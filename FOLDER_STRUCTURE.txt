@@ -1,0 +1,188 @@
+cloudguest/
+├── app/
+│   ├── __init__.py
+│   ├── config.py                          # Configuration management
+│   ├── main.py                            # FastAPI app initialization
+│   │
+│   └── modules/
+│       ├── __init__.py
+│       │
+│       ├── auth/                          # Authentication Module (MODULE 003)
+│       │   ├── __init__.py
+│       │   │
+│       │   ├── domain/                    # Domain Layer (DDD)
+│       │   │   ├── __init__.py
+│       │   │   ├── user_entity.py         # User aggregate root
+│       │   │   ├── session_entity.py      # Session aggregate
+│       │   │   ├── value_objects.py       # Email, Password, Phone, etc.
+│       │   │   └── events.py              # Domain events
+│       │   │
+│       │   ├── application/               # Application Layer
+│       │   │   ├── __init__.py
+│       │   │   ├── services/
+│       │   │   │   ├── __init__.py
+│       │   │   │   ├── auth_service.py    # Authentication business logic
+│       │   │   │   ├── user_service.py    # User management
+│       │   │   │   ├── token_service.py   # JWT & token handling
+│       │   │   │   ├── password_service.py# Password operations
+│       │   │   │   ├── session_service.py # Multi-session management
+│       │   │   │   └── security_service.py# Rate limit, account lock
+│       │   │   │
+│       │   │   ├── dto/                   # Data Transfer Objects
+│       │   │   │   ├── __init__.py
+│       │   │   │   └── auth_dto.py        # DTOs for auth operations
+│       │   │   │
+│       │   │   └── use_cases/             # Use cases (optional layer)
+│       │   │       ├── __init__.py
+│       │   │       ├── login_usecase.py
+│       │   │       └── register_usecase.py
+│       │   │
+│       │   ├── infrastructure/            # Infrastructure Layer
+│       │   │   ├── __init__.py
+│       │   │   │
+│       │   │   ├── persistence/
+│       │   │   │   ├── __init__.py
+│       │   │   │   ├── models.py          # SQLAlchemy models
+│       │   │   │   ├── repositories/
+│       │   │   │   │   ├── __init__.py
+│       │   │   │   │   ├── base_repository.py     # Base repo class
+│       │   │   │   │   ├── user_repository.py     # User repo
+│       │   │   │   │   ├── session_repository.py  # Session repo
+│       │   │   │   │   └── password_history_repository.py
+│       │   │   │   │
+│       │   │   │   └── migrations/        # Alembic migrations
+│       │   │   │       ├── versions/
+│       │   │   │       └── env.py
+│       │   │   │
+│       │   │   ├── cache/
+│       │   │   │   ├── __init__.py
+│       │   │   │   ├── redis_client.py    # Redis wrapper
+│       │   │   │   └── cache_service.py   # Cache operations
+│       │   │   │
+│       │   │   └── security/
+│       │   │       ├── __init__.py
+│       │   │       ├── jwt_handler.py     # JWT encode/decode
+│       │   │       ├── password_hasher.py # Argon2 hashing
+│       │   │       ├── rate_limiter.py    # Rate limiting logic
+│       │   │       └── device_tracker.py  # Device/IP tracking
+│       │   │
+│       │   ├── presentation/              # Presentation Layer
+│       │   │   ├── __init__.py
+│       │   │   │
+│       │   │   ├── schemas/
+│       │   │   │   ├── __init__.py
+│       │   │   │   ├── request.py         # Request models
+│       │   │   │   ├── response.py        # Response models
+│       │   │   │   └── validators.py      # Pydantic validators
+│       │   │   │
+│       │   │   ├── api/
+│       │   │   │   ├── __init__.py
+│       │   │   │   ├── v1/
+│       │   │   │   │   ├── __init__.py
+│       │   │   │   │   ├── routes.py      # API routes
+│       │   │   │   │   └── dependencies.py# FastAPI dependencies
+│       │   │   │   │
+│       │   │   │   └── dependencies.py    # Shared dependencies
+│       │   │   │
+│       │   │   └── middleware/
+│       │   │       ├── __init__.py
+│       │   │       ├── jwt_middleware.py  # JWT validation
+│       │   │       └── error_handler.py   # Error handling
+│       │   │
+│       │   ├── shared/                    # Shared utilities
+│       │   │   ├── __init__.py
+│       │   │   ├── exceptions.py          # Custom exceptions
+│       │   │   ├── validators.py          # Input validators
+│       │   │   ├── constants.py           # Constants
+│       │   │   └── utils.py               # Helper functions
+│       │   │
+│       │   └── tests/                     # Unit & Integration tests
+│       │       ├── __init__.py
+│       │       ├── conftest.py            # Pytest fixtures
+│       │       │
+│       │       ├── unit/
+│       │       │   ├── __init__.py
+│       │       │   ├── test_password_service.py
+│       │       │   ├── test_token_service.py
+│       │       │   ├── test_auth_service.py
+│       │       │   ├── test_session_service.py
+│       │       │   └── test_security_service.py
+│       │       │
+│       │       └── integration/
+│       │           ├── __init__.py
+│       │           ├── test_login_flow.py
+│       │           ├── test_registration_flow.py
+│       │           ├── test_password_reset_flow.py
+│       │           ├── test_email_verification_flow.py
+│       │           └── test_multi_session_flow.py
+│       │
+│       ├── common/                        # Common utilities (shared across modules)
+│       │   ├── __init__.py
+│       │   ├── logger.py                  # Logging configuration
+│       │   ├── exceptions.py              # Global exceptions
+│       │   └── utils.py                   # Shared utilities
+│       │
+│       └── __init__.py
+│
+├── tests/
+│   ├── __init__.py
+│   └── e2e/                               # End-to-end tests
+│       └── test_auth_flow.py
+│
+├── migrations/                            # Alembic migrations root
+│   ├── alembic.ini
+│   ├── versions/
+│   ├── env.py
+│   └── script.py.mako
+│
+├── docker/
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   └── .dockerignore
+│
+├── docs/
+│   ├── README.md                          # Project overview
+│   ├── AUTH_FLOW.md                       # Authentication flow documentation
+│   ├── API.md                             # API documentation
+│   └── SECURITY.md                        # Security considerations
+│
+├── .env.example                           # Environment template
+├── .gitignore
+├── requirements.txt                       # Python dependencies
+├── pyproject.toml                         # Project metadata
+├── pytest.ini                             # Pytest configuration
+├── .flake8                                # Flake8 configuration
+├── .mypy.ini                              # MyPy configuration
+└── README.md                              # Root README
+
+---
+
+KEY POINTS:
+
+1. DDD Structure:
+   - domain/: Aggregates, Value Objects, Domain Events
+   - application/: Services, DTOs, Use Cases
+   - infrastructure/: Repositories, External Services
+   - presentation/: API Routes, Schemas, Middleware
+
+2. Separation of Concerns:
+   - Each layer has specific responsibility
+   - Dependencies flow inward (from presentation to domain)
+   - Easy to test and maintain
+
+3. Feature-Based Organization:
+   - auth/ module contains complete authentication feature
+   - Can be reused across other projects
+   - Clear boundaries and interfaces
+
+4. Testing Structure:
+   - Unit tests for services and utilities
+   - Integration tests for full flows
+   - Fixtures in conftest.py for setup
+   - E2E tests for complete user journeys
+
+5. Documentation:
+   - API documentation in docs/
+   - Architecture decisions
+   - Security considerations
+   - Usage examples
