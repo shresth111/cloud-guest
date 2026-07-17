@@ -1,10 +1,14 @@
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from alembic import context
 from app.core.config import get_settings
 from app.database.base import Base
+
+# Import domain models so their tables are registered on Base.metadata
+# before autogenerate compares it against the database.
+from app.domains.auth import models as auth_models  # noqa: F401
 
 config = context.config
 
@@ -56,4 +60,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-

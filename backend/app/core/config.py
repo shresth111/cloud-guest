@@ -17,7 +17,9 @@ class Settings(BaseSettings):
     debug: bool = False
     service_name: str = "cloudguest-backend"
     api_v1_prefix: str = "/api/v1"
-    allowed_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    allowed_origins: list[str] = Field(
+        default_factory=lambda: ["http://localhost:3000"]
+    )
 
     database_url: PostgresDsn = Field(
         default="postgresql+asyncpg://cloudguest:cloudguest@localhost:5432/cloudguest"
@@ -28,6 +30,21 @@ class Settings(BaseSettings):
 
     redis_url: RedisDsn = Field(default="redis://localhost:6379/0")
     redis_health_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+
+    jwt_secret_key: str = Field(
+        default="insecure-local-dev-secret-key-change-me-32chars",
+        min_length=32,
+        description=(
+            "Secret key used to sign auth JWTs. Must be overridden in every "
+            "non-local environment."
+        ),
+    )
+    jwt_algorithm: str = Field(default="HS256")
+    access_token_expire_minutes: int = Field(default=15, ge=1, le=1440)
+    refresh_token_expire_days: int = Field(default=7, ge=1, le=90)
+    max_login_attempts: int = Field(default=5, ge=1, le=100)
+    account_lockout_minutes: int = Field(default=30, ge=1, le=1440)
+    password_history_limit: int = Field(default=5, ge=0, le=50)
 
     log_level: str = "INFO"
     log_dir: Path = Path("logs")
@@ -45,4 +62,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
