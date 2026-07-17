@@ -54,6 +54,28 @@ class Settings(BaseSettings):
 
     request_timeout_seconds: int = Field(default=30, ge=1, le=300)
 
+    rbac_permission_cache_ttl_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=86_400,
+        description=(
+            "TTL for the Redis-backed effective-permission cache "
+            "(app.domains.rbac.cache.PermissionCache). Real invalidation "
+            "happens on every role/permission/override mutation; this TTL "
+            "is only a backstop against a missed invalidation."
+        ),
+    )
+    rbac_max_parent_role_depth: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description=(
+            "Maximum number of parent_role_id hops walked when resolving "
+            "recursive role-permission inheritance. A defensive backstop "
+            "against any cycle that slips past the service-layer check."
+        ),
+    )
+
     @property
     def log_path(self) -> Path:
         return self.log_dir / self.log_file

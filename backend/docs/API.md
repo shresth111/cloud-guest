@@ -57,3 +57,29 @@ Every response includes:
 - `Permissions-Policy`
 - `Strict-Transport-Security`
 
+## RBAC Endpoints (Module 004)
+
+Roles, permissions, and user-role assignment. See
+`backend/docs/rbac/README.md` and `backend/docs/rbac/RBAC_ARCHITECTURE.md`
+for the full design.
+
+```text
+GET    /api/v1/roles
+POST   /api/v1/roles
+PUT    /api/v1/roles/{role_id}
+DELETE /api/v1/roles/{role_id}
+POST   /api/v1/roles/{role_id}/clone
+POST   /api/v1/roles/{role_id}/activate
+POST   /api/v1/roles/{role_id}/deactivate
+GET    /api/v1/permissions
+GET    /api/v1/permission-groups
+POST   /api/v1/users/{user_id}/roles
+DELETE /api/v1/users/{user_id}/roles/{role_assignment_id}
+GET    /api/v1/users/{user_id}/permissions
+GET    /api/v1/me/permissions
+```
+
+Mutating/protected endpoints require the appropriate `roles.*`/`permissions.*`
+permission at the resolved scope (`X-Organization-Id`/`X-Location-Id`/
+`X-Router-Id` headers supply scope context; see `RBAC_ARCHITECTURE.md` §7).
+
