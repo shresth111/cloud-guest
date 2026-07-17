@@ -57,9 +57,12 @@ curl http://localhost:8000/api/v1/health/live
 curl http://localhost:8000/api/v1/health/ready
 ```
 
+## Module Documentation
+
+- [Module 002: Database Core](docs/database-core/README.md)
+
 ## Git Commit Message
 
 ```text
 feat(module-001): add backend foundation
 ```
-
