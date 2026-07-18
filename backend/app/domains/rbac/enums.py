@@ -287,3 +287,34 @@ class AuditAction(StrEnum):
     CAPTIVE_PORTAL_CONFIG_ACTIVATED = "captive_portal_config_activated"
     CAPTIVE_PORTAL_CONFIG_DEACTIVATED = "captive_portal_config_deactivated"
     CAPTIVE_PORTAL_CONFIG_DELETED = "captive_portal_config_deleted"
+
+    # Guest domain events (Module 010 Part 4, the final BE-010 module) --
+    # written through this same table by
+    # ``app.domains.guest.service.GuestService``/``RadiusService`` via the
+    # same narrow ``AuditLogWriter`` protocol shape every other domain's
+    # service uses (see ``AuditLogEntry``'s "other domains could plausibly
+    # reuse it" design). Guest logins (``login_via_otp``/``login_via_voucher``)
+    # are deliberately **not** audited here at all -- they are high-volume,
+    # guest-facing traffic (the identical profile OTP's own *request*
+    # tiering already establishes), and the composed calls those methods
+    # make (``OtpService.verify_otp``, ``VoucherService.redeem_voucher``)
+    # already write their own audit entries for the moments that matter
+    # (``OTP_VERIFIED``/``VOUCHER_REDEEMED``) -- a second, guest-flavoured
+    # audit row for the same event would be pure duplication. Every login
+    # attempt is still recorded, at guest-module granularity, in
+    # ``app.domains.guest.models.GuestLoginHistory`` (a purpose-built,
+    # high-volume table, not this one -- mirrors
+    # ``app.domains.router_provisioning.models.RouterEvent``'s identical
+    # separation). ``GUEST_BLOCKED``/``GUEST_UNBLOCKED``/
+    # ``GUEST_SESSION_TERMINATED`` are always audited (low-volume, always
+    # admin-initiated). ``GUEST_SESSION_DISCONNECTED`` is audited only when
+    # the disconnect was admin-initiated -- a system-initiated one (RADIUS
+    # Accounting-Stop, timeout enforcement) is routine operational churn,
+    # mirroring ``ROUTER_CREATED``'s heartbeat non-audit precedent.
+    # ``RADIUS_NAS_REGISTERED`` is always audited (low-volume, admin-driven
+    # infrastructure change).
+    GUEST_BLOCKED = "guest_blocked"
+    GUEST_UNBLOCKED = "guest_unblocked"
+    GUEST_SESSION_DISCONNECTED = "guest_session_disconnected"
+    GUEST_SESSION_TERMINATED = "guest_session_terminated"
+    RADIUS_NAS_REGISTERED = "radius_nas_registered"

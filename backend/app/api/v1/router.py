@@ -3,6 +3,10 @@ from fastapi import APIRouter
 from app.api.v1.health.routes import router as health_router
 from app.domains.auth.router import router as auth_router
 from app.domains.captive_portal.router import router as captive_portal_router
+from app.domains.guest.router import admin_router as guest_admin_router
+from app.domains.guest.router import analytics_router as guest_analytics_router
+from app.domains.guest.router import guest_router
+from app.domains.guest.router import radius_router as guest_radius_router
 from app.domains.location.router import router as location_router
 from app.domains.organization.router import router as organization_router
 from app.domains.otp.router import router as otp_router
@@ -28,3 +32,7 @@ api_v1_router.include_router(wireguard_router)
 api_v1_router.include_router(otp_router)
 api_v1_router.include_router(voucher_router)
 api_v1_router.include_router(captive_portal_router)
+api_v1_router.include_router(guest_router)
+api_v1_router.include_router(guest_admin_router)
+api_v1_router.include_router(guest_radius_router)
+api_v1_router.include_router(guest_analytics_router)

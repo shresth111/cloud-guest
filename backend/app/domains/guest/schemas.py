@@ -1,0 +1,349 @@
+"""Pydantic request/response schemas for the Guest API.
+
+All admin/analytics response schemas follow the same pydantic v2
+conventions as every other domain (``ConfigDict``, ``from_attributes``,
+explicit ``Field`` descriptions) and are wrapped in the project's standard
+``ApiResponse``/``build_response`` envelope by ``router.py`` -- including
+the guest-facing login/consent endpoints (mirroring OTP's/Voucher's own
+guest-facing-but-still-enveloped precedent).
+
+The RADIUS-facing schemas (``Radius*``) follow a deliberately minimal,
+self-documented JSON contract rather than the standard envelope -- see
+``service.py``'s module docstring for the ``rlm_rest`` architectural
+write-up this mirrors.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from .constants import GuestAuthMethod, GuestSessionStatus
+
+__all__ = [
+    "GuestOtpLoginRequest",
+    "GuestVoucherLoginRequest",
+    "GuestConsentRequest",
+    "GuestBlockRequest",
+    "SessionDisconnectRequest",
+    "SessionTerminateRequest",
+    "SessionReconnectRequest",
+    "GuestDeviceResponse",
+    "GuestSessionResponse",
+    "GuestSessionListResponse",
+    "GuestLoginResponse",
+    "GuestResponse",
+    "GuestDetailResponse",
+    "GuestListResponse",
+    "GuestConsentResponse",
+    "RadiusNasRegisterRequest",
+    "RadiusNasResponse",
+    "RadiusAuthorizeRequest",
+    "RadiusAuthorizeResponse",
+    "RadiusAccountingRequest",
+    "RadiusAccountingResponse",
+    "GuestAnalyticsSummaryResponse",
+    "TopLocationItem",
+    "TopLocationsResponse",
+    "TopDeviceItem",
+    "TopDevicesResponse",
+    "OtpSuccessRateResponse",
+    "VoucherUsageResponse",
+]
+
+
+# ============================================================================
+# Guest-facing request schemas
+# ============================================================================
+
+
+class GuestOtpLoginRequest(BaseModel):
+    identifier: str = Field(..., min_length=3, max_length=255)
+    code: str = Field(..., min_length=4, max_length=10)
+    auth_method: GuestAuthMethod = Field(
+        default=GuestAuthMethod.OTP_SMS,
+        description="Must be otp_sms or otp_email -- which enabled-method "
+        "flag on the resolved captive portal config to check.",
+    )
+    organization_id: uuid.UUID | None = Field(default=None)
+    location_id: uuid.UUID = Field(...)
+    router_id: uuid.UUID = Field(
+        ..., description="The NAS (router) this guest's session will be on."
+    )
+    device_mac: str | None = Field(default=None, max_length=17)
+    device_name: str | None = Field(default=None, max_length=200)
+    ip_address: str | None = Field(default=None, max_length=45)
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "identifier": "+15551234567",
+                "code": "042817",
+                "auth_method": "otp_sms",
+                "location_id": "00000000-0000-0000-0000-000000000000",
+                "router_id": "00000000-0000-0000-0000-000000000000",
+                "device_mac": "AA:BB:CC:DD:EE:FF",
+            }
+        }
+    )
+
+
+class GuestVoucherLoginRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=64)
+    identifier: str = Field(..., min_length=1, max_length=255)
+    organization_id: uuid.UUID | None = Field(default=None)
+    location_id: uuid.UUID = Field(...)
+    router_id: uuid.UUID = Field(...)
+    device_mac: str | None = Field(default=None, max_length=17)
+    device_name: str | None = Field(default=None, max_length=200)
+    ip_address: str | None = Field(default=None, max_length=45)
+
+
+class GuestConsentRequest(BaseModel):
+    guest_id: uuid.UUID
+    captive_portal_config_id: uuid.UUID | None = Field(default=None)
+    terms_version: str | None = Field(default=None, max_length=50)
+    ip_address: str | None = Field(default=None, max_length=45)
+
+
+# ============================================================================
+# Admin-facing request schemas
+# ============================================================================
+
+
+class GuestBlockRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class SessionDisconnectRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class SessionTerminateRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class SessionReconnectRequest(BaseModel):
+    router_id: uuid.UUID
+    location_id: uuid.UUID
+    device_mac: str | None = Field(default=None, max_length=17)
+    ip_address: str | None = Field(default=None, max_length=45)
+
+
+# ============================================================================
+# Response schemas
+# ============================================================================
+
+
+class GuestDeviceResponse(BaseModel):
+    id: str
+    guest_id: str
+    mac_address: str
+    device_name: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GuestSessionResponse(BaseModel):
+    id: str
+    guest_id: str
+    device_id: str | None
+    router_id: str
+    location_id: str
+    organization_id: str
+    auth_method: str
+    voucher_id: str | None
+    status: str
+    started_at: datetime
+    ended_at: datetime | None
+    last_activity_at: datetime
+    ip_address: str | None
+    bytes_uploaded: int
+    bytes_downloaded: int
+    data_limit_mb: int | None
+    session_timeout_minutes: int | None
+    disconnect_reason: str | None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GuestSessionListResponse(BaseModel):
+    items: list[GuestSessionResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+class GuestLoginResponse(BaseModel):
+    guest_id: str
+    identifier: str
+    is_new_guest: bool
+    session: GuestSessionResponse
+    device: GuestDeviceResponse | None
+
+
+class GuestResponse(BaseModel):
+    id: str
+    organization_id: str
+    location_id: str | None
+    identifier: str
+    display_name: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    total_visit_count: int
+    is_blocked: bool
+    blocked_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GuestListResponse(BaseModel):
+    items: list[GuestResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+class GuestDetailResponse(GuestResponse):
+    sessions: list[GuestSessionResponse]
+
+
+class GuestConsentResponse(BaseModel):
+    id: str
+    guest_id: str
+    captive_portal_config_id: str | None
+    consented_at: datetime
+    terms_version: str | None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ============================================================================
+# RADIUS-facing schemas -- minimal, documented JSON contract (see module
+# docstring)
+# ============================================================================
+
+
+class RadiusNasRegisterRequest(BaseModel):
+    router_id: uuid.UUID
+    nas_identifier: str = Field(..., min_length=1, max_length=255)
+    shared_secret: str = Field(..., min_length=8, max_length=255)
+
+
+class RadiusNasResponse(BaseModel):
+    id: str
+    router_id: str
+    nas_identifier: str
+    is_active: bool
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RadiusAuthorizeRequest(BaseModel):
+    """Shape a FreeRADIUS ``rlm_rest`` Authorize-phase call would POST --
+    ``nas_identifier``/the shared secret are additionally required via
+    request headers (see ``constants.RADIUS_NAS_IDENTIFIER_HEADER``/
+    ``RADIUS_SHARED_SECRET_HEADER``), not this body, mirroring
+    ``app.domains.router_agent``'s device-credential-via-header
+    convention."""
+
+    username: str = Field(..., description="The guest's identifier (phone/email).")
+
+
+class RadiusAuthorizeResponse(BaseModel):
+    authorized: bool
+    session_timeout_seconds: int | None = Field(
+        default=None, description="RADIUS Session-Timeout reply attribute."
+    )
+    data_limit_mb: int | None = Field(
+        default=None, description="Bandwidth/data policy reply hint."
+    )
+    reply_message: str
+
+
+class RadiusAccountingRequest(BaseModel):
+    """Covers all three Acct-Status-Type values
+    (``constants.RADIUS_ACCT_STATUS_START``/``_INTERIM_UPDATE``/``_STOP``)
+    in one schema -- fields not relevant to a given ``status_type`` are
+    simply left ``None``/default."""
+
+    status_type: str = Field(..., description="One of: start, interim-update, stop.")
+    session_id: uuid.UUID = Field(
+        ...,
+        description="The GuestSession id -- echoed back by the NAS as "
+        "Acct-Session-Id, originated by this module's own login endpoints.",
+    )
+    bytes_uploaded_delta: int = Field(default=0, ge=0)
+    bytes_downloaded_delta: int = Field(default=0, ge=0)
+    bytes_uploaded_total: int | None = Field(default=None, ge=0)
+    bytes_downloaded_total: int | None = Field(default=None, ge=0)
+    disconnect_reason: str | None = Field(default=None, max_length=255)
+
+
+class RadiusAccountingResponse(BaseModel):
+    session_id: str
+    status: str
+
+
+# ============================================================================
+# Analytics response schemas
+# ============================================================================
+
+
+class GuestAnalyticsSummaryResponse(BaseModel):
+    visitors: int
+    unique_guests: int
+    returning_guests: int
+    average_session_duration_seconds: float | None
+    total_bandwidth_bytes: int
+
+
+class TopLocationItem(BaseModel):
+    location_id: str
+    location_name: str
+    session_count: int
+
+
+class TopLocationsResponse(BaseModel):
+    items: list[TopLocationItem]
+
+
+class TopDeviceItem(BaseModel):
+    device_id: str
+    mac_address: str
+    session_count: int
+    unique_guest_count: int
+
+
+class TopDevicesResponse(BaseModel):
+    items: list[TopDeviceItem]
+
+
+class OtpSuccessRateResponse(BaseModel):
+    total_attempts: int
+    successful_attempts: int
+    success_rate: float
+
+
+class VoucherUsageResponse(BaseModel):
+    sessions: int
+    unique_guests: int
+    total_bandwidth_bytes: int
+
+
+# Re-exported for router.py's status-filter query param.
+GuestSessionStatusQuery = GuestSessionStatus

@@ -1,0 +1,146 @@
+# Guest: Database Schema
+
+Migration: `alembic/versions/0015_create_guest_tables.py` (revises
+`0014_create_captive_portal_tables`). Six new tables, all extending
+`app.database.base.BaseModel` (`id`, `created_at`, `updated_at`,
+`deleted_at`/`is_deleted`, `created_by`/`updated_by`, `version`) -- no
+changes to any existing table's columns.
+
+## `guests`
+
+A returning-guest identity, recognized across visits by `identifier` (the
+same phone/email value presented to `app.domains.otp`/`app.domains
+.voucher`).
+
+| Column | Type | Notes |
+|---|---|---|
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable | A guest always belongs to a tenant |
+| `location_id` | UUID, FK `locations.id` (`SET NULL`), nullable | "Home" location -- where first seen; a guest may visit other locations under the same org over time, sessions are never constrained to only this location |
+| `identifier` | String(255) | Phone or email -- same value used with otp/voucher |
+| `display_name` | String(200), nullable | Optional self-reported name |
+| `first_seen_at` / `last_seen_at` | DateTime(tz) | |
+| `total_visit_count` | Integer, default `0` | Incremented on every successful login/reconnect |
+| `is_blocked` | Boolean, default `false` | Admin-set ban |
+| `blocked_reason` | Text, nullable | |
+
+Unique index: `uq_guests_organization_id_identifier` on
+`(organization_id, identifier)` -- see `FLOW.md` for why identity is scoped
+per tenant, not globally.
+
+## `guest_devices`
+
+A physical device (by MAC address) seen logging in as some `Guest`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `guest_id` | UUID, FK `guests.id` (`CASCADE`) | Current "owner" -- reassignable, see `FLOW.md` §10 |
+| `mac_address` | String(17), **globally unique** | Not scoped per guest -- see `FLOW.md` §10 |
+| `device_name` | String(200), nullable | |
+| `first_seen_at` / `last_seen_at` | DateTime(tz) | |
+
+## `guest_sessions`
+
+One continuous guest WiFi connection interval on one router (the RADIUS
+NAS). Append-only -- see `FLOW.md` §3.
+
+| Column | Type | Notes |
+|---|---|---|
+| `guest_id` | UUID, FK `guests.id` (`CASCADE`), not nullable | |
+| `device_id` | UUID, FK `guest_devices.id` (`SET NULL`), nullable | Absent if the guest presented no MAC |
+| `router_id` | UUID, FK `routers.id` (`CASCADE`), not nullable | The NAS this session is on |
+| `location_id` | UUID, FK `locations.id` (`CASCADE`), not nullable | |
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable | Denormalized from `location_id` at session-start time -- mirrors `Router.organization_id`'s identical rationale (avoids a join on every tenant-scoped analytics query); immutable after creation |
+| `auth_method` | String(30) | `constants.GuestAuthMethod` -- `otp_sms`/`otp_email`/`voucher`/`username_password` |
+| `voucher_id` | UUID, FK `vouchers.id` (`SET NULL`), nullable | Set only when `auth_method="voucher"` |
+| `status` | String(20), default `active` | `constants.GuestSessionStatus` -- see transition graph below |
+| `started_at` | DateTime(tz), not nullable | |
+| `ended_at` | DateTime(tz), nullable | Set when the session leaves `ACTIVE` |
+| `last_activity_at` | DateTime(tz), not nullable | Bumped by `record_usage`; drives timeout detection |
+| `ip_address` | String(45), nullable | |
+| `bytes_uploaded` / `bytes_downloaded` | BigInteger, default `0` | |
+| `data_limit_mb` | Integer, nullable | Copied from the voucher batch (or left `None`) at session start -- never a live reference, see `FLOW.md` §7 |
+| `session_timeout_minutes` | Integer, nullable | Same "copied, not referenced" reasoning |
+| `disconnect_reason` | String(255), nullable | e.g. `"inactivity_timeout"`, `"data_limit_exceeded"`, `"radius_accounting_stop"` |
+
+Status transition graph (`constants.GUEST_SESSION_STATUS_TRANSITIONS`):
+
+```text
+ACTIVE -> DISCONNECTED | EXPIRED | TERMINATED
+DISCONNECTED, EXPIRED, TERMINATED -> (terminal, no outgoing edges)
+```
+
+## `guest_login_history`
+
+Every login attempt, success or failure -- see `FLOW.md` §9 for the
+`guest_id`-nullability reasoning.
+
+| Column | Type | Notes |
+|---|---|---|
+| `guest_id` | UUID, FK `guests.id` (`SET NULL`), **nullable** | Populated only when a `Guest` row already exists for the identifier; never force-created on failure |
+| `organization_id` / `location_id` | UUID, FK (`SET NULL`), nullable | Additive beyond the minimal spec -- mirrors `OtpRequest`'s own scope columns, lets analytics filter without joining through the nullable `guest_id` |
+| `identifier` | String(255), not nullable | Always present, even when `guest_id` is null |
+| `auth_method` | String(30) | |
+| `success` | Boolean | |
+| `failure_reason` | String(255), nullable | e.g. the failing exception's class name |
+| `attempted_at` | DateTime(tz) | |
+| `ip_address` | String(45), nullable | |
+
+## `guest_consents`
+
+A record of a guest accepting a captive portal's terms and conditions.
+
+| Column | Type | Notes |
+|---|---|---|
+| `guest_id` | UUID, FK `guests.id` (`CASCADE`), not nullable | |
+| `captive_portal_config_id` | UUID, FK `captive_portal_configs.id` (`SET NULL`), nullable | |
+| `consented_at` | DateTime(tz) | |
+| `terms_version` | String(50), nullable | Which version of the T&C was agreed to |
+| `ip_address` | String(45), nullable | |
+
+## `radius_nas_clients`
+
+A router's registered FreeRADIUS NAS identity -- a router *is* a RADIUS
+NAS, one-to-one.
+
+| Column | Type | Notes |
+|---|---|---|
+| `router_id` | UUID, FK `routers.id` (`CASCADE`), **unique** | One-to-one with `routers` |
+| `nas_identifier` | String(255), **unique** | The identifier FreeRADIUS's `rlm_rest` presents |
+| `shared_secret_encrypted` | Text, not nullable | Fernet-encrypted via `app.domains.router.crypto.encrypt_secret` -- reused, not a new encryption mechanism; recoverable (not hashed), since a live comparison needs the plaintext back |
+| `is_active` | Boolean, default `true` | |
+
+## Facts genuinely new vs. reused from elsewhere
+
+* **New** (no existing column anywhere): every column on all six tables --
+  nothing elsewhere in this codebase models a guest identity, device,
+  session, login history, consent, or RADIUS NAS client.
+* **Reused, not duplicated**: `organizations.id`/`locations.id`/
+  `routers.id`/`vouchers.id`/`captive_portal_configs.id` as FK targets (no
+  schema change to any of them); `audit_log_entries` (RBAC) as the audit
+  sink, via 5 additive `AuditAction` values -- no new audit table;
+  `app.domains.router.crypto` for `RadiusNasClient.shared_secret_encrypted`
+  -- no new encryption mechanism.
+
+## Entity-relationship summary
+
+```text
+organizations --< guests (organization_id, NOT NULL)
+locations     --< guests (location_id, nullable)
+guests        --< guest_devices (guest_id, NOT NULL, reassignable)
+guests        --< guest_sessions (guest_id, NOT NULL)
+guest_devices --< guest_sessions (device_id, nullable)
+routers       --< guest_sessions (router_id, NOT NULL)
+locations     --< guest_sessions (location_id, NOT NULL)
+organizations --< guest_sessions (organization_id, NOT NULL, denormalized)
+vouchers      --< guest_sessions (voucher_id, nullable)
+guests        --< guest_login_history (guest_id, nullable)
+organizations --< guest_login_history (organization_id, nullable)
+locations     --< guest_login_history (location_id, nullable)
+guests        --< guest_consents (guest_id, NOT NULL)
+captive_portal_configs --< guest_consents (captive_portal_config_id, nullable)
+routers       --- radius_nas_clients (router_id, UNIQUE -- one-to-one)
+```
+
+No other existing table gained a new column or FK for this module -- like
+Module 010 Parts 1-3, none of these six tables are referenced by any RBAC
+scope column, so no RBAC follow-up migration is needed here.

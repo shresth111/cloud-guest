@@ -586,3 +586,109 @@ OAuth/social-login integration or guest username/password authentication
 exists anywhere in this codebase; setting them only changes what this
 resolve response reports as enabled (`FLOW.md` §5).
 
+## Guest Endpoints (Module 010 Part 4, the final BE-010 module)
+
+The Guest domain (`app.domains.guest`) is the module that actually ties
+`app.domains.otp`/`app.domains.voucher`/`app.domains.captive_portal`/
+`app.domains.router` together into a real guest WiFi login -- a
+returning-guest identity, a device, a session, session lifecycle
+management, a FreeRADIUS `rlm_rest` HTTP integration, and guest analytics.
+See `backend/docs/guest/README.md`, `backend/docs/guest/FLOW.md`, and
+`backend/docs/guest/DATABASE.md` for the full design.
+
+Guest-facing endpoints carry no `RequirePermission`/`CurrentUser`
+dependency at all -- the caller is an unauthenticated guest at a captive
+portal (mirrors OTP's/Voucher's identical precedent). Abuse protection is
+inherited entirely from `OtpService`'s/`VoucherService`'s own rate
+limiting, never reimplemented here. All three still use the standard
+`ApiResponse` envelope:
+
+```text
+POST /api/v1/guest/login/otp
+POST /api/v1/guest/login/voucher
+POST /api/v1/guest/consent
+```
+
+`POST /guest/login/otp`/`POST /guest/login/voucher` first confirm (via
+`CaptivePortalService.resolve_portal_config`) that the requested method is
+enabled for the given `location_id`, reject a request against a
+decommissioned/suspended `router_id`
+(`RouterNotEligibleForGuestSessionError`), reject a blocked guest
+(`GuestBlockedError`) before ever calling
+`OtpService.verify_otp`/`VoucherService.redeem_voucher`, then get-or-create
+the `Guest`/`GuestDevice` rows and create a new, `ACTIVE` `GuestSession`.
+For a voucher login, the session's `data_limit_mb`/`session_timeout_minutes`
+are copied from the redeemed voucher's batch at creation time -- a later
+edit to the batch never retroactively changes an in-progress guest's quota
+(`FLOW.md` §7).
+
+Admin-facing endpoints use the standard `ApiResponse` envelope and are
+gated by RBAC's already-seeded `guest_users.*`/`guest_sessions.*`
+permission keys:
+
+```text
+GET  /api/v1/guests                          guest_users.read
+GET  /api/v1/guests/{id}                     guest_users.read
+POST /api/v1/guests/{id}/block               guest_users.update
+POST /api/v1/guests/{id}/unblock             guest_users.update
+POST /api/v1/guests/{id}/reconnect           guest_sessions.execute
+GET  /api/v1/guest-sessions                  guest_sessions.read
+GET  /api/v1/guest-sessions/{id}             guest_sessions.read
+POST /api/v1/guest-sessions/{id}/disconnect  guest_sessions.execute
+POST /api/v1/guest-sessions/{id}/terminate   guest_sessions.execute
+```
+
+`disconnect` (normal, non-punitive end of use) and `terminate` (punitive,
+admin-driven, blocks reconnection for
+`constants.TERMINATION_RECONNECT_COOLDOWN_MINUTES`) are deliberately
+distinct -- see `FLOW.md` §4. `reconnect` always creates a **new**
+`GuestSession` row rather than resurrecting the guest's most recent one --
+sessions are append-only history (`FLOW.md` §3).
+
+RADIUS-facing endpoints implement the FreeRADIUS `rlm_rest` HTTP
+integration pattern (`FLOW.md` §5) -- there is no real FreeRADIUS server or
+RADIUS-UDP wire protocol anywhere in this sandbox, so this module
+implements the realistic, actually-deployed HTTP contract `rlm_rest` would
+be configured to call instead. Authenticated via a registered NAS's own
+shared secret (`X-RADIUS-NAS-Identifier`/`X-RADIUS-Shared-Secret` headers),
+**not** RBAC -- FreeRADIUS has no platform-user identity:
+
+```text
+POST /api/v1/radius/authorize     NAS shared secret
+POST /api/v1/radius/accounting    NAS shared secret
+POST /api/v1/radius/nas           radius.create (RBAC-gated, admin registers a NAS)
+```
+
+`POST /radius/nas` is the one RADIUS-prefixed endpoint that *is*
+RBAC-gated -- an admin registering a router's NAS identity, not FreeRADIUS
+calling in. `POST /radius/authorize` returns whether a given `username`
+(the guest's identifier) has a currently-`ACTIVE` session on a router bound
+to the authenticating NAS, plus reply attributes (`session_timeout_seconds`,
+`data_limit_mb`) a real deployment would forward as RADIUS reply
+attributes. `POST /radius/accounting` covers all three Acct-Status-Type
+values (`start`/`interim-update`/`stop`) in one schema
+(`RadiusAccountingRequest.status_type`): `start` confirms an existing
+session (never fabricates one -- `FLOW.md` §5), `interim-update` calls
+`record_usage` (immediately expiring the session if the running total now
+exceeds `data_limit_mb`), `stop` records the final byte counts and calls
+`disconnect_session`.
+
+Analytics endpoints are tenant-scoped (`organization_id` via
+`X-Organization-Id`, required), optional `location_id`, and a required
+date range, gated by RBAC's already-seeded `analytics.read` permission key,
+implemented as real SQL aggregate queries
+(`func.count`/`func.sum`/`func.avg`, `GROUP BY`) -- never a Python-side
+loop over fetched rows:
+
+```text
+GET /api/v1/guest-analytics/summary            analytics.read
+GET /api/v1/guest-analytics/top-locations      analytics.read
+GET /api/v1/guest-analytics/top-devices        analytics.read
+GET /api/v1/guest-analytics/otp-success-rate   analytics.read
+GET /api/v1/guest-analytics/voucher-usage      analytics.read
+```
+
+`otp-success-rate`/`voucher-usage` are derived entirely from this module's
+own `GuestLoginHistory`/`GuestSession` tables -- no new method was added to
+`app.domains.otp`/`app.domains.voucher` (`FLOW.md` §11).
+
