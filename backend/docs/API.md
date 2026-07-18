@@ -83,3 +83,36 @@ Mutating/protected endpoints require the appropriate `roles.*`/`permissions.*`
 permission at the resolved scope (`X-Organization-Id`/`X-Location-Id`/
 `X-Router-Id` headers supply scope context; see `RBAC_ARCHITECTURE.md` §7).
 
+## Organization Endpoints (Module 005)
+
+Tenant CRUD, MSP hierarchy, and membership management. See
+`backend/docs/organization/README.md` and
+`backend/docs/organization/ORGANIZATION_ARCHITECTURE.md` for the full
+design.
+
+```text
+GET    /api/v1/organizations
+POST   /api/v1/organizations
+GET    /api/v1/organizations/{organization_id}
+PUT    /api/v1/organizations/{organization_id}
+DELETE /api/v1/organizations/{organization_id}
+POST   /api/v1/organizations/{organization_id}/suspend
+POST   /api/v1/organizations/{organization_id}/activate
+GET    /api/v1/organizations/{organization_id}/children
+GET    /api/v1/organizations/{organization_id}/members
+POST   /api/v1/organizations/{organization_id}/members
+DELETE /api/v1/organizations/{organization_id}/members/{member_id}
+POST   /api/v1/organizations/{organization_id}/members/{member_id}/accept
+GET    /api/v1/me/organizations
+```
+
+Mutating/protected endpoints require the appropriate `organizations.*`
+permission (`create`/`read`/`update`/`delete`/`manage`) at the resolved
+scope. `DELETE /organizations/{id}` archives (soft-deletes); it never hard-
+deletes. `X-Organization-Id` is now validated against real membership data
+(RBAC's `CurrentOrganization`, updated in this module) rather than trusted
+at face value -- see `ORGANIZATION_ARCHITECTURE.md` §5.
+`/organizations/{id}/members/{member_id}/accept` requires only that the
+caller is the invited user, not any `organizations.*` permission (an
+invited member holds none yet).
+

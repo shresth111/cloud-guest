@@ -125,3 +125,17 @@ class AuditAction(StrEnum):
     PERMISSION_DENIED = "permission_denied"
     PERMISSION_OVERRIDE_GRANTED = "permission_override_granted"
     PERMISSION_OVERRIDE_REVOKED = "permission_override_revoked"
+
+    # Organization domain events (Module 005) -- written through this same
+    # table by ``app.domains.organization.service.OrganizationService`` via
+    # the ``AuditLogWriter`` protocol, per this table's documented "other
+    # domains could plausibly reuse it" design (see ``AuditLogEntry``).
+    ORGANIZATION_CREATED = "organization_created"
+    ORGANIZATION_UPDATED = "organization_updated"
+    ORGANIZATION_ARCHIVED = "organization_archived"
+    ORGANIZATION_SUSPENDED = "organization_suspended"
+    ORGANIZATION_ACTIVATED = "organization_activated"
+    ORGANIZATION_MEMBER_INVITED = "organization_member_invited"
+    ORGANIZATION_MEMBER_ACCEPTED = "organization_member_accepted"
+    ORGANIZATION_MEMBER_REMOVED = "organization_member_removed"
+    ORGANIZATION_MEMBER_STATUS_CHANGED = "organization_member_status_changed"

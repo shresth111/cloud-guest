@@ -6,13 +6,26 @@ session validation. RBAC only adds *authorization* on top of the identity
 auth already establishes.
 
 Design decision -- ``CurrentOrganization`` / ``CurrentLocation``: there is no
-Organization/Location domain yet (see the module scope boundary), so
-"what organization/location is this request acting within" cannot be
-resolved by querying a membership table. Instead, the caller states it
-explicitly via ``X-Organization-Id`` / ``X-Location-Id`` / ``X-Router-Id``
-request headers (validated as UUIDs). This is a deliberate interim design:
-once the Organization domain exists, these dependencies are the single
-place to change to instead resolve/validate against real membership data.
+Location/Router domain yet (see the module scope boundary), so "what
+location/router is this request acting within" still cannot be resolved by
+querying real data -- the caller states it via ``X-Location-Id`` /
+``X-Router-Id`` request headers (validated as UUIDs), same as before.
+
+**Module 005 update:** the Organization domain now exists, so
+``CurrentOrganization`` no longer trusts ``X-Organization-Id`` at face
+value. When the header is present, it now validates (a) the organization
+exists (``OrganizationNotFoundError``) and (b) the current user holds an
+*active* ``OrganizationMember`` row for it (``OrganizationMembershipRequiredError``)
+-- both reused from ``app.domains.organization.exceptions`` /
+``app.domains.organization.models`` rather than reinvented here, keeping a
+single source of truth for "what does organization membership mean". This
+is a deliberately minimal, targeted change: it only touches
+``CurrentOrganization`` (the exact seam this module's own docs called out
+as "the single place to change"). A request with no ``X-Organization-Id``
+header still resolves to ``None`` with no DB lookup at all, so
+platform-level (``GLOBAL``-scoped) callers acting without an organization
+context -- e.g. creating the very first organization -- are unaffected.
+``CurrentLocation``/``CurrentRouter`` are unchanged, for the reason above.
 """
 
 from __future__ import annotations
@@ -25,9 +38,16 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.redis import get_redis_client
+from app.database.repositories.generic import GenericRepository
 from app.database.session import get_db_session
 from app.domains.auth.dependencies import get_current_user
 from app.domains.auth.models import AuthUser
+from app.domains.organization.enums import MembershipStatus
+from app.domains.organization.exceptions import (
+    OrganizationMembershipRequiredError,
+    OrganizationNotFoundError,
+)
+from app.domains.organization.models import Organization, OrganizationMember
 
 from .authorization import AccessValidator, RoleResolver
 from .cache import PermissionCache
@@ -93,9 +113,39 @@ def _parse_uuid_header(request: Request, header_name: str) -> uuid.UUID | None:
         raise InvalidScopeHeaderError(header_name) from exc
 
 
-async def CurrentOrganization(request: Request) -> uuid.UUID | None:
-    """The organization context for this request, if any (``X-Organization-Id``)."""
-    return _parse_uuid_header(request, _ORG_HEADER)
+async def CurrentOrganization(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    db: AsyncSession = Depends(get_db_session),
+) -> uuid.UUID | None:
+    """The organization context for this request, if any (``X-Organization-Id``).
+
+    When the header is present, validates the organization exists and that
+    the current user is an *active* member of it (see module docstring for
+    why this is no longer a trust-the-header parse). Returns ``None`` (no
+    DB lookup performed) when the header is absent."""
+    organization_id = _parse_uuid_header(request, _ORG_HEADER)
+    if organization_id is None:
+        return None
+
+    organization_repo = GenericRepository(Organization, db)
+    organization = await organization_repo.get_by_id(organization_id)
+    if organization is None:
+        raise OrganizationNotFoundError(organization_id)
+
+    member_repo = GenericRepository(OrganizationMember, db)
+    active_memberships = await member_repo.get_all(
+        filters={
+            "organization_id": organization_id,
+            "user_id": uuid.UUID(user.id),
+            "status": MembershipStatus.ACTIVE.value,
+        },
+        limit=1,
+    )
+    if not active_memberships:
+        raise OrganizationMembershipRequiredError(organization_id)
+
+    return organization_id
 
 
 async def CurrentLocation(request: Request) -> uuid.UUID | None:

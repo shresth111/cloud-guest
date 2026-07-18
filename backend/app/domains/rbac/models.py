@@ -6,12 +6,18 @@ timestamp / soft-delete / audit / version mixin stack -- see
 Alembic autogenerate, the generic repository, and cross-domain FKs all work
 uniformly. No model here has a documented reason to diverge from that.
 
-Scope columns (``organization_id``, ``location_id``, ``router_id``, and the
-future ``msp_id``) are plain nullable ``UUID`` columns *without* a SQL
-``ForeignKey`` constraint, because the Organization/Location/Router (and
-future MSP) domains do not exist yet in this codebase (see the module scope
-boundary). A real FK constraint (with ``ondelete`` behavior) will be added
-in a follow-up migration once those domains land.
+Scope columns: ``organization_id`` now carries a real ``ForeignKey`` to
+``organizations.id`` (added in migration ``0004``, once
+``app.domains.organization`` landed -- Module 005) on every model that has
+one (``Role``, ``UserRole``, ``OrganizationRole``, ``PermissionOverride``,
+``AuditLogEntry``). ``location_id``, ``router_id``, and the future
+``msp_id`` remain plain nullable ``UUID`` columns *without* a SQL
+``ForeignKey`` constraint, because the Location/Router (and future MSP)
+domains still do not exist yet in this codebase (see the module scope
+boundary). Real FK constraints for those get added in a follow-up migration
+once those domains land, the same way ``organization_id`` just was.
+``PermissionScope`` carries no scope columns at all (only
+``permission_id``/``scope_type``) and is unaffected.
 
 Design decisions worth calling out (see ``docs/rbac/RBAC_ARCHITECTURE.md``
 for the full write-up):
@@ -159,10 +165,12 @@ class Role(BaseModel):
 
     scope_type: Mapped[str] = mapped_column(String(20), nullable=False)
 
-    # Nullable, FK-less: the Organization domain does not exist yet (see
-    # module scope boundary). Populated for org-scoped custom roles.
+    # Populated for org-scoped custom roles; NULL for global roles. See
+    # module docstring for the FK follow-up added in migration 0004.
     organization_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     parent_role_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -276,10 +284,12 @@ class UserRole(BaseModel):
     )
 
     scope_type: Mapped[str] = mapped_column(String(20), nullable=False)
-    # FK-less scope columns -- see module docstring.
+    # msp_id/location_id/router_id remain FK-less -- see module docstring.
     msp_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     organization_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
     )
     location_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
@@ -343,7 +353,9 @@ class PermissionOverride(BaseModel):
 
     scope_type: Mapped[str] = mapped_column(String(20), nullable=False)
     organization_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
     )
     location_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
@@ -397,7 +409,9 @@ class OrganizationRole(BaseModel):
     __tablename__ = "organization_roles"
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
     )
     role_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("roles.id", ondelete="CASCADE"), nullable=False
@@ -483,7 +497,9 @@ class AuditLogEntry(BaseModel):
         "metadata", JSONB, default=dict, nullable=False
     )
     organization_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
     )
     location_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True

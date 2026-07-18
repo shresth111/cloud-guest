@@ -9,6 +9,7 @@ from app.database.base import Base
 # Import domain models so their tables are registered on Base.metadata
 # before autogenerate compares it against the database.
 from app.domains.auth import models as auth_models  # noqa: F401
+from app.domains.organization import models as organization_models  # noqa: F401
 from app.domains.rbac import models as rbac_models  # noqa: F401
 
 config = context.config
