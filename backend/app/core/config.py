@@ -98,6 +98,22 @@ class Settings(BaseSettings):
             "remains valid before a device must have it regenerated."
         ),
     )
+    wireguard_handshake_stale_after_minutes: int = Field(
+        default=5,
+        ge=1,
+        le=1440,
+        description=(
+            "How long since a WireGuard peer's last device-reported "
+            "handshake (app.domains.wireguard) before its computed "
+            "health status flips from 'healthy' to 'stale'. There is no "
+            "live 'wg show' integration in this sandbox -- this is a "
+            "DB-tracked, device-reported signal, the same honest interim "
+            "posture app.domains.router.models.Router.health_status "
+            "already documents. Five minutes is roughly double WireGuard's "
+            "own ~2-minute keepalive/handshake-renegotiation cadence, so a "
+            "single missed report does not immediately read as unhealthy."
+        ),
+    )
 
     @property
     def log_path(self) -> Path:

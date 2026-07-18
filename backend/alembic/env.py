@@ -17,6 +17,7 @@ from app.domains.router_agent import models as router_agent_models  # noqa: F401
 from app.domains.router_provisioning import (
     models as router_provisioning_models,  # noqa: F401,E501
 )
+from app.domains.wireguard import models as wireguard_models  # noqa: F401
 
 config = context.config
 

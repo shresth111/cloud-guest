@@ -9,6 +9,7 @@ from app.domains.router.router import router as router_router
 from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.user.router import router as user_router
+from app.domains.wireguard.router import router as wireguard_router
 
 api_v1_router = APIRouter()
 api_v1_router.include_router(health_router, prefix="/health", tags=["Health"])
@@ -20,3 +21,4 @@ api_v1_router.include_router(user_router)
 api_v1_router.include_router(router_router)
 api_v1_router.include_router(router_provisioning_router)
 api_v1_router.include_router(router_agent_router)
+api_v1_router.include_router(wireguard_router)

@@ -351,3 +351,60 @@ records genuinely new facts (agent software version, capabilities, license
 state) on this module's own `RouterAgentCredential` row, never a duplicate
 of any existing field.
 
+## WireGuard Endpoints (Module 009 Part 3)
+
+Cloud-managed WireGuard tunnels between the platform's hub and each
+router-peer, so the platform can always reach a router's management
+interface even when it sits behind carrier-grade NAT with no public IP.
+The platform generates both sides' keypairs (the hub's and each
+router-peer's) -- see `backend/docs/wireguard/README.md`,
+`backend/docs/wireguard/FLOW.md`, and `backend/docs/wireguard/DATABASE.md`
+for the full design.
+
+Admin-facing endpoints use the standard `ApiResponse` envelope and are
+gated by RBAC's `RequirePermission` against the already-seeded
+`wireguard.*` permission keys:
+
+```text
+GET    /api/v1/routers/{router_id}/wireguard-peer          wireguard.read
+POST   /api/v1/routers/{router_id}/wireguard-peer          wireguard.create
+DELETE /api/v1/routers/{router_id}/wireguard-peer          wireguard.delete
+POST   /api/v1/routers/{router_id}/wireguard-peer/rotate   wireguard.execute
+```
+
+`GET` returns the peer's current status, tunnel IP, and a computed
+`health_status` (`healthy`/`stale`/`unknown`/`revoked`, derived from
+`last_handshake_at` against `Settings.wireguard_handshake_stale_after_minutes`
+-- a DB-tracked, device-reported signal, not a live `wg show` integration).
+`POST` creates a fresh tunnel (rejecting the call if the router already has
+one -- revoke it first) and returns the peer's own private key once, for
+manual configuration, alongside the hub's public connection details.
+`DELETE` revokes the tunnel (its IP becomes available for reuse). `POST
+.../rotate` generates a new keypair for the same peer, keeping its existing
+tunnel IP unchanged (see `FLOW.md` §6 for why tunnel rotation and key
+rotation are the same operation here).
+
+Device-facing endpoints are authenticated by
+`app.domains.router_agent`'s own `CurrentAgent` dependency (the
+`X-Agent-Credential` header) -- reused as-is, not reimplemented -- and,
+mirroring that module's own device-facing endpoints, do not use the
+`ApiResponse` envelope:
+
+```text
+GET  /api/v1/agent/wireguard-config
+POST /api/v1/agent/wireguard-config/handshake
+```
+
+`GET /agent/wireguard-config` returns the device's own (decrypted) private
+key plus the hub's public key/endpoint/tunnel CIDR needed to configure a
+local WireGuard interface -- unlike a one-time provisioning token, this is
+repeatable: the device may re-pull it any number of times, since the
+platform is its permanent custodian (see `FLOW.md` §9). The hub's private
+key is never included in any device-facing response.
+`POST /agent/wireguard-config/handshake` is an additive endpoint (beyond
+this module's literal five admin/device endpoints) recording a device
+-reported handshake, updating `last_handshake_at` for the health-status
+computation above -- see `FLOW.md` §8 for why this is a small, dedicated
+endpoint rather than composing through `router_agent`'s own
+`POST /agent/status`.
+

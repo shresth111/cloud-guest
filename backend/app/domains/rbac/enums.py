@@ -208,3 +208,16 @@ class AuditAction(StrEnum):
     ROUTER_CONFIG_VERSION_ROLLED_BACK = "router_config_version_rolled_back"
     ROUTER_BACKUP_CREATED = "router_backup_created"
     ROUTER_RESTORE_COMPLETED = "router_restore_completed"
+
+    # WireGuard domain events (Module 009 Part 3) -- written through this
+    # same table by ``app.domains.wireguard.service.WireGuardService`` via
+    # the same narrow ``AuditLogWriter`` protocol shape ``RouterService``/
+    # ``RouterProvisioningService``/every other domain's own service uses
+    # (see ``AuditLogEntry``'s "other domains could plausibly reuse it"
+    # design). Handshake reports are deliberately **not** audited here --
+    # they are frequent device telemetry, not an admin-driven event, the
+    # identical reasoning BE-008 already documents for why heartbeats are
+    # never audited either.
+    WIREGUARD_TUNNEL_CREATED = "wireguard_tunnel_created"
+    WIREGUARD_TUNNEL_ROTATED = "wireguard_tunnel_rotated"
+    WIREGUARD_TUNNEL_REVOKED = "wireguard_tunnel_revoked"
