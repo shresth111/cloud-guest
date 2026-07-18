@@ -1,8 +1,14 @@
 """Monitoring business logic: the Health Engine (real checks against every
-genuine platform dependency this codebase has, an honest ``UNKNOWN`` for the
-two pieces of infrastructure it doesn't have yet) and the Event Engine (a
+genuine platform dependency this codebase has) and the Event Engine (a
 narrowly-scoped new event table plus a read-side aggregation across it and
 two other domains' existing event tables).
+
+As of BE-012 Part 1, every component check is real -- Celery
+(``check_celery_health``) and WebSocket (``check_websocket_health``) started
+as honest ``UNKNOWN``s in BE-011 Part 1 for infrastructure that didn't exist
+yet, and both have since been updated in place (Celery once BE-012 Part 1
+gave this codebase a genuine deployment; WebSocket once BE-011 Part 3 added
+real WS routes) rather than left permanently stale.
 
 ## Design decisions worth calling out up front
 
@@ -15,10 +21,14 @@ real (if narrow) call through the real ``AuthRepository``. ``check_api_health``
 is close to tautological (see its own docstring) but still a real,
 meaningful signal in the aggregate dashboard: if this code is executing at
 all, the FastAPI process handling the request is, definitionally, up.
-``check_celery_health``/``check_websocket_health`` never fabricate a
-``HEALTHY`` for infrastructure that does not exist in this codebase (no
-Celery worker/broker anywhere, no WebSocket support anywhere) -- they return
-``HealthStatus.UNKNOWN`` with a clear, honest explanation instead.
+``check_celery_health`` performs a real Celery broker/worker ping
+(``app.core.celery_app.ping_celery_workers``) and reports HEALTHY/DEGRADED/
+UNHEALTHY based on what actually responds; ``check_websocket_health``
+reports HEALTHY since real WS routes exist on this process, with the
+tautological-but-meaningful caveat documented on its own docstring (no
+connection registry exists to report a live count). Neither ever fabricates
+a status for infrastructure that doesn't exist -- see each method's own
+docstring for exactly what it can and can't observe.
 ``check_freeradius_health``/``check_wireguard_health`` are documented,
 DB-tracked *proxy* signals (composing with ``app.domains.guest``'s
 ``RadiusNasClient``/``GuestSession`` rows and ``app.domains.wireguard``'s
@@ -51,6 +61,7 @@ aggregation across that table plus RBAC's ``audit_log_entries`` and
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
@@ -65,6 +76,7 @@ from typing import Protocol
 import httpx
 from redis.asyncio import Redis
 
+from app.core.celery_app import CELERY_HEALTH_CHECK_TIMEOUT_SECONDS, ping_celery_workers
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.database.utils.pagination import PaginationMeta
@@ -549,40 +561,94 @@ class MonitoringService:
             )
 
     async def check_celery_health(self) -> HealthCheckResult:
-        """No Celery deployment (worker/broker) exists anywhere in this
-        codebase yet -- there is no background task queue at all. This
-        returns an honest ``UNKNOWN``, never a fabricated ``HEALTHY``: the
-        health-check *type* is fully defined and wired into every
-        dashboard/history endpoint now, ready to report real state the
-        moment a real Celery deployment exists."""
+        """A REAL check, now that BE-012 Part 1 (``app.core.celery_app``)
+        gives this codebase a genuine Celery deployment -- no longer the
+        honest ``UNKNOWN`` BE-011 Part 1 left here ("ready to wire in once
+        one does"). Uses Celery's own inspection API
+        (``control.inspect().ping()``, via ``app.core.celery_app
+        .ping_celery_workers`` -- a real, if blocking, network round trip
+        against the configured broker, so it is run off the event loop via
+        ``asyncio.to_thread``) bounded by
+        ``CELERY_HEALTH_CHECK_TIMEOUT_SECONDS``.
+
+        Exactly three outcomes, each a real signal, never a fabricated
+        ``HEALTHY``:
+
+        * The broker itself could not be reached at all (connection
+          refused/timed out -- e.g. in this sandbox, where no actual Redis
+          broker or worker process is running during tests) ->
+          ``HealthStatus.UNHEALTHY``. The most severe of the three: the
+          task queue's own transport is unreachable, not merely idle.
+        * The broker was reached but zero workers replied within the
+          timeout (a broker is deployed and reachable, but no
+          ``celery worker`` process is currently up -- e.g. between
+          deployments, or a worker pool scaled to zero) ->
+          ``HealthStatus.DEGRADED``. Background aggregation is stale/paused,
+          but this is not a full platform outage -- guest login, RBAC, and
+          every synchronous request/response path are entirely unaffected
+          by a missing worker.
+        * At least one worker replied -> ``HealthStatus.HEALTHY``, with the
+          responding worker name(s) recorded in ``details``.
+        """
+        started = time.perf_counter()
+        try:
+            pong = await asyncio.to_thread(
+                ping_celery_workers, CELERY_HEALTH_CHECK_TIMEOUT_SECONDS
+            )
+        except Exception as exc:  # noqa: BLE001 -- broker unreachable is a real signal
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            return HealthCheckResult(
+                component=HealthComponent.CELERY,
+                status=HealthStatus.UNHEALTHY,
+                response_time_ms=round(elapsed_ms, 3),
+                details=None,
+                error_message=f"Celery broker is unreachable: {exc}",
+            )
+
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if not pong:
+            return HealthCheckResult(
+                component=HealthComponent.CELERY,
+                status=HealthStatus.DEGRADED,
+                response_time_ms=round(elapsed_ms, 3),
+                details={"workers_responding": 0},
+                error_message=(
+                    "Celery broker is reachable but no worker responded to "
+                    "ping within the configured timeout"
+                ),
+            )
         return HealthCheckResult(
             component=HealthComponent.CELERY,
-            status=HealthStatus.UNKNOWN,
-            response_time_ms=None,
+            status=HealthStatus.HEALTHY,
+            response_time_ms=round(elapsed_ms, 3),
             details={
-                "reason": "no Celery worker/broker is deployed in this environment"
+                "workers_responding": len(pong),
+                "workers": sorted(pong.keys()),
             },
-            error_message=(
-                "No Celery deployment exists in this environment yet; this "
-                "health-check type is defined and ready to wire in once one "
-                "does."
-            ),
+            error_message=None,
         )
 
     async def check_websocket_health(self) -> HealthCheckResult:
-        """No WebSocket support exists anywhere in this codebase yet. This
-        returns an honest ``UNKNOWN``, never a fabricated ``HEALTHY`` --
-        see ``check_celery_health``'s identical reasoning."""
+        """Real, if narrow: BE-011 Part 3 added genuine WebSocket endpoints
+        (``WS /monitoring/ws/dashboard``, ``WS /monitoring/ws/sessions``),
+        so this is no longer the honest ``UNKNOWN`` BE-011 Part 1 left here.
+        No connection registry exists to report a live connection count
+        (unlike Celery, WebSocket support is part of this same running
+        FastAPI process, not a separate broker/worker to ping) -- this is
+        HEALTHY in the same close-to-tautological-but-still-meaningful
+        sense as ``check_api_health``: if this code is executing, the
+        process serving those routes is up."""
         return HealthCheckResult(
             component=HealthComponent.WEBSOCKET,
-            status=HealthStatus.UNKNOWN,
+            status=HealthStatus.HEALTHY,
             response_time_ms=None,
-            details={"reason": "no WebSocket endpoint exists in this FastAPI app yet"},
-            error_message=(
-                "No WebSocket support exists in this environment yet; this "
-                "health-check type is defined and ready to wire in once one "
-                "does."
-            ),
+            details={
+                "reason": (
+                    "WebSocket routes are registered on this process; no "
+                    "live connection count is tracked"
+                )
+            },
+            error_message=None,
         )
 
     async def check_freeradius_health(self) -> HealthCheckResult:

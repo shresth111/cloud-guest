@@ -952,3 +952,53 @@ exporting spans to the console by default or to a real OTLP collector once
 `Settings.otel_exporter_otlp_endpoint` is configured -- it has no HTTP
 endpoint of its own to document here.
 
+## Analytics Endpoints (Module 012 Part 1: Analytics Core Infrastructure)
+
+See `docs/analytics/README.md`/`FLOW.md`/`DATABASE.md` for the full
+architecture write-up (the real Celery + Beat deployment, the
+async-in-a-sync-worker bridge, the Redis-vs-new-table cache decision, and
+exactly what changed in `check_celery_health`). A deliberately minimal HTTP
+surface for this infra-focused part -- full dashboard/per-domain-analytics/
+forecasting/reporting endpoints are later BE-012 parts' job.
+
+### `GET /analytics/snapshots`
+
+Requires `analytics.read`. Query params: `location_id`, `snapshot_type`
+(`org_daily_summary` / `location_daily_summary` / `platform_daily_summary`),
+`start_date`/`end_date`, `page`/`page_size`. `organization_id` is **not** a
+raw query parameter -- it is resolved via RBAC's `CurrentOrganization`
+dependency off the `X-Organization-Id` header (tenant-validated: the
+caller must hold active membership in that organization, or omit the
+header entirely for a `GLOBAL`-scoped platform-wide query -- see
+`docs/analytics/FLOW.md` §12). Returns a paginated list of
+`AnalyticsSnapshot` rows (`organization_id`, `location_id`, `snapshot_type`,
+`period_start`/`period_end`, `granularity`, `metrics` (the computed numbers
+-- shape documented per `snapshot_type` in `docs/analytics/DATABASE.md`),
+`computed_at`, `computation_duration_ms`).
+
+### `POST /analytics/snapshots/trigger`
+
+Requires `reports.manage` (see `docs/analytics/FLOW.md` §11 for why this
+endpoint reuses `reports.manage` rather than a nonexistent
+`analytics.manage`). Body: `organization_id` (required), `target_date_iso`
+(optional `YYYY-MM-DD` to backfill a specific past day; omitted means
+today's still-partial window). Synchronously (in the same request/response
+cycle, not via Celery) computes and persists that organization's
+`ORG_DAILY_SUMMARY` snapshot plus one `LOCATION_DAILY_SUMMARY` snapshot per
+active location, returning every snapshot just created. 404s
+(`AnalyticsOrganizationNotFoundError`) if `organization_id` does not
+correspond to a real, non-deleted organization.
+
+### Beat-scheduled background aggregation (no HTTP surface)
+
+`app.core.celery_app`'s Beat schedule runs
+`app.domains.analytics.tasks.run_daily_aggregation_for_all_organizations`
+every 15 minutes (a rolling "today so far" snapshot for every active
+organization/location/the platform) and once daily at 00:10 UTC (a final
+"yesterday, in full" snapshot) -- see `docs/analytics/FLOW.md` §4. This has
+no HTTP endpoint of its own; it requires a real `celery worker`
++ `celery beat` process running against the same `Settings.redis_url`
+broker (see `docs/analytics/README.md`'s "Running a Worker + Beat Locally"
+section) -- neither is started by `app.main.create_app()` or by the test
+suite.
+

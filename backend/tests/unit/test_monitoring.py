@@ -1,7 +1,10 @@
 """Unit tests for the Monitoring domain (BE-011 Part 1: Health Engine +
 Event Engine): each real health check's success and simulated-failure
-paths, the Celery/WebSocket honest-``UNKNOWN``-not-fabricated behavior, the
-FreeRADIUS/WireGuard proxy-signal checks, ``ServiceHealth`` rollup +
+paths, the now-real WebSocket health check (BE-011 Part 3 added real WS
+routes, so this is HEALTHY, not the honest ``UNKNOWN`` it started as), the
+now-real Celery health check's three outcomes (BE-012 Part 1 -- see
+``app.domains.monitoring.service.check_celery_health``'s updated docstring),
+the FreeRADIUS/WireGuard proxy-signal checks, ``ServiceHealth`` rollup +
 consecutive-failure tracking, dashboard aggregate-status logic, the event
 timeline's cross-source aggregation/sorting/filtering, and heartbeat
 recording.
@@ -12,6 +15,21 @@ directly. ``MonitoringService`` is exercised against a small, hand-rolled
 in-memory fake repository and fakes for every composed cross-domain
 dependency (auth repository, Redis client, WireGuard service) -- there is
 no live Postgres/Redis in this environment.
+
+``check_celery_health`` now performs a real ``celery_app.control.inspect()
+.ping()`` round trip (via ``app.core.celery_app.ping_celery_workers``) --
+since ``MonitoringService.__init__`` takes no Celery-related constructor
+parameter (BE-012 Part 1's directory rule scoped that edit narrowly to
+``check_celery_health``'s own method body only), this suite makes it
+testable the same way ``app.core.celery_app.ping_celery_workers`` was itself
+designed to be: an autouse fixture below monkeypatches that module-level
+function (looked up, at call time, in ``app.domains.monitoring.service``'s
+own namespace -- the standard "patch where it's used" pattern) so every
+test in this file defaults to "a worker is reachable and responds" (a
+healthy ping), keeping every pre-existing dashboard/aggregate-status
+assertion in this file unaffected by Celery's now-real check. The dedicated
+``test_check_celery_health_*`` tests below override that default explicitly
+to exercise the ``HEALTHY``/``DEGRADED``/``UNHEALTHY`` paths in isolation.
 """
 
 from __future__ import annotations
@@ -23,6 +41,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.core.config import Settings
+from app.domains.monitoring import service as monitoring_service_module
 from app.domains.monitoring.constants import (
     EVENT_TYPE_COMPONENT_DEGRADED,
     EVENT_TYPE_COMPONENT_RECOVERED,
@@ -219,6 +238,20 @@ class FakeWireGuardService:
 
 def _settings(*, log_dir) -> Settings:
     return Settings(log_dir=log_dir)
+
+
+@pytest.fixture(autouse=True)
+def _celery_worker_reachable_by_default(monkeypatch):
+    """See module docstring's Celery write-up: defaults every test in this
+    file to "a Celery worker is reachable and responds" so
+    ``check_celery_health``'s now-real network call never affects any
+    pre-existing dashboard/aggregate-status assertion. Overridden explicitly
+    by the ``test_check_celery_health_*`` tests below."""
+    monkeypatch.setattr(
+        monitoring_service_module,
+        "ping_celery_workers",
+        lambda timeout=None: {"worker1@test": {"ok": "pong"}},
+    )
 
 
 _UNSET = object()
@@ -427,24 +460,66 @@ async def test_check_storage_health_smoke(tmp_path):
 
 
 # ============================================================================
-# Celery / WebSocket -- honest UNKNOWN, never fabricated HEALTHY
+# Celery (BE-012 Part 1: a real check, three outcomes) / WebSocket (still
+# honest UNKNOWN, never fabricated HEALTHY)
 # ============================================================================
 
 
-async def test_check_celery_health_is_unknown_not_healthy():
+async def test_check_celery_health_is_healthy_when_a_worker_responds(monkeypatch):
+    """The autouse fixture already wires this default in, but this test
+    asserts it explicitly and checks the response details/timing shape."""
+    monkeypatch.setattr(
+        monitoring_service_module,
+        "ping_celery_workers",
+        lambda timeout=None: {"worker1@test": {"ok": "pong"}},
+    )
     service, _ = _make_service()
     result = await service.check_celery_health()
-    assert result.status == HealthStatus.UNKNOWN
+    assert result.status == HealthStatus.HEALTHY
+    assert result.error_message is None
+    assert result.details["workers_responding"] == 1
+    assert result.details["workers"] == ["worker1@test"]
+    assert result.response_time_ms is not None
+
+
+async def test_check_celery_health_is_degraded_when_no_worker_responds(monkeypatch):
+    """Broker reachable, zero workers replied within the timeout --
+    DEGRADED, not UNHEALTHY: background aggregation is stale, but this is
+    not a full platform outage (see the method's own docstring)."""
+    monkeypatch.setattr(
+        monitoring_service_module, "ping_celery_workers", lambda timeout=None: None
+    )
+    service, _ = _make_service()
+    result = await service.check_celery_health()
+    assert result.status == HealthStatus.DEGRADED
     assert result.status != HealthStatus.HEALTHY
-    assert "No Celery deployment exists" in (result.error_message or "")
+    assert "no worker responded" in (result.error_message or "").lower()
 
 
-async def test_check_websocket_health_is_unknown_not_healthy():
+async def test_check_celery_health_is_unhealthy_when_broker_unreachable(monkeypatch):
+    """No broker/worker at all reachable (e.g. this sandbox, with no real
+    Redis/Celery deployment running) -- UNHEALTHY, the most severe of the
+    three outcomes, never a fabricated HEALTHY."""
+
+    def _raise(timeout=None):
+        raise ConnectionError("Connection refused")
+
+    monkeypatch.setattr(monitoring_service_module, "ping_celery_workers", _raise)
+    service, _ = _make_service()
+    result = await service.check_celery_health()
+    assert result.status == HealthStatus.UNHEALTHY
+    assert result.status != HealthStatus.HEALTHY
+    assert "unreachable" in (result.error_message or "").lower()
+
+
+async def test_check_websocket_health_is_healthy_now_that_routes_exist():
+    """BE-011 Part 3 added real WS routes; this is no longer the honest
+    UNKNOWN BE-011 Part 1 left here (see check_websocket_health's own
+    docstring for the full reasoning)."""
     service, _ = _make_service()
     result = await service.check_websocket_health()
-    assert result.status == HealthStatus.UNKNOWN
-    assert result.status != HealthStatus.HEALTHY
-    assert "No WebSocket support exists" in (result.error_message or "")
+    assert result.status == HealthStatus.HEALTHY
+    assert result.error_message is None
 
 
 # ============================================================================
@@ -636,9 +711,15 @@ async def test_dashboard_summary_never_run_is_unknown():
 
 
 async def test_dashboard_summary_all_healthy_excludes_permanently_unknown():
-    """Celery/WebSocket are honestly UNKNOWN forever in this environment --
-    the aggregate must still be able to report HEALTHY when every *other*
-    component is healthy (see service.py's module docstring)."""
+    """FreeRADIUS/WireGuard are UNKNOWN here (no NAS clients/peers
+    registered on this fake repository) -- the aggregate must still be able
+    to report HEALTHY when every *other* component is healthy (see
+    service.py's module docstring). Celery is HEALTHY thanks to this file's
+    autouse "worker reachable" default (see module docstring) -- it is no
+    longer permanently UNKNOWN now that BE-012 Part 1 gives it a real
+    check. WebSocket is HEALTHY too, now that BE-011 Part 3 added real WS
+    routes -- it was never actually "permanently UNKNOWN", just stale
+    until this fixed it."""
     repo = FakeMonitoringRepository(active_nas_count=0)
     service, _ = _make_service(repository=repo)
     await service.run_all_health_checks()
