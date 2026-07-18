@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+.vite/
+bun.lock
+
+# Build outputs
+dist/
+build/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDEs and OS
+.DS_Store
+.vscode/
+.idea/
+
+# Backend patterns
+backend/__pycache__/
+backend/*.py[cod]
+backend/.pytest_cache/
+backend/.ruff_cache/
+backend/.mypy_cache/
+backend/.env
+backend/.venv/
+backend/venv/
+backend/htmlcov/
+backend/.coverage
+backend/dist/
+backend/build/
+backend/*.egg-info/
+backend/logs/

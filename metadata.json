@@ -1,0 +1,8 @@
+{
+  "name": "CloudGuest",
+  "description": "Commercial SaaS backend and administration interface for a cloud-managed MikroTik Network Operating System.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
