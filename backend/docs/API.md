@@ -450,3 +450,76 @@ additive, admin-facing endpoint gated by RBAC's already-seeded `otp.read`
 permission, giving platform support/audit visibility into a captive
 portal's OTP traffic without exposing any code value.
 
+## Voucher Endpoints (Module 010 Part 2)
+
+Pre-generated, printable access codes an admin/location-manager hands out
+to guests, who redeem them at the captive portal for guest WiFi access --
+no username/password, no OTP round-trip. Self-contained like OTP: no
+`Guest` model exists yet (a later module in this same BE-010 sequence). See
+`backend/docs/voucher/README.md`, `backend/docs/voucher/FLOW.md`, and
+`backend/docs/voucher/DATABASE.md` for the full design.
+
+Admin-facing endpoints use the standard `ApiResponse` envelope (except
+`GET .../export`, see below) and are gated by RBAC's already-seeded
+`voucher.*` permission keys:
+
+```text
+POST /api/v1/voucher-batches                    voucher.create
+GET  /api/v1/voucher-batches                    voucher.read
+GET  /api/v1/voucher-batches/{id}                voucher.read
+POST /api/v1/voucher-batches/{id}/approve        voucher.approve
+POST /api/v1/voucher-batches/{id}/revoke         voucher.update
+GET  /api/v1/voucher-batches/{id}/vouchers       voucher.read
+GET  /api/v1/voucher-batches/{id}/export         voucher.export
+GET  /api/v1/voucher-batches/{id}/stats          voucher.read
+POST /api/v1/vouchers/import                     voucher.import
+```
+
+A batch starts `DRAFT`, is auto-submitted to `PENDING_APPROVAL` in the same
+`POST /voucher-batches` call, and -- unless the creator holds
+`voucher.manage` (in which case the batch is auto-approved-and-activated,
+skipping the queue) -- awaits a `voucher.approve` holder's decision.
+`POST .../approve` performs both `-> APPROVED` and `APPROVED -> ACTIVE` in
+one call; this module has no separate activation endpoint (see `FLOW.md`
+§2). `POST .../revoke` (`voucher.update`, not `voucher.delete`/`.manage` --
+revoking is a lifecycle status change, not a destructive or platform-
+admin-only action) cascades to every non-terminal voucher in the batch.
+`GET .../export` deliberately returns raw `text/csv`, not
+`ApiResponse`-wrapped JSON -- a downloadable file a print vendor opens
+directly cannot usefully be JSON-wrapped (`FLOW.md` §8). `POST
+/vouchers/import` bulk-registers pre-printed codes from an external
+system/print vendor into an existing batch, with partial-success reporting
+(valid codes inserted, duplicates/invalid codes reported individually).
+
+Guest-facing endpoints carry no `RequirePermission`/`CurrentUser`
+dependency at all -- the caller is an unauthenticated guest at a captive
+portal, with no platform-user identity RBAC could ever grant a permission
+to (mirrors OTP's identical precedent; see `FLOW.md` §7). Abuse protection
+comes entirely from a Redis-backed, per-source (IP address) redemption
+rate limiter, distinct from OTP's own per-identifier request throttle.
+Both still use the standard `ApiResponse` envelope, since their real caller
+is the captive-portal frontend:
+
+```text
+POST /api/v1/vouchers/validate
+POST /api/v1/vouchers/redeem
+```
+
+`POST /vouchers/validate` is a read-only check (never mutates a voucher's
+state) returning whether a code is currently redeemable, its remaining
+uses, and its post-redemption expiry if already set. `POST
+/vouchers/redeem` performs the actual redemption: the first redemption sets
+the voucher's own `expires_at` (`redeemed_at + validity_minutes` -- computed
+at first use, not at generation time, since `validity_minutes` is a
+post-redemption duration, see `FLOW.md` §4) and transitions
+`UNUSED -> ACTIVE` (or straight to `EXHAUSTED` for a single-use voucher, the
+default); subsequent redemptions of a multi-use voucher just increment
+`use_count`/`last_used_at`. Voucher codes are stored in plaintext, never
+hashed (`Voucher.code`) -- unlike OTP codes/provisioning tokens, a voucher
+is a physical/verbally-communicated artifact the platform must be able to
+display/print/export (`FLOW.md` §1). Every successful redemption is written
+to RBAC's audit log (`AuditAction.VOUCHER_REDEEMED`) -- a deliberate
+departure from OTP's own "don't audit the routine event" call, since a
+voucher redemption is itself the moment real network access is granted
+(`FLOW.md` §9).
+

@@ -238,3 +238,31 @@ class AuditAction(StrEnum):
     OTP_REQUESTED = "otp_requested"
     OTP_VERIFIED = "otp_verified"
     OTP_VERIFICATION_FAILED = "otp_verification_failed"
+
+    # Voucher domain events (Module 010 Part 2) -- written through this same
+    # table by ``app.domains.voucher.service.VoucherService`` via the same
+    # narrow ``AuditLogWriter`` protocol shape every other domain's service
+    # uses (see ``AuditLogEntry``'s "other domains could plausibly reuse it"
+    # design). Batch lifecycle events (created/submitted/approved/activated/
+    # revoked) and pre-printed code imports are audited for the same reason
+    # every other domain's own lifecycle events are (moderate-volume,
+    # human-attributable, admin-reviewable). ``VOUCHER_REDEEMED`` is audited
+    # on **every** successful redemption -- a deliberate departure from
+    # OTP's own "don't audit the high-volume routine event" call, since a
+    # voucher redemption (unlike an OTP *request*) is itself the moment real
+    # network access is granted, standing in for a real monetary/access
+    # transaction. ``VOUCHER_REDEMPTION_FAILED`` mirrors
+    # ``OTP_VERIFICATION_FAILED``'s own tiering: only written for the two
+    # adversarially-relevant reasons (attempted reuse of a ``revoked``/
+    # ``exhausted`` voucher), never for routine not-found/expired/
+    # not-yet-active churn -- see
+    # ``app.domains.voucher.service``'s module docstring for the full
+    # audit-volume judgment call.
+    VOUCHER_BATCH_CREATED = "voucher_batch_created"
+    VOUCHER_BATCH_SUBMITTED = "voucher_batch_submitted"
+    VOUCHER_BATCH_APPROVED = "voucher_batch_approved"
+    VOUCHER_BATCH_ACTIVATED = "voucher_batch_activated"
+    VOUCHER_BATCH_REVOKED = "voucher_batch_revoked"
+    VOUCHER_CODES_IMPORTED = "voucher_codes_imported"
+    VOUCHER_REDEEMED = "voucher_redeemed"
+    VOUCHER_REDEMPTION_FAILED = "voucher_redemption_failed"
