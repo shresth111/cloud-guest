@@ -223,3 +223,76 @@ pending a real secrets-manager/KMS integration, documented in
 `ROUTER_ARCHITECTURE.md` §3; no response ever returns the ciphertext or a
 decrypted secret, only a `has_api_credentials` boolean flag.
 
+## Router Provisioning Endpoints (Module 009 Part 1)
+
+Configuration templates/variables/profiles/versions, a durable provisioning
+queue, device-initiated enrollment + admin approval, backup/restore,
+factory reset, router secret rotation, and health/event history -- extends
+Module 008's router registration/zero-touch-provisioning/heartbeat flows
+without duplicating any of them. See
+`backend/docs/router_provisioning/README.md`,
+`backend/docs/router_provisioning/FLOW.md`, and
+`backend/docs/router_provisioning/DATABASE.md` for the full design.
+
+```text
+GET    /api/v1/router-templates
+POST   /api/v1/router-templates
+GET    /api/v1/router-templates/{template_id}
+PUT    /api/v1/router-templates/{template_id}
+DELETE /api/v1/router-templates/{template_id}
+
+GET    /api/v1/router-templates/variables
+POST   /api/v1/router-templates/variables
+PUT    /api/v1/router-templates/variables/{variable_id}
+DELETE /api/v1/router-templates/variables/{variable_id}
+
+POST   /api/v1/routers/{router_id}/config-profile
+
+GET    /api/v1/routers/{router_id}/config-versions
+GET    /api/v1/routers/{router_id}/config-versions/{version_id}
+GET    /api/v1/routers/{router_id}/config-versions/{version_id}/diff/{other_version_id}
+POST   /api/v1/routers/{router_id}/config-versions/{version_id}/rollback
+POST   /api/v1/routers/{router_id}/config-versions/{version_id}/apply
+
+POST   /api/v1/router-enrollment
+GET    /api/v1/router-enrollment
+POST   /api/v1/router-enrollment/{enrollment_id}/approve
+POST   /api/v1/router-enrollment/{enrollment_id}/reject
+
+GET    /api/v1/routers/{router_id}/provisioning-status
+POST   /api/v1/routers/{router_id}/backup
+POST   /api/v1/routers/{router_id}/restore/{backup_id}
+POST   /api/v1/routers/{router_id}/factory-reset
+POST   /api/v1/routers/{router_id}/rotate-secret
+
+POST   /api/v1/routers/{router_id}/health-snapshot
+GET    /api/v1/routers/{router_id}/health-history
+GET    /api/v1/routers/{router_id}/events
+```
+
+Every endpoint except `POST /router-enrollment` requires the appropriate
+`router_provisioning.*`/`templates.*` permission (see
+`app/domains/rbac/seed.py::MODULE_ACTIONS`) and enforces organization-tenant
+scoping via `requesting_organization_id` (`X-Organization-Id`), inherited
+almost entirely from BE-008's own `RouterService.get_router` tenant checks
+(composed through a narrow `RouterLookupProtocol`, never duplicated).
+`POST /router-enrollment` is device-facing and carries no
+`RequirePermission`/`CurrentUser` dependency at all -- mirroring BE-008's
+own `POST /routers/provisioning/check-in`, see `FLOW.md` §3 for the
+minimal-trust-boundary reasoning. `POST /routers/{id}/health-snapshot`
+supplements (never replaces) `POST /routers/{id}/heartbeat` -- it calls
+BE-008's own heartbeat method first, then additionally records a
+`RouterHealthSnapshot` history row (see `FLOW.md` §5). Config version
+diffs use Python's stdlib `difflib` (no new dependency). Router secret
+rotation generates a new credential and stores it via BE-008's existing
+`RouterService.update_router` (which itself calls
+`app.domains.router.crypto.encrypt_secret` internally) -- this module never
+touches encryption directly; the new plaintext secret is returned exactly
+once, mirroring `ProvisioningTokenResponse.token`'s "shown once" convention.
+`complete_provisioning_job` (the seam that realizes a queued job's
+real-world side effects -- a version becoming `applied`, a restore
+producing a new version, a factory reset resetting the router's BE-008
+status) is intentionally **not** exposed over HTTP: this module manages the
+workflow/queue side only, actually executing a job against a live device is
+`app.domains.router_agent`'s job (a future module).
+

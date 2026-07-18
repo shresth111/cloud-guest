@@ -183,3 +183,28 @@ class AuditAction(StrEnum):
     ROUTER_REINSTATED = "router_reinstated"
     ROUTER_PROVISIONING_TOKEN_GENERATED = "router_provisioning_token_generated"
     ROUTER_PROVISIONED = "router_provisioned"
+
+    # Router Provisioning domain events (Module 009) -- written through this
+    # same table by
+    # ``app.domains.router_provisioning.service.RouterProvisioningService``
+    # via the same narrow ``AuditLogWriter`` protocol shape ``RouterService``/
+    # ``LocationService``/``OrganizationService``/``UserService`` all use
+    # (see ``AuditLogEntry``'s "other domains could plausibly reuse it"
+    # design). ``ROUTER_FACTORY_RESET`` is used by BE-008's own
+    # ``RouterService.reset_to_pending_provisioning`` (an additive method
+    # Module 009 added to support its factory-reset workflow), not by
+    # Module 009's service directly -- see
+    # ``docs/router_provisioning/FLOW.md``. High-frequency device telemetry
+    # (health snapshots, individual queue-job status ticks) is deliberately
+    # **not** audited here -- see ``RouterEvent``'s module docstring in
+    # ``app.domains.router_provisioning.models`` for why that lives in its
+    # own, separate, higher-volume table instead.
+    ROUTER_ENROLLMENT_SUBMITTED = "router_enrollment_submitted"
+    ROUTER_ENROLLMENT_APPROVED = "router_enrollment_approved"
+    ROUTER_ENROLLMENT_REJECTED = "router_enrollment_rejected"
+    ROUTER_SECRET_ROTATED = "router_secret_rotated"
+    ROUTER_FACTORY_RESET = "router_factory_reset"
+    ROUTER_CONFIG_VERSION_APPLIED = "router_config_version_applied"
+    ROUTER_CONFIG_VERSION_ROLLED_BACK = "router_config_version_rolled_back"
+    ROUTER_BACKUP_CREATED = "router_backup_created"
+    ROUTER_RESTORE_COMPLETED = "router_restore_completed"

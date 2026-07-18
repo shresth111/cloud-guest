@@ -69,11 +69,31 @@ ROUTER_STATUS_TRANSITIONS: dict[RouterStatus, frozenset[RouterStatus]] = {
     RouterStatus.PROVISIONING: frozenset(
         {RouterStatus.ONLINE, RouterStatus.DECOMMISSIONED}
     ),
+    # ONLINE/OFFLINE -> PENDING_PROVISIONING is an additive edge added by
+    # Module 009 (app.domains.router_provisioning) for its factory-reset
+    # workflow: wiping a device's configuration genuinely puts it back into
+    # "needs zero-touch provisioning again" -- the same state a brand-new
+    # router record starts in -- and RouterService.generate_provisioning_token
+    # already only accepts PENDING_PROVISIONING routers, so this edge is what
+    # makes "factory reset, then re-provision with a fresh token" internally
+    # consistent. See RouterService.reset_to_pending_provisioning and
+    # docs/router_provisioning/FLOW.md for the full reasoning. No existing
+    # edge was removed or renamed.
     RouterStatus.ONLINE: frozenset(
-        {RouterStatus.OFFLINE, RouterStatus.SUSPENDED, RouterStatus.DECOMMISSIONED}
+        {
+            RouterStatus.OFFLINE,
+            RouterStatus.SUSPENDED,
+            RouterStatus.DECOMMISSIONED,
+            RouterStatus.PENDING_PROVISIONING,
+        }
     ),
     RouterStatus.OFFLINE: frozenset(
-        {RouterStatus.ONLINE, RouterStatus.SUSPENDED, RouterStatus.DECOMMISSIONED}
+        {
+            RouterStatus.ONLINE,
+            RouterStatus.SUSPENDED,
+            RouterStatus.DECOMMISSIONED,
+            RouterStatus.PENDING_PROVISIONING,
+        }
     ),
     RouterStatus.SUSPENDED: frozenset(
         {RouterStatus.OFFLINE, RouterStatus.DECOMMISSIONED}

@@ -368,6 +368,33 @@ class RouterService:
             action=AuditAction.ROUTER_REINSTATED,
         )
 
+    async def reset_to_pending_provisioning(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> Router:
+        """Transitions an ``ONLINE``/``OFFLINE`` router back to
+        ``PENDING_PROVISIONING`` -- added for Module 009
+        (``app.domains.router_provisioning``)'s factory-reset workflow: a
+        factory-reset device has had its configuration wiped and, in the
+        real world, must be zero-touch-provisioned again from scratch, the
+        same state a brand-new router record starts in. Eligibility
+        (``ONLINE``/``OFFLINE`` only) is enforced by the caller
+        (``RouterProvisioningService``, via
+        ``validators.validate_router_eligible_for_factory_reset``) before
+        this method is ever invoked; this method itself only consults the
+        transition graph (``ROUTER_STATUS_TRANSITIONS``), exactly like
+        every other status-changing method on this service."""
+        return await self._set_status(
+            actor_user_id=actor_user_id,
+            router_id=router_id,
+            requesting_organization_id=requesting_organization_id,
+            new_status=RouterStatus.PENDING_PROVISIONING,
+            action=AuditAction.ROUTER_FACTORY_RESET,
+        )
+
     async def heartbeat(
         self,
         *,
