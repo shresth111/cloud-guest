@@ -12,6 +12,7 @@ from app.domains.auth import models as auth_models  # noqa: F401
 from app.domains.captive_portal import models as captive_portal_models  # noqa: F401
 from app.domains.guest import models as guest_models  # noqa: F401
 from app.domains.location import models as location_models  # noqa: F401
+from app.domains.monitoring import models as monitoring_models  # noqa: F401
 from app.domains.organization import models as organization_models  # noqa: F401
 from app.domains.otp import models as otp_models  # noqa: F401
 from app.domains.rbac import models as rbac_models  # noqa: F401

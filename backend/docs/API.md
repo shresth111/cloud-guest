@@ -692,3 +692,52 @@ GET /api/v1/guest-analytics/voucher-usage      analytics.read
 own `GuestLoginHistory`/`GuestSession` tables -- no new method was added to
 `app.domains.otp`/`app.domains.voucher` (`FLOW.md` §11).
 
+## Monitoring Endpoints (Module 011 Part 1: Health Engine + Event Engine)
+
+Distinct from the liveness/readiness probes under "Health Endpoints" above
+(`/api/v1/health/live`, `/api/v1/health/ready`, unauthenticated, meant for
+an orchestrator's own probe) -- these are RBAC-gated, richer,
+persisted-history endpoints meant for an authenticated operator/dashboard.
+All use the standard `ApiResponse` envelope and are gated by RBAC's
+already-seeded `monitoring.*` permission keys, reused for events too (no
+dedicated "events" permission module exists -- see
+`docs/monitoring/FLOW.md` §6):
+
+```text
+GET  /api/v1/monitoring/health              monitoring.read    dashboard summary + per-component current status
+GET  /api/v1/monitoring/health/{component}  monitoring.read    one component's health-check history (paginated)
+POST /api/v1/monitoring/health/run          monitoring.manage  on-demand health-check run (admin-gated)
+GET  /api/v1/events                         monitoring.read    unified, cross-domain event timeline
+```
+
+`{component}` is one of `database`/`redis`/`api`/`auth`/`storage`/`celery`/
+`websocket`/`freeradius`/`wireguard` (`constants.HealthComponent`). The
+dashboard summary's `overall_status` is `unhealthy` if any component is
+`unhealthy`, `degraded` if any (remaining) component is `degraded`, and
+`healthy` only when every component with a *known* status is `healthy` --
+`celery`/`websocket` are honestly `unknown` forever in this environment (no
+such infrastructure exists yet) and are deliberately excluded from that
+"must all be healthy" rule so the aggregate stays a useful signal (see
+`docs/monitoring/FLOW.md` §8).
+
+`database`/`redis`/`auth`/`storage` are real checks (a real `SELECT 1`, a
+real `PING`, a real narrow `AuthRepository` call, a real
+`shutil.disk_usage` against the configured log directory); `api` is the
+process's own trivial-but-uniform liveness; `celery`/`websocket` are
+honest `unknown` placeholders (no such infrastructure exists in this
+codebase yet -- never a fabricated `healthy`); `freeradius`/`wireguard` are
+documented, DB-tracked proxy signals composing with
+`app.domains.guest`/`app.domains.wireguard`'s own existing data, not a live
+daemon ping (`docs/monitoring/FLOW.md` §4/§5).
+
+`GET /events` accepts optional `organization_id`, repeatable `category`
+(`constants.EventCategory` -- `system`/`security`/`network`/
+`authentication`/`provisioning`/`guest`/`audit`) and `severity`
+(`constants.EventSeverity` -- `info`/`warning`/`error`/`critical`) filters,
+an optional `start_date`/`end_date` range, and `limit` (default 100, max
+500). The returned timeline is a **read-side aggregation** across this
+module's own narrowly-scoped `platform_events` table plus RBAC's
+`audit_log_entries` and `router_provisioning`'s `router_events` (read
+directly, never copied) -- see `docs/monitoring/FLOW.md` §3 for the full
+composition-vs-new-storage decision.
+

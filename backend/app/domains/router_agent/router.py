@@ -29,6 +29,9 @@ import uuid
 
 from fastapi import APIRouter, Depends, status
 
+from app.domains.monitoring.constants import HeartbeatComponentType
+from app.domains.monitoring.dependencies import get_monitoring_service
+from app.domains.monitoring.service import MonitoringService
 from app.domains.router.enums import RouterStatus
 
 from .dependencies import AgentIdentity, CurrentAgent, get_router_agent_service
@@ -57,15 +60,37 @@ async def agent_heartbeat(
     payload: AgentHeartbeatRequest,
     identity: AgentIdentity = Depends(CurrentAgent),
     service: RouterAgentService = Depends(get_router_agent_service),
+    monitoring_service: MonitoringService = Depends(get_monitoring_service),
 ) -> AgentHeartbeatResponse:
     """Device-authenticated counterpart to BE-008's admin-testing
     ``POST /routers/{id}/heartbeat`` (which stays exactly as-is, gated by
     ``RequirePermission("routers.manage")``, for admin/manual use) --
-    composes with ``RouterService.heartbeat`` directly."""
+    composes with ``RouterService.heartbeat`` directly.
+
+    **BE-011 Part 1 additive hook:** after the real liveness update above,
+    this also writes one row into ``app.domains.monitoring``'s platform-wide
+    ``HeartbeatLog`` (``component_type=ROUTER``) -- see that model's module
+    docstring for the full "composes with, does not replace, this
+    endpoint's own liveness detection" write-up. This is the one, small,
+    additive cross-domain call the monitoring module's directory rule
+    permitted; it does not change this endpoint's request/response contract
+    or its existing behavior in any way, and a failure to record the
+    heartbeat log would not be a reason to fail this call -- but no such
+    failure path currently exists (``record_heartbeat`` cannot itself raise
+    a device-facing error)."""
     updated = await service.heartbeat(
         router=identity.router,
         routeros_version=payload.routeros_version,
         management_ip_address=payload.management_ip_address,
+    )
+    await monitoring_service.record_heartbeat(
+        component_type=HeartbeatComponentType.ROUTER,
+        component_id=updated.id,
+        payload={
+            "routeros_version": payload.routeros_version,
+            "management_ip_address": payload.management_ip_address,
+            "status": updated.status,
+        },
     )
     return AgentHeartbeatResponse(
         router_id=str(updated.id),
