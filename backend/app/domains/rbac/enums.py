@@ -221,3 +221,20 @@ class AuditAction(StrEnum):
     WIREGUARD_TUNNEL_CREATED = "wireguard_tunnel_created"
     WIREGUARD_TUNNEL_ROTATED = "wireguard_tunnel_rotated"
     WIREGUARD_TUNNEL_REVOKED = "wireguard_tunnel_revoked"
+
+    # OTP domain events (Module 010 Part 1) -- written through this same
+    # table by ``app.domains.otp.service.OtpService`` via the same narrow
+    # ``AuditLogWriter`` protocol shape every other domain's service uses
+    # (see ``AuditLogEntry``'s "other domains could plausibly reuse it"
+    # design). ``OTP_REQUESTED`` deliberately exists as a value but is
+    # never actually written by ``OtpService.request_otp`` -- a guest-
+    # facing, unauthenticated, high-volume action would flood this
+    # moderate-volume, admin-reviewable table for no benefit; the value is
+    # kept for forward-compatibility (a future decision to start auditing
+    # it needs no migration). ``OTP_VERIFICATION_FAILED`` is likewise only
+    # written for the two adversarially-relevant failure reasons (wrong
+    # code, attempts exceeded) -- see ``app.domains.otp.service``'s module
+    # docstring for the full audit-volume judgment call.
+    OTP_REQUESTED = "otp_requested"
+    OTP_VERIFIED = "otp_verified"
+    OTP_VERIFICATION_FAILED = "otp_verification_failed"

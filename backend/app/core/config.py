@@ -115,6 +115,60 @@ class Settings(BaseSettings):
         ),
     )
 
+    otp_code_length: int = Field(
+        default=6,
+        ge=4,
+        le=10,
+        description=(
+            "Number of digits in a generated OTP code "
+            "(app.domains.otp.service.generate_numeric_code)."
+        ),
+    )
+    otp_expiry_seconds: int = Field(
+        default=300,
+        ge=30,
+        le=3600,
+        description=(
+            "How long a generated OTP code remains valid "
+            "(app.domains.otp.models.OtpRequest.expires_at) before "
+            "app.domains.otp.exceptions.OtpExpiredError is raised."
+        ),
+    )
+    otp_max_verification_attempts: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description=(
+            "Maximum times a single OTP code may be guessed "
+            "(OtpRequest.attempt_count vs. max_attempts) before it locks "
+            "itself out (OtpAttemptsExceededError) -- mirrors "
+            "max_login_attempts's identical per-secret brute-force cap, "
+            "distinct from the request-level throttle below."
+        ),
+    )
+    otp_max_requests_per_window: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description=(
+            "Maximum number of new OTP codes a single identifier "
+            "(phone/email) may request within otp_request_window_minutes "
+            "(app.domains.otp.service.OtpRateLimiter, Redis-backed) -- "
+            "protects the delivery channel from spam, distinct from "
+            "otp_max_verification_attempts's per-code brute-force cap."
+        ),
+    )
+    otp_request_window_minutes: int = Field(
+        default=60,
+        ge=1,
+        le=1440,
+        description=(
+            "Rolling window (minutes) otp_max_requests_per_window is "
+            "measured over -- mirrors account_lockout_minutes's identical "
+            "naming/style for a Redis-backed rate window."
+        ),
+    )
+
     @property
     def log_path(self) -> Path:
         return self.log_dir / self.log_file

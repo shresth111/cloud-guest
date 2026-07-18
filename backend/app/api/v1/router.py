@@ -4,6 +4,7 @@ from app.api.v1.health.routes import router as health_router
 from app.domains.auth.router import router as auth_router
 from app.domains.location.router import router as location_router
 from app.domains.organization.router import router as organization_router
+from app.domains.otp.router import router as otp_router
 from app.domains.rbac.router import router as rbac_router
 from app.domains.router.router import router as router_router
 from app.domains.router_agent.router import router as router_agent_router
@@ -22,3 +23,4 @@ api_v1_router.include_router(router_router)
 api_v1_router.include_router(router_provisioning_router)
 api_v1_router.include_router(router_agent_router)
 api_v1_router.include_router(wireguard_router)
+api_v1_router.include_router(otp_router)

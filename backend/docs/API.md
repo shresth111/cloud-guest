@@ -408,3 +408,45 @@ computation above -- see `FLOW.md` §8 for why this is a small, dedicated
 endpoint rather than composing through `router_agent`'s own
 `POST /agent/status`.
 
+## OTP Endpoints (Module 010 Part 1)
+
+Guest-facing one-time-passcode request/verification for guest WiFi
+captive-portal logins via SMS or email -- **not** platform-user
+authentication (that remains `app.domains.auth`, unchanged). No `Guest`
+model exists yet (a later module in this same BE-010 sequence); this
+module is self-contained, keyed by the raw phone/email identifier the
+guest supplies. See `backend/docs/otp/README.md`,
+`backend/docs/otp/FLOW.md`, and `backend/docs/otp/DATABASE.md` for the full
+design.
+
+```text
+POST /api/v1/otp/request
+POST /api/v1/otp/verify
+
+GET  /api/v1/otp/requests   otp.read
+```
+
+`POST /otp/request`/`POST /otp/verify` carry no `RequirePermission`/
+`CurrentUser` dependency at all -- the caller is an unauthenticated guest
+at a captive portal, with no platform-user identity RBAC could ever grant
+a permission to (mirrors BE-008's own
+`POST /routers/provisioning/check-in`; see `FLOW.md` §5). Abuse protection
+comes entirely from this module's own two distinct rate-limit mechanisms:
+a Redis-backed, per-identifier request throttle
+(`Settings.otp_max_requests_per_window`/`otp_request_window_minutes`)
+protecting the delivery channel from spam, and a persisted, per-code
+verification-attempt lockout
+(`Settings.otp_max_verification_attempts`) protecting against brute-forcing
+a live code -- see `FLOW.md` §2. Both guest-facing endpoints use the
+standard `ApiResponse` envelope (unlike the device-facing endpoints
+elsewhere in this API), since their caller is the captive-portal
+*frontend*, a real client that benefits from the same structured contract
+every other user-facing endpoint returns. OTP codes are stored only as a
+SHA-256 hash (`OtpRequest.code_hash`) -- never Argon2id, since a short
+-lived, expiry- and attempt-capped numeric code is a different threat model
+than a long-lived user password (`FLOW.md` §1); no response ever returns
+the code's plaintext value or its hash. `GET /otp/requests` is an
+additive, admin-facing endpoint gated by RBAC's already-seeded `otp.read`
+permission, giving platform support/audit visibility into a captive
+portal's OTP traffic without exposing any code value.
+
