@@ -906,3 +906,49 @@ the trailing 30 days), `retry_page`/`retry_page_size`,
   a literal time-to-first-`ONLINE` measurement -- see
   `docs/monitoring/FLOW.md` §24).
 
+## Observability (Module 011 Part 4)
+
+Cross-cutting infrastructure, not a new domain -- no new persisted tables,
+no new top-level router under `Settings.api_v1_prefix`. See
+`docs/monitoring/OBSERVABILITY.md` for the full write-up (metric
+inline-vs-on-scrape architecture, OpenTelemetry's honest default-vs-
+configured exporter behavior, and how to wire Grafana/Loki against this
+app).
+
+```text
+GET  /metrics    (no auth)    Prometheus scrape endpoint
+```
+
+`GET /metrics` is registered directly on the app
+(`app.main.create_app`) -- **deliberately not** under
+`Settings.api_v1_prefix` and **not** behind any RBAC dependency, since
+Prometheus scrapers never carry a platform-user JWT (see
+`docs/monitoring/OBSERVABILITY.md` for the full reasoning). **A production
+deployment must restrict this path at the network/ingress layer** (a
+scrape-only security group, a Kubernetes `NetworkPolicy`, or a reverse-
+proxy allowlist) -- there is no application-layer gate on it by design.
+
+Returns the standard Prometheus exposition text format
+(`prometheus_client.generate_latest`), containing:
+
+* `cloudguest_http_requests_total` / `cloudguest_http_request_duration_seconds`
+  -- inline, per-request HTTP metrics (`app.core.metrics.PrometheusMiddleware`).
+* `cloudguest_health_check_status` -- on-scrape `Gauge`, from
+  `app.domains.monitoring`'s `ServiceHealth` rollup, labeled by `component`.
+* `cloudguest_alerts_triggered_total` -- on-scrape `Gauge`, from
+  `app.domains.monitoring`'s `Alert` table, labeled by `severity`.
+* `cloudguest_guest_sessions_active` -- on-scrape `Gauge`, from
+  `app.domains.guest`'s `GuestSession` table.
+* `cloudguest_provisioning_jobs_total` -- on-scrape `Gauge`, from
+  `app.domains.router_provisioning`'s `ProvisioningJob` table, labeled by
+  `status`.
+
+Every business metric above is refreshed from current database state on
+each scrape, not incremented inline from within any other domain's own
+business logic -- see `docs/monitoring/OBSERVABILITY.md` for the full
+architecture write-up and why. OpenTelemetry tracing
+(`app.core.tracing.configure_tracing`) is wired into the same app factory,
+exporting spans to the console by default or to a real OTLP collector once
+`Settings.otel_exporter_otlp_endpoint` is configured -- it has no HTTP
+endpoint of its own to document here.
+

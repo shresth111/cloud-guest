@@ -1,0 +1,109 @@
+# Example Promtail scrape config for shipping the CloudGuest backend's
+# existing structured JSON logs (app.core.logging.JsonLogFormatter, written
+# to Settings.log_path -- Settings.log_dir/Settings.log_file, default
+# "logs/cloudguest.log", rotated via RotatingFileHandler) to a Loki
+# instance. See docs/monitoring/OBSERVABILITY.md for the full write-up of
+# why no application code changes were needed for this (the JSON formatter
+# was already "Loki-ready" before this part).
+#
+# This is a real, minimal, internally-consistent Promtail config -- every
+# field referenced by the `json` pipeline stage below (`timestamp`,
+# `level`, `logger`, `message`, `request_id`, `user_id`, `organization_id`)
+# is a field JsonLogFormatter.format() genuinely emits on every log record
+# (see app/core/logging.py). Any additional field a given log call passes
+# via `extra={...}` (e.g. "service", "method", "path",
+# "execution_time_ms") also survives untouched in the JSON line, since
+# Promtail's `json` stage only *extracts* named fields into labels/the
+# pipeline -- it never drops the rest of the line, which is still shipped
+# to Loki as the raw log line.
+#
+# Run this alongside the app (e.g. `promtail -config.file=promtail-config-example.yaml`),
+# pointed at a real Loki instance via `clients[0].url` below.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  # Durable read-cursor so Promtail resumes from where it left off across
+  # restarts instead of re-shipping (or skipping) lines.
+  filename: /tmp/promtail-positions.yaml
+
+clients:
+  # Point this at a real Loki instance (self-hosted, Grafana Cloud, etc.).
+  # There is no live Loki instance in this sandbox -- this URL is the
+  # standard local-Loki default, change it for any real deployment.
+  - url: http://localhost:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: cloudguest-backend
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: cloudguest-backend
+          # Matches Settings.service_name's default -- override alongside
+          # it if that setting is ever changed for a given deployment.
+          service: cloudguest-backend
+          # Matches CLOUDGUEST_LOG_DIR/CLOUDGUEST_LOG_FILE's default
+          # (Settings.log_path == "logs/cloudguest.log"). Update this glob
+          # if either setting is overridden for a given deployment --
+          # RotatingFileHandler's backup files (cloudguest.log.1, .2, ...)
+          # are intentionally NOT matched, so Promtail never re-ships a
+          # file that has already rolled over.
+          __path__: /app/logs/cloudguest.log
+
+    pipeline_stages:
+      # Every log line is a single JSON object (JsonLogFormatter.format
+      # ends each record with `json.dumps(..., separators=(",", ":"))`, one
+      # line per record, never pretty-printed/multi-line) -- so no
+      # multiline stage is needed before this.
+      - json:
+          expressions:
+            timestamp: timestamp
+            level: level
+            logger: logger
+            message: message
+            request_id: request_id
+            user_id: user_id
+            organization_id: organization_id
+
+      # Use the log record's own timestamp (already UTC ISO-8601, see
+      # JsonLogFormatter) as Loki's ingestion timestamp, instead of "the
+      # instant Promtail read the line" -- keeps ordering correct even
+      # under any read/ship delay.
+      - timestamp:
+          source: timestamp
+          format: RFC3339
+
+      # Promote a small, low-cardinality set of fields to real Loki
+      # labels (indexed, used for stream selection in LogQL). request_id
+      # is deliberately NOT a label -- it is unique per request, and a
+      # label with unbounded cardinality would blow up Loki's index; it
+      # stays queryable via `| json | request_id="..."` line filtering
+      # instead, using the field extracted above.
+      - labels:
+          level:
+          logger:
+
+      # Drop noisy access-log-style INFO records here if desired, e.g.:
+      # - match:
+      #     selector: '{job="cloudguest-backend"} |= "http_request_completed"'
+      #     stages:
+      #       - drop:
+      #           older_than: 720h
+      #
+      # Left commented out -- no retention policy is prescribed by this
+      # module; a real deployment tunes this per its own log volume/cost
+      # constraints.
+      #
+      # No `output` stage is used here -- deliberately. Without one,
+      # Promtail ships the full, original scraped JSON line to Loki
+      # unmodified (the `json`/`labels` stages above only *extract* fields
+      # into the pipeline/labels, they never rewrite the shipped line), so
+      # every field JsonLogFormatter ever emits (including ones not
+      # extracted above, e.g. a call site's own `extra={...}` data) stays
+      # queryable in Loki via `| json` at query time. Adding an `output:
+      # {source: message}` stage here would instead *replace* the shipped
+      # line with only the `message` field's text, discarding every other
+      # field -- the opposite of what this config wants.

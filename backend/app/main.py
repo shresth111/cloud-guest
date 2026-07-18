@@ -9,6 +9,9 @@ from app.api.v1.router import api_v1_router
 from app.common.exceptions import register_exception_handlers
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
+from app.core.metrics import PrometheusMiddleware
+from app.core.metrics import router as metrics_router
+from app.core.tracing import configure_tracing
 from app.middleware.request_context import RequestContextMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 
@@ -54,12 +57,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
     )
+    # Prometheus HTTP-level metrics (app.core.metrics) -- must wrap every
+    # request, so it is added like every other cross-cutting middleware
+    # above, not scoped to api_v1_router.
+    app.add_middleware(PrometheusMiddleware)
 
     register_exception_handlers(app)
     app.include_router(api_v1_router, prefix=app_settings.api_v1_prefix)
+    # GET /metrics -- the standard Prometheus scrape path, deliberately not
+    # under app_settings.api_v1_prefix and not behind RBAC. See
+    # app.core.metrics's module docstring and
+    # docs/monitoring/OBSERVABILITY.md for why.
+    app.include_router(metrics_router)
+
+    # OpenTelemetry tracing (app.core.tracing) -- real SDK + FastAPI
+    # instrumentation either way; exports to the console by default, or to
+    # a real OTLP collector once app_settings.otel_exporter_otlp_endpoint
+    # is configured. See app.core.tracing's module docstring.
+    configure_tracing(app, app_settings)
 
     return app
 
 
 app = create_app()
-
