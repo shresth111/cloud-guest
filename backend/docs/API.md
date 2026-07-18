@@ -116,3 +116,32 @@ at face value -- see `ORGANIZATION_ARCHITECTURE.md` §5.
 caller is the invited user, not any `organizations.*` permission (an
 invited member holds none yet).
 
+## Location Endpoints (Module 006)
+
+Physical sites (Organization -> Location -> Router -> Guest) belonging to
+exactly one organization. See `backend/docs/location/README.md` and
+`backend/docs/location/LOCATION_ARCHITECTURE.md` for the full design.
+
+```text
+GET    /api/v1/organizations/{organization_id}/locations
+POST   /api/v1/organizations/{organization_id}/locations
+GET    /api/v1/locations/{location_id}
+PUT    /api/v1/locations/{location_id}
+DELETE /api/v1/locations/{location_id}
+POST   /api/v1/locations/{location_id}/suspend
+POST   /api/v1/locations/{location_id}/activate
+```
+
+Mutating/protected endpoints require the appropriate `locations.*`
+permission (`create`/`read`/`update`/`delete`/`manage`) at the resolved
+scope. `DELETE /locations/{id}` archives (soft-deletes); it never hard-
+deletes. `organization_id` is immutable after creation (not present on the
+update schema) -- see `LOCATION_ARCHITECTURE.md` §5. Every endpoint enforces
+organization-tenant scoping via `requesting_organization_id`
+(`X-Organization-Id`), the same as the Organization domain's own endpoints
+-- see `LOCATION_ARCHITECTURE.md` §6. `X-Location-Id` (RBAC's
+`CurrentLocation`, updated in this module) is now validated against a real,
+non-archived location whose `organization_id` matches the resolved
+`X-Organization-Id` context, rather than trusted at face value -- see
+`LOCATION_ARCHITECTURE.md` §8.
+

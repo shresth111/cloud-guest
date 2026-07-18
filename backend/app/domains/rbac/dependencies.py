@@ -6,10 +6,10 @@ session validation. RBAC only adds *authorization* on top of the identity
 auth already establishes.
 
 Design decision -- ``CurrentOrganization`` / ``CurrentLocation``: there is no
-Location/Router domain yet (see the module scope boundary), so "what
-location/router is this request acting within" still cannot be resolved by
-querying real data -- the caller states it via ``X-Location-Id`` /
-``X-Router-Id`` request headers (validated as UUIDs), same as before.
+Router domain yet (see the module scope boundary), so "what router is this
+request acting within" still cannot be resolved by querying real data -- the
+caller states it via the ``X-Router-Id`` request header (validated as a
+UUID), same as before.
 
 **Module 005 update:** the Organization domain now exists, so
 ``CurrentOrganization`` no longer trusts ``X-Organization-Id`` at face
@@ -25,7 +25,25 @@ as "the single place to change"). A request with no ``X-Organization-Id``
 header still resolves to ``None`` with no DB lookup at all, so
 platform-level (``GLOBAL``-scoped) callers acting without an organization
 context -- e.g. creating the very first organization -- are unaffected.
-``CurrentLocation``/``CurrentRouter`` are unchanged, for the reason above.
+
+**Module 006 update:** the Location domain now exists, so ``CurrentLocation``
+no longer trusts ``X-Location-Id`` at face value either. When the header is
+present, it now validates (a) the location exists and is not archived
+(``LocationNotFoundError`` -- a soft-deleted/archived location reads as "not
+found", the same convention ``CurrentOrganization`` already uses for
+archived organizations) and (b) -- when an organization context was already
+resolved via ``CurrentOrganization`` -- that the location's
+``organization_id`` matches it (``LocationOrganizationMismatchError``
+otherwise, a real cross-tenant boundary check: a location belonging to a
+different organization than the one named by ``X-Organization-Id`` must be
+rejected, not silently trusted). Both reused from
+``app.domains.location.exceptions``/``app.domains.location.models`` rather
+than reinvented here. A request with no ``X-Location-Id`` header still
+resolves to ``None`` with no DB lookup at all. When ``X-Location-Id`` is
+present but ``X-Organization-Id`` is not, the mismatch check is skipped
+(there is nothing to compare against) -- the location's own existence check
+still applies. ``CurrentRouter`` is unchanged, for the reason above (no
+Router domain yet).
 """
 
 from __future__ import annotations
@@ -42,6 +60,11 @@ from app.database.repositories.generic import GenericRepository
 from app.database.session import get_db_session
 from app.domains.auth.dependencies import get_current_user
 from app.domains.auth.models import AuthUser
+from app.domains.location.exceptions import (
+    LocationNotFoundError,
+    LocationOrganizationMismatchError,
+)
+from app.domains.location.models import Location
 from app.domains.organization.enums import MembershipStatus
 from app.domains.organization.exceptions import (
     OrganizationMembershipRequiredError,
@@ -148,9 +171,31 @@ async def CurrentOrganization(
     return organization_id
 
 
-async def CurrentLocation(request: Request) -> uuid.UUID | None:
-    """The location context for this request, if any (``X-Location-Id``)."""
-    return _parse_uuid_header(request, _LOCATION_HEADER)
+async def CurrentLocation(
+    request: Request,
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    db: AsyncSession = Depends(get_db_session),
+) -> uuid.UUID | None:
+    """The location context for this request, if any (``X-Location-Id``).
+
+    When the header is present, validates the location exists and is not
+    archived, and -- if an organization context was already resolved via
+    ``CurrentOrganization`` -- that the location belongs to it (see module
+    docstring for why this is no longer a trust-the-header parse). Returns
+    ``None`` (no DB lookup performed) when the header is absent."""
+    location_id = _parse_uuid_header(request, _LOCATION_HEADER)
+    if location_id is None:
+        return None
+
+    location_repo = GenericRepository(Location, db)
+    location = await location_repo.get_by_id(location_id)
+    if location is None:
+        raise LocationNotFoundError(location_id)
+
+    if organization_id is not None and location.organization_id != organization_id:
+        raise LocationOrganizationMismatchError(location_id, organization_id)
+
+    return location_id
 
 
 async def CurrentRouter(request: Request) -> uuid.UUID | None:

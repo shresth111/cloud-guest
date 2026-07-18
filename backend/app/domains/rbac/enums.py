@@ -139,3 +139,14 @@ class AuditAction(StrEnum):
     ORGANIZATION_MEMBER_ACCEPTED = "organization_member_accepted"
     ORGANIZATION_MEMBER_REMOVED = "organization_member_removed"
     ORGANIZATION_MEMBER_STATUS_CHANGED = "organization_member_status_changed"
+
+    # Location domain events (Module 006) -- written through this same table
+    # by ``app.domains.location.service.LocationService`` via the same
+    # narrow ``AuditLogWriter`` protocol shape ``OrganizationService`` uses
+    # (see ``AuditLogEntry``'s "other domains could plausibly reuse it"
+    # design).
+    LOCATION_CREATED = "location_created"
+    LOCATION_UPDATED = "location_updated"
+    LOCATION_ARCHIVED = "location_archived"
+    LOCATION_SUSPENDED = "location_suspended"
+    LOCATION_ACTIVATED = "location_activated"

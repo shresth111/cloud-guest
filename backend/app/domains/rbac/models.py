@@ -6,18 +6,21 @@ timestamp / soft-delete / audit / version mixin stack -- see
 Alembic autogenerate, the generic repository, and cross-domain FKs all work
 uniformly. No model here has a documented reason to diverge from that.
 
-Scope columns: ``organization_id`` now carries a real ``ForeignKey`` to
+Scope columns: ``organization_id`` carries a real ``ForeignKey`` to
 ``organizations.id`` (added in migration ``0004``, once
 ``app.domains.organization`` landed -- Module 005) on every model that has
 one (``Role``, ``UserRole``, ``OrganizationRole``, ``PermissionOverride``,
-``AuditLogEntry``). ``location_id``, ``router_id``, and the future
-``msp_id`` remain plain nullable ``UUID`` columns *without* a SQL
-``ForeignKey`` constraint, because the Location/Router (and future MSP)
-domains still do not exist yet in this codebase (see the module scope
-boundary). Real FK constraints for those get added in a follow-up migration
-once those domains land, the same way ``organization_id`` just was.
-``PermissionScope`` carries no scope columns at all (only
-``permission_id``/``scope_type``) and is unaffected.
+``AuditLogEntry``). ``location_id`` now likewise carries a real
+``ForeignKey`` to ``locations.id`` (added in migration ``0006``, once
+``app.domains.location`` landed -- Module 006) on every model that has one
+(``UserRole``, ``PermissionOverride``, ``LocationRole``, ``AuditLogEntry``).
+``router_id`` and the future ``msp_id`` remain plain nullable ``UUID``
+columns *without* a SQL ``ForeignKey`` constraint, because the Router (and
+future MSP) domains still do not exist yet in this codebase (see the module
+scope boundary). A real FK constraint for ``router_id`` gets added in a
+follow-up migration once that domain lands, the same way ``organization_id``
+and ``location_id`` just were. ``PermissionScope`` carries no scope columns
+at all (only ``permission_id``/``scope_type``) and is unaffected.
 
 Design decisions worth calling out (see ``docs/rbac/RBAC_ARCHITECTURE.md``
 for the full write-up):
@@ -284,7 +287,7 @@ class UserRole(BaseModel):
     )
 
     scope_type: Mapped[str] = mapped_column(String(20), nullable=False)
-    # msp_id/location_id/router_id remain FK-less -- see module docstring.
+    # msp_id/router_id remain FK-less -- see module docstring.
     msp_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     organization_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -292,7 +295,9 @@ class UserRole(BaseModel):
         nullable=True,
     )
     location_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="SET NULL"),
+        nullable=True,
     )
     router_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
@@ -358,7 +363,9 @@ class PermissionOverride(BaseModel):
         nullable=True,
     )
     location_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="SET NULL"),
+        nullable=True,
     )
     router_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
@@ -446,7 +453,11 @@ class LocationRole(BaseModel):
 
     __tablename__ = "location_roles"
 
-    location_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
     role_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("roles.id", ondelete="CASCADE"), nullable=False
     )
@@ -502,7 +513,9 @@ class AuditLogEntry(BaseModel):
         nullable=True,
     )
     location_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     __table_args__ = (
