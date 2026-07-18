@@ -811,3 +811,98 @@ downtime-duration-weighted formula, is the honest choice in this
 environment. Raises a `422` if zero `HealthCheck` rows exist for the
 window (never fabricates a result from no data).
 
+## Real-Time + ZTP Monitoring Dashboard + Analytics Endpoints (Module 011 Part 3)
+
+Extends the same Monitoring domain (no new top-level domain, no new
+persisted tables -- see `docs/monitoring/DATABASE.md`'s Part 3 section).
+See `docs/monitoring/FLOW.md` §18-28 for every design decision in detail.
+
+```text
+WS   /api/v1/monitoring/ws/dashboard   monitoring.read        live health-transition/alert-triggered/alert-resolved feed
+WS   /api/v1/monitoring/ws/sessions    guest_sessions.read     live guest-session-started/ended feed
+GET  /api/v1/monitoring/dashboard      monitoring.read        platform "at a glance" statistics
+GET  /api/v1/monitoring/devices        monitoring.read        device statistics + per-router lifecycle-stage listing
+GET  /api/v1/ztp/dashboard             monitoring.read        provisioning dashboard/status/progress
+GET  /api/v1/ztp/analytics             analytics.read          success rate / failure reports / retry dashboard / activation timing
+```
+
+### WebSocket endpoints
+
+Both `WS /monitoring/ws/dashboard` and `WS /monitoring/ws/sessions` accept
+a required `?token=<JWT access token>` query parameter (the same access
+token issued by `POST /api/v1/auth/login`) -- a browser's native
+`WebSocket` API cannot set an `Authorization` header, so the token travels
+as a query parameter instead, validated with the identical JWT-decode logic
+the HTTP `Authorization: Bearer` flow uses. **Known tradeoff:** a token in
+a URL can be recorded in server access logs/browser history/proxy
+logs/`Referer` headers -- see `docs/monitoring/FLOW.md` §20 for the full
+write-up and the first-message-handshake alternative considered. The
+connection is closed with code `4401` (missing/invalid/expired token, or
+inactive user) or `4403` (authenticated but lacking the required
+permission) before ever being accepted on any auth failure.
+
+Every relayed message has the shape:
+
+```json
+{
+  "type": "health_transition | alert_triggered | alert_resolved | guest_session_started | guest_session_ended",
+  "payload": { "...": "message-type-specific fields" },
+  "occurred_at": "2026-01-01T00:00:00+00:00"
+}
+```
+
+`WS /monitoring/ws/dashboard` only ever relays
+`health_transition`/`alert_triggered`/`alert_resolved`;
+`WS /monitoring/ws/sessions` only ever relays
+`guest_session_started`/`guest_session_ended` (`guest_session_ended` is
+defined but has no current writer -- see `docs/monitoring/FLOW.md` §19).
+Both share one underlying Redis channel and filter server-side, per
+`docs/monitoring/FLOW.md` §19's "one channel, two purpose-filtered
+endpoints" design.
+
+### `GET /monitoring/dashboard`
+
+Accepts optional `organization_id`, `start_date`, `end_date` (defaults to
+the trailing 24 hours). Returns overall health status + every component's
+current status, alert counts by severity/status, device counts by
+`RouterStatus`, ZTP lifecycle-stage counts, pending-enrollment count,
+average health-check response time, platform availability percentage
+(same formula as SLA's `achieved_percentage`, computed live rather than
+requiring a pre-configured `SlaTarget`), and -- only when `organization_id`
+is supplied -- guest visitor/unique-guest counts (`app.domains.guest
+.GuestAnalyticsService`, composed read-only).
+
+### `GET /monitoring/devices` / `GET /ztp/dashboard`
+
+Both call the identical underlying aggregation (see
+`docs/monitoring/FLOW.md` §26) -- accept optional `organization_id`,
+`page`, `page_size`. Returns a full stage-count tally
+(`RouterLifecycleStage` -- `pending`/`claimed`/`approved`/`provisioning`/
+`provisioned`/`online`/`offline`/`warning`/`failed`) over every matching
+router/enrollment, a `pending_enrollment_count`, and a paginated listing of
+individual rows (`router_id`/`enrollment_id` -- one or the other is
+`null`, never both -- plus `lifecycle_stage`, `router_status`,
+`enrollment_status`, `last_seen_at`, and the latest `ProvisioningJob`'s
+type/status/attempts). See `docs/monitoring/FLOW.md` §22 for the complete
+9-state derivation table.
+
+### `GET /ztp/analytics`
+
+Accepts optional `organization_id`, `start_date`/`end_date` (defaults to
+the trailing 30 days), `retry_page`/`retry_page_size`,
+`failure_sample_limit`. Returns:
+
+* `success_rate_percentage` (`succeeded ProvisioningJobs / (succeeded +
+  failed) ProvisioningJobs` in the window, `null` if none -- see
+  `docs/monitoring/FLOW.md` §23 for the denominator-choice write-up),
+  `succeeded_job_count`, `terminal_job_count`.
+* `failure_breakdown` (counts grouped by `ProvisioningJobType`) and
+  `failure_samples` (a small, most-recent-first list of individual failed
+  jobs with their real `error_message`).
+* `retry_jobs` (every job with `attempts > 0`, nearest-to-exhaustion
+  first, paginated).
+* `average_activation_seconds`/`activation_sample_size` -- an honest
+  approximation (enrollment-approval-to-initial-config-job-completion, NOT
+  a literal time-to-first-`ONLINE` measurement -- see
+  `docs/monitoring/FLOW.md` §24).
+

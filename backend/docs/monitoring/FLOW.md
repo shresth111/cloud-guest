@@ -472,3 +472,346 @@ channel's delivery is recorded as `FAILED` with a diagnosable
 `error_message`, every *other* channel still gets notified, and the
 alert's own `TRIGGERED`/`RESOLVED` state (the actual source of truth an
 operator or automated poller relies on) is completely unaffected.
+
+# BE-011 Part 3: Real-Time + ZTP Monitoring Dashboard + Analytics -- Design Decisions
+
+Part 3 extends the same `app.domains.monitoring` domain (no new top-level
+domain) with three things: (1) genuine, working WebSocket endpoints backed
+by Redis pub/sub, composing with Part 1's Health Engine and Part 2's Alert
+Engine plus one narrow, additive hook into `app.domains.guest`; (2) a
+read-only ZTP (zero-touch-provisioning) monitoring dashboard/analytics
+layer over `app.domains.router_provisioning`'s already-existing data; (3)
+platform-wide dashboard statistics composing all of the above. Unlike the
+Celery/WebSocket honesty note from Part 1 ("no such infrastructure exists
+yet"), WebSocket support is something FastAPI provides natively, and this
+part is specifically tasked with building it for real -- every endpoint
+below is a genuinely working `@router.websocket(...)` route backed by a
+real Redis `PUBLISH`/`SUBSCRIBE`, not a placeholder.
+
+## 18. No new persisted state (migration decision)
+
+**Conclusion: zero new tables, zero new columns.** Every one of Part 3's
+three surfaces is either (a) a live relay of already-happening domain
+events (Redis pub/sub is a transient, disposable transport -- nothing about
+it needs Postgres durability, mirroring `ProvisioningJob`'s own "Redis is
+the dispatch transport, Postgres is the durable source of truth" precedent
+from `app.domains.router_provisioning`) or (b) a read-side computation over
+data three other domains already persist (`RouterEnrollmentRequest.status`,
+`Router.status`/`last_seen_at`, `ProvisioningJob.status`/`attempts`/
+`max_attempts`/timestamps, `Alert`/`HealthCheck` rows Part 1/2 already
+own). `RouterLifecycleStage` (§20) is the clearest instance of "don't
+persist a value you can always recompute correctly from data you already
+have" -- see that section for the full argument. No `alembic/versions/0018_...`
+migration was written for this part; `backend/alembic/versions/` and
+`alembic/env.py` are untouched.
+
+## 19. Real-Time Engine: one Redis channel, message-type filtering, two endpoints
+
+`constants.MONITORING_LIVE_CHANNEL` (`"monitoring:live"`) is the single
+Redis pub/sub channel every real-time-producing write path publishes a
+uniformly-shaped JSON message to: `{"type": <RealtimeMessageType>,
+"payload": {...}, "occurred_at": <iso8601>}`. Three write paths publish,
+each *after* its own real database write already succeeded (never instead
+of, never before):
+
+* `MonitoringService._persist_result` -- on a genuine `ServiceHealth`
+  status *transition* (the same trigger condition Part 1's
+  `_record_transition_event` already uses for `PlatformEvent`), publishes
+  `RealtimeMessageType.HEALTH_TRANSITION`.
+* `AlertService._create_alert`/`_auto_resolve`/`resolve_alert` -- publishes
+  `ALERT_TRIGGERED` on every new `Alert` row, `ALERT_RESOLVED` on both
+  auto-resolution and manual `POST /alerts/{id}/resolve`.
+* `app.domains.guest.service.GuestService`'s `login_via_otp`/
+  `login_via_voucher` (via the additive hook, §21) -- publishes
+  `GUEST_SESSION_STARTED`.
+
+`GUEST_SESSION_ENDED` is a defined `RealtimeMessageType` member with **no
+current writer** -- the identical honest "defined, wired into every
+consumer, not yet produced" posture Part 1 already established for
+`HeartbeatComponentType.WIREGUARD_PEER`/`HealthComponent.CELERY`. Producing
+it would need a hook into `GuestService`'s session-end methods
+(disconnect/terminate/expire), which this part's directory rule does not
+license (exactly one guest-domain hook was budgeted; see §21).
+
+**Two WebSocket endpoints share the one channel, filtering by
+`message["type"]`, rather than one Redis channel per message type:**
+`WS /monitoring/ws/dashboard` relays `HEALTH_TRANSITION`/`ALERT_TRIGGERED`/
+`ALERT_RESOLVED`; `WS /monitoring/ws/sessions` relays
+`GUEST_SESSION_STARTED`/`GUEST_SESSION_ENDED`. This was chosen over a
+per-type channel because every publisher already knows unambiguously what
+kind of event it is producing (no channel-selection logic needed at
+publish time), a single channel is a single operational
+`PUBLISH`/`SUBSCRIBE` surface to reason about, and it cleanly separates the
+*transport* concern (one channel) from the *client-facing* concern (which
+message types a given widget wants) -- adding a third WebSocket endpoint
+with a third filter set later needs zero publisher-side changes.
+
+**Publish resilience.** `service._publish_live_message` never raises: a
+Redis publish failure (Redis down, a transient blip) is caught and logged,
+never propagated -- the same resilience posture
+`NotificationService.dispatch_notification` already established in Part 2
+for a notification-delivery failure. A missed live-stream update never
+means lost data -- the underlying `HealthCheck`/`ServiceHealth`/`Alert`/
+`GuestSession` row the message describes is already durably committed; only
+the real-time *notice* of it can be missed, and the next state-changing
+event (or a fresh `GET`) still reflects reality.
+
+## 20. WebSocket authentication: JWT via `?token=` query parameter, and its tradeoff
+
+A browser's native `WebSocket` constructor cannot set custom request
+headers (unlike `fetch`/`XMLHttpRequest`), so the conventional pattern for
+browser-originated WebSocket auth is a bearer token passed as a query
+parameter. `router._authenticate_websocket` validates it with the exact
+same `app.domains.auth.jwt.JWTManager.validate_token` the HTTP
+`Authorization: Bearer` flow already uses (composed, never reimplemented),
+then checks the resolved permission via the exact same
+`app.domains.rbac.authorization.AccessValidator.has_permission` every
+`RequirePermission`-gated HTTP route already uses -- closing the socket
+with a private-use code (4401 unauthenticated, 4403 forbidden; RFC 6455
+reserves 3000-4999 for this) *before* `websocket.accept()` on any failure,
+never a silent drop.
+
+**Known, documented tradeoff.** A token in a URL can end up recorded in
+server access logs, browser history, proxy logs, and `Referer` headers of
+any same-origin request a page embedding the socket URL later makes -- a
+real exposure surface a header-based credential does not have. The
+alternative considered was a **first-message auth handshake**: accept the
+connection unauthenticated, require the client's first WebSocket *message*
+to carry the token before subscribing to anything. That is genuinely more
+secure against the log-leakage class of exposure, at the cost of a
+two-step client protocol (connect, then send auth, then wait for an ack)
+instead of a single `new WebSocket(url + "?token=...")` call, and a
+connection that briefly exists unauthenticated. The query-param pattern was
+chosen for this iteration as the simpler, more conventional approach (it is
+how most production WebSocket APIs that must support plain browser clients
+actually do this) -- a documented, revisitable choice, not an oversight. A
+deployment with strict log-hygiene requirements should ensure access logs
+are not persisted with query strings (or configure a reverse proxy to
+redact the `token` param before logging); switching to the first-message
+handshake later requires no change to `MONITORING_LIVE_CHANNEL`'s message
+shape or to any publisher, only to `_authenticate_websocket`'s call site.
+
+**Connection lifecycle.** Each endpoint subscribes via
+`redis_client.pubsub()` and runs two concurrent `asyncio` tasks --
+`_relay_redis_to_websocket` (forwards matching `pubsub.listen()` messages
+via `websocket.send_json`) and `_watch_for_websocket_disconnect` (awaits
+`websocket.receive()` purely to detect a client-initiated disconnect
+promptly, since a pure server-push socket would otherwise never notice the
+client left until its next send attempt failed). Whichever finishes first
+wins (`asyncio.wait(..., return_when=FIRST_COMPLETED)`); the other is
+cancelled, and the `finally` block always unsubscribes and closes the
+`PubSub` -- no leaked Redis subscription, no leaked task, on either a clean
+disconnect or an error. See
+`tests/unit/test_monitoring_realtime.py::test_websocket_disconnect_unsubscribes_from_redis_channel`.
+
+## 21. The `GuestService` broadcast hook: precisely what was added, and why it is additive
+
+`app.domains.guest.service.GuestService.__init__` gained one new,
+keyword-only, `None`-by-default constructor parameter: `monitoring_hook:
+GuestSessionBroadcastProtocol | None = None` (duck-typed against
+`MonitoringService.broadcast_guest_session_event`, the same narrow-protocol
+composition style every other `GuestService` dependency -- `otp_service`/
+`voucher_service`/`captive_portal_service`/`router_lookup`/`audit_writer` --
+already uses). `login_via_otp`/`login_via_voucher` each gained exactly one
+new call, `await self._broadcast_guest_session_started(...)`, placed
+immediately after their existing `session = await self._create_session(...)`
+line (i.e. strictly after the real session row already exists) and before
+`_bump_guest_visit`. `_broadcast_guest_session_started` is a new private
+helper that no-ops when `monitoring_hook is None` and otherwise wraps the
+hook call in a `try`/`except` that only ever logs a warning, never raises.
+
+**Why this is additive, not a behavior change:** (1) the parameter defaults
+to `None`, so every existing caller -- including every test in
+`tests/unit/test_guest.py`'s `make_fixture` -- behaves exactly as before,
+with zero broadcast attempts; (2) no existing parameter, return type, or
+exception contract of `login_via_otp`/`login_via_voucher` changed; (3) a
+hook failure can never break a real guest's login (mirrors
+`NotificationService.dispatch_notification`'s identical resilience
+posture). `tests/unit/test_monitoring_realtime.py` verifies all three:
+the hook fires with the right arguments, a raising hook does not break
+login, and a fixture built without the hook keeps working unmodified.
+
+`app.domains.guest.dependencies.get_guest_service` gained one line wiring
+`MonitoringService` in as `monitoring_hook` -- necessary for the hook to
+ever fire in the real running app (without it, `GuestService` would only
+ever be constructed with `monitoring_hook=None`, and the broadcast would be
+dead code no request path exercises). This mirrors
+`app.domains.router_agent.router.agent_heartbeat`'s Part 1 precedent in
+spirit (a small, additive, documented composition seam into a *different*
+domain's existing lifecycle method) with one deliberate difference: that
+heartbeat hook lives at the single `router_agent` *endpoint* call site,
+while this hook lives inside `GuestService`'s own method bodies, since
+guest login is reachable through more than one caller and every one of
+them should broadcast, not just whichever endpoint happens to call it
+first.
+
+**A note on `app.domains.monitoring.dependencies`/`app.domains.guest.dependencies`
+avoiding a circular import.** `guest.dependencies` now imports
+`monitoring.dependencies.get_monitoring_service` for the hook above.
+Because of this, `monitoring.dependencies.get_platform_dashboard_service`
+(§23) deliberately does **not** import anything from `app.domains.guest` --
+doing so would create `guest.dependencies -> monitoring.dependencies ->
+guest.dependencies`, a cycle. Instead, `router.py`'s
+`get_platform_dashboard` endpoint (which has no such cycle) imports
+`app.domains.guest.dependencies.get_guest_analytics_service` directly and
+passes the resolved service into
+`PlatformDashboardService.get_dashboard_statistics` as a per-call argument.
+
+## 22. ZTP Monitoring Dashboard: `RouterLifecycleStage` is computed, never persisted
+
+The module brief names 9 idealized lifecycle labels -- `Pending`,
+`Claimed`, `Approved`, `Provisioning`, `Provisioned`, `Online`, `Offline`,
+`Warning`, `Failed` -- that map onto no single existing enum.
+`validators.compute_lifecycle_stage(router, enrollment, latest_job, now=)`
+is a pure, side-effect-free function (mirrors `classify_storage_health`'s
+identical shape) that derives one of these 9 labels by combining
+`EnrollmentStatus` + `RouterStatus` + `ProvisioningJobStatus`
+(+`attempts`/`max_attempts`) + `Router.last_seen_at` heartbeat staleness.
+**Full mapping table** (evaluated top-to-bottom, first match wins -- see
+the function's own docstring for the identical, canonical copy):
+
+| # | Condition | Stage |
+|---|---|---|
+| 1 | No `Router` row, no `RouterEnrollmentRequest` either | `PENDING` |
+| 2 | No `Router` row, enrollment `status=PENDING` | `PENDING` |
+| 3 | No `Router` row, enrollment `status=REJECTED` | `FAILED` |
+| 4 | No `Router` row, enrollment `status=APPROVED` (data anomaly: approved but the linked router is unresolvable) | `WARNING` |
+| 5 | `Router.status=SUSPENDED` | `WARNING` |
+| 6 | `Router.status=PENDING_PROVISIONING`, no `ProvisioningJob` yet | `APPROVED` |
+| 7 | `Router.status=PENDING_PROVISIONING`, latest job `QUEUED`/`RUNNING`/`SUCCEEDED` | `CLAIMED` |
+| 8 | `Router.status=PENDING_PROVISIONING`, latest job `FAILED`, `attempts < max_attempts` | `WARNING` |
+| 9 | `Router.status=PENDING_PROVISIONING`, latest job `FAILED`, `attempts >= max_attempts` | `FAILED` |
+| 10 | `Router.status=PROVISIONING`, no job or latest job `QUEUED`/`RUNNING` | `PROVISIONING` |
+| 11 | `Router.status=PROVISIONING`, latest job `SUCCEEDED` | `PROVISIONED` |
+| 12 | `Router.status=PROVISIONING`, latest job `FAILED`, `attempts < max_attempts` | `WARNING` |
+| 13 | `Router.status=PROVISIONING`, latest job `FAILED`, `attempts >= max_attempts` | `FAILED` |
+| 14 | `Router.status=OFFLINE` | `OFFLINE` |
+| 15 | `Router.status=ONLINE`, heartbeat fresh (< `ROUTER_HEARTBEAT_WARNING_STALE_MINUTES`, 5 min) | `ONLINE` |
+| 16 | `Router.status=ONLINE`, heartbeat stale (>= 5 min, < 15 min) | `WARNING` |
+| 17 | `Router.status=ONLINE`, heartbeat very stale (>= `ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`, 15 min) or `last_seen_at IS NULL` | `OFFLINE` |
+| 18 | `Router.status=DECOMMISSIONED` (excluded from the active dashboard listing by `ZtpMonitoringService.get_dashboard` -- reachable here only defensively) | `WARNING` |
+
+`CLAIMED` (row 7) is the one genuinely new sub-phase this system's actual
+data can distinguish within the `PENDING_PROVISIONING` window: "an
+initial-config job has been queued/picked up for this router, but the
+device has not yet checked in with its provisioning token" (`Router.status`
+itself only flips to `PROVISIONING` once the device presents that token).
+
+**Why this is computed on every read, never persisted as a tenth column
+anywhere.** Every one of its four inputs (`RouterEnrollmentRequest.status`,
+`Router.status`, `ProvisioningJob.status`/`attempts`, `Router.last_seen_at`)
+already has its own authoritative, independently-owned column in its own
+domain, updated by that domain's own service methods. A persisted
+`lifecycle_stage` column would be a **derived, tenth copy** of information
+already fully recoverable from the other four -- and would immediately risk
+drifting out of sync the moment any one of those four changes without this
+label being recomputed in lockstep (e.g. a router's heartbeat going stale
+between health-check runs would leave a persisted `ONLINE` stage
+technically "true" by the stale copy but false by the actual `last_seen_at`
+data). Recomputing it fresh on every dashboard read costs one pure Python
+function call per row and is correct-by-construction, always. This mirrors
+this codebase's own established discipline (`RouterHealthStatus`'s "not
+storing computed staleness" precedent in `app.domains.router`,
+`AccessValidator`'s "recompute effective grants fresh, cache only as an
+invalidatable accelerant" design in `app.domains.rbac`).
+
+## 23. Provisioning Success Rate: denominator choice
+
+`ZtpMonitoringService.get_analytics` computes success rate as `succeeded
+ProvisioningJobs / (succeeded + failed) ProvisioningJobs` in the requested
+window -- **not** "approved enrollments that reached `ONLINE` / total
+approved enrollments" (the module brief's other suggested denominator).
+`ProvisioningJob`-based was chosen because it is the actual execution unit
+this codebase already tracks success/failure/retry
+(`attempts`/`max_attempts`) for, per job type (`initial_config`/
+`config_push`/`backup`/`restore`/`factory_reset`) -- exactly what "did this
+provisioning *action* succeed" means operationally. `Router.status ==
+ONLINE`, by contrast, is driven by **heartbeats**
+(`app.domains.router_agent`'s check-in flow), a signal orthogonal to any
+specific job's outcome: a router can reach `ONLINE` via heartbeat even
+after its most recent `config_push` job failed, and a router whose
+`initial_config` job succeeded can still show `OFFLINE`/stale for reasons
+that have nothing to do with provisioning execution (a device unplugged
+after setup). Using "reached `ONLINE`" as the success signal would conflate
+provisioning-execution success with device-connectivity success -- two
+genuinely different failure modes this dashboard should be able to tell
+apart (the Retry Dashboard for the former, the lifecycle stage's
+`OFFLINE`/`WARNING` heartbeat signal for the latter). Queued/running jobs
+are excluded from both numerator and denominator (still in flight, not yet
+a resolved outcome).
+
+Failure Reports (`list_provisioning_failure_counts`) are a real SQL
+`GROUP BY job_type` over `FAILED` jobs in the window, paired with a small,
+most-recent-first sample of individual failures (with their real
+`error_message` -- not itself aggregated, since there is no meaningful
+`GROUP BY` over arbitrary free-form error text). The Retry Dashboard
+(`list_retry_jobs`) lists every job with `attempts > 0`, ordered nearest-
+to-exhaustion first (`max_attempts - attempts` ascending).
+
+## 24. Router Activation analytics: an honest approximation, not a literal measurement
+
+`ZtpMonitoringService.get_analytics`'s `average_activation_seconds`
+composes `RouterEnrollmentRequest.reviewed_at` (the approval timestamp)
+with the completion timestamp of that router's `initial_config`
+`ProvisioningJob` (`repository.compute_activation_duration_stats`, a real
+SQL `AVG`/`COUNT` over an `extract('epoch', ...)` expression, mirroring
+`SlaService.get_average_provisioning_duration_seconds`'s identical
+`started_at`/`completed_at` composition from Part 2). This is explicitly
+**not** a literal "time to first `ONLINE`" measurement: no table anywhere
+in this codebase records the timestamp of a router's first transition to
+`RouterStatus.ONLINE` -- `Router.last_seen_at` is overwritten on every
+single heartbeat (never "first seen"), and neither `RouterHealthSnapshot`
+(periodic metrics, not status transitions) nor `RouterEvent` (no
+`"router_online"` event type exists) capture that moment. "Approval ->
+initial-config-job-completion" is the closest genuinely-recoverable proxy
+this system's actual persisted data supports, reported honestly as such
+(the response schema's field descriptions say so explicitly) rather than
+mislabeled as more precise than it is -- the identical "don't fabricate
+precision the data doesn't support" discipline
+`SlaService.generate_report` already established in Part 2 for its
+check-count-ratio-vs-duration-weighted formula choice.
+
+## 25. Availability % / Average Response Time: composed, not reimplemented
+
+The platform dashboard's `availability_percentage` calls the exact same
+`repository.compute_health_check_stats` method Part 2's
+`SlaService.generate_report` already uses (a real SQL `COUNT`/`AVG`
+aggregate against `health_checks`), computed live for the "at a glance"
+figure rather than requiring an admin to have first configured an
+`SlaTarget` and generated a persisted `SlaReport` against it -- this
+dashboard figure must be available with zero configuration.
+`average_response_time_ms` is the same call's `AVG(response_time_ms)`
+column, not a second query.
+
+## 26. `GET /monitoring/devices` vs `GET /ztp/dashboard`: same data, two framings
+
+Both endpoints call the identical `ZtpMonitoringService.get_dashboard` --
+deliberately, per this module's "compose, don't duplicate" discipline. The
+former is that data framed for the monitoring dashboard's device tab
+(alongside health/alerts); the latter is the same data framed as the
+ZTP-specific provisioning-progress view. No second implementation exists.
+
+## 27. `GET /monitoring/services` was deliberately not added
+
+The module brief invited a "service/component health listing" endpoint and
+explicitly said to check whether Part 1 already exposed one under a
+different path before adding a duplicate. It did: `GET /monitoring/health`
+(Part 1) already returns exactly this -- the overall aggregate status plus
+every `ServiceHealth` row. Adding `GET /monitoring/services` would be a
+pure duplicate route serving identical data from the identical repository
+method, which the brief's own "don't duplicate, extend if so" instruction
+argues against. No such route exists in this part.
+
+## 28. RBAC permission-key reuse (Part 3)
+
+No new `PermissionModule` was added. `WS /monitoring/ws/dashboard`,
+`GET /monitoring/dashboard`, `GET /monitoring/devices`, and
+`GET /ztp/dashboard` all require `monitoring.read` -- the same
+observability surface Part 1 already gates this way (live status/health
+views). `WS /monitoring/ws/sessions` requires `guest_sessions.read` -- a
+live guest-session feed is conceptually a `GUEST_SESSIONS` concern (already
+seeded with a `read` action), not a platform `MONITORING` one.
+`GET /ztp/analytics` requires `analytics.read` -- statistics/success-rates/
+failure-reports/retry-projections are a reporting/analytics concern,
+matching `PermissionModule.ANALYTICS`'s own seeded semantic, distinct from
+the live-status `monitoring.read` surface the other three endpoints use.

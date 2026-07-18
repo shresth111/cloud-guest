@@ -185,6 +185,7 @@ from typing import Protocol
 
 from app.common.exceptions import CloudGuestError
 from app.domains.captive_portal.service import ResolvedPortalConfig
+from app.domains.monitoring.constants import RealtimeMessageType
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
 from app.domains.rbac.enums import AuditAction
@@ -302,6 +303,28 @@ class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
 
+class GuestSessionBroadcastProtocol(Protocol):
+    """The single method ``GuestService``'s ``login_via_otp``/
+    ``login_via_voucher`` hook needs from the real
+    ``app.domains.monitoring.service.MonitoringService`` (BE-011 Part 3's
+    Real-Time Engine) -- reused directly, never reimplemented. See
+    ``GuestService.__init__``'s docstring for the full write-up of why this
+    hook exists and why it is additive, not a behavior change."""
+
+    async def broadcast_guest_session_event(
+        self,
+        *,
+        message_type: RealtimeMessageType,
+        session_id: uuid.UUID,
+        guest_id: uuid.UUID,
+        router_id: uuid.UUID,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        auth_method: str,
+        is_new_guest: bool,
+    ) -> None: ...
+
+
 # ============================================================================
 # Read models
 # ============================================================================
@@ -351,7 +374,42 @@ class VoucherUsageResult:
 
 
 class GuestService:
-    """Core Guest business logic: login orchestration and session lifecycle."""
+    """Core Guest business logic: login orchestration and session lifecycle.
+
+    ## BE-011 Part 3 addition: an additive, optional real-time broadcast hook
+
+    ``monitoring_hook`` is a new, keyword-only, ``None``-by-default
+    constructor parameter (``GuestSessionBroadcastProtocol``, duck-typed
+    against ``app.domains.monitoring.service.MonitoringService`` -- the same
+    narrow-protocol composition style ``otp_service``/``voucher_service``/
+    ``captive_portal_service``/``router_lookup``/``audit_writer`` already
+    use). It is called from ``login_via_otp``/``login_via_voucher`` *after*
+    their existing session-creation logic has already succeeded (see
+    ``_broadcast_guest_session_started`` below) to publish a
+    ``guest_session_started`` event onto the monitoring domain's real-time
+    WebSocket channel (``WS /monitoring/ws/sessions``).
+
+    This is additive, not a behavior change, for three reasons: (1) the
+    parameter defaults to ``None`` and every existing caller/test that
+    constructs ``GuestService`` without it (including this module's own
+    existing test suite) behaves exactly as before -- no broadcast attempt
+    at all; (2) it changes no existing parameter, return type, or exception
+    contract of ``login_via_otp``/``login_via_voucher``; (3) the broadcast
+    call itself is wrapped in a try/except that only ever logs a warning,
+    never raises -- a monitoring-side failure (Redis down, a bug in the
+    hook) can never break a real guest's login, mirroring
+    ``NotificationService.dispatch_notification``'s identical resilience
+    posture for Part 2's alert notifications. This mirrors the discipline
+    ``app.domains.router_agent``'s existing heartbeat -> ``HeartbeatLog``
+    hook (BE-011 Part 1) already established for composing a *different*
+    domain's lifecycle event into this module -- small, additive,
+    documented, and never changing the composed-into method's own contract.
+    The one difference: that hook lives in ``router_agent``'s own endpoint
+    (a single call site), while this one lives inside ``GuestService``'s own
+    method bodies, since guest login is reachable through more than one
+    caller and every one of them should broadcast, not just whichever
+    endpoint happens to call it first.
+    """
 
     def __init__(
         self,
@@ -362,6 +420,7 @@ class GuestService:
         router_lookup: RouterLookupProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        monitoring_hook: GuestSessionBroadcastProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.otp_service = otp_service
@@ -369,6 +428,40 @@ class GuestService:
         self.captive_portal_service = captive_portal_service
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
+        self.monitoring_hook = monitoring_hook
+
+    async def _broadcast_guest_session_started(
+        self,
+        *,
+        session: GuestSession,
+        guest: Guest,
+        router: Router,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        auth_method: str,
+        is_new_guest: bool,
+    ) -> None:
+        """Best-effort, additive real-time broadcast -- see ``GuestService``'s
+        own docstring for the full write-up. A no-op when no
+        ``monitoring_hook`` was wired (the default); never raises."""
+        if self.monitoring_hook is None:
+            return
+        try:
+            await self.monitoring_hook.broadcast_guest_session_event(
+                message_type=RealtimeMessageType.GUEST_SESSION_STARTED,
+                session_id=session.id,
+                guest_id=guest.id,
+                router_id=router.id,
+                location_id=location_id,
+                organization_id=organization_id,
+                auth_method=auth_method,
+                is_new_guest=is_new_guest,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "guest_session_broadcast_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
 
     # ========================================================================
     # Login orchestration
@@ -441,6 +534,18 @@ class GuestService:
             ip_address=ip_address,
             data_limit_mb=None,
             session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
+        )
+        # BE-011 Part 3: additive, best-effort real-time broadcast -- see
+        # GuestService's own docstring. Fires only after the real session
+        # row above already exists.
+        await self._broadcast_guest_session_started(
+            session=session,
+            guest=guest,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+            auth_method=auth_method.value,
+            is_new_guest=is_new,
         )
         await self._bump_guest_visit(guest)
         await self._record_login_success(
@@ -527,6 +632,18 @@ class GuestService:
             ip_address=ip_address,
             data_limit_mb=batch.data_limit_mb,
             session_timeout_minutes=batch.validity_minutes,
+        )
+        # BE-011 Part 3: additive, best-effort real-time broadcast -- see
+        # GuestService's own docstring. Fires only after the real session
+        # row above already exists.
+        await self._broadcast_guest_session_started(
+            session=session,
+            guest=guest,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+            auth_method=GuestAuthMethod.VOUCHER.value,
+            is_new_guest=is_new,
         )
         await self._bump_guest_visit(guest)
         await self._record_login_success(

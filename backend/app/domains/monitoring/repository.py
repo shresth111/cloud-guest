@@ -38,12 +38,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
-from app.database.utils.pagination import PaginationMeta
+from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 from app.domains.guest.models import GuestSession, RadiusNasClient
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.models import Router
+from app.domains.router_provisioning.constants import ProvisioningJobStatus
 from app.domains.router_provisioning.models import (
     ProvisioningJob,
+    RouterEnrollmentRequest,
     RouterEvent,
     RouterHealthSnapshot,
 )
@@ -317,6 +319,84 @@ class MonitoringRepositoryProtocol(Protocol):
         start: datetime,
         end: datetime,
     ) -> float | None: ...
+
+    # -- ZTP monitoring dashboard / analytics (BE-011 Part 3) -----------------
+    async def list_all_enrollment_requests(self) -> list[RouterEnrollmentRequest]: ...
+
+    async def get_enrollment_for_router(
+        self, router_id: uuid.UUID
+    ) -> RouterEnrollmentRequest | None: ...
+
+    async def get_latest_provisioning_job_for_router(
+        self, router_id: uuid.UUID
+    ) -> ProvisioningJob | None: ...
+
+    async def count_pending_enrollment_requests(self) -> int: ...
+
+    async def count_routers_by_status(
+        self, *, organization_id: uuid.UUID | None
+    ) -> list[tuple[str, int]]: ...
+
+    async def compute_provisioning_job_outcome_counts(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+    ) -> tuple[int, int]: ...
+
+    async def list_provisioning_failure_counts(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+    ) -> list[tuple[str, int]]: ...
+
+    async def list_provisioning_failure_samples(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        limit: int,
+    ) -> list[ProvisioningJob]: ...
+
+    async def list_retry_jobs(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[ProvisioningJob], PaginationMeta]: ...
+
+    async def compute_activation_duration_stats(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+    ) -> tuple[float | None, int]: ...
+
+    async def compute_alert_counts_by_severity(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+    ) -> list[tuple[str, int]]: ...
+
+    async def compute_alert_counts_by_status(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+    ) -> list[tuple[str, int]]: ...
+
+    async def compute_health_status_counts(
+        self, *, start: datetime, end: datetime
+    ) -> list[tuple[str, str, int]]: ...
 
 
 class MonitoringRepository:
@@ -937,6 +1017,332 @@ class MonitoringRepository:
             ).where(Router.organization_id == organization_id)
         result = await self.session.execute(statement)
         return result.scalar_one_or_none()
+
+    # -- ZTP monitoring dashboard / analytics (BE-011 Part 3) -----------------
+    #
+    # Every query here is a read-only SELECT against router_provisioning's/
+    # router's own already-defined models -- the same "compose, don't
+    # duplicate, don't touch the owning domain's files" precedent this
+    # repository already established above for RadiusNasClient/WireGuardPeer/
+    # RouterEvent/RouterHealthSnapshot/ProvisioningJob.
+
+    async def list_all_enrollment_requests(self) -> list[RouterEnrollmentRequest]:
+        """Unpaginated -- mirrors ``list_routers``/``list_wireguard_peers``'s
+        identical "small enough platform-wide table, fetch it all" precedent.
+        Used to surface enrollment requests that have not yet produced a
+        ``Router`` row (``PENDING``/``REJECTED``) on the ZTP dashboard."""
+        statement = select(RouterEnrollmentRequest).where(
+            RouterEnrollmentRequest.is_deleted.is_(False)
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def get_enrollment_for_router(
+        self, router_id: uuid.UUID
+    ) -> RouterEnrollmentRequest | None:
+        statement = (
+            select(RouterEnrollmentRequest)
+            .where(
+                RouterEnrollmentRequest.approved_router_id == router_id,
+                RouterEnrollmentRequest.is_deleted.is_(False),
+            )
+            .limit(1)
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
+
+    async def get_latest_provisioning_job_for_router(
+        self, router_id: uuid.UUID
+    ) -> ProvisioningJob | None:
+        statement = (
+            select(ProvisioningJob)
+            .where(
+                ProvisioningJob.router_id == router_id,
+                ProvisioningJob.is_deleted.is_(False),
+            )
+            .order_by(ProvisioningJob.scheduled_at.desc())
+            .limit(1)
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
+
+    async def count_pending_enrollment_requests(self) -> int:
+        statement = (
+            select(func.count())
+            .select_from(RouterEnrollmentRequest)
+            .where(
+                RouterEnrollmentRequest.is_deleted.is_(False),
+                RouterEnrollmentRequest.status == "pending",
+            )
+        )
+        result = await self.session.execute(statement)
+        return int(result.scalar_one())
+
+    async def count_routers_by_status(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[tuple[str, int]]:
+        """Real SQL ``GROUP BY`` -- the module brief's "Device Statistics:
+        router counts by RouterStatus" bullet."""
+        statement = (
+            select(Router.status, func.count())
+            .where(Router.is_deleted.is_(False))
+            .group_by(Router.status)
+        )
+        if organization_id is not None:
+            statement = statement.where(Router.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return [(row[0], int(row[1])) for row in result.all()]
+
+    async def compute_provisioning_job_outcome_counts(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+    ) -> tuple[int, int]:
+        """Returns ``(succeeded_count, terminal_count)`` where
+        ``terminal_count`` is succeeded+failed jobs scheduled in
+        ``[start, end]`` (queued/running jobs are still in flight, excluded
+        from a success-*rate* denominator by design -- see
+        ``service.ZtpMonitoringService.get_analytics``'s docstring for the
+        full denominator-choice write-up). Real SQL ``COUNT`` aggregates."""
+        conditions = [
+            ProvisioningJob.is_deleted.is_(False),
+            ProvisioningJob.scheduled_at >= start,
+            ProvisioningJob.scheduled_at <= end,
+            ProvisioningJob.status.in_(
+                [
+                    ProvisioningJobStatus.SUCCEEDED.value,
+                    ProvisioningJobStatus.FAILED.value,
+                ]
+            ),
+        ]
+        base = select(ProvisioningJob.id).where(*conditions)
+        if organization_id is not None:
+            base = base.join(Router, Router.id == ProvisioningJob.router_id).where(
+                Router.organization_id == organization_id
+            )
+
+        terminal_statement = select(func.count()).select_from(base.subquery())
+        terminal_count = int(
+            (await self.session.execute(terminal_statement)).scalar_one()
+        )
+
+        succeeded_base = base.where(
+            ProvisioningJob.status == ProvisioningJobStatus.SUCCEEDED.value
+        )
+        succeeded_statement = select(func.count()).select_from(
+            succeeded_base.subquery()
+        )
+        succeeded_count = int(
+            (await self.session.execute(succeeded_statement)).scalar_one()
+        )
+        return succeeded_count, terminal_count
+
+    async def list_provisioning_failure_counts(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+    ) -> list[tuple[str, int]]:
+        """Real SQL ``GROUP BY job_type`` over ``FAILED`` jobs -- the module
+        brief's "Provisioning Failure Reports (grouped by
+        ProvisioningJobType)" bullet."""
+        statement = (
+            select(ProvisioningJob.job_type, func.count())
+            .where(
+                ProvisioningJob.is_deleted.is_(False),
+                ProvisioningJob.status == ProvisioningJobStatus.FAILED.value,
+                ProvisioningJob.scheduled_at >= start,
+                ProvisioningJob.scheduled_at <= end,
+            )
+            .group_by(ProvisioningJob.job_type)
+        )
+        if organization_id is not None:
+            statement = statement.join(
+                Router, Router.id == ProvisioningJob.router_id
+            ).where(Router.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return [(row[0], int(row[1])) for row in result.all()]
+
+    async def list_provisioning_failure_samples(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+        limit: int,
+    ) -> list[ProvisioningJob]:
+        """A small, most-recent-first sample of individual failed jobs (with
+        their real ``error_message``) -- real aggregate counts come from
+        ``list_provisioning_failure_counts``; this is deliberately *not* an
+        aggregate over free-form ``error_message`` text (there is no
+        meaningful ``GROUP BY`` over arbitrary error strings)."""
+        statement = select(ProvisioningJob).where(
+            ProvisioningJob.is_deleted.is_(False),
+            ProvisioningJob.status == ProvisioningJobStatus.FAILED.value,
+            ProvisioningJob.scheduled_at >= start,
+            ProvisioningJob.scheduled_at <= end,
+        )
+        if organization_id is not None:
+            statement = statement.join(
+                Router, Router.id == ProvisioningJob.router_id
+            ).where(Router.organization_id == organization_id)
+        statement = statement.order_by(ProvisioningJob.scheduled_at.desc()).limit(limit)
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_retry_jobs(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[ProvisioningJob], PaginationMeta]:
+        """The module brief's "Retry Dashboard (jobs with attempts>0)"
+        bullet, ordered nearest-to-exhaustion first (``max_attempts -
+        attempts`` ascending) so the jobs most likely to fail permanently
+        next surface at the top."""
+        params = PageParams(page=page, page_size=page_size)
+        conditions = [
+            ProvisioningJob.is_deleted.is_(False),
+            ProvisioningJob.attempts > 0,
+        ]
+        if organization_id is not None:
+            base_join = (Router, Router.id == ProvisioningJob.router_id)
+        else:
+            base_join = None
+
+        count_statement = (
+            select(func.count()).select_from(ProvisioningJob).where(*conditions)
+        )
+        if base_join is not None:
+            count_statement = count_statement.join(*base_join).where(
+                Router.organization_id == organization_id
+            )
+        total_items = int((await self.session.execute(count_statement)).scalar_one())
+
+        statement = select(ProvisioningJob).where(*conditions)
+        if base_join is not None:
+            statement = statement.join(*base_join).where(
+                Router.organization_id == organization_id
+            )
+        statement = statement.order_by(
+            (ProvisioningJob.max_attempts - ProvisioningJob.attempts).asc(),
+            ProvisioningJob.scheduled_at.desc(),
+        )
+        result = await self.session.execute(paginate(statement, params))
+        rows = list(result.scalars().all())
+        return rows, PaginationMeta.from_total(params, total_items)
+
+    async def compute_activation_duration_stats(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+    ) -> tuple[float | None, int]:
+        """Returns ``(average_seconds, sample_size)`` for
+        ``RouterEnrollmentRequest.reviewed_at`` (approval) -> the router's
+        first ``initial_config`` :class:`~.models.ProvisioningJob`
+        ``completed_at`` (succeeded) -- the closest recoverable proxy for
+        "time from approval to activation" this codebase's actual persisted
+        data supports. See ``service.ZtpMonitoringService.get_analytics``'s
+        docstring for why this is an honest *approximation*, not a literal
+        "time to first ONLINE" (no table anywhere records the timestamp of
+        a router's first ``ONLINE`` transition -- ``Router.last_seen_at`` is
+        overwritten on every heartbeat, and neither
+        ``RouterHealthSnapshot`` nor ``RouterEvent`` record status-transition
+        moments). Real SQL ``AVG``/``COUNT`` aggregate, never a Python-side
+        loop."""
+        conditions = [
+            ProvisioningJob.is_deleted.is_(False),
+            ProvisioningJob.job_type == "initial_config",
+            ProvisioningJob.status == ProvisioningJobStatus.SUCCEEDED.value,
+            ProvisioningJob.completed_at.is_not(None),
+            ProvisioningJob.completed_at >= start,
+            ProvisioningJob.completed_at <= end,
+            RouterEnrollmentRequest.approved_router_id == ProvisioningJob.router_id,
+            RouterEnrollmentRequest.reviewed_at.is_not(None),
+            RouterEnrollmentRequest.is_deleted.is_(False),
+        ]
+        statement = select(
+            func.avg(
+                func.extract(
+                    "epoch",
+                    ProvisioningJob.completed_at - RouterEnrollmentRequest.reviewed_at,
+                )
+            ),
+            func.count(ProvisioningJob.id),
+        ).where(*conditions)
+        if organization_id is not None:
+            statement = statement.join(
+                Router, Router.id == ProvisioningJob.router_id
+            ).where(Router.organization_id == organization_id)
+        result = (await self.session.execute(statement)).one()
+        average_seconds = result[0]
+        sample_size = int(result[1] or 0)
+        return average_seconds, sample_size
+
+    async def compute_alert_counts_by_severity(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+    ) -> list[tuple[str, int]]:
+        statement = (
+            select(Alert.severity, func.count())
+            .where(
+                Alert.is_deleted.is_(False),
+                Alert.triggered_at >= start,
+                Alert.triggered_at <= end,
+            )
+            .group_by(Alert.severity)
+        )
+        if organization_id is not None:
+            statement = statement.where(Alert.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return [(row[0], int(row[1])) for row in result.all()]
+
+    async def compute_alert_counts_by_status(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+    ) -> list[tuple[str, int]]:
+        statement = (
+            select(Alert.status, func.count())
+            .where(
+                Alert.is_deleted.is_(False),
+                Alert.triggered_at >= start,
+                Alert.triggered_at <= end,
+            )
+            .group_by(Alert.status)
+        )
+        if organization_id is not None:
+            statement = statement.where(Alert.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return [(row[0], int(row[1])) for row in result.all()]
+
+    async def compute_health_status_counts(
+        self, *, start: datetime, end: datetime
+    ) -> list[tuple[str, str, int]]:
+        """The module brief's "Health Statistics: uptime/downtime counts per
+        component" bullet -- real SQL ``GROUP BY (component, status)``."""
+        statement = (
+            select(HealthCheck.component, HealthCheck.status, func.count())
+            .where(
+                HealthCheck.is_deleted.is_(False),
+                HealthCheck.checked_at >= start,
+                HealthCheck.checked_at <= end,
+            )
+            .group_by(HealthCheck.component, HealthCheck.status)
+        )
+        result = await self.session.execute(statement)
+        return [(row[0], row[1], int(row[2])) for row in result.all()]
 
 
 __all__ = [

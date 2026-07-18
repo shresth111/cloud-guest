@@ -52,6 +52,13 @@ __all__ = [
     "SlaReportResponse",
     "SlaReportListResponse",
     "SlaReportGenerateRequest",
+    "RouterLifecycleEntryResponse",
+    "ZtpDashboardResponse",
+    "ProvisioningFailureBreakdownResponse",
+    "ProvisioningFailureSampleResponse",
+    "RetryJobEntryResponse",
+    "ZtpAnalyticsResponse",
+    "PlatformDashboardResponse",
 ]
 
 
@@ -382,3 +389,104 @@ class SlaReportListResponse(BaseModel):
 
 class SlaReportGenerateRequest(BaseModel):
     period_days: int | None = Field(default=None, gt=0)
+
+
+# ============================================================================
+# ZTP Monitoring Dashboard + Platform Dashboard Statistics (BE-011 Part 3)
+# ============================================================================
+
+
+class RouterLifecycleEntryResponse(BaseModel):
+    router_id: uuid.UUID | None
+    enrollment_id: uuid.UUID | None
+    serial_number: str
+    mac_address: str | None
+    model: str
+    name: str | None
+    organization_id: uuid.UUID | None
+    location_id: uuid.UUID | None
+    router_status: str | None
+    enrollment_status: str | None
+    lifecycle_stage: str
+    last_seen_at: datetime | None
+    latest_job_type: str | None
+    latest_job_status: str | None
+    latest_job_attempts: int | None
+    latest_job_max_attempts: int | None
+
+
+class ZtpDashboardResponse(BaseModel):
+    stage_counts: dict[str, int]
+    pending_enrollment_count: int
+    items: list[RouterLifecycleEntryResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+class ProvisioningFailureBreakdownResponse(BaseModel):
+    job_type: str
+    failure_count: int
+
+
+class ProvisioningFailureSampleResponse(BaseModel):
+    job_id: uuid.UUID
+    router_id: uuid.UUID
+    job_type: str
+    attempts: int
+    max_attempts: int
+    error_message: str | None
+    scheduled_at: datetime
+
+
+class RetryJobEntryResponse(BaseModel):
+    job_id: uuid.UUID
+    router_id: uuid.UUID
+    job_type: str
+    status: str
+    attempts: int
+    max_attempts: int
+    attempts_remaining: int
+    scheduled_at: datetime
+
+
+class ZtpAnalyticsResponse(BaseModel):
+    success_rate_percentage: float | None = Field(
+        description=(
+            "succeeded ProvisioningJobs / (succeeded + failed) ProvisioningJobs "
+            "in the requested window -- see docs/monitoring/FLOW.md for the "
+            "full denominator-choice write-up. null when zero terminal jobs "
+            "exist in the window."
+        )
+    )
+    succeeded_job_count: int
+    terminal_job_count: int
+    failure_breakdown: list[ProvisioningFailureBreakdownResponse]
+    failure_samples: list[ProvisioningFailureSampleResponse]
+    retry_jobs: list[RetryJobEntryResponse]
+    average_activation_seconds: float | None = Field(
+        description=(
+            "Approximation: average(initial_config ProvisioningJob.completed_at "
+            "- RouterEnrollmentRequest.reviewed_at). NOT a literal "
+            "time-to-first-ONLINE measurement -- no table records that "
+            "timestamp. See docs/monitoring/FLOW.md."
+        )
+    )
+    activation_sample_size: int
+
+
+class PlatformDashboardResponse(BaseModel):
+    overall_health_status: str
+    health_components: list[ServiceHealthResponse]
+    alert_counts_by_severity: dict[str, int]
+    alert_counts_by_status: dict[str, int]
+    device_counts_by_status: dict[str, int]
+    lifecycle_stage_counts: dict[str, int]
+    pending_enrollment_count: int
+    average_response_time_ms: float | None
+    availability_percentage: float | None
+    visitors: int | None
+    unique_guests: int | None

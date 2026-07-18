@@ -391,6 +391,94 @@ INCIDENT_STATUS_TRANSITIONS: dict[IncidentStatus, frozenset[IncidentStatus]] = {
 DEFAULT_SLA_TARGET_PERCENTAGE = 99.9
 DEFAULT_SLA_MEASUREMENT_WINDOW_DAYS = 30
 
+# ============================================================================
+# Real-Time (WebSocket + Redis pub/sub) -- BE-011 Part 3
+# ============================================================================
+
+# The single Redis pub/sub channel every real-time-producing write path
+# (Health Engine status transitions, Alert Engine trigger/resolve, the
+# guest-session-start hook) publishes to, and every WebSocket connection
+# (``router.py``'s ``/monitoring/ws/dashboard``/``/monitoring/ws/sessions``)
+# subscribes to. One shared channel, not one channel per message type --
+# see ``router.py``'s module docstring for the full "one channel, two
+# purpose-filtered endpoints" design write-up.
+MONITORING_LIVE_CHANNEL = "monitoring:live"
+
+
+class RealtimeMessageType(StrEnum):
+    """The closed set of ``"type"`` values a message published to
+    :data:`MONITORING_LIVE_CHANNEL` carries -- each WebSocket endpoint
+    filters the shared channel down to the subset it cares about (see
+    ``router.py``'s ``_DASHBOARD_MESSAGE_TYPES``/``_SESSION_MESSAGE_TYPES``).
+
+    ``GUEST_SESSION_ENDED`` is a real, first-class member with **no current
+    writer** -- the same honest "defined, wired into every consumer, not yet
+    produced" posture ``HeartbeatComponentType.WIREGUARD_PEER``/
+    ``HealthComponent.CELERY`` already establish in this module. Producing
+    it would require a hook into ``GuestService``'s session-end methods
+    (disconnect/terminate/expire), which this part's directory rule does not
+    license (exactly one guest-domain hook was budgeted, spent on the
+    login-start seam -- see ``app.domains.guest.service.GuestService``'s
+    updated docstring). A future part may add that hook the same way.
+    """
+
+    HEALTH_TRANSITION = "health_transition"
+    ALERT_TRIGGERED = "alert_triggered"
+    ALERT_RESOLVED = "alert_resolved"
+    GUEST_SESSION_STARTED = "guest_session_started"
+    GUEST_SESSION_ENDED = "guest_session_ended"
+
+
+# ============================================================================
+# ZTP Monitoring Dashboard -- router lifecycle stage (BE-011 Part 3)
+# ============================================================================
+
+
+class RouterLifecycleStage(StrEnum):
+    """A **derived, presentation-layer** label synthesizing
+    ``app.domains.router_provisioning.constants.EnrollmentStatus`` +
+    ``app.domains.router.enums.RouterStatus`` +
+    ``app.domains.router_provisioning.constants.ProvisioningJobStatus`` (plus
+    heartbeat staleness) into the module brief's idealized 9-state ZTP
+    dashboard vocabulary. See
+    ``validators.compute_lifecycle_stage`` for the full, exact mapping table
+    and ``docs/monitoring/FLOW.md`` for the write-up of why this is computed
+    fresh on every read rather than persisted anywhere: every one of its
+    inputs already has its own authoritative, independently-owned column in
+    its own domain (``RouterEnrollmentRequest.status``, ``Router.status``,
+    ``ProvisioningJob.status``/``attempts``, ``Router.last_seen_at``) --
+    storing a tenth, derived copy would create a second source of truth that
+    can drift the moment any one of those four inputs changes without this
+    label being recomputed in lockstep, for a value that costs nothing to
+    recompute on read.
+    """
+
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    APPROVED = "approved"
+    PROVISIONING = "provisioning"
+    PROVISIONED = "provisioned"
+    ONLINE = "online"
+    OFFLINE = "offline"
+    WARNING = "warning"
+    FAILED = "failed"
+
+
+# How long since ``Router.last_seen_at`` before an ``ONLINE`` router's
+# lifecycle stage degrades to ``WARNING`` (heartbeat getting stale) and then
+# ``OFFLINE`` (heartbeat long gone) -- see ``validators.compute_lifecycle_stage``.
+# Mirrors ``Settings.wireguard_handshake_stale_after_minutes``'s identical
+# "roughly double the expected keepalive cadence" reasoning for the WARNING
+# threshold; OFFLINE is set more generously (three missed heartbeats' worth)
+# since a single delayed check-in should read as "degrading", not instantly
+# "down".
+ROUTER_HEARTBEAT_WARNING_STALE_MINUTES = 5
+ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES = 15
+
+DEFAULT_ZTP_PAGE = 1
+DEFAULT_ZTP_PAGE_SIZE = 25
+DEFAULT_FAILURE_SAMPLE_LIMIT = 5
+
 __all__ = [
     "HealthComponent",
     "HealthStatus",
@@ -427,4 +515,12 @@ __all__ = [
     "INCIDENT_STATUS_TRANSITIONS",
     "DEFAULT_SLA_TARGET_PERCENTAGE",
     "DEFAULT_SLA_MEASUREMENT_WINDOW_DAYS",
+    "MONITORING_LIVE_CHANNEL",
+    "RealtimeMessageType",
+    "RouterLifecycleStage",
+    "ROUTER_HEARTBEAT_WARNING_STALE_MINUTES",
+    "ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES",
+    "DEFAULT_ZTP_PAGE",
+    "DEFAULT_ZTP_PAGE_SIZE",
+    "DEFAULT_FAILURE_SAMPLE_LIMIT",
 ]

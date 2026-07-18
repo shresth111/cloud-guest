@@ -9,12 +9,25 @@ filesystem.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
+
+from app.domains.router.enums import RouterStatus
+from app.domains.router.models import Router
+from app.domains.router_provisioning.constants import (
+    EnrollmentStatus,
+    ProvisioningJobStatus,
+)
+from app.domains.router_provisioning.models import (
+    ProvisioningJob,
+    RouterEnrollmentRequest,
+)
 
 from .constants import (
     ALERT_STATUS_TRANSITIONS,
     ALERT_TARGET_ROUTER,
     INCIDENT_STATUS_TRANSITIONS,
+    ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES,
+    ROUTER_HEARTBEAT_WARNING_STALE_MINUTES,
     STORAGE_DEGRADED_USED_PERCENT,
     STORAGE_UNHEALTHY_USED_PERCENT,
     AlertStatus,
@@ -23,6 +36,7 @@ from .constants import (
     HealthStatus,
     IncidentStatus,
     NotificationChannelType,
+    RouterLifecycleStage,
     ThresholdMetric,
     ThresholdOperator,
 )
@@ -236,6 +250,142 @@ def validate_sla_target_config(
         )
 
 
+# ============================================================================
+# ZTP Monitoring Dashboard -- router lifecycle stage (BE-011 Part 3)
+# ============================================================================
+
+
+def _heartbeat_staleness_minutes(
+    last_seen_at: datetime | None, moment: datetime
+) -> float | None:
+    """Minutes since ``last_seen_at``, or ``None`` if a router has never
+    once checked in (``last_seen_at IS NULL``) -- callers treat ``None`` the
+    same as "maximally stale"."""
+    if last_seen_at is None:
+        return None
+    return (moment - last_seen_at).total_seconds() / 60.0
+
+
+def compute_lifecycle_stage(
+    *,
+    router: Router | None,
+    enrollment: RouterEnrollmentRequest | None,
+    latest_job: ProvisioningJob | None,
+    now: datetime | None = None,
+) -> RouterLifecycleStage:
+    """Derives one of the module brief's 9 idealized ZTP lifecycle labels
+    (:class:`~.constants.RouterLifecycleStage`) from three other domains'
+    already-authoritative signals -- a pure, side-effect-free
+    classification (mirrors ``classify_storage_health``'s identical
+    "pure function the service layer calls" shape), never persisted (see
+    ``RouterLifecycleStage``'s own docstring for why).
+
+    ## Full mapping table
+
+    Evaluated top-to-bottom; the first matching rule wins.
+
+    1. No ``Router`` row yet, no ``RouterEnrollmentRequest`` either
+       -> ``PENDING``.
+    2. No ``Router`` row yet, enrollment ``status=PENDING`` -> ``PENDING``.
+    3. No ``Router`` row yet, enrollment ``status=REJECTED`` -> ``FAILED``.
+    4. No ``Router`` row yet, enrollment ``status=APPROVED`` (data anomaly:
+       approved but the linked router is unresolvable) -> ``WARNING``.
+    5. ``Router.status=SUSPENDED`` -> ``WARNING``.
+    6. ``Router.status=PENDING_PROVISIONING``, no ``ProvisioningJob`` yet
+       -> ``APPROVED``.
+    7. ``Router.status=PENDING_PROVISIONING``, latest job
+       ``QUEUED``/``RUNNING``/``SUCCEEDED`` -> ``CLAIMED``.
+    8. ``Router.status=PENDING_PROVISIONING``, latest job ``FAILED``,
+       ``attempts < max_attempts`` -> ``WARNING``.
+    9. ``Router.status=PENDING_PROVISIONING``, latest job ``FAILED``,
+       ``attempts >= max_attempts`` -> ``FAILED``.
+    10. ``Router.status=PROVISIONING``, no job or latest job
+        ``QUEUED``/``RUNNING`` -> ``PROVISIONING``.
+    11. ``Router.status=PROVISIONING``, latest job ``SUCCEEDED``
+        -> ``PROVISIONED``.
+    12. ``Router.status=PROVISIONING``, latest job ``FAILED``,
+        ``attempts < max_attempts`` -> ``WARNING``.
+    13. ``Router.status=PROVISIONING``, latest job ``FAILED``,
+        ``attempts >= max_attempts`` -> ``FAILED``.
+    14. ``Router.status=OFFLINE`` -> ``OFFLINE``.
+    15. ``Router.status=ONLINE``, heartbeat fresh (below
+        ``ROUTER_HEARTBEAT_WARNING_STALE_MINUTES``) -> ``ONLINE``.
+    16. ``Router.status=ONLINE``, heartbeat stale (at/above the warning
+        threshold, below the offline threshold) -> ``WARNING``.
+    17. ``Router.status=ONLINE``, heartbeat very stale (at/above
+        ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES``) or ``last_seen_at IS
+        NULL`` -> ``OFFLINE``.
+    18. ``Router.status=DECOMMISSIONED`` (excluded from the active
+        dashboard listing by the caller -- see
+        ``service.ZtpMonitoringService.get_dashboard``; reachable here only
+        defensively) -> ``WARNING``.
+
+    ``CLAIMED`` (row 7) sits between ``APPROVED`` (nothing dispatched yet)
+    and ``PROVISIONING`` (``Router.status`` itself has flipped, meaning the
+    device already presented its provisioning token) -- it represents "an
+    initial-config job has been queued/picked up for this router, but the
+    device has not yet checked in with its provisioning token," the one
+    genuinely distinct sub-phase this system's data can actually
+    distinguish within the ``PENDING_PROVISIONING`` window.
+    """
+    moment = now or datetime.now(UTC)
+
+    if router is None:
+        if enrollment is None:
+            return RouterLifecycleStage.PENDING
+        if enrollment.status == EnrollmentStatus.REJECTED.value:
+            return RouterLifecycleStage.FAILED
+        if enrollment.status == EnrollmentStatus.APPROVED.value:
+            # Data anomaly: approved but the linked router record could not
+            # be resolved by the caller. Surfaced as WARNING (needs human
+            # attention), never silently reported as a healthy stage.
+            return RouterLifecycleStage.WARNING
+        return RouterLifecycleStage.PENDING
+
+    status = RouterStatus(router.status)
+
+    if status == RouterStatus.SUSPENDED:
+        return RouterLifecycleStage.WARNING
+
+    if status == RouterStatus.PENDING_PROVISIONING:
+        if latest_job is None:
+            return RouterLifecycleStage.APPROVED
+        job_status = ProvisioningJobStatus(latest_job.status)
+        if job_status == ProvisioningJobStatus.FAILED:
+            if latest_job.attempts >= latest_job.max_attempts:
+                return RouterLifecycleStage.FAILED
+            return RouterLifecycleStage.WARNING
+        return RouterLifecycleStage.CLAIMED
+
+    if status == RouterStatus.PROVISIONING:
+        if latest_job is None:
+            return RouterLifecycleStage.PROVISIONING
+        job_status = ProvisioningJobStatus(latest_job.status)
+        if job_status == ProvisioningJobStatus.SUCCEEDED:
+            return RouterLifecycleStage.PROVISIONED
+        if job_status == ProvisioningJobStatus.FAILED:
+            if latest_job.attempts >= latest_job.max_attempts:
+                return RouterLifecycleStage.FAILED
+            return RouterLifecycleStage.WARNING
+        return RouterLifecycleStage.PROVISIONING
+
+    if status == RouterStatus.OFFLINE:
+        return RouterLifecycleStage.OFFLINE
+
+    if status == RouterStatus.ONLINE:
+        staleness = _heartbeat_staleness_minutes(router.last_seen_at, moment)
+        if staleness is None or staleness >= ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES:
+            return RouterLifecycleStage.OFFLINE
+        if staleness >= ROUTER_HEARTBEAT_WARNING_STALE_MINUTES:
+            return RouterLifecycleStage.WARNING
+        return RouterLifecycleStage.ONLINE
+
+    # DECOMMISSIONED -- excluded from the active ZTP dashboard listing by the
+    # caller (see service.ZtpMonitoringService.get_dashboard); reachable
+    # only if a caller passes a decommissioned router directly.
+    return RouterLifecycleStage.WARNING  # pragma: no cover -- defensive only
+
+
 __all__ = [
     "validate_date_range",
     "classify_storage_health",
@@ -245,4 +395,5 @@ __all__ = [
     "validate_notification_channel_config",
     "validate_incident_status_transition",
     "validate_sla_target_config",
+    "compute_lifecycle_stage",
 ]

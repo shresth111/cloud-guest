@@ -76,6 +76,7 @@ from app.domains.otp.service import (
 )
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
+from app.domains.router_provisioning.constants import EnrollmentStatus
 from app.domains.router_provisioning.models import RouterEvent
 
 from .constants import (
@@ -83,14 +84,18 @@ from .constants import (
     ALERT_TARGET_ROUTER,
     AUDIT_LOG_SOURCE_DOMAIN,
     DEFAULT_EVENT_TIMELINE_LIMIT,
+    DEFAULT_FAILURE_SAMPLE_LIMIT,
     DEFAULT_LIST_PAGE,
     DEFAULT_LIST_PAGE_SIZE,
+    DEFAULT_ZTP_PAGE,
+    DEFAULT_ZTP_PAGE_SIZE,
     EVENT_TYPE_COMPONENT_DEGRADED,
     EVENT_TYPE_COMPONENT_RECOVERED,
     EVENT_TYPE_COMPONENT_UNHEALTHY,
     FREERADIUS_ACTIVITY_STALE_MINUTES,
     HTTP_NOTIFICATION_TIMEOUT_SECONDS,
     MAX_EVENT_TIMELINE_LIMIT,
+    MONITORING_LIVE_CHANNEL,
     ROUTER_EVENT_SOURCE_DOMAIN,
     SOURCE_DOMAIN,
     AlertStatus,
@@ -103,6 +108,8 @@ from .constants import (
     IncidentStatus,
     NotificationChannelType,
     NotificationStatus,
+    RealtimeMessageType,
+    RouterLifecycleStage,
     ThresholdOperator,
 )
 from .events import (
@@ -142,6 +149,7 @@ from .repository import MonitoringRepositoryProtocol
 from .validators import (
     classify_storage_health,
     compare_threshold,
+    compute_lifecycle_stage,
     validate_alert_rule_condition_config,
     validate_alert_status_transition,
     validate_date_range,
@@ -179,6 +187,90 @@ class WireGuardHealthLookupProtocol(Protocol):
     def compute_health_status(
         self, peer: object, *, now: datetime | None = None
     ) -> object: ...
+
+
+class _VisitorSummaryProtocol(Protocol):
+    """The two attributes ``PlatformDashboardService`` reads off whatever
+    ``GuestVisitorLookupProtocol.get_summary`` returns -- structurally
+    satisfied by the real ``app.domains.guest.service.GuestAnalyticsSummary``
+    without importing that class (mirrors ``AuthLookupProtocol``/
+    ``WireGuardHealthLookupProtocol``'s identical "duck-typed, no hard
+    import of the concrete class" discipline)."""
+
+    visitors: int
+    unique_guests: int
+
+
+class GuestVisitorLookupProtocol(Protocol):
+    """The single method ``PlatformDashboardService.get_dashboard_statistics``
+    needs from the real ``app.domains.guest.service.GuestAnalyticsService``
+    -- reused directly (its own real SQL-aggregate queries), never
+    reimplemented. See that method's docstring for why visitor/unique-guest
+    counts are only populated when an ``organization_id`` is supplied (guest
+    analytics are inherently tenant-scoped upstream)."""
+
+    async def get_summary(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+    ) -> _VisitorSummaryProtocol: ...
+
+
+async def _publish_live_message(
+    redis_client: Redis | None,
+    message_type: RealtimeMessageType,
+    payload: dict[str, object],
+) -> None:
+    """Best-effort ``PUBLISH`` to :data:`~.constants.MONITORING_LIVE_CHANNEL`
+    -- the single fan-out point every real-time write path (health-status
+    transitions, alert trigger/resolve, the guest-session-start hook) calls
+    *after* its own real database write already succeeded (never instead
+    of, never before). Deliberately **never raises**: a Redis publish
+    failure (Redis down, a transient network blip) must never roll back or
+    otherwise affect the DB write it is riding along with -- exactly the
+    same resilience posture ``NotificationService.dispatch_notification``
+    already establishes for Part 2's alert notifications (a failure is
+    logged, not propagated). Every connected WebSocket client simply misses
+    that one update; the next state-changing event (or a fresh
+    HTTP ``GET`` against the same data) still reflects reality, so nothing
+    is silently lost from the actual source of truth, only from the live
+    stream."""
+    if redis_client is None:
+        return
+    try:
+        message = {
+            "type": message_type.value,
+            "payload": payload,
+            "occurred_at": datetime.now(UTC).isoformat(),
+        }
+        await redis_client.publish(
+            MONITORING_LIVE_CHANNEL, json.dumps(message, default=str)
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "monitoring_live_publish_failed",
+            extra={"message_type": message_type.value, "error": str(exc)},
+        )
+
+
+def _compute_overall_health_status(rows: list[ServiceHealth]) -> HealthStatus:
+    """See module docstring's "overall dashboard status excludes
+    permanently-``UNKNOWN`` components" write-up. Extracted to module scope
+    (from what was ``MonitoringService._aggregate_status``) so
+    ``PlatformDashboardService`` can reuse the identical aggregate-status
+    rule without a second, potentially-drifting implementation."""
+    statuses = {row.status for row in rows}
+    if HealthStatus.UNHEALTHY.value in statuses:
+        return HealthStatus.UNHEALTHY
+    if HealthStatus.DEGRADED.value in statuses:
+        return HealthStatus.DEGRADED
+    known_statuses = statuses - {HealthStatus.UNKNOWN.value}
+    if not known_statuses:
+        return HealthStatus.UNKNOWN
+    return HealthStatus.HEALTHY
 
 
 # ============================================================================
@@ -681,6 +773,20 @@ class MonitoringService:
             await self._record_transition_event(
                 result, previous_status=previous_status, failure_count=failure_count
             )
+            # Real-Time (BE-011 Part 3): publish this genuine status
+            # transition to MONITORING_LIVE_CHANNEL, after the DB write
+            # above has already succeeded -- see _publish_live_message's
+            # own docstring for the "never raises" resilience contract.
+            await _publish_live_message(
+                self.redis_client,
+                RealtimeMessageType.HEALTH_TRANSITION,
+                payload={
+                    "component": result.component.value,
+                    "previous_status": previous_status,
+                    "new_status": result.status.value,
+                    "consecutive_failure_count": failure_count,
+                },
+            )
 
     async def _record_transition_event(
         self,
@@ -727,16 +833,11 @@ class MonitoringService:
 
     def _aggregate_status(self, rows: list[ServiceHealth]) -> HealthStatus:
         """See module docstring's "overall dashboard status excludes
-        permanently-``UNKNOWN`` components" write-up."""
-        statuses = {row.status for row in rows}
-        if HealthStatus.UNHEALTHY.value in statuses:
-            return HealthStatus.UNHEALTHY
-        if HealthStatus.DEGRADED.value in statuses:
-            return HealthStatus.DEGRADED
-        known_statuses = statuses - {HealthStatus.UNKNOWN.value}
-        if not known_statuses:
-            return HealthStatus.UNKNOWN
-        return HealthStatus.HEALTHY
+        permanently-``UNKNOWN`` components" write-up. Delegates to the
+        module-level :func:`_compute_overall_health_status` so
+        ``PlatformDashboardService`` (BE-011 Part 3) reuses the identical
+        rule rather than a second, potentially-drifting copy."""
+        return _compute_overall_health_status(rows)
 
     async def get_dashboard_summary(self) -> DashboardSummary:
         """Aggregates overall platform status plus every component's
@@ -746,6 +847,50 @@ class MonitoringService:
         rows = await self.repository.list_service_health()
         return DashboardSummary(
             overall_status=self._aggregate_status(rows), components=rows
+        )
+
+    # ========================================================================
+    # Real-Time (BE-011 Part 3): guest-session live broadcast
+    # ========================================================================
+
+    async def broadcast_guest_session_event(
+        self,
+        *,
+        message_type: RealtimeMessageType,
+        session_id: uuid.UUID,
+        guest_id: uuid.UUID,
+        router_id: uuid.UUID,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        auth_method: str,
+        is_new_guest: bool,
+    ) -> None:
+        """Best-effort publish of a guest-session lifecycle moment to
+        ``WS /monitoring/ws/sessions`` -- called by
+        ``app.domains.guest.service.GuestService``'s ``login_via_otp``/
+        ``login_via_voucher`` methods, via a narrow, optional, duck-typed
+        hook (``GuestService.monitoring_hook`` -- see that module's own
+        updated docstring for the precise, additive edit and why it never
+        changes ``GuestService``'s existing contract or behavior). Mirrors
+        this module's own ``record_heartbeat``'s identical "a real, if
+        narrow, composition seam into another domain's existing lifecycle
+        method" precedent from Part 1's ``app.domains.router_agent``
+        heartbeat hook -- the difference here is only *which* file owns the
+        call site (``GuestService``'s own method body, since guest login can
+        be reached through more than one endpoint and every one of them
+        should broadcast, not just one specific route)."""
+        await _publish_live_message(
+            self.redis_client,
+            message_type,
+            payload={
+                "session_id": str(session_id),
+                "guest_id": str(guest_id),
+                "router_id": str(router_id),
+                "location_id": str(location_id),
+                "organization_id": str(organization_id) if organization_id else None,
+                "auth_method": auth_method,
+                "is_new_guest": is_new_guest,
+            },
         )
 
     async def get_health_history(
@@ -951,9 +1096,16 @@ class AlertService:
         repository: MonitoringRepositoryProtocol,
         *,
         notification_service: NotificationService | None = None,
+        redis_client: Redis | None = None,
     ) -> None:
         self.repository = repository
         self.notification_service = notification_service
+        # Real-Time (BE-011 Part 3): optional, additive -- see
+        # _publish_live_message's own docstring. ``None`` (the default) is
+        # exactly how every existing caller/test that constructs
+        # ``AlertService`` without a Redis client already behaves: no
+        # publish attempt, no behavior change.
+        self.redis_client = redis_client
 
     # ------------------------------------------------------------------
     # AlertRule CRUD
@@ -1106,6 +1258,17 @@ class AlertService:
         )
         event = AlertResolved(alert_id=updated.id, auto_resolved=False)
         logger.info("alert_resolved", extra=_event_extra(event))
+        await _publish_live_message(
+            self.redis_client,
+            RealtimeMessageType.ALERT_RESOLVED,
+            payload={
+                "alert_id": str(updated.id),
+                "rule_id": str(updated.rule_id),
+                "severity": updated.severity,
+                "message": updated.message,
+                "auto_resolved": False,
+            },
+        )
         return updated
 
     # ------------------------------------------------------------------
@@ -1305,7 +1468,7 @@ class AlertService:
         related_event_id: uuid.UUID | None = None,
         related_health_check_id: uuid.UUID | None = None,
     ) -> Alert:
-        return await self.repository.create_alert(
+        alert = await self.repository.create_alert(
             rule_id=rule.id,
             status=AlertStatus.TRIGGERED.value,
             triggered_at=datetime.now(UTC),
@@ -1320,6 +1483,22 @@ class AlertService:
             related_event_id=related_event_id,
             severity=rule.severity,
         )
+        # Real-Time (BE-011 Part 3): publish after the DB write above has
+        # already succeeded -- see _publish_live_message's own docstring.
+        await _publish_live_message(
+            self.redis_client,
+            RealtimeMessageType.ALERT_TRIGGERED,
+            payload={
+                "alert_id": str(alert.id),
+                "rule_id": str(alert.rule_id),
+                "severity": alert.severity,
+                "message": alert.message,
+                "organization_id": str(organization_id) if organization_id else None,
+                "location_id": str(location_id) if location_id else None,
+                "router_id": str(router_id) if router_id else None,
+            },
+        )
+        return alert
 
     async def _auto_resolve(self, alert: Alert) -> Alert:
         resolved = await self.repository.update_alert(
@@ -1328,6 +1507,17 @@ class AlertService:
         )
         event = AlertResolved(alert_id=resolved.id, auto_resolved=True)
         logger.info("alert_auto_resolved", extra=_event_extra(event))
+        await _publish_live_message(
+            self.redis_client,
+            RealtimeMessageType.ALERT_RESOLVED,
+            payload={
+                "alert_id": str(resolved.id),
+                "rule_id": str(resolved.rule_id),
+                "severity": resolved.severity,
+                "message": resolved.message,
+                "auto_resolved": True,
+            },
+        )
         return resolved
 
     async def _dispatch_for_alert(self, alert: Alert) -> None:
@@ -1990,6 +2180,513 @@ class SlaService:
         )
 
 
+# ============================================================================
+# ZTP Monitoring Dashboard (BE-011 Part 3) -- read-only aggregation over
+# app.domains.router_provisioning's own existing data
+# ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class RouterLifecycleEntry:
+    """One row of ``ZtpMonitoringService.get_dashboard``'s unified listing
+    -- either a real ``Router`` (``router_id`` set) or a still-router-less
+    ``RouterEnrollmentRequest`` (``enrollment_id`` set, ``router_id`` and
+    every router-only field ``None``)."""
+
+    router_id: uuid.UUID | None
+    enrollment_id: uuid.UUID | None
+    serial_number: str
+    mac_address: str | None
+    model: str
+    name: str | None
+    organization_id: uuid.UUID | None
+    location_id: uuid.UUID | None
+    router_status: str | None
+    enrollment_status: str | None
+    lifecycle_stage: RouterLifecycleStage
+    last_seen_at: datetime | None
+    latest_job_type: str | None
+    latest_job_status: str | None
+    latest_job_attempts: int | None
+    latest_job_max_attempts: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ZtpDashboardResult:
+    stage_counts: dict[str, int]
+    pending_enrollment_count: int
+    items: list[RouterLifecycleEntry]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisioningFailureBreakdown:
+    job_type: str
+    failure_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisioningFailureSample:
+    job_id: uuid.UUID
+    router_id: uuid.UUID
+    job_type: str
+    attempts: int
+    max_attempts: int
+    error_message: str | None
+    scheduled_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RetryJobEntry:
+    job_id: uuid.UUID
+    router_id: uuid.UUID
+    job_type: str
+    status: str
+    attempts: int
+    max_attempts: int
+    attempts_remaining: int
+    scheduled_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ZtpAnalyticsResult:
+    success_rate_percentage: float | None
+    succeeded_job_count: int
+    terminal_job_count: int
+    failure_breakdown: list[ProvisioningFailureBreakdown]
+    failure_samples: list[ProvisioningFailureSample]
+    retry_jobs: list[RetryJobEntry]
+    average_activation_seconds: float | None
+    activation_sample_size: int
+
+
+class ZtpMonitoringService:
+    """Read-only aggregation/monitoring views over
+    ``app.domains.router_provisioning``'s own already-persisted data --
+    per this part's directory rule, this class **never** creates, updates,
+    or regenerates a single row of provisioning state; every method here is
+    a ``SELECT``-only composition (through ``MonitoringRepositoryProtocol``'s
+    new ZTP methods, which themselves read ``router_provisioning``'s/
+    ``router``'s models directly -- the same "compose, don't duplicate,
+    don't touch the owning domain's files" precedent this whole repository
+    already establishes for ``RouterEvent``/``RouterHealthSnapshot``/
+    ``ProvisioningJob``).
+
+    ## Provisioning Success Rate: denominator choice
+
+    ``get_analytics`` computes success rate as ``succeeded ProvisioningJobs
+    / (succeeded + failed) ProvisioningJobs`` in the window -- **not**
+    "approved enrollments that reached ``ONLINE`` / total approved
+    enrollments". Both were considered; ``ProvisioningJob``-based was
+    chosen because:
+
+    * ``ProvisioningJob`` is the actual execution unit this codebase already
+      tracks success/failure and retry (``attempts``/``max_attempts``) for,
+      per job type (``initial_config``/``config_push``/``backup``/
+      ``restore``/``factory_reset``) -- exactly what "did this provisioning
+      *action* succeed" means operationally.
+    * ``Router.status == ONLINE`` is driven by **heartbeats**
+      (``app.domains.router_agent``'s check-in flow), a signal orthogonal to
+      any specific job's outcome -- a router can reach ``ONLINE`` via
+      heartbeat even after its most recent ``config_push`` job failed (a
+      later successful heartbeat doesn't retroactively fix a failed config
+      push), and conversely a router whose ``initial_config`` job succeeded
+      can still show as ``OFFLINE``/stale for reasons that have nothing to
+      do with provisioning execution (a device unplugged after setup). Using
+      "reached ``ONLINE``" as the success signal would conflate provisioning
+      execution success with device connectivity, two genuinely different
+      failure modes this dashboard should be able to tell apart (a retry
+      dashboard for the former, a heartbeat/offline signal for the latter).
+    * Queued/running jobs are excluded from both numerator and denominator
+      (they are still in flight, not yet a resolved outcome) -- included,
+      they would understate the success rate for a window with recent
+      activity.
+
+    ## Router Activation analytics: an honest approximation
+
+    ``get_analytics``'s ``average_activation_seconds`` composes
+    ``RouterEnrollmentRequest.reviewed_at`` (the approval timestamp) with the
+    completion timestamp of that router's ``initial_config``
+    :class:`~.models.ProvisioningJob` (via
+    ``MonitoringRepositoryProtocol.compute_activation_duration_stats``).
+    This is **not** a literal "time to first ``ONLINE``" measurement --
+    no table anywhere in this codebase records the timestamp of a router's
+    first transition to ``RouterStatus.ONLINE``: ``Router.last_seen_at`` is
+    overwritten on every single heartbeat (never "first seen"), and neither
+    ``RouterHealthSnapshot`` (periodic metrics, not status transitions) nor
+    ``RouterEvent`` (no ``"router_online"`` event type exists) capture that
+    moment either. "Approval -> initial-config-job-completion" is the
+    closest genuinely-recoverable proxy this system's actual persisted data
+    supports, and is reported honestly as such (see the response schema's
+    own field naming/description) rather than mislabeled as something more
+    precise than it is -- the same "don't fabricate precision the data
+    doesn't support" discipline Part 2's ``SlaService.generate_report``
+    already documents for its own check-count-ratio-vs-duration-weighted
+    formula choice.
+    """
+
+    def __init__(self, repository: MonitoringRepositoryProtocol) -> None:
+        self.repository = repository
+
+    async def get_dashboard(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        page: int = DEFAULT_ZTP_PAGE,
+        page_size: int = DEFAULT_ZTP_PAGE_SIZE,
+    ) -> ZtpDashboardResult:
+        """Builds the unified "where does every router currently sit"
+        listing plus a full stage-count tally (over *every* matching row,
+        not just the current page).
+
+        Performs one lookup per router to resolve its own enrollment/latest-
+        job context (not a single mega-join) -- deliberate: ``lifecycle
+        stage`` is a Python-level classification
+        (``validators.compute_lifecycle_stage``) over three typed model
+        instances, not a value a single SQL expression can produce, and this
+        table's realistic scale (one row per physical router, not per
+        guest-session) does not need single-query optimization the way the
+        *statistics*/*analytics* methods below do (those ARE real SQL
+        ``GROUP BY``/``AVG`` aggregates)."""
+        routers = await self.repository.list_routers(organization_id=organization_id)
+        all_enrollments = await self.repository.list_all_enrollment_requests()
+        # Enrollment requests carry no organization_id of their own (they
+        # are, by definition, submitted before any Router/tenant
+        # association exists -- see RouterEnrollmentRequest's own
+        # docstring), so a still-router-less enrollment can only ever be
+        # shown in the platform-wide (organization_id=None) view.
+        unclaimed_enrollments = (
+            []
+            if organization_id is not None
+            else [
+                e
+                for e in all_enrollments
+                if e.status != EnrollmentStatus.APPROVED.value
+            ]
+        )
+
+        entries: list[RouterLifecycleEntry] = []
+        for router in routers:
+            enrollment = await self.repository.get_enrollment_for_router(router.id)
+            latest_job = await self.repository.get_latest_provisioning_job_for_router(
+                router.id
+            )
+            stage = compute_lifecycle_stage(
+                router=router, enrollment=enrollment, latest_job=latest_job
+            )
+            entries.append(
+                RouterLifecycleEntry(
+                    router_id=router.id,
+                    enrollment_id=enrollment.id if enrollment else None,
+                    serial_number=router.serial_number,
+                    mac_address=router.mac_address,
+                    model=router.model,
+                    name=router.name,
+                    organization_id=router.organization_id,
+                    location_id=router.location_id,
+                    router_status=router.status,
+                    enrollment_status=enrollment.status if enrollment else None,
+                    lifecycle_stage=stage,
+                    last_seen_at=router.last_seen_at,
+                    latest_job_type=latest_job.job_type if latest_job else None,
+                    latest_job_status=latest_job.status if latest_job else None,
+                    latest_job_attempts=latest_job.attempts if latest_job else None,
+                    latest_job_max_attempts=(
+                        latest_job.max_attempts if latest_job else None
+                    ),
+                )
+            )
+        for enrollment in unclaimed_enrollments:
+            stage = compute_lifecycle_stage(
+                router=None, enrollment=enrollment, latest_job=None
+            )
+            entries.append(
+                RouterLifecycleEntry(
+                    router_id=None,
+                    enrollment_id=enrollment.id,
+                    serial_number=enrollment.serial_number,
+                    mac_address=enrollment.mac_address,
+                    model=enrollment.model,
+                    name=None,
+                    organization_id=None,
+                    location_id=None,
+                    router_status=None,
+                    enrollment_status=enrollment.status,
+                    lifecycle_stage=stage,
+                    last_seen_at=None,
+                    latest_job_type=None,
+                    latest_job_status=None,
+                    latest_job_attempts=None,
+                    latest_job_max_attempts=None,
+                )
+            )
+
+        stage_counts: dict[str, int] = {
+            stage.value: 0 for stage in RouterLifecycleStage
+        }
+        for entry in entries:
+            stage_counts[entry.lifecycle_stage.value] += 1
+
+        entries.sort(
+            key=lambda e: e.last_seen_at or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        total_items = len(entries)
+        start_index = (page - 1) * page_size
+        page_items = entries[start_index : start_index + page_size]
+        total_pages = (
+            max(1, (total_items + page_size - 1) // page_size) if total_items else 0
+        )
+        pending_enrollment_count = (
+            await self.repository.count_pending_enrollment_requests()
+        )
+
+        return ZtpDashboardResult(
+            stage_counts=stage_counts,
+            pending_enrollment_count=pending_enrollment_count,
+            items=page_items,
+            page=page,
+            page_size=page_size,
+            total_items=total_items,
+            total_pages=total_pages,
+            has_next=start_index + page_size < total_items,
+            has_previous=page > 1,
+        )
+
+    async def get_analytics(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+        failure_sample_limit: int = DEFAULT_FAILURE_SAMPLE_LIMIT,
+        retry_page: int = DEFAULT_ZTP_PAGE,
+        retry_page_size: int = DEFAULT_ZTP_PAGE_SIZE,
+    ) -> ZtpAnalyticsResult:
+        """Provisioning Success Rate + Provisioning Failure Reports + Retry
+        Dashboard + Router Activation timing -- see this class's own
+        docstring for the denominator/approximation write-ups. Every
+        aggregate here is a real SQL query (``MonitoringRepositoryProtocol``'s
+        new ZTP methods), never a Python-side loop over fetched rows."""
+        validate_date_range(start, end)
+
+        (
+            succeeded,
+            terminal,
+        ) = await self.repository.compute_provisioning_job_outcome_counts(
+            organization_id=organization_id, start=start, end=end
+        )
+        success_rate = round((succeeded / terminal) * 100, 4) if terminal else None
+
+        failure_counts = await self.repository.list_provisioning_failure_counts(
+            organization_id=organization_id, start=start, end=end
+        )
+        failure_breakdown = [
+            ProvisioningFailureBreakdown(job_type=job_type, failure_count=count)
+            for job_type, count in failure_counts
+        ]
+
+        failure_samples_raw = await self.repository.list_provisioning_failure_samples(
+            organization_id=organization_id,
+            start=start,
+            end=end,
+            limit=failure_sample_limit,
+        )
+        failure_samples = [
+            ProvisioningFailureSample(
+                job_id=job.id,
+                router_id=job.router_id,
+                job_type=job.job_type,
+                attempts=job.attempts,
+                max_attempts=job.max_attempts,
+                error_message=job.error_message,
+                scheduled_at=job.scheduled_at,
+            )
+            for job in failure_samples_raw
+        ]
+
+        retry_rows, _retry_meta = await self.repository.list_retry_jobs(
+            organization_id=organization_id, page=retry_page, page_size=retry_page_size
+        )
+        retry_jobs = [
+            RetryJobEntry(
+                job_id=job.id,
+                router_id=job.router_id,
+                job_type=job.job_type,
+                status=job.status,
+                attempts=job.attempts,
+                max_attempts=job.max_attempts,
+                attempts_remaining=max(job.max_attempts - job.attempts, 0),
+                scheduled_at=job.scheduled_at,
+            )
+            for job in retry_rows
+        ]
+
+        (
+            avg_seconds,
+            sample_size,
+        ) = await self.repository.compute_activation_duration_stats(
+            organization_id=organization_id, start=start, end=end
+        )
+
+        return ZtpAnalyticsResult(
+            success_rate_percentage=success_rate,
+            succeeded_job_count=succeeded,
+            terminal_job_count=terminal,
+            failure_breakdown=failure_breakdown,
+            failure_samples=failure_samples,
+            retry_jobs=retry_jobs,
+            average_activation_seconds=avg_seconds,
+            activation_sample_size=sample_size,
+        )
+
+
+# ============================================================================
+# Platform Dashboard Statistics (BE-011 Part 3)
+# ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformDashboardResult:
+    overall_health_status: str
+    health_components: list[ServiceHealth]
+    alert_counts_by_severity: dict[str, int]
+    alert_counts_by_status: dict[str, int]
+    device_counts_by_status: dict[str, int]
+    lifecycle_stage_counts: dict[str, int]
+    pending_enrollment_count: int
+    average_response_time_ms: float | None
+    availability_percentage: float | None
+    visitors: int | None
+    unique_guests: int | None
+
+
+class PlatformDashboardService:
+    """Composes Part 1's Health Engine summary, Part 2's Alert Engine
+    counts, this Part's own ``ZtpMonitoringService`` stage counts, and
+    (optionally) ``app.domains.guest``'s visitor analytics into the single
+    "at a glance" payload ``GET /monitoring/dashboard`` serves. Every field
+    is produced by an existing, already-tested aggregate method -- this
+    class adds no new query logic of its own beyond simple orchestration and
+    the ``Availability %``/``Average Response Time`` glance figures (which
+    reuse ``MonitoringRepositoryProtocol.compute_health_check_stats``, the
+    exact same real-SQL-aggregate method Part 2's ``SlaService
+    .generate_report`` already uses -- see ``get_dashboard_statistics``'s
+    own docstring for why a live, un-persisted call to that same method is
+    the right "at a glance" number here, rather than reading the latest
+    persisted ``SlaReport`` (which only exists once an admin has configured
+    an ``SlaTarget`` and generated a report against it -- this dashboard
+    figure must be available with zero configuration).
+
+    ## Visitor stats: only populated with an ``organization_id``
+
+    ``app.domains.guest.service.GuestAnalyticsService.get_summary`` requires
+    a non-``None`` ``organization_id`` -- guest analytics are inherently
+    tenant-scoped upstream (every guest session belongs to exactly one
+    organization). A genuinely platform-wide visitor aggregate would need
+    either a new cross-tenant query added to ``guest``'s own repository (out
+    of this part's directory-rule scope: the only permitted guest-domain
+    edit is the narrow ``GuestService`` broadcast hook) or an expensive
+    per-organization fan-out loop that isn't a real aggregate query. The
+    honest choice made here: ``visitors``/``unique_guests`` are populated
+    only when the caller supplies ``organization_id``; the platform-wide
+    dashboard view (no ``organization_id``) reports them as ``None`` rather
+    than a fabricated or partial number.
+    """
+
+    def __init__(
+        self,
+        repository: MonitoringRepositoryProtocol,
+        ztp_service: ZtpMonitoringService,
+        *,
+        guest_visitor_lookup: GuestVisitorLookupProtocol | None = None,
+    ) -> None:
+        self.repository = repository
+        self.ztp_service = ztp_service
+        self.guest_visitor_lookup = guest_visitor_lookup
+
+    async def get_dashboard_statistics(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        guest_visitor_lookup: GuestVisitorLookupProtocol | None = None,
+    ) -> PlatformDashboardResult:
+        """``guest_visitor_lookup`` may be supplied per-call (in addition to,
+        or instead of, one wired at construction time) -- ``router.py``'s
+        ``get_platform_dashboard`` endpoint does exactly this, since it (not
+        ``dependencies.py``) is the seam that can safely import
+        ``app.domains.guest``'s own dependency factory with no circular-
+        import risk (see ``dependencies.get_platform_dashboard_service``'s
+        docstring for the full write-up). Falls back to the constructor-time
+        value, then to ``None`` (no visitor stats)."""
+        validate_date_range(start, end)
+        visitor_lookup = guest_visitor_lookup or self.guest_visitor_lookup
+
+        health_rows = await self.repository.list_service_health()
+        overall_status = _compute_overall_health_status(health_rows)
+
+        alert_by_severity = dict(
+            await self.repository.compute_alert_counts_by_severity(
+                organization_id=organization_id, start=start, end=end
+            )
+        )
+        alert_by_status = dict(
+            await self.repository.compute_alert_counts_by_status(
+                organization_id=organization_id, start=start, end=end
+            )
+        )
+        device_by_status = dict(
+            await self.repository.count_routers_by_status(
+                organization_id=organization_id
+            )
+        )
+        ztp_dashboard = await self.ztp_service.get_dashboard(
+            organization_id=organization_id, page=1, page_size=1
+        )
+
+        (
+            total,
+            healthy,
+            average_response_time_ms,
+        ) = await self.repository.compute_health_check_stats(
+            component=None, start=start, end=end
+        )
+        availability_percentage = round((healthy / total) * 100, 4) if total else None
+
+        visitors: int | None = None
+        unique_guests: int | None = None
+        if organization_id is not None and visitor_lookup is not None:
+            summary = await visitor_lookup.get_summary(
+                organization_id=organization_id,
+                location_id=None,
+                start=start,
+                end=end,
+            )
+            visitors = summary.visitors
+            unique_guests = summary.unique_guests
+
+        return PlatformDashboardResult(
+            overall_health_status=overall_status.value,
+            health_components=health_rows,
+            alert_counts_by_severity=alert_by_severity,
+            alert_counts_by_status=alert_by_status,
+            device_counts_by_status=device_by_status,
+            lifecycle_stage_counts=ztp_dashboard.stage_counts,
+            pending_enrollment_count=ztp_dashboard.pending_enrollment_count,
+            average_response_time_ms=average_response_time_ms,
+            availability_percentage=availability_percentage,
+            visitors=visitors,
+            unique_guests=unique_guests,
+        )
+
+
 __all__ = [
     "MonitoringService",
     "AuthLookupProtocol",
@@ -2011,4 +2708,14 @@ __all__ = [
     "WebhookNotifier",
     "IncidentService",
     "SlaService",
+    "GuestVisitorLookupProtocol",
+    "RouterLifecycleEntry",
+    "ZtpDashboardResult",
+    "ProvisioningFailureBreakdown",
+    "ProvisioningFailureSample",
+    "RetryJobEntry",
+    "ZtpAnalyticsResult",
+    "ZtpMonitoringService",
+    "PlatformDashboardResult",
+    "PlatformDashboardService",
 ]

@@ -260,3 +260,42 @@ Same as Part 1: none of these nine tables are referenced by any RBAC scope
 column. The RBAC permission-key-reuse decisions (`FLOW.md` §16) are
 config-only (which seeded `permission_key` string gates which route) and
 have zero schema impact.
+
+# BE-011 Part 3: no new tables, no new columns
+
+Part 3 (Real-Time WebSockets + ZTP Monitoring Dashboard + Analytics)
+introduces **zero new persisted state** -- no new table, no new column on
+any existing table, and therefore no `backend/alembic/versions/0018_...py`
+migration. This was a genuine architectural conclusion, not an oversight:
+
+* The Real-Time Engine's transport is Redis pub/sub
+  (`constants.MONITORING_LIVE_CHANNEL`), which is deliberately transient --
+  a `PUBLISH` a WebSocket client happens to have missed is simply gone, the
+  same disposable-transport posture `app.domains.router_provisioning
+  .ProvisioningJob`'s own `PROVISIONING_QUEUE_REDIS_KEY` already documents
+  ("Redis is the dispatch transport, Postgres is the durable source of
+  truth"). Every fact a client could want to recover after a missed
+  broadcast is already durably persisted in an existing table
+  (`health_checks`/`service_health`, `alerts`, `guest_sessions`) -- nothing
+  needs a new row.
+* `RouterLifecycleStage` (see `FLOW.md` §22) is a **pure, computed,
+  presentation-layer label**, deliberately never persisted as a column
+  anywhere. It is derived on every read from four columns that already
+  exist across three other domains
+  (`router_enrollment_requests.status`, `routers.status`,
+  `provisioning_jobs.status`/`attempts`/`max_attempts`,
+  `routers.last_seen_at`). Persisting a tenth, derived copy of that
+  composition would create a second source of truth that can drift the
+  moment any one of those four columns changes without this label being
+  recomputed in lockstep -- see `FLOW.md` §22 for the full argument.
+* Every dashboard/analytics aggregate (device counts by status, alert
+  counts by severity/status, health-check uptime/downtime counts,
+  provisioning success rate/failure breakdown/retry dashboard/activation
+  timing) is a real SQL `SELECT`/`GROUP BY`/`AVG`/`COUNT` query against
+  `routers`, `alerts`, `health_checks`, and `provisioning_jobs` +
+  `router_enrollment_requests` -- all already-existing tables from BE-008/
+  BE-009/Part 1/Part 2. Nothing new is stored; everything is computed at
+  request time from data that already has an authoritative home.
+
+`backend/alembic/versions/` and `backend/alembic/env.py` are untouched by
+this part.
