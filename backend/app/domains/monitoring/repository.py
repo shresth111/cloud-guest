@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
@@ -42,10 +42,29 @@ from app.database.utils.pagination import PaginationMeta
 from app.domains.guest.models import GuestSession, RadiusNasClient
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.models import Router
-from app.domains.router_provisioning.models import RouterEvent
+from app.domains.router_provisioning.models import (
+    ProvisioningJob,
+    RouterEvent,
+    RouterHealthSnapshot,
+)
 from app.domains.wireguard.models import WireGuardPeer
 
-from .models import HealthCheck, HeartbeatLog, PlatformEvent, ServiceHealth
+from .constants import AlertStatus
+from .models import (
+    Alert,
+    AlertRule,
+    AlertRuleNotificationChannel,
+    HealthCheck,
+    HeartbeatLog,
+    Incident,
+    IncidentAlert,
+    NotificationChannel,
+    NotificationLog,
+    PlatformEvent,
+    ServiceHealth,
+    SlaReport,
+    SlaTarget,
+)
 
 
 class MonitoringRepositoryProtocol(Protocol):
@@ -113,6 +132,192 @@ class MonitoringRepositoryProtocol(Protocol):
     # -- WireGuard proxy signal (composes with app.domains.wireguard) --------
     async def list_wireguard_peers(self) -> list[WireGuardPeer]: ...
 
+    # -- alert rules -----------------------------------------------------------
+    async def create_alert_rule(self, **fields: object) -> AlertRule: ...
+
+    async def get_alert_rule(self, rule_id: uuid.UUID) -> AlertRule | None: ...
+
+    async def update_alert_rule(
+        self, rule: AlertRule, data: dict[str, object]
+    ) -> AlertRule: ...
+
+    async def soft_delete_alert_rule(self, rule: AlertRule) -> AlertRule: ...
+
+    async def list_alert_rules(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        is_active: bool | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[AlertRule], PaginationMeta]: ...
+
+    async def list_active_alert_rules(self) -> list[AlertRule]: ...
+
+    async def add_alert_rule_notification_channel(
+        self, alert_rule_id: uuid.UUID, notification_channel_id: uuid.UUID
+    ) -> AlertRuleNotificationChannel: ...
+
+    async def replace_alert_rule_notification_channels(
+        self, alert_rule_id: uuid.UUID, notification_channel_ids: list[uuid.UUID]
+    ) -> None: ...
+
+    async def list_notification_channel_ids_for_rule(
+        self, alert_rule_id: uuid.UUID
+    ) -> list[uuid.UUID]: ...
+
+    # -- alerts ------------------------------------------------------------
+    async def create_alert(self, **fields: object) -> Alert: ...
+
+    async def get_alert(self, alert_id: uuid.UUID) -> Alert | None: ...
+
+    async def update_alert(self, alert: Alert, data: dict[str, object]) -> Alert: ...
+
+    async def list_alerts(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        status: str | None,
+        severity: str | None,
+        router_id: uuid.UUID | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[Alert], PaginationMeta]: ...
+
+    async def find_active_alert(
+        self,
+        *,
+        rule_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        router_id: uuid.UUID | None,
+    ) -> Alert | None: ...
+
+    async def find_alert_by_related_event(
+        self, *, rule_id: uuid.UUID, related_event_id: uuid.UUID
+    ) -> Alert | None: ...
+
+    # -- alert-rule evaluation composition (read-only, other domains) --------
+    async def list_routers(
+        self, *, organization_id: uuid.UUID | None
+    ) -> list[Router]: ...
+
+    async def get_latest_router_health_snapshot(
+        self, router_id: uuid.UUID
+    ) -> RouterHealthSnapshot | None: ...
+
+    async def list_recent_platform_events(
+        self,
+        *,
+        event_type: str,
+        organization_id: uuid.UUID | None,
+        since: datetime,
+    ) -> list[PlatformEvent]: ...
+
+    # -- notification channels -----------------------------------------------
+    async def create_notification_channel(
+        self, **fields: object
+    ) -> NotificationChannel: ...
+
+    async def get_notification_channel(
+        self, channel_id: uuid.UUID
+    ) -> NotificationChannel | None: ...
+
+    async def update_notification_channel(
+        self, channel: NotificationChannel, data: dict[str, object]
+    ) -> NotificationChannel: ...
+
+    async def soft_delete_notification_channel(
+        self, channel: NotificationChannel
+    ) -> NotificationChannel: ...
+
+    async def list_notification_channels(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        channel_type: str | None,
+        is_active: bool | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[NotificationChannel], PaginationMeta]: ...
+
+    async def get_notification_channels_by_ids(
+        self, channel_ids: list[uuid.UUID]
+    ) -> list[NotificationChannel]: ...
+
+    # -- notification logs ---------------------------------------------------
+    async def create_notification_log(self, **fields: object) -> NotificationLog: ...
+
+    async def list_notification_logs(
+        self,
+        *,
+        channel_id: uuid.UUID | None,
+        alert_id: uuid.UUID | None,
+        status: str | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[NotificationLog], PaginationMeta]: ...
+
+    # -- incidents -------------------------------------------------------------
+    async def create_incident(self, **fields: object) -> Incident: ...
+
+    async def get_incident(self, incident_id: uuid.UUID) -> Incident | None: ...
+
+    async def update_incident(
+        self, incident: Incident, data: dict[str, object]
+    ) -> Incident: ...
+
+    async def list_incidents(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        status: str | None,
+        severity: str | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[Incident], PaginationMeta]: ...
+
+    async def incident_alert_exists(
+        self, incident_id: uuid.UUID, alert_id: uuid.UUID
+    ) -> bool: ...
+
+    async def attach_alert_to_incident(
+        self, incident_id: uuid.UUID, alert_id: uuid.UUID
+    ) -> IncidentAlert: ...
+
+    async def list_alerts_for_incident(self, incident_id: uuid.UUID) -> list[Alert]: ...
+
+    # -- SLA monitoring --------------------------------------------------------
+    async def create_sla_target(self, **fields: object) -> SlaTarget: ...
+
+    async def get_sla_target(self, target_id: uuid.UUID) -> SlaTarget | None: ...
+
+    async def list_sla_targets(
+        self, *, organization_id: uuid.UUID | None
+    ) -> list[SlaTarget]: ...
+
+    async def create_sla_report(self, **fields: object) -> SlaReport: ...
+
+    async def list_sla_reports(
+        self, *, sla_target_id: uuid.UUID, page: int, page_size: int
+    ) -> tuple[list[SlaReport], PaginationMeta]: ...
+
+    async def get_latest_sla_report(
+        self, sla_target_id: uuid.UUID
+    ) -> SlaReport | None: ...
+
+    async def compute_health_check_stats(
+        self, *, component: str | None, start: datetime, end: datetime
+    ) -> tuple[int, int, float | None]: ...
+
+    async def get_average_provisioning_duration_seconds(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+    ) -> float | None: ...
+
 
 class MonitoringRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -124,6 +329,17 @@ class MonitoringRepository:
         self.service_health = GenericRepository(ServiceHealth, session)
         self.heartbeat_logs = GenericRepository(HeartbeatLog, session)
         self.platform_events = GenericRepository(PlatformEvent, session)
+        self.alert_rules = GenericRepository(AlertRule, session)
+        self.alert_rule_notification_channels = GenericRepository(
+            AlertRuleNotificationChannel, session
+        )
+        self.alerts = GenericRepository(Alert, session)
+        self.notification_channels = GenericRepository(NotificationChannel, session)
+        self.notification_logs = GenericRepository(NotificationLog, session)
+        self.incidents = GenericRepository(Incident, session)
+        self.incident_alerts = GenericRepository(IncidentAlert, session)
+        self.sla_targets = GenericRepository(SlaTarget, session)
+        self.sla_reports = GenericRepository(SlaReport, session)
 
     # -- health checks -----------------------------------------------------
 
@@ -279,6 +495,448 @@ class MonitoringRepository:
         statement = select(WireGuardPeer).where(WireGuardPeer.is_deleted.is_(False))
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    # -- alert rules -----------------------------------------------------------
+
+    async def create_alert_rule(self, **fields: object) -> AlertRule:
+        return await self.alert_rules.create(fields)
+
+    async def get_alert_rule(self, rule_id: uuid.UUID) -> AlertRule | None:
+        return await self.alert_rules.get_by_id(rule_id)
+
+    async def update_alert_rule(
+        self, rule: AlertRule, data: dict[str, object]
+    ) -> AlertRule:
+        return await self.alert_rules.partial_update(rule, data)
+
+    async def soft_delete_alert_rule(self, rule: AlertRule) -> AlertRule:
+        return await self.alert_rules.soft_delete(rule)
+
+    async def list_alert_rules(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        is_active: bool | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[AlertRule], PaginationMeta]:
+        return await self.alert_rules.paginate(
+            page=page,
+            page_size=page_size,
+            filters={"organization_id": organization_id, "is_active": is_active},
+            sort_by="created_at",
+            sort_order=SortOrder.DESC,
+        )
+
+    async def list_active_alert_rules(self) -> list[AlertRule]:
+        return await self.alert_rules.get_all(filters={"is_active": True})
+
+    async def add_alert_rule_notification_channel(
+        self, alert_rule_id: uuid.UUID, notification_channel_id: uuid.UUID
+    ) -> AlertRuleNotificationChannel:
+        return await self.alert_rule_notification_channels.create(
+            {
+                "alert_rule_id": alert_rule_id,
+                "notification_channel_id": notification_channel_id,
+            }
+        )
+
+    async def replace_alert_rule_notification_channels(
+        self, alert_rule_id: uuid.UUID, notification_channel_ids: list[uuid.UUID]
+    ) -> None:
+        await self.session.execute(
+            delete(AlertRuleNotificationChannel).where(
+                AlertRuleNotificationChannel.alert_rule_id == alert_rule_id
+            )
+        )
+        for channel_id in notification_channel_ids:
+            await self.add_alert_rule_notification_channel(alert_rule_id, channel_id)
+
+    async def list_notification_channel_ids_for_rule(
+        self, alert_rule_id: uuid.UUID
+    ) -> list[uuid.UUID]:
+        statement = select(AlertRuleNotificationChannel.notification_channel_id).where(
+            AlertRuleNotificationChannel.alert_rule_id == alert_rule_id,
+            AlertRuleNotificationChannel.is_deleted.is_(False),
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    # -- alerts ------------------------------------------------------------
+
+    async def create_alert(self, **fields: object) -> Alert:
+        return await self.alerts.create(fields)
+
+    async def get_alert(self, alert_id: uuid.UUID) -> Alert | None:
+        return await self.alerts.get_by_id(alert_id)
+
+    async def update_alert(self, alert: Alert, data: dict[str, object]) -> Alert:
+        return await self.alerts.partial_update(alert, data)
+
+    async def list_alerts(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        status: str | None = None,
+        severity: str | None = None,
+        router_id: uuid.UUID | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[Alert], PaginationMeta]:
+        return await self.alerts.paginate(
+            page=page,
+            page_size=page_size,
+            filters={
+                "organization_id": organization_id,
+                "status": status,
+                "severity": severity,
+                "router_id": router_id,
+            },
+            sort_by="triggered_at",
+            sort_order=SortOrder.DESC,
+        )
+
+    async def find_active_alert(
+        self,
+        *,
+        rule_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        router_id: uuid.UUID | None,
+    ) -> Alert | None:
+        """The de-duplication lookup: is there already an open (not
+        ``RESOLVED``) ``Alert`` for this exact rule+target? See
+        ``service.AlertService.evaluate_alert_rules``'s module docstring for
+        the full de-duplication-key write-up."""
+        statement = (
+            select(Alert)
+            .where(
+                Alert.is_deleted.is_(False),
+                Alert.rule_id == rule_id,
+                Alert.status != AlertStatus.RESOLVED.value,
+                Alert.organization_id.is_(organization_id)
+                if organization_id is None
+                else Alert.organization_id == organization_id,
+                Alert.location_id.is_(location_id)
+                if location_id is None
+                else Alert.location_id == location_id,
+                Alert.router_id.is_(router_id)
+                if router_id is None
+                else Alert.router_id == router_id,
+            )
+            .order_by(Alert.triggered_at.desc())
+            .limit(1)
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
+
+    async def find_alert_by_related_event(
+        self, *, rule_id: uuid.UUID, related_event_id: uuid.UUID
+    ) -> Alert | None:
+        statement = (
+            select(Alert)
+            .where(
+                Alert.is_deleted.is_(False),
+                Alert.rule_id == rule_id,
+                Alert.related_event_id == related_event_id,
+            )
+            .limit(1)
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
+
+    # -- alert-rule evaluation composition (read-only, other domains) --------
+
+    async def list_routers(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[Router]:
+        statement = select(Router).where(Router.is_deleted.is_(False))
+        if organization_id is not None:
+            statement = statement.where(Router.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def get_latest_router_health_snapshot(
+        self, router_id: uuid.UUID
+    ) -> RouterHealthSnapshot | None:
+        statement = (
+            select(RouterHealthSnapshot)
+            .where(
+                RouterHealthSnapshot.router_id == router_id,
+                RouterHealthSnapshot.is_deleted.is_(False),
+            )
+            .order_by(RouterHealthSnapshot.recorded_at.desc())
+            .limit(1)
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
+
+    async def list_recent_platform_events(
+        self,
+        *,
+        event_type: str,
+        organization_id: uuid.UUID | None = None,
+        since: datetime,
+    ) -> list[PlatformEvent]:
+        statement = select(PlatformEvent).where(
+            PlatformEvent.is_deleted.is_(False),
+            PlatformEvent.event_type == event_type,
+            PlatformEvent.occurred_at >= since,
+        )
+        if organization_id is not None:
+            statement = statement.where(
+                PlatformEvent.organization_id == organization_id
+            )
+        statement = statement.order_by(PlatformEvent.occurred_at.asc())
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    # -- notification channels -----------------------------------------------
+
+    async def create_notification_channel(
+        self, **fields: object
+    ) -> NotificationChannel:
+        return await self.notification_channels.create(fields)
+
+    async def get_notification_channel(
+        self, channel_id: uuid.UUID
+    ) -> NotificationChannel | None:
+        return await self.notification_channels.get_by_id(channel_id)
+
+    async def update_notification_channel(
+        self, channel: NotificationChannel, data: dict[str, object]
+    ) -> NotificationChannel:
+        return await self.notification_channels.partial_update(channel, data)
+
+    async def soft_delete_notification_channel(
+        self, channel: NotificationChannel
+    ) -> NotificationChannel:
+        return await self.notification_channels.soft_delete(channel)
+
+    async def list_notification_channels(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        channel_type: str | None = None,
+        is_active: bool | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[NotificationChannel], PaginationMeta]:
+        return await self.notification_channels.paginate(
+            page=page,
+            page_size=page_size,
+            filters={
+                "organization_id": organization_id,
+                "channel_type": channel_type,
+                "is_active": is_active,
+            },
+            sort_by="created_at",
+            sort_order=SortOrder.DESC,
+        )
+
+    async def get_notification_channels_by_ids(
+        self, channel_ids: list[uuid.UUID]
+    ) -> list[NotificationChannel]:
+        if not channel_ids:
+            return []
+        statement = select(NotificationChannel).where(
+            NotificationChannel.id.in_(channel_ids),
+            NotificationChannel.is_deleted.is_(False),
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    # -- notification logs ---------------------------------------------------
+
+    async def create_notification_log(self, **fields: object) -> NotificationLog:
+        return await self.notification_logs.create(fields)
+
+    async def list_notification_logs(
+        self,
+        *,
+        channel_id: uuid.UUID | None = None,
+        alert_id: uuid.UUID | None = None,
+        status: str | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[NotificationLog], PaginationMeta]:
+        return await self.notification_logs.paginate(
+            page=page,
+            page_size=page_size,
+            filters={"channel_id": channel_id, "alert_id": alert_id, "status": status},
+            sort_by="sent_at",
+            sort_order=SortOrder.DESC,
+        )
+
+    # -- incidents -------------------------------------------------------------
+
+    async def create_incident(self, **fields: object) -> Incident:
+        return await self.incidents.create(fields)
+
+    async def get_incident(self, incident_id: uuid.UUID) -> Incident | None:
+        return await self.incidents.get_by_id(incident_id)
+
+    async def update_incident(
+        self, incident: Incident, data: dict[str, object]
+    ) -> Incident:
+        return await self.incidents.partial_update(incident, data)
+
+    async def list_incidents(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        status: str | None = None,
+        severity: str | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[Incident], PaginationMeta]:
+        return await self.incidents.paginate(
+            page=page,
+            page_size=page_size,
+            filters={
+                "organization_id": organization_id,
+                "status": status,
+                "severity": severity,
+            },
+            sort_by="opened_at",
+            sort_order=SortOrder.DESC,
+        )
+
+    async def incident_alert_exists(
+        self, incident_id: uuid.UUID, alert_id: uuid.UUID
+    ) -> bool:
+        return await self.incident_alerts.exists(
+            filters={"incident_id": incident_id, "alert_id": alert_id}
+        )
+
+    async def attach_alert_to_incident(
+        self, incident_id: uuid.UUID, alert_id: uuid.UUID
+    ) -> IncidentAlert:
+        return await self.incident_alerts.create(
+            {"incident_id": incident_id, "alert_id": alert_id}
+        )
+
+    async def list_alerts_for_incident(self, incident_id: uuid.UUID) -> list[Alert]:
+        statement = (
+            select(Alert)
+            .join(IncidentAlert, IncidentAlert.alert_id == Alert.id)
+            .where(
+                IncidentAlert.incident_id == incident_id,
+                IncidentAlert.is_deleted.is_(False),
+                Alert.is_deleted.is_(False),
+            )
+            .order_by(Alert.triggered_at.desc())
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    # -- SLA monitoring --------------------------------------------------------
+
+    async def create_sla_target(self, **fields: object) -> SlaTarget:
+        return await self.sla_targets.create(fields)
+
+    async def get_sla_target(self, target_id: uuid.UUID) -> SlaTarget | None:
+        return await self.sla_targets.get_by_id(target_id)
+
+    async def list_sla_targets(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[SlaTarget]:
+        return await self.sla_targets.get_all(
+            filters={"organization_id": organization_id},
+            sort_by="created_at",
+            sort_order=SortOrder.DESC,
+        )
+
+    async def create_sla_report(self, **fields: object) -> SlaReport:
+        return await self.sla_reports.create(fields)
+
+    async def list_sla_reports(
+        self, *, sla_target_id: uuid.UUID, page: int = 1, page_size: int = 25
+    ) -> tuple[list[SlaReport], PaginationMeta]:
+        return await self.sla_reports.paginate(
+            page=page,
+            page_size=page_size,
+            filters={"sla_target_id": sla_target_id},
+            sort_by="period_end",
+            sort_order=SortOrder.DESC,
+        )
+
+    async def get_latest_sla_report(self, sla_target_id: uuid.UUID) -> SlaReport | None:
+        results = await self.sla_reports.get_all(
+            filters={"sla_target_id": sla_target_id},
+            sort_by="generated_at",
+            sort_order=SortOrder.DESC,
+            limit=1,
+        )
+        return results[0] if results else None
+
+    async def compute_health_check_stats(
+        self, *, component: str | None, start: datetime, end: datetime
+    ) -> tuple[int, int, float | None]:
+        """Real SQL aggregate queries against ``HealthCheck`` history --
+        never a Python-side loop over fetched rows. Returns
+        ``(total_checks, healthy_checks, average_response_time_ms)``. See
+        ``service.SlaService.generate_report`` for the formula this feeds."""
+        base_filters = [
+            HealthCheck.is_deleted.is_(False),
+            HealthCheck.checked_at >= start,
+            HealthCheck.checked_at <= end,
+        ]
+        if component is not None:
+            base_filters.append(HealthCheck.component == component)
+
+        total_statement = (
+            select(func.count()).select_from(HealthCheck).where(*base_filters)
+        )
+        total = int((await self.session.execute(total_statement)).scalar_one())
+
+        healthy_statement = (
+            select(func.count())
+            .select_from(HealthCheck)
+            .where(*base_filters, HealthCheck.status == "healthy")
+        )
+        healthy = int((await self.session.execute(healthy_statement)).scalar_one())
+
+        avg_statement = select(func.avg(HealthCheck.response_time_ms)).where(
+            *base_filters, HealthCheck.response_time_ms.is_not(None)
+        )
+        average_response_time_ms = (
+            await self.session.execute(avg_statement)
+        ).scalar_one_or_none()
+
+        return total, healthy, average_response_time_ms
+
+    async def get_average_provisioning_duration_seconds(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+    ) -> float | None:
+        """Read-only composition with
+        ``app.domains.router_provisioning.models.ProvisioningJob``'s own
+        ``started_at``/``completed_at`` timestamps -- the module brief's
+        provisioning-time analytics bullet, without inventing a new
+        provisioning-time tracking mechanism."""
+        statement = select(
+            func.avg(
+                func.extract(
+                    "epoch", ProvisioningJob.completed_at - ProvisioningJob.started_at
+                )
+            )
+        ).where(
+            ProvisioningJob.is_deleted.is_(False),
+            ProvisioningJob.started_at.is_not(None),
+            ProvisioningJob.completed_at.is_not(None),
+            ProvisioningJob.completed_at >= start,
+            ProvisioningJob.completed_at <= end,
+        )
+        if organization_id is not None:
+            statement = statement.join(
+                Router, Router.id == ProvisioningJob.router_id
+            ).where(Router.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
 
 
 __all__ = [

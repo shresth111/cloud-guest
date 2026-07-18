@@ -183,6 +183,214 @@ MAX_EVENT_TIMELINE_LIMIT = 500
 DEFAULT_HEALTH_HISTORY_PAGE = 1
 DEFAULT_HEALTH_HISTORY_PAGE_SIZE = 25
 
+DEFAULT_LIST_PAGE = 1
+DEFAULT_LIST_PAGE_SIZE = 25
+
+# ============================================================================
+# Alert Engine (BE-011 Part 2)
+# ============================================================================
+
+
+class AlertTriggerType(StrEnum):
+    """The kind of condition an :class:`~.models.AlertRule` watches for.
+
+    * ``HEALTH_STATUS_CHANGE`` -- e.g. "Database Down"/"Router Offline".
+      ``AlertRule.target_component`` is either a ``HealthComponent`` value
+      (watches the platform-wide ``ServiceHealth`` rollup for that
+      component -- composes with Part 1's Health Engine, never duplicates
+      it) or the sentinel :data:`ALERT_TARGET_ROUTER` (watches every
+      in-scope ``app.domains.router.models.Router.health_status`` directly
+      -- read-only, composes with BE-008, the same "read another domain's
+      table directly" precedent ``repository.py`` already establishes for
+      ``RadiusNasClient``/``WireGuardPeer``/``RouterEvent``).
+      ``condition_config`` shape: ``{"expected_status": <str>}``.
+    * ``THRESHOLD`` -- e.g. "CPU High"/"Disk Full". Compares one of
+      ``app.domains.router_provisioning.models.RouterHealthSnapshot``'s own
+      already-persisted metrics (:class:`ThresholdMetric` -- never a new
+      metrics system) against a configured value for every router in scope.
+      ``AlertRule.target_component`` is always ``None`` for this trigger
+      type (the rule watches every router in ``organization_id``'s scope,
+      not one named component). ``condition_config`` shape:
+      ``{"metric": <ThresholdMetric>, "operator": <ThresholdOperator>,
+      "value": <float>}``.
+    * ``EVENT_OCCURRED`` -- e.g. "Provisioning Failed"/"Guest Authentication
+      Failed"/"OTP Delivery Failed" in the module brief's examples. This
+      module can only evaluate a rule against a *queryable* event source,
+      and per Part 1's own documented design, the only cross-domain event
+      table this module may read without editing another domain's files is
+      ``PlatformEvent`` (Part 1's own narrowly-scoped table -- see
+      ``models.PlatformEvent``'s docstring). ``RouterEvent``/RBAC's
+      ``audit_log_entries`` are deliberately **not** wired as
+      ``EVENT_OCCURRED`` sources in this iteration: unlike ``PlatformEvent``,
+      ``Alert.related_event_id`` is a single FK to ``platform_events.id``
+      (not a polymorphic reference), so matching+de-duplicating against a
+      second table's primary key would need a second, differently-typed FK
+      column for zero currently-demonstrated need. A genuinely new event
+      (e.g. a real "OTP delivery failed" moment) becomes alertable the
+      moment its owning domain calls
+      ``MonitoringService.record_platform_event`` -- the same composition
+      seam Part 1's own docstring already invites -- without any change
+      here. ``condition_config`` shape: ``{"event_type": <str>}`` (matches
+      ``PlatformEvent.event_type``).
+    """
+
+    HEALTH_STATUS_CHANGE = "health_status_change"
+    THRESHOLD = "threshold"
+    EVENT_OCCURRED = "event_occurred"
+
+
+# Sentinel ``AlertRule.target_component`` value for a ``HEALTH_STATUS_CHANGE``
+# rule that watches per-router ``Router.health_status``
+# (``app.domains.router.enums.RouterHealthStatus``) rather than one of this
+# module's own platform ``HealthComponent`` values. Deliberately not a
+# ``HealthComponent`` member itself -- "router" is not a platform component
+# this module's own Health Engine checks (see ``HealthComponent``'s
+# docstring), it is a pointer to a *different* domain's own health signal.
+ALERT_TARGET_ROUTER = "router"
+
+
+class ThresholdMetric(StrEnum):
+    """The exact, already-persisted
+    ``app.domains.router_provisioning.models.RouterHealthSnapshot`` columns a
+    ``THRESHOLD`` rule may compare against -- composition, not a new metrics
+    system (see ``AlertTriggerType.THRESHOLD``'s docstring)."""
+
+    CPU_USAGE_PERCENT = "cpu_usage_percent"
+    MEMORY_USAGE_PERCENT = "memory_usage_percent"
+    UPTIME_SECONDS = "uptime_seconds"
+    CONNECTED_CLIENTS_COUNT = "connected_clients_count"
+
+
+class ThresholdOperator(StrEnum):
+    GT = "gt"
+    GTE = "gte"
+    LT = "lt"
+    LTE = "lte"
+    EQ = "eq"
+
+
+class AlertSeverity(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+class AlertStatus(StrEnum):
+    """See ``ALERT_STATUS_TRANSITIONS`` for the exact transition graph.
+
+    * ``TRIGGERED`` -- the initial state every ``Alert`` is created in.
+    * ``ACKNOWLEDGED`` -- a human has seen it and is working it; set by
+      ``POST /alerts/{id}/acknowledge``.
+    * ``RESOLVED`` -- terminal. Set either by a human
+      (``POST /alerts/{id}/resolve``) or automatically by
+      ``AlertService.evaluate_alert_rules`` the moment the underlying
+      condition clears (see that method's own docstring for the full
+      recovery-design write-up: there is no separate "Router Online" rule,
+      recovery is the same rule transitioning its own open alert to
+      ``RESOLVED`` plus a recovery notification through the same channels).
+    """
+
+    TRIGGERED = "triggered"
+    ACKNOWLEDGED = "acknowledged"
+    RESOLVED = "resolved"
+
+
+ALERT_STATUS_TRANSITIONS: dict[AlertStatus, frozenset[AlertStatus]] = {
+    AlertStatus.TRIGGERED: frozenset({AlertStatus.ACKNOWLEDGED, AlertStatus.RESOLVED}),
+    AlertStatus.ACKNOWLEDGED: frozenset({AlertStatus.RESOLVED}),
+    AlertStatus.RESOLVED: frozenset(),
+}
+
+# How far back ``AlertService._evaluate_event_occurred_rule`` looks for
+# ``PlatformEvent`` rows matching an ``EVENT_OCCURRED`` rule's
+# ``condition_config["event_type"]`` on each evaluation pass. Since this
+# environment has no recurring scheduler (no Celery -- see
+# ``HealthComponent.CELERY``'s docstring), ``evaluate_alert_rules`` runs
+# on-demand (an admin/operator action or a composed call after a health
+# check), not on a guaranteed fixed cadence -- a bounded lookback window
+# (rather than "since the last evaluation ever ran", which this module has
+# no durable checkpoint for) is what keeps repeated evaluation idempotent
+# (de-duplicated by ``related_event_id``, see ``Alert``'s module docstring)
+# without needing a new "last evaluated at" table.
+ALERT_EVENT_LOOKBACK_MINUTES = 15
+
+# ============================================================================
+# Notification Engine (BE-011 Part 2)
+# ============================================================================
+
+
+class NotificationChannelType(StrEnum):
+    """See ``docs/monitoring/FLOW.md`` for the exact per-type
+    ``config_encrypted`` JSON schema and delivery-implementation write-up.
+
+    ``EMAIL``/``SMS`` wrap ``app.domains.otp``'s existing
+    ``EmailProviderProtocol``/``SmsProviderProtocol`` (composition, never a
+    second provider abstraction). ``SLACK``/``TEAMS``/``DISCORD``/``WEBHOOK``
+    are REAL ``httpx.AsyncClient`` POSTs to a configurable incoming-webhook
+    URL. ``WHATSAPP`` is an honest logging-only placeholder, mirroring
+    OTP's own ``LoggingSmsProvider``/``LoggingEmailProvider`` precedent --
+    see ``service.py``'s ``WhatsAppNotifier`` docstring for exactly why this
+    one channel (and only this one) does not get a real integration: it
+    genuinely requires a paid WhatsApp Business API account/SDK this sandbox
+    does not have, unlike Slack/Teams/Discord/Webhook, which are just a
+    plain outbound HTTP POST to a URL any operator can generate for free.
+    """
+
+    EMAIL = "email"
+    SMS = "sms"
+    WHATSAPP = "whatsapp"
+    SLACK = "slack"
+    TEAMS = "teams"
+    DISCORD = "discord"
+    WEBHOOK = "webhook"
+
+
+class NotificationStatus(StrEnum):
+    SENT = "sent"
+    FAILED = "failed"
+
+
+# Timeout for every real outbound HTTP POST this module makes (Slack/Teams/
+# Discord/generic Webhook notifiers) -- bounded so one slow/unreachable
+# third-party webhook endpoint cannot hang alert dispatch indefinitely.
+HTTP_NOTIFICATION_TIMEOUT_SECONDS = 10.0
+
+# ============================================================================
+# Incident Engine (BE-011 Part 2)
+# ============================================================================
+
+
+class IncidentStatus(StrEnum):
+    """See ``INCIDENT_STATUS_TRANSITIONS`` for the exact transition graph.
+    ``OPEN`` is the initial state every ``Incident`` is created in;
+    ``CLOSED`` is terminal."""
+
+    OPEN = "open"
+    INVESTIGATING = "investigating"
+    RESOLVED = "resolved"
+    CLOSED = "closed"
+
+
+INCIDENT_STATUS_TRANSITIONS: dict[IncidentStatus, frozenset[IncidentStatus]] = {
+    IncidentStatus.OPEN: frozenset(
+        {IncidentStatus.INVESTIGATING, IncidentStatus.RESOLVED, IncidentStatus.CLOSED}
+    ),
+    IncidentStatus.INVESTIGATING: frozenset(
+        {IncidentStatus.OPEN, IncidentStatus.RESOLVED, IncidentStatus.CLOSED}
+    ),
+    IncidentStatus.RESOLVED: frozenset(
+        {IncidentStatus.INVESTIGATING, IncidentStatus.CLOSED}
+    ),
+    IncidentStatus.CLOSED: frozenset(),
+}
+
+# ============================================================================
+# SLA Monitoring (BE-011 Part 2)
+# ============================================================================
+
+DEFAULT_SLA_TARGET_PERCENTAGE = 99.9
+DEFAULT_SLA_MEASUREMENT_WINDOW_DAYS = 30
+
 __all__ = [
     "HealthComponent",
     "HealthStatus",
@@ -202,4 +410,21 @@ __all__ = [
     "MAX_EVENT_TIMELINE_LIMIT",
     "DEFAULT_HEALTH_HISTORY_PAGE",
     "DEFAULT_HEALTH_HISTORY_PAGE_SIZE",
+    "DEFAULT_LIST_PAGE",
+    "DEFAULT_LIST_PAGE_SIZE",
+    "AlertTriggerType",
+    "ALERT_TARGET_ROUTER",
+    "ThresholdMetric",
+    "ThresholdOperator",
+    "AlertSeverity",
+    "AlertStatus",
+    "ALERT_STATUS_TRANSITIONS",
+    "ALERT_EVENT_LOOKBACK_MINUTES",
+    "NotificationChannelType",
+    "NotificationStatus",
+    "HTTP_NOTIFICATION_TIMEOUT_SECONDS",
+    "IncidentStatus",
+    "INCIDENT_STATUS_TRANSITIONS",
+    "DEFAULT_SLA_TARGET_PERCENTAGE",
+    "DEFAULT_SLA_MEASUREMENT_WINDOW_DAYS",
 ]

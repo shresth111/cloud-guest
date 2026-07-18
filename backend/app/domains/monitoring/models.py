@@ -81,7 +81,17 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -322,9 +332,445 @@ class PlatformEvent(BaseModel):
         )
 
 
+# ============================================================================
+# Alert Engine (BE-011 Part 2)
+# ============================================================================
+
+
+class AlertRule(BaseModel):
+    """A watched condition (see ``constants.AlertTriggerType`` for the three
+    kinds, and its docstring for the exact ``condition_config``/
+    ``target_component`` shape per type). ``organization_id`` ``NULL`` means
+    a platform-wide system rule (e.g. "Database Down" -- a platform
+    component every tenant shares), non-``NULL`` scopes the rule (and every
+    router/threshold check it drives) to one tenant.
+
+    Which channels a triggered alert notifies is modeled as a real join
+    table, :class:`AlertRuleNotificationChannel`, rather than a JSONB list of
+    ids on this row -- deliberately, for real referential integrity (a
+    deleted ``NotificationChannel`` cascades its association row away
+    instead of leaving a dangling id in a JSON blob that would need
+    defensive existence-checking on every read).
+    """
+
+    __tablename__ = "alert_rules"
+
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    trigger_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    # See constants.AlertTriggerType's docstring: a HealthComponent value,
+    # constants.ALERT_TARGET_ROUTER, or NULL (THRESHOLD/EVENT_OCCURRED rules).
+    target_component: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    condition_config: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, nullable=False
+    )
+    severity: Mapped[str] = mapped_column(String(20), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        Index("ix_alert_rules_organization_id", "organization_id"),
+        Index("ix_alert_rules_trigger_type", "trigger_type"),
+        Index("ix_alert_rules_is_active", "is_active"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AlertRule(name={self.name}, trigger_type={self.trigger_type})>"
+
+
+class AlertRuleNotificationChannel(BaseModel):
+    """Join table: which :class:`~.models.NotificationChannel` rows a
+    triggered :class:`AlertRule` notifies. See ``AlertRule``'s docstring for
+    why this is a real association table, not a JSONB id list."""
+
+    __tablename__ = "alert_rule_notification_channels"
+
+    alert_rule_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("alert_rules.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    notification_channel_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("notification_channels.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "alert_rule_id",
+            "notification_channel_id",
+            name="uq_alert_rule_notification_channels_rule_channel",
+        ),
+        Index("ix_alert_rule_notification_channels_alert_rule_id", "alert_rule_id"),
+        Index(
+            "ix_alert_rule_notification_channels_notification_channel_id",
+            "notification_channel_id",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<AlertRuleNotificationChannel(alert_rule_id={self.alert_rule_id}, "
+            f"notification_channel_id={self.notification_channel_id})>"
+        )
+
+
+class Alert(BaseModel):
+    """One firing (or resolved) instance of an :class:`AlertRule`'s
+    condition. ``severity`` is copied from the rule at trigger time (never
+    referenced live) -- the same "copy, don't reference" reasoning
+    ``app.domains.guest``'s voucher-derived session quotas already
+    establish, so a later edit to ``AlertRule.severity`` never retroactively
+    rewrites a historical alert's recorded severity.
+
+    See ``service.AlertService.evaluate_alert_rules`` for the exact
+    de-duplication key (one open ``Alert`` per rule+target at a time) and
+    the auto-recovery design (an ``Alert`` transitions itself to
+    ``RESOLVED`` -- no separate "recovery rule" -- the moment its rule's
+    condition stops being true on a later evaluation pass).
+    """
+
+    __tablename__ = "alerts"
+
+    rule_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("alert_rules.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    triggered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # No FK to any user table -- mirrors this codebase's existing convention
+    # for cross-domain "who did this" columns (e.g.
+    # app.domains.router_provisioning.models.ProvisioningJob
+    # .requested_by_user_id, RouterEnrollmentRequest.reviewed_by_user_id).
+    acknowledged_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    location_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    router_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    related_health_check_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("health_checks.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    related_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("platform_events.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    severity: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    __table_args__ = (
+        Index("ix_alerts_rule_id", "rule_id"),
+        Index("ix_alerts_status", "status"),
+        Index("ix_alerts_organization_id", "organization_id"),
+        Index("ix_alerts_location_id", "location_id"),
+        Index("ix_alerts_router_id", "router_id"),
+        Index("ix_alerts_triggered_at", "triggered_at"),
+        Index("ix_alerts_severity", "severity"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Alert(rule_id={self.rule_id}, status={self.status})>"
+
+
+# ============================================================================
+# Notification Engine (BE-011 Part 2)
+# ============================================================================
+
+
+class NotificationChannel(BaseModel):
+    """A configured delivery destination. ``organization_id`` ``NULL`` means
+    a platform-wide default channel (e.g. a platform-ops Slack channel every
+    system-wide rule notifies); non-``NULL`` scopes it to one tenant.
+
+    ``config_encrypted`` is a JSON object (per ``channel_type`` -- see
+    ``docs/monitoring/FLOW.md`` for the exact schema per type), serialized
+    then encrypted with ``app.domains.router.crypto.encrypt_secret`` before
+    ever reaching this column -- a Slack/Teams/Discord incoming-webhook URL
+    (or a generic webhook's optional auth header value) is a bearer-
+    equivalent secret exactly like a RouterOS API password, so it gets the
+    identical Fernet-encrypted-at-rest treatment, never plaintext JSONB.
+    """
+
+    __tablename__ = "notification_channels"
+
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    channel_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    config_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        Index("ix_notification_channels_organization_id", "organization_id"),
+        Index("ix_notification_channels_channel_type", "channel_type"),
+        Index("ix_notification_channels_is_active", "is_active"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<NotificationChannel(name={self.name}, "
+            f"channel_type={self.channel_type})>"
+        )
+
+
+class NotificationLog(BaseModel):
+    """A durable delivery record for one ``NotificationService
+    .dispatch_notification`` attempt -- written on both success and
+    failure (see ``service.py``'s module docstring: a delivery failure is
+    logged here, never raised, so it can never crash alert evaluation)."""
+
+    __tablename__ = "notification_logs"
+
+    channel_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("notification_channels.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    alert_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("alerts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # e.g. "HTTP 200" for webhook-style channels, or a short honest note for
+    # the logging-only WhatsApp placeholder / real SMS/email providers.
+    response_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_notification_logs_channel_id", "channel_id"),
+        Index("ix_notification_logs_alert_id", "alert_id"),
+        Index("ix_notification_logs_status", "status"),
+        Index("ix_notification_logs_sent_at", "sent_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<NotificationLog(channel_id={self.channel_id}, status={self.status})>"
+
+
+# ============================================================================
+# Incident Engine (BE-011 Part 2)
+# ============================================================================
+
+
+class Incident(BaseModel):
+    """A human-managed grouping of one or more related :class:`Alert` rows.
+
+    **Fully manual, by design** -- see ``IncidentAlert``'s docstring for why
+    this module does not implement an auto-grouping/auto-correlation
+    heuristic."""
+
+    __tablename__ = "incidents"
+
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    severity: Mapped[str] = mapped_column(String(20), nullable=False)
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # No FK -- mirrors Alert.acknowledged_by_user_id's identical convention.
+    assigned_to_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resolution_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_incidents_organization_id", "organization_id"),
+        Index("ix_incidents_status", "status"),
+        Index("ix_incidents_severity", "severity"),
+        Index("ix_incidents_opened_at", "opened_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Incident(title={self.title}, status={self.status})>"
+
+
+class IncidentAlert(BaseModel):
+    """Join table: which :class:`Alert` rows have been grouped into one
+    :class:`Incident`.
+
+    **Design decision: fully manual, no auto-grouping heuristic.** The
+    module brief invited an auto-correlation heuristic (e.g. "N alerts for
+    the same location within M minutes auto-creates an incident"). No such
+    heuristic is implemented here: every candidate rule this module could
+    write (what counts as "the same location", what window, what alert
+    count threshold, whether severity should factor in) would be an
+    arbitrary, untested guess with no real incident data in this
+    environment to validate it against -- exactly the kind of unjustified
+    complexity this codebase's own conventions (e.g. Part 1's honest
+    Celery/WebSocket ``UNKNOWN``s) argue against fabricating. A fully-manual
+    model -- an operator creates an ``Incident`` and explicitly attaches the
+    ``Alert`` rows they judge related via ``POST /incidents/{id}/alerts`` --
+    is simpler, fully defensible, and easy to revisit later: nothing about
+    this schema needs to change if an auto-suggestion heuristic is added on
+    top in a future iteration (it would only ever *call* the same
+    ``IncidentService.attach_alert`` this manual path already uses).
+    """
+
+    __tablename__ = "incident_alerts"
+
+    incident_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("incidents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    alert_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("alerts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "incident_id", "alert_id", name="uq_incident_alerts_incident_alert"
+        ),
+        Index("ix_incident_alerts_incident_id", "incident_id"),
+        Index("ix_incident_alerts_alert_id", "alert_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<IncidentAlert(incident_id={self.incident_id}, "
+            f"alert_id={self.alert_id})>"
+        )
+
+
+# ============================================================================
+# SLA Monitoring (BE-011 Part 2)
+# ============================================================================
+
+
+class SlaTarget(BaseModel):
+    """A committed uptime target. ``organization_id`` ``NULL`` means a
+    platform-wide target; ``component`` ``NULL`` means the target applies to
+    the platform's *overall* dashboard status rather than one named
+    component. ``component``, when set, reuses ``constants.HealthComponent``
+    values -- SLA targets are defined over the exact same components Part
+    1's Health Engine already checks, never a new metric namespace."""
+
+    __tablename__ = "sla_targets"
+
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    component: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    target_percentage: Mapped[float] = mapped_column(Float, nullable=False)
+    measurement_window_days: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        Index("ix_sla_targets_organization_id", "organization_id"),
+        Index("ix_sla_targets_component", "component"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<SlaTarget(component={self.component}, "
+            f"target_percentage={self.target_percentage})>"
+        )
+
+
+class SlaReport(BaseModel):
+    """One computed measurement of a :class:`SlaTarget` over
+    ``[period_start, period_end]``. See ``service.SlaService.generate_report``
+    for the exact formula (``achieved_percentage = healthy_checks /
+    total_checks * 100``) and why a simple check-count ratio, not a
+    downtime-duration-weighted calculation, is the honest choice in this
+    environment."""
+
+    __tablename__ = "sla_reports"
+
+    sla_target_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sla_targets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    period_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    period_end: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    achieved_percentage: Mapped[float] = mapped_column(Float, nullable=False)
+    total_checks: Mapped[int] = mapped_column(Integer, nullable=False)
+    healthy_checks: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The spec's "Average Response Time"/"Average Router Response" analytics
+    # bullet -- computed from the same HealthCheck history this report's
+    # achieved_percentage already scans, not a second query/table.
+    average_response_time_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_sla_reports_sla_target_id", "sla_target_id"),
+        Index("ix_sla_reports_period_start", "period_start"),
+        Index("ix_sla_reports_period_end", "period_end"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<SlaReport(sla_target_id={self.sla_target_id}, "
+            f"achieved_percentage={self.achieved_percentage})>"
+        )
+
+
 __all__ = [
     "HealthCheck",
     "ServiceHealth",
     "HeartbeatLog",
     "PlatformEvent",
+    "AlertRule",
+    "AlertRuleNotificationChannel",
+    "Alert",
+    "NotificationChannel",
+    "NotificationLog",
+    "Incident",
+    "IncidentAlert",
+    "SlaTarget",
+    "SlaReport",
 ]

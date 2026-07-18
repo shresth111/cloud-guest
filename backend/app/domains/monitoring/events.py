@@ -52,9 +52,69 @@ class PlatformEventRecorded:
     occurred_at: datetime = field(default_factory=_now)
 
 
+@dataclass(frozen=True, slots=True)
+class AlertTriggered:
+    alert_id: uuid.UUID
+    rule_id: uuid.UUID
+    severity: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class AlertAcknowledged:
+    alert_id: uuid.UUID
+    acknowledged_by_user_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class AlertResolved:
+    alert_id: uuid.UUID
+    auto_resolved: bool
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationDispatched:
+    channel_id: uuid.UUID
+    channel_type: str
+    alert_id: uuid.UUID
+    status: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentOpened:
+    incident_id: uuid.UUID
+    severity: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentStatusChanged:
+    incident_id: uuid.UUID
+    previous_status: str
+    new_status: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class SlaReportGenerated:
+    sla_target_id: uuid.UUID
+    achieved_percentage: float
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "HealthCheckExecuted",
     "ServiceHealthTransitioned",
     "HeartbeatRecorded",
     "PlatformEventRecorded",
+    "AlertTriggered",
+    "AlertAcknowledged",
+    "AlertResolved",
+    "NotificationDispatched",
+    "IncidentOpened",
+    "IncidentStatusChanged",
+    "SlaReportGenerated",
 ]

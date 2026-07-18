@@ -741,3 +741,73 @@ module's own narrowly-scoped `platform_events` table plus RBAC's
 directly, never copied) -- see `docs/monitoring/FLOW.md` §3 for the full
 composition-vs-new-storage decision.
 
+## Alert / Notification / Incident / SLA Endpoints (Module 011 Part 2)
+
+Extends the same Monitoring domain (no new top-level domain). Every
+endpoint uses the standard `ApiResponse` envelope. See
+`docs/monitoring/FLOW.md` §16 for the complete RBAC permission-key-reuse
+reasoning (there is no dedicated "incidents"/"sla" permission module in the
+seeded 36, and neither `alerts` nor `notifications` has a seeded `create`
+action):
+
+```text
+POST   /api/v1/alerts/rules                     alerts.manage    create an alert rule
+GET    /api/v1/alerts/rules                     alerts.read      list alert rules (organization_id/is_active filters, paginated)
+GET    /api/v1/alerts/rules/{rule_id}           alerts.read      get one alert rule
+PUT    /api/v1/alerts/rules/{rule_id}           alerts.update    update an alert rule (+ its notification channels)
+DELETE /api/v1/alerts/rules/{rule_id}           alerts.delete    soft-delete an alert rule
+GET    /api/v1/alerts                           alerts.read      list triggered alerts (organization_id/router_id/status/severity filters, paginated)
+GET    /api/v1/alerts/{alert_id}                alerts.read      get one alert
+POST   /api/v1/alerts/{alert_id}/acknowledge    alerts.update    TRIGGERED -> ACKNOWLEDGED
+POST   /api/v1/alerts/{alert_id}/resolve        alerts.update    TRIGGERED/ACKNOWLEDGED -> RESOLVED
+
+POST   /api/v1/notifications/channels                  notifications.manage  create a notification channel
+GET    /api/v1/notifications/channels                   notifications.read    list channels (organization_id/is_active filters, paginated)
+GET    /api/v1/notifications/channels/{channel_id}      notifications.read    get one channel (config never returned decrypted)
+PUT    /api/v1/notifications/channels/{channel_id}      notifications.update  update a channel (name/config/is_active)
+DELETE /api/v1/notifications/channels/{channel_id}      notifications.delete  soft-delete a channel
+GET    /api/v1/notifications/logs                       notifications.read    list delivery logs (channel_id/alert_id/status filters, paginated)
+
+POST   /api/v1/incidents                        alerts.manage    create an incident (OPEN)
+GET    /api/v1/incidents                        alerts.read      list incidents (organization_id/status/severity filters, paginated)
+GET    /api/v1/incidents/{incident_id}          alerts.read      get one incident
+PUT    /api/v1/incidents/{incident_id}          alerts.update    update title/description/assignee/status (transition-graph-validated)
+POST   /api/v1/incidents/{incident_id}/alerts   alerts.update    attach an alert to an incident (idempotent)
+
+GET    /api/v1/sla                               reports.read     list SLA targets + each one's latest report
+POST   /api/v1/sla/targets                       reports.manage   create an SLA target
+GET    /api/v1/sla/{target_id}/reports           reports.read     list an SLA target's historical reports (paginated)
+POST   /api/v1/sla/{target_id}/generate-report   reports.manage   on-demand report computation (optional period_days override)
+```
+
+**Alert rules** (`AlertRuleCreateRequest`): `trigger_type`
+(`health_status_change`/`threshold`/`event_occurred`), `target_component`
+(a `HealthComponent` value, `"router"`, or `null` -- see
+`docs/monitoring/FLOW.md` §11/§12), `condition_config` (shape depends on
+`trigger_type`), `severity` (`info`/`warning`/`critical`),
+`notification_channel_ids` (which channels a triggered alert notifies --
+a real join table, `alert_rule_notification_channels`, not a JSONB list).
+
+**Notification channels** (`NotificationChannelCreateRequest`):
+`channel_type` (`email`/`sms`/`whatsapp`/`slack`/`teams`/`discord`/
+`webhook`) plus a `config` object whose required keys depend on
+`channel_type` -- see `docs/monitoring/DATABASE.md`'s per-type schema
+table. `config` is Fernet-encrypted before storage and never returned by
+any `GET`.
+
+**Incidents** (`IncidentCreateRequest`/`IncidentUpdateRequest`): status
+transition graph is `OPEN -> {INVESTIGATING, RESOLVED, CLOSED}`,
+`INVESTIGATING -> {OPEN, RESOLVED, CLOSED}`, `RESOLVED -> {INVESTIGATING,
+CLOSED}`, `CLOSED` terminal. Grouping alerts into an incident is fully
+manual (`POST /incidents/{id}/alerts`) -- no auto-correlation heuristic
+(see `docs/monitoring/FLOW.md` §14).
+
+**SLA** (`SlaTargetCreateRequest`/`SlaReportGenerateRequest`):
+`achieved_percentage = healthy_checks / total_checks * 100` over the
+target's `measurement_window_days` (or an explicit `period_days`
+override), computed from Part 1's own `health_checks` history -- see
+`docs/monitoring/FLOW.md` §15 for why this simple ratio, not a
+downtime-duration-weighted formula, is the honest choice in this
+environment. Raises a `422` if zero `HealthCheck` rows exist for the
+window (never fabricates a result from no data).
+
