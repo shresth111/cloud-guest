@@ -12,6 +12,7 @@ from app.domains.auth import models as auth_models  # noqa: F401
 from app.domains.location import models as location_models  # noqa: F401
 from app.domains.organization import models as organization_models  # noqa: F401
 from app.domains.rbac import models as rbac_models  # noqa: F401
+from app.domains.router import models as router_models  # noqa: F401
 
 config = context.config
 

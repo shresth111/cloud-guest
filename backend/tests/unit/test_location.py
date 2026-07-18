@@ -576,9 +576,19 @@ class TestRbacLocationFkFollowUp:
 
         assert LocationRole.__table__.columns["location_id"].nullable is False
 
-    def test_router_id_columns_remain_fk_less(self) -> None:
+    def test_router_id_columns_now_carry_fk_per_module_008(self) -> None:
+        """At the time Module 006 landed, ``router_id`` was still plain and
+        FK-less (the Router domain did not exist yet) -- this test used to
+        assert exactly that. Module 008 (``app.domains.router``) has since
+        landed and added the anticipated FK follow-up (see
+        ``docs/router/ROUTER_ARCHITECTURE.md``), so this test is updated in
+        place to assert the new, current state rather than left asserting a
+        now-superseded fact; see ``tests/unit/test_router.py
+        ::TestRbacRouterFkFollowUp`` for the dedicated Module 008 coverage."""
         from app.domains.rbac.models import PermissionOverride, UserRole
 
         for model in (UserRole, PermissionOverride):
             column = model.__table__.columns["router_id"]
-            assert len(column.foreign_keys) == 0
+            assert len(column.foreign_keys) == 1
+            foreign_key = next(iter(column.foreign_keys))
+            assert foreign_key.target_fullname == "routers.id"

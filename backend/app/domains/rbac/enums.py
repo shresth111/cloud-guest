@@ -168,3 +168,18 @@ class AuditAction(StrEnum):
     USER_UPDATED = "user_updated"
     USER_DEACTIVATED = "user_deactivated"
     USER_REACTIVATED = "user_reactivated"
+
+    # Router domain events (Module 008) -- written through this same table by
+    # ``app.domains.router.service.RouterService`` via the same narrow
+    # ``AuditLogWriter`` protocol shape ``OrganizationService``/
+    # ``LocationService``/``UserService`` use (see ``AuditLogEntry``'s
+    # "other domains could plausibly reuse it" design). Heartbeats are
+    # deliberately not audited here -- see
+    # ``docs/router/ROUTER_ARCHITECTURE.md`` §6.
+    ROUTER_CREATED = "router_created"
+    ROUTER_UPDATED = "router_updated"
+    ROUTER_DECOMMISSIONED = "router_decommissioned"
+    ROUTER_SUSPENDED = "router_suspended"
+    ROUTER_REINSTATED = "router_reinstated"
+    ROUTER_PROVISIONING_TOKEN_GENERATED = "router_provisioning_token_generated"
+    ROUTER_PROVISIONED = "router_provisioned"

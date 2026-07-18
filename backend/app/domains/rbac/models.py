@@ -10,17 +10,36 @@ Scope columns: ``organization_id`` carries a real ``ForeignKey`` to
 ``organizations.id`` (added in migration ``0004``, once
 ``app.domains.organization`` landed -- Module 005) on every model that has
 one (``Role``, ``UserRole``, ``OrganizationRole``, ``PermissionOverride``,
-``AuditLogEntry``). ``location_id`` now likewise carries a real
-``ForeignKey`` to ``locations.id`` (added in migration ``0006``, once
-``app.domains.location`` landed -- Module 006) on every model that has one
-(``UserRole``, ``PermissionOverride``, ``LocationRole``, ``AuditLogEntry``).
-``router_id`` and the future ``msp_id`` remain plain nullable ``UUID``
-columns *without* a SQL ``ForeignKey`` constraint, because the Router (and
-future MSP) domains still do not exist yet in this codebase (see the module
-scope boundary). A real FK constraint for ``router_id`` gets added in a
-follow-up migration once that domain lands, the same way ``organization_id``
-and ``location_id`` just were. ``PermissionScope`` carries no scope columns
-at all (only ``permission_id``/``scope_type``) and is unaffected.
+``AuditLogEntry``). ``location_id`` likewise carries a real ``ForeignKey``
+to ``locations.id`` (added in migration ``0006``, once
+``app.domains.location`` landed --
+Module 006) on every model that has one (``UserRole``, ``PermissionOverride``,
+``LocationRole``, ``AuditLogEntry``). ``router_id`` now likewise carries a
+real ``ForeignKey`` to ``routers.id`` (added in migration ``0008``, once
+``app.domains.router`` landed -- Module 008) on the two models that have one
+(``UserRole``, ``PermissionOverride`` -- ``AuditLogEntry`` has no
+``router_id`` column at all, only ``organization_id``/``location_id``, and
+there is no dedicated ``RouterRole`` table, see below). The future ``msp_id``
+remains a plain nullable ``UUID`` column *without* a SQL ``ForeignKey``
+constraint, because the MSP domain still does not exist yet in this codebase
+(see the module scope boundary). A real FK constraint for ``msp_id`` gets
+added in a follow-up migration once that domain lands, the same way
+``organization_id``/``location_id``/``router_id`` just were.
+``PermissionScope`` carries no scope columns at all (only
+``permission_id``/``scope_type``) and is unaffected.
+
+**No ``RouterRole`` table.** ``OrganizationRole``/``LocationRole`` exist to
+let an organization/location curate which roles are enabled and pick a
+default role for new members at that scope. Module 008 deliberately did not
+add a ``RouterRole`` equivalent: no gap was found that would require one --
+a router has no "which roles are usable here" curation need distinct from
+what ``LocationRole`` (one level up) already provides, and no router-level
+"default role for new members" concept exists in the RBAC/Router briefs.
+``ScopeType.ROUTER`` and ``router_id``-scoped ``UserRole``/
+``PermissionOverride`` rows remain the only router-scoped RBAC surface --
+this was an intentional scope decision, not an oversight; see
+``docs/router/ROUTER_ARCHITECTURE.md`` §7 for the full reasoning, and
+revisit only if a genuine per-router role-curation need emerges.
 
 Design decisions worth calling out (see ``docs/rbac/RBAC_ARCHITECTURE.md``
 for the full write-up):
@@ -300,7 +319,9 @@ class UserRole(BaseModel):
         nullable=True,
     )
     router_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     granted_at: Mapped[datetime] = mapped_column(
@@ -368,7 +389,9 @@ class PermissionOverride(BaseModel):
         nullable=True,
     )
     router_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -178,3 +178,48 @@ initial `ORGANIZATION`-scoped role assignment in the same call -- see
 own `POST/DELETE /users/{id}/roles`, `GET /users/{id}/permissions`, or
 `GET /me/permissions` endpoints, all of which remain unchanged.
 
+## Router Endpoints (Module 008)
+
+MikroTik RouterOS device records: registration, lifecycle, health, and
+zero-touch provisioning (Organization -> Location -> Router -> Guest) --
+not the guest-facing captive portal/hotspot/network-service configuration
+layered on top of a router (separate future modules). See
+`backend/docs/router/README.md` and
+`backend/docs/router/ROUTER_ARCHITECTURE.md` for the full design.
+
+```text
+GET    /api/v1/locations/{location_id}/routers
+POST   /api/v1/locations/{location_id}/routers
+GET    /api/v1/routers/{router_id}
+PUT    /api/v1/routers/{router_id}
+DELETE /api/v1/routers/{router_id}
+POST   /api/v1/routers/{router_id}/suspend
+POST   /api/v1/routers/{router_id}/reinstate
+POST   /api/v1/routers/{router_id}/provisioning-token
+POST   /api/v1/routers/{router_id}/heartbeat
+POST   /api/v1/routers/provisioning/check-in
+```
+
+Mutating/protected endpoints require the appropriate `routers.*` permission
+(`create`/`read`/`update`/`delete`/`manage`) at the resolved scope; `DELETE
+/routers/{id}` decommissions (soft-deletes), it never hard-deletes.
+`location_id`/`organization_id` are immutable after creation (not present
+on the update schema) -- see `ROUTER_ARCHITECTURE.md` §1. Every user-facing
+endpoint enforces organization-tenant scoping via
+`requesting_organization_id` (`X-Organization-Id`), the same as
+Organization/Location/User's own endpoints. `POST
+/routers/{id}/provisioning-token` additionally requires
+`router_provisioning.approve` alongside `router_provisioning.create` --
+see `ROUTER_ARCHITECTURE.md` §5. `POST /routers/provisioning/check-in` is
+the one endpoint in this API that is **not** authenticated as a platform
+user at all: it is presented by the physical device itself, using a
+single-use provisioning token (issued by the token-generation endpoint) as
+its sole credential, submitted in the request body rather than as a bearer
+header, and its response is a minimal, non-`ApiResponse`-envelope shape --
+see `ROUTER_ARCHITECTURE.md` §5 for the full auth-scheme reasoning. Router
+API connection credentials (RouterOS username/password or API key) are
+Fernet-encrypted at rest (`app.domains.router.crypto`) -- an interim design
+pending a real secrets-manager/KMS integration, documented in
+`ROUTER_ARCHITECTURE.md` §3; no response ever returns the ciphertext or a
+decrypted secret, only a `has_api_credentials` boolean flag.
+

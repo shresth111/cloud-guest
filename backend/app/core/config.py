@@ -76,6 +76,29 @@ class Settings(BaseSettings):
         ),
     )
 
+    router_encryption_key: str = Field(
+        default="aW5zZWN1cmUtbG9jYWwtZGV2LWZlcm5ldC1rZXkzMiE=",
+        min_length=32,
+        description=(
+            "App-level symmetric key (Fernet, urlsafe-base64) used by "
+            "app.domains.router.crypto to encrypt/decrypt RouterOS API "
+            "connection credentials at rest. Must be overridden with a real "
+            "Fernet key (Fernet.generate_key()) in every non-local "
+            "environment -- this is an interim design pending a real "
+            "secrets-manager/KMS integration (see "
+            "docs/router/ROUTER_ARCHITECTURE.md)."
+        ),
+    )
+    router_provisioning_token_expire_hours: int = Field(
+        default=24,
+        ge=1,
+        le=720,
+        description=(
+            "How long a generated zero-touch-provisioning bearer token "
+            "remains valid before a device must have it regenerated."
+        ),
+    )
+
     @property
     def log_path(self) -> Path:
         return self.log_dir / self.log_file
