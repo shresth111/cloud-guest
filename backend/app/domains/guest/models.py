@@ -242,6 +242,23 @@ class GuestSession(BaseModel):
         DateTime(timezone=True), nullable=False
     )
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    # BE-012 Part 2 addition: the raw ``User-Agent`` request header captured
+    # at login time (``login_via_otp``/``login_via_voucher`` -- see
+    # ``app.domains.guest.router``'s two guest-facing login endpoints, both
+    # of which already receive a ``Request`` object for ``ip_address``).
+    # Nullable and best-effort: a guest's device/browser may omit or spoof
+    # this header, and every session created before this column existed has
+    # (and will always have) ``NULL`` here. Deliberately the *raw* string,
+    # not a pre-parsed device/browser/OS -- classification happens at
+    # dashboard read time via real SQL (see
+    # ``app.domains.analytics.repository.AnalyticsRepository
+    # .get_user_agent_breakdown``), so a future, better heuristic (or a real
+    # parsing library, should one ever become warranted) never needs a
+    # backfill migration, only a smarter read-side query. See
+    # ``docs/analytics/FLOW.md``'s "Device/Browser/OS" section for the full
+    # honesty write-up on why this narrow, additive column exists and a
+    # dedicated parsing library does not.
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
     bytes_uploaded: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     bytes_downloaded: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     # Copied from the redeemed voucher's batch (or a portal/location

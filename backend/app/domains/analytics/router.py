@@ -54,10 +54,24 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
-from app.domains.rbac.dependencies import CurrentOrganization, RequirePermission
+from app.domains.auth.models import AuthUser
+from app.domains.rbac.dependencies import (
+    CurrentOrganization,
+    CurrentUser,
+    RequireLocation,
+    RequireOrganization,
+    RequirePermission,
+)
+from app.domains.rbac.enums import ScopeType
 
 from .constants import AnalyticsSnapshotType
-from .dependencies import get_analytics_service
+from .dashboard_schemas import (
+    LocationDashboardResponse,
+    OrganizationDashboardResponse,
+    SuperAdminDashboardResponse,
+)
+from .dashboard_service import DashboardService
+from .dependencies import get_analytics_service, get_dashboard_service
 from .models import AnalyticsSnapshot
 from .schemas import (
     AnalyticsSnapshotListResponse,
@@ -143,6 +157,86 @@ async def trigger_snapshot_aggregation(
         success=True,
         message="Analytics aggregation triggered",
         data=response_payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# BE-012 Part 2: Super Admin + Organization + Location Dashboards
+#
+# All three are gated by RBAC's ``RequirePermission`` at an explicit scope
+# (never inferred) *plus* ``DashboardService``'s own, independent
+# ``DashboardScope`` check (see ``dashboard_scope.py``'s module docstring for
+# why both layers matter -- "what action" vs. "which tenant's data", the
+# identical distinction every other domain's own tenant-scoped endpoints
+# already enforce).
+# ============================================================================
+
+
+@router.get(
+    "/dashboard/super-admin",
+    response_model=ApiResponse[SuperAdminDashboardResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("analytics.read", scope=ScopeType.GLOBAL))],
+)
+async def get_super_admin_dashboard(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    service: DashboardService = Depends(get_dashboard_service),
+):
+    payload = await service.get_super_admin_dashboard(uuid.UUID(user.id))
+    return build_response(
+        success=True,
+        message="Super Admin dashboard retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/dashboard/organization",
+    response_model=ApiResponse[OrganizationDashboardResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_organization_dashboard(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: DashboardService = Depends(get_dashboard_service),
+):
+    payload = await service.get_organization_dashboard(
+        uuid.UUID(user.id), organization_id
+    )
+    return build_response(
+        success=True,
+        message="Organization dashboard retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/dashboard/location",
+    response_model=ApiResponse[LocationDashboardResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.LOCATION))
+    ],
+)
+async def get_location_dashboard(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    location_id: uuid.UUID = Depends(RequireLocation),
+    service: DashboardService = Depends(get_dashboard_service),
+):
+    payload = await service.get_location_dashboard(uuid.UUID(user.id), location_id)
+    return build_response(
+        success=True,
+        message="Location dashboard retrieved",
+        data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )
 

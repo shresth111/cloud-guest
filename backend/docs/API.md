@@ -1002,3 +1002,75 @@ broker (see `docs/analytics/README.md`'s "Running a Worker + Beat Locally"
 section) -- neither is started by `app.main.create_app()` or by the test
 suite.
 
+## Dashboard Endpoints (Module 012 Part 2: Super Admin + Organization + Location Dashboards)
+
+See `docs/analytics/FLOW.md` §§13-22 for the full design write-up (the
+peak-concurrent-sessions sweep-line algorithm, the Organization Health
+Score formula and exact weights, the `DashboardScope` resolution and its
+MSP-child rollup, the device/browser/OS real-capture-and-classify decision,
+and the dashboard-view audit-throttling decision). All three endpoints
+require `analytics.read`, each at an explicit, non-inferred RBAC scope
+(`scope=` on `RequirePermission`), plus a second, independent
+`DashboardScope` check inside `DashboardService` itself (see
+`app.domains.analytics.dashboard_scope`'s module docstring for why both
+layers exist).
+
+### `GET /dashboard/super-admin`
+
+Requires `analytics.read` at `GLOBAL` scope -- only a caller holding a
+platform-wide (`GLOBAL`-scoped) RBAC role assignment (Super Admin, Platform
+Admin, Platform Support, Billing Manager) can ever satisfy this; every
+other caller is rejected by `app.domains.rbac.authorization.ScopeResolver`
+itself (a `GLOBAL` check can only be satisfied by a `GLOBAL` grant), and
+`DashboardScope.require_global()` re-asserts the same thing independently.
+No query parameters. Returns: total organizations/locations/routers,
+routers online/offline, total/today's/monthly guests, total/active
+sessions, peak concurrent sessions (see FLOW.md §13) plus the exact window
+it was computed over, five growth-trend series (organization/location/
+router/guest/network, each a day-over-(`DEFAULT_GROWTH_LOOKBACK_DAYS`,
+default 7)-days-ago delta computed from `PLATFORM_DAILY_SUMMARY` snapshot
+history), trial/paid customer counts (see FLOW.md §17 for exactly how these
+are approximated and why), and a `revenue` object that is **always**
+`available: false` with every numeric field `null` (see FLOW.md §17 -- no
+billing/subscription/payment domain exists anywhere in this codebase).
+
+### `GET /dashboard/organization`
+
+Requires `analytics.read` at `ORGANIZATION` scope. `organization_id` is
+resolved via RBAC's `RequireOrganization` (`X-Organization-Id` header,
+membership-validated) -- never a raw query parameter. If that organization
+is an MSP (`OrganizationType.MSP`), the response additionally rolls up
+every one of its child organizations' latest `ORG_DAILY_SUMMARY` snapshot
+into the same totals (see FLOW.md §18 for the exact MSP-rollup composition
+with `OrganizationService.list_children`, and which sub-sections stay
+scoped to the primary organization only). Returns: per-organization summary
+items (own org + any children) plus rolled-up totals (guest/session/router/
+location counts), Captive Portal Usage (see FLOW.md §16 for the exact
+data-source decision), Authentication Summary (real
+`GuestLoginHistory.auth_method`/success breakdown), OTP Statistics (real
+aggregate over `OtpRequest`), Voucher Statistics (real aggregate over
+`Voucher`/`VoucherBatch`), bandwidth consumption + average session
+duration, peak hour/day (UTC), a 7-day bandwidth traffic trend (from
+`ORG_DAILY_SUMMARY` snapshot history), and the Organization Health Score
+(see FLOW.md §15 for the exact formula and weights).
+
+### `GET /dashboard/location`
+
+Requires `analytics.read` at `LOCATION` scope. `location_id` is resolved
+via RBAC's `RequireLocation` (`X-Location-Id` header, existence + org-
+consistency validated). Returns: daily/weekly/monthly visitor counts (daily
+is a live "today so far" aggregate; weekly/monthly sum already-closed
+`LOCATION_DAILY_SUMMARY` daily snapshots plus today's own live count -- see
+FLOW.md §19), unique/returning guests (reusing
+`app.domains.guest.service.GuestAnalyticsService`'s own existing
+"returning" definition, never redefined here), average stay time, peak
+hours/days (UTC, real `EXTRACT(HOUR/DOW FROM started_at)` `GROUP BY`),
+bandwidth usage + average session bandwidth/duration, a `devices` object
+(Top Devices/Browsers/Operating Systems -- see FLOW.md §14 for the real
+capture-and-classify mechanism, including honest `sessions_with_data`/
+`sessions_total` coverage reporting), Authentication Methods (same real
+`GuestLoginHistory` composition as the Organization Dashboard, scoped to
+this one location), and a `country_statistics` object that is **always**
+`available: false` (see FLOW.md §17 -- no GeoIP/IP-geolocation data source
+exists in this environment).
+

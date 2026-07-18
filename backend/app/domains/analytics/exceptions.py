@@ -19,6 +19,7 @@ __all__ = [
     "InvalidAnalyticsDateRangeError",
     "AnalyticsOrganizationNotFoundError",
     "AnalyticsSnapshotNotFoundError",
+    "DashboardScopeForbiddenError",
 ]
 
 
@@ -65,3 +66,17 @@ class AnalyticsSnapshotNotFoundError(AnalyticsError):
             f"Analytics snapshot not found: {snapshot_id}",
             status_code=status.HTTP_404_NOT_FOUND,
         )
+
+
+class DashboardScopeForbiddenError(AnalyticsError):
+    """Raised by :class:`~.dashboard_scope.DashboardScope`'s ``require_*``
+    methods when a caller's *real, RBAC-role-derived* dashboard scope does
+    not cover the organization/location/global view they asked for -- the
+    second, independent "which tenant's data" check every dashboard endpoint
+    runs after RBAC's own ``RequirePermission`` "what action" check has
+    already passed. See ``dashboard_scope.py``'s module docstring for why
+    this check exists as a second, real layer rather than trusting the
+    permission dependency alone."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)

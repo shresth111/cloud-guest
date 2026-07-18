@@ -480,6 +480,7 @@ class GuestService:
         device_mac: str | None = None,
         device_name: str | None = None,
         ip_address: str | None = None,
+        user_agent: str | None = None,
     ) -> GuestLoginResult:
         if auth_method not in (GuestAuthMethod.OTP_SMS, GuestAuthMethod.OTP_EMAIL):
             raise GuestAuthMethodNotEnabledError(auth_method.value)
@@ -532,6 +533,7 @@ class GuestService:
             auth_method=auth_method,
             voucher_id=None,
             ip_address=ip_address,
+            user_agent=user_agent,
             data_limit_mb=None,
             session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
         )
@@ -579,6 +581,7 @@ class GuestService:
         device_mac: str | None = None,
         device_name: str | None = None,
         ip_address: str | None = None,
+        user_agent: str | None = None,
     ) -> GuestLoginResult:
         identifier = normalize_identifier(identifier)
         resolved = await self._require_method_enabled(
@@ -630,6 +633,7 @@ class GuestService:
             auth_method=GuestAuthMethod.VOUCHER,
             voucher_id=voucher.id,
             ip_address=ip_address,
+            user_agent=user_agent,
             data_limit_mb=batch.data_limit_mb,
             session_timeout_minutes=batch.validity_minutes,
         )
@@ -1023,6 +1027,7 @@ class GuestService:
             auth_method=GuestAuthMethod(prior.auth_method),
             voucher_id=prior.voucher_id,
             ip_address=ip_address,
+            user_agent=prior.user_agent,
             data_limit_mb=prior.data_limit_mb,
             session_timeout_minutes=prior.session_timeout_minutes,
         )
@@ -1179,6 +1184,7 @@ class GuestService:
         ip_address: str | None,
         data_limit_mb: int | None,
         session_timeout_minutes: int | None,
+        user_agent: str | None = None,
     ) -> GuestSession:
         now = datetime.now(UTC)
         session = await self.repository.create_session(
@@ -1194,6 +1200,7 @@ class GuestService:
             ended_at=None,
             last_activity_at=now,
             ip_address=ip_address,
+            user_agent=user_agent,
             bytes_uploaded=0,
             bytes_downloaded=0,
             data_limit_mb=data_limit_mb,

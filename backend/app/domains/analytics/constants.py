@@ -72,6 +72,51 @@ TASK_RUN_DAILY_AGGREGATION_FOR_ORGANIZATION = (
     "app.domains.analytics.tasks.run_daily_aggregation_for_organization"
 )
 
+
+# ============================================================================
+# BE-012 Part 2: Super Admin + Organization + Location Dashboards
+# ============================================================================
+
+# How many days back "growth" trend comparisons look for a prior period of
+# equal length (day-over-day at 1, but every dashboard's default trend
+# window uses this) -- see ``dashboard_aggregation.compute_growth``.
+DEFAULT_GROWTH_LOOKBACK_DAYS = 7
+
+# How many days of daily LOCATION_DAILY_SUMMARY snapshots "weekly"/"monthly"
+# visitor counts sum across -- see ``dashboard_aggregation
+# .sum_metric_across_snapshots``.
+WEEKLY_WINDOW_DAYS = 7
+MONTHLY_WINDOW_DAYS = 30
+
+# How far back "open alerts" are considered for the Organization Health
+# Score's alert component -- see ``health_score.py``. An alert that has been
+# open for a very long time still counts (there is no age-decay in this
+# heuristic, see that module's docstring), but this bounds the query itself
+# to a sane recent window rather than scanning a tenant's entire alert
+# history on every dashboard read.
+HEALTH_SCORE_ALERT_LOOKBACK_DAYS = 30
+
+# ``audit_log_entries.action`` values this domain writes -- kept as local,
+# plain string constants (not added to ``app.domains.rbac.enums.AuditAction``)
+# because this part's directory rule scopes changes to
+# ``app.domains.analytics`` only; ``AuditLogEntry.action`` is a plain,
+# unconstrained ``String(50)`` column (see
+# ``app.domains.rbac.models.AuditLogEntry``), so a value that is not also a
+# member of RBAC's own enum works identically for storage/querying -- it is
+# simply not registered in that shared, cross-domain registry. See
+# ``docs/analytics/FLOW.md`` for the full write-up of this scoping decision.
+AUDIT_ACTION_DASHBOARD_SUPER_ADMIN_VIEWED = "dashboard_super_admin_viewed"
+AUDIT_ACTION_DASHBOARD_ORGANIZATION_VIEWED = "dashboard_organization_viewed"
+AUDIT_ACTION_DASHBOARD_LOCATION_VIEWED = "dashboard_location_viewed"
+
+# Dashboard-view audit throttling: see ``dashboard_audit.py`` for the full
+# volume-tiering write-up (mirrors OTP/Voucher's own audit-volume judgment
+# calls). A dashboard view is always logged via the structured logger; it is
+# only written into the moderate-volume ``audit_log_entries`` table once per
+# this many minutes, per (user, dashboard kind, scope).
+DASHBOARD_AUDIT_THROTTLE_MINUTES = 15
+DASHBOARD_AUDIT_THROTTLE_KEY_TEMPLATE = "dashboard_audit_throttle:{key}"
+
 __all__ = [
     "AnalyticsSnapshotType",
     "AnalyticsGranularity",
@@ -79,4 +124,13 @@ __all__ = [
     "DEFAULT_LIST_PAGE_SIZE",
     "TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS",
     "TASK_RUN_DAILY_AGGREGATION_FOR_ORGANIZATION",
+    "DEFAULT_GROWTH_LOOKBACK_DAYS",
+    "WEEKLY_WINDOW_DAYS",
+    "MONTHLY_WINDOW_DAYS",
+    "HEALTH_SCORE_ALERT_LOOKBACK_DAYS",
+    "AUDIT_ACTION_DASHBOARD_SUPER_ADMIN_VIEWED",
+    "AUDIT_ACTION_DASHBOARD_ORGANIZATION_VIEWED",
+    "AUDIT_ACTION_DASHBOARD_LOCATION_VIEWED",
+    "DASHBOARD_AUDIT_THROTTLE_MINUTES",
+    "DASHBOARD_AUDIT_THROTTLE_KEY_TEMPLATE",
 ]

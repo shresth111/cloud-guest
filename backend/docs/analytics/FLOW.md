@@ -318,3 +318,379 @@ own scope inference (`app.domains.rbac.dependencies._infer_scope_type`)
 requires `GLOBAL` scope for a request with no scope headers at all, so an
 organization-scoped caller cannot simply omit the header to see every
 tenant's data.
+
+---
+
+# BE-012 Part 2: Super Admin + Organization + Location Dashboards
+
+Everything below extends this same domain -- no new top-level domain, no
+new table besides one narrow, additive column on a different domain's
+model (see §14). New modules added to `app.domains.analytics`:
+`dashboard_scope.py`, `dashboard_service.py`, `dashboard_schemas.py`,
+`dashboard_aggregation.py`, `peak_concurrency.py`, `health_score.py`,
+`dashboard_audit.py` -- plus extensions to `repository.py`,
+`dependencies.py`, `router.py`, `constants.py`, and `exceptions.py`.
+
+## 13. Peak Concurrent Sessions: a real interval sweep, not a sampling approximation
+
+"Peak concurrent sessions" means: at the single busiest moment within a
+window, how many `GuestSession` rows were simultaneously alive? A naive
+"sample every N minutes and count active sessions at each sample point"
+approach can miss the true peak between samples -- this codebase does not
+do that. Instead, `app.domains.analytics.peak_concurrency
+.compute_peak_concurrent_sessions` implements a real, correct sweep-line:
+
+1. Every session interval becomes two events: `+1` at its (window-clipped)
+   start, `-1` at its (window-clipped) end. A session still `ACTIVE`
+   (`ended_at IS NULL`) is treated as alive through the window's own end
+   (it cannot be known to have ended before the window closes).
+2. Events are sorted chronologically, with **ties broken end-before-start**
+   -- a half-open `[start, end)` interval convention, so a session ending
+   at exactly `t` and a different session starting at exactly `t` do not
+   count as briefly overlapping.
+3. Walking the sorted events left to right while keeping a running total,
+   the **maximum value that running total ever reaches is the true peak**,
+   by definition.
+
+**Why the sweep itself is a plain Python function, not one SQL window-
+function query end to end:** the query *could* be expressed in Postgres as
+a `SUM(delta) OVER (ORDER BY ts)` window function followed by a `MAX(...)`
+of that running sum, but this codebase's own test convention (hand-rolled
+fakes, no live Postgres in any unit test -- see `test_analytics.py`'s
+module docstring) could not verify that SQL's *correctness* against a
+hand-constructed overlapping-intervals fixture without either mocking away
+the real logic or introducing a live database into the test suite. The
+split chosen keeps both halves honest and testable: **real SQL**
+(`AnalyticsRepository.list_session_intervals`) narrows the candidate set to
+only sessions whose interval could possibly overlap the requested window (a
+bounded, indexed `WHERE` filter -- `started_at <= end AND (ended_at IS NULL
+OR ended_at >= start)` -- never every row ever created), and the **pure,
+Postgres-independent sweep function** computes the true peak over just the
+two datetime columns of that already-filtered result set. This is an
+O(n log n) sort-and-scan over interval endpoints, not the kind of
+"Python-side loop over bulk-fetched business rows" this codebase's coding
+rules warn against -- it operates on exactly two primitive columns per
+candidate row, and only over rows a real SQL `WHERE` clause has already
+narrowed to "could plausibly matter for this window."
+
+`tests/unit/test_analytics_dashboards.py` verifies this against several
+hand-constructed fixtures: no overlap (peak 1), a genuine three-way overlap
+(peak 3), the half-open boundary case (a session ending exactly when
+another starts is *not* double-counted), a still-`ACTIVE` session treated
+as alive through the window's end, and window-clipping of intervals that
+extend beyond the requested range.
+
+## 14. The device/browser/OS decision: real capture, not an honest placeholder
+
+Per this part's honesty investigation: `app.domains.guest.router`'s
+`guest_login_via_otp`/`guest_login_via_voucher` endpoints already receive a
+`Request` object (used today only for `ip_address`) -- so capturing the raw
+`User-Agent` header at the exact same call sites is genuinely a small,
+narrow, additive change, following the identical discipline BE-011 Part 1's
+`HeartbeatLog` hook and BE-011 Part 3's real-time broadcast hook already
+established for composing into `app.domains.guest` from elsewhere:
+
+* **One new nullable column**: `GuestSession.user_agent` (`Text`,
+  nullable) -- the *raw* header string, never a pre-parsed device/browser/
+  OS. Storing it raw means a smarter future classifier never needs a
+  backfill migration, only a better read-side query.
+* **One line at each of the two login call sites**
+  (`app/domains/guest/router.py`): `user_agent =
+  request.headers.get("user-agent")`, threaded through
+  `GuestService.login_via_otp`/`login_via_voucher` (new, default-`None`
+  keyword parameters -- every existing caller/test that does not pass it
+  behaves exactly as before) into `_create_session`. `reconnect` also
+  carries a prior session's `user_agent` forward onto its derived new
+  session, the same "copy forward" discipline it already applies to
+  `auth_method`/`device_id`/quota fields.
+* **One migration**: `alembic/versions/0019_add_user_agent_to_guest_
+  sessions.py` -- a single `ALTER TABLE guest_sessions ADD COLUMN
+  user_agent TEXT NULL`, no index (never filtered/joined on, only
+  classified via `CASE`/regex and aggregated at read time).
+
+**Files touched inside `app.domains.guest`, exhaustively:** `models.py`
+(the one column), `router.py` (two one-line header captures at the two
+existing login endpoints), `service.py` (a new, default-`None` keyword
+parameter threaded through `login_via_otp`/`login_via_voucher`/
+`_create_session`/`reconnect`). Nothing else in that domain was touched --
+no schema/response change (`schemas.py` is untouched, so the raw session
+response does not expose this field), no new endpoint, no behavior change
+for any existing caller.
+
+### Why a regex-based classifier, not a `user-agents`-style dependency
+
+A real, well-known User-Agent parsing library was considered and rejected
+for this narrow slice: this dashboard only needs three coarse buckets
+(OS/browser/device-type), not a full device model/version-level parse, and
+the existing patterns (iPhone/iPad/Android/Windows/Mac/Linux for OS;
+Edge/Opera/Chrome/Firefox/Safari for browser, checked most-specific-first
+since Edge/Opera/Chrome-on-iOS all also contain the substring `"Chrome"` or
+`"Safari"` in their own UA strings) cover the overwhelming majority of real
+browser/OS traffic with a handful of `~*` (case-insensitive Postgres regex)
+`CASE` branches. Adding a new third-party dependency for three coarse
+buckets, for one analytics dashboard slice, was judged unwarranted scope
+creep -- this is documented as a **small, honest heuristic classifier, not
+a specification-compliant parser**: anything it does not recognize buckets
+into `"Other"` rather than guessing, and it is never presented as more
+precise than it is.
+
+### Where the classification actually happens: real SQL, not a Python loop
+
+`AnalyticsRepository.get_user_agent_breakdown` classifies every non-`NULL`
+`GuestSession.user_agent` in scope/window via Postgres `CASE`/`~*` regex
+matching directly in the `SELECT`, then `GROUP BY`/`COUNT` -- never a
+Python-side per-row parsing loop. It also reports `sessions_total` and
+`sessions_with_user_agent` alongside the breakdown, so
+`DeviceBreakdownResponse` can honestly convey coverage: sessions created
+before this column existed (or where a guest's device omitted the header)
+are real `NULL`s, and the dashboard says so explicitly (`message` field)
+rather than silently treating them as zero devices of every kind.
+
+## 15. Organization Health Score: exact formula and weights
+
+`app.domains.analytics.health_score.compute_health_score` implements:
+
+```text
+health_score = round(
+    0.50 * router_health_component
+  + 0.30 * alert_health_component
+  + 0.20 * growth_health_component
+)
+```
+
+Clamped to `[0, 100]`. This is explicitly documented (in the module's own
+docstring, and surfaced on the API response itself via
+`HealthScoreResponse.formula_note`) as a **heuristic composite score, not a
+scientific or statistically-calibrated measure** -- there is no historical
+health-score-vs-actual-outcome dataset in this environment to fit weights
+against, and this module never claims otherwise.
+
+* **Router health (weight 0.50)**: `online_routers / total_routers * 100`
+  for the organization's own, non-deleted routers (`RouterStatus.ONLINE`
+  vs. everything else). An organization with zero routers scores `100` on
+  this component (nothing to be unhealthy about).
+* **Alert health (weight 0.30)**: `100` minus a penalty summed over every
+  currently-*open* (non-`RESOLVED`) `Alert` for the organization triggered
+  within the last `HEALTH_SCORE_ALERT_LOOKBACK_DAYS` (30) days, weighted by
+  severity -- `CRITICAL` costs 25 points each, `WARNING` costs 10, `INFO`
+  costs 3 -- capped at a maximum total penalty of 100 (component floors at
+  0, never negative).
+* **Growth health (weight 0.20)**: `100` if the organization's unique-guest
+  count (from `ORG_DAILY_SUMMARY` snapshot history, current period vs. the
+  immediately preceding period of equal length) is *increasing*, `70` if
+  *flat* (or if there is no prior-period snapshot yet to compare against --
+  treated as neutral, not penalized, for a brand-new organization), `40` if
+  *declining*. Only the sign is used, never the magnitude.
+
+**Why these three inputs, and why these weights** (see the module's own
+docstring for the full write-up): router uptime is weighted highest
+because it is the most directly actionable, most objective "is this
+organization's deployed infrastructure currently working" signal. Alerts
+add everything the platform's monitoring domain has already judged worth
+surfacing beyond router connectivity (SLA breaches, provisioning failures,
+...), weighted below router health because an alert can be lower-severity/
+informational. Growth is weighted lowest since it is the most business/
+context-dependent of the three (a seasonal business's low season is not
+the same as genuine churn) and the least "healthy infrastructure" flavored.
+
+`tests/unit/test_analytics_dashboards.py::test_health_score_exact_weighted_
+formula` verifies the exact arithmetic against known inputs (5/10 routers
+online, one critical + one warning alert, a declining trend ->
+`25.0 + 19.5 + 8.0 = 52.5 -> round -> 52`).
+
+## 16. Captive Portal Usage: the data-source decision
+
+`app.domains.captive_portal.models.CaptivePortalConfig` has no
+view/impression counter, and `GuestSession` carries no direct foreign key
+to a specific `CaptivePortalConfig` row -- a portal is resolved at login
+time by `(organization_id, location_id)` (most-specific-wins, see that
+domain's own `resolve_portal_config`), not referenced per-session
+afterward. There is therefore no clean way to attribute "N logins happened
+through *this specific* portal config" without adding a new column/FK to
+either domain, which this part's directory rule (extend `analytics` only,
+compose with `captive_portal`'s existing public interface) does not permit.
+
+**Decision**: "Captive Portal Usage" on the Organization Dashboard is
+defined as **guest login volume** (a real `COUNT` of `GuestSession` rows)
+**under the organization**, since every guest session that exists is, by
+construction, one that passed through *some* active captive portal
+resolved for that organization/location -- this is a real, honest, if
+coarser-than-per-config-row, usage signal. Alongside it, the dashboard
+reports a real, direct count of the organization's `active`/`total`
+`CaptivePortalConfig` rows (`AnalyticsRepository
+.count_captive_portal_configs`) for context. Both are documented on the
+response itself (`captive_portal_note`) so this scoping decision is never
+silently implied.
+
+## 17. Honest unavailability: Revenue/ARR/MRR, Trial/Paid, and Country Statistics
+
+**Revenue/Monthly Revenue/ARR/MRR** (`RevenueMetricsResponse`, Super Admin
+Dashboard): **always** `available: false`, every numeric field `null`, with
+an explanatory `message`. There is no billing/subscription/payment domain
+anywhere in this codebase --
+`app.domains.organization.models.Organization.subscription_tier` is
+explicitly documented (Module 005's own decision) as a lightweight,
+unpopulated *label* with no pricing/entitlement logic behind it. Nothing is
+guessed or backed into from any other signal.
+
+**Trial Customers / Paid Customers**: the module brief's own instruction
+allows approximating these from `subscription_tier`, *if that field is
+actually populated anywhere*. It is checked and confirmed **not
+populated** in any of this codebase's real data paths (every test factory
+and every real `create_organization` call site that does not explicitly
+pass it leaves it `NULL`). Rather than report two counts that would always
+read `{unknown: N}` off an unpopulated field, this part uses the one
+*other* real, always-populated signal this codebase has for exactly this
+distinction: `Organization.status` (`app.domains.organization.enums
+.OrganizationStatus`), which already has a real `TRIAL` value alongside
+`ACTIVE`/`SUSPENDED`/`ARCHIVED`, and every organization's `status` is a
+required, non-nullable column with a real, meaningful current value.
+`trial_customers = COUNT(status = TRIAL)`, `paid_customers = COUNT(status
+IN (ACTIVE, SUSPENDED))` (archived organizations excluded from both). This
+is disclosed explicitly on the response (`subscription_note`) as an
+**approximation from lifecycle status, not verified billing data** -- "paid"
+here means "not currently trialing and not archived," not "has an active,
+paid subscription record" (no such record exists anywhere to check).
+
+**Country Statistics** (Location Dashboard): **always**
+`available: false`. There is no GeoIP database, no IP-geolocation service,
+and no billing/payment data anywhere in this sandbox from which a guest's
+country could be honestly derived (an `ip_address` column exists on
+`GuestSession`, but resolving an IP to a country requires a real
+geolocation data source/service this environment does not have) -- treated
+with the exact same honest-unavailable posture as revenue.
+
+## 18. `DashboardScope`: composing RBAC + MSP-children, not reinventing scope resolution
+
+Every dashboard endpoint enforces **two independent layers**, mirroring the
+"permission answers *what*, tenant-scoping answers *which tenant's data*"
+distinction every other domain in this codebase already draws (e.g.
+`app.domains.guest.service.GuestService._enforce_tenant_scope`,
+`app.domains.organization.service.OrganizationService
+._enforce_tenant_access`):
+
+1. **RBAC's `RequirePermission("analytics.read", scope=...)`**, with an
+   explicit, non-inferred `scope=` (`GLOBAL`/`ORGANIZATION`/`LOCATION` per
+   endpoint) -- this already verifies the caller holds a role grant whose
+   scope covers whatever the request's headers name.
+2. **`app.domains.analytics.dashboard_scope.DashboardScope`**, resolved
+   from the caller's *real, active RBAC role assignments* (via
+   `app.domains.rbac.authorization.RoleResolver`, reused directly) and
+   checked independently inside `DashboardService` itself
+   (`require_global`/`require_organization`/`require_location`) before any
+   data is touched.
+
+Layer 2 exists because layer 1 alone cannot express "an MSP Admin's role
+assignment is scoped to their MSP organization, yet they should also see a
+rollup across that MSP's child organizations" -- composing a child
+organization into a caller's effective dashboard visibility needs a second
+step: `DashboardScopeResolver.resolve` expands any `ORGANIZATION`-scoped
+grant on an MSP-type organization (`Organization.is_msp()`) into its
+children via `app.domains.organization.service.OrganizationService
+.list_children` (reused directly, never reimplemented). This one
+resolution path handles **both** "Organization Admin -> their own,
+non-MSP org" and "MSP Admin -> their MSP org's child organizations" without
+special-casing either -- the only difference between the two is whether
+`is_msp()` is true for the organization the caller's own grant names.
+
+A `LOCATION`-scoped grant's `UserRole` row is not required to also carry
+`organization_id` (see `app.domains.rbac.service.RBACService
+._validate_scope_assignment`), so `DashboardScope
+Resolver.resolve_location_organization_id` looks up a location's real
+owning organization via `app.domains.location.service.LocationService
+.get_location` (reused directly) whenever a location-scoped check needs to
+compare against an organization id.
+
+**The hierarchy asymmetry is preserved**, mirroring
+`app.domains.rbac.authorization.ScopeResolver.satisfies`: a `GLOBAL` scope
+allows everything; an `ORGANIZATION`-level scope (already MSP-expanded)
+allows every location under any of its organizations (broader covers
+narrower); a `LOCATION`-level scope allows *only* its explicit location ids
+and can never satisfy an organization-level check (narrower can never
+satisfy broader) -- `tests/unit/test_analytics_dashboards.py::test_
+dashboard_scope_location_level_cannot_satisfy_organization_check` verifies
+this directly.
+
+No file inside `rbac`/`organization`/`location` is edited to make any of
+this work -- every composition point is that domain's own already-public
+service method or dependency factory.
+
+## 19. Weekly/Monthly visitors: summing daily snapshots, never re-querying raw sessions
+
+The Location Dashboard's weekly/monthly visitor counts are computed by
+summing `session_count_total` across already-persisted, already-closed
+`LOCATION_DAILY_SUMMARY` snapshots (`app.domains.analytics
+.dashboard_aggregation.sum_metric_across_snapshots`, fed by
+`AnalyticsRepository.list_snapshots` -- a method that already existed in
+Part 1) for the trailing 7/30 days, plus one live, real aggregate call
+(`GuestAnalyticsService.get_summary`) for *today's own still-open* window
+(a day this early in its own life has no closed snapshot yet). This is the
+entire reason the snapshot table exists -- summing seven or thirty
+already-computed daily numbers is O(1)-ish regardless of how many
+underlying `GuestSession` rows a location has ever accumulated, unlike
+re-running a raw aggregate query over the full wider window on every
+dashboard request.
+
+## 20. Peak hours/days: real `GROUP BY EXTRACT(...)` queries
+
+`AnalyticsRepository.get_session_counts_by_hour`/
+`get_session_counts_by_day_of_week` are real SQL: `EXTRACT(HOUR FROM
+started_at)`/`EXTRACT(DOW FROM started_at)` (Postgres `DOW`: `0` = Sunday
+.. `6` = Saturday, UTC, matching every other timestamp column in this
+codebase), cast to `Integer`, `GROUP BY`, `COUNT`. The service layer then
+picks the top result(s) in Python (a trivial `max`/`sort` over at most 24
+or 7 already-aggregated rows, not a per-session loop).
+
+## 21. Dashboard-view audit-volume decision
+
+The instruction to "audit every report generation," read completely
+literally, would write one `audit_log_entries` row per single dashboard
+HTTP request -- exactly the profile this codebase's own OTP/Voucher
+audit-volume precedents already warn against for a routine, no-state-
+change *read* a real admin UI can reasonably poll/auto-refresh. See
+`app.domains.analytics.dashboard_audit`'s own module docstring for the full
+write-up; the decision made here is a middle ground:
+
+* **Every** dashboard view is logged via the structured logger,
+  unconditionally (`logger.info("dashboard_viewed", ...)`)  -- the cheap,
+  high-volume sink this codebase already uses everywhere for exactly this
+  kind of signal.
+* A durable `audit_log_entries` row is written **at most once per
+  `(user_id, dashboard_kind, scope)` per `DASHBOARD_AUDIT_THROTTLE_MINUTES`
+  (15) window**, via a real, Redis-backed dedup (`DashboardAuditThrottle`,
+  a `SET key value NX EX <window>` -- set-if-absent-with-TTL, the same
+  INCR/EXPIRE-adjacent idiom `OtpRateLimiter`/
+  `VoucherRedemptionRateLimiter` already establish for a different kind of
+  check). This still gives a real, periodic, durable audit trail of who
+  viewed which dashboard (the first view of every 15-minute window, per
+  user+dashboard+scope, is always recorded) without turning routine
+  dashboard polling into unbounded audit-table growth.
+
+**Additive `AuditAction` values, deliberately not added to
+`app.domains.rbac.enums.AuditAction`**: this part's directory rule scopes
+file changes to `app.domains.analytics` (plus a few named exceptions) --
+`app/domains/rbac/enums.py` is explicitly out of scope. `AuditLogEntry
+.action` (`app.domains.rbac.models`) is a plain, unconstrained
+`String(50)` column, not a native Postgres enum -- a value that is not
+also a member of RBAC's own Python-level `AuditAction` registry is stored
+and queried identically. `app.domains.analytics.constants` therefore
+defines its own local string constants
+(`AUDIT_ACTION_DASHBOARD_SUPER_ADMIN_VIEWED`/`_ORGANIZATION_VIEWED`/
+`_LOCATION_VIEWED`) written into the exact same shared
+`audit_log_entries` table via the same narrow `create_audit_log_entry`
+writer protocol every other domain's service already uses -- composition
+with RBAC's public storage surface, without editing RBAC's own file.
+
+## 22. Live aggregation vs. snapshot reads -- a quick reference
+
+| Dashboard figure | Source |
+|---|---|
+| Total organizations/locations/routers, online/offline routers | Live `COUNT`/`GROUP BY` (cheap, small tables) |
+| Total/monthly guests, total sessions | Live aggregate (all-time/whole-month figures a daily snapshot alone cannot answer without summing history) |
+| Active sessions, peak concurrent sessions | Live -- "right now"/"at this exact moment" has no meaningful snapshot equivalent |
+| Organization/location/router/guest/network growth | `AnalyticsSnapshot` history (current vs. N-days-ago snapshot) |
+| Organization/Location Summary rollup counts | Latest `ORG_DAILY_SUMMARY`/`LOCATION_DAILY_SUMMARY` snapshot |
+| Weekly/monthly visitors | Summed daily snapshots + one live call for today's still-open window (see §19) |
+| Auth methods, OTP/voucher stats, captive portal usage, peak hour/day, device/browser/OS, bandwidth/average-session | Live aggregate (none of these are captured in a snapshot's `metrics` shape) |
+| Traffic trend (Organization Dashboard) | `ORG_DAILY_SUMMARY` snapshot history, day-over-day |
+| Health Score | Live router/alert counts + snapshot-derived growth direction |

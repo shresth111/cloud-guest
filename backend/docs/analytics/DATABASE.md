@@ -125,3 +125,33 @@ Plus the standard `BaseModel` indexes (`created_at`, `deleted_at`,
 This domain reuses RBAC's already-seeded `analytics.read`/`reports.manage`
 permission keys (see `FLOW.md` §11) -- a config-only decision with no
 schema impact, no new `PermissionModule` value, no new migration.
+
+---
+
+# BE-012 Part 2 schema additions
+
+No new table. One narrow, additive column on a different domain's table
+(the one conditionally-permitted exception this part's directory rule
+allows -- see `FLOW.md` §14 for the full write-up of why this was judged
+worth doing for real):
+
+## `guest_sessions.user_agent` (new column)
+
+Migration: `alembic/versions/0019_add_user_agent_to_guest_sessions.py`
+(revises `0018_create_analytics_tables`).
+
+| Column | Type | Notes |
+|---|---|---|
+| `user_agent` | `Text`, nullable | The raw `User-Agent` request header, captured best-effort at `app.domains.guest.service.GuestService.login_via_otp`/`login_via_voucher` (and copied forward by `reconnect`). `NULL` for every session created before this column existed, and for any guest device that omitted the header. No index -- never filtered/joined on, only classified via `CASE`/regex at dashboard read time (see below). |
+
+### Where this column is actually read: `AnalyticsRepository.get_user_agent_breakdown`
+
+This domain's own `repository.py` classifies every non-`NULL`
+`GuestSession.user_agent` in scope/window into OS/browser/device-type
+buckets via real Postgres `CASE`/`~*` (case-insensitive regex) matching
+directly in the `SELECT`, then `GROUP BY`/`COUNT` -- see `FLOW.md` §14 for
+the exact classifier and why it is a small, honest, hand-written heuristic
+rather than a `user-agents`-style parsing dependency. No other file in
+`app.domains.guest` beyond `models.py` (the column)/`router.py` (header
+capture)/`service.py` (threading the value through session creation) was
+touched to support this.

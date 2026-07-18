@@ -181,6 +181,11 @@ async def guest_login_via_otp(
     service: GuestService = Depends(get_guest_service),
 ):
     ip_address = payload.ip_address or (request.client.host if request.client else None)
+    # BE-012 Part 2: capture the raw User-Agent header at login time -- see
+    # app.domains.guest.models.GuestSession.user_agent's docstring for the
+    # full "narrow, additive hook" write-up and app.domains.analytics's own
+    # honest read-side classification of this value.
+    user_agent = request.headers.get("user-agent")
     result = await service.login_via_otp(
         identifier=payload.identifier,
         code=payload.code,
@@ -191,6 +196,7 @@ async def guest_login_via_otp(
         device_mac=payload.device_mac,
         device_name=payload.device_name,
         ip_address=ip_address,
+        user_agent=user_agent,
     )
     return build_response(
         success=True,
@@ -211,6 +217,7 @@ async def guest_login_via_voucher(
     service: GuestService = Depends(get_guest_service),
 ):
     ip_address = payload.ip_address or (request.client.host if request.client else None)
+    user_agent = request.headers.get("user-agent")
     result = await service.login_via_voucher(
         code=payload.code,
         identifier=payload.identifier,
@@ -220,6 +227,7 @@ async def guest_login_via_voucher(
         device_mac=payload.device_mac,
         device_name=payload.device_name,
         ip_address=ip_address,
+        user_agent=user_agent,
     )
     return build_response(
         success=True,
