@@ -1,0 +1,17 @@
+"""Constants for the Monitoring domain."""
+
+METRIC_CPU_USAGE = "cpu_usage"
+METRIC_MEMORY_USAGE = "memory_usage"
+METRIC_DISK_USAGE = "disk_usage"
+METRIC_TEMPERATURE = "temperature"
+METRIC_VOLTAGE = "voltage"
+METRIC_CONNECTED_CLIENTS = "connected_clients"
+METRIC_LATENCY = "latency"
+METRIC_PACKET_LOSS = "packet_loss"
+METRIC_JITTER = "jitter"
+METRIC_THROUGHPUT_RX = "rx_throughput"
+METRIC_THROUGHPUT_TX = "tx_throughput"
+
+METRICS_CACHE_KEY_PREFIX = "monitoring:metrics:"
+HEALTH_CACHE_KEY_PREFIX = "monitoring:health:"
+WEBSOCKET_PUB_SUB_CHANNEL = "monitoring:live_metrics"

@@ -13,6 +13,11 @@ from app.domains.location import models as location_models  # noqa: F401
 from app.domains.organization import models as organization_models  # noqa: F401
 from app.domains.rbac import models as rbac_models  # noqa: F401
 from app.domains.router import models as router_models  # noqa: F401
+from app.domains.monitoring import models as monitoring_models  # noqa: F401
+from app.domains.alerts import models as alerts_models  # noqa: F401
+from app.domains.events import models as events_models  # noqa: F401
+from app.domains.analytics import models as analytics_models  # noqa: F401
+from app.domains.reports import models as reports_models  # noqa: F401
 
 config = context.config
 
