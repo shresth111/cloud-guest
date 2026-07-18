@@ -150,3 +150,21 @@ class AuditAction(StrEnum):
     LOCATION_ARCHIVED = "location_archived"
     LOCATION_SUSPENDED = "location_suspended"
     LOCATION_ACTIVATED = "location_activated"
+
+    # User management/aggregation events (Module 007) -- written through
+    # this same table by ``app.domains.user.service.UserService`` via the
+    # same narrow ``AuditLogWriter`` protocol shape ``OrganizationService``/
+    # ``LocationService`` use (see ``AuditLogEntry``'s "other domains could
+    # plausibly reuse it" design). Note this module never writes
+    # ``ROLE_ASSIGNED``/organization-membership audit entries itself -- an
+    # admin-time initial role assignment or organization membership grant
+    # made during ``UserService.create_user`` is performed by *calling*
+    # ``RBACService.assign_role_to_user`` / ``OrganizationService.
+    # invite_member`` + ``accept_invite`` directly, so those domains' own
+    # audit entries (``ROLE_ASSIGNED``, ``ORGANIZATION_MEMBER_INVITED``,
+    # ``ORGANIZATION_MEMBER_ACCEPTED``) are what get recorded for that part
+    # -- these four values cover only the identity-record lifecycle itself.
+    USER_CREATED = "user_created"
+    USER_UPDATED = "user_updated"
+    USER_DEACTIVATED = "user_deactivated"
+    USER_REACTIVATED = "user_reactivated"

@@ -11,6 +11,21 @@ names and its three original methods (``get_user_by_email``,
 ``create_refresh_token``, ``revoke_refresh_token``), extended with the
 session, password-history, and login-attempt operations the real auth
 service needs.
+
+``list_users`` (added for Module 007 -- the ``app.domains.user`` aggregation
+layer) is the one genuinely new capability added here: search + pagination
+over ``User`` with an optional ``user_ids`` narrowing filter, expressed as a
+hand-written query for the same reason ``OrganizationRepository.
+list_organizations`` and ``LocationRepository.list_locations`` are -- an
+OR-across-columns ``ilike`` search can't be expressed via
+``GenericRepository``'s equality/IN-only filter convention. Module 007
+deliberately does *not* add ``create_user_by_admin``/``deactivate_user``/
+``reactivate_user`` wrapper methods here: the already-existing, fully
+generic ``create_user``/``update_user`` cover those use cases verbatim (an
+admin-created account and a deactivation are both just a ``User`` row
+created/updated with a particular set of fields -- see
+``app.domains.user.service`` for where that field selection actually
+happens), so a wrapper would add indirection without adding capability.
 """
 
 from __future__ import annotations
@@ -19,11 +34,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
+from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 
 from .models import LoginAttempt, PasswordHistory, Session, User
 
@@ -38,6 +54,16 @@ class AuthRepositoryProtocol(Protocol):
     async def create_user(self, **fields: object) -> User: ...
 
     async def update_user(self, user: User, **fields: object) -> User: ...
+
+    async def list_users(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        search: str | None = None,
+        is_active: bool | None = None,
+        user_ids: list[uuid.UUID] | None = None,
+    ) -> tuple[list[User], PaginationMeta]: ...
 
     async def create_refresh_token(
         self,
@@ -124,6 +150,50 @@ class AuthRepository:
 
     async def update_user(self, user: User, **fields: object) -> User:
         return await self.users.update(user, fields)
+
+    async def list_users(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        search: str | None = None,
+        is_active: bool | None = None,
+        user_ids: list[uuid.UUID] | None = None,
+    ) -> tuple[list[User], PaginationMeta]:
+        """Search/paginate ``User`` rows, optionally narrowed to a specific
+        ``user_ids`` set.
+
+        ``user_ids`` is what lets a single method serve both platform-wide
+        listing (``app.domains.user.UserService`` calls this with
+        ``user_ids=None``) and organization-scoped listing (called with the
+        ``user_id``s of that organization's active members) -- see
+        ``docs/user/USER_ARCHITECTURE.md`` for the tenant-scoping design.
+        """
+        params = PageParams(page=page, page_size=page_size)
+        conditions = [User.is_deleted.is_(False)]
+        if is_active is not None:
+            conditions.append(User.is_active.is_(is_active))
+        if user_ids is not None:
+            conditions.append(User.id.in_(user_ids))
+        if search:
+            like = f"%{search}%"
+            conditions.append(
+                or_(
+                    User.first_name.ilike(like),
+                    User.last_name.ilike(like),
+                    User.email.ilike(like),
+                    User.username.ilike(like),
+                )
+            )
+
+        count_statement = select(func.count()).select_from(User).where(*conditions)
+        total_result = await self.session.execute(count_statement)
+        total_items = int(total_result.scalar_one())
+
+        statement = select(User).where(*conditions).order_by(User.created_at.desc())
+        result = await self.session.execute(paginate(statement, params))
+        rows = list(result.scalars().all())
+        return rows, PaginationMeta.from_total(params, total_items)
 
     # -- sessions / refresh tokens ---------------------------------------
 

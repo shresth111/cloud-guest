@@ -145,3 +145,36 @@ non-archived location whose `organization_id` matches the resolved
 `X-Organization-Id` context, rather than trusted at face value -- see
 `LOCATION_ARCHITECTURE.md` §8.
 
+## User Management Endpoints (Module 007)
+
+An aggregation/management layer over the existing `auth.User`,
+`OrganizationMember`, and RBAC domains -- not a second user table. See
+`backend/docs/user/README.md` and `backend/docs/user/USER_ARCHITECTURE.md`
+for the full design.
+
+```text
+GET    /api/v1/users
+POST   /api/v1/users
+GET    /api/v1/users/{user_id}
+PUT    /api/v1/users/{user_id}
+POST   /api/v1/users/{user_id}/deactivate
+POST   /api/v1/users/{user_id}/activate
+GET    /api/v1/me
+PUT    /api/v1/me
+```
+
+Admin endpoints require the appropriate `users.*` permission
+(`create`/`read`/`update`/`manage`) at the resolved scope; `/me` endpoints
+require only an authenticated caller. `GET /users/{id}` and `GET /me`
+return an aggregated view (identity + organization memberships + active
+roles) assembled by `UserService`, not a persisted model. `PUT /me` exposes
+a narrower, self-editable field set than admin's `PUT /users/{id}` -- see
+`USER_ARCHITECTURE.md` §8 for the exact table (in particular: `email`/
+`username`/`is_active`/`status` are never editable via either `PUT`, and
+`designation`/`department`/`employee_id`/`is_verified` are admin-only).
+`POST /users` optionally creates an active organization membership and an
+initial `ORGANIZATION`-scoped role assignment in the same call -- see
+`USER_ARCHITECTURE.md` §5 and §10. This module does not duplicate RBAC's
+own `POST/DELETE /users/{id}/roles`, `GET /users/{id}/permissions`, or
+`GET /me/permissions` endpoints, all of which remain unchanged.
+
