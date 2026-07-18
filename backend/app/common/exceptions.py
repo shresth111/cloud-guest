@@ -1,8 +1,9 @@
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.common.responses import build_response
 from app.core.logging import get_logger
@@ -48,10 +49,10 @@ def register_exception_handlers(app: FastAPI) -> None:
             ),
         )
 
-    @app.exception_handler(HTTPException)
+    @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(
         request: Request,
-        exc: HTTPException,
+        exc: StarletteHTTPException,
     ) -> JSONResponse:
         message = exc.detail if isinstance(exc.detail, str) else "HTTP error"
         return JSONResponse(
@@ -98,4 +99,3 @@ def register_exception_handlers(app: FastAPI) -> None:
                 request_id=_request_id(request),
             ),
         )
-
