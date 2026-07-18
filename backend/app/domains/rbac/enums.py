@@ -266,3 +266,24 @@ class AuditAction(StrEnum):
     VOUCHER_CODES_IMPORTED = "voucher_codes_imported"
     VOUCHER_REDEEMED = "voucher_redeemed"
     VOUCHER_REDEMPTION_FAILED = "voucher_redemption_failed"
+
+    # Captive Portal domain events (Module 010 Part 3) -- written through
+    # this same table by
+    # ``app.domains.captive_portal.service.CaptivePortalService`` via the
+    # same narrow ``AuditLogWriter`` protocol shape every other domain's
+    # service uses (see ``AuditLogEntry``'s "other domains could plausibly
+    # reuse it" design). Unlike OTP/Voucher's careful volume-tiering for
+    # high-frequency guest actions, **every** create/update/activate/
+    # deactivate/delete is audited here -- this module's mutating actions
+    # are low-volume, always-authenticated admin configuration changes (who
+    # changed a tenant's guest WiFi login page branding/content/enabled
+    # login methods, and when), not guest-facing traffic, so there is no
+    # analogous volume problem to tier against. The guest-facing
+    # ``resolve_portal_config`` read path is never audited (no state
+    # change, mirrors every other domain's own "reads aren't audited"
+    # convention).
+    CAPTIVE_PORTAL_CONFIG_CREATED = "captive_portal_config_created"
+    CAPTIVE_PORTAL_CONFIG_UPDATED = "captive_portal_config_updated"
+    CAPTIVE_PORTAL_CONFIG_ACTIVATED = "captive_portal_config_activated"
+    CAPTIVE_PORTAL_CONFIG_DEACTIVATED = "captive_portal_config_deactivated"
+    CAPTIVE_PORTAL_CONFIG_DELETED = "captive_portal_config_deleted"

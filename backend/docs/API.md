@@ -523,3 +523,66 @@ departure from OTP's own "don't audit the routine event" call, since a
 voucher redemption is itself the moment real network access is granted
 (`FLOW.md` §9).
 
+## Captive Portal Endpoints (Module 010 Part 3)
+
+Branding/content/enabled-login-methods configuration for the guest WiFi
+login page a guest's device is redirected to before getting internet
+access -- logo, colors, terms and conditions, splash content, and which
+login methods (OTP SMS/email, voucher, username/password, social login)
+are enabled. This module does **not** implement guest authentication
+itself (that is `app.domains.otp`/`app.domains.voucher`, already built);
+it is pure configuration/branding data plus one guest-facing resolve
+endpoint. See `backend/docs/captive_portal/README.md`,
+`backend/docs/captive_portal/FLOW.md`, and
+`backend/docs/captive_portal/DATABASE.md` for the full design.
+
+Admin-facing endpoints use the standard `ApiResponse` envelope and are
+gated by RBAC's already-seeded `captive_portal.*` permission keys:
+
+```text
+POST   /api/v1/captive-portal-configs                    captive_portal.create
+GET    /api/v1/captive-portal-configs                    captive_portal.read
+GET    /api/v1/captive-portal-configs/{id}               captive_portal.read
+PUT    /api/v1/captive-portal-configs/{id}               captive_portal.update
+DELETE /api/v1/captive-portal-configs/{id}               captive_portal.delete
+POST   /api/v1/captive-portal-configs/{id}/activate      captive_portal.update
+POST   /api/v1/captive-portal-configs/{id}/deactivate    captive_portal.update
+```
+
+A config is either an organization-level default (`location_id` null,
+`is_default=true`) or a location-specific override (`location_id` set).
+Creating/updating a config as `is_default=true` un-defaults any prior
+default for the same organization -- at most one org-level default may
+exist per organization at a time, enforced both by the service layer and
+by a database partial unique index backstop (`FLOW.md` §3).
+`terms_and_conditions_text`/`terms_and_conditions_url` (and the identical
+`privacy_policy_text`/`privacy_policy_url` pair) accept at most one
+populated at a time, never both (`FLOW.md` §4). `activate`/`deactivate`
+map to `captive_portal.update`, not `.manage`/`.delete` -- a lifecycle
+status toggle, not a destructive or platform-admin-only action, mirroring
+Voucher's identical "revoke -> voucher.update" precedent.
+
+Guest-facing endpoint carries no `RequirePermission`/`CurrentUser`
+dependency at all -- the caller is a guest's device/captive-portal
+frontend, resolving *before* the guest has authenticated by any method
+(mirrors OTP's/Voucher's identical precedent; see `FLOW.md` §6). It still
+uses the standard `ApiResponse` envelope, since its real caller is the
+captive-portal frontend:
+
+```text
+GET /api/v1/captive-portal/resolve?location_id={location_id}
+GET /api/v1/captive-portal/resolve?organization_id={organization_id}
+```
+
+Implements a most-specific-wins lookup: an active config scoped to the
+exact `location_id` (organization derived from the location itself if not
+separately supplied), else the organization's active default, else a
+`404` (`CaptivePortalConfigNotConfiguredError`) -- there is no hardcoded
+platform-wide fallback branding; every organization must configure at
+least one active default portal before going live (`FLOW.md` §2).
+`social_login_enabled`/`social_login_providers` and
+`username_password_enabled` are schema-only readiness flags -- no real
+OAuth/social-login integration or guest username/password authentication
+exists anywhere in this codebase; setting them only changes what this
+resolve response reports as enabled (`FLOW.md` §5).
+

@@ -9,6 +9,7 @@ from app.database.base import Base
 # Import domain models so their tables are registered on Base.metadata
 # before autogenerate compares it against the database.
 from app.domains.auth import models as auth_models  # noqa: F401
+from app.domains.captive_portal import models as captive_portal_models  # noqa: F401
 from app.domains.location import models as location_models  # noqa: F401
 from app.domains.organization import models as organization_models  # noqa: F401
 from app.domains.otp import models as otp_models  # noqa: F401
