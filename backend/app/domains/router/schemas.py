@@ -100,10 +100,30 @@ class ProvisioningCheckInResponse(BaseModel):
     ``docs/router/ROUTER_ARCHITECTURE.md`` §5 for why this endpoint's
     response is not the standard ``ApiResponse`` envelope: the calling
     device is not expected to parse a rich, user-facing API contract, only
-    "did the check-in succeed and what should I do next"."""
+    "did the check-in succeed and what should I do next".
+
+    ``agent_credential``/``agent_credential_expires_at`` are an additive
+    extension for ``app.domains.router_agent`` (Module 009 Part 2): the
+    persistent bearer credential that module's device-facing endpoints
+    (heartbeat/config-pull/status-push/action-poll) require, issued exactly
+    once, right here -- the one-time provisioning token this check-in call
+    just consumed is the device's last opportunity to authenticate itself
+    before that credential exists, so there is no separate, later
+    "activate" call the device could instead present it to. Both fields are
+    optional/default ``None`` so this remains a purely additive schema
+    change. See ``app.domains.router_agent.service``'s module docstring for
+    the full reasoning."""
 
     router_id: str
     status: RouterStatus
+    agent_credential: str | None = Field(
+        default=None,
+        description=(
+            "Persistent app.domains.router_agent bearer credential, shown "
+            "exactly once -- never retrievable again after this response."
+        ),
+    )
+    agent_credential_expires_at: datetime | None = Field(default=None)
 
 
 # ============================================================================

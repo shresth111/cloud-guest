@@ -294,5 +294,60 @@ real-world side effects -- a version becoming `applied`, a restore
 producing a new version, a factory reset resetting the router's BE-008
 status) is intentionally **not** exposed over HTTP: this module manages the
 workflow/queue side only, actually executing a job against a live device is
-`app.domains.router_agent`'s job (a future module).
+`app.domains.router_agent`'s job.
+
+## Router Agent Endpoints (Module 009 Part 2)
+
+The device-facing protocol a real MikroTik RouterOS agent uses for its
+entire ongoing lifecycle after BE-008's zero-touch provisioning has
+completed: a persistent device credential, heartbeat, current-configuration
+pull, status push, and provisioning-action-queue poll/complete -- the
+module `app.domains.router_provisioning.service`'s own docstring names as
+the intended caller of `complete_provisioning_job`. See
+`backend/docs/router_agent/README.md`, `backend/docs/router_agent/FLOW.md`,
+and `backend/docs/router_agent/DATABASE.md` for the full design.
+
+```text
+POST   /api/v1/agent/heartbeat
+GET    /api/v1/agent/config
+POST   /api/v1/agent/status
+GET    /api/v1/agent/actions
+POST   /api/v1/agent/actions/{job_id}/complete
+```
+
+**Every endpoint above is device-facing** -- none carry
+`RequirePermission`/`CurrentUser`, and none use the standard `ApiResponse`
+envelope (mirroring `ProvisioningCheckInResponse`'s own minimal, "the
+calling device is not expected to parse a rich, user-facing API contract"
+shape). Authentication is this module's own `CurrentAgent` dependency: a
+persistent credential presented via the `X-Agent-Credential` header
+(deliberately not `Authorization: Bearer`, which is already RBAC's
+platform-user JWT scheme, and deliberately a header rather than
+BE-008/BE-009's request-body-token precedent, since two of these five
+endpoints are `GET`s -- see `FLOW.md` §3). `CurrentAgent` rejects a
+missing/invalid/expired/revoked credential and a `decommissioned`/
+`suspended` router -- this check *is* the module's identity verification,
+there is no separate "verify identity" endpoint (`FLOW.md` §4).
+
+The persistent credential itself is **not** issued by any endpoint above --
+it is issued additively inside BE-008's own
+`POST /api/v1/routers/provisioning/check-in` response
+(`ProvisioningCheckInResponse` gained two new, optional fields:
+`agent_credential`, `agent_credential_expires_at`), since that check-in call
+is the device's last opportunity to authenticate itself with a credential
+this platform already trusts before the one-time provisioning token is
+consumed (`FLOW.md` §2). `GET /agent/config` returns Module 009 Part 1's
+current, latest-*applied* `ConfigVersion` (never a draft/pending/failed
+one). `GET /agent/actions` composes with
+`RouterProvisioningRepository.list_active_jobs_for_router`, claiming
+(transitioning to `running`) every still-`queued` job via
+`RouterProvisioningService.start_provisioning_job`; `POST
+/agent/actions/{job_id}/complete` calls
+`RouterProvisioningService.complete_provisioning_job` directly -- the exact
+seam that service's own docstring names this module as the caller of.
+`POST /agent/status` updates BE-008's existing `Router.routeros_version`
+(via `RouterService.update_router`, only when it actually changed) and
+records genuinely new facts (agent software version, capabilities, license
+state) on this module's own `RouterAgentCredential` row, never a duplicate
+of any existing field.
 

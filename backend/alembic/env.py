@@ -13,6 +13,7 @@ from app.domains.location import models as location_models  # noqa: F401
 from app.domains.organization import models as organization_models  # noqa: F401
 from app.domains.rbac import models as rbac_models  # noqa: F401
 from app.domains.router import models as router_models  # noqa: F401
+from app.domains.router_agent import models as router_agent_models  # noqa: F401
 from app.domains.router_provisioning import (
     models as router_provisioning_models,  # noqa: F401,E501
 )

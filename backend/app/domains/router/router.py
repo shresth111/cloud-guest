@@ -37,6 +37,15 @@ provisioning token itself, presented in the request body and validated by
 single-use). See ``docs/router/ROUTER_ARCHITECTURE.md`` §5 for the full
 reasoning, including why this was chosen over a bespoke bearer-header auth
 scheme.
+
+**Additive dependency on Module 009 Part 2
+(``app.domains.router_agent``).** ``provisioning_check_in`` composes with
+``RouterAgentService.issue_credential_for_router`` to additionally issue
+that module's persistent, device-facing bearer credential in the same
+response -- see ``ProvisioningCheckInResponse``'s own docstring and
+``app.domains.router_agent.service``'s module docstring for why this was
+chosen over a separate, later "activate" endpoint. Nothing else in this
+file changed for that module's sake.
 """
 
 from __future__ import annotations
@@ -52,6 +61,8 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.router_agent.dependencies import get_router_agent_service
+from app.domains.router_agent.service import RouterAgentService
 
 from .dependencies import get_router_service
 from .enums import RouterStatus
@@ -390,12 +401,27 @@ async def generate_provisioning_token(
 async def provisioning_check_in(
     payload: ProvisioningCheckInRequest,
     router_service: RouterService = Depends(get_router_service),
+    agent_service: RouterAgentService = Depends(get_router_agent_service),
 ) -> ProvisioningCheckInResponse:
     """Presented by the physical device, not an authenticated platform user
-    -- see module docstring and ``docs/router/ROUTER_ARCHITECTURE.md`` §5."""
+    -- see module docstring and ``docs/router/ROUTER_ARCHITECTURE.md`` §5.
+
+    Additively issues the device's persistent ``app.domains.router_agent``
+    credential in the same response (see
+    ``ProvisioningCheckInResponse``'s own docstring and
+    ``app.domains.router_agent.service``'s module docstring for why here,
+    not a separate later endpoint): this call is the device's last chance to
+    authenticate itself with a credential (the one-time provisioning token)
+    this platform already trusts before that token is consumed."""
     updated = await router_service.check_in(plaintext_token=payload.token)
+    credential, agent_credential = await agent_service.issue_credential_for_router(
+        updated
+    )
     return ProvisioningCheckInResponse(
-        router_id=str(updated.id), status=RouterStatus(updated.status)
+        router_id=str(updated.id),
+        status=RouterStatus(updated.status),
+        agent_credential=agent_credential,
+        agent_credential_expires_at=credential.expires_at,
     )
 
 
