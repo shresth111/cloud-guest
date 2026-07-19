@@ -383,10 +383,303 @@ class UsageMetric(BaseModel):
         )
 
 
+# ============================================================================
+# BE-013 Part 2: Subscription + Coupon
+# ============================================================================
+
+
+class Subscription(BaseModel):
+    """What one organization's *billing arrangement* looks like, right now.
+
+    ## Cardinality decision: one row per organization, ever
+
+    Exactly mirrors :class:`License`'s own decision (see that model's
+    docstring for the full write-up): ``organization_id`` is **unique**.
+    ``Subscription`` is mutated in place through
+    ``constants.SubscriptionStatus``'s transition graph -- there is no
+    append-only "subscription history" table, because (like ``License``)
+    what matters is "what is this organization's billing arrangement *now*"
+    plus a full record of *when it changed* (here, that record is spread
+    across ``LicenseChangeLog`` (plan changes), ``CouponUsage`` (coupon
+    redemptions), and this module's own structured log lines/events for
+    every lifecycle transition -- no single append-only table was judged to
+    carry enough independent value to justify a sixth table for it).
+
+    ## ``plan_id`` denormalization -- justified, not just copied for
+    ## convenience
+
+    ``plan_id`` duplicates what ``license_id`` -> ``License.plan_id``
+    already tells you. It is kept anyway, deliberately, for two concrete
+    reasons: (1) every subscription-list/renewal-sweep query in this module
+    (``renewal_service.RenewalService.process_renewal``,
+    ``list_due_for_renewal``) needs the plan's ``base_price``/
+    ``billing_cycle``/``currency`` on every single row it touches, and
+    joining through ``license_id`` -> ``licenses.plan_id`` -> ``plans`` on
+    every renewal-sweep tick is real, avoidable query overhead for a value
+    that is 1:1 with the license at read time anyway; (2) a subscription's
+    plan and a license's plan are **kept in lockstep by this module's own
+    service methods** (``SubscriptionService`` never changes a license's
+    plan without also updating the owning subscription's ``plan_id`` in the
+    same operation), so the duplication cannot silently drift the way an
+    uncoordinated cache could. This is the same judgment call
+    ``Subscription.billing_cycle`` makes below, just for a foreign key
+    instead of a scalar.
+
+    ## ``billing_cycle`` -- a snapshot copy, not a live read of ``Plan``
+
+    Copied from ``Plan.billing_cycle`` at subscription-creation time (never
+    re-read from ``Plan`` afterward), for the same "copy, not reference"
+    principle ``CouponUsage.discount_amount_applied`` documents below: if a
+    Super Admin later edits the referenced ``Plan``'s ``billing_cycle``,
+    an already-running subscription's own billing cadence should not
+    silently change out from under it mid-term.
+
+    ## Status transition graph -- see ``constants.SubscriptionStatus``'s own
+    docstring for the full write-up (mirrors ``License``'s identical
+    "define every legal transition, reject everything else" rigor via
+    ``service._SUBSCRIPTION_TRANSITIONS``/``_assert_subscription_transition``).
+
+    ## Three additive bookkeeping columns beyond the literal spec list
+
+    ``past_due_at``, ``last_renewal_reminder_sent_at``, and
+    ``last_expiry_reminder_sent_at`` are not in BE-013 Part 2's own bullet
+    list of ``Subscription`` columns, but each is a genuine correctness
+    requirement, not a nice-to-have:
+
+    * ``past_due_at`` -- when this subscription *most recently* entered
+      ``PAST_DUE`` (cleared the moment it recovers to ``ACTIVE``). Without
+      it, "how long has this subscription been unpaid" -- the entire basis
+      for the configurable grace period before
+      ``renewal_service.RenewalService.expire_lapsed_subscriptions`` calls
+      ``LicenseService.expire_license`` -- could not be computed at all.
+    * ``last_renewal_reminder_sent_at`` / ``last_expiry_reminder_sent_at``
+      -- idempotency markers so an hourly Beat sweep sends each reminder
+      **once** per billing period / per past-due episode, not once per
+      hourly tick for the entire multi-day reminder window. Mirrors
+      ``app.domains.analytics.models.ScheduledReport.last_run_at``'s
+      identical "a periodic sweep needs its own bookkeeping to avoid
+      re-firing" reasoning.
+    """
+
+    __tablename__ = "subscriptions"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    license_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("licenses.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    # Denormalized from the owning License -- see module docstring.
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("plans.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Snapshot copy of Plan.billing_cycle at creation time -- see module
+    # docstring.
+    billing_cycle: Mapped[str] = mapped_column(String(20), nullable=False)
+    current_period_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    current_period_end: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    trial_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    auto_renew: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    cancel_at_period_end: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    applied_coupon_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("coupons.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Additive bookkeeping columns -- see module docstring.
+    past_due_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_renewal_reminder_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_expiry_reminder_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_subscriptions_organization_id", "organization_id", unique=True),
+        Index("ix_subscriptions_license_id", "license_id"),
+        Index("ix_subscriptions_plan_id", "plan_id"),
+        Index("ix_subscriptions_status", "status"),
+        Index("ix_subscriptions_current_period_end", "current_period_end"),
+        Index("ix_subscriptions_applied_coupon_id", "applied_coupon_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Subscription(organization_id={self.organization_id}, "
+            f"plan_id={self.plan_id}, status={self.status})>"
+        )
+
+
+class Coupon(BaseModel):
+    """A discount code -- global (``organization_id IS NULL``, usable by any
+    organization) or organization-specific.
+
+    ## ``applicable_plan_ids`` storage shape: a real join table, not a
+    ## JSONB list
+
+    The spec's own suggested shape was a nullable JSONB list of plan UUIDs.
+    This module instead uses a real join table, :class:`CouponPlan`
+    (``coupon_id``, ``plan_id``, unique together) -- the exact same
+    "typed, referentially-integral columns over an untyped blob" judgment
+    call ``PlanFeature``'s own docstring already makes for this domain (see
+    that model's "three typed columns, not one JSONB blob" write-up). A
+    JSONB list of plan UUIDs cannot be declared as a real foreign key: a
+    plan referenced by a coupon could later be hard-deleted (this domain
+    never does that today, but nothing would stop a future change from
+    doing so) with no database-level protection or cascade, and "does this
+    coupon apply to plan X" would be an un-indexable JSON-containment
+    query instead of a plain, indexed join. An empty/no-rows
+    ``CouponPlan`` set for a coupon means "applicable to all plans" (see
+    ``service.CouponService.validate_coupon``), exactly the same "empty ==
+    unrestricted" semantics the spec's own JSONB suggestion described.
+    """
+
+    __tablename__ = "coupons"
+
+    code: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
+    discount_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    discount_value: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    # Only meaningful for FLAT-shaped coupons; NULL for PERCENTAGE.
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    # NULL = a GLOBAL coupon, usable by any organization. Non-NULL = usable
+    # only by that one organization.
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    max_uses: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_uses: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    valid_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    valid_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    plan_associations: Mapped[list[CouponPlan]] = relationship(
+        "CouponPlan",
+        back_populates="coupon",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        Index("ix_coupons_code", "code"),
+        Index("ix_coupons_organization_id", "organization_id"),
+        Index("ix_coupons_is_active", "is_active"),
+        Index("ix_coupons_valid_until", "valid_until"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Coupon(id={self.id}, code={self.code}, "
+            f"discount_type={self.discount_type})>"
+        )
+
+
+class CouponPlan(BaseModel):
+    """One ``(coupon_id, plan_id)`` association row -- see :class:`Coupon`'s
+    docstring for why this is a real join table, not a JSONB list."""
+
+    __tablename__ = "coupon_plans"
+
+    coupon_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("coupons.id", ondelete="CASCADE"), nullable=False
+    )
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("plans.id", ondelete="CASCADE"), nullable=False
+    )
+
+    coupon: Mapped[Coupon] = relationship("Coupon", back_populates="plan_associations")
+
+    __table_args__ = (
+        UniqueConstraint("coupon_id", "plan_id", name="uq_coupon_plans_coupon_plan"),
+        Index("ix_coupon_plans_coupon_id", "coupon_id"),
+        Index("ix_coupon_plans_plan_id", "plan_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CouponPlan(coupon_id={self.coupon_id}, plan_id={self.plan_id})>"
+
+
+class CouponUsage(BaseModel):
+    """One redemption of one :class:`Coupon` -- ``discount_amount_applied``
+    is the **real, computed discount at the moment of use**, never
+    re-derived later from the coupon's own (possibly since-edited)
+    ``discount_value`` -- the identical "copy not reference" principle
+    ``guest``'s voucher-derived session quotas already establish for this
+    codebase (a redemption's historical record must not silently change
+    meaning if the coupon it referenced is edited afterward).
+    ``subscription_id`` is nullable: a coupon is redeemed against a
+    ``Subscription`` in this part, but the column stays nullable for a
+    future part where a coupon might apply outside a subscription context
+    entirely (e.g. a one-off invoice discount)."""
+
+    __tablename__ = "coupon_usages"
+
+    coupon_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("coupons.id", ondelete="CASCADE"), nullable=False
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subscription_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    discount_amount_applied: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_coupon_usages_coupon_id", "coupon_id"),
+        Index("ix_coupon_usages_organization_id", "organization_id"),
+        Index("ix_coupon_usages_subscription_id", "subscription_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<CouponUsage(coupon_id={self.coupon_id}, "
+            f"organization_id={self.organization_id})>"
+        )
+
+
 __all__ = [
     "Plan",
     "PlanFeature",
     "License",
     "LicenseChangeLog",
     "UsageMetric",
+    "Subscription",
+    "Coupon",
+    "CouponPlan",
+    "CouponUsage",
 ]

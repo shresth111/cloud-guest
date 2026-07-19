@@ -179,6 +179,119 @@ class LicenseChangeType(StrEnum):
     DOWNGRADED = "downgraded"
 
 
+# ============================================================================
+# BE-013 Part 2: Subscription + Renewal + Coupon Engines
+# ============================================================================
+
+
+class SubscriptionStatus(StrEnum):
+    """The full :class:`~.models.Subscription` lifecycle -- see
+    ``service.py``'s ``_SUBSCRIPTION_TRANSITIONS`` for the exact, explicit
+    transition graph (same rigor as ``LicenseStatus``'s own
+    ``_LICENSE_TRANSITIONS``), and ``docs/billing/FLOW.md`` for the full
+    write-up of every transition and the ``PAUSED``-vs-``CANCELLED``
+    distinction below.
+
+    * ``TRIALING`` -- a free-trial period is in progress (``Plan.plan_type
+      == FREE_TRIAL``); ``trial_end``/``current_period_end`` mark when the
+      trial converts (a real renewal attempt is made -- see
+      ``renewal_service.RenewalService.process_renewal``).
+    * ``ACTIVE`` -- usable and current on billing.
+    * ``PAST_DUE`` -- the most recent renewal attempt failed (a real decline,
+      or the ``PaymentGatewayProtocol`` seam not yet being configured); the
+      organization's license is **not** immediately revoked -- a
+      configurable grace period (``Settings
+      .subscription_renewal_grace_period_days``) still applies before
+      ``LicenseService.expire_license`` is finally called (see
+      ``renewal_service.RenewalService.expire_lapsed_subscriptions``).
+    * ``PAUSED`` -- billing is suspended but the organization's entitlements
+      (``License``) are left completely untouched -- distinct from
+      ``CANCELLED`` (see below). Reversible via ``resume_subscription``.
+    * ``CANCELLED`` -- the organization chose to stop (immediately, or at
+      the end of the current period via ``cancel_at_period_end``); the
+      underlying ``License`` is suspended (reversible) at the moment
+      cancellation takes effect, not hard-expired -- only the grace-period
+      sweep above ever calls the terminal ``LicenseService.expire_license``.
+      Reversible via ``reactivate_subscription`` *only* while the license
+      has not since been expired by that sweep.
+
+    **``PAUSED`` vs ``CANCELLED`` -- the real distinction implemented here:**
+    pausing is a *billing* pause only -- no renewal attempts are made while
+    ``PAUSED`` (excluded from ``renewal_service`` module's own renewable-
+    status set), but the organization keeps using the product on its
+    current plan's entitlements exactly as before (no ``License`` call at
+    all). Cancelling is a *commercial* decision to stop -- the ``License``
+    is suspended the moment cancellation takes effect (immediately, or when
+    a scheduled ``cancel_at_period_end`` period elapses), which does revoke
+    entitlements, just via the same reversible ``SUSPENDED`` state
+    ``LicenseService`` already uses for a payment issue -- not the
+    ``EXPIRED`` terminal state, which is reserved for a lapsed grace period
+    with no active recovery in progress.
+    """
+
+    TRIALING = "trialing"
+    ACTIVE = "active"
+    PAST_DUE = "past_due"
+    PAUSED = "paused"
+    CANCELLED = "cancelled"
+
+
+# Statuses ``renewal_service.RenewalService`` will attempt to renew --
+# ``PAUSED``/``CANCELLED`` subscriptions are never billed. ``PAST_DUE`` is
+# included so a retry attempt (this same sweep, next tick) can recover a
+# subscription back to ``ACTIVE`` without a separate "retry" code path.
+RENEWABLE_SUBSCRIPTION_STATUSES: frozenset[SubscriptionStatus] = frozenset(
+    {
+        SubscriptionStatus.TRIALING,
+        SubscriptionStatus.ACTIVE,
+        SubscriptionStatus.PAST_DUE,
+    }
+)
+
+# Billing cycles a real, recurring renewal sweep applies to. ``NONE`` (a
+# trial/custom/MSP-negotiated plan with no fixed cadence -- see
+# ``BillingCycle``'s own docstring) is deliberately excluded: there is no
+# "next period" to compute for a cycle-less plan, so such a subscription is
+# never auto-renewed regardless of its own ``auto_renew`` flag.
+CYCLIC_BILLING_CYCLES: frozenset[BillingCycle] = frozenset(
+    {BillingCycle.MONTHLY, BillingCycle.YEARLY}
+)
+
+
+class DiscountType(StrEnum):
+    """The shape of a :class:`~.models.Coupon`'s ``discount_value`` --
+    ``PERCENTAGE`` (0-100, applied against the base charge amount) or
+    ``FLAT`` (a currency amount in ``Coupon.currency``, clamped so it can
+    never exceed -- and therefore never make negative -- the amount it is
+    applied against; see ``validators.compute_discount_amount``)."""
+
+    PERCENTAGE = "percentage"
+    FLAT = "flat"
+
+
+# Legal range for a PERCENTAGE-shaped Coupon.discount_value -- a percentage
+# discount above 100% (i.e. "pay less than nothing") is never legal.
+MAX_PERCENTAGE_DISCOUNT_VALUE = 100
+
+# The Celery Beat task name and interval for
+# ``tasks.run_subscription_renewal_sweep`` (registered in
+# ``app.core.celery_app``'s ``beat_schedule``). Hourly -- the same
+# granularity ``app.domains.analytics.report_tasks``' own scheduler sweep
+# uses, and for the identical reasoning: this domain's own billing periods
+# are day/month/year granularity (``BillingCycle``), so checking every 15
+# minutes (like Analytics' near-real-time dashboard tick) would mean dozens
+# of no-op sweeps for every one that actually finds a due subscription, for
+# no freshness benefit any real billing workflow needs -- an hourly sweep
+# still renews every subscription within an hour of its
+# ``current_period_end``, processes grace-period expiries the same day the
+# grace period lapses, and sends both reminder kinds well within their own
+# multi-day windows.
+TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP = (
+    "app.domains.billing.tasks.run_subscription_renewal_sweep"
+)
+SUBSCRIPTION_RENEWAL_SWEEP_INTERVAL_SECONDS = 3600.0
+
+
 class UsageMetricKey(StrEnum):
     """The closed, finite set of usage counters this module tracks --
     exactly the list the spec enumerates. See ``service.UsageService
@@ -242,6 +355,13 @@ __all__ = [
     "FEATURE_KEY_TYPE",
     "LicenseStatus",
     "LicenseChangeType",
+    "SubscriptionStatus",
+    "RENEWABLE_SUBSCRIPTION_STATUSES",
+    "CYCLIC_BILLING_CYCLES",
+    "DiscountType",
+    "MAX_PERCENTAGE_DISCOUNT_VALUE",
+    "TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP",
+    "SUBSCRIPTION_RENEWAL_SWEEP_INTERVAL_SECONDS",
     "UsageMetricKey",
     "USAGE_METRIC_TO_LIMIT_FEATURE",
     "DEFAULT_PLAN_CURRENCY",

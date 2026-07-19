@@ -421,6 +421,64 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ========================================================================
+    # BE-013 Part 2: Subscription + Renewal + Coupon Engines
+    #
+    # Every tunable ``renewal_service.RenewalService`` compares a real,
+    # computed date against lives here, following this file's own
+    # established pattern (a plain, documented Settings field, never a
+    # hardcoded magic number inline in renewal code) -- see
+    # docs/billing/FLOW.md for the full write-up.
+    # ========================================================================
+
+    subscription_trial_period_days: int = Field(
+        default=14,
+        ge=1,
+        le=365,
+        description=(
+            "How long a FREE_TRIAL-plan Subscription's trial period lasts "
+            "(app.domains.billing.service.SubscriptionService"
+            ".create_subscription) before its first real renewal attempt "
+            "is due."
+        ),
+    )
+    subscription_renewal_grace_period_days: int = Field(
+        default=7,
+        ge=0,
+        le=90,
+        description=(
+            "How long a Subscription may remain PAST_DUE (a failed or "
+            "not-yet-configured renewal charge) before "
+            "app.domains.billing.renewal_service.RenewalService"
+            ".expire_lapsed_subscriptions finally calls Part 1's "
+            "LicenseService.expire_license -- the real grace-period policy "
+            "Part 1's own docs/billing/FLOW.md deferred to this later part."
+        ),
+    )
+    subscription_renewal_reminder_days_before: int = Field(
+        default=3,
+        ge=0,
+        le=90,
+        description=(
+            "How many days before Subscription.current_period_end "
+            "RenewalService.send_renewal_reminders dispatches an upcoming-"
+            "renewal reminder email (once per billing period -- see "
+            "Subscription.last_renewal_reminder_sent_at)."
+        ),
+    )
+    subscription_expiry_reminder_days_before: int = Field(
+        default=3,
+        ge=0,
+        le=90,
+        description=(
+            "How many days before a PAST_DUE subscription's grace-period "
+            "deadline (past_due_at + subscription_renewal_grace_period_"
+            "days) RenewalService.send_expiry_reminders dispatches a "
+            "license-expiring-soon reminder email (once per past-due "
+            "episode -- see Subscription.last_expiry_reminder_sent_at)."
+        ),
+    )
+
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None,
         description=(

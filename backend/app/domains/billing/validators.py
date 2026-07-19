@@ -7,10 +7,20 @@ service layer can call before touching the database.
 
 from __future__ import annotations
 
+import calendar
+from datetime import datetime
 from decimal import Decimal
 
-from .constants import FEATURE_KEY_TYPE, PlanFeatureKey, PlanFeatureType, SupportTier
-from .exceptions import InvalidPlanFeatureValueError
+from .constants import (
+    FEATURE_KEY_TYPE,
+    MAX_PERCENTAGE_DISCOUNT_VALUE,
+    BillingCycle,
+    DiscountType,
+    PlanFeatureKey,
+    PlanFeatureType,
+    SupportTier,
+)
+from .exceptions import InvalidDiscountValueError, InvalidPlanFeatureValueError
 
 
 def normalize_slug(slug: str) -> str:
@@ -82,4 +92,92 @@ def validate_feature_value(
             )
 
 
-__all__ = ["normalize_slug", "expected_feature_type", "validate_feature_value"]
+# ============================================================================
+# BE-013 Part 2: Subscription + Renewal + Coupon
+# ============================================================================
+
+
+def normalize_coupon_code(code: str) -> str:
+    """Coupon codes are stored uppercase-normalized -- case-insensitive
+    entry at checkout (``"save20"``/``"SAVE20"``/``"Save20"`` are the same
+    coupon), the same normalization discipline ``normalize_slug`` already
+    applies to ``Plan.slug`` (lowercase there, uppercase here since a
+    coupon code is conventionally displayed/typed in caps, e.g.
+    "SAVE20")."""
+    return code.strip().upper()
+
+
+def validate_discount_value(
+    *, discount_type: DiscountType, discount_value: Decimal
+) -> None:
+    """Raises ``InvalidDiscountValueError`` unless ``discount_value`` is in
+    the legal range for ``discount_type`` -- a ``PERCENTAGE`` must be
+    ``0 <= value <= 100`` (a discount above 100% is never legal -- see
+    ``constants.MAX_PERCENTAGE_DISCOUNT_VALUE``); a ``FLAT`` amount must be
+    non-negative (its own upper bound is enforced at apply-time by
+    ``compute_discount_amount``'s clamp, not here, since a flat amount is
+    legal at creation time regardless of which future base amount it will
+    later be applied against)."""
+    if discount_value < 0:
+        raise InvalidDiscountValueError("discount_value cannot be negative")
+    if (
+        discount_type == DiscountType.PERCENTAGE
+        and discount_value > MAX_PERCENTAGE_DISCOUNT_VALUE
+    ):
+        raise InvalidDiscountValueError(
+            f"A PERCENTAGE discount_value cannot exceed "
+            f"{MAX_PERCENTAGE_DISCOUNT_VALUE}"
+        )
+
+
+def compute_discount_amount(
+    *, discount_type: DiscountType, discount_value: Decimal, base_amount: Decimal
+) -> Decimal:
+    """The real discount computation -- ``PERCENTAGE`` ->
+    ``base_amount * discount_value / 100``; ``FLAT`` -> ``min(discount_value,
+    base_amount)`` so a flat discount can never make the charge negative
+    (a real, important correctness detail the spec calls out explicitly).
+    Rounded to 2 decimal places (currency-precision), matching every other
+    ``Numeric(12, 2)``/``Numeric(18, 2)`` money column in this domain."""
+    if discount_type == DiscountType.PERCENTAGE:
+        raw = base_amount * discount_value / Decimal(100)
+    else:
+        raw = min(discount_value, base_amount)
+    return raw.quantize(Decimal("0.01"))
+
+
+def add_billing_cycle(start: datetime, billing_cycle: str) -> datetime:
+    """The next period boundary after ``start`` for ``billing_cycle`` --
+    calendar-correct month/year addition (stdlib ``calendar`` only, no new
+    dependency), clamping the day-of-month for e.g. "Jan 31 + 1 month"
+    (which becomes Feb 28/29, never an invalid "Feb 31"). ``BillingCycle
+    .NONE`` (no fixed cadence) returns ``start`` unchanged -- callers
+    (``renewal_service``) never schedule a cycle-less subscription for
+    auto-renewal in the first place (see
+    ``constants.CYCLIC_BILLING_CYCLES``), so this is a defensive no-op, not
+    a code path expected to be exercised in practice."""
+    cycle = BillingCycle(billing_cycle)
+    if cycle == BillingCycle.MONTHLY:
+        return _add_months(start, 1)
+    if cycle == BillingCycle.YEARLY:
+        return _add_months(start, 12)
+    return start
+
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    month_index = dt.month - 1 + months
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+__all__ = [
+    "normalize_slug",
+    "expected_feature_type",
+    "validate_feature_value",
+    "normalize_coupon_code",
+    "validate_discount_value",
+    "compute_discount_amount",
+    "add_billing_cycle",
+]

@@ -1472,3 +1472,83 @@ Forces a real recomputation (never a cached/stale read) of every
 `UsageMetric` for this organization, then returns the same
 usage-vs-limit summary as the `GET` above.
 
+## Billing Endpoints (Module 013 Part 2: Subscription + Renewal + Coupon Engines)
+
+See `docs/billing/FLOW.md` §12-§20 for the full design write-up --
+including the `Subscription` status transition graph, the
+`PAUSED`-vs-`CANCELLED` distinction, the `PaymentGatewayProtocol` seam
+(and exactly what BE-013 Part 3 needs to wire in), the
+coupon-applies-once decision, the flat-discount clamp, the atomic
+`current_uses` increment, and the grace-period-then-expire composition
+with Part 1's `LicenseService.expire_license`.
+
+### Subscriptions (`subscriptions.*`, reused -- no new `PermissionModule`)
+
+`POST /subscriptions` -- requires `subscriptions.create`. Body:
+`organization_id`, `plan_id`, optional `coupon_code`. One `Subscription`
+row per organization, ever (mirrors `License`'s own cardinality) -- a
+second call for the same organization is a `409`
+(`DuplicateSubscriptionError`). Composes with Part 1's
+`LicenseService.assign_license`/`activate_license` (never duplicates
+license assignment). Starts `trialing` (a `FREE_TRIAL`-type plan) or
+`active` otherwise. A valid `coupon_code` is redeemed (a real
+`CouponUsage` row written, `current_uses` incremented) at this exact
+moment -- see the "coupon applies once" decision below.
+
+`GET /subscriptions/{organization_id}` -- requires `subscriptions.read`.
+
+`POST /subscriptions/{id}/cancel` -- requires `subscriptions.update`.
+Body: `immediate` (bool, default `false`). `immediate=true` transitions
+to `cancelled` right now and suspends (reversible, not hard-expires) the
+underlying license. `immediate=false` only sets `cancel_at_period_end`;
+the actual transition + license suspension happens later, when
+`current_period_end` is reached (`RenewalService.process_renewal`'s own
+fast path).
+
+`POST /subscriptions/{id}/reactivate` -- requires `subscriptions.update`.
+Legal only from `cancelled`, and only while the underlying license has
+not since been hard-expired by the grace-period sweep (`409`
+`SubscriptionReactivationNotAllowedError` otherwise) -- reverses the
+license suspension and starts a fresh billing period from now.
+
+`POST /subscriptions/{id}/pause` -- requires `subscriptions.update`.
+Legal only from `active`. Stops future renewal attempts; the underlying
+license/entitlements are completely untouched (see the
+`PAUSED`-vs-`CANCELLED` write-up).
+
+`POST /subscriptions/{id}/resume` -- requires `subscriptions.update`.
+Legal only from `paused`. If the current billing period already elapsed
+while paused, starts a fresh one from now; otherwise leaves it unchanged.
+
+### Coupons (`billing.*`, reused -- no new `PermissionModule`)
+
+`POST /coupons` -- requires `billing.manage` at **`GLOBAL`** scope
+(mirrors the Plan-catalog gate -- an uncontrolled coupon is a direct
+revenue-impacting instrument). Body: `code` (uppercase-normalized),
+`discount_type` (`percentage`|`flat`), `discount_value`, optional
+`currency`/`organization_id` (null = GLOBAL coupon)/`max_uses`,
+`valid_from`, optional `valid_until`, `is_active`,
+`applicable_plan_ids` (empty = every plan).
+
+`GET /coupons` -- requires `billing.read`. Filterable by
+`organization_id`/`is_active`, paginated.
+
+`GET /coupons/{coupon_id}` -- requires `billing.read`.
+
+`PUT /coupons/{coupon_id}` -- requires `billing.update` at `GLOBAL`
+scope. Partial update; supplying `applicable_plan_ids` fully replaces
+the plan restriction set.
+
+`DELETE /coupons/{coupon_id}` -- requires `billing.manage` at `GLOBAL`
+scope. Deactivates (`is_active=false` + soft delete), never a hard
+delete.
+
+`POST /coupons/validate` -- requires `subscriptions.read` (a
+checkout-time eligibility read, not a billing-catalog-admin action).
+Body: `code`, `organization_id`, `plan_id`, optional `base_amount`.
+**Real-time, no side effects** -- writes no `CouponUsage` row, never
+increments `current_uses` (the mutating counterpart,
+`CouponService.apply_coupon`, is only ever called from
+`POST /subscriptions`). When `base_amount` is supplied, the response
+includes the real computed `estimated_discount_amount`.
+

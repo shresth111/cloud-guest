@@ -32,11 +32,11 @@ numbers.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
@@ -46,7 +46,18 @@ from app.domains.location.models import Location
 from app.domains.otp.models import OtpRequest
 from app.domains.router.models import Router
 
-from .models import License, LicenseChangeLog, Plan, PlanFeature, UsageMetric
+from .constants import CYCLIC_BILLING_CYCLES, RENEWABLE_SUBSCRIPTION_STATUSES
+from .models import (
+    Coupon,
+    CouponPlan,
+    CouponUsage,
+    License,
+    LicenseChangeLog,
+    Plan,
+    PlanFeature,
+    Subscription,
+    UsageMetric,
+)
 
 # ============================================================================
 # Plan / PlanFeature
@@ -330,6 +341,220 @@ class UsageRepository:
         return [(row[0], int(row[1])) for row in result.all()]
 
 
+# ============================================================================
+# Subscription (BE-013 Part 2)
+# ============================================================================
+
+
+class SubscriptionRepositoryProtocol(Protocol):
+    async def create_subscription(self, **fields: object) -> Subscription: ...
+
+    async def get_by_id(
+        self, subscription_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> Subscription | None: ...
+
+    async def get_by_organization_id(
+        self, organization_id: uuid.UUID
+    ) -> Subscription | None: ...
+
+    async def update_subscription(
+        self, subscription: Subscription, data: Mapping[str, object]
+    ) -> Subscription: ...
+
+    async def list_by_status(self, statuses: Sequence[str]) -> list[Subscription]: ...
+
+    async def list_due_for_renewal(self, *, now: datetime) -> list[Subscription]: ...
+
+
+class SubscriptionRepository:
+    """Concrete, SQLAlchemy-backed implementation of
+    ``SubscriptionRepositoryProtocol``. ``list_due_for_renewal`` is the one
+    hand-written query in this class -- ``GenericRepository``'s equality/
+    ``IN``-only filter support (``apply_filters``) cannot express a ``<=``
+    comparison against ``current_period_end``."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.subscriptions = GenericRepository(Subscription, session)
+
+    async def create_subscription(self, **fields: object) -> Subscription:
+        return await self.subscriptions.create(fields)
+
+    async def get_by_id(
+        self, subscription_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> Subscription | None:
+        return await self.subscriptions.get_by_id(
+            subscription_id, include_deleted=include_deleted
+        )
+
+    async def get_by_organization_id(
+        self, organization_id: uuid.UUID
+    ) -> Subscription | None:
+        results = await self.subscriptions.get_all(
+            filters={"organization_id": organization_id}, limit=1
+        )
+        return results[0] if results else None
+
+    async def update_subscription(
+        self, subscription: Subscription, data: Mapping[str, object]
+    ) -> Subscription:
+        return await self.subscriptions.update(subscription, data)
+
+    async def list_by_status(self, statuses: Sequence[str]) -> list[Subscription]:
+        return await self.subscriptions.get_all(filters={"status": list(statuses)})
+
+    async def list_due_for_renewal(self, *, now: datetime) -> list[Subscription]:
+        statement = select(Subscription).where(
+            Subscription.is_deleted.is_(False),
+            Subscription.auto_renew.is_(True),
+            Subscription.billing_cycle.in_(
+                [cycle.value for cycle in CYCLIC_BILLING_CYCLES]
+            ),
+            Subscription.status.in_(
+                [status.value for status in RENEWABLE_SUBSCRIPTION_STATUSES]
+            ),
+            Subscription.current_period_end <= now,
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+
+# ============================================================================
+# Coupon / CouponPlan / CouponUsage (BE-013 Part 2)
+# ============================================================================
+
+
+class CouponRepositoryProtocol(Protocol):
+    async def create_coupon(self, **fields: object) -> Coupon: ...
+
+    async def get_by_id(
+        self, coupon_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> Coupon | None: ...
+
+    async def get_by_code(self, code: str) -> Coupon | None: ...
+
+    async def update_coupon(
+        self, coupon: Coupon, data: Mapping[str, object]
+    ) -> Coupon: ...
+
+    async def soft_delete_coupon(self, coupon: Coupon) -> Coupon: ...
+
+    async def list_coupons(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        organization_id: uuid.UUID | None = None,
+        is_active: bool | None = None,
+    ) -> tuple[list[Coupon], PaginationMeta]: ...
+
+    async def set_applicable_plans(
+        self, coupon_id: uuid.UUID, plan_ids: Sequence[uuid.UUID]
+    ) -> None: ...
+
+    async def list_applicable_plan_ids(
+        self, coupon_id: uuid.UUID
+    ) -> list[uuid.UUID]: ...
+
+    async def increment_current_uses(self, coupon_id: uuid.UUID) -> Coupon: ...
+
+    async def create_coupon_usage(self, **fields: object) -> CouponUsage: ...
+
+
+class CouponRepository:
+    """Concrete, SQLAlchemy-backed implementation of
+    ``CouponRepositoryProtocol``.
+
+    ## Atomic ``current_uses`` increment
+
+    ``increment_current_uses`` issues a real, single, server-evaluated
+    ``UPDATE coupons SET current_uses = current_uses + 1 WHERE id = :id``
+    (via SQLAlchemy's ``update().values(current_uses=Coupon.current_uses +
+    1)``) rather than reading ``current_uses`` in Python and writing back
+    ``value + 1`` -- the latter would race under concurrent redemptions of
+    the same coupon (two requests could both read ``current_uses=4`` and
+    both write back ``5``, silently losing one redemption's count).
+    Postgres evaluates the right-hand side of the ``SET`` clause against the
+    row's *current* value at update time, making this a single atomic
+    operation regardless of concurrent callers.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.coupons = GenericRepository(Coupon, session)
+        self.coupon_plans = GenericRepository(CouponPlan, session)
+        self.usages = GenericRepository(CouponUsage, session)
+
+    async def create_coupon(self, **fields: object) -> Coupon:
+        return await self.coupons.create(fields)
+
+    async def get_by_id(
+        self, coupon_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> Coupon | None:
+        return await self.coupons.get_by_id(coupon_id, include_deleted=include_deleted)
+
+    async def get_by_code(self, code: str) -> Coupon | None:
+        results = await self.coupons.get_all(filters={"code": code}, limit=1)
+        return results[0] if results else None
+
+    async def update_coupon(self, coupon: Coupon, data: Mapping[str, object]) -> Coupon:
+        return await self.coupons.update(coupon, data)
+
+    async def soft_delete_coupon(self, coupon: Coupon) -> Coupon:
+        return await self.coupons.soft_delete(coupon)
+
+    async def list_coupons(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        organization_id: uuid.UUID | None = None,
+        is_active: bool | None = None,
+    ) -> tuple[list[Coupon], PaginationMeta]:
+        filters: dict[str, object] = {}
+        if organization_id is not None:
+            filters["organization_id"] = organization_id
+        if is_active is not None:
+            filters["is_active"] = is_active
+        return await self.coupons.paginate(
+            page=page,
+            page_size=page_size,
+            filters=filters,
+            sort_by="created_at",
+            sort_order=SortOrder.DESC,
+        )
+
+    async def set_applicable_plans(
+        self, coupon_id: uuid.UUID, plan_ids: Sequence[uuid.UUID]
+    ) -> None:
+        for association in await self.coupon_plans.get_all(
+            filters={"coupon_id": coupon_id}
+        ):
+            await self.coupon_plans.delete(association)
+        for plan_id in plan_ids:
+            await self.coupon_plans.create({"coupon_id": coupon_id, "plan_id": plan_id})
+
+    async def list_applicable_plan_ids(self, coupon_id: uuid.UUID) -> list[uuid.UUID]:
+        associations = await self.coupon_plans.get_all(filters={"coupon_id": coupon_id})
+        return [association.plan_id for association in associations]
+
+    async def increment_current_uses(self, coupon_id: uuid.UUID) -> Coupon:
+        statement = (
+            update(Coupon)
+            .where(Coupon.id == coupon_id)
+            .values(current_uses=Coupon.current_uses + 1, version=Coupon.version + 1)
+        )
+        await self.session.execute(statement)
+        await self.session.flush()
+        updated = await self.coupons.get_by_id(coupon_id, include_deleted=True)
+        assert updated is not None  # the row was just updated above
+        await self.session.refresh(updated)
+        return updated
+
+    async def create_coupon_usage(self, **fields: object) -> CouponUsage:
+        return await self.usages.create(fields)
+
+
 __all__ = [
     "PlanRepositoryProtocol",
     "PlanRepository",
@@ -337,4 +562,8 @@ __all__ = [
     "LicenseRepository",
     "UsageRepositoryProtocol",
     "UsageRepository",
+    "SubscriptionRepositoryProtocol",
+    "SubscriptionRepository",
+    "CouponRepositoryProtocol",
+    "CouponRepository",
 ]

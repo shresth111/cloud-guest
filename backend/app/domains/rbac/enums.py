@@ -349,3 +349,35 @@ class AuditAction(StrEnum):
     LICENSE_CANCELLED = "license_cancelled"
     LICENSE_UPGRADED = "license_upgraded"
     LICENSE_DOWNGRADED = "license_downgraded"
+
+    # Billing domain events (Module 013 Part 2: Subscription + Renewal +
+    # Coupon Engines) -- written through this same table by
+    # ``app.domains.billing.service.SubscriptionService``/``CouponService``/
+    # ``app.domains.billing.renewal_service.RenewalService`` via the same
+    # narrow ``AuditLogWriter`` protocol shape Part 1's own ``PlanService``/
+    # ``LicenseService`` already use (see ``AuditLogEntry``'s "other domains
+    # could plausibly reuse it" design) -- an existing domain's later Part
+    # extending its own additive block, the same precedent BE-012's later
+    # Parts (e.g. Part 5's ``REPORTS``) already followed for themselves.
+    # Every Subscription lifecycle transition (create/cancel/reactivate/
+    # pause/resume/renew/renewal-failed) and every Coupon catalog mutation/
+    # application is audited -- the same moderate-volume, admin- or
+    # billing-event-attributable profile Part 1's own License/Plan actions
+    # already cover this way. Coupon *validation* (the no-side-effect
+    # ``POST /coupons/validate`` check) and renewal reminder emails are
+    # never audited (a pure read/notification triggers no billable state
+    # change -- the same "reads aren't audited" convention every prior
+    # domain's own additions already follow); both are still logged via the
+    # structured logger for operational visibility.
+    SUBSCRIPTION_CREATED = "subscription_created"
+    SUBSCRIPTION_CANCELLED = "subscription_cancelled"
+    SUBSCRIPTION_REACTIVATED = "subscription_reactivated"
+    SUBSCRIPTION_PAUSED = "subscription_paused"
+    SUBSCRIPTION_RESUMED = "subscription_resumed"
+    SUBSCRIPTION_RENEWED = "subscription_renewed"
+    SUBSCRIPTION_RENEWAL_FAILED = "subscription_renewal_failed"
+    SUBSCRIPTION_EXPIRED_AFTER_GRACE_PERIOD = "subscription_expired_after_grace_period"
+    COUPON_CREATED = "coupon_created"
+    COUPON_UPDATED = "coupon_updated"
+    COUPON_DEACTIVATED = "coupon_deactivated"
+    COUPON_APPLIED = "coupon_applied"

@@ -110,6 +110,10 @@ from app.domains.analytics.constants import (
     TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS,
     TASK_RUN_SCHEDULED_REPORTS,
 )
+from app.domains.billing.constants import (
+    SUBSCRIPTION_RENEWAL_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
+)
 
 _settings = get_settings()
 
@@ -133,7 +137,11 @@ celery_app = Celery(
     # imported eagerly by a real worker process
     # (`celery -A app.core.celery_app worker`) so they are registered
     # without a caller needing to import either module first.
-    include=["app.domains.analytics.tasks", "app.domains.analytics.report_tasks"],
+    include=[
+        "app.domains.analytics.tasks",
+        "app.domains.analytics.report_tasks",
+        "app.domains.billing.tasks",
+    ],
 )
 
 celery_app.conf.update(
@@ -175,6 +183,21 @@ celery_app.conf.update(
         "reports-run-scheduled": {
             "task": TASK_RUN_SCHEDULED_REPORTS,
             "schedule": SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS,
+        },
+        # BE-013 Part 2: Renewal Engine sweep -- hourly, not every 15
+        # minutes like the analytics rolling tick above. See
+        # ``app.domains.billing.constants
+        # .SUBSCRIPTION_RENEWAL_SWEEP_INTERVAL_SECONDS``'s own docstring for
+        # why hourly is the right granularity for a domain whose billing
+        # periods are day/month/year granularity, and
+        # ``app.domains.billing.renewal_service.RenewalService
+        # .run_renewal_sweep``'s own docstring for its per-phase and
+        # per-subscription failure-isolation contract, mirroring
+        # ``run_daily_aggregation_for_all_organizations``'s own
+        # per-organization isolation.
+        "billing-subscription-renewal-sweep": {
+            "task": TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
+            "schedule": SUBSCRIPTION_RENEWAL_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

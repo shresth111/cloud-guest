@@ -746,10 +746,15 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # BE-012 Part 5 adds a third Beat entry ("reports-run-scheduled") for
     # the Report Engine's scheduler -- see
     # app.domains.analytics.report_tasks's own module docstring.
+    # BE-013 Part 2 adds a fourth Beat entry
+    # ("billing-subscription-renewal-sweep") for the Renewal Engine's
+    # sweep -- see app.domains.billing.renewal_service's own module
+    # docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
         "reports-run-scheduled",
+        "billing-subscription-renewal-sweep",
     }
 
 

@@ -91,6 +91,104 @@ class UsageLimitExceeded:
     occurred_at: datetime = field(default_factory=_now)
 
 
+# ============================================================================
+# BE-013 Part 2: Subscription + Renewal + Coupon
+# ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionCreated:
+    subscription_id: uuid.UUID
+    organization_id: uuid.UUID
+    plan_id: uuid.UUID
+    status: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionCancelled:
+    subscription_id: uuid.UUID
+    organization_id: uuid.UUID
+    immediate: bool
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionReactivated:
+    subscription_id: uuid.UUID
+    organization_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionPaused:
+    subscription_id: uuid.UUID
+    organization_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionResumed:
+    subscription_id: uuid.UUID
+    organization_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionRenewed:
+    subscription_id: uuid.UUID
+    organization_id: uuid.UUID
+    amount_charged: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionRenewalFailed:
+    subscription_id: uuid.UUID
+    organization_id: uuid.UUID
+    reason: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionExpiredAfterGracePeriod:
+    subscription_id: uuid.UUID
+    organization_id: uuid.UUID
+    license_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class CouponApplied:
+    coupon_id: uuid.UUID
+    organization_id: uuid.UUID
+    subscription_id: uuid.UUID | None
+    discount_amount: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class CouponValidationFailed:
+    code: str
+    organization_id: uuid.UUID
+    reason: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class RenewalReminderSent:
+    subscription_id: uuid.UUID
+    organization_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class ExpiryReminderSent:
+    subscription_id: uuid.UUID
+    organization_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "LicenseAssigned",
     "LicenseActivated",
@@ -100,4 +198,16 @@ __all__ = [
     "LicenseUpgraded",
     "LicenseDowngraded",
     "UsageLimitExceeded",
+    "SubscriptionCreated",
+    "SubscriptionCancelled",
+    "SubscriptionReactivated",
+    "SubscriptionPaused",
+    "SubscriptionResumed",
+    "SubscriptionRenewed",
+    "SubscriptionRenewalFailed",
+    "SubscriptionExpiredAfterGracePeriod",
+    "CouponApplied",
+    "CouponValidationFailed",
+    "RenewalReminderSent",
+    "ExpiryReminderSent",
 ]

@@ -114,3 +114,101 @@ enum values (`enums.py`) -- no migration needed, `audit_log_entries.action`
 already accepts any string. `PermissionModule.BILLING`/`SUBSCRIPTIONS` were
 already seeded since BE-004; no new permission group/action/scope row is
 seeded by this part.
+
+---
+
+# BE-013 Part 2: Subscription + Renewal + Coupon Engines
+
+Migration: `alembic/versions/0023_create_billing_subscription_coupon_tables.py`
+(revises `0022_create_billing_plan_license_usage_tables`). Four new
+tables, all extending `BaseModel`. No `alembic/env.py` edit was needed --
+that file already imports `app.domains.billing.models` as a whole module
+(`from app.domains.billing import models as billing_models`), so these new
+classes (defined in that same `models.py`) are registered on
+`Base.metadata` automatically.
+
+## `subscriptions`
+
+One row per organization, ever (`organization_id` unique) -- see
+FLOW.md §12.
+
+| Column | Type | Notes |
+|---|---|---|
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable, **unique** | |
+| `license_id` | UUID, FK `licenses.id` (`RESTRICT`), not nullable | |
+| `plan_id` | UUID, FK `plans.id` (`RESTRICT`), not nullable | denormalized from `license_id` -- see FLOW.md §12 |
+| `status` | String(20), not nullable | `constants.SubscriptionStatus` -- see FLOW.md §13 for the full transition graph |
+| `billing_cycle` | String(20), not nullable | snapshot copy of `Plan.billing_cycle` at creation time, never re-read afterward |
+| `current_period_start` / `current_period_end` | DateTime(tz), not nullable | |
+| `trial_end` | DateTime(tz), nullable | set only for a `TRIALING` subscription |
+| `auto_renew` | Boolean, not nullable, default `true` | |
+| `cancel_at_period_end` | Boolean, not nullable, default `false` | |
+| `started_at` | DateTime(tz), not nullable | |
+| `cancelled_at` | DateTime(tz), nullable | |
+| `applied_coupon_id` | UUID, FK `coupons.id` (`SET NULL`), nullable | attribution only -- see FLOW.md §17 |
+| `past_due_at` | DateTime(tz), nullable | additive -- when this subscription most recently entered `PAST_DUE`; drives the grace-period computation (FLOW.md §16) |
+| `last_renewal_reminder_sent_at` / `last_expiry_reminder_sent_at` | DateTime(tz), nullable | additive -- reminder-sweep idempotency markers (FLOW.md §21) |
+
+Indexes: `organization_id` (unique), `license_id`, `plan_id`, `status`,
+`current_period_end` (the exact column `list_due_for_renewal` filters
+on), `applied_coupon_id`, plus base-model indexes.
+
+## `coupons`
+
+| Column | Type | Notes |
+|---|---|---|
+| `code` | String(50), not nullable, unique | uppercase-normalized (`validators.normalize_coupon_code`) |
+| `discount_type` | String(20), not nullable | `constants.DiscountType` -- `percentage`/`flat` |
+| `discount_value` | **Numeric(12, 2)**, not nullable | never `Float` |
+| `currency` | String(3), nullable | only meaningful for `flat` |
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), nullable | `NULL` = GLOBAL coupon, usable by any organization |
+| `max_uses` | Integer, nullable | `NULL` = unlimited |
+| `current_uses` | Integer, not nullable, default `0` | atomically incremented -- see FLOW.md §19 |
+| `valid_from` / `valid_until` | DateTime(tz) (`valid_until` nullable) | |
+| `is_active` | Boolean, not nullable, default `true` | |
+
+Indexes: `code`, `organization_id`, `is_active`, `valid_until`, plus
+base-model indexes.
+
+## `coupon_plans`
+
+The `(coupon_id, plan_id)` join table backing `Coupon.applicable_plan_ids`
+-- a real join table, not a JSONB list, for referential integrity (see
+FLOW.md §18).
+
+| Column | Type | Notes |
+|---|---|---|
+| `coupon_id` | UUID, FK `coupons.id` (`CASCADE`), not nullable | |
+| `plan_id` | UUID, FK `plans.id` (`CASCADE`), not nullable | |
+
+`UniqueConstraint(coupon_id, plan_id)` (`uq_coupon_plans_coupon_plan`).
+No rows for a coupon means "applicable to every plan". Indexes:
+`coupon_id`, `plan_id`, plus base-model indexes.
+
+## `coupon_usages`
+
+One row per coupon redemption.
+
+| Column | Type | Notes |
+|---|---|---|
+| `coupon_id` | UUID, FK `coupons.id` (`CASCADE`), not nullable | |
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable | |
+| `subscription_id` | UUID, FK `subscriptions.id` (`SET NULL`), nullable | nullable for a future part where a coupon might apply outside a subscription context |
+| `used_at` | DateTime(tz), not nullable | |
+| `discount_amount_applied` | **Numeric(12, 2)**, not nullable | the real, computed discount **at the moment of use** -- never re-derived later if the coupon's own `discount_value` changes afterward (copy, not reference) |
+
+Indexes: `coupon_id`, `organization_id`, `subscription_id`, plus
+base-model indexes.
+
+## Table creation order (FK dependency chain)
+
+`coupons` -> `coupon_plans` (needs `coupons` + `plans`) -> `subscriptions`
+(needs `organizations`/`licenses`/`plans`/`coupons`) -> `coupon_usages`
+(needs `coupons`/`organizations`/`subscriptions`). The migration's
+`upgrade()`/`downgrade()` follow this order (and its exact reverse),
+matching `0022`'s own dependency-ordered convention.
+
+## No further RBAC schema change
+
+Same as Part 1 -- this part's only RBAC edit is additive `AuditAction`
+values (`SUBSCRIPTION_*`/`COUPON_*`), no migration needed.

@@ -21,11 +21,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .constants import (
     BillingCycle,
+    DiscountType,
     LicenseChangeType,
     LicenseStatus,
     PlanFeatureKey,
     PlanFeatureType,
     PlanType,
+    SubscriptionStatus,
     UsageMetricKey,
 )
 
@@ -45,6 +47,15 @@ __all__ = [
     "UsageMetricResponse",
     "UsageLimitCheckResponse",
     "UsageSummaryResponse",
+    "SubscriptionCreateRequest",
+    "SubscriptionCancelRequest",
+    "SubscriptionResponse",
+    "CouponCreateRequest",
+    "CouponUpdateRequest",
+    "CouponResponse",
+    "CouponListResponse",
+    "CouponValidateRequest",
+    "CouponValidateResponse",
 ]
 
 
@@ -243,3 +254,155 @@ class UsageSummaryResponse(BaseModel):
     metrics: list[UsageMetricResponse]
     limit_checks: list[UsageLimitCheckResponse]
     any_limit_exceeded: bool
+
+
+# ============================================================================
+# Subscription (BE-013 Part 2)
+# ============================================================================
+
+
+class SubscriptionCreateRequest(BaseModel):
+    organization_id: uuid.UUID
+    plan_id: uuid.UUID
+    coupon_code: str | None = Field(default=None, min_length=1, max_length=50)
+
+
+class SubscriptionCancelRequest(BaseModel):
+    immediate: bool = Field(
+        default=False,
+        description=(
+            "true = cancel right now (License suspended immediately). "
+            "false = schedule cancellation for the end of the current "
+            "billing period (cancel_at_period_end)."
+        ),
+    )
+
+
+class SubscriptionResponse(BaseModel):
+    id: str
+    organization_id: str
+    license_id: str
+    plan_id: str
+    status: SubscriptionStatus
+    billing_cycle: str
+    current_period_start: datetime
+    current_period_end: datetime
+    trial_end: datetime | None
+    auto_renew: bool
+    cancel_at_period_end: bool
+    started_at: datetime
+    cancelled_at: datetime | None
+    applied_coupon_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ============================================================================
+# Coupon (BE-013 Part 2)
+# ============================================================================
+
+
+class CouponCreateRequest(BaseModel):
+    code: str = Field(..., min_length=2, max_length=50)
+    discount_type: DiscountType
+    discount_value: Decimal = Field(..., ge=0)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
+    organization_id: uuid.UUID | None = Field(
+        default=None,
+        description="Omit/null for a GLOBAL coupon usable by any organization.",
+    )
+    max_uses: int | None = Field(default=None, ge=1)
+    valid_from: datetime
+    valid_until: datetime | None = None
+    is_active: bool = True
+    applicable_plan_ids: list[uuid.UUID] = Field(
+        default_factory=list,
+        description="Empty = applicable to every plan.",
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "code": "SAVE20",
+                "discount_type": "percentage",
+                "discount_value": "20",
+                "max_uses": 100,
+                "valid_from": "2026-01-01T00:00:00Z",
+                "valid_until": "2026-12-31T23:59:59Z",
+                "is_active": True,
+                "applicable_plan_ids": [],
+            }
+        }
+    )
+
+
+class CouponUpdateRequest(BaseModel):
+    discount_type: DiscountType | None = None
+    discount_value: Decimal | None = Field(default=None, ge=0)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
+    max_uses: int | None = Field(default=None, ge=1)
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+    is_active: bool | None = None
+    applicable_plan_ids: list[uuid.UUID] | None = Field(
+        default=None,
+        description="When provided, fully replaces this coupon's plan restrictions.",
+    )
+
+
+class CouponResponse(BaseModel):
+    id: str
+    code: str
+    discount_type: str
+    discount_value: Decimal
+    currency: str | None
+    organization_id: str | None
+    max_uses: int | None
+    current_uses: int
+    valid_from: datetime
+    valid_until: datetime | None
+    is_active: bool
+    applicable_plan_ids: list[str] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CouponListResponse(BaseModel):
+    items: list[CouponResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+class CouponValidateRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=50)
+    organization_id: uuid.UUID
+    plan_id: uuid.UUID
+    base_amount: Decimal | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Optional -- when provided, the response includes the real "
+            "computed discount against this amount (e.g. the plan's own "
+            "base_price)."
+        ),
+    )
+
+
+class CouponValidateResponse(BaseModel):
+    valid: bool
+    code: str
+    discount_type: str
+    discount_value: Decimal
+    currency: str | None
+    estimated_discount_amount: Decimal | None = Field(
+        default=None,
+        description="Only populated when the request included base_amount.",
+    )
