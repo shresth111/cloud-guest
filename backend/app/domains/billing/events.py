@@ -259,6 +259,82 @@ class WebhookSignatureInvalid:
     occurred_at: datetime = field(default_factory=_now)
 
 
+# ============================================================================
+# BE-013 Part 4: Invoice Engine + Tax/GST
+# ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class InvoiceGenerated:
+    invoice_id: uuid.UUID
+    organization_id: uuid.UUID
+    invoice_number: str
+    total_amount: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class InvoiceMarkedPaid:
+    invoice_id: uuid.UUID
+    organization_id: uuid.UUID
+    payment_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class InvoiceVoided:
+    invoice_id: uuid.UUID
+    organization_id: uuid.UUID
+    previous_status: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class InvoiceMarkedOverdue:
+    invoice_id: uuid.UUID
+    organization_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class CreditNoteIssued:
+    note_id: uuid.UUID
+    invoice_id: uuid.UUID
+    organization_id: uuid.UUID
+    amount: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class DebitNoteIssued:
+    note_id: uuid.UUID
+    invoice_id: uuid.UUID
+    organization_id: uuid.UUID
+    amount: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class TaxRateCreated:
+    tax_rate_id: uuid.UUID
+    country_code: str
+    rate_percentage: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class TaxRateUpdated:
+    tax_rate_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class BillingProfileUpdated:
+    billing_profile_id: uuid.UUID
+    organization_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "LicenseAssigned",
     "LicenseActivated",
@@ -288,4 +364,13 @@ __all__ = [
     "PaymentMethodRemoved",
     "WebhookProcessed",
     "WebhookSignatureInvalid",
+    "InvoiceGenerated",
+    "InvoiceMarkedPaid",
+    "InvoiceVoided",
+    "InvoiceMarkedOverdue",
+    "CreditNoteIssued",
+    "DebitNoteIssued",
+    "TaxRateCreated",
+    "TaxRateUpdated",
+    "BillingProfileUpdated",
 ]

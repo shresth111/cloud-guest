@@ -22,8 +22,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from .constants import (
     BillingCycle,
     DiscountType,
+    InvoiceStatus,
     LicenseChangeType,
     LicenseStatus,
+    NoteType,
     PaymentMethodType,
     PaymentProvider,
     PaymentStatus,
@@ -31,6 +33,7 @@ from .constants import (
     PlanFeatureType,
     PlanType,
     SubscriptionStatus,
+    TaxType,
     UsageMetricKey,
 )
 
@@ -66,6 +69,18 @@ __all__ = [
     "PaymentMethodRegisterRequest",
     "PaymentMethodResponse",
     "PaymentMethodListResponse",
+    "TaxRateCreateRequest",
+    "TaxRateUpdateRequest",
+    "TaxRateResponse",
+    "TaxRateListResponse",
+    "BillingProfileUpsertRequest",
+    "BillingProfileResponse",
+    "InvoiceItemResponse",
+    "CreditDebitNoteResponse",
+    "CreditNoteIssueRequest",
+    "DebitNoteIssueRequest",
+    "InvoiceResponse",
+    "InvoiceListResponse",
 ]
 
 
@@ -545,3 +560,173 @@ class PaymentMethodResponse(BaseModel):
 
 class PaymentMethodListResponse(BaseModel):
     items: list[PaymentMethodResponse]
+
+
+# ============================================================================
+# BE-013 Part 4: Invoice Engine + Tax/GST
+# ============================================================================
+
+
+class TaxRateCreateRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    tax_type: TaxType
+    rate_percentage: Decimal = Field(..., ge=0, le=100)
+    country_code: str = Field(..., min_length=2, max_length=2)
+    is_active: bool = True
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "name": "India GST",
+                "tax_type": "gst",
+                "rate_percentage": "18.00",
+                "country_code": "IN",
+                "is_active": True,
+            }
+        }
+    )
+
+
+class TaxRateUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=100)
+    tax_type: TaxType | None = None
+    rate_percentage: Decimal | None = Field(default=None, ge=0, le=100)
+    country_code: str | None = Field(default=None, min_length=2, max_length=2)
+    is_active: bool | None = None
+
+
+class TaxRateResponse(BaseModel):
+    id: str
+    name: str
+    tax_type: str
+    rate_percentage: Decimal
+    country_code: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TaxRateListResponse(BaseModel):
+    items: list[TaxRateResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+class BillingProfileUpsertRequest(BaseModel):
+    billing_name: str = Field(..., min_length=2, max_length=200)
+    billing_address_line1: str = Field(..., min_length=2, max_length=255)
+    billing_address_line2: str | None = Field(default=None, max_length=255)
+    billing_city: str = Field(..., min_length=1, max_length=100)
+    billing_state: str = Field(..., min_length=1, max_length=100)
+    billing_country: str = Field(..., min_length=2, max_length=2)
+    billing_postal_code: str = Field(..., min_length=1, max_length=20)
+    gst_identifier: str | None = Field(default=None, max_length=20)
+    tax_exempt: bool = False
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "billing_name": "Acme Hospitality Pvt Ltd",
+                "billing_address_line1": "221B Baker Street",
+                "billing_address_line2": None,
+                "billing_city": "Mumbai",
+                "billing_state": "Maharashtra",
+                "billing_country": "IN",
+                "billing_postal_code": "400001",
+                "gst_identifier": "27AAAAA0000A1Z5",
+                "tax_exempt": False,
+            }
+        }
+    )
+
+
+class BillingProfileResponse(BaseModel):
+    id: str
+    organization_id: str
+    billing_name: str
+    billing_address_line1: str
+    billing_address_line2: str | None
+    billing_city: str
+    billing_state: str
+    billing_country: str
+    billing_postal_code: str
+    gst_identifier: str | None
+    tax_exempt: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class InvoiceItemResponse(BaseModel):
+    id: str
+    description: str
+    quantity: Decimal
+    unit_price: Decimal
+    amount: Decimal
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CreditDebitNoteResponse(BaseModel):
+    id: str
+    invoice_id: str
+    note_type: NoteType
+    note_number: str
+    amount: Decimal
+    reason: str
+    issued_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CreditNoteIssueRequest(BaseModel):
+    amount: Decimal = Field(..., gt=0)
+    reason: str = Field(..., min_length=3, max_length=1000)
+
+
+class DebitNoteIssueRequest(BaseModel):
+    amount: Decimal = Field(..., gt=0)
+    reason: str = Field(..., min_length=3, max_length=1000)
+
+
+class InvoiceResponse(BaseModel):
+    id: str
+    organization_id: str
+    subscription_id: str | None
+    payment_id: str | None
+    invoice_number: str
+    status: InvoiceStatus
+    issue_date: datetime
+    due_date: datetime
+    subtotal: Decimal
+    cgst_amount: Decimal
+    sgst_amount: Decimal
+    igst_amount: Decimal
+    tax_amount: Decimal
+    tax_rate_percentage: Decimal
+    total_amount: Decimal
+    currency: str
+    billing_snapshot: dict[str, object]
+    items: list[InvoiceItemResponse] = Field(default_factory=list)
+    notes: list[CreditDebitNoteResponse] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class InvoiceListResponse(BaseModel):
+    items: list[InvoiceResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool

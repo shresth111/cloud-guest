@@ -41,11 +41,23 @@ from app.domains.organization.repository import OrganizationRepository
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.repository import RBACRepository
 
-from .constants import TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP
+from .constants import (
+    TASK_RUN_INVOICE_OVERDUE_SWEEP,
+    TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
+)
 from .dependencies import build_payment_gateway
 from .renewal_service import RenewalService, RenewalSweepReport
-from .repository import LicenseRepository, PlanRepository, SubscriptionRepository
-from .service import LicenseService
+from .repository import (
+    BillingProfileRepository,
+    CreditDebitNoteRepository,
+    InvoiceRepository,
+    LicenseRepository,
+    NumberCounterRepository,
+    PlanRepository,
+    SubscriptionRepository,
+    TaxRateRepository,
+)
+from .service import InvoiceService, LicenseService
 
 logger = get_logger(__name__)
 
@@ -131,4 +143,80 @@ def run_subscription_renewal_sweep() -> dict[str, object]:
     }
 
 
-__all__ = ["run_subscription_renewal_sweep"]
+# ============================================================================
+# BE-013 Part 4: Invoice overdue sweep
+#
+# ## Honest scope boundary: this task exists and works, but is not
+# ## Beat-registered here
+#
+# Mirrors BE-013 Part 1's own explicit "expire_license is fully built,
+# tested, and ready for a future part's Beat schedule to call" deferral
+# (see service.LicenseService's own module docstring): this task is a real,
+# fully working, independently callable Celery task -- but wiring its
+# entry into ``app.core.celery_app``'s ``beat_schedule`` is a change to
+# ``app/core/celery_app.py``, a file outside this Part's own directory-rule
+# boundary (only ``app/domains/billing/``, ``app/core/config.py``,
+# ``alembic/versions/``, ``tests/unit/``, ``docs/billing/``, and a few
+# other explicitly-named files are in scope for BE-013 Part 4). Registering
+# ``TASK_RUN_INVOICE_OVERDUE_SWEEP`` in that file's ``beat_schedule`` dict
+# (the same one-line addition ``TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP``
+# already has) is the one remaining step to make this run automatically,
+# on an interval of ``Settings.invoice_overdue_sweep_interval_seconds`` --
+# deliberately left to that dedicated, narrow follow-up edit rather than
+# reaching outside this part's own directory rule.
+# ============================================================================
+
+
+async def _run_invoice_overdue_sweep_async() -> list[str]:
+    """The actual async work behind ``run_invoice_overdue_sweep`` -- a
+    fresh session per task run, mirroring
+    ``_run_renewal_sweep_async``'s identical pattern."""
+    settings = get_settings()
+    async with SessionLocal() as session:
+        try:
+            invoice_repository = InvoiceRepository(session)
+            subscription_repository = SubscriptionRepository(session)
+            plan_repository = PlanRepository(session)
+            billing_profile_repository = BillingProfileRepository(session)
+            tax_rate_repository = TaxRateRepository(session)
+            number_counter_repository = NumberCounterRepository(session)
+            note_repository = CreditDebitNoteRepository(session)
+            audit_repository = RBACRepository(session)
+
+            invoice_service = InvoiceService(
+                invoice_repository,
+                subscription_repository=subscription_repository,
+                plan_repository=plan_repository,
+                billing_profile_repository=billing_profile_repository,
+                tax_rate_repository=tax_rate_repository,
+                number_counter_repository=number_counter_repository,
+                note_repository=note_repository,
+                platform_gst_state=settings.platform_gst_state,
+                platform_gst_country=settings.platform_gst_country,
+                invoice_due_days=settings.invoice_due_days,
+                audit_writer=audit_repository,
+            )
+            overdue_ids = await invoice_service.mark_overdue_invoices()
+            await session.commit()
+            return [str(invoice_id) for invoice_id in overdue_ids]
+        except Exception:
+            await session.rollback()
+            raise
+
+
+@celery_app.task(name=TASK_RUN_INVOICE_OVERDUE_SWEEP)
+def run_invoice_overdue_sweep() -> dict[str, object]:
+    """Real, callable Celery task -- transitions every ``ISSUED`` invoice
+    whose ``due_date`` has passed to ``OVERDUE``, with real per-invoice
+    failure isolation (``InvoiceService.mark_overdue_invoices``'s own
+    docstring). See the module-level note above for why this is not yet
+    registered in ``app.core.celery_app``'s ``beat_schedule``."""
+    overdue_ids = asyncio.run(_run_invoice_overdue_sweep_async())
+    logger.info(
+        "billing_task_run_invoice_overdue_sweep_completed",
+        extra={"overdue_count": len(overdue_ids)},
+    )
+    return {"overdue_invoice_ids": overdue_ids}
+
+
+__all__ = ["run_subscription_renewal_sweep", "run_invoice_overdue_sweep"]

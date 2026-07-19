@@ -146,7 +146,7 @@ from __future__ import annotations
 import json
 import uuid
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import Settings, get_settings
@@ -161,9 +161,11 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.rbac.enums import ScopeType
 
-from .constants import DiscountType, PaymentStatus, PlanType
+from .constants import DiscountType, InvoiceStatus, PaymentStatus, PlanType
 from .dependencies import (
+    get_billing_profile_service,
     get_coupon_service,
+    get_invoice_service,
     get_license_service,
     get_payment_method_service,
     get_payment_repository,
@@ -171,12 +173,18 @@ from .dependencies import (
     get_plan_service,
     get_renewal_service,
     get_subscription_service,
+    get_tax_rate_service,
     get_usage_service,
     get_webhook_event_dedup,
 )
 from .exceptions import WebhookSignatureInvalidError
+from .invoice_pdf import SellerInfo, render_invoice_pdf
 from .models import (
+    BillingProfile,
     Coupon,
+    CreditDebitNote,
+    Invoice,
+    InvoiceItem,
     License,
     LicenseChangeLog,
     Payment,
@@ -184,16 +192,25 @@ from .models import (
     Plan,
     PlanFeature,
     Subscription,
+    TaxRate,
 )
 from .renewal_service import RenewalService
 from .repository import PaymentRepositoryProtocol
 from .schemas import (
+    BillingProfileResponse,
+    BillingProfileUpsertRequest,
     CouponCreateRequest,
     CouponListResponse,
     CouponResponse,
     CouponUpdateRequest,
     CouponValidateRequest,
     CouponValidateResponse,
+    CreditDebitNoteResponse,
+    CreditNoteIssueRequest,
+    DebitNoteIssueRequest,
+    InvoiceItemResponse,
+    InvoiceListResponse,
+    InvoiceResponse,
     LicenseAssignRequest,
     LicenseChangeLogResponse,
     LicenseDowngradeRequest,
@@ -215,17 +232,24 @@ from .schemas import (
     SubscriptionCancelRequest,
     SubscriptionCreateRequest,
     SubscriptionResponse,
+    TaxRateCreateRequest,
+    TaxRateListResponse,
+    TaxRateResponse,
+    TaxRateUpdateRequest,
     UsageLimitCheckResponse,
     UsageMetricResponse,
     UsageSummaryResponse,
 )
 from .service import (
+    BillingProfileService,
     CouponService,
+    InvoiceService,
     LicenseService,
     PaymentMethodService,
     PaymentService,
     PlanService,
     SubscriptionService,
+    TaxRateService,
     UsageService,
     UsageValidationResult,
 )
@@ -1431,6 +1455,7 @@ async def stripe_webhook(
     payment_repository: PaymentRepositoryProtocol = Depends(get_payment_repository),
     renewal_service: RenewalService = Depends(get_renewal_service),
     dedup: WebhookEventDedupProtocol = Depends(get_webhook_event_dedup),
+    invoice_service: InvoiceService = Depends(get_invoice_service),
 ):
     payload = await request.body()
     signature_header = request.headers.get("stripe-signature", "")
@@ -1449,6 +1474,7 @@ async def stripe_webhook(
         payment_repository=payment_repository,
         renewal_service=renewal_service,
         dedup=dedup,
+        invoice_service=invoice_service,
     )
     return {"received": True}
 
@@ -1460,6 +1486,7 @@ async def razorpay_webhook(
     payment_repository: PaymentRepositoryProtocol = Depends(get_payment_repository),
     renewal_service: RenewalService = Depends(get_renewal_service),
     dedup: WebhookEventDedupProtocol = Depends(get_webhook_event_dedup),
+    invoice_service: InvoiceService = Depends(get_invoice_service),
 ):
     payload = await request.body()
     signature = request.headers.get("x-razorpay-signature", "")
@@ -1477,8 +1504,479 @@ async def razorpay_webhook(
         payment_repository=payment_repository,
         renewal_service=renewal_service,
         dedup=dedup,
+        invoice_service=invoice_service,
     )
     return {"received": True}
+
+
+# ============================================================================
+# BE-013 Part 4: Invoice Engine + Tax/GST
+#
+# ## RBAC permission-key reuse
+#
+# ``PermissionModule.INVOICES`` (seeded since BE-004: create/read/update/
+# delete/export/approve/manage) covers every ``/invoices`` endpoint below --
+# ``invoices.read`` for every read (including the PDF download, which is
+# fundamentally an export of an already-generated invoice's own content --
+# ``invoices.export`` is the seeded action this maps to precisely);
+# ``invoices.manage`` for every consequential financial write (void, credit
+# note, debit note) -- the same "reuse the closest seeded action for a
+# consequential write" precedent Payments' own refund/retry already
+# establish via ``billing.manage``. None of these endpoints enforce
+# tenant-organization matching against the caller's own scope context --
+# mirrors ``POST /payments/{id}/refund``/``retry``'s identical "an admin
+# action operating directly on the entity by id" precedent (only the
+# *read*-side ``GET /invoices``/``GET /invoices/{id}`` enforce real tenant
+# isolation, via ``RequireOrganization`` + the service layer's own
+# ``organization_id`` filter). Tax rates (``/billing/tax-rates``) and the
+# organization's own billing profile (``/billing/profile``) reuse
+# ``billing.*`` exactly like Plans/Coupons/Payments before them: tax rates
+# are a platform-wide pricing/tax catalog concern, pinned to
+# ``scope=ScopeType.GLOBAL`` for writes (mirrors Plans/Coupons); the billing
+# profile is a real, tenant-owned resource (ordinary inferred scope, no
+# GLOBAL pin), mirroring Payments/PaymentMethods.
+# ============================================================================
+
+
+def _invoice_item_response(item: InvoiceItem) -> InvoiceItemResponse:
+    return InvoiceItemResponse(
+        id=str(item.id),
+        description=item.description,
+        quantity=item.quantity,
+        unit_price=item.unit_price,
+        amount=item.amount,
+    )
+
+
+def _note_response(note: CreditDebitNote) -> CreditDebitNoteResponse:
+    return CreditDebitNoteResponse(
+        id=str(note.id),
+        invoice_id=str(note.invoice_id),
+        note_type=note.note_type,
+        note_number=note.note_number,
+        amount=note.amount,
+        reason=note.reason,
+        issued_at=note.issued_at,
+    )
+
+
+def _invoice_response(
+    invoice: Invoice, items: list[InvoiceItem], notes: list[CreditDebitNote]
+) -> InvoiceResponse:
+    return InvoiceResponse(
+        id=str(invoice.id),
+        organization_id=str(invoice.organization_id),
+        subscription_id=(
+            str(invoice.subscription_id) if invoice.subscription_id else None
+        ),
+        payment_id=str(invoice.payment_id) if invoice.payment_id else None,
+        invoice_number=invoice.invoice_number,
+        status=invoice.status,
+        issue_date=invoice.issue_date,
+        due_date=invoice.due_date,
+        subtotal=invoice.subtotal,
+        cgst_amount=invoice.cgst_amount,
+        sgst_amount=invoice.sgst_amount,
+        igst_amount=invoice.igst_amount,
+        tax_amount=invoice.tax_amount,
+        tax_rate_percentage=invoice.tax_rate_percentage,
+        total_amount=invoice.total_amount,
+        currency=invoice.currency,
+        billing_snapshot=invoice.billing_snapshot,
+        items=[_invoice_item_response(item) for item in items],
+        notes=[_note_response(note) for note in notes],
+        created_at=invoice.created_at,
+        updated_at=invoice.updated_at,
+    )
+
+
+def _tax_rate_response(tax_rate: TaxRate) -> TaxRateResponse:
+    return TaxRateResponse(
+        id=str(tax_rate.id),
+        name=tax_rate.name,
+        tax_type=tax_rate.tax_type,
+        rate_percentage=tax_rate.rate_percentage,
+        country_code=tax_rate.country_code,
+        is_active=tax_rate.is_active,
+        created_at=tax_rate.created_at,
+        updated_at=tax_rate.updated_at,
+    )
+
+
+def _billing_profile_response(profile: BillingProfile) -> BillingProfileResponse:
+    return BillingProfileResponse(
+        id=str(profile.id),
+        organization_id=str(profile.organization_id),
+        billing_name=profile.billing_name,
+        billing_address_line1=profile.billing_address_line1,
+        billing_address_line2=profile.billing_address_line2,
+        billing_city=profile.billing_city,
+        billing_state=profile.billing_state,
+        billing_country=profile.billing_country,
+        billing_postal_code=profile.billing_postal_code,
+        gst_identifier=profile.gst_identifier,
+        tax_exempt=profile.tax_exempt,
+        created_at=profile.created_at,
+        updated_at=profile.updated_at,
+    )
+
+
+@router.get(
+    "/invoices",
+    response_model=ApiResponse[InvoiceListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("invoices.read"))],
+)
+async def list_invoices(
+    request: Request,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    status_filter: InvoiceStatus | None = Query(default=None, alias="status"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    service: InvoiceService = Depends(get_invoice_service),
+):
+    items, meta = await service.list_invoices(
+        page=page,
+        page_size=page_size,
+        organization_id=organization_id,
+        status=status_filter.value if status_filter else None,
+    )
+    responses = []
+    for invoice in items:
+        line_items = await service.list_items(invoice.id)
+        notes = await service.list_notes(invoice.id)
+        responses.append(_invoice_response(invoice, line_items, notes))
+    payload = InvoiceListResponse(
+        items=responses,
+        page=meta.page,
+        page_size=meta.page_size,
+        total_items=meta.total_items,
+        total_pages=meta.total_pages,
+        has_next=meta.has_next,
+        has_previous=meta.has_previous,
+    )
+    return build_response(
+        success=True,
+        message="Invoices retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/invoices/{invoice_id}",
+    response_model=ApiResponse[InvoiceResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("invoices.read"))],
+)
+async def get_invoice(
+    request: Request,
+    invoice_id: uuid.UUID,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: InvoiceService = Depends(get_invoice_service),
+):
+    invoice = await service.get_invoice(invoice_id, organization_id=organization_id)
+    items = await service.list_items(invoice.id)
+    notes = await service.list_notes(invoice.id)
+    return build_response(
+        success=True,
+        message="Invoice retrieved",
+        data=_invoice_response(invoice, items, notes).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/invoices/{invoice_id}/download",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("invoices.export"))],
+)
+async def download_invoice(
+    invoice_id: uuid.UUID,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: InvoiceService = Depends(get_invoice_service),
+    settings: Settings = Depends(get_settings),
+):
+    """Returns the real, rendered invoice PDF -- ``reportlab``-generated
+    bytes, not the standard ``ApiResponse`` envelope (a file download, the
+    same "raw bytes + Content-Type/Content-Disposition" shape
+    ``app.domains.analytics.report_router``'s own export-download endpoint
+    already establishes for this codebase)."""
+    invoice = await service.get_invoice(invoice_id, organization_id=organization_id)
+    items = await service.list_items(invoice.id)
+    notes = await service.list_notes(invoice.id)
+    seller = SellerInfo(
+        legal_business_name=settings.platform_legal_business_name,
+        gstin=settings.platform_gstin,
+        state=settings.platform_gst_state,
+        country=settings.platform_gst_country,
+    )
+    pdf_bytes = render_invoice_pdf(invoice, items, seller=seller, notes=notes)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{invoice.invoice_number}.pdf"'
+            )
+        },
+    )
+
+
+@router.post(
+    "/invoices/{invoice_id}/void",
+    response_model=ApiResponse[InvoiceResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("invoices.manage"))],
+)
+async def void_invoice(
+    request: Request,
+    invoice_id: uuid.UUID,
+    user: AuthUser = Depends(get_current_user),
+    service: InvoiceService = Depends(get_invoice_service),
+):
+    invoice = await service.void_invoice(
+        actor_user_id=uuid.UUID(user.id), invoice_id=invoice_id
+    )
+    items = await service.list_items(invoice.id)
+    notes = await service.list_notes(invoice.id)
+    return build_response(
+        success=True,
+        message="Invoice voided",
+        data=_invoice_response(invoice, items, notes).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/invoices/{invoice_id}/credit-note",
+    response_model=ApiResponse[CreditDebitNoteResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("invoices.manage"))],
+)
+async def issue_credit_note(
+    request: Request,
+    invoice_id: uuid.UUID,
+    payload: CreditNoteIssueRequest,
+    user: AuthUser = Depends(get_current_user),
+    service: InvoiceService = Depends(get_invoice_service),
+):
+    note = await service.issue_credit_note(
+        actor_user_id=uuid.UUID(user.id),
+        invoice_id=invoice_id,
+        amount=payload.amount,
+        reason=payload.reason,
+    )
+    return build_response(
+        success=True,
+        message="Credit note issued",
+        data=_note_response(note).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/invoices/{invoice_id}/debit-note",
+    response_model=ApiResponse[CreditDebitNoteResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("invoices.manage"))],
+)
+async def issue_debit_note(
+    request: Request,
+    invoice_id: uuid.UUID,
+    payload: DebitNoteIssueRequest,
+    user: AuthUser = Depends(get_current_user),
+    service: InvoiceService = Depends(get_invoice_service),
+):
+    note = await service.issue_debit_note(
+        actor_user_id=uuid.UUID(user.id),
+        invoice_id=invoice_id,
+        amount=payload.amount,
+        reason=payload.reason,
+    )
+    return build_response(
+        success=True,
+        message="Debit note issued",
+        data=_note_response(note).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+# ----------------------------------------------------------------------------
+# Tax rates -- Super Admin "Manage Taxes" (platform-wide, GLOBAL-pinned,
+# mirrors Plans/Coupons above).
+# ----------------------------------------------------------------------------
+
+
+@router.post(
+    "/billing/tax-rates",
+    response_model=ApiResponse[TaxRateResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("billing.manage", scope=ScopeType.GLOBAL))],
+)
+async def create_tax_rate(
+    request: Request,
+    payload: TaxRateCreateRequest,
+    user: AuthUser = Depends(get_current_user),
+    service: TaxRateService = Depends(get_tax_rate_service),
+):
+    tax_rate = await service.create_tax_rate(
+        actor_user_id=uuid.UUID(user.id),
+        name=payload.name,
+        tax_type=payload.tax_type.value,
+        rate_percentage=payload.rate_percentage,
+        country_code=payload.country_code,
+        is_active=payload.is_active,
+    )
+    return build_response(
+        success=True,
+        message="Tax rate created",
+        data=_tax_rate_response(tax_rate).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/billing/tax-rates",
+    response_model=ApiResponse[TaxRateListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.read"))],
+)
+async def list_tax_rates(
+    request: Request,
+    country_code: str | None = Query(default=None, min_length=2, max_length=2),
+    is_active: bool | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    service: TaxRateService = Depends(get_tax_rate_service),
+):
+    items, meta = await service.list_tax_rates(
+        page=page, page_size=page_size, country_code=country_code, is_active=is_active
+    )
+    payload = TaxRateListResponse(
+        items=[_tax_rate_response(tax_rate) for tax_rate in items],
+        page=meta.page,
+        page_size=meta.page_size,
+        total_items=meta.total_items,
+        total_pages=meta.total_pages,
+        has_next=meta.has_next,
+        has_previous=meta.has_previous,
+    )
+    return build_response(
+        success=True,
+        message="Tax rates retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/billing/tax-rates/{tax_rate_id}",
+    response_model=ApiResponse[TaxRateResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.update", scope=ScopeType.GLOBAL))],
+)
+async def update_tax_rate(
+    request: Request,
+    tax_rate_id: uuid.UUID,
+    payload: TaxRateUpdateRequest,
+    user: AuthUser = Depends(get_current_user),
+    service: TaxRateService = Depends(get_tax_rate_service),
+):
+    data = payload.model_dump(exclude_unset=True)
+    if "tax_type" in data and payload.tax_type is not None:
+        data["tax_type"] = payload.tax_type.value
+    tax_rate = await service.update_tax_rate(
+        actor_user_id=uuid.UUID(user.id), tax_rate_id=tax_rate_id, data=data
+    )
+    return build_response(
+        success=True,
+        message="Tax rate updated",
+        data=_tax_rate_response(tax_rate).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+# ----------------------------------------------------------------------------
+# Billing profile -- an organization's own billing address/GSTIN. Registered
+# BEFORE /billing/tax-rates has no path-shape overlap, but /billing/profile/me
+# must still be registered before /billing/profile/{organization_id} -- the
+# same literal-before-wildcard ordering requirement /licenses/me establishes.
+# ----------------------------------------------------------------------------
+
+
+@router.post(
+    "/billing/profile",
+    response_model=ApiResponse[BillingProfileResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.update"))],
+)
+async def upsert_billing_profile(
+    request: Request,
+    payload: BillingProfileUpsertRequest,
+    user: AuthUser = Depends(get_current_user),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: BillingProfileService = Depends(get_billing_profile_service),
+):
+    profile = await service.upsert_billing_profile(
+        actor_user_id=uuid.UUID(user.id),
+        organization_id=organization_id,
+        billing_name=payload.billing_name,
+        billing_address_line1=payload.billing_address_line1,
+        billing_address_line2=payload.billing_address_line2,
+        billing_city=payload.billing_city,
+        billing_state=payload.billing_state,
+        billing_country=payload.billing_country,
+        billing_postal_code=payload.billing_postal_code,
+        gst_identifier=payload.gst_identifier,
+        tax_exempt=payload.tax_exempt,
+    )
+    return build_response(
+        success=True,
+        message="Billing profile saved",
+        data=_billing_profile_response(profile).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/billing/profile/me",
+    response_model=ApiResponse[BillingProfileResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.read"))],
+)
+async def get_my_billing_profile(
+    request: Request,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: BillingProfileService = Depends(get_billing_profile_service),
+):
+    profile = await service.get_billing_profile(organization_id)
+    return build_response(
+        success=True,
+        message="Billing profile retrieved",
+        data=_billing_profile_response(profile).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/billing/profile/{organization_id}",
+    response_model=ApiResponse[BillingProfileResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.read"))],
+)
+async def get_billing_profile(
+    request: Request,
+    organization_id: uuid.UUID,
+    service: BillingProfileService = Depends(get_billing_profile_service),
+):
+    profile = await service.get_billing_profile(organization_id)
+    return build_response(
+        success=True,
+        message="Billing profile retrieved",
+        data=_billing_profile_response(profile).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
 
 
 __all__ = ["router"]

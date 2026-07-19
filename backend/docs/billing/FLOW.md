@@ -909,3 +909,349 @@ later `payment_intent.succeeded`/`payment_intent.payment_failed` webhook.
 such an intermediate-status `Payment` row `PENDING` (never fabricating a
 final outcome); the corresponding webhook, once it arrives, is what
 resolves it.
+
+---
+
+# Billing (BE-013 Part 4): Invoice Engine + Tax/GST -- Design Decisions
+
+## §35. Part 4 overview
+
+Six new tables (`tax_rates`, `billing_profiles`, `invoice_number_counters`,
+`invoices`, `invoice_items`, `credit_debit_notes`; migration
+`0025_create_billing_invoice_tax_tables.py`), three new modules
+(`number_generator.py`, `invoice_pdf.py`, plus additions to every existing
+module), three new services (`TaxRateService`, `BillingProfileService`,
+`InvoiceService`), and a new `/invoices`/`/billing/tax-rates`/
+`/billing/profile` API surface. The real, driving requirement this part
+answers: an invoice is not a second, independent computation of "what does
+this organization owe" -- it is a legal/financial *record* of the exact
+same charge Parts 2/3's renewal engine already computes and (attempts to)
+collect, with a real, India-specific GST tax rule applied on top.
+
+## §36. Billing address/GSTIN storage: a new, billing-owned `BillingProfile`
+## table -- not an `Organization` column extension
+
+Two real candidates were considered for where an organization's billing
+address/GSTIN should live:
+
+1. A narrow, additive extension to `Organization` itself -- the same class
+   of exception Part 1's own `subscription_tier` sync already established
+   as acceptable ("this module's entire purpose is to give a reserved
+   concept real meaning").
+2. A new, purely-billing-owned table (`BillingProfile`) keyed to
+   `organization_id`, entirely inside `app.domains.billing`.
+
+This part chooses (2), and the distinguishing factor from Part 1's own
+precedent is concrete: `subscription_tier` has *multiple* real readers
+across this codebase (Analytics' own Plan Distribution `GROUP BY`,
+potentially other future consumers) -- it is a genuinely shared,
+cross-domain concept that happens to be populated by Billing. A billing
+address/GSTIN has **exactly one** consumer anywhere in this codebase:
+this domain's own invoice generation and PDF rendering. Adding five-plus
+columns to `Organization` for a concept only Billing ever reads would
+widen that table's surface for zero benefit any other domain needs, and
+would require editing `organization`'s own `models.py`/migration/schemas --
+a real cross-domain boundary crossing this part's own directory rule
+explicitly minimizes to begin with. `BillingProfile` keeps 100% of this
+concept's read/write surface inside `app.domains.billing`, the identical
+"don't touch other domains' internals" discipline this codebase enforces
+everywhere else. One row per organization, ever (`organization_id`
+unique) -- mirrors `License`/`Subscription`'s identical one-to-one,
+mutated-in-place cardinality; a superseded billing address has no
+standalone historical value once updated (what *does* need preserving is
+a historical invoice's own frozen copy of it -- see §41).
+
+## §37. Invoice number generator: the real, DB-level-atomic concurrency
+## mechanism
+
+**The bug class avoided:** generating the next sequential number via
+`SELECT MAX(sequence) + 1 FROM ...; INSERT ...` (or the identical
+application-level pattern: read a "current count" into Python, increment
+it there, write it back) is a real, well-known race. Two concurrent
+requests can both execute the read before either commits its own write,
+both observe the same "current" value, both compute the same "next"
+value, and both persist a row with the identical number.
+
+**This module's real mechanism:** `models.InvoiceNumberCounter` has a
+unique `counter_key` column (`"<document_type>:<year>"`, e.g.
+`"invoice:2026"`). `repository.NumberCounterRepository
+.increment_and_get_next` issues **exactly one** SQL statement per call --
+`INSERT ... ON CONFLICT (counter_key) DO UPDATE SET last_value =
+invoice_number_counters.last_value + 1 ... RETURNING last_value`, via
+SQLAlchemy's `postgresql.insert(...).on_conflict_do_update(...)`. This is
+genuinely safe under concurrency, not merely apparently so, for two
+concrete reasons:
+
+1. **No read-then-write round trip from the application at all** -- the
+   increment is computed by Postgres itself, evaluating the `SET` clause
+   against the row's value *at the instant the statement executes*. There
+   is no intervening moment where this module's own Python code could
+   observe a stale value.
+2. **Postgres serializes concurrent UPSERTs targeting the same row** -- a
+   second transaction's `INSERT ... ON CONFLICT` against the same
+   `counter_key` blocks on the first transaction's row lock until it
+   commits or rolls back, then proceeds against the now-updated value.
+   Two concurrent callers can never observe the same "before" value and
+   therefore can never generate the same "next" number. This is the exact
+   same class of guarantee `CouponRepository.increment_current_uses`'s own
+   `UPDATE ... SET current_uses = current_uses + 1` already relies on for
+   this domain's coupon-redemption counter -- the only difference here is
+   the `ON CONFLICT` branch, needed because a brand-new calendar year's
+   counter row does not exist yet the first time it is requested.
+
+`counter_key` includes the calendar year, so each document type's own
+sequence resets to 1 at the start of a new year (a real, common invoicing
+convention); credit notes and debit notes each get their own,
+entirely independent counter key -- never the invoice sequence, never
+each other's.
+
+`test_billing_invoices_tax.py`'s `TestInvoiceNumberGeneratorConcurrency`
+tests this for real: 25 concurrent `generate_invoice_number` calls via
+`asyncio.gather` against a fake repository whose own
+`increment_and_get_next` holds an `asyncio.Lock` across a genuine
+`await asyncio.sleep(0)` yield point (deliberately proving the lock does
+real serialization work, not merely "no `await` happened to occur between
+the read and the write" -- which would trivially pass under Python's
+single-threaded cooperative scheduling even with zero real protection)
+must, and does, produce 25 entirely distinct numbers.
+
+## §38. `compute_renewal_charge_amount` relocated to `validators.py` --
+## composition without an import cycle
+
+The spec requires invoice generation to reuse -- never recompute -- the
+exact real charge amount a subscription renewal would actually bill. That
+computation (`plan.base_price`) was first written inline inside
+`renewal_service.process_renewal`, then briefly factored into a named
+function still living in `renewal_service.py`. That placement caused a
+real import cycle once `service.InvoiceService` needed to call it:
+`renewal_service.py` already imports `service.AuditLogWriter`/
+`LicenseLifecycleProtocol`, so a second, reverse edge (`service.py`
+importing from `renewal_service.py`) would close a genuine cycle.
+
+The fix: `compute_renewal_charge_amount` now lives in `validators.py` --
+a pure, side-effect-free, "depends on nothing else in this domain" module
+by its own established discipline, which neither `service.py` nor
+`renewal_service.py` need to avoid importing from. `renewal_service.py`
+imports it from `.validators` (and re-exports it in its own `__all__` for
+any caller still expecting to find it there); `service.py` imports the
+identical function the same way. `RenewalService.process_renewal`/
+`confirm_renewal_payment_succeeded` and `InvoiceService
+.generate_invoice_for_subscription` therefore all call the exact same
+function -- proven in `TestInvoiceGenerationComposesRenewalAmount` via a
+`unittest.mock.patch` spy on `app.domains.billing.service
+.compute_renewal_charge_amount`, asserting it is actually invoked with the
+real `Plan` row, never independently reimplemented.
+
+## §39. The real CGST/SGST/IGST rule + platform home-jurisdiction config
+
+India's GST law splits a transaction's tax in exactly one of two ways,
+determined by comparing the **seller's** (this platform's own) registered
+jurisdiction against the **buyer's** (the organization's own
+`BillingProfile`) billing jurisdiction:
+
+* **Intra-state** (same state, same country) -- the total rate splits into
+  two *equal* halves: `CGST` (Central GST) + `SGST` (State GST), each
+  exactly `rate_percentage / 2`. `IGST` is zero.
+* **Inter-state** (different state, or a different country entirely -- a
+  different country is always inter-state, checked first) -- the *entire*
+  rate is charged as one `IGST` (Integrated GST) line; `CGST`/`SGST` are
+  both zero.
+
+`validators.compute_tax_breakdown` implements this exactly (see its own
+docstring). The platform's own registered jurisdiction is a plain,
+documented pair of `Settings` fields -- `platform_gst_state` (default
+`"Maharashtra"`) and `platform_gst_country` (default `"IN"`) -- modeled as
+Settings, not a config table, because there is exactly one "home
+jurisdiction" for this platform at any given time (the same "a plain,
+documented Settings field, never a hardcoded magic number" pattern every
+other tunable in `config.py` already follows). `platform_gstin`/
+`platform_legal_business_name` are cosmetic-only fields shown on the
+invoice PDF's seller line; they gate no computation.
+
+Non-GST tax types (`VAT`/`SALES_TAX`) have no CGST/SGST/IGST concept at
+all -- `compute_tax_breakdown` applies a flat, single-amount computation
+for those instead (populates only `tax_amount`). `TaxType.NONE`,
+`tax_exempt=True`, a non-positive `rate_percentage`, or no active
+`TaxRate` configured for the organization's billing country all
+short-circuit to an honest all-zero result -- never a fabricated non-zero
+charge.
+
+## §40. Tax breakdown storage shape: three typed columns, not a separate
+## `InvoiceTaxLine` table
+
+India's GST regime has **exactly** three possible tax-line components for
+any one invoice -- CGST/SGST (intra-state) or IGST (inter-state) -- never
+more, never a variable-length list the way e.g. US sales tax across many
+overlapping local jurisdictions might need. Given that closed, fixed
+shape, `models.Invoice` makes the identical judgment call `PlanFeature`'s
+own docstring already makes for this domain ("three typed columns, not
+one JSONB blob"): `cgst_amount`/`sgst_amount`/`igst_amount` are three
+plain, precisely-typed `Numeric` columns -- directly queryable, summable,
+indexable -- with exactly the legal subset populated per
+`compute_tax_breakdown`'s own rule. A separate `InvoiceTaxLine` table (one
+row per tax component) was a real, legitimate alternative -- rejected
+because it would model a *variable-cardinality* concept for a domain
+where this part only ever produces at most 2 populated components per
+invoice, at a fixed, known set of names; the extra join buys no real
+flexibility this part's own scope needs. `tax_amount` is the universal
+total (`cgst_amount + sgst_amount + igst_amount` for GST; the flat
+computed value for VAT/SALES_TAX) so every caller has one column to read
+regardless of tax regime; `tax_rate_percentage` freezes the total rate
+actually applied (see §41 for why).
+
+## §41. `billing_snapshot`: a frozen copy, not a live reference
+
+`Invoice.billing_snapshot` (JSONB) is a plain-dict copy of the
+organization's `BillingProfile` fields **at the moment the invoice was
+issued** -- never re-read from `BillingProfile` afterward.
+`tax_rate_percentage` is frozen the same way, for the identical reason.
+This is the same "copy, not reference" principle already established
+repeatedly in this codebase: `guest`'s voucher-derived session quotas
+frozen at redemption time, `monitoring.Alert.severity` copied at trigger
+time, `CouponUsage.discount_amount_applied` frozen at redemption time,
+this domain's own `Subscription.billing_cycle` snapshot-copied from `Plan`
+at subscription-creation time. If a customer later updates their billing
+address/GSTIN, every invoice already issued must keep showing the address
+it was legally issued against -- a real, non-negotiable requirement for
+any financial/legal document. `TestBillingSnapshotFrozenAtIssueTime`
+proves this directly: it generates an invoice, mutates the organization's
+`BillingProfile` afterward, and asserts the already-issued invoice's own
+`billing_snapshot` is completely unaffected.
+
+## §42. Payment-webhook-to-invoice composition
+
+The spec asks for a successful payment to trigger invoice generation/
+marking-paid. This part's actual composition, precisely: `webhooks.py`'s
+existing `process_stripe_event`/`process_razorpay_event` handlers gained
+one new, optional keyword parameter, `invoice_service:
+InvoiceServiceProtocol | None = None` (defaulting to `None` -- an
+entirely backward-compatible, additive change; every existing caller/test
+that omits it observes byte-for-byte the same behavior these handlers had
+before Part 4). When a real success is resolved
+(`payment_intent.succeeded`/`payment.captured`) and `invoice_service` is
+supplied (the real, wired case, via `router.py`'s own
+`get_invoice_service` dependency), the handler calls
+`invoice_service.mark_invoice_paid_for_payment(payment)` -- a single,
+narrow, additive `InvoiceService` method that finds the most recently
+issued unpaid (`ISSUED`/`OVERDUE`) invoice for the payment's own
+`subscription_id` and marks it `PAID` via the exact same
+`mark_invoice_paid` transition a manual reconciliation would use. A
+payment with no `subscription_id`, or no matching unpaid invoice, is a
+safe, deliberate no-op (`None` returned) -- a real payment not tied to any
+invoice (e.g. a manual, standalone `POST /payments` charge) is a
+legitimate outcome, never an error. No period-extension/past-due
+bookkeeping, and no new payment-side reimplementation of "what does a
+successful payment mean," is added anywhere -- this is a pure, additive
+composition, mirroring `RenewalService.confirm_renewal_payment_succeeded`'s
+own identical shape from Part 3.
+
+## §43. Invoice PDF: a dedicated `reportlab` renderer, not the generic
+## analytics report renderer
+
+`app.domains.analytics.export.render_report`/`_render_pdf` (BE-012 Part 5)
+already builds real PDFs via `reportlab`'s `platypus` layout engine, and
+was evaluated for direct reuse before writing `invoice_pdf.py`. The
+conclusion: build a **dedicated** invoice PDF renderer using the same
+`reportlab`/`platypus` primitives, not the generic report renderer --
+
+* `export._render_pdf` is intentionally generic/flexible: it walks an
+  arbitrary, variable-shaped `ReportPayload` tree (any number of sections,
+  each with free-form scalar fields and tabular blocks) with no fixed
+  layout contract -- exactly right for a dashboard-style analytics export
+  where the *set of sections itself* varies by report type.
+* An invoice is the opposite: a rigid, legally/commercially defined
+  document with a **fixed** set of required elements in a **fixed** order
+  (seller/buyer header, dated line-item table, a tax breakdown that must
+  show CGST/SGST/IGST as separate, clearly labeled lines -- never a lumped
+  generic "tax" row -- then totals, then a footer). Coercing that fixed
+  shape through `ReportPayload`/`ReportSection`'s generic convention would
+  fight the very rigidity a real invoice needs, and would still require
+  post-processing/relabeling those generic blocks to get GST-compliant
+  labeling anyway -- at which point nothing would actually be saved.
+
+What *is* reused, directly, without modification: the same installed
+`reportlab` package (no new dependency), the same `platypus` primitives
+(`SimpleDocTemplate`/`Paragraph`/`Table`/`TableStyle`/`Spacer`), the same
+`A4`/`cm` page-geometry constants, and the same `getSampleStyleSheet()`
+base styles `export.py` already uses. `invoice_pdf.render_invoice_pdf`
+is verified for real in `test_billing_invoices_tax.py`'s
+`TestInvoicePdfGeneration` -- the `%PDF` magic header, the `%%EOF`
+trailer, a real non-trivial byte length, and (best-effort) that CGST/SGST
+text actually appears in the rendered stream -- the identical rigor
+BE-012 Part 5's own PDF export tests already establish.
+
+## §44. RBAC permission-key reuse (Part 4)
+
+No new `PermissionModule` for tax rates or the billing profile --
+`/billing/tax-rates` and `/billing/profile` reuse `billing.*` exactly like
+Plans/Coupons/Payments before them: tax rates are a platform-wide pricing/
+tax catalog concern, so writes are pinned to `scope=ScopeType.GLOBAL`
+(mirrors Plans/Coupons); the billing profile is a real, tenant-owned
+resource, so ordinary inferred scope applies (mirrors Payments/
+PaymentMethods), with `billing.update` for the upsert and `billing.read`
+for both `GET /billing/profile/me` and `GET /billing/profile/{organization_id}`.
+`/invoices` reuses `PermissionModule.INVOICES` -- seeded since BE-004 with
+exactly the seven actions this part needs (`create`/`read`/`update`/
+`delete`/`export`/`approve`/`manage`): `invoices.read` for every read
+(including the PDF download, which is fundamentally an export of an
+already-generated invoice, mapped onto the seeded `invoices.export`
+action precisely); `invoices.manage` for every consequential financial
+write (void, credit note, debit note) -- the same "reuse the closest
+seeded action for a consequential write" precedent Payments' own refund/
+retry already established via `billing.manage`. None of the mutating
+`/invoices` endpoints enforce tenant-organization matching against the
+caller's own scope context (mirrors `POST /payments/{id}/refund`/
+`retry`'s identical "an admin action operating directly on the entity by
+id" precedent) -- only the read-side `GET /invoices`/`GET /invoices/{id}`
+enforce real tenant isolation, via `RequireOrganization` + the service
+layer's own `organization_id` filter (`TestTenantIsolation`).
+
+## §45. Invoice overdue sweep: real, working, but not yet Beat-registered
+
+`OVERDUE` is a real, first-class `InvoiceStatus` member, and
+`InvoiceService.mark_overdue_invoices` (backing the Celery task
+`tasks.run_invoice_overdue_sweep`) is a real, fully working, independently
+callable implementation -- every `ISSUED` invoice whose `due_date` has
+passed transitions to `OVERDUE`, with real per-invoice failure isolation
+mirroring `RenewalService.process_due_renewals`'s identical resilience
+pattern. What this part deliberately does **not** do is register that
+task in `app.core.celery_app`'s `beat_schedule` -- doing so requires
+editing `app/core/celery_app.py`, a file outside this Part's own
+directory-rule boundary (only `app/domains/billing/`, `app/core/config.py`,
+`alembic/versions/`, `tests/unit/`, `docs/billing/`, and a few other
+explicitly-named files are in scope). This mirrors Part 1's own explicit
+"`expire_license` is fully built, tested, and ready for a future part's
+Beat schedule to call" deferral -- the real, working code exists and is
+tested; only the one-line Beat registration (an addition to
+`beat_schedule`, at `Settings.invoice_overdue_sweep_interval_seconds`) is
+left to that dedicated, narrow follow-up edit.
+
+## §46. Invoice status transition graph + credit/debit note modeling
+
+`constants.InvoiceStatus`'s full lifecycle -- `DRAFT` (created but never
+sent; reachable via a future manual-invoice flow, not yet built) ->
+`ISSUED` (this part's own `generate_invoice_for_subscription` issues
+directly, skipping `DRAFT` -- it is the real trigger tied to an actual
+renewal/charge event) -> `PAID` (terminal from this service's own
+perspective -- correcting a paid invoice is done via a `CreditDebitNote`,
+never a direct status change) or `OVERDUE` (reversible back to `PAID`) ->
+`VOID` (an already-sent invoice formally voided; terminal) or, for a
+never-sent `DRAFT`, `CANCELLED` (terminal). `void_invoice` picks the
+correct terminal state automatically based on the invoice's current
+status (`DRAFT` -> `CANCELLED`; `ISSUED`/`OVERDUE` -> `VOID`) and rejects
+voiding an already-`PAID` invoice outright (a real accounting distinction
+-- once money has changed hands, the correction path is a credit note,
+never a silent void).
+
+`CreditDebitNote` is one table with a `note_type` discriminator
+(`constants.NoteType.CREDIT`/`DEBIT`), not two near-duplicate tables --
+every other column (`invoice_id`/`amount`/`reason`/`issued_at`/
+`note_number`) is identical between a credit note and a debit note; they
+differ only in commercial direction (reduces vs. increases what the
+customer owes) and in which independent number sequence generates their
+own `note_number` (see §37). A credit note's `amount` is additionally
+validated against the invoice's own `total_amount` (a credit note can
+never credit more than was ever charged) -- a debit note has no such
+ceiling (it represents a genuine additional charge). Both are legal only
+against an invoice that was actually sent (`ISSUED`/`OVERDUE`/`PAID`) --
+never against a `DRAFT`/`CANCELLED`/`VOID` invoice.

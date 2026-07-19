@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import calendar
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -21,6 +22,7 @@ from .constants import (
     PlanFeatureKey,
     PlanFeatureType,
     SupportTier,
+    TaxType,
 )
 from .exceptions import InvalidDiscountValueError, InvalidPlanFeatureValueError
 
@@ -195,6 +197,34 @@ def to_minor_units(amount: Decimal, currency: str) -> int:
     return int((amount * 100).to_integral_value(rounding=ROUND_HALF_UP))
 
 
+def compute_renewal_charge_amount(plan: object) -> Decimal:
+    """The one, real computation of what a subscription renewal actually
+    charges -- the plan's own ``base_price`` (see ``service.CouponService``'s
+    own "coupon applies once, at signup" docstring for why no per-renewal
+    discount recomputation happens here).
+
+    Deliberately factored out into its own tiny, named, pure function --
+    living here in ``validators.py`` (not ``renewal_service.py``, where it
+    was first written) specifically so both
+    ``renewal_service.RenewalService.process_renewal``/
+    ``confirm_renewal_payment_succeeded`` **and** BE-013 Part 4's
+    ``service.InvoiceService.generate_invoice_for_subscription`` can import
+    this exact same function with no import cycle: ``renewal_service.py``
+    already imports ``service.AuditLogWriter``/``LicenseLifecycleProtocol``,
+    so a second, reverse edge (``service.py`` importing *from*
+    ``renewal_service.py``) would close a real cycle. This module
+    (``validators.py``) imports from neither, exactly the same "pure,
+    side-effect-free, no I/O, depends on nothing else in this domain"
+    posture its own module docstring already establishes -- the correct
+    home for a function every other layer needs to share, never
+    duplicate. ``plan`` is typed loosely (``object``, not ``models.Plan``)
+    to avoid this module taking on a model-layer import purely for a type
+    annotation, mirroring ``renewal_service._mark_renewed``'s own identical
+    ``plan: object`` parameter.
+    """
+    return plan.base_price
+
+
 def derive_retry_idempotency_key(original_idempotency_key: str) -> str:
     """The wire-level idempotency key a gateway passes to Stripe on
     ``retry_failed_payment`` -- **deliberately a fresh, derived value, never
@@ -209,6 +239,137 @@ def derive_retry_idempotency_key(original_idempotency_key: str) -> str:
     return f"{original_idempotency_key}:retry:{uuid.uuid4().hex[:12]}"
 
 
+# ============================================================================
+# BE-013 Part 4: Invoice Engine + Tax/GST
+# ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class GstBreakdown:
+    """The real, computed result of :func:`compute_tax_breakdown` -- exactly
+    the shape ``models.Invoice``'s own typed ``cgst_amount``/
+    ``sgst_amount``/``igst_amount``/``tax_amount`` columns store."""
+
+    cgst_amount: Decimal
+    sgst_amount: Decimal
+    igst_amount: Decimal
+    tax_amount: Decimal
+    is_intra_state: bool
+
+
+_ZERO_BREAKDOWN = GstBreakdown(
+    cgst_amount=Decimal("0.00"),
+    sgst_amount=Decimal("0.00"),
+    igst_amount=Decimal("0.00"),
+    tax_amount=Decimal("0.00"),
+    is_intra_state=False,
+)
+
+
+def normalize_region(value: str) -> str:
+    """Case/whitespace-insensitive comparison key for a state/country name
+    or code -- ``"Maharashtra"``/``"maharashtra "``/``" MAHARASHTRA"`` must
+    all compare equal for the intra-vs-inter-state decision below."""
+    return value.strip().casefold()
+
+
+def compute_tax_breakdown(
+    *,
+    subtotal: Decimal,
+    tax_type: TaxType | None,
+    rate_percentage: Decimal,
+    tax_exempt: bool,
+    platform_state: str,
+    platform_country: str,
+    billing_state: str,
+    billing_country: str,
+) -> GstBreakdown:
+    """The real tax computation ``service.InvoiceService`` applies to every
+    generated invoice's ``subtotal``.
+
+    ## The real GST rule -- CGST+SGST (intra-state) vs. IGST (inter-state)
+
+    India's GST law splits a transaction's tax in exactly one of two ways,
+    determined by comparing the **seller's** (this platform's own,
+    ``Settings.platform_gst_state``/``platform_gst_country``) registered
+    jurisdiction against the **buyer's** (the organization's own
+    ``BillingProfile.billing_state``/``billing_country``) billing
+    jurisdiction:
+
+    * **Intra-state** (same state, same country) -- the total rate is
+      split into two *equal* halves: ``CGST`` (Central GST) + ``SGST``
+      (State GST), each exactly ``rate_percentage / 2``. ``IGST`` is zero.
+    * **Inter-state** (different state, or a different country entirely --
+      a different country is always inter-state by definition, checked
+      first) -- the *entire* rate is charged as a single ``IGST``
+      (Integrated GST) line. ``CGST``/``SGST`` are both zero.
+
+    This is a real, legally-defined rule -- not a fake flat "tax = rate%"
+    that ignores the split; see ``models.Invoice``'s own docstring for why
+    this module stores the result as three typed columns rather than a
+    generic percentage-only field.
+
+    ## Non-GST tax types
+
+    ``VAT``/``SALES_TAX`` have no CGST/SGST/IGST concept at all (that split
+    is specific to India's GST regime) -- this function applies a flat,
+    single-amount computation for those (`tax_amount` populated,
+    ``cgst_amount``/``sgst_amount``/``igst_amount`` all zero). ``NONE``
+    (or ``tax_exempt=True``, or a non-positive ``rate_percentage``, or no
+    ``tax_type`` at all -- e.g. no active ``TaxRate`` was found for the
+    organization's billing country) short-circuits to an all-zero result --
+    an honest "no tax applies here" outcome, not a fabricated non-zero
+    charge.
+
+    All amounts are rounded to 2 decimal places (currency precision),
+    matching ``compute_discount_amount``'s identical rounding convention.
+    """
+    if (
+        tax_exempt
+        or tax_type is None
+        or tax_type == TaxType.NONE
+        or rate_percentage <= 0
+    ):
+        return _ZERO_BREAKDOWN
+
+    if tax_type == TaxType.GST:
+        is_intra_state = normalize_region(platform_country) == normalize_region(
+            billing_country
+        ) and normalize_region(platform_state) == normalize_region(billing_state)
+        if is_intra_state:
+            half = (subtotal * rate_percentage / Decimal(2) / Decimal(100)).quantize(
+                Decimal("0.01")
+            )
+            cgst_amount, sgst_amount, igst_amount = half, half, Decimal("0.00")
+        else:
+            cgst_amount, sgst_amount = Decimal("0.00"), Decimal("0.00")
+            igst_amount = (subtotal * rate_percentage / Decimal(100)).quantize(
+                Decimal("0.01")
+            )
+        tax_amount = (cgst_amount + sgst_amount + igst_amount).quantize(Decimal("0.01"))
+        return GstBreakdown(
+            cgst_amount=cgst_amount,
+            sgst_amount=sgst_amount,
+            igst_amount=igst_amount,
+            tax_amount=tax_amount,
+            is_intra_state=is_intra_state,
+        )
+
+    # VAT / SALES_TAX -- a flat, single-line tax; no CGST/SGST/IGST split
+    # applies outside India's GST regime (see this function's own
+    # docstring).
+    flat_tax_amount = (subtotal * rate_percentage / Decimal(100)).quantize(
+        Decimal("0.01")
+    )
+    return GstBreakdown(
+        cgst_amount=Decimal("0.00"),
+        sgst_amount=Decimal("0.00"),
+        igst_amount=Decimal("0.00"),
+        tax_amount=flat_tax_amount,
+        is_intra_state=False,
+    )
+
+
 __all__ = [
     "normalize_slug",
     "expected_feature_type",
@@ -219,4 +380,8 @@ __all__ = [
     "add_billing_cycle",
     "to_minor_units",
     "derive_retry_idempotency_key",
+    "compute_renewal_charge_amount",
+    "GstBreakdown",
+    "normalize_region",
+    "compute_tax_breakdown",
 ]

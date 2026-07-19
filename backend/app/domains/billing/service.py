@@ -61,17 +61,27 @@ from .constants import (
     BYTES_PER_MB,
     USAGE_METRIC_TO_LIMIT_FEATURE,
     DiscountType,
+    InvoiceStatus,
     LicenseChangeType,
     LicenseStatus,
+    NoteType,
     PaymentStatus,
     PlanFeatureType,
     PlanType,
     SubscriptionStatus,
+    TaxType,
     UsageMetricKey,
 )
 from .events import (
+    BillingProfileUpdated,
     CouponApplied,
     CouponValidationFailed,
+    CreditNoteIssued,
+    DebitNoteIssued,
+    InvoiceGenerated,
+    InvoiceMarkedOverdue,
+    InvoiceMarkedPaid,
+    InvoiceVoided,
     LicenseActivated,
     LicenseAssigned,
     LicenseCancelled,
@@ -90,8 +100,11 @@ from .events import (
     SubscriptionPaused,
     SubscriptionReactivated,
     SubscriptionResumed,
+    TaxRateCreated,
+    TaxRateUpdated,
 )
 from .exceptions import (
+    BillingProfileNotFoundError,
     CouponExhaustedError,
     CouponExpiredError,
     CouponInactiveError,
@@ -105,8 +118,12 @@ from .exceptions import (
     DuplicatePlanFeatureError,
     DuplicatePlanSlugError,
     DuplicateSubscriptionError,
+    InvalidInvoiceStatusTransitionError,
     InvalidLicenseStatusTransitionError,
+    InvalidNoteAmountError,
     InvalidSubscriptionStatusTransitionError,
+    InvalidTaxRateError,
+    InvoiceNotFoundError,
     LicenseNotActiveError,
     LicenseNotFoundError,
     PaymentMethodNotFoundError,
@@ -119,10 +136,15 @@ from .exceptions import (
     SamePlanError,
     SubscriptionNotFoundError,
     SubscriptionReactivationNotAllowedError,
+    TaxRateNotFoundError,
     UnsupportedPaymentProviderError,
 )
 from .models import (
+    BillingProfile,
     Coupon,
+    CreditDebitNote,
+    Invoice,
+    InvoiceItem,
     License,
     LicenseChangeLog,
     Payment,
@@ -130,20 +152,33 @@ from .models import (
     Plan,
     PlanFeature,
     Subscription,
+    TaxRate,
     UsageMetric,
 )
+from .number_generator import (
+    NumberCounterRepositoryProtocol,
+    generate_credit_note_number,
+    generate_debit_note_number,
+    generate_invoice_number,
+)
 from .repository import (
+    BillingProfileRepositoryProtocol,
     CouponRepositoryProtocol,
+    CreditDebitNoteRepositoryProtocol,
+    InvoiceRepositoryProtocol,
     LicenseRepositoryProtocol,
     PaymentMethodRepositoryProtocol,
     PaymentRepositoryProtocol,
     PlanRepositoryProtocol,
     SubscriptionRepositoryProtocol,
+    TaxRateRepositoryProtocol,
     UsageRepositoryProtocol,
 )
 from .validators import (
     add_billing_cycle,
     compute_discount_amount,
+    compute_renewal_charge_amount,
+    compute_tax_breakdown,
     normalize_coupon_code,
     normalize_slug,
     validate_discount_value,
@@ -2139,6 +2174,698 @@ class PaymentMethodService:
         )
 
 
+# ============================================================================
+# BE-013 Part 4: Invoice Engine + Tax/GST
+# ============================================================================
+
+# The full, explicit Invoice.status transition graph -- see
+# constants.InvoiceStatus's own docstring for what each state means. Every
+# method below that changes ``status`` is checked against this graph first
+# (directly, or via ``_assert_invoice_transition``); there is no implicit/
+# derived transition anywhere in this service.
+_INVOICE_TRANSITIONS: dict[InvoiceStatus, frozenset[InvoiceStatus]] = {
+    InvoiceStatus.DRAFT: frozenset({InvoiceStatus.ISSUED, InvoiceStatus.CANCELLED}),
+    InvoiceStatus.ISSUED: frozenset(
+        {InvoiceStatus.PAID, InvoiceStatus.OVERDUE, InvoiceStatus.VOID}
+    ),
+    InvoiceStatus.OVERDUE: frozenset({InvoiceStatus.PAID, InvoiceStatus.VOID}),
+    InvoiceStatus.PAID: frozenset(),
+    InvoiceStatus.CANCELLED: frozenset(),
+    InvoiceStatus.VOID: frozenset(),
+}
+
+
+def _assert_invoice_transition(current: str, target: InvoiceStatus) -> None:
+    current_status = InvoiceStatus(current)
+    if target not in _INVOICE_TRANSITIONS[current_status]:
+        raise InvalidInvoiceStatusTransitionError(current_status.value, target.value)
+
+
+class TaxRateService:
+    """Super-Admin "Manage Taxes" CRUD -- composable per-organization
+    based on billing jurisdiction (``InvoiceService.generate_invoice_for_
+    subscription`` looks up the active rate for an organization's own
+    ``BillingProfile.billing_country`` -- see that method's own
+    docstring)."""
+
+    def __init__(
+        self,
+        repository: TaxRateRepositoryProtocol,
+        *,
+        audit_writer: AuditLogWriter | None = None,
+    ) -> None:
+        self.repository = repository
+        self.audit_writer = audit_writer
+
+    async def get_tax_rate(self, tax_rate_id: uuid.UUID) -> TaxRate:
+        tax_rate = await self.repository.get_by_id(tax_rate_id)
+        if tax_rate is None:
+            raise TaxRateNotFoundError(tax_rate_id)
+        return tax_rate
+
+    async def list_tax_rates(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 25,
+        country_code: str | None = None,
+        is_active: bool | None = None,
+    ):
+        return await self.repository.list_tax_rates(
+            page=page,
+            page_size=page_size,
+            country_code=country_code.upper() if country_code else None,
+            is_active=is_active,
+        )
+
+    async def create_tax_rate(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        name: str,
+        tax_type: str,
+        rate_percentage: Decimal,
+        country_code: str,
+        is_active: bool,
+    ) -> TaxRate:
+        if rate_percentage < 0 or rate_percentage > 100:
+            raise InvalidTaxRateError("rate_percentage must be between 0 and 100")
+        tax_rate = await self.repository.create_tax_rate(
+            name=name,
+            tax_type=tax_type,
+            rate_percentage=rate_percentage,
+            country_code=country_code.upper(),
+            is_active=is_active,
+            created_by=actor_user_id,
+        )
+        event = TaxRateCreated(
+            tax_rate_id=tax_rate.id,
+            country_code=tax_rate.country_code,
+            rate_percentage=str(tax_rate.rate_percentage),
+        )
+        logger.info("billing_tax_rate_created", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.TAX_RATE_CREATED,
+            tax_rate.id,
+            description=f"Tax rate '{tax_rate.name}' created for "
+            f"{tax_rate.country_code}",
+        )
+        return tax_rate
+
+    async def update_tax_rate(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        tax_rate_id: uuid.UUID,
+        data: dict[str, object],
+    ) -> TaxRate:
+        tax_rate = await self.get_tax_rate(tax_rate_id)
+        rate_percentage = data.get("rate_percentage")
+        rate_out_of_range = rate_percentage is not None and (
+            rate_percentage < 0 or rate_percentage > 100
+        )
+        if rate_out_of_range:
+            raise InvalidTaxRateError("rate_percentage must be between 0 and 100")
+        if "country_code" in data and data["country_code"]:
+            data = {**data, "country_code": str(data["country_code"]).upper()}
+        updated = await self.repository.update_tax_rate(
+            tax_rate, {**data, "updated_by": actor_user_id}
+        )
+        event = TaxRateUpdated(tax_rate_id=updated.id)
+        logger.info("billing_tax_rate_updated", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.TAX_RATE_UPDATED,
+            updated.id,
+            description=f"Tax rate {updated.id} updated",
+        )
+        return updated
+
+    async def _audit(
+        self,
+        actor_user_id: uuid.UUID | None,
+        action: AuditAction,
+        entity_id: uuid.UUID,
+        *,
+        description: str,
+    ) -> None:
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=actor_user_id,
+                action=action.value,
+                entity_type="tax_rate",
+                entity_id=entity_id,
+                description=description,
+                event_metadata={},
+                organization_id=None,
+                location_id=None,
+            )
+        logger.info("billing_tax_rate_audit_event", extra={"action": action.value})
+
+
+class BillingProfileService:
+    """An organization's own billing address/GSTIN -- one profile per
+    organization, ever (upserted in place); see ``models.BillingProfile``'s
+    own docstring for the full "why a billing-owned table, not an
+    ``Organization`` column extension" write-up."""
+
+    def __init__(
+        self,
+        repository: BillingProfileRepositoryProtocol,
+        *,
+        audit_writer: AuditLogWriter | None = None,
+    ) -> None:
+        self.repository = repository
+        self.audit_writer = audit_writer
+
+    async def get_billing_profile(self, organization_id: uuid.UUID) -> BillingProfile:
+        profile = await self.repository.get_by_organization_id(organization_id)
+        if profile is None:
+            raise BillingProfileNotFoundError(organization_id)
+        return profile
+
+    async def upsert_billing_profile(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        organization_id: uuid.UUID,
+        billing_name: str,
+        billing_address_line1: str,
+        billing_address_line2: str | None,
+        billing_city: str,
+        billing_state: str,
+        billing_country: str,
+        billing_postal_code: str,
+        gst_identifier: str | None,
+        tax_exempt: bool,
+    ) -> BillingProfile:
+        """Creates the organization's one ``BillingProfile`` row the first
+        time this is called, mutates it in place on every subsequent call --
+        the identical one-row-per-organization cardinality
+        ``License``/``Subscription`` already establish for this domain.
+        Never retroactively changes any already-issued ``Invoice``'s own
+        ``billing_snapshot`` -- see that column's own "copy, not reference"
+        docstring."""
+        existing = await self.repository.get_by_organization_id(organization_id)
+        fields: dict[str, object] = {
+            "billing_name": billing_name,
+            "billing_address_line1": billing_address_line1,
+            "billing_address_line2": billing_address_line2,
+            "billing_city": billing_city,
+            "billing_state": billing_state,
+            "billing_country": billing_country.upper(),
+            "billing_postal_code": billing_postal_code,
+            "gst_identifier": gst_identifier,
+            "tax_exempt": tax_exempt,
+        }
+        if existing is None:
+            profile = await self.repository.create_billing_profile(
+                organization_id=organization_id, created_by=actor_user_id, **fields
+            )
+        else:
+            profile = await self.repository.update_billing_profile(
+                existing, {**fields, "updated_by": actor_user_id}
+            )
+        event = BillingProfileUpdated(
+            billing_profile_id=profile.id, organization_id=organization_id
+        )
+        logger.info("billing_profile_updated", extra=_event_extra(event))
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=actor_user_id,
+                action=AuditAction.BILLING_PROFILE_UPDATED.value,
+                entity_type="billing_profile",
+                entity_id=profile.id,
+                description=f"Billing profile updated for organization "
+                f"{organization_id}",
+                event_metadata={},
+                organization_id=organization_id,
+                location_id=None,
+            )
+        logger.info(
+            "billing_profile_audit_event",
+            extra={"action": AuditAction.BILLING_PROFILE_UPDATED.value},
+        )
+        return profile
+
+
+class InvoiceService:
+    """Invoice generation (composing -- never recomputing --
+    ``renewal_service.compute_renewal_charge_amount`` and
+    ``validators.compute_tax_breakdown``), payment-webhook-triggered
+    mark-paid, void, overdue detection, and credit/debit note issuance.
+    """
+
+    def __init__(
+        self,
+        repository: InvoiceRepositoryProtocol,
+        *,
+        subscription_repository: SubscriptionRepositoryProtocol,
+        plan_repository: PlanRepositoryProtocol,
+        billing_profile_repository: BillingProfileRepositoryProtocol,
+        tax_rate_repository: TaxRateRepositoryProtocol,
+        number_counter_repository: NumberCounterRepositoryProtocol,
+        note_repository: CreditDebitNoteRepositoryProtocol,
+        platform_gst_state: str,
+        platform_gst_country: str,
+        invoice_due_days: int = 15,
+        audit_writer: AuditLogWriter | None = None,
+    ) -> None:
+        self.repository = repository
+        self.subscription_repository = subscription_repository
+        self.plan_repository = plan_repository
+        self.billing_profile_repository = billing_profile_repository
+        self.tax_rate_repository = tax_rate_repository
+        self.number_counter_repository = number_counter_repository
+        self.note_repository = note_repository
+        self.platform_gst_state = platform_gst_state
+        self.platform_gst_country = platform_gst_country
+        self.invoice_due_days = invoice_due_days
+        self.audit_writer = audit_writer
+
+    async def get_invoice(
+        self, invoice_id: uuid.UUID, *, organization_id: uuid.UUID | None = None
+    ) -> Invoice:
+        """``organization_id``, when supplied, enforces tenant isolation --
+        mirrors ``PaymentService.get_payment``'s identical "not-found, never
+        a leak" convention."""
+        invoice = await self.repository.get_by_id(invoice_id)
+        if invoice is None or (
+            organization_id is not None and invoice.organization_id != organization_id
+        ):
+            raise InvoiceNotFoundError(invoice_id)
+        return invoice
+
+    async def list_invoices(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 25,
+        organization_id: uuid.UUID | None = None,
+        status: str | None = None,
+    ):
+        return await self.repository.list_invoices(
+            page=page,
+            page_size=page_size,
+            organization_id=organization_id,
+            status=status,
+        )
+
+    async def list_items(self, invoice_id: uuid.UUID) -> list[InvoiceItem]:
+        return await self.repository.list_items(invoice_id)
+
+    async def list_notes(self, invoice_id: uuid.UUID) -> list[CreditDebitNote]:
+        return await self.note_repository.list_for_invoice(invoice_id)
+
+    async def generate_invoice_for_subscription(
+        self, subscription_id: uuid.UUID
+    ) -> Invoice:
+        """Generates one real, issued ``Invoice`` (+ its one ``InvoiceItem``
+        line) for a subscription's current plan.
+
+        ## Reuses, never recomputes, the renewal engine's own charge amount
+
+        ``subtotal`` is exactly ``renewal_service
+        .compute_renewal_charge_amount(plan)`` -- the identical, single real
+        computation ``RenewalService.process_renewal``/
+        ``confirm_renewal_payment_succeeded`` themselves call. This
+        function never independently derives "how much does this
+        subscription cost" a second way.
+
+        ## Real GST/tax computation, applied via the organization's own
+        ## ``BillingProfile``
+
+        The organization must have a ``BillingProfile`` on file (billing
+        address is a real, required prerequisite for issuing a legal
+        invoice -- ``BillingProfileNotFoundError`` if not, never a silently
+        blank/fabricated address). Unless ``tax_exempt``, the active
+        ``TaxRate`` for the profile's own ``billing_country`` is looked up
+        and applied via ``validators.compute_tax_breakdown`` -- the real
+        CGST/SGST/IGST split for GST, comparing this platform's own
+        registered jurisdiction (``Settings.platform_gst_state``/
+        ``platform_gst_country``) against the organization's billing
+        jurisdiction. No active rate for the country is an honest "no tax
+        configured" outcome (zero tax), never a fabricated charge.
+
+        ## Frozen ``billing_snapshot``
+
+        A plain-dict copy of the ``BillingProfile``'s own fields *at this
+        exact moment* is stored on the created ``Invoice`` -- see that
+        column's own "copy, not reference" docstring for why a later
+        billing-address edit must never retroactively alter this invoice.
+
+        The created invoice is issued directly (``InvoiceStatus.ISSUED``,
+        never ``DRAFT``) -- this method is the real trigger tied to an
+        actual renewal/charge event, not a preparatory draft a human still
+        needs to review before sending.
+        """
+        subscription = await self.subscription_repository.get_by_id(subscription_id)
+        if subscription is None:
+            raise SubscriptionNotFoundError(subscription_id)
+        plan = await self.plan_repository.get_by_id(subscription.plan_id)
+        if plan is None:
+            raise PlanNotFoundError(subscription.plan_id)
+        billing_profile = await self.billing_profile_repository.get_by_organization_id(
+            subscription.organization_id
+        )
+        if billing_profile is None:
+            raise BillingProfileNotFoundError(subscription.organization_id)
+
+        subtotal = compute_renewal_charge_amount(plan)
+
+        tax_rate: TaxRate | None = None
+        if not billing_profile.tax_exempt:
+            tax_rate = await self.tax_rate_repository.get_active_for_country(
+                billing_profile.billing_country
+            )
+
+        breakdown = compute_tax_breakdown(
+            subtotal=subtotal,
+            tax_type=TaxType(tax_rate.tax_type) if tax_rate is not None else None,
+            rate_percentage=(
+                tax_rate.rate_percentage if tax_rate is not None else Decimal("0")
+            ),
+            tax_exempt=billing_profile.tax_exempt,
+            platform_state=self.platform_gst_state,
+            platform_country=self.platform_gst_country,
+            billing_state=billing_profile.billing_state,
+            billing_country=billing_profile.billing_country,
+        )
+        total_amount = (subtotal + breakdown.tax_amount).quantize(Decimal("0.01"))
+
+        now = datetime.now(UTC)
+        invoice_number = await generate_invoice_number(
+            self.number_counter_repository, at=now
+        )
+        snapshot: dict[str, object] = {
+            "billing_name": billing_profile.billing_name,
+            "billing_address_line1": billing_profile.billing_address_line1,
+            "billing_address_line2": billing_profile.billing_address_line2,
+            "billing_city": billing_profile.billing_city,
+            "billing_state": billing_profile.billing_state,
+            "billing_country": billing_profile.billing_country,
+            "billing_postal_code": billing_profile.billing_postal_code,
+            "gst_identifier": billing_profile.gst_identifier,
+            "tax_exempt": billing_profile.tax_exempt,
+        }
+
+        invoice = await self.repository.create_invoice(
+            organization_id=subscription.organization_id,
+            subscription_id=subscription.id,
+            payment_id=None,
+            invoice_number=invoice_number,
+            status=InvoiceStatus.ISSUED.value,
+            issue_date=now,
+            due_date=now + timedelta(days=self.invoice_due_days),
+            subtotal=subtotal,
+            cgst_amount=breakdown.cgst_amount,
+            sgst_amount=breakdown.sgst_amount,
+            igst_amount=breakdown.igst_amount,
+            tax_amount=breakdown.tax_amount,
+            tax_rate_percentage=(
+                tax_rate.rate_percentage if tax_rate is not None else Decimal("0")
+            ),
+            total_amount=total_amount,
+            currency=plan.currency,
+            billing_snapshot=snapshot,
+        )
+        await self.repository.create_invoice_item(
+            invoice_id=invoice.id,
+            description=f"{plan.name} subscription ({plan.billing_cycle})",
+            quantity=Decimal("1"),
+            unit_price=subtotal,
+            amount=subtotal,
+        )
+
+        event = InvoiceGenerated(
+            invoice_id=invoice.id,
+            organization_id=invoice.organization_id,
+            invoice_number=invoice.invoice_number,
+            total_amount=str(invoice.total_amount),
+        )
+        logger.info("billing_invoice_generated", extra=_event_extra(event))
+        await self._audit(
+            None,
+            AuditAction.INVOICE_GENERATED,
+            invoice,
+            description=f"Invoice {invoice.invoice_number} generated for "
+            f"subscription {subscription.id}",
+        )
+        return invoice
+
+    async def mark_invoice_paid(
+        self, *, invoice_id: uuid.UUID, payment_id: uuid.UUID
+    ) -> Invoice:
+        """Marks a real, previously-``ISSUED``/``OVERDUE`` invoice ``PAID``
+        against ``payment_id`` -- called directly (a manual reconciliation)
+        or via ``mark_invoice_paid_for_payment`` (the real webhook-driven
+        composition path -- see that method's own docstring)."""
+        invoice = await self.get_invoice(invoice_id)
+        _assert_invoice_transition(invoice.status, InvoiceStatus.PAID)
+        updated = await self.repository.update_invoice(
+            invoice, {"status": InvoiceStatus.PAID.value, "payment_id": payment_id}
+        )
+        event = InvoiceMarkedPaid(
+            invoice_id=updated.id,
+            organization_id=updated.organization_id,
+            payment_id=payment_id,
+        )
+        logger.info("billing_invoice_marked_paid", extra=_event_extra(event))
+        await self._audit(
+            None,
+            AuditAction.INVOICE_MARKED_PAID,
+            updated,
+            description=f"Invoice {updated.invoice_number} marked paid via "
+            f"payment {payment_id}",
+        )
+        return updated
+
+    async def mark_invoice_paid_for_payment(self, payment: Payment) -> Invoice | None:
+        """The natural continuation of a successful payment webhook --
+        composed from ``webhooks.py``'s existing success-handling code (an
+        additive call into this method, never a new payment-side
+        reimplementation of "what does a successful payment mean for
+        billing"). Finds the most recently issued unpaid (``ISSUED``/
+        ``OVERDUE``) invoice for the payment's own ``subscription_id`` and
+        marks it paid via ``mark_invoice_paid``. Returns ``None`` -- a safe,
+        deliberate no-op -- when the payment carries no ``subscription_id``
+        at all, or no matching unpaid invoice is found: a real payment not
+        tied to any invoice is a legitimate outcome (e.g. a manual, one-off
+        ``POST /payments`` charge with no invoice ever generated for it),
+        never an error."""
+        if payment.subscription_id is None:
+            return None
+        candidates = await self.repository.list_unpaid_for_subscription(
+            payment.subscription_id
+        )
+        if not candidates:
+            return None
+        return await self.mark_invoice_paid(
+            invoice_id=candidates[0].id, payment_id=payment.id
+        )
+
+    async def void_invoice(
+        self, *, actor_user_id: uuid.UUID | None, invoice_id: uuid.UUID
+    ) -> Invoice:
+        """Voids an invoice -- a ``DRAFT`` (never sent) becomes
+        ``CANCELLED``; an ``ISSUED``/``OVERDUE`` (already sent) becomes
+        ``VOID`` -- see ``constants.InvoiceStatus``'s own docstring for the
+        real accounting distinction between the two terminal outcomes. A
+        ``PAID`` invoice cannot be voided through this method -- correct it
+        via ``issue_credit_note`` instead (voiding a paid invoice directly
+        would silently discard the fact that real money changed hands)."""
+        invoice = await self.get_invoice(invoice_id)
+        current_status = InvoiceStatus(invoice.status)
+        if current_status == InvoiceStatus.DRAFT:
+            target = InvoiceStatus.CANCELLED
+        elif current_status in (InvoiceStatus.ISSUED, InvoiceStatus.OVERDUE):
+            target = InvoiceStatus.VOID
+        else:
+            raise InvalidInvoiceStatusTransitionError(invoice.status, "void")
+        _assert_invoice_transition(invoice.status, target)
+        updated = await self.repository.update_invoice(
+            invoice, {"status": target.value, "updated_by": actor_user_id}
+        )
+        event = InvoiceVoided(
+            invoice_id=updated.id,
+            organization_id=updated.organization_id,
+            previous_status=current_status.value,
+        )
+        logger.info("billing_invoice_voided", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.INVOICE_VOIDED,
+            updated,
+            description=f"Invoice {updated.invoice_number} {target.value} "
+            f"(was {current_status.value})",
+        )
+        return updated
+
+    async def mark_overdue_invoices(self) -> list[uuid.UUID]:
+        """The real, Beat-scheduled sweep (``tasks.run_invoice_overdue_
+        sweep``) that keeps ``OVERDUE`` a real, reachable, automatically-
+        detected state rather than dead enum member -- every ``ISSUED``
+        invoice whose ``due_date`` has passed transitions to ``OVERDUE``,
+        with real per-invoice failure isolation (mirrors
+        ``RenewalService.process_due_renewals``'s identical resilience
+        pattern)."""
+        now = datetime.now(UTC)
+        due = await self.repository.list_issued_past_due(now=now)
+        overdue_ids: list[uuid.UUID] = []
+        for invoice in due:
+            try:
+                updated = await self.repository.update_invoice(
+                    invoice, {"status": InvoiceStatus.OVERDUE.value}
+                )
+            except Exception:  # noqa: BLE001 -- per-invoice isolation
+                logger.exception(
+                    "billing_invoice_overdue_sweep_item_failed",
+                    extra={"invoice_id": str(invoice.id)},
+                )
+                continue
+            overdue_ids.append(updated.id)
+            event = InvoiceMarkedOverdue(
+                invoice_id=updated.id, organization_id=updated.organization_id
+            )
+            logger.info("billing_invoice_marked_overdue", extra=_event_extra(event))
+            await self._audit(
+                None,
+                AuditAction.INVOICE_MARKED_OVERDUE,
+                updated,
+                description=f"Invoice {updated.invoice_number} marked overdue",
+            )
+        return overdue_ids
+
+    async def issue_credit_note(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        invoice_id: uuid.UUID,
+        amount: Decimal,
+        reason: str,
+    ) -> CreditDebitNote:
+        """A credit note reduces what the customer owes/was charged --
+        legal only against an invoice that was actually sent
+        (``ISSUED``/``OVERDUE``/``PAID``), and its own amount can never
+        exceed the invoice's own ``total_amount`` (a credit note cannot
+        credit more than was ever charged)."""
+        invoice = await self.get_invoice(invoice_id)
+        if InvoiceStatus(invoice.status) not in (
+            InvoiceStatus.ISSUED,
+            InvoiceStatus.OVERDUE,
+            InvoiceStatus.PAID,
+        ):
+            raise InvalidInvoiceStatusTransitionError(invoice.status, "credit_note")
+        if amount <= 0:
+            raise InvalidNoteAmountError("Credit note amount must be positive")
+        if amount > invoice.total_amount:
+            raise InvalidNoteAmountError(
+                f"Credit note amount {amount} exceeds invoice total "
+                f"{invoice.total_amount}"
+            )
+        now = datetime.now(UTC)
+        note_number = await generate_credit_note_number(
+            self.number_counter_repository, at=now
+        )
+        note = await self.note_repository.create_note(
+            invoice_id=invoice.id,
+            note_type=NoteType.CREDIT.value,
+            note_number=note_number,
+            amount=amount,
+            reason=reason,
+            issued_at=now,
+            created_by=actor_user_id,
+        )
+        event = CreditNoteIssued(
+            note_id=note.id,
+            invoice_id=invoice.id,
+            organization_id=invoice.organization_id,
+            amount=str(amount),
+        )
+        logger.info("billing_credit_note_issued", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.CREDIT_NOTE_ISSUED,
+            invoice,
+            description=f"Credit note {note.note_number} issued against "
+            f"invoice {invoice.invoice_number} ({amount})",
+        )
+        return note
+
+    async def issue_debit_note(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        invoice_id: uuid.UUID,
+        amount: Decimal,
+        reason: str,
+    ) -> CreditDebitNote:
+        """A debit note increases what the customer owes (e.g. an
+        under-billed correction) -- legal against the same set of invoice
+        statuses a credit note is (``ISSUED``/``OVERDUE``/``PAID``), with
+        its own, entirely independent number sequence (never the credit
+        note's, never the invoice's -- see ``number_generator.py``)."""
+        invoice = await self.get_invoice(invoice_id)
+        if InvoiceStatus(invoice.status) not in (
+            InvoiceStatus.ISSUED,
+            InvoiceStatus.OVERDUE,
+            InvoiceStatus.PAID,
+        ):
+            raise InvalidInvoiceStatusTransitionError(invoice.status, "debit_note")
+        if amount <= 0:
+            raise InvalidNoteAmountError("Debit note amount must be positive")
+        now = datetime.now(UTC)
+        note_number = await generate_debit_note_number(
+            self.number_counter_repository, at=now
+        )
+        note = await self.note_repository.create_note(
+            invoice_id=invoice.id,
+            note_type=NoteType.DEBIT.value,
+            note_number=note_number,
+            amount=amount,
+            reason=reason,
+            issued_at=now,
+            created_by=actor_user_id,
+        )
+        event = DebitNoteIssued(
+            note_id=note.id,
+            invoice_id=invoice.id,
+            organization_id=invoice.organization_id,
+            amount=str(amount),
+        )
+        logger.info("billing_debit_note_issued", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.DEBIT_NOTE_ISSUED,
+            invoice,
+            description=f"Debit note {note.note_number} issued against "
+            f"invoice {invoice.invoice_number} ({amount})",
+        )
+        return note
+
+    async def _audit(
+        self,
+        actor_user_id: uuid.UUID | None,
+        action: AuditAction,
+        invoice: Invoice,
+        *,
+        description: str,
+    ) -> None:
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=actor_user_id,
+                action=action.value,
+                entity_type="invoice",
+                entity_id=invoice.id,
+                description=description,
+                event_metadata={},
+                organization_id=invoice.organization_id,
+                location_id=None,
+            )
+        logger.info("billing_invoice_audit_event", extra={"action": action.value})
+
+
 def _event_extra(event: object) -> dict[str, object]:
     """Flattens a frozen, ``slots=True`` ``events.py`` dataclass into
     ``logger.info(extra=)``-friendly, JSON-serializable keys -- identical
@@ -2170,4 +2897,7 @@ __all__ = [
     "SubscriptionService",
     "PaymentService",
     "PaymentMethodService",
+    "TaxRateService",
+    "BillingProfileService",
+    "InvoiceService",
 ]

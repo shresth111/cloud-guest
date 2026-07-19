@@ -411,3 +411,29 @@ class AuditAction(StrEnum):
     PAYMENT_RETRIED = "payment_retried"
     PAYMENT_METHOD_REGISTERED = "payment_method_registered"
     PAYMENT_METHOD_REMOVED = "payment_method_removed"
+
+    # Billing domain events (Module 013 Part 4: Invoice Engine + Tax/GST) --
+    # written through this same table by
+    # ``app.domains.billing.service.InvoiceService``/``TaxRateService``/
+    # ``BillingProfileService`` via the same narrow ``AuditLogWriter``
+    # protocol shape every prior Part's own services already use (see
+    # ``AuditLogEntry``'s "other domains could plausibly reuse it" design)
+    # -- an existing domain's later Part extending its own additive block,
+    # the same precedent Parts 2/3 themselves already followed for Part 1.
+    # Every invoice lifecycle transition (generate/mark-paid/void/overdue)
+    # and every credit/debit note issuance is audited -- the same
+    # moderate-volume, billing-event-attributable profile Parts 1-3's own
+    # actions already cover this way. ``INVOICE_MARKED_OVERDUE`` (a sweep-
+    # driven, not human-initiated, transition) is audited with
+    # ``actor_user_id=None``, mirroring ``LICENSE_EXPIRED``/
+    # ``SUBSCRIPTION_EXPIRED_AFTER_GRACE_PERIOD``'s identical "a real
+    # system-attributed event, not a human one" precedent.
+    INVOICE_GENERATED = "invoice_generated"
+    INVOICE_MARKED_PAID = "invoice_marked_paid"
+    INVOICE_VOIDED = "invoice_voided"
+    INVOICE_MARKED_OVERDUE = "invoice_marked_overdue"
+    CREDIT_NOTE_ISSUED = "credit_note_issued"
+    DEBIT_NOTE_ISSUED = "debit_note_issued"
+    TAX_RATE_CREATED = "tax_rate_created"
+    TAX_RATE_UPDATED = "tax_rate_updated"
+    BILLING_PROFILE_UPDATED = "billing_profile_updated"

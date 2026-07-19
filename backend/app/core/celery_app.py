@@ -112,6 +112,7 @@ from app.domains.analytics.constants import (
 )
 from app.domains.billing.constants import (
     SUBSCRIPTION_RENEWAL_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_INVOICE_OVERDUE_SWEEP,
     TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
 )
 
@@ -198,6 +199,21 @@ celery_app.conf.update(
         "billing-subscription-renewal-sweep": {
             "task": TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
             "schedule": SUBSCRIPTION_RENEWAL_SWEEP_INTERVAL_SECONDS,
+        },
+        # BE-013 Part 4: Invoice Engine overdue sweep -- once daily rather
+        # than hourly like the renewal sweep above, since `Invoice.due_date`
+        # is day-granularity (an invoice doesn't become newly overdue
+        # within the same day it was already checked), and 01:00 UTC is
+        # deliberately after `analytics-finalize-yesterday` (00:10 UTC) and
+        # `billing-subscription-renewal-sweep`'s own hourly cadence, so any
+        # renewal-driven invoice created earlier in that hour has already
+        # landed before this sweep runs. See
+        # ``app.domains.billing.service.InvoiceService.mark_overdue_invoices``'s
+        # own docstring for its per-invoice failure-isolation contract,
+        # mirroring every other sweep task in this module.
+        "billing-invoice-overdue-sweep": {
+            "task": TASK_RUN_INVOICE_OVERDUE_SWEEP,
+            "schedule": crontab(hour=1, minute=0),
         },
     },
 )

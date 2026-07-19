@@ -66,6 +66,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     Boolean,
@@ -78,7 +79,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import BaseModel
@@ -811,6 +812,356 @@ class PaymentMethod(BaseModel):
         )
 
 
+# ============================================================================
+# BE-013 Part 4: Invoice Engine + Tax/GST
+# ============================================================================
+
+
+class TaxRate(BaseModel):
+    """Super-Admin-managed tax jurisdiction config -- e.g. "India GST 18%",
+    "EU VAT 20%". Composable per-organization based on billing jurisdiction:
+    ``service.InvoiceService.generate_invoice_for_subscription`` looks up
+    the active rate for an organization's own
+    :class:`BillingProfile`.``billing_country`` (see that method's own
+    docstring), never a hardcoded percentage.
+
+    ``rate_percentage`` is a real ``Numeric(5, 2)`` -- never ``Float`` --
+    matching every other percentage/money column's own non-negotiable
+    correctness rule in this domain (``Coupon.discount_value``,
+    ``Plan.base_price``, ...).
+    """
+
+    __tablename__ = "tax_rates"
+
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    tax_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    rate_percentage: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
+    country_code: Mapped[str] = mapped_column(String(2), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        Index("ix_tax_rates_country_code", "country_code"),
+        Index("ix_tax_rates_tax_type", "tax_type"),
+        Index("ix_tax_rates_is_active", "is_active"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<TaxRate(id={self.id}, name={self.name}, "
+            f"country_code={self.country_code}, rate={self.rate_percentage})>"
+        )
+
+
+class BillingProfile(BaseModel):
+    """One organization's billing address + GSTIN -- **entirely owned by
+    this domain**, not a field added to
+    ``app.domains.organization.models.Organization``.
+
+    ## Storage-location decision: a billing-owned table, not an
+    ## ``Organization`` column extension
+
+    ``Organization`` has no address-like fields today beyond what
+    ``app.domains.location.models.Location`` already covers (a location's
+    address is where guests physically connect, a wholly different concept
+    from where an organization's *invoice* should be mailed/addressed).
+    Two options were real candidates: (a) a narrow, additive extension to
+    ``Organization`` itself (the same class of exception Part 1's own
+    ``subscription_tier`` sync established), or (b) a new, purely-billing-
+    owned table keyed to ``organization_id``. This module chooses (b) --
+    unlike ``subscription_tier`` (a label every *other* domain, e.g.
+    Analytics' own Plan Distribution rollup, already reads), a billing
+    address/GSTIN has exactly one consumer anywhere in this codebase: this
+    domain's own invoice generation. Adding five-plus new columns to
+    ``Organization`` for a concept only this module ever reads would widen
+    that table's surface for zero benefit any other domain needs, and would
+    require touching ``organization``'s own migration/model/schema files --
+    a real domain-boundary crossing this part's own directory rule is
+    explicit about minimizing. A dedicated, billing-owned table keeps
+    100% of this concept's read/write surface inside
+    ``app.domains.billing``, exactly the same "don't touch other domains'
+    internals" discipline this codebase enforces everywhere else. One row
+    per organization, ever (``organization_id`` unique) -- mirrors
+    ``License``/``Subscription``'s identical one-to-one, mutated-in-place
+    cardinality; there is no per-organization billing-address *history* to
+    preserve (a superseded address has no standalone value once updated --
+    what must be preserved is a historical *invoice's own frozen copy*,
+    which is exactly what ``Invoice.billing_snapshot`` is for -- see that
+    column's own docstring).
+
+    ``tax_exempt`` short-circuits ``validators.compute_tax_breakdown``
+    straight to zero tax regardless of any matched ``TaxRate`` -- a real,
+    first-class exemption flag (e.g. a diplomatic/nonprofit/reseller
+    organization), not inferred from the absence of a ``gst_identifier``.
+    """
+
+    __tablename__ = "billing_profiles"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    billing_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    billing_address_line1: Mapped[str] = mapped_column(String(255), nullable=False)
+    billing_address_line2: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    billing_city: Mapped[str] = mapped_column(String(100), nullable=False)
+    billing_state: Mapped[str] = mapped_column(String(100), nullable=False)
+    billing_country: Mapped[str] = mapped_column(String(2), nullable=False)
+    billing_postal_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Nullable -- an organization outside India (or one with no real GSTIN)
+    # legitimately has none.
+    gst_identifier: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    tax_exempt: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    __table_args__ = (
+        Index("ix_billing_profiles_organization_id", "organization_id", unique=True),
+        Index("ix_billing_profiles_billing_country", "billing_country"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BillingProfile(organization_id={self.organization_id}, "
+            f"billing_country={self.billing_country})>"
+        )
+
+
+class InvoiceNumberCounter(BaseModel):
+    """The dedicated, real, DB-level-atomic counter table backing every
+    sequential document number this part generates (invoice/credit-note/
+    debit-note) -- see ``number_generator.py``'s own module docstring for
+    the exact concurrency-safety mechanism this table's ``counter_key``
+    unique constraint + a single atomic ``INSERT ... ON CONFLICT DO
+    UPDATE ... RETURNING`` statement provide (never a racy
+    ``SELECT MAX(...) + 1``).
+
+    ``counter_key`` is ``"<document_type>:<year>"`` (e.g. ``"invoice:2026"``,
+    ``"credit_note:2026"``, ``"debit_note:2026"``) -- one row per document
+    type per calendar year, so each type's own sequence resets to 1 at the
+    start of a new year (a real, common invoicing convention), and credit/
+    debit notes never share a sequence with invoices or with each other.
+    """
+
+    __tablename__ = "invoice_number_counters"
+
+    counter_key: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
+    last_value: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("counter_key", name="uq_invoice_number_counters_counter_key"),
+        Index("ix_invoice_number_counters_counter_key", "counter_key", unique=True),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<InvoiceNumberCounter(counter_key={self.counter_key}, "
+            f"last_value={self.last_value})>"
+        )
+
+
+class Invoice(BaseModel):
+    """One generated invoice -- created by
+    ``service.InvoiceService.generate_invoice_for_subscription``, which
+    reuses (never recomputes) ``renewal_service.compute_renewal_charge_amount``
+    for ``subtotal`` -- the exact same real charge-amount computation Parts
+    2/3's own renewal engine already uses, so an invoice's line-item amount
+    can never silently drift from what a real renewal actually charges.
+
+    ## Tax breakdown storage shape: three typed columns, not a separate
+    ## ``InvoiceTaxLine`` table
+
+    India's GST regime has **exactly** three possible tax-line components
+    for any one invoice -- ``CGST``/``SGST`` (intra-state, always equal
+    halves of the total rate) or ``IGST`` (inter-state, the full rate) --
+    never more, never a variable-length list the way e.g. US sales tax
+    across many overlapping local jurisdictions might need. Given that
+    closed, fixed, well-defined shape, this module makes the identical
+    judgment call ``PlanFeature``'s own docstring already makes for this
+    domain ("three typed columns, not one JSONB blob" -- see that model's
+    full write-up): ``cgst_amount``/``sgst_amount``/``igst_amount`` are
+    three plain, precisely-typed ``Numeric`` columns, directly queryable/
+    summable/indexable, with exactly the legal subset populated per
+    ``validators.compute_tax_breakdown``'s real CGST+SGST-vs-IGST rule (see
+    that function's own docstring). A separate ``InvoiceTaxLine`` table (one
+    row per tax component) was a real, legitimate alternative -- rejected
+    here because it would model a *variable-cardinality* concept (many
+    jurisdictions' sales-tax regimes genuinely need N tax lines) for a
+    domain where this part only ever produces at most 2 populated
+    components per invoice, at a fixed, known set of names; the extra join
+    buys no real flexibility this part's own scope needs.
+    ``tax_amount`` is the universal total (``cgst_amount + sgst_amount +
+    igst_amount`` for GST; a flat computed value for VAT/SALES_TAX, which
+    have no CGST/SGST/IGST split -- see ``validators.compute_tax_breakdown``)
+    so every caller has one column to read regardless of tax regime.
+    ``tax_rate_percentage`` freezes the **total** rate actually applied, for
+    the same "copy, not reference" reason ``billing_snapshot`` below
+    documents -- a later edit to the ``TaxRate`` row this invoice was
+    computed from must never retroactively change a historical invoice's
+    own numbers.
+
+    ## ``billing_snapshot``: a frozen copy, not a live reference
+
+    A JSONB copy of the organization's ``BillingProfile`` fields **at the
+    moment this invoice was issued** -- never re-read from
+    ``BillingProfile`` afterward. This is the identical "copy, not
+    reference" principle already established repeatedly in this codebase
+    (``guest``'s voucher-derived session quotas frozen at redemption time;
+    ``monitoring.Alert.severity`` copied at trigger time;
+    ``CouponUsage.discount_amount_applied`` frozen at redemption time; this
+    domain's own ``Subscription.billing_cycle`` snapshot-copied from
+    ``Plan`` at subscription-creation time): if a customer later updates
+    their billing address/GSTIN, every invoice already issued must keep
+    showing the address it was legally issued against -- a real,
+    non-negotiable requirement for any financial/legal document, not a
+    stylistic preference.
+    """
+
+    __tablename__ = "invoices"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subscription_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    payment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("payments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    invoice_number: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    issue_date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    due_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    subtotal: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    cgst_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0"), nullable=False
+    )
+    sgst_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0"), nullable=False
+    )
+    igst_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0"), nullable=False
+    )
+    tax_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0"), nullable=False
+    )
+    tax_rate_percentage: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2), default=Decimal("0"), nullable=False
+    )
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    billing_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+    items: Mapped[list[InvoiceItem]] = relationship(
+        "InvoiceItem",
+        back_populates="invoice",
+        cascade="all, delete-orphan",
+    )
+    notes: Mapped[list[CreditDebitNote]] = relationship(
+        "CreditDebitNote",
+        back_populates="invoice",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("invoice_number", name="uq_invoices_invoice_number"),
+        Index("ix_invoices_organization_id", "organization_id"),
+        Index("ix_invoices_subscription_id", "subscription_id"),
+        Index("ix_invoices_payment_id", "payment_id"),
+        Index("ix_invoices_invoice_number", "invoice_number", unique=True),
+        Index("ix_invoices_status", "status"),
+        Index("ix_invoices_issue_date", "issue_date"),
+        Index("ix_invoices_due_date", "due_date"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Invoice(id={self.id}, invoice_number={self.invoice_number}, "
+            f"status={self.status})>"
+        )
+
+
+class InvoiceItem(BaseModel):
+    """One line item on an :class:`Invoice`. ``quantity`` is a real
+    ``Numeric`` (not ``Integer``) -- a future prorated/partial-period line
+    item (e.g. a mid-cycle upgrade) is a fractional quantity, not always a
+    whole number. ``amount`` is stored explicitly (``quantity *
+    unit_price``, computed once at creation) rather than always
+    recomputed on read -- matching this domain's own established
+    "compute once, store the result" discipline
+    (``CouponUsage.discount_amount_applied``) so a historical line item's
+    own amount can never drift from what was actually invoiced."""
+
+    __tablename__ = "invoice_items"
+
+    invoice_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("invoices.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    description: Mapped[str] = mapped_column(String(500), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("1"), nullable=False
+    )
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+
+    invoice: Mapped[Invoice] = relationship("Invoice", back_populates="items")
+
+    __table_args__ = (Index("ix_invoice_items_invoice_id", "invoice_id"),)
+
+    def __repr__(self) -> str:
+        return f"<InvoiceItem(invoice_id={self.invoice_id}, amount={self.amount})>"
+
+
+class CreditDebitNote(BaseModel):
+    """One credit note or debit note against an :class:`Invoice` --
+    ``note_type`` (``constants.NoteType``) discriminates the two, sharing
+    one table since every other column is identical (see ``constants
+    .NoteType``'s own docstring for why one discriminated table was chosen
+    over two near-duplicate ones). ``note_number`` is generated by its own,
+    real, independent sequence per ``note_type`` (see
+    ``number_generator.py``) -- never the invoice sequence, and never
+    shared between credit and debit notes."""
+
+    __tablename__ = "credit_debit_notes"
+
+    invoice_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("invoices.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    note_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    note_number: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    invoice: Mapped[Invoice] = relationship("Invoice", back_populates="notes")
+
+    __table_args__ = (
+        UniqueConstraint("note_number", name="uq_credit_debit_notes_note_number"),
+        Index("ix_credit_debit_notes_invoice_id", "invoice_id"),
+        Index("ix_credit_debit_notes_note_type", "note_type"),
+        Index("ix_credit_debit_notes_note_number", "note_number", unique=True),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<CreditDebitNote(invoice_id={self.invoice_id}, "
+            f"note_type={self.note_type}, note_number={self.note_number})>"
+        )
+
+
 __all__ = [
     "Plan",
     "PlanFeature",
@@ -823,4 +1174,10 @@ __all__ = [
     "CouponUsage",
     "Payment",
     "PaymentMethod",
+    "TaxRate",
+    "BillingProfile",
+    "InvoiceNumberCounter",
+    "Invoice",
+    "InvoiceItem",
+    "CreditDebitNote",
 ]

@@ -409,6 +409,55 @@ class WebhookSignatureInvalidError(BillingError):
         )
 
 
+# -- Tax / BillingProfile / Invoice (BE-013 Part 4) ------------------------------
+
+
+class TaxRateNotFoundError(BillingError):
+    def __init__(self, identifier: object) -> None:
+        super().__init__(
+            f"Tax rate not found: {identifier}", status_code=status.HTTP_404_NOT_FOUND
+        )
+
+
+class InvalidTaxRateError(BillingError):
+    """A ``TaxRate.rate_percentage`` (or other field) is out of its legal
+    range (e.g. negative, or above a defensible sanity ceiling)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
+
+
+class BillingProfileNotFoundError(BillingError):
+    def __init__(self, organization_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Organization {organization_id} has no billing profile on file",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class InvoiceNotFoundError(BillingError):
+    def __init__(self, identifier: object) -> None:
+        super().__init__(
+            f"Invoice not found: {identifier}", status_code=status.HTTP_404_NOT_FOUND
+        )
+
+
+class InvalidInvoiceStatusTransitionError(BillingError):
+    def __init__(self, current_status: str, target: str) -> None:
+        super().__init__(
+            f"Cannot transition an invoice from '{current_status}' to '{target}'",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class InvalidNoteAmountError(BillingError):
+    """A credit/debit note's ``amount`` is non-positive, or (for a credit
+    note specifically) exceeds the invoice's own ``total_amount``."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
+
+
 __all__ = [
     "BillingError",
     "PlanNotFoundError",
@@ -448,4 +497,10 @@ __all__ = [
     "UnsupportedPaymentProviderError",
     "PaymentProviderError",
     "WebhookSignatureInvalidError",
+    "TaxRateNotFoundError",
+    "InvalidTaxRateError",
+    "BillingProfileNotFoundError",
+    "InvoiceNotFoundError",
+    "InvalidInvoiceStatusTransitionError",
+    "InvalidNoteAmountError",
 ]

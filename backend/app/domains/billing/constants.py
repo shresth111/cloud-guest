@@ -427,6 +427,97 @@ ZERO_DECIMAL_CURRENCIES: frozenset[str] = frozenset(
 WEBHOOK_EVENT_DEDUP_KEY_PREFIX = "billing:webhook_event"
 
 
+# ============================================================================
+# BE-013 Part 4: Invoice Engine + Tax/GST
+# ============================================================================
+
+
+class TaxType(StrEnum):
+    """The closed set of tax regimes a :class:`~.models.TaxRate` row can
+    represent. ``GST`` is the one this part implements the real CGST/SGST/
+    IGST split for (see ``validators.compute_tax_breakdown``); ``VAT``/
+    ``SALES_TAX`` get an honest flat-percentage computation (no split --
+    neither regime has GST's own intra/inter-state CGST/SGST/IGST concept);
+    ``NONE`` is a real, first-class "no tax applies" member, mirroring
+    ``BillingCycle.NONE``'s identical "explicit member, never an ambiguous
+    NULL" reasoning."""
+
+    GST = "gst"
+    VAT = "vat"
+    SALES_TAX = "sales_tax"
+    NONE = "none"
+
+
+class InvoiceStatus(StrEnum):
+    """The full :class:`~.models.Invoice` lifecycle -- see ``service.py``'s
+    ``_INVOICE_TRANSITIONS`` for the exact, explicit transition graph (same
+    "define every legal transition, reject everything else" rigor as
+    ``LicenseStatus``/``SubscriptionStatus``/``PaymentStatus``).
+
+    * ``DRAFT`` -- created but not yet issued to the customer. Reachable
+      only via a future manual-invoice-creation flow (this part's own
+      ``generate_invoice_for_subscription`` issues directly -- see that
+      method's own docstring); kept as a real, legal member for that
+      forward compatibility rather than invented dead.
+    * ``ISSUED`` -- sent to the customer, awaiting payment.
+    * ``PAID`` -- a real ``Payment`` has settled it in full (see
+      ``service.InvoiceService.mark_invoice_paid``). Terminal from this
+      service's own perspective -- correcting a paid invoice is done via a
+      :class:`~.models.CreditDebitNote`, never a direct status change.
+    * ``OVERDUE`` -- ``ISSUED`` past its ``due_date`` with no payment yet.
+      Reversible back to ``PAID`` the moment a payment settles it.
+    * ``CANCELLED`` -- a ``DRAFT`` invoice withdrawn before ever being sent
+      (never reached a customer). Terminal.
+    * ``VOID`` -- an already-``ISSUED``/``OVERDUE`` invoice formally
+      voided after being sent (a real accounting reversal, the invoice
+      number itself is never reused/reassigned). Terminal.
+    """
+
+    DRAFT = "draft"
+    ISSUED = "issued"
+    PAID = "paid"
+    OVERDUE = "overdue"
+    CANCELLED = "cancelled"
+    VOID = "void"
+
+
+class NoteType(StrEnum):
+    """The discriminator for :class:`~.models.CreditDebitNote` -- one table,
+    not two near-identical ones, since a credit note and a debit note share
+    every column (``invoice_id``/``amount``/``reason``/``issued_at``/
+    ``note_number``) and differ only in commercial direction (reduces vs.
+    increases what the customer owes) and their own independent number
+    sequence (see ``number_generator.py``)."""
+
+    CREDIT = "credit"
+    DEBIT = "debit"
+
+
+# Invoice/credit-note/debit-note number-format prefixes -- see
+# number_generator.py for the exact "INV-2026-00001"-shaped format and its
+# real, DB-level-atomic concurrency mechanism. Credit and debit notes get
+# their own, independent sequences (never the invoice sequence, and never
+# each other's) -- a real, distinct accounting-document-type numbering
+# convention.
+INVOICE_NUMBER_PREFIX = "INV"
+CREDIT_NOTE_NUMBER_PREFIX = "CN"
+DEBIT_NOTE_NUMBER_PREFIX = "DN"
+
+# Zero-padded digit width for the sequence portion of every generated
+# number (e.g. "00001") -- 5 digits comfortably covers 99,999 documents of
+# one type within a single calendar year before rolling over into 6 digits
+# (never a hard ceiling -- Python's ``:0{width}d}`` format simply widens
+# for a larger value; this is a cosmetic default, not an enforced limit).
+NUMBER_SEQUENCE_DIGITS = 5
+
+# The Celery Beat task name and interval for
+# ``tasks.run_invoice_overdue_sweep`` (registered in
+# ``app.core.celery_app``'s ``beat_schedule``) -- see
+# ``Settings.invoice_overdue_sweep_interval_seconds``'s own docstring for
+# the interval reasoning.
+TASK_RUN_INVOICE_OVERDUE_SWEEP = "app.domains.billing.tasks.run_invoice_overdue_sweep"
+
+
 __all__ = [
     "PlanType",
     "BillingCycle",
@@ -455,4 +546,12 @@ __all__ = [
     "PaymentMethodType",
     "ZERO_DECIMAL_CURRENCIES",
     "WEBHOOK_EVENT_DEDUP_KEY_PREFIX",
+    "TaxType",
+    "InvoiceStatus",
+    "NoteType",
+    "INVOICE_NUMBER_PREFIX",
+    "CREDIT_NOTE_NUMBER_PREFIX",
+    "DEBIT_NOTE_NUMBER_PREFIX",
+    "NUMBER_SEQUENCE_DIGITS",
+    "TASK_RUN_INVOICE_OVERDUE_SWEEP",
 ]

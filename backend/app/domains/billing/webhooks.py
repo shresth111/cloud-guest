@@ -71,6 +71,20 @@ two narrow, additive Part 3 methods that do nothing but call that class's
 own existing, already-tested ``_mark_renewed``/``_mark_past_due``
 transitions (see that module's own docstring). No period-extension/
 past-due bookkeeping is reimplemented here.
+
+## BE-013 Part 4 addition: payment-webhook-to-invoice composition
+
+On a real success confirmation, ``process_stripe_event``/
+``process_razorpay_event`` now also accept an optional
+``invoice_service: InvoiceServiceProtocol | None`` parameter -- when
+supplied (the real, wired case, via ``router.py``'s own dependency), a
+resolved successful payment is handed to
+``service.InvoiceService.mark_invoice_paid_for_payment`` (an additive call
+into this new BE-013 Part 4 method, never a second, independent
+reimplementation of "what does a successful payment mean for billing").
+Defaulting to ``None`` keeps this an entirely backward-compatible, additive
+change: every existing caller/test that does not pass ``invoice_service``
+observes byte-for-byte the same behavior this module had before Part 4.
 """
 
 from __future__ import annotations
@@ -86,10 +100,26 @@ from redis.asyncio import Redis
 from .constants import WEBHOOK_EVENT_DEDUP_KEY_PREFIX, PaymentStatus
 from .events import WebhookProcessed, WebhookSignatureInvalid
 from .exceptions import WebhookSignatureInvalidError
+from .models import Payment
 from .renewal_service import RenewalService
 from .repository import PaymentRepositoryProtocol
 
 logger = logging.getLogger(__name__)
+
+
+class InvoiceServiceProtocol(Protocol):
+    """The single, narrow method these webhook handlers need from
+    ``service.InvoiceService`` -- see that method's own docstring for the
+    full "natural continuation of a successful payment webhook" write-up.
+    Kept as a locally-defined ``Protocol`` (never a concrete import of
+    ``service.InvoiceService``) for the same "avoid a construction cycle /
+    keep the dependency structural" reasoning ``service
+    .LicenseLifecycleProtocol``/``renewal_service
+    .PaymentGatewayProtocol`` already establish elsewhere in this domain."""
+
+    async def mark_invoice_paid_for_payment(
+        self, payment: Payment
+    ) -> object | None: ...
 
 
 # ============================================================================
@@ -206,6 +236,7 @@ async def process_stripe_event(
     payment_repository: PaymentRepositoryProtocol,
     renewal_service: RenewalService,
     dedup: WebhookEventDedupProtocol,
+    invoice_service: InvoiceServiceProtocol | None = None,
 ) -> bool:
     """Processes one verified Stripe ``Event``. Returns ``True`` if this
     call actually applied the event (``False`` if it was a dedup no-op).
@@ -236,6 +267,8 @@ async def process_stripe_event(
             await renewal_service.confirm_renewal_payment_succeeded(
                 payment.subscription_id
             )
+        if payment is not None and invoice_service is not None:
+            await invoice_service.mark_invoice_paid_for_payment(payment)
     elif event.type == "payment_intent.payment_failed":
         last_error = getattr(intent, "last_payment_error", None)
         reason = getattr(last_error, "message", None) if last_error else None
@@ -268,6 +301,7 @@ async def process_razorpay_event(
     payment_repository: PaymentRepositoryProtocol,
     renewal_service: RenewalService,
     dedup: WebhookEventDedupProtocol,
+    invoice_service: InvoiceServiceProtocol | None = None,
 ) -> bool:
     """Processes one verified Razorpay webhook payload (already
     signature-verified JSON, parsed into a plain dict). Real event types
@@ -305,6 +339,8 @@ async def process_razorpay_event(
             await renewal_service.confirm_renewal_payment_succeeded(
                 payment.subscription_id
             )
+        if payment is not None and invoice_service is not None:
+            await invoice_service.mark_invoice_paid_for_payment(payment)
     elif event_type == "payment.failed":
         reason = payment_entity.get("error_description")
         payment = await _resolve_and_update_payment(
@@ -353,6 +389,7 @@ __all__ = [
     "verify_razorpay_signature",
     "WebhookEventDedupProtocol",
     "RedisWebhookEventDedup",
+    "InvoiceServiceProtocol",
     "process_stripe_event",
     "process_razorpay_event",
     "log_signature_failure",

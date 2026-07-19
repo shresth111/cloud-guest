@@ -38,10 +38,17 @@ from .constants import PaymentProvider
 from .payment_gateways import RazorpayPaymentGateway, StripePaymentGateway
 from .renewal_service import PaymentGatewayProtocol, RenewalService
 from .repository import (
+    BillingProfileRepository,
+    BillingProfileRepositoryProtocol,
     CouponRepository,
     CouponRepositoryProtocol,
+    CreditDebitNoteRepository,
+    CreditDebitNoteRepositoryProtocol,
+    InvoiceRepository,
+    InvoiceRepositoryProtocol,
     LicenseRepository,
     LicenseRepositoryProtocol,
+    NumberCounterRepository,
     PaymentMethodRepository,
     PaymentMethodRepositoryProtocol,
     PaymentRepository,
@@ -50,16 +57,21 @@ from .repository import (
     PlanRepositoryProtocol,
     SubscriptionRepository,
     SubscriptionRepositoryProtocol,
+    TaxRateRepository,
+    TaxRateRepositoryProtocol,
     UsageRepository,
     UsageRepositoryProtocol,
 )
 from .service import (
+    BillingProfileService,
     CouponService,
+    InvoiceService,
     LicenseService,
     PaymentMethodService,
     PaymentService,
     PlanService,
     SubscriptionService,
+    TaxRateService,
     UsageService,
 )
 from .webhooks import RedisWebhookEventDedup, WebhookEventDedupProtocol
@@ -306,6 +318,91 @@ def get_renewal_service(
     )
 
 
+# ============================================================================
+# BE-013 Part 4: Invoice Engine + Tax/GST
+# ============================================================================
+
+
+def get_tax_rate_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> TaxRateRepositoryProtocol:
+    return TaxRateRepository(db)
+
+
+def get_tax_rate_service(
+    repository: TaxRateRepositoryProtocol = Depends(get_tax_rate_repository),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> TaxRateService:
+    return TaxRateService(repository, audit_writer=audit_repository)
+
+
+def get_billing_profile_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> BillingProfileRepositoryProtocol:
+    return BillingProfileRepository(db)
+
+
+def get_billing_profile_service(
+    repository: BillingProfileRepositoryProtocol = Depends(
+        get_billing_profile_repository
+    ),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> BillingProfileService:
+    return BillingProfileService(repository, audit_writer=audit_repository)
+
+
+def get_invoice_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> InvoiceRepositoryProtocol:
+    return InvoiceRepository(db)
+
+
+def get_credit_debit_note_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> CreditDebitNoteRepositoryProtocol:
+    return CreditDebitNoteRepository(db)
+
+
+def get_number_counter_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> NumberCounterRepository:
+    return NumberCounterRepository(db)
+
+
+def get_invoice_service(
+    repository: InvoiceRepositoryProtocol = Depends(get_invoice_repository),
+    subscription_repository: SubscriptionRepositoryProtocol = Depends(
+        get_subscription_repository
+    ),
+    plan_repository: PlanRepositoryProtocol = Depends(get_plan_repository),
+    billing_profile_repository: BillingProfileRepositoryProtocol = Depends(
+        get_billing_profile_repository
+    ),
+    tax_rate_repository: TaxRateRepositoryProtocol = Depends(get_tax_rate_repository),
+    number_counter_repository: NumberCounterRepository = Depends(
+        get_number_counter_repository
+    ),
+    note_repository: CreditDebitNoteRepositoryProtocol = Depends(
+        get_credit_debit_note_repository
+    ),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    settings: Settings = Depends(get_settings),
+) -> InvoiceService:
+    return InvoiceService(
+        repository,
+        subscription_repository=subscription_repository,
+        plan_repository=plan_repository,
+        billing_profile_repository=billing_profile_repository,
+        tax_rate_repository=tax_rate_repository,
+        number_counter_repository=number_counter_repository,
+        note_repository=note_repository,
+        platform_gst_state=settings.platform_gst_state,
+        platform_gst_country=settings.platform_gst_country,
+        invoice_due_days=settings.invoice_due_days,
+        audit_writer=audit_repository,
+    )
+
+
 __all__ = [
     "get_plan_repository",
     "get_license_repository",
@@ -325,4 +422,12 @@ __all__ = [
     "get_payment_service",
     "get_payment_method_service",
     "get_webhook_event_dedup",
+    "get_tax_rate_repository",
+    "get_tax_rate_service",
+    "get_billing_profile_repository",
+    "get_billing_profile_service",
+    "get_invoice_repository",
+    "get_credit_debit_note_repository",
+    "get_number_counter_repository",
+    "get_invoice_service",
 ]

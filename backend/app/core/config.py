@@ -576,6 +576,84 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ========================================================================
+    # BE-013 Part 4: Invoice Engine + Tax/GST
+    #
+    # Platform-level tax jurisdiction config -- what state/country/GSTIN the
+    # platform itself is registered in, needed to determine intra-state
+    # (CGST+SGST) vs. inter-state (IGST) for every GST invoice
+    # (app.domains.billing.validators.compute_tax_breakdown). Modeled as
+    # plain Settings fields (a real business config, not a per-deployment
+    # secret) rather than a config table -- there is exactly one "home
+    # jurisdiction" for this platform at any given time, the same "a plain,
+    # documented Settings field, never a hardcoded magic number" pattern
+    # every other tunable in this file already follows. See
+    # docs/billing/FLOW.md for the full write-up.
+    # ========================================================================
+
+    platform_gst_state: str = Field(
+        default="Maharashtra",
+        description=(
+            "The Indian state this platform's own business is GST-"
+            "registered in. Compared (case-insensitively) against an "
+            "organization's own BillingProfile.billing_state to decide "
+            "intra-state (CGST+SGST split) vs. inter-state (IGST) GST -- "
+            "see app.domains.billing.validators.compute_tax_breakdown. "
+            "Override via CLOUDGUEST_PLATFORM_GST_STATE in any real "
+            "deployment to the platform's actual registered state."
+        ),
+    )
+    platform_gst_country: str = Field(
+        default="IN",
+        description=(
+            "ISO 3166-1 alpha-2 country code this platform's GST "
+            "registration applies to. An organization whose BillingProfile"
+            ".billing_country differs from this is always inter-state "
+            "(IGST) by definition, regardless of billing_state."
+        ),
+    )
+    platform_gstin: str = Field(
+        default="",
+        description=(
+            "This platform's own GSTIN (GST identification number), shown "
+            "on the seller line of every generated GST invoice PDF. Empty "
+            "= unconfigured -- an honest, cosmetic-only gap (invoice PDFs "
+            "still generate correctly, just without a seller GSTIN line); "
+            "does not gate any tax computation. Override via "
+            "CLOUDGUEST_PLATFORM_GSTIN in any real deployment."
+        ),
+    )
+    platform_legal_business_name: str = Field(
+        default="CloudGuest",
+        description=(
+            "This platform's own legal/business name, printed as the "
+            "seller on every generated invoice PDF header."
+        ),
+    )
+    invoice_due_days: int = Field(
+        default=15,
+        ge=0,
+        le=365,
+        description=(
+            "Default payment-terms window -- app.domains.billing.service"
+            ".InvoiceService.generate_invoice_for_subscription sets "
+            "Invoice.due_date to issue_date + this many days."
+        ),
+    )
+    invoice_overdue_sweep_interval_seconds: float = Field(
+        default=3600.0,
+        ge=60.0,
+        le=86_400.0,
+        description=(
+            "Beat interval for app.domains.billing.tasks"
+            ".run_invoice_overdue_sweep, which transitions every ISSUED "
+            "invoice whose due_date has passed to OVERDUE -- mirrors "
+            "subscription_renewal_grace_period_days's own hourly-sweep "
+            "granularity reasoning (invoice due dates are day-granularity, "
+            "so hourly checking has no freshness cost)."
+        ),
+    )
+
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None,
         description=(

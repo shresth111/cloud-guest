@@ -1660,3 +1660,98 @@ Both webhook endpoints track processed event ids in Redis
 event id delivered twice (a real, documented behavior of both providers)
 is only ever actually applied once (see FLOW.md §24).
 
+## Billing Endpoints (Module 013 Part 4: Invoice Engine + Tax/GST)
+
+See `docs/billing/FLOW.md` §35-§46 for the full design write-up --
+including the `BillingProfile` storage-location decision, the invoice
+number generator's exact DB-level-atomic concurrency mechanism, the real
+CGST/SGST/IGST-vs-IGST GST rule + platform home-jurisdiction config, the
+tax-breakdown storage shape, the frozen `billing_snapshot` "copy, not
+reference" principle, the payment-webhook-to-invoice composition, and the
+PDF reuse-vs-dedicated-renderer decision.
+
+### Invoices (`invoices.*` -- `PermissionModule.INVOICES`, seeded since BE-004)
+
+`GET /invoices` -- requires `invoices.read` plus a resolved
+`X-Organization-Id` (`RequireOrganization`). Tenant-scoped invoice
+history, optionally filtered by `status`
+(`draft`|`issued`|`paid`|`overdue`|`cancelled`|`void`), paginated.
+
+`GET /invoices/{invoice_id}` -- requires `invoices.read` plus
+`X-Organization-Id`. An invoice belonging to a different organization
+reports `404`, never leaking its existence (real tenant isolation,
+enforced in `InvoiceService.get_invoice`). Response includes the
+invoice's own line items, any credit/debit notes, and its frozen
+`billing_snapshot`.
+
+`GET /invoices/{invoice_id}/download` -- requires `invoices.export` plus
+`X-Organization-Id`. Returns the real, `reportlab`-rendered invoice PDF
+(`Content-Type: application/pdf`,
+`Content-Disposition: attachment; filename="<invoice_number>.pdf"`) --
+raw file bytes, not the standard `ApiResponse` envelope (the same
+"raw bytes + Content-Type/Content-Disposition" shape
+`GET /reports`'s own export-download path already establishes). Header
+(invoice number, dates, seller/buyer address block), a real line-item
+table, a tax breakdown showing CGST/SGST/IGST as separate lines whenever
+non-zero (never a lumped generic "tax" line), totals, and a footer.
+
+`POST /invoices/{invoice_id}/void` -- requires `invoices.manage`. A
+never-issued `draft` invoice transitions to `cancelled`; an `issued`/
+`overdue` invoice transitions to `void`. Rejects (`409`) voiding an
+already-`paid` invoice -- correct a paid invoice via a credit note
+instead (see FLOW.md §46).
+
+`POST /invoices/{invoice_id}/credit-note` -- requires `invoices.manage`.
+Body: `amount` (`Decimal`, `> 0`), `reason`. Legal only against an
+`issued`/`overdue`/`paid` invoice; rejects (`400`) an amount exceeding
+the invoice's own `total_amount`. Generates its own real, independent
+`"CN-2026-00001"`-shaped sequential number (see FLOW.md §37) -- never the
+invoice sequence.
+
+`POST /invoices/{invoice_id}/debit-note` -- requires `invoices.manage`.
+Same legal invoice statuses as a credit note, no upper-amount ceiling (a
+debit note represents a genuine additional charge). Its own,
+independent `"DN-2026-00001"`-shaped sequence -- never the invoice's,
+never the credit note's.
+
+Invoices are generated automatically by
+`InvoiceService.generate_invoice_for_subscription` (composing --  never
+recomputing -- the same real charge-amount computation
+`RenewalService.process_renewal` itself uses) and marked paid
+automatically the moment a real payment webhook confirms success for a
+payment tied to that invoice's own subscription (see FLOW.md §42) --
+there is no `POST /invoices` endpoint; invoice creation is a real system
+event, not a direct API write.
+
+### Tax Rates (`billing.*`, reused -- no new `PermissionModule`; Super Admin "Manage Taxes")
+
+`POST /billing/tax-rates` -- requires `billing.manage` at
+`scope=GLOBAL`. Body: `name`, `tax_type`
+(`gst`|`vat`|`sales_tax`|`none`), `rate_percentage` (`Decimal`, `0`-`100`),
+`country_code` (ISO 3166-1 alpha-2), `is_active`. Platform-wide pricing/
+tax catalog -- pinned to `GLOBAL` scope exactly like `POST /plans`/
+`POST /coupons`.
+
+`GET /billing/tax-rates` -- requires `billing.read`. Lists tax rates,
+filterable by `country_code`/`is_active`, paginated.
+
+`PUT /billing/tax-rates/{tax_rate_id}` -- requires `billing.update` at
+`scope=GLOBAL`. Partial update.
+
+### Billing Profile (`billing.*`, reused -- no new `PermissionModule`)
+
+`POST /billing/profile` -- requires `billing.update` plus
+`X-Organization-Id`. Body: `billing_name`, `billing_address_line1`,
+optional `billing_address_line2`, `billing_city`, `billing_state`,
+`billing_country` (ISO 3166-1 alpha-2), `billing_postal_code`, optional
+`gst_identifier`, `tax_exempt`. Creates the organization's one
+`BillingProfile` row the first time, upserts it in place on every
+subsequent call (one profile per organization, ever -- see FLOW.md §36).
+Editing this profile never retroactively changes any already-issued
+invoice's own frozen `billing_snapshot` (see FLOW.md §41).
+
+`GET /billing/profile/me` -- requires `billing.read` plus
+`X-Organization-Id`. The caller's own organization's billing profile.
+
+`GET /billing/profile/{organization_id}` -- requires `billing.read`.
+

@@ -1,6 +1,6 @@
 # BE-013: Billing & Subscription Module
 
-**Parts 1-3 of 5** in the Billing & Subscription module (BE-013), all
+**Parts 1-4 of 5** in the Billing & Subscription module (BE-013), all
 living in `app.domains.billing` (one domain, extended, not a new one per
 part).
 
@@ -23,12 +23,24 @@ part).
   providers + Redis-backed event-id dedup), refund/retry, and the
   `POST /payments`/`POST /payments/methods`/`POST /webhooks/*` API surface.
 
-Later BE-013 parts (not built here) layer Invoice/Tax (Part 4) and
+* **Part 4** (this doc's latest addition): the Invoice Engine + Tax/GST --
+  `TaxRate` (Super-Admin-managed tax jurisdiction config),
+  `BillingProfile` (an organization's own billing address/GSTIN, entirely
+  owned by this domain), `Invoice`/`InvoiceItem`/`CreditDebitNote`, a real,
+  DB-level-atomic invoice/credit-note/debit-note number generator
+  (`number_generator.py`), the real CGST/SGST/IGST-vs-IGST GST computation
+  (`validators.compute_tax_breakdown`), a dedicated `reportlab`-based
+  invoice PDF renderer (`invoice_pdf.py`), and the
+  `POST /invoices/{id}/void`/`credit-note`/`debit-note`,
+  `GET /invoices`/`{id}`/`{id}/download`, `POST`/`GET`/`PUT
+  /billing/tax-rates`, and `POST`/`GET /billing/profile` API surface.
+
+Later BE-013 part (not built here) layers Super Admin + Customer
 dashboards (Part 5) on top of this foundation.
 
 See `FLOW.md` for every design decision in full detail (§1-§11 Part 1,
-§12-§21 Part 2, §22-§34 Part 3) and `DATABASE.md` for the schema reference.
-This file is a short orientation.
+§12-§21 Part 2, §22-§34 Part 3, §35-§46 Part 4) and `DATABASE.md` for the
+schema reference. This file is a short orientation.
 
 ## In One Paragraph (Part 1)
 
@@ -115,7 +127,49 @@ additive `RenewalService` methods
 resolve an asynchronously-confirmed renewal charge without reimplementing
 any period-extension/past-due logic (`FLOW.md` §34).
 
-## What This Module Does NOT Do (as of Part 3)
+## In One Paragraph (Part 4)
+
+Six more tables (`tax_rates`, `billing_profiles`, `invoice_number_counters`,
+`invoices`, `invoice_items`, `credit_debit_notes`; migration
+`0025_create_billing_invoice_tax_tables.py`). `BillingProfile` (billing
+address + GSTIN) is **entirely owned by this domain** -- a new table keyed
+to `organization_id`, not a column added to `Organization` -- since that
+concept has exactly one consumer anywhere in this codebase (this domain's
+own invoice generation); see `FLOW.md` §36 for the full write-up of why
+this is judged the cleaner call than Part 1's own `subscription_tier`-sync
+precedent. `service.InvoiceService.generate_invoice_for_subscription`
+composes -- never recomputes -- `validators.compute_renewal_charge_amount`
+(the exact same real charge-amount function `RenewalService` itself calls,
+relocated there specifically to give both layers one shared function with
+no import cycle -- see `FLOW.md` §38) for the invoice's own `subtotal`,
+then applies the real, legally-defined GST rule via
+`validators.compute_tax_breakdown`: intra-state (same state, same country
+as this platform's own `Settings.platform_gst_state`/`platform_gst_country`)
+splits the rate into equal CGST+SGST halves; inter-state charges the full
+rate as IGST; `tax_exempt`/no-configured-rate/`TaxType.NONE` all
+short-circuit to an honest zero, never a fabricated charge (`FLOW.md`
+§39-§40). The created `Invoice` freezes a JSONB `billing_snapshot` copy of
+the `BillingProfile` at issue time -- a later address edit never
+retroactively changes an already-issued invoice (`FLOW.md` §41, the
+identical "copy, not reference" principle this codebase already applies
+repeatedly elsewhere). `number_generator.py` generates every
+`"INV-2026-00001"`/`"CN-2026-00001"`/`"DN-2026-00001"`-shaped number via a
+single, real, atomic `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`
+statement against a dedicated `invoice_number_counters` row -- genuinely
+concurrency-safe, never a racy `SELECT MAX(...) + 1` (`FLOW.md` §37).
+`webhooks.py`'s existing success-handling code gained one additive,
+optional call into the new `InvoiceService.mark_invoice_paid_for_payment`
+-- the natural continuation of a successful payment confirming its own
+subscription's most recent unpaid invoice, never a second payment-side
+reimplementation (`FLOW.md` §42). `invoice_pdf.py` is a **dedicated**
+`reportlab`/`platypus` renderer (reusing the exact same library BE-012
+Part 5 already added, never a second PDF dependency) rather than routing
+through `analytics.export`'s generic report renderer -- an invoice's fixed,
+legally-defined layout (CGST/SGST/IGST shown as separate lines, never
+lumped) does not fit that renderer's own deliberately flexible, variable-
+shaped report-section model (`FLOW.md` §43).
+
+## What This Module Does NOT Do (as of Part 4)
 
 * **It cannot actually charge real money in this sandbox.** There are no
   real Stripe/Razorpay credentials anywhere in it, and there never will
@@ -130,10 +184,19 @@ any period-extension/past-due logic (`FLOW.md` §34).
   see `FLOW.md` §28's honest write-up of this scope simplification.
 * **It does not re-apply a coupon on renewal.** A coupon is redeemed once,
   at subscription creation -- see `FLOW.md` §17 (unchanged by Part 3).
-* **It does not build Invoice/Tax.** Those are BE-013 Part 4.
-* **It does not add a new `PermissionModule`.** `billing.*` (no dedicated
-  payment/invoice module) covers every Part 3 endpoint -- see `FLOW.md`
-  §32.
+* **It does not build Super Admin / Customer dashboards.** Those are
+  BE-013 Part 5.
+* **It does not add a new `PermissionModule` for tax rates/billing
+  profile.** `billing.*` covers `/billing/tax-rates`/`/billing/profile`
+  exactly like Plans/Coupons/Payments before them; `/invoices` reuses
+  `PermissionModule.INVOICES`'s own seven actions, already seeded since
+  BE-004 -- see `FLOW.md` §44.
+* **It does not automatically Beat-schedule the invoice-overdue sweep.**
+  `tasks.run_invoice_overdue_sweep` is a real, fully working, independently
+  callable Celery task (mirrors Part 1's own `expire_license` deferral),
+  but registering it in `app.core.celery_app`'s `beat_schedule` is a change
+  to a file outside this Part's own directory-rule boundary -- see
+  `FLOW.md` §45.
 * **It does not touch `organization`/`otp`/`rbac`/`router` internals**
   beyond Part 1's one narrow `OrganizationService.sync_subscription_tier`
   method, reusing (never modifying) `otp`'s `EmailProviderProtocol`,
@@ -142,7 +205,10 @@ any period-extension/past-due logic (`FLOW.md` §34).
   modified, by `webhooks.RedisWebhookEventDedup`). `app.domains.router
   .crypto`'s Fernet helpers were evaluated for `PaymentMethod` and found
   unnecessary -- that table never stores a recoverable secret at all, only
-  an opaque provider token (see `FLOW.md` §28).
+  an opaque provider token (see `FLOW.md` §28). Part 4 does not add any
+  column to `app.domains.organization.models.Organization` -- billing
+  address/GSTIN lives entirely in this domain's own `BillingProfile` table
+  (see `FLOW.md` §36).
 
 ## Folder Structure
 
@@ -152,32 +218,51 @@ backend/
     0022_create_billing_plan_license_usage_tables.py
     0023_create_billing_subscription_coupon_tables.py
     0024_create_billing_payment_tables.py
+    0025_create_billing_invoice_tax_tables.py
   app/
     core/
       celery_app.py    # + billing-subscription-renewal-sweep Beat entry
+                       #   (run_invoice_overdue_sweep NOT yet registered here --
+                       #   see "What This Module Does NOT Do" above)
       config.py        # + subscription_trial_period_days/renewal_grace_period_days/
                         #   renewal_reminder_days_before/expiry_reminder_days_before/
                         #   stripe_secret_key/stripe_webhook_secret/
                         #   stripe_webhook_tolerance_seconds/razorpay_key_id/
                         #   razorpay_key_secret/razorpay_webhook_secret/
-                        #   payment_default_provider/payment_webhook_event_dedup_ttl_seconds
+                        #   payment_default_provider/payment_webhook_event_dedup_ttl_seconds/
+                        #   platform_gst_state/platform_gst_country/platform_gstin/
+                        #   platform_legal_business_name/invoice_due_days/
+                        #   invoice_overdue_sweep_interval_seconds
     domains/billing/
       __init__.py
       models.py          # Plan, PlanFeature, License, LicenseChangeLog, UsageMetric,
                           # Subscription, Coupon, CouponPlan, CouponUsage, Payment,
-                          # PaymentMethod
+                          # PaymentMethod, TaxRate, BillingProfile,
+                          # InvoiceNumberCounter, Invoice, InvoiceItem, CreditDebitNote
       constants.py        # + SubscriptionStatus, DiscountType, RENEWABLE_SUBSCRIPTION_STATUSES,
                            #   CYCLIC_BILLING_CYCLES, MAX_PERCENTAGE_DISCOUNT_VALUE,
                            #   TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP, PaymentProvider,
                            #   PaymentStatus, PaymentMethodType, ZERO_DECIMAL_CURRENCIES,
-                           #   WEBHOOK_EVENT_DEDUP_KEY_PREFIX
+                           #   WEBHOOK_EVENT_DEDUP_KEY_PREFIX, TaxType, InvoiceStatus,
+                           #   NoteType, INVOICE_NUMBER_PREFIX, CREDIT_NOTE_NUMBER_PREFIX,
+                           #   DEBIT_NOTE_NUMBER_PREFIX, NUMBER_SEQUENCE_DIGITS,
+                           #   TASK_RUN_INVOICE_OVERDUE_SWEEP
       schemas.py           # + Subscription*/Coupon*/Payment*/PaymentMethod* request/
-                           #   response models
+                           #   response models, TaxRate*/BillingProfile*/Invoice*/
+                           #   CreditDebitNote*/CreditNoteIssueRequest/DebitNoteIssueRequest
       repository.py        # + SubscriptionRepository, CouponRepository (atomic increment),
                             #   PaymentRepository, PaymentMethodRepository (atomic
-                            #   set_as_default)
+                            #   set_as_default), NumberCounterRepository (atomic UPSERT),
+                            #   TaxRateRepository, BillingProfileRepository,
+                            #   InvoiceRepository, CreditDebitNoteRepository
       service.py             # + SubscriptionService, CouponService, PaymentService,
-                              #   PaymentMethodService
+                              #   PaymentMethodService, TaxRateService,
+                              #   BillingProfileService, InvoiceService
+      number_generator.py      # generate_invoice_number/generate_credit_note_number/
+                                # generate_debit_note_number -- see the real, atomic
+                                # concurrency-safety mechanism in its own module docstring
+      invoice_pdf.py            # render_invoice_pdf -- a dedicated reportlab/platypus
+                                 # renderer (never routed through analytics.export)
       renewal_service.py       # PaymentGatewayProtocol seam, UnconfiguredPaymentGateway,
                                 # RenewalService (process_renewal, process_due_renewals,
                                 # expire_lapsed_subscriptions, reminders,
@@ -186,25 +271,38 @@ backend/
                                   # stripe/razorpay SDK integration)
       webhooks.py                  # Real Stripe/Razorpay signature verification,
                                     # RedisWebhookEventDedup, process_stripe_event/
-                                    # process_razorpay_event
-      tasks.py                  # Celery task: run_subscription_renewal_sweep
+                                    # process_razorpay_event (+ optional invoice_service
+                                    # composition -- InvoiceServiceProtocol)
+      tasks.py                  # Celery tasks: run_subscription_renewal_sweep,
+                                 # run_invoice_overdue_sweep
       router.py                  # + /subscriptions, /coupons, /payments,
                                   #   /payments/methods, /webhooks/stripe,
-                                  #   /webhooks/razorpay endpoints
+                                  #   /webhooks/razorpay, /invoices, /invoices/{id}/
+                                  #   download|void|credit-note|debit-note,
+                                  #   /billing/tax-rates, /billing/profile endpoints
       validators.py                # + normalize_coupon_code, validate_discount_value,
                                     #   compute_discount_amount, add_billing_cycle,
-                                    #   to_minor_units, derive_retry_idempotency_key
+                                    #   to_minor_units, derive_retry_idempotency_key,
+                                    #   compute_renewal_charge_amount, normalize_region,
+                                    #   compute_tax_breakdown, GstBreakdown
       dependencies.py                # + get_subscription_service, get_coupon_service,
                                       #   build_payment_gateway, get_payment_gateway,
                                       #   get_renewal_service, get_payment_service,
                                       #   get_payment_method_service,
-                                      #   get_webhook_event_dedup
+                                      #   get_webhook_event_dedup, get_tax_rate_service,
+                                      #   get_billing_profile_service, get_invoice_service
       exceptions.py                    # + Subscription*/Coupon*/PaymentGatewayNotConfiguredError/
                                         #   Payment*/PaymentMethodNotFoundError/
-                                        #   WebhookSignatureInvalidError/PaymentProviderError
+                                        #   WebhookSignatureInvalidError/PaymentProviderError/
+                                        #   TaxRateNotFoundError/InvalidTaxRateError/
+                                        #   BillingProfileNotFoundError/InvoiceNotFoundError/
+                                        #   InvalidInvoiceStatusTransitionError/
+                                        #   InvalidNoteAmountError
       events.py                         # + Subscription*/Coupon*/RenewalReminderSent/
                                          #   ExpiryReminderSent/Payment*/WebhookProcessed/
-                                         #   WebhookSignatureInvalid dataclasses
+                                         #   WebhookSignatureInvalid/Invoice*/
+                                         #   CreditNoteIssued/DebitNoteIssued/TaxRate*/
+                                         #   BillingProfileUpdated dataclasses
   docs/billing/
     README.md   # this file
     FLOW.md
@@ -213,5 +311,8 @@ backend/
     test_billing_plans_licenses_usage.py
     test_billing_subscriptions_renewals_coupons.py
     test_billing_payments_webhooks.py
-  requirements.txt / pyproject.toml   # + stripe==15.3.1, razorpay==2.0.1
+    test_billing_invoices_tax.py
+  requirements.txt / pyproject.toml   # + stripe==15.3.1, razorpay==2.0.1 (no new
+                                       #   dependency for Part 4 -- reportlab already
+                                       #   present from BE-012 Part 5)
 ```

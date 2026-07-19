@@ -284,3 +284,133 @@ new module) covers every Part 3 endpoint -- see FLOW.md §32.
 Webhook event-id dedup (`webhooks.RedisWebhookEventDedup`) is deliberately
 **not** a table at all -- see FLOW.md §24 for the full "Redis + TTL vs. a
 dedicated table" write-up.
+
+---
+
+# BE-013 Part 4: Invoice Engine + Tax/GST
+
+Migration: `alembic/versions/0025_create_billing_invoice_tax_tables.py`
+(revises `0024_create_billing_payment_tables`). Six new tables, all
+extending `BaseModel`. No `alembic/env.py` edit was needed -- same reason
+as Parts 2/3 (that file already imports `app.domains.billing.models` as a
+whole module).
+
+## `tax_rates`
+
+Super-Admin-managed tax jurisdiction config -- no FK.
+
+| Column | Type | Notes |
+|---|---|---|
+| `name` | String(100), not nullable | e.g. "India GST" |
+| `tax_type` | String(20), not nullable | `constants.TaxType` -- `gst`/`vat`/`sales_tax`/`none` |
+| `rate_percentage` | **Numeric(5, 2)**, not nullable | never `Float` |
+| `country_code` | String(2), not nullable | ISO 3166-1 alpha-2 |
+| `is_active` | Boolean, not nullable, default `true` | |
+
+Indexes: `country_code`, `tax_type`, `is_active`, plus base-model indexes.
+
+## `billing_profiles`
+
+One organization's billing address/GSTIN -- **entirely owned by this
+domain**, not a column on `organizations` (see FLOW.md §36 for the full
+storage-location decision). One row per organization, ever
+(`organization_id` unique) -- mirrors `licenses`/`subscriptions`'
+identical one-to-one cardinality.
+
+| Column | Type | Notes |
+|---|---|---|
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable, **unique** | |
+| `billing_name` | String(200), not nullable | |
+| `billing_address_line1` | String(255), not nullable | |
+| `billing_address_line2` | String(255), nullable | |
+| `billing_city` | String(100), not nullable | |
+| `billing_state` | String(100), not nullable | compared against `Settings.platform_gst_state` for CGST/SGST vs. IGST |
+| `billing_country` | String(2), not nullable | ISO 3166-1 alpha-2 |
+| `billing_postal_code` | String(20), not nullable | |
+| `gst_identifier` | String(20), nullable | GSTIN -- nullable for a non-Indian/no-GSTIN organization |
+| `tax_exempt` | Boolean, not nullable, default `false` | short-circuits `compute_tax_breakdown` to zero regardless of any matched `TaxRate` |
+
+Indexes: `organization_id` (unique), `billing_country`, plus base-model
+indexes.
+
+## `invoice_number_counters`
+
+The dedicated, real, DB-level-atomic counter table backing every
+sequential document number this part generates -- see FLOW.md §37 for the
+exact `INSERT ... ON CONFLICT DO UPDATE ... RETURNING` concurrency
+mechanism this table's `counter_key` unique constraint enables.
+
+| Column | Type | Notes |
+|---|---|---|
+| `counter_key` | String(50), not nullable, **unique** | `"<document_type>:<year>"`, e.g. `"invoice:2026"` |
+| `last_value` | Integer, not nullable, default `0` | the real, atomically-incremented sequence value |
+
+Indexes: `counter_key` (unique), plus base-model indexes.
+
+## `invoices`
+
+| Column | Type | Notes |
+|---|---|---|
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable | |
+| `subscription_id` | UUID, FK `subscriptions.id` (`SET NULL`), nullable | |
+| `payment_id` | UUID, FK `payments.id` (`SET NULL`), nullable | set once a real payment settles this invoice |
+| `invoice_number` | String(50), not nullable, **unique** | `"INV-2026-00001"`-shaped -- see FLOW.md §37 |
+| `status` | String(20), not nullable | `constants.InvoiceStatus` -- see FLOW.md §46 for the full transition graph |
+| `issue_date` / `due_date` | DateTime(tz), not nullable | |
+| `subtotal` | **Numeric(12, 2)**, not nullable | reuses `renewal_service.compute_renewal_charge_amount` -- see FLOW.md §38 |
+| `cgst_amount` / `sgst_amount` / `igst_amount` | **Numeric(12, 2)**, not nullable, default `0` | three typed columns, not a separate `InvoiceTaxLine` table -- see FLOW.md §40 |
+| `tax_amount` | **Numeric(12, 2)**, not nullable, default `0` | universal total across every tax regime |
+| `tax_rate_percentage` | **Numeric(5, 2)**, not nullable, default `0` | the total rate actually applied, frozen at issue time |
+| `total_amount` | **Numeric(12, 2)**, not nullable | `subtotal + tax_amount` |
+| `currency` | String(3), not nullable | |
+| `billing_snapshot` | JSONB, not nullable | a frozen copy of `BillingProfile` at issue time -- never re-read afterward, see FLOW.md §41 |
+
+Indexes: `organization_id`, `subscription_id`, `payment_id`,
+`invoice_number` (unique), `status`, `issue_date`, `due_date`, plus
+base-model indexes.
+
+## `invoice_items`
+
+| Column | Type | Notes |
+|---|---|---|
+| `invoice_id` | UUID, FK `invoices.id` (`CASCADE`), not nullable | |
+| `description` | String(500), not nullable | |
+| `quantity` | **Numeric(12, 2)**, not nullable, default `1` | a real `Numeric`, not `Integer` -- a future prorated line item is fractional |
+| `unit_price` | **Numeric(12, 2)**, not nullable | |
+| `amount` | **Numeric(12, 2)**, not nullable | computed once at creation (`quantity * unit_price`), never recomputed on read |
+
+Indexes: `invoice_id`, plus base-model indexes.
+
+## `credit_debit_notes`
+
+One discriminated table for both credit and debit notes -- see FLOW.md
+§46 for the full "one table, not two" write-up.
+
+| Column | Type | Notes |
+|---|---|---|
+| `invoice_id` | UUID, FK `invoices.id` (`CASCADE`), not nullable | |
+| `note_type` | String(10), not nullable | `constants.NoteType` -- `credit`/`debit` |
+| `note_number` | String(50), not nullable, **unique** | `"CN-2026-00001"`/`"DN-2026-00001"`-shaped -- its own independent sequence per `note_type`, never the invoice sequence |
+| `amount` | **Numeric(12, 2)**, not nullable | |
+| `reason` | Text, not nullable | |
+| `issued_at` | DateTime(tz), not nullable | |
+
+Indexes: `invoice_id`, `note_type`, `note_number` (unique), plus
+base-model indexes.
+
+## Table creation order (FK dependency chain)
+
+`tax_rates` (no FK) -> `billing_profiles` (needs `organizations`) ->
+`invoice_number_counters` (no FK) -> `invoices` (needs `organizations`/
+`subscriptions`/`payments`) -> `invoice_items` (needs `invoices`) ->
+`credit_debit_notes` (needs `invoices`). The migration's `upgrade()`/
+`downgrade()` follow this order (and its exact reverse).
+
+## No further RBAC schema change
+
+Same as Parts 1-3 -- this part's only RBAC edit is additive `AuditAction`
+values (`INVOICE_*`/`CREDIT_NOTE_ISSUED`/`DEBIT_NOTE_ISSUED`/`TAX_RATE_*`/
+`BILLING_PROFILE_UPDATED`), no migration needed. `PermissionModule
+.INVOICES` was already seeded since BE-004 (create/read/update/delete/
+export/approve/manage); no new permission group/action/scope row is
+seeded by this part -- see FLOW.md §44.

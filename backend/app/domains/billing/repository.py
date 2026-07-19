@@ -37,6 +37,7 @@ from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
@@ -49,12 +50,18 @@ from app.domains.router.models import Router
 from .constants import (
     CYCLIC_BILLING_CYCLES,
     RENEWABLE_SUBSCRIPTION_STATUSES,
+    InvoiceStatus,
     PaymentStatus,
 )
 from .models import (
+    BillingProfile,
     Coupon,
     CouponPlan,
     CouponUsage,
+    CreditDebitNote,
+    Invoice,
+    InvoiceItem,
+    InvoiceNumberCounter,
     License,
     LicenseChangeLog,
     Payment,
@@ -62,6 +69,7 @@ from .models import (
     Plan,
     PlanFeature,
     Subscription,
+    TaxRate,
     UsageMetric,
 )
 
@@ -782,6 +790,310 @@ class PaymentMethodRepository:
         return await self.payment_methods.update(payment_method, {"is_default": True})
 
 
+# ============================================================================
+# BE-013 Part 4: Invoice Engine + Tax/GST
+# ============================================================================
+
+
+class NumberCounterRepository:
+    """Concrete, real, DB-level-atomic implementation of
+    ``number_generator.NumberCounterRepositoryProtocol`` -- see that
+    module's own docstring for the full write-up of exactly why the single
+    ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING`` statement below is
+    genuinely concurrency-safe (never a racy ``SELECT MAX(...) + 1``)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def increment_and_get_next(self, counter_key: str) -> int:
+        statement = (
+            pg_insert(InvoiceNumberCounter)
+            .values(counter_key=counter_key, last_value=1)
+            .on_conflict_do_update(
+                index_elements=[InvoiceNumberCounter.counter_key],
+                set_={
+                    "last_value": InvoiceNumberCounter.last_value + 1,
+                    "version": InvoiceNumberCounter.version + 1,
+                },
+            )
+            .returning(InvoiceNumberCounter.last_value)
+        )
+        result = await self.session.execute(statement)
+        await self.session.flush()
+        return int(result.scalar_one())
+
+
+class TaxRateRepositoryProtocol(Protocol):
+    async def create_tax_rate(self, **fields: object) -> TaxRate: ...
+
+    async def get_by_id(
+        self, tax_rate_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> TaxRate | None: ...
+
+    async def update_tax_rate(
+        self, tax_rate: TaxRate, data: Mapping[str, object]
+    ) -> TaxRate: ...
+
+    async def list_tax_rates(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        country_code: str | None = None,
+        is_active: bool | None = None,
+    ) -> tuple[list[TaxRate], PaginationMeta]: ...
+
+    async def get_active_for_country(self, country_code: str) -> TaxRate | None: ...
+
+
+class TaxRateRepository:
+    """Concrete, SQLAlchemy-backed implementation of
+    ``TaxRateRepositoryProtocol``."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.tax_rates = GenericRepository(TaxRate, session)
+
+    async def create_tax_rate(self, **fields: object) -> TaxRate:
+        return await self.tax_rates.create(fields)
+
+    async def get_by_id(
+        self, tax_rate_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> TaxRate | None:
+        return await self.tax_rates.get_by_id(
+            tax_rate_id, include_deleted=include_deleted
+        )
+
+    async def update_tax_rate(
+        self, tax_rate: TaxRate, data: Mapping[str, object]
+    ) -> TaxRate:
+        return await self.tax_rates.update(tax_rate, data)
+
+    async def list_tax_rates(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        country_code: str | None = None,
+        is_active: bool | None = None,
+    ) -> tuple[list[TaxRate], PaginationMeta]:
+        filters: dict[str, object] = {}
+        if country_code is not None:
+            filters["country_code"] = country_code
+        if is_active is not None:
+            filters["is_active"] = is_active
+        return await self.tax_rates.paginate(
+            page=page,
+            page_size=page_size,
+            filters=filters,
+            sort_by="created_at",
+            sort_order=SortOrder.DESC,
+        )
+
+    async def get_active_for_country(self, country_code: str) -> TaxRate | None:
+        """The active tax rate this platform applies for a given billing
+        country -- assumes at most one Super-Admin-managed active default
+        rate per country (a real, documented operational assumption, not
+        an enforced DB constraint); the first match is used. No active rate
+        for a country is an honest "no tax configured here" outcome, not
+        an error -- ``validators.compute_tax_breakdown`` treats a ``None``
+        rate the same as ``TaxType.NONE``."""
+        results = await self.tax_rates.get_all(
+            filters={"country_code": country_code, "is_active": True}, limit=1
+        )
+        return results[0] if results else None
+
+
+class BillingProfileRepositoryProtocol(Protocol):
+    async def create_billing_profile(self, **fields: object) -> BillingProfile: ...
+
+    async def get_by_organization_id(
+        self, organization_id: uuid.UUID
+    ) -> BillingProfile | None: ...
+
+    async def update_billing_profile(
+        self, billing_profile: BillingProfile, data: Mapping[str, object]
+    ) -> BillingProfile: ...
+
+
+class BillingProfileRepository:
+    """Concrete, SQLAlchemy-backed implementation of
+    ``BillingProfileRepositoryProtocol``."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.billing_profiles = GenericRepository(BillingProfile, session)
+
+    async def create_billing_profile(self, **fields: object) -> BillingProfile:
+        return await self.billing_profiles.create(fields)
+
+    async def get_by_organization_id(
+        self, organization_id: uuid.UUID
+    ) -> BillingProfile | None:
+        results = await self.billing_profiles.get_all(
+            filters={"organization_id": organization_id}, limit=1
+        )
+        return results[0] if results else None
+
+    async def update_billing_profile(
+        self, billing_profile: BillingProfile, data: Mapping[str, object]
+    ) -> BillingProfile:
+        return await self.billing_profiles.update(billing_profile, data)
+
+
+class InvoiceRepositoryProtocol(Protocol):
+    async def create_invoice(self, **fields: object) -> Invoice: ...
+
+    async def get_by_id(
+        self, invoice_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> Invoice | None: ...
+
+    async def get_by_invoice_number(self, invoice_number: str) -> Invoice | None: ...
+
+    async def update_invoice(
+        self, invoice: Invoice, data: Mapping[str, object]
+    ) -> Invoice: ...
+
+    async def list_invoices(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        organization_id: uuid.UUID | None = None,
+        status: str | None = None,
+    ) -> tuple[list[Invoice], PaginationMeta]: ...
+
+    async def list_unpaid_for_subscription(
+        self, subscription_id: uuid.UUID
+    ) -> list[Invoice]: ...
+
+    async def list_issued_past_due(self, *, now: datetime) -> list[Invoice]: ...
+
+    async def create_invoice_item(self, **fields: object) -> InvoiceItem: ...
+
+    async def list_items(self, invoice_id: uuid.UUID) -> list[InvoiceItem]: ...
+
+
+class InvoiceRepository:
+    """Concrete, SQLAlchemy-backed implementation of
+    ``InvoiceRepositoryProtocol``. ``list_unpaid_for_subscription``/
+    ``list_issued_past_due`` are hand-written queries --
+    ``GenericRepository``'s equality/``IN``-only filter support
+    (``apply_filters``) cannot express ``status IN (...)`` combined with a
+    ``<=`` comparison, or the most-recent-first ordering
+    ``list_unpaid_for_subscription`` needs."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.invoices = GenericRepository(Invoice, session)
+        self.items = GenericRepository(InvoiceItem, session)
+
+    async def create_invoice(self, **fields: object) -> Invoice:
+        return await self.invoices.create(fields)
+
+    async def get_by_id(
+        self, invoice_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> Invoice | None:
+        return await self.invoices.get_by_id(
+            invoice_id, include_deleted=include_deleted
+        )
+
+    async def get_by_invoice_number(self, invoice_number: str) -> Invoice | None:
+        results = await self.invoices.get_all(
+            filters={"invoice_number": invoice_number}, limit=1
+        )
+        return results[0] if results else None
+
+    async def update_invoice(
+        self, invoice: Invoice, data: Mapping[str, object]
+    ) -> Invoice:
+        return await self.invoices.update(invoice, data)
+
+    async def list_invoices(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        organization_id: uuid.UUID | None = None,
+        status: str | None = None,
+    ) -> tuple[list[Invoice], PaginationMeta]:
+        filters: dict[str, object] = {}
+        if organization_id is not None:
+            filters["organization_id"] = organization_id
+        if status is not None:
+            filters["status"] = status
+        return await self.invoices.paginate(
+            page=page,
+            page_size=page_size,
+            filters=filters,
+            sort_by="issue_date",
+            sort_order=SortOrder.DESC,
+        )
+
+    async def list_unpaid_for_subscription(
+        self, subscription_id: uuid.UUID
+    ) -> list[Invoice]:
+        statement = (
+            select(Invoice)
+            .where(
+                Invoice.is_deleted.is_(False),
+                Invoice.subscription_id == subscription_id,
+                Invoice.status.in_(
+                    [InvoiceStatus.ISSUED.value, InvoiceStatus.OVERDUE.value]
+                ),
+            )
+            .order_by(Invoice.issue_date.desc())
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_issued_past_due(self, *, now: datetime) -> list[Invoice]:
+        statement = select(Invoice).where(
+            Invoice.is_deleted.is_(False),
+            Invoice.status == InvoiceStatus.ISSUED.value,
+            Invoice.due_date <= now,
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def create_invoice_item(self, **fields: object) -> InvoiceItem:
+        return await self.items.create(fields)
+
+    async def list_items(self, invoice_id: uuid.UUID) -> list[InvoiceItem]:
+        return await self.items.get_all(
+            filters={"invoice_id": invoice_id},
+            sort_by="created_at",
+            sort_order=SortOrder.ASC,
+        )
+
+
+class CreditDebitNoteRepositoryProtocol(Protocol):
+    async def create_note(self, **fields: object) -> CreditDebitNote: ...
+
+    async def list_for_invoice(
+        self, invoice_id: uuid.UUID
+    ) -> list[CreditDebitNote]: ...
+
+
+class CreditDebitNoteRepository:
+    """Concrete, SQLAlchemy-backed implementation of
+    ``CreditDebitNoteRepositoryProtocol``."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.notes = GenericRepository(CreditDebitNote, session)
+
+    async def create_note(self, **fields: object) -> CreditDebitNote:
+        return await self.notes.create(fields)
+
+    async def list_for_invoice(self, invoice_id: uuid.UUID) -> list[CreditDebitNote]:
+        return await self.notes.get_all(
+            filters={"invoice_id": invoice_id},
+            sort_by="issued_at",
+            sort_order=SortOrder.DESC,
+        )
+
+
 __all__ = [
     "PlanRepositoryProtocol",
     "PlanRepository",
@@ -797,4 +1109,13 @@ __all__ = [
     "PaymentRepository",
     "PaymentMethodRepositoryProtocol",
     "PaymentMethodRepository",
+    "NumberCounterRepository",
+    "TaxRateRepositoryProtocol",
+    "TaxRateRepository",
+    "BillingProfileRepositoryProtocol",
+    "BillingProfileRepository",
+    "InvoiceRepositoryProtocol",
+    "InvoiceRepository",
+    "CreditDebitNoteRepositoryProtocol",
+    "CreditDebitNoteRepository",
 ]

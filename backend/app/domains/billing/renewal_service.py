@@ -96,7 +96,7 @@ from .exceptions import (
 from .models import Subscription
 from .repository import PlanRepositoryProtocol, SubscriptionRepositoryProtocol
 from .service import AuditLogWriter, LicenseLifecycleProtocol
-from .validators import add_billing_cycle
+from .validators import add_billing_cycle, compute_renewal_charge_amount
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +271,7 @@ class RenewalService:
 
         # Coupon applies once, at signup, never re-applied on renewal --
         # see service.CouponService's own docstring for the full decision.
-        charge_amount = plan.base_price
+        charge_amount = compute_renewal_charge_amount(plan)
 
         try:
             result = await self.payment_gateway.charge(
@@ -345,7 +345,9 @@ class RenewalService:
         plan = await self.plan_repository.get_by_id(subscription.plan_id)
         if plan is None:
             raise PlanNotFoundError(subscription.plan_id)
-        return await self._mark_renewed(subscription, plan, plan.base_price)
+        return await self._mark_renewed(
+            subscription, plan, compute_renewal_charge_amount(plan)
+        )
 
     async def confirm_renewal_payment_failed(
         self, subscription_id: uuid.UUID, *, reason: str
@@ -702,6 +704,7 @@ def _event_extra(event: object) -> dict[str, object]:
 
 
 __all__ = [
+    "compute_renewal_charge_amount",
     "PaymentResult",
     "PaymentGatewayProtocol",
     "UnconfiguredPaymentGateway",
