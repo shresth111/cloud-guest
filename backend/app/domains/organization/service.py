@@ -322,6 +322,39 @@ class OrganizationService:
         )
         return updated
 
+    async def sync_subscription_tier(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        subscription_tier: str | None,
+    ) -> Organization:
+        """Narrow, additive hook for the Billing domain (BE-013 Part 1):
+        keeps the legacy, denormalized ``Organization.subscription_tier``
+        label in sync with the real ``License``/``Plan`` relationship that
+        domain now maintains as the actual source of truth. See
+        ``app.domains.billing.models``'s module docstring for the full
+        decision write-up of why ``subscription_tier`` -- reserved,
+        unpopulated, and documented as carrying "no pricing/entitlement
+        logic" since Module 005 -- is kept as a best-effort, write-only-from-
+        Billing's-perspective convenience column rather than removed or
+        duplicated.
+
+        Deliberately minimal: writes exactly one column, no other
+        organization state is touched, no
+        ``OrganizationStatus.ARCHIVED``/tenant-scope check is performed
+        (billing operations are platform-level and already independently
+        authorized by RBAC before this is ever called), and no audit entry
+        is written here -- ``app.domains.billing.service.LicenseService``
+        already writes its own ``license_assigned``/``license_upgraded``/
+        ``license_downgraded`` audit row for the event that triggers this
+        sync; a second, organization-flavoured audit row for the same
+        moment would be pure duplication.
+        """
+        organization = await self.get_organization(organization_id)
+        return await self.repository.update_organization(
+            organization, {"subscription_tier": subscription_tier}
+        )
+
     async def _assert_valid_parent(
         self,
         parent_organization_id: uuid.UUID,

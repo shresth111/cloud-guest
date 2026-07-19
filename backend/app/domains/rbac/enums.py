@@ -318,3 +318,34 @@ class AuditAction(StrEnum):
     GUEST_SESSION_DISCONNECTED = "guest_session_disconnected"
     GUEST_SESSION_TERMINATED = "guest_session_terminated"
     RADIUS_NAS_REGISTERED = "radius_nas_registered"
+
+    # Billing domain events (Module 013 Part 1: Plan + License + Usage Core)
+    # -- written through this same table by
+    # ``app.domains.billing.service.PlanService``/``LicenseService`` via the
+    # same narrow ``AuditLogWriter`` protocol shape every other domain's
+    # service uses (see ``AuditLogEntry``'s "other domains could plausibly
+    # reuse it" design). Billing is a brand-new domain, not an extension of
+    # an existing one -- the precedent followed here is the one every other
+    # brand-new domain in this codebase's history has followed at its own
+    # first Part (Organization/Module 005, Location/Module 006,
+    # User/Module 007, Router/Module 008, Router Provisioning/Module 009,
+    # WireGuard/Module 009 Part 3, OTP/Voucher/Captive Portal/Guest/Module
+    # 010): add its own additive block of ``AuditAction`` values directly
+    # here, never a domain-local constants shadow of this same enum. Every
+    # Plan catalog mutation (create/update/deactivate) and every License
+    # lifecycle transition (assign/activate/suspend/upgrade/downgrade/
+    # expire/cancel) is audited -- the same moderate-volume,
+    # admin-attributable event profile every prior domain's own additions
+    # already cover this way. Usage recording/limit-check reads are never
+    # audited (a pure read/recompute triggers no state change a human made,
+    # mirroring every other domain's own "reads aren't audited" convention).
+    PLAN_CREATED = "plan_created"
+    PLAN_UPDATED = "plan_updated"
+    PLAN_DEACTIVATED = "plan_deactivated"
+    LICENSE_ASSIGNED = "license_assigned"
+    LICENSE_ACTIVATED = "license_activated"
+    LICENSE_SUSPENDED = "license_suspended"
+    LICENSE_EXPIRED = "license_expired"
+    LICENSE_CANCELLED = "license_cancelled"
+    LICENSE_UPGRADED = "license_upgraded"
+    LICENSE_DOWNGRADED = "license_downgraded"

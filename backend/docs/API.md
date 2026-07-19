@@ -1378,3 +1378,97 @@ schedule failing never blocks the rest of the hourly batch -- see FLOW.md
 §51 for the exact per-schedule failure-isolation contract (mirroring
 Module 012 Part 1's own per-organization aggregation-batch isolation).
 
+## Billing Endpoints (Module 013 Part 1: Plan + License + Usage Core)
+
+See `docs/billing/README.md`/`FLOW.md`/`DATABASE.md` for the full design
+write-up -- including the `Organization.subscription_tier` relationship
+decision, the `PlanFeature` typed-column choice, the full `License` status
+transition graph, the `LicenseChangeLog` history mechanism, the
+license-expiry-sweep scope decision, and exactly which existing domains'
+data backs every `UsageMetric`.
+
+### Plans (`billing.*`, reused -- no new `PermissionModule`)
+
+`POST /plans` -- create a plan (unlimited plans, per the spec). Requires
+`billing.manage` at **`GLOBAL`** scope explicitly (the pricing catalog is
+platform-wide; in this codebase's seed data that's `Super Admin`/
+`Platform Admin`/`Billing Manager`). Body: name/slug/`plan_type`/
+`billing_cycle`/`base_price` (a `Decimal`, never a float)/`currency`/
+`is_active`/`is_public`/`sort_order`/`features` (a list of
+`{feature_key, feature_type, limit_value|is_enabled|tier_value}`, exactly
+one of the three value columns populated per `feature_type`).
+
+`GET /plans` -- requires `billing.read`. `include_private=true` is only
+honored for a caller who independently holds `billing.manage` at `GLOBAL`
+scope (checked inline via `AccessValidator.has_permission`); every other
+caller always sees `is_public=true` plans only. Filterable by
+`is_active`/`plan_type`, paginated.
+
+`GET /plans/{plan_id}` -- requires `billing.read`; no public/private
+filtering (knowing the id is treated as sufficient).
+
+`PUT /plans/{plan_id}` -- requires `billing.update` at `GLOBAL` scope.
+Partial update; supplying `features` fully replaces the plan's feature
+set.
+
+`DELETE /plans/{plan_id}` -- requires `billing.manage` at `GLOBAL` scope.
+Deactivates (`is_active=false` + soft delete), never a hard delete.
+
+### Licenses (`subscriptions.*`, reused -- no new `PermissionModule`)
+
+`POST /licenses` -- requires `subscriptions.create`. Body:
+`organization_id`, `plan_id`, optional `expires_at`. One `License` row per
+organization, ever (`organization_id` unique) -- a second call for the
+same organization is a `409` (`DuplicateLicenseError`); use
+upgrade/downgrade to change plans instead. Starts in
+`pending_activation`.
+
+`GET /licenses/me` -- requires `subscriptions.read` plus a resolved
+`X-Organization-Id` (`RequireOrganization`) -- the caller's own
+organization's license.
+
+`GET /licenses/{organization_id}` -- requires `subscriptions.read` --
+any organization's license (RBAC scope governs which organizations a
+caller may query).
+
+`GET /licenses/{license_id}/history` -- requires `subscriptions.read` --
+the full, ordered `LicenseChangeLog` for this license (every
+assign/upgrade/downgrade, `from_plan_id`/`to_plan_id`/`changed_at`/
+`changed_by_user_id`/`reason`).
+
+`POST /licenses/{license_id}/activate` -- requires `subscriptions.update`.
+Legal from `pending_activation` or `suspended` only (see FLOW.md's full
+transition graph).
+
+`POST /licenses/{license_id}/suspend` -- requires `subscriptions.update`.
+Body: `reason` (required). Legal from `active` only.
+
+`POST /licenses/{license_id}/cancel` -- requires `subscriptions.update`.
+One additive endpoint beyond the spec's explicit list -- `cancelled` is a
+first-class, required terminal state in the transition graph and needs a
+real route to reach it (see FLOW.md). Terminal; legal from any
+non-terminal state.
+
+`POST /licenses/{license_id}/upgrade` / `POST /licenses/{license_id}/downgrade`
+-- requires `subscriptions.update`. Body: `new_plan_id`, optional `reason`.
+Legal only when the license is currently `active`; rejects a no-op
+same-plan call (`409`). A downgrade additionally recomputes the
+organization's real current usage and rejects (`409`,
+`DowngradeBelowUsageError`, naming every exceeded metric) a change that
+would immediately violate the target plan's own `LIMIT` features. Both
+record a real `LicenseChangeLog` row and re-sync
+`Organization.subscription_tier` to the new plan's slug.
+
+### Usage
+
+`GET /usage/{organization_id}` -- requires `billing.read`. Returns this
+organization's current-period `UsageMetric` values (computing them fresh
+if nothing has been recorded yet this calendar month) plus, for every
+metric with a corresponding `LIMIT`-typed `PlanFeature` on the
+organization's active license's plan, whether it is currently exceeded.
+
+`POST /usage/{organization_id}/refresh` -- requires `billing.update`.
+Forces a real recomputation (never a cached/stale read) of every
+`UsageMetric` for this organization, then returns the same
+usage-vs-limit summary as the `GET` above.
+
