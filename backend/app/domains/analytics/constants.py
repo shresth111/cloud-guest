@@ -117,6 +117,39 @@ AUDIT_ACTION_DASHBOARD_LOCATION_VIEWED = "dashboard_location_viewed"
 DASHBOARD_AUDIT_THROTTLE_MINUTES = 15
 DASHBOARD_AUDIT_THROTTLE_KEY_TEMPLATE = "dashboard_audit_throttle:{key}"
 
+# ============================================================================
+# BE-012 Part 3: Router + Network + Guest + Authentication Analytics
+# ============================================================================
+
+# Default trailing window (days) applied to every Part 3 analytics endpoint
+# when the caller omits explicit ``start_date``/``end_date`` query params --
+# reuses the exact same "30 days" figure ``MONTHLY_WINDOW_DAYS`` already
+# establishes elsewhere in this domain, kept as its own named constant here
+# since it plays a different role (an HTTP query-param default, not a
+# snapshot-summation window).
+DEFAULT_ANALYTICS_WINDOW_DAYS = MONTHLY_WINDOW_DAYS
+
+# How many days of ``RouterHealthSnapshot`` history feed the "average"
+# baseline a router's current CPU/RAM reading is compared against to derive
+# a trend direction (see ``domain_analytics_service.py``'s Router Analytics
+# docstring for the exact formula: current reading vs. this window's own
+# average, via ``dashboard_aggregation.compute_growth``).
+ROUTER_HEALTH_TREND_WINDOW_DAYS = 7
+
+# Default/maximum "top N" size for Network Analytics' Top Consumers/
+# Locations/Routers and Guest Analytics' Top Devices/Locations.
+TOP_N_DEFAULT = 10
+TOP_N_MAX = 50
+
+# ``audit_log_entries.action`` values this part's four new endpoints write --
+# same local-string-constant posture as Part 2's own dashboard-view actions
+# above (see that block's own docstring for why these are not added to
+# ``app.domains.rbac.enums.AuditAction``).
+AUDIT_ACTION_ROUTER_ANALYTICS_VIEWED = "router_analytics_viewed"
+AUDIT_ACTION_NETWORK_ANALYTICS_VIEWED = "network_analytics_viewed"
+AUDIT_ACTION_GUEST_ANALYTICS_VIEWED = "guest_analytics_viewed"
+AUDIT_ACTION_AUTHENTICATION_ANALYTICS_VIEWED = "authentication_analytics_viewed"
+
 __all__ = [
     "AnalyticsSnapshotType",
     "AnalyticsGranularity",
@@ -133,4 +166,12 @@ __all__ = [
     "AUDIT_ACTION_DASHBOARD_LOCATION_VIEWED",
     "DASHBOARD_AUDIT_THROTTLE_MINUTES",
     "DASHBOARD_AUDIT_THROTTLE_KEY_TEMPLATE",
+    "DEFAULT_ANALYTICS_WINDOW_DAYS",
+    "ROUTER_HEALTH_TREND_WINDOW_DAYS",
+    "TOP_N_DEFAULT",
+    "TOP_N_MAX",
+    "AUDIT_ACTION_ROUTER_ANALYTICS_VIEWED",
+    "AUDIT_ACTION_NETWORK_ANALYTICS_VIEWED",
+    "AUDIT_ACTION_GUEST_ANALYTICS_VIEWED",
+    "AUDIT_ACTION_AUTHENTICATION_ANALYTICS_VIEWED",
 ]

@@ -63,6 +63,18 @@ class GuestAnalyticsLookupProtocol(Protocol):
     ) -> GuestSummaryLike: ...
 
 
+def new_guest_count(*, unique_guests: int, returning_guests: int) -> int:
+    """``guest_count_new = max(unique_guests - returning_guests, 0)`` --
+    pulled out as its own tiny, named function (rather than left as an
+    inline expression repeated at every call site) so BE-012 Part 3's own
+    Guest Analytics endpoint (``domain_analytics_service.py``) can reuse the
+    *exact* same "new guests" definition this module's own
+    ``compute_org_daily_summary``/``compute_location_daily_summary`` already
+    established, instead of re-deriving a second, possibly-inconsistent
+    formula for the same concept."""
+    return max(unique_guests - returning_guests, 0)
+
+
 def _router_counts(rows: list[tuple[str, int]]) -> tuple[int, int, int]:
     """Reduces a ``[(status, count), ...]`` ``GROUP BY`` result (real SQL,
     from ``AnalyticsRepositoryProtocol.count_routers_by_status``) into
@@ -103,7 +115,10 @@ async def compute_org_daily_summary(
 
     return {
         "guest_count_unique": summary.unique_guests,
-        "guest_count_new": max(summary.unique_guests - summary.returning_guests, 0),
+        "guest_count_new": new_guest_count(
+            unique_guests=summary.unique_guests,
+            returning_guests=summary.returning_guests,
+        ),
         "guest_count_returning": summary.returning_guests,
         "session_count_total": summary.visitors,
         "session_count_active": active_sessions,
@@ -143,7 +158,10 @@ async def compute_location_daily_summary(
 
     return {
         "guest_count_unique": summary.unique_guests,
-        "guest_count_new": max(summary.unique_guests - summary.returning_guests, 0),
+        "guest_count_new": new_guest_count(
+            unique_guests=summary.unique_guests,
+            returning_guests=summary.returning_guests,
+        ),
         "guest_count_returning": summary.returning_guests,
         "session_count_total": summary.visitors,
         "session_count_active": active_sessions,
@@ -188,6 +206,7 @@ async def compute_platform_daily_summary(
 __all__ = [
     "GuestSummaryLike",
     "GuestAnalyticsLookupProtocol",
+    "new_guest_count",
     "compute_org_daily_summary",
     "compute_location_daily_summary",
     "compute_platform_daily_summary",

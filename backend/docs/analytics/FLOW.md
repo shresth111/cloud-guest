@@ -694,3 +694,343 @@ with RBAC's public storage surface, without editing RBAC's own file.
 | Auth methods, OTP/voucher stats, captive portal usage, peak hour/day, device/browser/OS, bandwidth/average-session | Live aggregate (none of these are captured in a snapshot's `metrics` shape) |
 | Traffic trend (Organization Dashboard) | `ORG_DAILY_SUMMARY` snapshot history, day-over-day |
 | Health Score | Live router/alert counts + snapshot-derived growth direction |
+
+---
+
+# BE-012 Part 3: Router + Network + Guest + Authentication Analytics
+
+Everything below extends this same domain -- no new top-level domain, one
+new table-column (`guest_sessions.accept_language`, the exact same
+conditionally-permitted pattern Part 2 used for `user_agent`). New modules
+added to `app.domains.analytics`: `domain_analytics_schemas.py`,
+`domain_analytics_service.py`, `router_availability.py` -- plus extensions
+to `repository.py`, `dependencies.py`, `router.py`, `constants.py`,
+`aggregation.py` (one small shared helper), and `dashboard_aggregation.py`
+(new pure computation helpers, plus two functions moved out of
+`dashboard_service.py` for reuse -- see §29).
+
+## 23. Bandwidth: from `GuestSession`, never from `RouterHealthSnapshot`
+
+`app.domains.router_provisioning.models.RouterHealthSnapshot` captures only
+`health_status`/`cpu_usage_percent`/`memory_usage_percent`/`uptime_seconds`/
+`connected_clients_count` -- confirmed by reading the model in full. There
+has never been a real MikroTik device in this sandbox to report a byte
+counter, and inventing one with no real writer would be exactly the kind of
+fabrication this part's honesty mandate forbids.
+
+Every guest session, however, already records which router it connected
+through (`GuestSession.router_id`) and how many bytes it moved
+(`bytes_uploaded`/`bytes_downloaded`) -- Router Analytics' "Bandwidth" and
+Network Analytics' "Download/Upload Usage" are therefore real,
+`GROUP BY router_id`/organization-wide `SUM` aggregates over `GuestSession`
+(`AnalyticsRepository.get_bandwidth_by_router`/
+`get_network_bandwidth_totals`), never a fabricated per-router counter on a
+table that has no byte-counter column at all.
+
+## 24. Hotspot Sessions == Guest Sessions (an equivalence, not a new concept)
+
+There is no separate "hotspot session" table or concept anywhere in this
+codebase. Every guest WiFi connection *is* a `GuestSession` row -- "Hotspot
+Sessions" per router is simply that router's `GuestSession` count within
+the window (the same `GROUP BY router_id` query that already produces
+bandwidth also produces this count, in one aggregate, not two). This is
+documented directly on the response
+(`RouterAnalyticsItem.hotspot_sessions_note`) rather than silently implied,
+and the same number doubles as "RADIUS Success" per router (see §26).
+
+## 25. Internet Availability: a documented proxy signal, reusing monitoring's own threshold
+
+`Router.status == ONLINE` alone is not a trustworthy "is this router's
+internet uplink up right now" signal: nothing in `app.domains.router`
+automatically flips an `ONLINE` router to `OFFLINE` purely from a missed
+heartbeat -- that only happens the next time `RouterService.heartbeat` (or
+an explicit status endpoint) runs. `app.domains.monitoring.constants
+.RouterLifecycleStage`'s own module docstring already documents this exact
+gap for its own ZTP dashboard, and `app.domains.monitoring.validators
+.compute_lifecycle_stage` already resolves it by combining `Router.status`
+with `Router.last_seen_at` recency.
+
+`app.domains.analytics.router_availability.compute_internet_availability`
+reuses that *exact* resolution, reduced to a plain boolean: `Router.status
+== ONLINE` **and** `Router.last_seen_at` is no more than
+`app.domains.monitoring.constants.ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`
+old -- the identical constant `compute_lifecycle_stage` itself already uses
+for its own `ONLINE -> OFFLINE` staleness rule, reused directly rather than
+re-derived as a second, possibly-inconsistent number. This mirrors
+`app.domains.monitoring.service.MonitoringService.check_freeradius_health`/
+`check_wireguard_health`'s own documented "proxy signal, not a live daemon
+ping" posture -- there is no live internet/uplink probe anywhere in this
+sandbox, and none is fabricated here. Network Analytics' "Network
+Availability" is a straight platform/org-wide rollup of the same per-router
+signal (`available_router_count / total_router_count`).
+
+## 26. Authentication Requests / RADIUS Success / RADIUS Failure: exact scoping
+
+Checked first, per this part's own mandate: does `GuestLoginHistory` carry a
+`router_id`? Reading `app.domains.guest.models.GuestLoginHistory` in full
+confirms it does **not** -- only `organization_id`/`location_id`. Only
+`GuestSession` (created exclusively on a *successful* login or reconnect)
+carries `router_id`. This drove an explicit, honest design rather than a
+silent approximation:
+
+* **RADIUS Success** (per router) is exact: `GuestSession` count for that
+  router within the window (`AnalyticsRepository.get_bandwidth_by_router`'s
+  own `session_count` column -- see §24, the same number as "Hotspot
+  Sessions", documented as identical rather than coincidental).
+* **RADIUS Failure** (per router) is a *location-level proxy*:
+  `GuestLoginHistory` failures grouped by `location_id`
+  (`AnalyticsRepository.get_login_failure_counts_by_location`), attributed
+  to every router at that router's own location. `RouterAnalyticsItem
+  .radius_failure_scope_note` states this plainly: at a location with more
+  than one router, this number is shared across all of them, not an exact
+  per-device figure. This is the precise, honest boundary of what the
+  existing schema can answer -- adding a `router_id` column to
+  `GuestLoginHistory` would fix this exactly, but this part's directory
+  rule (extend `analytics` only, compose with `guest`'s existing public
+  interface) does not license that schema change.
+* **Authentication Requests Total** (per router) =
+  `radius_success_count + radius_failure_count`.
+
+## 27. Guest Retention: exact formula and two-part real/pure split
+
+**Formula**: the percentage of guests seen in the immediately preceding
+period (of equal length to the caller's own window) who were *also* seen
+again in the current period --
+
+```text
+retention_rate_percent = |current_period_guest_ids ∩ previous_period_guest_ids|
+                          / |previous_period_guest_ids| * 100
+```
+
+`None` (never a fabricated `0.0`) when the previous period had zero guests
+-- an undefined ratio, not a real zero, mirroring `compute_growth`'s own
+"never divide by zero" discipline.
+
+Mirrors `peak_concurrency.py`'s own "real SQL narrows, pure function
+computes" split: `AnalyticsRepository.get_distinct_guest_ids` is a real,
+bounded `SELECT DISTINCT GuestSession.guest_id` for one window (two calls,
+current and previous period), and `dashboard_aggregation
+.compute_guest_retention_rate` is a pure Python set-intersection over those
+two already-small id sets -- a mathematical operation over primary keys,
+not the "Python-side loop over bulk-fetched business rows" this codebase's
+own coding rules warn against.
+
+`tests/unit/test_analytics_router_network_guest_auth.py::test_guest_
+analytics_retention_multi_period_fixture` verifies this against a
+constructed 4-guest, two-period fixture (3 previous-period guests, 2
+retained into the current period plus 1 brand-new guest -> 66.7%
+retention).
+
+## 28. Peak Bandwidth: exact formula, and why it is snapshot-bucket-based
+
+**Formula**: the single highest-`total_bandwidth_bytes` bucket among recent
+`ORG_DAILY_SUMMARY` `AnalyticsSnapshot` history for the requested window --
+one bucket = one already-computed daily rollup's own
+`[period_start, period_end)` window and its `total_bandwidth_bytes` value.
+`dashboard_aggregation.compute_peak_bandwidth` is a pure `max(..., key=...)`
+over already-fetched `(bucket_start, bucket_end, bytes_total)` tuples --
+`AnalyticsRepository.list_snapshots` (a method that already existed since
+Part 1) supplies the real, bounded SQL fetch, and `domain_analytics_service
+.py`'s `_compute_peak_bandwidth_response` reuses the exact same fetched
+snapshot list for both Peak Bandwidth *and* Traffic Trend (one query, two
+figures).
+
+**This is "bytes transferred within the busiest already-computed bucket,"
+never an instantaneous bits-per-second throughput rate.** No such rate
+exists anywhere in this codebase's real data -- neither `GuestSession` nor
+`RouterHealthSnapshot` records a point-in-time rate, only cumulative byte
+counters, so a genuine "peak Mbps" figure cannot be honestly derived from
+anything this sandbox has. `PeakBandwidthResponse.formula_note` states this
+explicitly on every response. Reported `available: false` (never a
+fabricated zero) when no snapshot history exists yet for the window (e.g.
+before Celery's aggregation pipeline has ever run for that organization) --
+`tests/unit/test_analytics_router_network_guest_auth.py::test_network_
+analytics_peak_bandwidth_unavailable_without_snapshots` verifies this.
+
+## 29. Refactor: `build_auth_method_breakdown`/`device_breakdown_response` moved to `dashboard_aggregation.py`
+
+Part 2's `dashboard_service.py` originally defined two private,
+underscore-prefixed helpers (`_build_auth_method_breakdown`,
+`_device_breakdown_response`) mapping real repository query results into
+API response schemas. Part 3's own Guest Analytics (device/browser/OS) and
+Authentication Analytics (auth-method breakdown) endpoints needed the
+*exact same* mappings -- rather than copy-pasting either function a second
+time (this part's explicit "compose, don't duplicate" mandate), both were
+promoted to public functions on `dashboard_aggregation.py`
+(`build_auth_method_breakdown`/`device_breakdown_response`) and
+`dashboard_service.py` was updated to import and call them instead of its
+own now-removed private copies. This is a pure, behavior-preserving
+refactor -- every one of Part 2's own dashboard tests
+(`tests/unit/test_analytics_dashboards.py`) still passes unchanged, since
+the two functions' bodies moved verbatim, only their module and visibility
+changed.
+
+## 30. Composing with BE-010's own Guest Analytics, not re-deriving it
+
+Checked first, per this part's own "prefer composing" mandate:
+`app.domains.guest.service.GuestAnalyticsService` already exposes
+`get_summary` (visitors/unique/returning guests, average session duration,
+total bandwidth), `get_top_devices`, `get_top_locations`,
+`get_otp_success_rate`, and `get_voucher_usage` -- all real, tenant-scoped
+SQL aggregates BE-010 Part 4 already built. Guest Analytics
+(`GET /analytics/guests`) calls into `get_summary`/`get_top_devices`/
+`get_top_locations` directly, through `GuestAnalyticsCompositionProtocol`
+(a narrow, duck-typed protocol satisfied by the real service, the identical
+composition pattern `aggregation.GuestAnalyticsLookupProtocol` and
+`dashboard_service.py`'s own guest-analytics composition already
+establish) -- never re-deriving "New Guests"/"Returning Guests"/"Unique
+Guests"/"Top Devices"/"Top Locations" with a second, possibly-inconsistent
+definition.
+
+`tests/unit/test_analytics_router_network_guest_auth
+.py::test_guest_analytics_composes_with_guest_analytics_service` verifies
+this with a spy fake (`_FakeGuestAnalyticsService`) that records every call
+it receives and asserts `get_summary`/`get_top_devices`/`get_top_locations`
+were all actually invoked by `DomainAnalyticsService.get_guest_analytics`.
+
+"New Guests" reuses `aggregation.new_guest_count` -- the exact same
+`max(unique_guests - returning_guests, 0)` formula Part 1's own
+`compute_org_daily_summary`/`compute_location_daily_summary` already
+established for the identical concept, pulled out into its own small,
+named, shared function specifically so Part 3 does not re-derive the same
+formula inline a second time. "Repeat Visits" is a distinct, real metric
+this part adds: `visitors - unique_guests` -- sessions beyond each guest's
+*first* visit *within this window* (documented, via
+`GuestAnalyticsResponse.repeat_visits_note`, as different from
+`returning_guests`, which is guests with a *lifetime*
+`total_visit_count > 1`).
+
+"Top Devices"/"OS"/"Browser Statistics" compose with **two** real,
+independent sources rather than one: `GuestAnalyticsService.get_top_devices`
+(BE-010's own MAC-address-ranked physical device list) for "Top Devices",
+and `AnalyticsRepository.get_user_agent_breakdown` -- Part 2's own real
+User-Agent classification SQL, extended (see §33) to accept an optional
+`location_id` so this organization-scoped endpoint can reuse the identical
+classifier organization-wide -- for the OS/browser/device-type breakdown.
+Neither is reimplemented a second time.
+
+## 31. Voucher Failure: an honestly partial signal, and why
+
+Checked first, per this part's honesty mandate: is a failed voucher
+redemption attempt tracked anywhere queryable? Reading
+`app.domains.voucher.service`'s own module docstring ("Audit-volume
+judgment call" section) in full confirms: **only** an attempted reuse of an
+already-`revoked`/`exhausted` code is written to `audit_log_entries`
+(`AuditAction.VOUCHER_REDEMPTION_FAILED`) -- routine failures
+(`not_found`/`batch_not_active`/`expired`, a guest presenting an old or
+not-yet-live code) are logged via the structured logger only, never
+persisted anywhere queryable, by that module's own explicit, pre-existing
+design (not something this part changed or could change without touching
+`app.domains.voucher`, which this part's directory rule does not permit).
+
+`AnalyticsRepository.get_voucher_redemption_failed_audit_count` therefore
+returns a real but **partial** count -- a genuine lower bound on total
+voucher failures, not the total. `VoucherAuthStatsResponse
+.failure_tracking_note` states this explicitly on every response, mirroring
+this part's overall honesty posture: report exactly what is real, and say
+so precisely when a real number is known to be incomplete, rather than
+implying it is the whole picture. "Voucher Success" (`redeemed_count`), by
+contrast, is a complete, real, time-windowed count of `Voucher.redeemed_at`
+-- every successful redemption is durably recorded on the `Voucher` row
+itself.
+
+## 32. Honest placeholders in this part
+
+Five bullets have no real data source anywhere in this codebase, following
+Part 2's exact `available: bool = False` + explanatory `message` shape
+(`UnavailableMetricResponse`, this part's one generic, reusable placeholder
+schema -- see `domain_analytics_schemas.py`'s own module docstring for why
+it is reused instead of four bespoke schemas):
+
+* **Router disk usage/temperature/packet loss/latency** -- confirmed by
+  reading `RouterHealthSnapshot` in full: only `health_status`/
+  `cpu_usage_percent`/`memory_usage_percent`/`uptime_seconds`/
+  `connected_clients_count` exist. No real MikroTik device has ever
+  reported anything else in this sandbox.
+* **Network "Top Applications"** -- no deep packet inspection /
+  application-layer traffic classification exists, or could exist without
+  new network infrastructure this part's directory rule does not license
+  inventing.
+* **Authentication "PMS Login"** -- no Property Management System
+  integration exists anywhere in this codebase (confirmed: no `pms`
+  domain, no PMS-shaped fields on any existing model).
+* **Authentication "Social Login"** -- confirmed by reading
+  `app.domains.captive_portal.models.CaptivePortalConfig
+  .social_login_enabled`'s own docstring: "a schema-only readiness flag,
+  not a working feature." No real OAuth/social-login integration exists or
+  is attempted anywhere in this codebase.
+* **Country Statistics** (Guest Analytics) -- reuses Part 2's own
+  `CountryStatisticsResponse` and exact reasoning verbatim (§17 above): no
+  GeoIP database or IP-geolocation service exists anywhere in this sandbox.
+  Not re-litigated -- the same honest conclusion Part 2 already reached
+  still holds.
+
+## 33. `get_user_agent_breakdown`: `location_id` made optional (additive signature change)
+
+Part 2's original signature required a non-`None` `location_id` (the
+Location Dashboard is always location-scoped). Part 3's own organization-
+scoped Guest Analytics endpoint needs the *identical* classification query,
+organization-wide, with an *optional* `location_id` narrowing filter --
+rather than duplicate the entire classifier a second time with a subtly
+different signature, `AnalyticsRepositoryProtocol
+.get_user_agent_breakdown`'s `location_id` parameter was widened to
+`uuid.UUID | None`, and the method body's `GuestSession.location_id ==
+location_id` filter became conditional (`if location_id is not None`).
+Every existing call site (`dashboard_service.py`'s Location Dashboard)
+still always passes a real, non-`None` location, so this is a strictly
+additive, backward-compatible widening -- `tests/unit/test_analytics_
+dashboards.py`'s existing device-breakdown tests pass unchanged.
+
+## 34. The Accept-Language decision: applying Part 2's exact `user_agent` judgment call
+
+Per this part's explicit brief: apply the *same* judgment call Part 2 made
+for `User-Agent` to `Accept-Language` for "Language Statistics", and either
+do it for real (if it is an equally narrow, cheap, honest capture) or treat
+it as an honest placeholder -- not skip the decision either way.
+
+**Decision: do it for real.** `app.domains.guest.router`'s
+`guest_login_via_otp`/`guest_login_via_voucher` endpoints already receive a
+`Request` object (used for `ip_address` and, since Part 2, `User-Agent`) --
+reading one more header (`Accept-Language`) at the exact same two call
+sites is precisely as narrow and cheap as `user_agent` was, and the
+identical reasoning applies point-for-point:
+
+* **One new nullable column**: `GuestSession.accept_language` (`Text`,
+  nullable) -- the *raw* header value (e.g.
+  `"en-US,en;q=0.9,fr;q=0.8"`), never a pre-parsed primary language.
+  Storing it raw means a smarter future classifier never needs a backfill
+  migration, only a better read-side query -- the exact same "raw value,
+  not pre-parsed" reasoning `user_agent` already established.
+* **One line at each of the two login call sites**
+  (`app/domains/guest/router.py`): `accept_language =
+  request.headers.get("accept-language")`, threaded through
+  `GuestService.login_via_otp`/`login_via_voucher` (new, default-`None`
+  keyword parameters -- every existing caller/test that omits it behaves
+  exactly as before) into `_create_session`. `reconnect` also carries a
+  prior session's `accept_language` forward onto its derived new session,
+  mirroring `user_agent`'s identical "copy forward" discipline.
+* **One migration**:
+  `alembic/versions/0020_add_accept_language_to_guest_sessions.py` -- a
+  single `ALTER TABLE guest_sessions ADD COLUMN accept_language TEXT
+  NULL`, no index (same reasoning as `user_agent`'s own migration: never
+  filtered/joined on, only classified via SQL at read time). No
+  `alembic/env.py` change was needed -- `app.domains.guest.models` was
+  already imported there since Part 2.
+
+**Classification, at read time, real SQL**:
+`AnalyticsRepository.get_language_breakdown` extracts the primary language
+tag from the RFC 7231 `Accept-Language` header shape (a comma-separated,
+quality-weighted list, most-preferred-first) via
+`split_part(split_part(accept_language, ',', 1), ';', 1)`, trimmed --
+`"en-US;q=0.9,fr;q=0.8"` -> `"en-US;q=0.9"` -> `"en-US"` -- then
+`GROUP BY`/`COUNT`, mirroring `get_user_agent_breakdown`'s identical
+"classify via real SQL at read time, never a Python-side parsing loop"
+discipline, and its identical honest-coverage shape
+(`sessions_total`/`sessions_with_data`).
+
+**Files touched inside `app.domains.guest`, exhaustively**: `models.py`
+(the one column), `router.py` (two one-line header captures at the two
+existing login endpoints), `service.py` (a new, default-`None` keyword
+parameter threaded through `login_via_otp`/`login_via_voucher`/
+`_create_session`/`reconnect`). Nothing else in that domain was touched --
+identical scope to `user_agent`'s own Part 2 change.

@@ -481,6 +481,7 @@ class GuestService:
         device_name: str | None = None,
         ip_address: str | None = None,
         user_agent: str | None = None,
+        accept_language: str | None = None,
     ) -> GuestLoginResult:
         if auth_method not in (GuestAuthMethod.OTP_SMS, GuestAuthMethod.OTP_EMAIL):
             raise GuestAuthMethodNotEnabledError(auth_method.value)
@@ -534,6 +535,7 @@ class GuestService:
             voucher_id=None,
             ip_address=ip_address,
             user_agent=user_agent,
+            accept_language=accept_language,
             data_limit_mb=None,
             session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
         )
@@ -582,6 +584,7 @@ class GuestService:
         device_name: str | None = None,
         ip_address: str | None = None,
         user_agent: str | None = None,
+        accept_language: str | None = None,
     ) -> GuestLoginResult:
         identifier = normalize_identifier(identifier)
         resolved = await self._require_method_enabled(
@@ -634,6 +637,7 @@ class GuestService:
             voucher_id=voucher.id,
             ip_address=ip_address,
             user_agent=user_agent,
+            accept_language=accept_language,
             data_limit_mb=batch.data_limit_mb,
             session_timeout_minutes=batch.validity_minutes,
         )
@@ -1028,6 +1032,7 @@ class GuestService:
             voucher_id=prior.voucher_id,
             ip_address=ip_address,
             user_agent=prior.user_agent,
+            accept_language=prior.accept_language,
             data_limit_mb=prior.data_limit_mb,
             session_timeout_minutes=prior.session_timeout_minutes,
         )
@@ -1185,6 +1190,7 @@ class GuestService:
         data_limit_mb: int | None,
         session_timeout_minutes: int | None,
         user_agent: str | None = None,
+        accept_language: str | None = None,
     ) -> GuestSession:
         now = datetime.now(UTC)
         session = await self.repository.create_session(
@@ -1201,6 +1207,7 @@ class GuestService:
             last_activity_at=now,
             ip_address=ip_address,
             user_agent=user_agent,
+            accept_language=accept_language,
             bytes_uploaded=0,
             bytes_downloaded=0,
             data_limit_mb=data_limit_mb,

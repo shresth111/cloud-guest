@@ -51,16 +51,15 @@ from .constants import (
     AnalyticsSnapshotType,
 )
 from .dashboard_aggregation import (
+    build_auth_method_breakdown,
     compute_growth,
+    device_breakdown_response,
     growth_direction_to_health_direction,
     sum_metric_across_snapshots,
 )
 from .dashboard_audit import DashboardAuditThrottle
 from .dashboard_schemas import (
-    AuthMethodBreakdownItem,
     CountryStatisticsResponse,
-    DeviceBreakdownItem,
-    DeviceBreakdownResponse,
     GrowthPointResponse,
     HealthScoreResponse,
     LocationDashboardResponse,
@@ -78,7 +77,7 @@ from .dashboard_scope import (
 )
 from .health_score import compute_health_score
 from .peak_concurrency import compute_peak_concurrent_sessions
-from .repository import AnalyticsRepositoryProtocol, UserAgentBreakdown
+from .repository import AnalyticsRepositoryProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +378,7 @@ class DashboardService:
             start=window_start,
             end=now,
         )
-        auth_methods = _build_auth_method_breakdown(auth_rows)
+        auth_methods = build_auth_method_breakdown(auth_rows)
 
         otp_stats = await self.repository.get_otp_stats(
             organization_id=organization_id,
@@ -696,8 +695,8 @@ class DashboardService:
             total_bandwidth_bytes=monthly_summary.total_bandwidth_bytes,
             average_session_bandwidth_bytes=average_session_bandwidth,
             average_session_duration_seconds=monthly_summary.average_session_duration_seconds,
-            devices=_device_breakdown_response(device_breakdown),
-            auth_methods=_build_auth_method_breakdown(auth_rows),
+            devices=device_breakdown_response(device_breakdown),
+            auth_methods=build_auth_method_breakdown(auth_rows),
             country_statistics=CountryStatisticsResponse(),
         )
 
@@ -744,57 +743,6 @@ class DashboardService:
             organization_id=organization_id,
             location_id=location_id,
         )
-
-
-def _build_auth_method_breakdown(
-    rows: list[tuple[str, bool, int]],
-) -> list[AuthMethodBreakdownItem]:
-    by_method: dict[str, dict[str, int]] = {}
-    for auth_method, success, count in rows:
-        entry = by_method.setdefault(auth_method, {"success": 0, "failure": 0})
-        if success:
-            entry["success"] += count
-        else:
-            entry["failure"] += count
-    return [
-        AuthMethodBreakdownItem(
-            auth_method=auth_method,
-            successful_attempts=counts["success"],
-            failed_attempts=counts["failure"],
-        )
-        for auth_method, counts in sorted(by_method.items())
-    ]
-
-
-def _device_breakdown_response(
-    breakdown: UserAgentBreakdown,
-) -> DeviceBreakdownResponse:
-    message = None
-    if breakdown.sessions_total and not breakdown.sessions_with_user_agent:
-        message = (
-            "No sessions in this window captured a User-Agent header (all "
-            "predate this capture, or every guest device omitted it)."
-        )
-    elif not breakdown.sessions_total:
-        message = "No guest sessions in this window."
-    return DeviceBreakdownResponse(
-        available=True,
-        sessions_total=breakdown.sessions_total,
-        sessions_with_data=breakdown.sessions_with_user_agent,
-        by_os=[
-            DeviceBreakdownItem(label=label, session_count=count)
-            for label, count in breakdown.by_os
-        ],
-        by_browser=[
-            DeviceBreakdownItem(label=label, session_count=count)
-            for label, count in breakdown.by_browser
-        ],
-        by_device_type=[
-            DeviceBreakdownItem(label=label, session_count=count)
-            for label, count in breakdown.by_device_type
-        ],
-        message=message,
-    )
 
 
 __all__ = ["DashboardService", "AuditLogWriter"]

@@ -186,6 +186,9 @@ async def guest_login_via_otp(
     # full "narrow, additive hook" write-up and app.domains.analytics's own
     # honest read-side classification of this value.
     user_agent = request.headers.get("user-agent")
+    # BE-012 Part 3: the exact same judgment call, applied to Accept-Language
+    # -- see app.domains.guest.models.GuestSession.accept_language's docstring.
+    accept_language = request.headers.get("accept-language")
     result = await service.login_via_otp(
         identifier=payload.identifier,
         code=payload.code,
@@ -197,6 +200,7 @@ async def guest_login_via_otp(
         device_name=payload.device_name,
         ip_address=ip_address,
         user_agent=user_agent,
+        accept_language=accept_language,
     )
     return build_response(
         success=True,
@@ -218,6 +222,7 @@ async def guest_login_via_voucher(
 ):
     ip_address = payload.ip_address or (request.client.host if request.client else None)
     user_agent = request.headers.get("user-agent")
+    accept_language = request.headers.get("accept-language")
     result = await service.login_via_voucher(
         code=payload.code,
         identifier=payload.identifier,
@@ -228,6 +233,7 @@ async def guest_login_via_voucher(
         device_name=payload.device_name,
         ip_address=ip_address,
         user_agent=user_agent,
+        accept_language=accept_language,
     )
     return build_response(
         success=True,

@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import app.domains.analytics.dashboard_service as dashboard_service_module
 from app.domains.analytics.constants import AnalyticsSnapshotType
 from app.domains.analytics.dashboard_aggregation import (
     TrendDirection,
@@ -768,8 +769,26 @@ def _global_service(
     )
 
 
-async def test_get_super_admin_dashboard_aggregates_and_computes_peak():
-    now = _now()
+async def test_get_super_admin_dashboard_aggregates_and_computes_peak(monkeypatch):
+    """Pins ``dashboard_service``'s notion of "now" to a fixed, arbitrary
+    noon rather than the real wall clock: the service computes the peak-
+    concurrency window as ``[today_start, now]`` (see
+    ``get_super_admin_dashboard``), and this test's fixture intervals are
+    hardcoded at hours 1-4 relative to midnight -- if real wall-clock "now"
+    happens to fall before those hours (e.g. the suite runs at 01:00 UTC),
+    the second interval gets clipped away by
+    ``compute_peak_concurrent_sessions``'s window-end clamp before the
+    sweep ever sees it, silently collapsing the expected peak of 2 down to
+    1. Fixing "now" at noon removes that flakiness entirely regardless of
+    when the suite actually runs."""
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(dashboard_service_module, "datetime", _FixedDateTime)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     repository = _FakeDashboardRepository(
         total_organizations=4,

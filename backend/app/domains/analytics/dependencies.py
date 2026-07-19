@@ -27,9 +27,12 @@ from app.domains.organization.service import OrganizationService
 from app.domains.rbac.authorization import RoleResolver
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
+from app.domains.wireguard.dependencies import get_wireguard_service
+from app.domains.wireguard.service import WireGuardService
 
 from .dashboard_scope import DashboardScopeResolver
 from .dashboard_service import DashboardService
+from .domain_analytics_service import DomainAnalyticsService
 from .repository import AnalyticsRepository, AnalyticsRepositoryProtocol
 from .service import AnalyticsService
 
@@ -87,9 +90,39 @@ def get_dashboard_service(
     )
 
 
+def get_domain_analytics_service(
+    repository: AnalyticsRepositoryProtocol = Depends(get_analytics_repository),
+    guest_analytics_service: GuestAnalyticsService = Depends(
+        get_guest_analytics_service
+    ),
+    scope_resolver: DashboardScopeResolver = Depends(get_dashboard_scope_resolver),
+    wireguard_service: WireGuardService = Depends(get_wireguard_service),
+    redis: Redis = Depends(get_redis_client),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> DomainAnalyticsService:
+    """Wires BE-012 Part 3's ``DomainAnalyticsService`` -- composes the same
+    ``AnalyticsRepository``/``GuestAnalyticsService``/``DashboardScopeResolver``/
+    Redis/audit-writer Part 2's own ``get_dashboard_service`` already wires,
+    plus one new composition point: the real
+    ``app.domains.wireguard.service.WireGuardService`` (via that domain's own
+    already-public ``get_wireguard_service`` dependency factory, reused
+    directly -- no file inside ``app.domains.wireguard`` is edited to make
+    this work), satisfying ``WireGuardHealthProtocol``'s single
+    ``compute_health_status`` method."""
+    return DomainAnalyticsService(
+        repository,
+        guest_analytics_service,
+        scope_resolver,
+        wireguard_service,
+        redis,
+        audit_writer=audit_repository,
+    )
+
+
 __all__ = [
     "get_analytics_repository",
     "get_analytics_service",
     "get_dashboard_scope_resolver",
     "get_dashboard_service",
+    "get_domain_analytics_service",
 ]

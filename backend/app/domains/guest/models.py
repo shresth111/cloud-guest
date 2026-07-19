@@ -259,6 +259,21 @@ class GuestSession(BaseModel):
     # honesty write-up on why this narrow, additive column exists and a
     # dedicated parsing library does not.
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # BE-012 Part 3 addition: the raw ``Accept-Language`` request header,
+    # captured at the exact same two login call sites and following the
+    # exact same judgment call as ``user_agent`` above (see that column's
+    # docstring) -- narrow, additive, nullable, best-effort, and the *raw*
+    # header value (e.g. ``"en-US,en;q=0.9,fr;q=0.8"``), never a pre-parsed
+    # primary language. Classification (extracting the primary language tag)
+    # happens at dashboard read time via real SQL (see
+    # ``app.domains.analytics.repository.AnalyticsRepository
+    # .get_language_breakdown``), the identical "store raw, parse at read
+    # time" reasoning ``user_agent`` already established, so a smarter future
+    # heuristic never needs a backfill migration. See
+    # ``docs/analytics/FLOW.md``'s "Language Statistics" section for the full
+    # write-up of why this was judged an equally narrow, cheap, honest
+    # capture worth doing for real.
+    accept_language: Mapped[str | None] = mapped_column(Text, nullable=True)
     bytes_uploaded: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     bytes_downloaded: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     # Copied from the redeemed voucher's batch (or a portal/location

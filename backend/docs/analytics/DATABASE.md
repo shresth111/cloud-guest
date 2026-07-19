@@ -155,3 +155,46 @@ rather than a `user-agents`-style parsing dependency. No other file in
 `app.domains.guest` beyond `models.py` (the column)/`router.py` (header
 capture)/`service.py` (threading the value through session creation) was
 touched to support this.
+
+---
+
+# BE-012 Part 3 schema additions
+
+One narrow, additive column (the same conditionally-permitted exception
+Part 2 used for `user_agent` -- see `FLOW.md` §34 for the full "why this
+was judged worth doing for real" write-up):
+
+## `guest_sessions.accept_language` (new column)
+
+Migration: `alembic/versions/0020_add_accept_language_to_guest_sessions.py`
+(revises `0019_add_user_agent_to_guest_sessions`). No `alembic/env.py`
+change was needed -- `app.domains.guest.models` was already imported there
+since Part 2.
+
+| Column | Type | Notes |
+|---|---|---|
+| `accept_language` | `Text`, nullable | The raw `Accept-Language` request header, captured best-effort at `app.domains.guest.service.GuestService.login_via_otp`/`login_via_voucher` (and copied forward by `reconnect`). `NULL` for every session created before this column existed, and for any guest device that omitted the header. No index -- never filtered/joined on, only classified via `split_part`/`GROUP BY` at dashboard read time (see below). |
+
+### Where this column is actually read: `AnalyticsRepository.get_language_breakdown`
+
+Extracts the primary language tag from the RFC 7231 `Accept-Language`
+header shape (comma-separated, quality-weighted, most-preferred-first) via
+`split_part(split_part(accept_language, ',', 1), ';', 1)`, trimmed, then
+`GROUP BY`/`COUNT` -- see `FLOW.md` §34 for the full write-up. No other
+file in `app.domains.guest` beyond `models.py`/`router.py`/`service.py` was
+touched -- identical scope to `user_agent`'s own Part 2 change.
+
+## No other schema changes
+
+Every other BE-012 Part 3 figure (Router/Network/Guest/Authentication
+Analytics) is a real SQL aggregate over already-existing tables
+(`GuestSession`, `GuestLoginHistory`, `Router`,
+`app.domains.router_provisioning.models.RouterHealthSnapshot`,
+`app.domains.wireguard.models.WireGuardPeer`,
+`app.domains.voucher.models.Voucher`/`VoucherBatch`,
+`app.domains.otp.models.OtpRequest`, `app.domains.rbac.models
+.AuditLogEntry`) -- see `AnalyticsRepository`'s own module docstring for
+the full "read another domain's table directly for a narrow aggregate"
+precedent this part continues, and `FLOW.md` §§23-34 for exactly which
+query backs which figure. No table was added, and no other existing
+table's columns changed.

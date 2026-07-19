@@ -49,7 +49,7 @@ organization-scoped endpoints already rely on, not reimplemented here.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query, Request, status
 
@@ -64,14 +64,30 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.rbac.enums import ScopeType
 
-from .constants import AnalyticsSnapshotType
+from .constants import (
+    DEFAULT_ANALYTICS_WINDOW_DAYS,
+    TOP_N_DEFAULT,
+    TOP_N_MAX,
+    AnalyticsSnapshotType,
+)
 from .dashboard_schemas import (
     LocationDashboardResponse,
     OrganizationDashboardResponse,
     SuperAdminDashboardResponse,
 )
 from .dashboard_service import DashboardService
-from .dependencies import get_analytics_service, get_dashboard_service
+from .dependencies import (
+    get_analytics_service,
+    get_dashboard_service,
+    get_domain_analytics_service,
+)
+from .domain_analytics_schemas import (
+    AuthenticationAnalyticsResponse,
+    GuestAnalyticsResponse,
+    NetworkAnalyticsResponse,
+    RouterAnalyticsResponse,
+)
+from .domain_analytics_service import DomainAnalyticsService
 from .models import AnalyticsSnapshot
 from .schemas import (
     AnalyticsSnapshotListResponse,
@@ -80,12 +96,28 @@ from .schemas import (
     TriggerAggregationResponse,
 )
 from .service import AnalyticsService
+from .validators import validate_date_range
 
 router = APIRouter(tags=["Analytics"])
 
 
 def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
+
+
+def _resolve_window(
+    start_date: datetime | None, end_date: datetime | None
+) -> tuple[datetime, datetime]:
+    """Resolves the ``[start, end]`` window every BE-012 Part 3 analytics
+    endpoint operates over: an explicit, validated caller-supplied range
+    when both bounds are given, else a trailing
+    ``DEFAULT_ANALYTICS_WINDOW_DAYS``-day window ending now (mirrors this
+    domain's own ``validators.day_bounds_utc``'s "sane default when the
+    caller supplies nothing" posture)."""
+    validate_date_range(start_date, end_date)
+    end = end_date or datetime.now(UTC)
+    start = start_date or (end - timedelta(days=DEFAULT_ANALYTICS_WINDOW_DAYS))
+    return start, end
 
 
 def _snapshot_response(snapshot: AnalyticsSnapshot) -> AnalyticsSnapshotResponse:
@@ -236,6 +268,156 @@ async def get_location_dashboard(
     return build_response(
         success=True,
         message="Location dashboard retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# BE-012 Part 3: Router + Network + Guest + Authentication Analytics
+#
+# Each is gated identically to Part 2's own Organization Dashboard: RBAC's
+# RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION) at the
+# route, plus DomainAnalyticsService's own, independent DashboardScope check
+# (the same DashboardScopeResolver Part 2 built -- see dashboard_scope.py's
+# module docstring for why both layers matter). organization_id is resolved
+# via RBAC's RequireOrganization (X-Organization-Id header), never a raw,
+# unchecked query parameter -- the same tenant-isolation guarantee every
+# other organization-scoped endpoint in this codebase already relies on.
+# ============================================================================
+
+
+@router.get(
+    "/analytics/routers",
+    response_model=ApiResponse[RouterAnalyticsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_router_analytics(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    start_date: datetime | None = Query(default=None),
+    end_date: datetime | None = Query(default=None),
+    service: DomainAnalyticsService = Depends(get_domain_analytics_service),
+):
+    start, end = _resolve_window(start_date, end_date)
+    payload = await service.get_router_analytics(
+        uuid.UUID(user.id),
+        organization_id,
+        location_id=location_id,
+        start=start,
+        end=end,
+    )
+    return build_response(
+        success=True,
+        message="Router analytics retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/network",
+    response_model=ApiResponse[NetworkAnalyticsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_network_analytics(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    start_date: datetime | None = Query(default=None),
+    end_date: datetime | None = Query(default=None),
+    limit: int = Query(default=TOP_N_DEFAULT, ge=1, le=TOP_N_MAX),
+    service: DomainAnalyticsService = Depends(get_domain_analytics_service),
+):
+    start, end = _resolve_window(start_date, end_date)
+    payload = await service.get_network_analytics(
+        uuid.UUID(user.id),
+        organization_id,
+        location_id=location_id,
+        start=start,
+        end=end,
+        limit=limit,
+    )
+    return build_response(
+        success=True,
+        message="Network analytics retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/guests",
+    response_model=ApiResponse[GuestAnalyticsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_guest_analytics(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    start_date: datetime | None = Query(default=None),
+    end_date: datetime | None = Query(default=None),
+    limit: int = Query(default=TOP_N_DEFAULT, ge=1, le=TOP_N_MAX),
+    service: DomainAnalyticsService = Depends(get_domain_analytics_service),
+):
+    start, end = _resolve_window(start_date, end_date)
+    payload = await service.get_guest_analytics(
+        uuid.UUID(user.id),
+        organization_id,
+        location_id=location_id,
+        start=start,
+        end=end,
+        limit=limit,
+    )
+    return build_response(
+        success=True,
+        message="Guest analytics retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/authentication",
+    response_model=ApiResponse[AuthenticationAnalyticsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_authentication_analytics(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    start_date: datetime | None = Query(default=None),
+    end_date: datetime | None = Query(default=None),
+    service: DomainAnalyticsService = Depends(get_domain_analytics_service),
+):
+    start, end = _resolve_window(start_date, end_date)
+    payload = await service.get_authentication_analytics(
+        uuid.UUID(user.id),
+        organization_id,
+        location_id=location_id,
+        start=start,
+        end=end,
+    )
+    return build_response(
+        success=True,
+        message="Authentication analytics retrieved",
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )

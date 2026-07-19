@@ -1074,3 +1074,87 @@ this one location), and a `country_statistics` object that is **always**
 `available: false` (see FLOW.md §17 -- no GeoIP/IP-geolocation data source
 exists in this environment).
 
+## Domain Analytics Endpoints (Module 012 Part 3: Router + Network + Guest + Authentication Analytics)
+
+See `docs/analytics/FLOW.md` §§23-34 for the full design write-up
+(bandwidth-from-`GuestSession` reasoning, the hotspot-sessions equivalence,
+the Internet Availability proxy signal, RADIUS success/failure scoping, the
+Guest Retention and Peak Bandwidth formulas, composing with BE-010's own
+Guest Analytics, the Voucher Failure honest-partial-signal gap, every
+honest placeholder, and the Accept-Language capture decision). All four
+endpoints require `analytics.read` at `ORGANIZATION` scope, plus a second,
+independent `DashboardScope.require_organization` check inside
+`DomainAnalyticsService` itself -- the same two-layer pattern Part 2's own
+dashboards already establish. `organization_id` is resolved via RBAC's
+`RequireOrganization` (`X-Organization-Id` header, membership-validated).
+Every endpoint accepts an optional `location_id` query parameter (narrows
+to one location within the organization) and optional `start_date`/
+`end_date` query parameters (ISO 8601 datetimes; default to a trailing
+30-day window ending now when omitted).
+
+### `GET /analytics/routers`
+
+Returns, per router in scope: CPU/RAM usage (current reading plus a trend
+direction against a trailing 7-day average -- real, from
+`RouterHealthSnapshot`), uptime and connected-clients count (real), total
+bandwidth uploaded/downloaded (real, aggregated from `GuestSession` -- see
+FLOW.md §23 for why this is not, and cannot be, read off
+`RouterHealthSnapshot`), Internet Availability (a documented proxy signal --
+see FLOW.md §25), WireGuard tunnel status (composed with
+`app.domains.wireguard.service.WireGuardService.compute_health_status`),
+Hotspot Sessions (real -- see FLOW.md §24 for the exact "guest sessions
+are hotspot sessions" equivalence), and Authentication Requests/RADIUS
+Success/RADIUS Failure (real per-router success count; a documented
+location-level proxy for failure -- see FLOW.md §26).
+`disk_usage`/`temperature`/`packet_loss`/`latency` are each **always**
+`available: false` -- no MikroTik device has ever reported any of the four
+in this sandbox.
+
+### `GET /analytics/network`
+
+Also accepts an optional `limit` query parameter (top-N size, default 10,
+max 50). Returns: real download/upload/total bandwidth usage for the
+scope, Peak Bandwidth (the highest-bandwidth bucket among recent
+`ORG_DAILY_SUMMARY` snapshot history -- see FLOW.md §28 for the exact
+formula and why it is a bucket total, not an instantaneous rate), Average
+Speed (real, `total_bytes / window_duration_seconds`), Network
+Availability (a platform/org-wide rollup of the same router-level Internet
+Availability proxy signal), Top Consumers/Locations/Routers (real,
+bandwidth-ranked), and a Traffic Trend (day-over-day, from the same
+snapshot history Peak Bandwidth reads). `top_applications` is **always**
+`available: false` -- no deep packet inspection exists.
+
+### `GET /analytics/guests`
+
+Also accepts an optional `limit` query parameter (top-N size, default 10,
+max 50). Composes directly with
+`app.domains.guest.service.GuestAnalyticsService` (`get_summary`/
+`get_top_devices`/`get_top_locations`) rather than re-deriving any of its
+numbers -- see FLOW.md §30. Returns: New/Returning/Unique Guests (New
+Guests reuses the exact same `max(unique - returning, 0)` formula Part 1's
+own snapshot aggregation established), Repeat Visits (a distinct, real
+metric -- sessions beyond each guest's first visit *within this window*),
+Guest Retention (a real formula -- see FLOW.md §27 for the exact
+"% of previous-period guests retained into the current period"
+definition), Average Data Usage and Average Session Duration (real), Top
+Devices (real, composed from `GuestAnalyticsService`), device/OS/browser
+statistics (reusing Part 2's exact User-Agent classification SQL), a
+`languages` object (real -- the primary language tag extracted from the
+new `Accept-Language` capture, see FLOW.md §34), and a `country_statistics`
+object that is **always** `available: false` (Part 2's exact placeholder,
+reused verbatim -- see FLOW.md §17/§32).
+
+### `GET /analytics/authentication`
+
+Returns: OTP Statistics (real, from `OtpRequest`), Voucher Statistics
+(`redeemed_count` real and complete; `failed_attempts_recorded` real but
+**partial** -- see FLOW.md §31 for exactly which failure reasons are
+durably tracked and which are not), overall Authentication Success/Failure
+totals and day-over-day trend (real, from `GuestLoginHistory`), Failed
+Login Reasons (real `GROUP BY failure_reason`), and per-auth-method
+success/failure breakdown (the same real composition Part 2's Organization
+Dashboard already uses). `pms_login`/`social_login` are each **always**
+`available: false` -- no PMS integration exists anywhere in this codebase,
+and `CaptivePortalConfig.social_login_enabled` is a schema-only readiness
+flag with no working social-login flow behind it.
+
