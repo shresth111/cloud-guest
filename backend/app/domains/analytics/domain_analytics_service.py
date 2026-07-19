@@ -182,7 +182,6 @@ from .constants import (
 from .dashboard_aggregation import (
     build_auth_method_breakdown,
     compute_average_speed_bytes_per_second,
-    compute_growth,
     compute_guest_retention_rate,
     compute_peak_bandwidth,
     device_breakdown_response,
@@ -222,6 +221,8 @@ from .repository import (
     UserAgentBreakdown,
 )
 from .router_availability import compute_internet_availability
+from .trends import build_growth_trend
+from .trends import growth_point_response as _growth_response
 
 logger = logging.getLogger(__name__)
 
@@ -681,19 +682,11 @@ class DomainAnalyticsService:
     def _compute_traffic_trend(
         self, snapshots: list[AnalyticsSnapshot]
     ) -> list[GrowthPointResponse]:
-        points: list[GrowthPointResponse] = []
-        previous_value: float | None = None
-        for snapshot in snapshots:
-            current_value = float(snapshot.metrics.get("total_bandwidth_bytes", 0) or 0)
-            points.append(
-                _growth_response(
-                    snapshot.period_start.date().isoformat(),
-                    current_value,
-                    previous_value,
-                )
-            )
-            previous_value = current_value
-        return points
+        """Composes ``trends.build_growth_trend`` (BE-012 Part 4) -- see
+        that module's own docstring for why this method and
+        ``dashboard_service._compute_org_traffic_trend`` no longer each
+        define their own copy of this loop."""
+        return build_growth_trend(snapshots, "total_bandwidth_bytes")
 
     # ========================================================================
     # Guest Analytics
@@ -996,20 +989,6 @@ class DomainAnalyticsService:
             organization_id=organization_id,
             location_id=location_id,
         )
-
-
-def _growth_response(
-    metric: str, current: float, previous: float | None
-) -> GrowthPointResponse:
-    point = compute_growth(metric=metric, current=current, previous=previous)
-    return GrowthPointResponse(
-        metric=point.metric,
-        current_value=point.current_value,
-        previous_value=point.previous_value,
-        delta=point.delta,
-        delta_percent=point.delta_percent,
-        direction=point.direction.value,
-    )
 
 
 def _language_breakdown_response(

@@ -169,6 +169,258 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ========================================================================
+    # BE-012 Part 4: Forecast Engine + Insight Engine thresholds
+    #
+    # Every number the Forecast Engine (app.domains.analytics.forecast) and
+    # Insight Engine (app.domains.analytics.insights) compare a real,
+    # computed value against lives here, following this file's own
+    # established pattern (a plain, documented Settings field, never a
+    # hardcoded magic number inline in analytics code) -- see
+    # docs/analytics/FLOW.md for the exact rule/threshold cross-reference.
+    # None of these change what data is real; they only tune when a real
+    # linear-regression trend or rule-engine comparison is judged
+    # "significant enough to report".
+    # ========================================================================
+
+    analytics_forecast_history_days: int = Field(
+        default=30,
+        ge=3,
+        le=365,
+        description=(
+            "How many trailing days of ORG_DAILY_SUMMARY/LOCATION_DAILY_"
+            "SUMMARY AnalyticsSnapshot history feed the Forecast Engine's "
+            "linear-trend fit (bandwidth/guest-growth/network-load/capacity "
+            "forecasts) -- app.domains.analytics.forecast_service."
+            "ForecastService."
+        ),
+    )
+    analytics_forecast_default_days: int = Field(
+        default=7,
+        ge=1,
+        le=90,
+        description=(
+            "Default number of days a Forecast Engine endpoint projects "
+            "forward when the caller omits the forecast_days query "
+            "parameter."
+        ),
+    )
+    analytics_forecast_min_history_points: int = Field(
+        default=3,
+        ge=2,
+        le=90,
+        description=(
+            "Minimum number of real historical data points required before "
+            "app.domains.analytics.forecast.fit_linear_trend is even "
+            "attempted (bandwidth/guest-growth/network-load/capacity "
+            "forecasts, and the Router Failure Risk heuristic's own CPU/"
+            "memory trend fits) -- fewer points than this reports "
+            "available=false rather than fabricating a line through too "
+            "little data."
+        ),
+    )
+    analytics_forecast_capacity_router_count_threshold: int = Field(
+        default=50,
+        ge=1,
+        le=100_000,
+        description=(
+            "The router-count 'capacity ceiling' app.domains.analytics."
+            "forecast_service.ForecastService.get_capacity_forecast "
+            "projects an organization's real router_count_total trend "
+            "against. This is an operator-set planning assumption, not "
+            "data derived from any real infrastructure-capacity record "
+            "(no such record exists anywhere in this codebase) -- override "
+            "per-deployment via CLOUDGUEST_ANALYTICS_FORECAST_CAPACITY_"
+            "ROUTER_COUNT_THRESHOLD."
+        ),
+    )
+    analytics_forecast_router_health_lookback_days: int = Field(
+        default=14,
+        ge=1,
+        le=90,
+        description=(
+            "How many trailing days of RouterHealthSnapshot history feed "
+            "the Router Failure Risk heuristic's CPU/memory trend fits and "
+            "unhealthy-ratio signal."
+        ),
+    )
+    analytics_forecast_router_cpu_rising_slope_threshold: float = Field(
+        default=1.0,
+        ge=0,
+        le=100,
+        description=(
+            "CPU usage percentage-points-per-day slope (from a real "
+            "ordinary-least-squares fit over RouterHealthSnapshot history) "
+            "above which the Router Failure Risk heuristic's "
+            "'rising_cpu_usage' signal fires for a router."
+        ),
+    )
+    analytics_forecast_router_memory_rising_slope_threshold: float = Field(
+        default=1.0,
+        ge=0,
+        le=100,
+        description=(
+            "Same as analytics_forecast_router_cpu_rising_slope_threshold, "
+            "for memory_usage_percent."
+        ),
+    )
+    analytics_forecast_router_unhealthy_ratio_threshold: float = Field(
+        default=0.3,
+        ge=0,
+        le=1,
+        description=(
+            "Fraction of a router's recent RouterHealthSnapshot readings "
+            "reporting health_status='unhealthy' at/above which the Router "
+            "Failure Risk heuristic's 'degrading_health_status' signal "
+            "fires -- health_status is categorical, not numeric, so a "
+            "'sustained negative trend' is operationalized as this ratio "
+            "rather than a regression slope."
+        ),
+    )
+    analytics_forecast_router_alert_count_threshold: int = Field(
+        default=2,
+        ge=1,
+        le=1000,
+        description=(
+            "Number of monitoring Alerts recorded against one router within "
+            "analytics_forecast_router_alert_lookback_days at/above which "
+            "the Router Failure Risk heuristic's 'repeated_alerts' signal "
+            "fires."
+        ),
+    )
+    analytics_forecast_router_alert_lookback_days: int = Field(
+        default=7,
+        ge=1,
+        le=90,
+        description=(
+            "Lookback window (days) the Router Failure Risk heuristic's "
+            "'repeated_alerts' signal counts app.domains.monitoring.models."
+            "Alert rows within, per router."
+        ),
+    )
+    analytics_insight_customer_growth_significant_percent: float = Field(
+        default=10.0,
+        ge=0,
+        le=1000,
+        description=(
+            "Minimum absolute organization-count growth percentage (over "
+            "DEFAULT_GROWTH_LOOKBACK_DAYS) before the Business Insight "
+            "Engine's 'customer_growth' rule fires."
+        ),
+    )
+    analytics_insight_guest_growth_significant_percent: float = Field(
+        default=15.0,
+        ge=0,
+        le=1000,
+        description=(
+            "Same as analytics_insight_customer_growth_significant_percent, "
+            "for platform-wide unique-guest-count growth."
+        ),
+    )
+    analytics_insight_plan_distribution_min_coverage_percent: float = Field(
+        default=50.0,
+        ge=0,
+        le=100,
+        description=(
+            "Minimum percentage of organizations with a populated "
+            "Organization.subscription_tier before the Business Insight "
+            "Engine's 'plan_distribution_coverage' rule stops flagging the "
+            "figure as too sparse to be meaningful."
+        ),
+    )
+    analytics_insight_offline_router_hours_threshold: int = Field(
+        default=24,
+        ge=1,
+        le=720,
+        description=(
+            "How many consecutive hours a router's last_seen_at heartbeat "
+            "must be stale (with Router.status == OFFLINE) before the "
+            "Operational Recommendations Engine's 'offline_routers' rule "
+            "counts it."
+        ),
+    )
+    analytics_insight_offline_router_count_threshold: int = Field(
+        default=1,
+        ge=1,
+        le=1000,
+        description=(
+            "Minimum number of qualifying offline routers within one "
+            "organization before the 'offline_routers' rule fires "
+            "(WARNING severity)."
+        ),
+    )
+    analytics_insight_offline_router_critical_count_threshold: int = Field(
+        default=3,
+        ge=1,
+        le=1000,
+        description=(
+            "Minimum number of qualifying offline routers within one "
+            "organization at/above which the 'offline_routers' rule "
+            "escalates to CRITICAL severity instead of WARNING."
+        ),
+    )
+    analytics_insight_location_volume_lookback_days: int = Field(
+        default=7,
+        ge=1,
+        le=90,
+        description=(
+            "The 'week' in the Operational Recommendations Engine's "
+            "'location_guest_volume_drop' week-over-week comparison."
+        ),
+    )
+    analytics_insight_location_volume_drop_percent: float = Field(
+        default=20.0,
+        ge=0,
+        le=100,
+        description=(
+            "Minimum percentage drop in a location's session_count_total "
+            "(this lookback period vs. the immediately preceding one of "
+            "equal length) before the 'location_guest_volume_drop' rule "
+            "fires."
+        ),
+    )
+    analytics_insight_router_cpu_lookback_days: int = Field(
+        default=7,
+        ge=1,
+        le=90,
+        description=(
+            "How many trailing days of RouterHealthSnapshot history feed "
+            "the Operational Recommendations Engine's 'rising_router_cpu' "
+            "consecutive-increase check."
+        ),
+    )
+    analytics_insight_router_cpu_consecutive_threshold: int = Field(
+        default=3,
+        ge=2,
+        le=100,
+        description=(
+            "Number of consecutive strictly-increasing cpu_usage_percent "
+            "readings (chronologically trailing) before the "
+            "'rising_router_cpu' rule fires."
+        ),
+    )
+    analytics_insight_critical_alert_count_threshold: int = Field(
+        default=2,
+        ge=1,
+        le=1000,
+        description=(
+            "Minimum number of currently-open CRITICAL alerts, aged past "
+            "analytics_insight_critical_alert_age_hours_threshold, within "
+            "one organization before the 'persistent_critical_alerts' rule "
+            "fires."
+        ),
+    )
+    analytics_insight_critical_alert_age_hours_threshold: int = Field(
+        default=24,
+        ge=1,
+        le=720,
+        description=(
+            "How long (hours) a CRITICAL alert must have been open "
+            "(non-RESOLVED) before it counts toward the "
+            "'persistent_critical_alerts' rule."
+        ),
+    )
+
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None,
         description=(

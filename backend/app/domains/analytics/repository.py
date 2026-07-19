@@ -46,7 +46,7 @@ from app.domains.guest.constants import GuestSessionStatus
 from app.domains.guest.models import Guest, GuestLoginHistory, GuestSession
 from app.domains.location.enums import LocationStatus
 from app.domains.location.models import Location
-from app.domains.monitoring.constants import AlertStatus
+from app.domains.monitoring.constants import AlertSeverity, AlertStatus
 from app.domains.monitoring.models import Alert
 from app.domains.organization.enums import OrganizationStatus
 from app.domains.organization.models import Organization
@@ -165,6 +165,41 @@ class AuthenticationOutcomeTotals:
     total_attempts: int
     successful_attempts: int
     failed_attempts: int
+
+
+# ============================================================================
+# BE-012 Part 4: Business Analytics + Forecast/Insight Engine read-models
+# ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class RouterStatusRow:
+    """One router's identity/status/owning-organization -- the platform-wide
+    (not one-organization-at-a-time) seed row the Operational Recommendations
+    Engine's offline-router and rising-CPU rules sweep over. Includes
+    ``organization_name`` directly (a real ``JOIN``, not a second lookup per
+    row) since every consumer of this row needs it for a human-readable
+    insight message."""
+
+    organization_id: uuid.UUID
+    organization_name: str
+    router_id: uuid.UUID
+    router_name: str
+    location_id: uuid.UUID
+    status: str
+    last_seen_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class RouterHealthHistoryRow:
+    """One ``RouterHealthSnapshot`` reading -- the real numeric/categorical
+    time-series input the Forecast Engine's Router Failure Risk heuristic
+    and the Insight Engine's rising-CPU rule both fit/scan."""
+
+    recorded_at: datetime
+    cpu_usage_percent: float | None
+    memory_usage_percent: float | None
+    health_status: str | None
 
 
 class AnalyticsRepositoryProtocol(Protocol):
@@ -420,6 +455,33 @@ class AnalyticsRepositoryProtocol(Protocol):
         start: datetime,
         end: datetime,
     ) -> list[tuple[date, int, int]]: ...
+
+    # -- BE-012 Part 4: Business Analytics + Forecast/Insight Engines --------
+    async def count_organizations_by_subscription_tier(
+        self,
+    ) -> list[tuple[str | None, int]]: ...
+
+    async def list_all_routers_with_organization(self) -> list[RouterStatusRow]: ...
+
+    async def get_router_health_snapshot_history(
+        self, router_ids: Sequence[uuid.UUID], *, start: datetime, end: datetime
+    ) -> dict[uuid.UUID, list[RouterHealthHistoryRow]]: ...
+
+    async def get_alert_counts_by_router(
+        self, router_ids: Sequence[uuid.UUID], *, since: datetime
+    ) -> dict[uuid.UUID, int]: ...
+
+    async def get_persistent_critical_alert_counts_by_organization(
+        self, *, older_than: datetime
+    ) -> list[tuple[uuid.UUID, int]]: ...
+
+    async def get_organization_names(
+        self, organization_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, str]: ...
+
+    async def get_location_names(
+        self, location_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, str]: ...
 
 
 class AnalyticsRepository:
@@ -1602,6 +1664,173 @@ class AnalyticsRepository:
         result = await self.session.execute(statement)
         return [(row[0], int(row[1]), int(row[2])) for row in result.all()]
 
+    # ========================================================================
+    # BE-012 Part 4: Business Analytics + Forecast/Insight Engines
+    # ========================================================================
+
+    async def count_organizations_by_subscription_tier(
+        self,
+    ) -> list[tuple[str | None, int]]:
+        """Real ``GROUP BY Organization.subscription_tier`` -- Business
+        Analytics' "Plan Distribution", reporting whatever the actual
+        distribution is (including a real, unmasked count of ``NULL``
+        i.e. unset) rather than skipping the query because the field is
+        known to be sparsely populated -- see ``business_service.py``'s own
+        module docstring."""
+        statement = (
+            select(Organization.subscription_tier, func.count())
+            .where(Organization.is_deleted.is_(False))
+            .group_by(Organization.subscription_tier)
+        )
+        result = await self.session.execute(statement)
+        return [(row[0], int(row[1])) for row in result.all()]
+
+    async def list_all_routers_with_organization(self) -> list[RouterStatusRow]:
+        """Every non-deleted router platform-wide, joined to its owning
+        organization's name -- the seed row-set the Operational
+        Recommendations Engine's offline-router and rising-CPU rules sweep
+        over (platform-wide, unlike Part 3's own ``list_routers_for_scope``,
+        which is deliberately one-organization-at-a-time). One bulk query,
+        never an N+1 per-organization loop."""
+        statement = (
+            select(
+                Router.organization_id,
+                Organization.name,
+                Router.id,
+                Router.name,
+                Router.location_id,
+                Router.status,
+                Router.last_seen_at,
+            )
+            .select_from(Router)
+            .join(Organization, Organization.id == Router.organization_id)
+            .where(Router.is_deleted.is_(False), Organization.is_deleted.is_(False))
+            .order_by(Router.name.asc())
+        )
+        result = await self.session.execute(statement)
+        return [
+            RouterStatusRow(
+                organization_id=row[0],
+                organization_name=row[1],
+                router_id=row[2],
+                router_name=row[3],
+                location_id=row[4],
+                status=row[5],
+                last_seen_at=row[6],
+            )
+            for row in result.all()
+        ]
+
+    async def get_router_health_snapshot_history(
+        self, router_ids: Sequence[uuid.UUID], *, start: datetime, end: datetime
+    ) -> dict[uuid.UUID, list[RouterHealthHistoryRow]]:
+        """Every ``RouterHealthSnapshot`` reading for ``router_ids`` within
+        ``[start, end]``, ordered ``(router_id, recorded_at)`` ascending --
+        the real, bounded (by router-id set and date window) row-set the
+        Forecast Engine's Router Failure Risk heuristic and the Insight
+        Engine's rising-CPU rule each fit/scan in pure Python. Mirrors
+        ``peak_concurrency.py``'s own "real SQL narrows, pure function
+        computes" split: this method's only job is the bounded fetch,
+        already grouped by router for the caller."""
+        if not router_ids:
+            return {}
+        statement = (
+            select(
+                RouterHealthSnapshot.router_id,
+                RouterHealthSnapshot.recorded_at,
+                RouterHealthSnapshot.cpu_usage_percent,
+                RouterHealthSnapshot.memory_usage_percent,
+                RouterHealthSnapshot.health_status,
+            )
+            .where(
+                RouterHealthSnapshot.is_deleted.is_(False),
+                RouterHealthSnapshot.router_id.in_(router_ids),
+                RouterHealthSnapshot.recorded_at >= start,
+                RouterHealthSnapshot.recorded_at <= end,
+            )
+            .order_by(
+                RouterHealthSnapshot.router_id, RouterHealthSnapshot.recorded_at.asc()
+            )
+        )
+        result = await self.session.execute(statement)
+        history: dict[uuid.UUID, list[RouterHealthHistoryRow]] = {}
+        for row in result.all():
+            history.setdefault(row[0], []).append(
+                RouterHealthHistoryRow(
+                    recorded_at=row[1],
+                    cpu_usage_percent=row[2],
+                    memory_usage_percent=row[3],
+                    health_status=row[4],
+                )
+            )
+        return history
+
+    async def get_alert_counts_by_router(
+        self, router_ids: Sequence[uuid.UUID], *, since: datetime
+    ) -> dict[uuid.UUID, int]:
+        """Real ``GROUP BY Alert.router_id`` count of alerts (any status --
+        "repeated" is a frequency signal, not an "is it still open" one)
+        triggered on/after ``since`` -- the Router Failure Risk heuristic's
+        "repeated Alerts" signal. ``Alert.router_id`` is a real, populated
+        FK (unlike ``GuestLoginHistory``, which has none)."""
+        if not router_ids:
+            return {}
+        statement = (
+            select(Alert.router_id, func.count())
+            .where(
+                Alert.is_deleted.is_(False),
+                Alert.router_id.in_(router_ids),
+                Alert.triggered_at >= since,
+            )
+            .group_by(Alert.router_id)
+        )
+        result = await self.session.execute(statement)
+        return {row[0]: int(row[1]) for row in result.all()}
+
+    async def get_persistent_critical_alert_counts_by_organization(
+        self, *, older_than: datetime
+    ) -> list[tuple[uuid.UUID, int]]:
+        """Real ``GROUP BY Alert.organization_id`` count of currently-open
+        (non-``RESOLVED``) CRITICAL alerts triggered at/before
+        ``older_than`` (i.e. that have been open for at least that long) --
+        the Operational Recommendations Engine's "persistent_critical_alerts"
+        rule's real input."""
+        statement = (
+            select(Alert.organization_id, func.count())
+            .where(
+                Alert.is_deleted.is_(False),
+                Alert.organization_id.is_not(None),
+                Alert.severity == AlertSeverity.CRITICAL.value,
+                Alert.status != AlertStatus.RESOLVED.value,
+                Alert.triggered_at <= older_than,
+            )
+            .group_by(Alert.organization_id)
+        )
+        result = await self.session.execute(statement)
+        return [(row[0], int(row[1])) for row in result.all()]
+
+    async def get_organization_names(
+        self, organization_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, str]:
+        if not organization_ids:
+            return {}
+        statement = select(Organization.id, Organization.name).where(
+            Organization.id.in_(organization_ids)
+        )
+        result = await self.session.execute(statement)
+        return {row[0]: row[1] for row in result.all()}
+
+    async def get_location_names(
+        self, location_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, str]:
+        if not location_ids:
+            return {}
+        statement = select(Location.id, Location.name).where(
+            Location.id.in_(location_ids)
+        )
+        result = await self.session.execute(statement)
+        return {row[0]: row[1] for row in result.all()}
+
 
 __all__ = [
     "AnalyticsRepositoryProtocol",
@@ -1614,4 +1843,6 @@ __all__ = [
     "BandwidthRankingRow",
     "LanguageBreakdown",
     "AuthenticationOutcomeTotals",
+    "RouterStatusRow",
+    "RouterHealthHistoryRow",
 ]

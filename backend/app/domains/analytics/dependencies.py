@@ -16,6 +16,7 @@ from fastapi import Depends
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings, get_settings
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.guest.dependencies import get_guest_analytics_service
@@ -30,9 +31,12 @@ from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
+from .business_service import BusinessAnalyticsService
 from .dashboard_scope import DashboardScopeResolver
 from .dashboard_service import DashboardService
 from .domain_analytics_service import DomainAnalyticsService
+from .forecast_service import ForecastService
+from .insight_service import InsightService
 from .repository import AnalyticsRepository, AnalyticsRepositoryProtocol
 from .service import AnalyticsService
 
@@ -119,10 +123,57 @@ def get_domain_analytics_service(
     )
 
 
+def get_business_analytics_service(
+    repository: AnalyticsRepositoryProtocol = Depends(get_analytics_repository),
+    scope_resolver: DashboardScopeResolver = Depends(get_dashboard_scope_resolver),
+    redis: Redis = Depends(get_redis_client),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> BusinessAnalyticsService:
+    """Wires BE-012 Part 4's ``BusinessAnalyticsService`` -- reuses the exact
+    same ``AnalyticsRepository``/``DashboardScopeResolver``/Redis/audit-writer
+    composition every other analytics service in this domain already wires."""
+    return BusinessAnalyticsService(
+        repository, scope_resolver, redis, audit_writer=audit_repository
+    )
+
+
+def get_forecast_service(
+    repository: AnalyticsRepositoryProtocol = Depends(get_analytics_repository),
+    scope_resolver: DashboardScopeResolver = Depends(get_dashboard_scope_resolver),
+    redis: Redis = Depends(get_redis_client),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    settings: Settings = Depends(get_settings),
+) -> ForecastService:
+    """Wires BE-012 Part 4's ``ForecastService`` -- same composition as
+    above, plus the real ``Settings`` object every forecast threshold
+    (history window, minimum fit points, capacity ceiling, router-risk
+    signal thresholds) is read from."""
+    return ForecastService(
+        repository, scope_resolver, redis, settings, audit_writer=audit_repository
+    )
+
+
+def get_insight_service(
+    repository: AnalyticsRepositoryProtocol = Depends(get_analytics_repository),
+    scope_resolver: DashboardScopeResolver = Depends(get_dashboard_scope_resolver),
+    redis: Redis = Depends(get_redis_client),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    settings: Settings = Depends(get_settings),
+) -> InsightService:
+    """Wires BE-012 Part 4's ``InsightService`` -- same composition as
+    ``get_forecast_service``, for the Insight Engine's own rule thresholds."""
+    return InsightService(
+        repository, scope_resolver, redis, settings, audit_writer=audit_repository
+    )
+
+
 __all__ = [
     "get_analytics_repository",
     "get_analytics_service",
     "get_dashboard_scope_resolver",
     "get_dashboard_service",
     "get_domain_analytics_service",
+    "get_business_analytics_service",
+    "get_forecast_service",
+    "get_insight_service",
 ]

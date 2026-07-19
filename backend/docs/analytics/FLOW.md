@@ -1034,3 +1034,345 @@ existing login endpoints), `service.py` (a new, default-`None` keyword
 parameter threaded through `login_via_otp`/`login_via_voucher`/
 `_create_session`/`reconnect`). Nothing else in that domain was touched --
 identical scope to `user_agent`'s own Part 2 change.
+
+---
+
+# BE-012 Part 4: Business Analytics + Forecast/Insight/Trend Engines
+
+Everything below extends this same domain -- no new top-level domain, no
+schema migration (see §46). New modules: `trends.py` (the Trend Engine),
+`forecast.py` (the Forecast Engine's pure math), `insights.py` (the Insight
+Engine's pure rule functions), `business_schemas.py`/`business_service.py`
+(Business Analytics), `forecast_schemas.py`/`forecast_service.py` (Forecast
+Engine composition), `insight_schemas.py`/`insight_service.py` (Insight
+Engine composition) -- plus extensions to `repository.py` (7 new read-only
+queries), `constants.py` (4 new audit actions), `dependencies.py` (3 new
+factories), `router.py` (8 new endpoints), and `app/core/config.py` (22 new
+`Settings` fields for every Forecast/Insight threshold), plus a pure,
+behavior-preserving de-duplication refactor of two Part 2/3 methods (§40).
+
+## 35. The two honesty investigations this part opens with
+
+Per the module brief's own explicit instruction, two things were confirmed
+(not assumed) before writing a line of business logic:
+
+1. **No billing/subscription/payment domain exists.** Confirmed again (the
+   same conclusion Parts 2/3 already reached and this part does not
+   re-litigate): `app.domains.organization.models.Organization
+   .subscription_tier` is a lightweight, nullable `String(50)` label with
+   zero pricing/entitlement logic anywhere behind it (its own module
+   docstring states this explicitly), and no `billing`/`invoices`/
+   `subscriptions` domain exists in this codebase at all --
+   `PermissionModule.BILLING`/`INVOICES`/`SUBSCRIPTIONS` are seeded RBAC
+   permission keys with **no domain behind them yet** (reserved for a future
+   module). Revenue Trends/Subscription Trends/Churn Rate/Renewal
+   Rate/License Utilization therefore have zero underlying events (no
+   subscription-created/cancelled/renewed timestamp, no invoice amount)
+   anywhere to compute from.
+2. **No AI/ML/LLM provider exists, and none is added.** Confirmed by
+   inspection: no OpenAI/Anthropic/Ollama/any-LLM client library import
+   anywhere in `requirements.txt`/`requirements-dev.txt`, no API key
+   `Settings` field, no mocked "AI response" anywhere. The module brief's
+   own instruction ("Reuse existing AI Platform Services. Do NOT implement
+   AI providers") is honored literally: every "AI-Ready Analytics" figure
+   (Capacity/Bandwidth/Router-Failure/Guest-Growth/Network-Load Prediction,
+   Traffic Forecast, Business Insights, Operational Recommendations) is
+   implemented with real, classical, deterministic statistics/rule logic
+   over already-real `AnalyticsSnapshot`/`RouterHealthSnapshot`/`Alert`
+   history -- ordinary least-squares linear regression and a plain rule
+   engine, both pure-stdlib Python, no `numpy`/`scipy`/ML dependency added.
+
+## 36. The Trend Engine: one implementation, not three copies
+
+`trends.py` is this part's answer to the module brief's own instruction:
+"expose a general-purpose 'trend for metric X over period Y' query usable by
+both the Forecast and Insight engines and by the dashboard endpoints, so
+trend computation has one implementation, not three copies across this part
+and Parts 2-3." Before writing it, what already existed was checked:
+`dashboard_aggregation.py` (Part 2) already owns the two-point comparison
+primitive (`compute_growth`) and whole-window summation helpers -- reused
+directly, never reimplemented. What was missing, and is new in `trends.py`:
+
+* `extract_metric_series` -- turns a list of `AnalyticsSnapshot`-shaped rows
+  into a plain, chronologically-sorted `[TrendPoint(timestamp, value), ...]`
+  series for one `metrics` key. Neither Part 2 nor Part 3 ever needed a full
+  numeric series before (they only ever compared two points or summed a
+  whole window) -- the Forecast Engine's regression fit and the Insight
+  Engine's rule inputs both need exactly this shape.
+* `growth_point_response` -- the ONE shared `compute_growth` ->
+  `GrowthPointResponse` mapping. `dashboard_service.py` (Part 2) and
+  `domain_analytics_service.py` (Part 3) each independently defined a
+  private, byte-for-byte-identical `_growth_response(metric, current,
+  previous)` wrapper. Both were refactored (this part) to import this one
+  public function instead of their own private copy -- see §40 for the full
+  write-up of why this refactor is safe and behavior-preserving.
+* `build_growth_trend` -- the ONE shared day-over-day trend builder.
+  `dashboard_service._compute_org_traffic_trend` and
+  `domain_analytics_service._compute_traffic_trend` each independently
+  looped over an ordered snapshot list building a day-over-day
+  `GrowthPointResponse` series for `total_bandwidth_bytes`. Both were
+  refactored to call this one function, parameterized by `metric_key` (not
+  bandwidth-specific).
+* `compute_snapshot_metric_growth` -- a genuinely NEW capability (not a
+  refactor): fetches the latest snapshot of one `snapshot_type`/scope plus
+  the closest snapshot at least `lookback_days` earlier, and returns a real
+  `GrowthPointResponse` for one metric. See §37 for why this is not
+  retrofitted into Part 2's own multi-metric-per-fetch methods.
+* `count_trailing_consecutive_increases` -- a small, general "has this
+  been rising for N readings in a row" numeric-series check, used by the
+  Insight Engine's rising-router-CPU rule (§42).
+
+## 37. Why `compute_snapshot_metric_growth` is new code, not a Part 2 refactor
+
+`DashboardService._compute_platform_growth` fetches **one** current/previous
+`PLATFORM_DAILY_SUMMARY` snapshot pair and derives **five** growth figures
+from it in a single round trip -- an intentional, already-tested
+optimization. `compute_snapshot_metric_growth` fetches current/previous for
+**one** metric at a time. Refactoring `_compute_platform_growth` (or
+`_compute_health_score`'s own single-metric guest-growth fetch) to call this
+new function would trade one efficient multi-metric round trip for several
+redundant ones, for zero behavior change and non-trivial regression risk to
+already-passing Part 2 tests, for no benefit (this part's own callers --
+`BusinessAnalyticsService`'s Customer Growth, `InsightService`'s
+Customer/Guest Growth insight rules -- each only need one metric's growth at
+a time, so the inefficiency the multi-metric fetch avoids does not apply to
+them). Part 2's own two call sites are therefore deliberately left
+unchanged; only `trends.py`'s own new callers use this new function.
+
+## 38. Forecast Engine: the exact linear-regression method
+
+`forecast.fit_linear_trend` is a real ordinary-least-squares (OLS) fit of
+`y = slope * x + intercept` over `(x, y)` pairs, implemented directly (no
+`numpy`/`scipy` -- a single-variable OLS closed-form solution is ~20 lines
+of pure Python):
+
+```text
+slope     = (n * sum(xy) - sum(x) * sum(y)) / (n * sum(x^2) - sum(x)^2)
+intercept = (sum(y) - slope * sum(x)) / n
+r_squared = 1 - SS_res / SS_tot   (SS_tot == 0 -> r_squared = 1.0)
+```
+
+`x` is always a day-offset (`float`, days since the series' first
+observation), so `slope` is directly "units per day". `r_squared` is the
+REAL coefficient of determination of *this exact fit against this exact
+data* -- the ONLY "confidence"-shaped number this module ever reports, and
+it is mathematically guaranteed to be within `[0, 1]` for an OLS fit
+evaluated against its own training data (never invented, never a fabricated
+"N% confidence"). `fit_linear_trend` returns `None` (never a degenerate fit)
+for fewer than 2 points, or when every `x` is identical (no time
+separation to fit a slope against).
+
+`forecast_linear_series` wraps this over a real `TrendPoint` series (fed by
+`ForecastService`'s real `AnalyticsSnapshot` history fetch, via
+`trends.extract_metric_series`), projecting `forecast_days` daily points
+beyond the last real observation. `available=False` (never a fabricated
+projection) when fewer than `Settings.analytics_forecast_min_history_points`
+(default 3) real points exist. Verified in
+`tests/unit/test_analytics_forecast_insights.py::test_forecast_linear_
+series_projects_exactly_for_a_perfectly_linear_series` against a
+hand-computed perfectly-linear series (slope=10, intercept=10, R^2=1.0,
+projected values computed by hand and asserted exactly).
+
+**Honest limitation, stated on every response** (`LinearFitInfo.note`):
+this is a linear projection of a recent trend continuing unchanged; it does
+not and cannot account for seasonality, one-off events, or any factor
+outside the metric's own recent history. Every forecast response carries
+both the real historical points the fit was computed from and the projected
+points, so a caller can always see exactly what was extrapolated from --
+never a bare number with no traceable basis.
+
+## 39. Forecast endpoint consolidation: five endpoints, not six
+
+The module brief lists six forecast concepts. **Traffic Forecast and
+Bandwidth Forecast are folded into one endpoint**
+(`GET /analytics/forecast/bandwidth`): this codebase has exactly one real
+per-day network-volume metric in `AnalyticsSnapshot` history
+(`total_bandwidth_bytes`) -- there is no separate "traffic" metric (packet
+count, request count, ...) anywhere in this codebase's real data to
+forecast independently, so a second, identically-computed endpoint under a
+different name would be pure duplication. Network Load Prediction is kept
+as its own, genuinely distinct endpoint
+(`GET /analytics/forecast/network-load`, `session_count_total` -- concurrent
+guest-session volume) since it answers a materially different operational
+question ("how many simultaneous guests" vs. "how much data"). Final five:
+`/analytics/forecast/bandwidth`, `/capacity`, `/router-failure-risk`,
+`/guest-growth`, `/network-load`.
+
+## 40. Router Failure Risk: an honest heuristic risk FLAG, not a predictive model
+
+**Explicitly NOT machine learning.** No failure-prediction model exists in
+this codebase, and none is fabricated here -- a false-precision "87% failure
+probability" style number would be exactly the kind of invented confidence
+this part's honesty mandate forbids. `forecast.assess_router_failure_risk`
+is instead a real, multi-signal heuristic: a router is flagged
+`at_risk=True` if and only if at least one of three independently computed,
+real, cited signals fires:
+
+1. **Rising CPU/memory usage** -- a real OLS fit (`fit_linear_trend`, the
+   exact same function every other forecast in this module uses) over the
+   router's own recent `RouterHealthSnapshot.cpu_usage_percent`/
+   `memory_usage_percent` history (`Settings.analytics_forecast_router_
+   health_lookback_days`, default 14 days). Fires when the fitted slope
+   exceeds `Settings.analytics_forecast_router_cpu_rising_slope_threshold`/
+   `..._memory_rising_slope_threshold` (default 1.0 percentage-point/day
+   each). Requires at least `Settings.analytics_forecast_min_history_points`
+   (default 3) real readings -- no signal is computed from too little data.
+2. **Degrading health status** -- `RouterHealthSnapshot.health_status` is
+   categorical (`"healthy"`/`"unhealthy"`/`None`), not numeric, so a literal
+   regression slope cannot be fit to it. "A sustained negative trend" is
+   therefore operationalized as the *ratio* of recent readings reporting
+   `"unhealthy"` meeting
+   `Settings.analytics_forecast_router_unhealthy_ratio_threshold` (default
+   0.3) -- an honest, real, categorical-appropriate alternative to a
+   numeric slope, documented explicitly as such (never silently presented as
+   equivalent to the CPU/memory regression signals).
+3. **Repeated Alerts** -- a real `GROUP BY Alert.router_id` count
+   (`AnalyticsRepository.get_alert_counts_by_router` -- `Alert.router_id` is
+   a real, populated FK, confirmed by reading `app.domains.monitoring.models
+   .Alert` in full) within
+   `Settings.analytics_forecast_router_alert_lookback_days` (default 7
+   days), fired at/above `Settings.analytics_forecast_router_alert_count_
+   threshold` (default 2).
+
+Every signal that fires reports the exact real number behind it (the fitted
+slope and its own real R^2, the real unhealthy-reading ratio, the real
+alert count) on the response itself -- never a synthesized single risk
+score. `RouterFailureRiskResponse.heuristic_note` states this posture
+explicitly on every response. Verified in
+`tests/unit/test_analytics_forecast_insights.py` for each signal firing
+independently and for the "everything flat and healthy" no-fire case.
+
+## 41. Capacity Prediction: the exact threshold-crossing formula
+
+`forecast.project_upward_threshold_crossing` answers "when will this metric
+first reach/exceed `threshold`, given its current real linear trend" --
+deliberately an *upward*-crossing question only (the natural framing for
+"when will this resource exceed its capacity ceiling"), which keeps the
+math unambiguous:
+
+* `current_value >= threshold` -> already crossed, `days_until_crossing=0`.
+* `slope <= 0` (flat or declining) and not already crossed -> `available:
+  false` ("will not be reached at the current rate" -- never a fabricated
+  future date for a trend moving the wrong direction).
+* Otherwise: solve the real OLS line for the `x` where it equals
+  `threshold` (`x_star = (threshold - intercept) / slope`), and report
+  `ceil(x_star - last_x)` days from the most recent real observation.
+
+Capacity Prediction (`GET /analytics/forecast/capacity`) applies this to an
+organization's own `router_count_total` history (from `ORG_DAILY_SUMMARY`/
+`LOCATION_DAILY_SUMMARY` snapshots -- a resource every organization already
+has real history for) against
+`Settings.analytics_forecast_capacity_router_count_threshold` (default 50).
+**This threshold is an operator-set planning assumption, not data derived
+from any real infrastructure-capacity record** -- no such record exists
+anywhere in this codebase, and `ThresholdCrossingInfo.threshold_note` states
+this on every response. Verified against a hand-computed series (slope=10,
+intercept=10, current value 40, threshold 100 -> exactly 6 days).
+
+## 42. Insight Engine: the exact rule set and every threshold's home in `Settings`
+
+`insights.py` is a real, deterministic RULE ENGINE -- plain Python functions,
+real numbers in, either an `Insight` (message + severity) or `None` out. No
+LLM call, no generated free text beyond simple, deterministic string
+formatting of real numbers against real, configured thresholds. "AI-ready"
+only in the sense the module brief itself uses the term: a real LLM
+integration could later enhance/replace this text generation -- it does not
+claim to already BE one.
+
+**Business Insights** (`GET /analytics/insights/business`):
+
+| Rule | Fires when | Threshold(s) (in `Settings`) |
+|---|---|---|
+| `customer_growth` | Platform organization-count growth (7-day lookback, `DEFAULT_GROWTH_LOOKBACK_DAYS`) has \|delta_percent\| at/above threshold | `analytics_insight_customer_growth_significant_percent` (10.0) |
+| `guest_growth` | Platform unique-guest-count growth (same lookback) has \|delta_percent\| at/above threshold | `analytics_insight_guest_growth_significant_percent` (15.0) |
+| `plan_distribution_coverage` | % of organizations with a populated `subscription_tier` is below threshold | `analytics_insight_plan_distribution_min_coverage_percent` (50.0) |
+
+**Operational Recommendations** (`GET /analytics/insights/operational`):
+
+| Rule | Fires when | Threshold(s) (in `Settings`) |
+|---|---|---|
+| `offline_routers` | An organization has >= N routers with `status=OFFLINE` and a stale heartbeat for over H hours | `analytics_insight_offline_router_count_threshold` (1, WARNING) / `..._critical_count_threshold` (3, escalates to CRITICAL) / `..._offline_router_hours_threshold` (24) |
+| `location_guest_volume_drop` | A location's `session_count_total` dropped >= P% vs. the immediately preceding period of equal length | `analytics_insight_location_volume_drop_percent` (20.0), window `analytics_insight_location_volume_lookback_days` (7) |
+| `rising_router_cpu` | A router's `cpu_usage_percent` rose on >= N consecutive trailing readings | `analytics_insight_router_cpu_consecutive_threshold` (3), lookback `analytics_insight_router_cpu_lookback_days` (7) |
+| `persistent_critical_alerts` | An organization has >= N CRITICAL alerts open (non-`RESOLVED`) for over H hours | `analytics_insight_critical_alert_count_threshold` (2), `analytics_insight_critical_alert_age_hours_threshold` (24) |
+
+Every rule is exercised in
+`tests/unit/test_analytics_forecast_insights.py` for BOTH outcomes -- a
+constructed input that fires, and one at/below the threshold that does not.
+
+### Why "3 organizations have had 2+ CRITICAL alerts..." becomes N separate insights
+
+The module brief's own illustrative phrasing rolls this rule up into one
+platform-wide sentence. This engine instead emits **one insight per
+qualifying organization** (`rule_persistent_critical_alerts` called once per
+organization meeting the threshold) -- the same one-item-per-qualifying-
+entity shape every other Operational Recommendation rule already uses. This
+is a deliberate consistency choice: every rule produces one addressable,
+per-entity finding, never a mix of aggregate-sentence rules and per-entity
+rules that would need different downstream handling.
+
+## 43. Business Analytics: what is real, and the exact honest-placeholder shape
+
+`GET /analytics/business` -- two figures are real:
+
+* **Customer Growth** -- `PLATFORM_DAILY_SUMMARY.organization_count_total`
+  history, via `trends.compute_snapshot_metric_growth` (composing Part 2's
+  own `compute_growth`, never reimplemented).
+* **Plan Distribution** -- a real `GROUP BY Organization.subscription_tier`
+  query (`AnalyticsRepository.count_organizations_by_subscription_tier`),
+  reporting whatever the actual distribution is, including a real, unmasked
+  count of `NULL` (`"unset"`). This part does not skip the query just
+  because `subscription_tier` is known (per Module 005's own documented
+  decision, and Part 2's own confirmation) to be almost entirely
+  unpopulated in this codebase's real data paths -- the real distribution
+  (however unimpressive) is still reported honestly, never silently omitted.
+
+Revenue Trends / Subscription Trends / Churn Rate / Renewal Rate / License
+Utilization mirror `dashboard_schemas.RevenueMetricsResponse`'s exact
+honesty posture (`available: bool`, every numeric field `None`, an
+explanatory `message`) but are their OWN schemas, not a verbatim reuse of
+`RevenueMetricsResponse`, since the fields genuinely differ in shape:
+Revenue Trends/Subscription Trends are inherently **time series**, so they
+mirror `CountryStatisticsResponse.by_country`'s "unavailable list" shape
+instead (`trend: list[...] = []`); Churn/Renewal/License Utilization are
+naturally **scalar** percentages, so they reuse `RevenueMetricsResponse`'s
+scalar shape most directly. Every message states plainly why: no billing/
+subscription/payment domain, and (for Subscription Trends specifically) no
+historical snapshot of `subscription_tier` distribution over time exists
+either (`AnalyticsSnapshot` never captured a per-tier breakdown) -- only the
+current-moment distribution is real.
+
+## 44. Scope design: GLOBAL for platform-wide views, ORGANIZATION for per-tenant forecasts
+
+Business Analytics and both Insight Engine endpoints are gated
+`RequirePermission("analytics.read", scope=ScopeType.GLOBAL)` plus
+`DashboardScope.require_global()` -- the same two-layer pattern Part 2's own
+Super Admin Dashboard already establishes. This mirrors what each figure
+actually IS: Customer Growth/Plan Distribution are platform-wide,
+cross-tenant concepts (an organization does not have "customers" of its own
+in this codebase's model -- organizations themselves are CloudGuest's
+customers), and both Insight Engine rule families are, by design,
+platform-wide sweeps (the module brief's own illustrative examples name
+multiple organizations/locations at once). Forecast Engine endpoints, by
+contrast, are per-organization operational concepts (this organization's own
+bandwidth/guest-count/session-count/router-count/router-health trend) --
+gated exactly like Part 3's own domain analytics endpoints:
+`RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION)` plus
+`DashboardScope.require_organization()`.
+
+## 45. Dashboard-view auditing: the same throttle mechanism, reused
+
+Every new endpoint reuses `dashboard_audit.DashboardAuditThrottle` (Part 2's
+own Redis-backed, once-per-`(user, dashboard_kind, scope)`-per-15-minutes
+dedup) unchanged -- four new local `AUDIT_ACTION_*` string constants
+(`constants.py`) are the only addition, following the identical "not added
+to `app.domains.rbac.enums.AuditAction`, this part's directory rule scopes
+changes to `app.domains.analytics`" posture Parts 2/3 already established.
+
+## 46. Migration: none needed
+
+This part is pure read/computation over already-existing data --
+`AnalyticsSnapshot` (Part 1), `RouterHealthSnapshot`/`Alert` (already
+existed, only new read-only queries added), `Organization.subscription_tier`
+(already existed, unpopulated). No new table, no new column, no schema
+change of any kind. `alembic/versions/` is untouched by this part.

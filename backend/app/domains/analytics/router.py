@@ -64,6 +64,8 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.rbac.enums import ScopeType
 
+from .business_schemas import BusinessAnalyticsResponse
+from .business_service import BusinessAnalyticsService
 from .constants import (
     DEFAULT_ANALYTICS_WINDOW_DAYS,
     TOP_N_DEFAULT,
@@ -78,8 +80,11 @@ from .dashboard_schemas import (
 from .dashboard_service import DashboardService
 from .dependencies import (
     get_analytics_service,
+    get_business_analytics_service,
     get_dashboard_service,
     get_domain_analytics_service,
+    get_forecast_service,
+    get_insight_service,
 )
 from .domain_analytics_schemas import (
     AuthenticationAnalyticsResponse,
@@ -88,6 +93,17 @@ from .domain_analytics_schemas import (
     RouterAnalyticsResponse,
 )
 from .domain_analytics_service import DomainAnalyticsService
+from .forecast_schemas import (
+    CapacityForecastResponse,
+    LinearForecastResponse,
+    RouterFailureRiskResponse,
+)
+from .forecast_service import ForecastService
+from .insight_schemas import (
+    BusinessInsightsResponse,
+    OperationalRecommendationsResponse,
+)
+from .insight_service import InsightService
 from .models import AnalyticsSnapshot
 from .schemas import (
     AnalyticsSnapshotListResponse,
@@ -418,6 +434,225 @@ async def get_authentication_analytics(
     return build_response(
         success=True,
         message="Authentication analytics retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# BE-012 Part 4: Business Analytics + Forecast Engine + Insight Engine
+#
+# Business Analytics and both Insight Engine endpoints are inherently
+# platform-wide, cross-tenant concepts (Customer Growth/Plan Distribution,
+# and the module brief's own illustrative "3 organizations have had..."/
+# "location A's guest volume dropped..." examples) -- gated exactly like
+# Part 2's Super Admin Dashboard: RequirePermission("analytics.read",
+# scope=ScopeType.GLOBAL) plus DashboardScope.require_global(). Forecast
+# Engine endpoints are per-organization operational concepts -- gated
+# exactly like Part 3's own domain analytics endpoints:
+# RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION) plus
+# DashboardScope.require_organization(). See each service module's own
+# docstring for the full write-up of this scope-design decision.
+# ============================================================================
+
+
+@router.get(
+    "/analytics/business",
+    response_model=ApiResponse[BusinessAnalyticsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("analytics.read", scope=ScopeType.GLOBAL))],
+)
+async def get_business_analytics(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    service: BusinessAnalyticsService = Depends(get_business_analytics_service),
+):
+    payload = await service.get_business_analytics(uuid.UUID(user.id))
+    return build_response(
+        success=True,
+        message="Business analytics retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/forecast/bandwidth",
+    response_model=ApiResponse[LinearForecastResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_bandwidth_forecast(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    forecast_days: int | None = Query(default=None, ge=1, le=90),
+    service: ForecastService = Depends(get_forecast_service),
+):
+    payload = await service.get_bandwidth_forecast(
+        uuid.UUID(user.id),
+        organization_id,
+        location_id=location_id,
+        forecast_days=forecast_days,
+    )
+    return build_response(
+        success=True,
+        message="Bandwidth (traffic) forecast retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/forecast/guest-growth",
+    response_model=ApiResponse[LinearForecastResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_guest_growth_forecast(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    forecast_days: int | None = Query(default=None, ge=1, le=90),
+    service: ForecastService = Depends(get_forecast_service),
+):
+    payload = await service.get_guest_growth_forecast(
+        uuid.UUID(user.id),
+        organization_id,
+        location_id=location_id,
+        forecast_days=forecast_days,
+    )
+    return build_response(
+        success=True,
+        message="Guest growth forecast retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/forecast/network-load",
+    response_model=ApiResponse[LinearForecastResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_network_load_forecast(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    forecast_days: int | None = Query(default=None, ge=1, le=90),
+    service: ForecastService = Depends(get_forecast_service),
+):
+    payload = await service.get_network_load_forecast(
+        uuid.UUID(user.id),
+        organization_id,
+        location_id=location_id,
+        forecast_days=forecast_days,
+    )
+    return build_response(
+        success=True,
+        message="Network load forecast retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/forecast/capacity",
+    response_model=ApiResponse[CapacityForecastResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_capacity_forecast(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    service: ForecastService = Depends(get_forecast_service),
+):
+    payload = await service.get_capacity_forecast(
+        uuid.UUID(user.id), organization_id, location_id=location_id
+    )
+    return build_response(
+        success=True,
+        message="Capacity forecast retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/forecast/router-failure-risk",
+    response_model=ApiResponse[RouterFailureRiskResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_router_failure_risk(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    service: ForecastService = Depends(get_forecast_service),
+):
+    payload = await service.get_router_failure_risk(
+        uuid.UUID(user.id), organization_id, location_id=location_id
+    )
+    return build_response(
+        success=True,
+        message="Router failure risk retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/insights/business",
+    response_model=ApiResponse[BusinessInsightsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("analytics.read", scope=ScopeType.GLOBAL))],
+)
+async def get_business_insights(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    service: InsightService = Depends(get_insight_service),
+):
+    payload = await service.get_business_insights(uuid.UUID(user.id))
+    return build_response(
+        success=True,
+        message="Business insights retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/insights/operational",
+    response_model=ApiResponse[OperationalRecommendationsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("analytics.read", scope=ScopeType.GLOBAL))],
+)
+async def get_operational_recommendations(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    service: InsightService = Depends(get_insight_service),
+):
+    payload = await service.get_operational_recommendations(uuid.UUID(user.id))
+    return build_response(
+        success=True,
+        message="Operational recommendations retrieved",
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )

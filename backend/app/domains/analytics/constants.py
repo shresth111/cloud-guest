@@ -150,6 +150,19 @@ AUDIT_ACTION_NETWORK_ANALYTICS_VIEWED = "network_analytics_viewed"
 AUDIT_ACTION_GUEST_ANALYTICS_VIEWED = "guest_analytics_viewed"
 AUDIT_ACTION_AUTHENTICATION_ANALYTICS_VIEWED = "authentication_analytics_viewed"
 
+# ============================================================================
+# BE-012 Part 4: Business Analytics + Forecast/Insight Engines
+# ============================================================================
+
+# ``audit_log_entries.action`` values this part's new endpoints write --
+# same local-string-constant posture as Part 2/3's own dashboard-view
+# actions above (see that block's own docstring for why these are not added
+# to ``app.domains.rbac.enums.AuditAction``).
+AUDIT_ACTION_BUSINESS_ANALYTICS_VIEWED = "business_analytics_viewed"
+AUDIT_ACTION_FORECAST_VIEWED = "forecast_viewed"
+AUDIT_ACTION_BUSINESS_INSIGHTS_VIEWED = "business_insights_viewed"
+AUDIT_ACTION_OPERATIONAL_RECOMMENDATIONS_VIEWED = "operational_recommendations_viewed"
+
 __all__ = [
     "AnalyticsSnapshotType",
     "AnalyticsGranularity",
@@ -174,4 +187,8 @@ __all__ = [
     "AUDIT_ACTION_NETWORK_ANALYTICS_VIEWED",
     "AUDIT_ACTION_GUEST_ANALYTICS_VIEWED",
     "AUDIT_ACTION_AUTHENTICATION_ANALYTICS_VIEWED",
+    "AUDIT_ACTION_BUSINESS_ANALYTICS_VIEWED",
+    "AUDIT_ACTION_FORECAST_VIEWED",
+    "AUDIT_ACTION_BUSINESS_INSIGHTS_VIEWED",
+    "AUDIT_ACTION_OPERATIONAL_RECOMMENDATIONS_VIEWED",
 ]

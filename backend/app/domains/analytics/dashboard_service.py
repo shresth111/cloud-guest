@@ -78,6 +78,8 @@ from .dashboard_scope import (
 from .health_score import compute_health_score
 from .peak_concurrency import compute_peak_concurrent_sessions
 from .repository import AnalyticsRepositoryProtocol
+from .trends import build_growth_trend
+from .trends import growth_point_response as _growth_response
 
 logger = logging.getLogger(__name__)
 
@@ -96,20 +98,6 @@ def _reduce_router_counts(rows: list[tuple[str, int]]) -> tuple[int, int, int]:
     offline = counts.get(RouterStatus.OFFLINE.value, 0)
     total = sum(counts.values())
     return online, offline, total
-
-
-def _growth_response(
-    metric: str, current: float, previous: float | None
-) -> GrowthPointResponse:
-    point = compute_growth(metric=metric, current=current, previous=previous)
-    return GrowthPointResponse(
-        metric=point.metric,
-        current_value=point.current_value,
-        previous_value=point.previous_value,
-        delta=point.delta,
-        delta_percent=point.delta_percent,
-        direction=point.direction.value,
-    )
 
 
 class DashboardService:
@@ -472,7 +460,11 @@ class DashboardService:
     ) -> list[GrowthPointResponse]:
         """A real day-over-day bandwidth trend built entirely from
         ``ORG_DAILY_SUMMARY`` snapshot history (never re-querying raw
-        ``GuestSession`` rows for a wider window)."""
+        ``GuestSession`` rows for a wider window) -- composes
+        ``trends.build_growth_trend`` (BE-012 Part 4), the one shared
+        implementation of this exact loop (see that module's own docstring
+        for why this method and ``domain_analytics_service
+        ._compute_traffic_trend`` no longer each define their own copy)."""
         window_start = now - timedelta(days=WEEKLY_WINDOW_DAYS + 1)
         snapshots, _ = await self.repository.list_snapshots(
             organization_id=organization_id,
@@ -483,20 +475,7 @@ class DashboardService:
             page=1,
             page_size=WEEKLY_WINDOW_DAYS + 1,
         )
-        ordered = sorted(snapshots, key=lambda snap: snap.period_start)
-        points: list[GrowthPointResponse] = []
-        previous_value: float | None = None
-        for snapshot in ordered:
-            current_value = float(snapshot.metrics.get("total_bandwidth_bytes", 0) or 0)
-            points.append(
-                _growth_response(
-                    snapshot.period_start.date().isoformat(),
-                    current_value,
-                    previous_value,
-                )
-            )
-            previous_value = current_value
-        return points
+        return build_growth_trend(snapshots, "total_bandwidth_bytes")
 
     async def _compute_health_score(
         self, organization_id: uuid.UUID, now: datetime

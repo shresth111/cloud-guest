@@ -198,3 +198,29 @@ the full "read another domain's table directly for a narrow aggregate"
 precedent this part continues, and `FLOW.md` §§23-34 for exactly which
 query backs which figure. No table was added, and no other existing
 table's columns changed.
+
+---
+
+# BE-012 Part 4 schema additions
+
+**None.** This part is pure read/computation over data that already exists
+-- see `FLOW.md` §46 for the explicit statement of why no migration was
+needed. Seven new, read-only repository methods were added to
+`AnalyticsRepository`, all real SQL over already-existing tables, no new
+table and no new column:
+
+| Method | Real query over | Feeds |
+|---|---|---|
+| `count_organizations_by_subscription_tier` | `GROUP BY Organization.subscription_tier` | Business Analytics' Plan Distribution |
+| `list_all_routers_with_organization` | `Router JOIN Organization` (platform-wide, unlike Part 3's own one-organization-at-a-time `list_routers_for_scope`) | Operational Recommendations' offline-router and rising-CPU rules |
+| `get_router_health_snapshot_history` | `RouterHealthSnapshot`, bounded by router-id set + date window, ordered `(router_id, recorded_at)` ascending | Forecast Engine's Router Failure Risk heuristic; Operational Recommendations' rising-CPU rule |
+| `get_alert_counts_by_router` | `GROUP BY Alert.router_id` (`Alert.router_id` is a real, populated FK) | Router Failure Risk's "repeated Alerts" signal |
+| `get_persistent_critical_alert_counts_by_organization` | `GROUP BY Alert.organization_id`, filtered `severity=CRITICAL AND status != RESOLVED AND triggered_at <= older_than` | Operational Recommendations' "persistent_critical_alerts" rule |
+| `get_organization_names` | `Organization.id/name`, bulk `IN` lookup | Human-readable insight/recommendation messages |
+| `get_location_names` | `Location.id/name`, bulk `IN` lookup | Human-readable insight/recommendation messages |
+
+Every Forecast Engine linear-trend endpoint (Bandwidth/Traffic, Guest
+Growth, Network Load, Capacity) reuses `AnalyticsRepository.list_snapshots`
+-- a method that already existed since Part 1 -- with no new query needed;
+`trends.extract_metric_series`/`forecast.forecast_linear_series` do all the
+new work in pure Python over an already-real, already-fetched snapshot list.

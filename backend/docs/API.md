@@ -1158,3 +1158,118 @@ Dashboard already uses). `pms_login`/`social_login` are each **always**
 and `CaptivePortalConfig.social_login_enabled` is a schema-only readiness
 flag with no working social-login flow behind it.
 
+## Business Analytics + Forecast/Insight Engines (Module 012 Part 4)
+
+See `docs/analytics/FLOW.md` §§35-46 for the full design write-up (the two
+honesty investigations this part opens with, the Trend Engine's
+de-duplication of Part 2/3's own near-identical trend code, the exact OLS
+linear-regression method, forecast endpoint consolidation, the Router
+Failure Risk heuristic's exact signal set, the Capacity Prediction
+threshold-crossing formula, every Insight Engine rule + threshold + its
+home in `Settings`, Business Analytics' honest-placeholder shape, the
+GLOBAL-vs-ORGANIZATION scope design, and why no migration was needed). No
+new dependency was added anywhere in this part -- every forecast is
+ordinary least-squares linear regression implemented directly in pure
+stdlib Python (`app.domains.analytics.forecast.fit_linear_trend`), and
+every insight is a plain, deterministic rule function
+(`app.domains.analytics.insights`) -- **neither is, nor calls, an AI/LLM
+provider**, since none exists anywhere in this codebase and this part's own
+brief explicitly forbids implementing one.
+
+### `GET /analytics/business`
+
+Requires `analytics.read` at `GLOBAL` scope, plus a second, independent
+`DashboardScope.require_global()` check inside `BusinessAnalyticsService`
+itself -- the same two-layer pattern every other analytics endpoint in this
+domain already establishes. No query parameters (this is an inherently
+platform-wide, cross-tenant view: organizations themselves are CloudGuest's
+customers, so there is no meaningful "one organization's" customer growth).
+Returns: Customer Growth (real -- `organization_count_total` from
+`PLATFORM_DAILY_SUMMARY` snapshot history, `DEFAULT_GROWTH_LOOKBACK_DAYS`
+comparison, via the shared Trend Engine), Plan Distribution (real -- a
+`GROUP BY Organization.subscription_tier`, reporting the true distribution
+including a real, unmasked "unset" count -- see FLOW.md §43 for why this is
+never skipped just because the field is known to be sparsely populated),
+and Revenue Trends/Subscription Trends/Churn Rate/Renewal Rate/License
+Utilization, each **always** `available: false` (mirroring
+`dashboard_schemas.RevenueMetricsResponse`'s exact honesty posture -- see
+FLOW.md §43 for the exact schema shape of each) -- no billing/subscription/
+payment domain exists anywhere in this codebase to derive any of the five
+from.
+
+### `GET /analytics/forecast/bandwidth` / `/guest-growth` / `/network-load`
+
+Each requires `analytics.read` at `ORGANIZATION` scope, plus a second,
+independent `DashboardScope.require_organization` check inside
+`ForecastService` itself. `organization_id` is resolved via RBAC's
+`RequireOrganization` (`X-Organization-Id` header, membership-validated).
+Each accepts an optional `location_id` query parameter (narrows to one
+location's own `LOCATION_DAILY_SUMMARY` history instead of the
+organization's `ORG_DAILY_SUMMARY` history) and an optional `forecast_days`
+query parameter (`1`-`90`, defaults to `Settings.analytics_forecast_
+default_days`, 7). Each projects one real metric
+(`total_bandwidth_bytes`/`guest_count_unique`/`session_count_total`
+respectively) forward via a real ordinary-least-squares linear-regression
+fit over `Settings.analytics_forecast_history_days` (default 30) trailing
+days of snapshot history -- see FLOW.md §38 for the exact formula. Returns
+`available: false` (never a fabricated projection) when fewer than
+`Settings.analytics_forecast_min_history_points` (default 3) real data
+points exist. Every response carries the real historical points, the
+projected points, and the fit's own real slope/intercept/R^2 (the ONLY
+"confidence"-shaped number ever reported -- never an invented percentage),
+plus a stated limitation: this is a linear projection assuming the recent
+trend continues unchanged, not a guarantee. **Traffic Forecast and
+Bandwidth Forecast are the same endpoint** -- see FLOW.md §39 for why a
+second, identically-computed endpoint under a different name would be pure
+duplication (this codebase has exactly one real per-day network-volume
+metric).
+
+### `GET /analytics/forecast/capacity`
+
+Same RBAC/scope gating as the three endpoints above. Projects an
+organization's own `router_count_total` history forward via the identical
+linear-regression fit, then answers "when will this cross the configured
+capacity ceiling" (`Settings.analytics_forecast_capacity_router_count_
+threshold`, default 50) -- see FLOW.md §41 for the exact threshold-crossing
+formula (already-crossed -> 0 days; flat/declining trend -> `available:
+false`, never a fabricated future date; otherwise the real fitted line
+solved for the crossing point). `threshold_crossing.threshold_note` states
+on every response that this threshold is an operator-set planning
+assumption, not data derived from any real infrastructure-capacity record --
+no such record exists anywhere in this codebase.
+
+### `GET /analytics/forecast/router-failure-risk`
+
+Same RBAC/scope gating as the other Forecast Engine endpoints; `location_id`
+narrows which routers are assessed (via `list_routers_for_scope`) rather
+than narrowing snapshot history. For every router in scope, evaluates the
+Router Failure Risk heuristic (`forecast.assess_router_failure_risk`) --
+**explicitly a heuristic risk FLAG, never a machine-learning prediction or a
+fabricated failure-probability number** -- flagging `at_risk: true` only
+when at least one of three real, cited signals fires: a rising CPU/memory
+usage trend (the same OLS fit, against `RouterHealthSnapshot` history), a
+high ratio of recent `health_status="unhealthy"` readings, or repeated real
+`app.domains.monitoring.models.Alert` rows against that router. See FLOW.md
+§40 for the exact thresholds (all in `Settings`) and why each signal is
+real. `heuristic_note` states this posture on every response.
+
+### `GET /analytics/insights/business` / `GET /analytics/insights/operational`
+
+Both require `analytics.read` at `GLOBAL` scope, plus a second, independent
+`DashboardScope.require_global()` check inside `InsightService` itself --
+both are, by design, platform-wide sweeps (mirroring Business Analytics'
+own scope reasoning). No query parameters. Both run a real, deterministic
+RULE ENGINE (`app.domains.analytics.insights`) -- **explicitly not an
+AI/LLM system**; every insight fires only when a real, already-aggregated
+number crosses a real, configured threshold in `Settings`, and every
+response's own `rule_engine_note` states this explicitly. See FLOW.md §42
+for the exact seven rules and their threshold's home in `Settings`.
+Business Insights evaluates `customer_growth`/`guest_growth`/
+`plan_distribution_coverage` (each platform-wide, at most one insight per
+rule). Operational Recommendations evaluates `offline_routers` (per
+organization), `location_guest_volume_drop` (per location),
+`rising_router_cpu` (per router), and `persistent_critical_alerts` (per
+organization) -- each producing one insight per qualifying entity, never a
+single rolled-up sentence (see FLOW.md §42's own write-up of this
+consistency choice).
+

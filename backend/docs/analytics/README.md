@@ -8,13 +8,21 @@ router/organization/location data, and a persisted, indexed
 (Super Admin + Organization + Location Dashboards) builds three real
 dashboard endpoints over that infrastructure, reading mostly from
 already-computed snapshots and falling back to live aggregation only where
-a snapshot doesn't cover what is needed. **Part 3** (this update -- Router +
-Network + Guest + Authentication Analytics) builds four more real,
-organization-scoped analytics endpoints, composing with `app.domains
-.router_provisioning`/`app.domains.wireguard`/BE-010's own Guest Analytics
-rather than duplicating any of them, and is honest about the handful of
-figures no real data source in this codebase can back. Later parts (not
-built here): forecasting and reporting/export.
+a snapshot doesn't cover what is needed. **Part 3** (Router + Network +
+Guest + Authentication Analytics) builds four more real, organization-scoped
+analytics endpoints, composing with `app.domains.router_provisioning`/
+`app.domains.wireguard`/BE-010's own Guest Analytics rather than duplicating
+any of them, and is honest about the handful of figures no real data source
+in this codebase can back. **Part 4** (this update -- Business Analytics +
+Forecast/Insight/Trend Engines) adds Customer Growth + Plan Distribution
+(real) alongside honestly-unavailable Revenue/Subscription/Churn/Renewal/
+License-Utilization figures, a real ordinary-least-squares linear-regression
+Forecast Engine (bandwidth/guest-growth/network-load projections, a
+capacity threshold-crossing prediction, and a Router Failure Risk heuristic
+-- explicitly not a machine-learning model), and a real, deterministic
+rule-based Insight Engine (Business Insights + Operational Recommendations)
+-- explicitly not an AI/LLM system, since none exists in this codebase and
+none is added. Later parts (not built here): reporting/export.
 
 See `FLOW.md` for every design decision in detail: §§1-12 cover Part 1 (the
 async-bridge pattern, the Beat schedule's two cadences, the
@@ -32,10 +40,49 @@ threshold, the RADIUS success/failure exact-vs-location-proxy scoping, the
 Guest Retention and Peak Bandwidth formulas, the `build_auth_method_
 breakdown`/`device_breakdown_response` reuse refactor, composing with
 BE-010's own Guest Analytics, the Voucher Failure honest-partial-signal
-gap, every honest placeholder, and the Accept-Language capture decision).
+gap, every honest placeholder, and the Accept-Language capture decision);
+§§35-46 cover Part 4 (the two honesty investigations this part opens with,
+the Trend Engine's de-duplication of Part 2/3's own near-identical trend
+code, the exact OLS linear-regression method, forecast endpoint
+consolidation, the Router Failure Risk heuristic's exact signal set, the
+Capacity Prediction threshold-crossing formula, every Insight Engine rule +
+threshold + its home in `Settings`, Business Analytics' honest-placeholder
+shape, the GLOBAL-vs-ORGANIZATION scope design, and why no migration was
+needed).
 See `DATABASE.md` for the `analytics_snapshots` table's full column/index
-reference plus Part 2's `user_agent`/Part 3's `accept_language` columns on
-`guest_sessions`.
+reference, Part 2's `user_agent`/Part 3's `accept_language` columns on
+`guest_sessions`, and Part 4's seven new read-only repository queries (no
+schema change).
+
+## Part 4 In One Paragraph
+
+Two new figures on `GET /analytics/business` are real: Customer Growth
+(platform organization-count trend, from existing `AnalyticsSnapshot`
+history) and Plan Distribution (a real `GROUP BY
+Organization.subscription_tier`, reporting the true -- if sparse --
+distribution); Revenue/Subscription Trends/Churn/Renewal/License
+Utilization are honest `available: false` placeholders mirroring Part 2's
+`RevenueMetricsResponse` posture. Five new Forecast Engine endpoints
+(`GET /analytics/forecast/bandwidth|capacity|router-failure-risk|
+guest-growth|network-load`) apply a real, pure ordinary-least-squares linear
+regression (`forecast.fit_linear_trend`, ~20 lines of stdlib Python, no
+`numpy`/`scipy`) to real `AnalyticsSnapshot` history for bandwidth/guest-
+growth/network-load projections and a router-count capacity
+threshold-crossing prediction, plus a Router Failure Risk heuristic that
+flags a router "at risk" only when a real, cited signal (rising CPU/memory
+slope, a high ratio of recent unhealthy health snapshots, or repeated real
+`Alert` rows) fires -- explicitly documented as a heuristic risk flag, never
+a fabricated failure-probability number. Two new Insight Engine endpoints
+(`GET /analytics/insights/business|operational`) run a real, deterministic
+rule engine (`insights.py`) -- seven rules total, each with its own
+configurable threshold in `app.core.config.Settings` -- producing
+human-readable findings from real comparisons against real aggregated data,
+explicitly labeled as a rules-based system, not an AI/LLM (none exists in
+this codebase, and per this part's own mandate, none is added). A new
+`trends.py` Trend Engine consolidates what were, before this part, two
+near-identical private trend-building functions in `dashboard_service.py`/
+`domain_analytics_service.py` into one shared implementation, reused by
+both those existing call sites and every new Part 4 caller.
 
 ## Part 3 In One Paragraph
 
@@ -174,17 +221,21 @@ backend/
     domains/
       analytics/
         __init__.py
-        constants.py             # + Part 2/3: audit actions, growth/health-score/
+        constants.py             # + Part 2/3/4: audit actions, growth/health-score/
                                    #   analytics-window constants
         models.py                # AnalyticsSnapshot
         schemas.py                # Pydantic request/response models (Part 1 endpoints)
         dashboard_schemas.py       # Part 2: dashboard response schemas
         domain_analytics_schemas.py  # Part 3: router/network/guest/auth response schemas
+        business_schemas.py         # Part 4: Business Analytics response schemas
+        forecast_schemas.py          # Part 4: Forecast Engine response schemas
+        insight_schemas.py            # Part 4: Insight Engine response schemas
         validators.py             # date-range validation, day_bounds_utc
         exceptions.py             # + Part 2: DashboardScopeForbiddenError
         events.py
         repository.py            # AnalyticsRepositoryProtocol + AnalyticsRepository
-                                   # + Part 2/3: dashboard + domain-analytics read-model queries
+                                   # + Part 2/3/4: dashboard + domain-analytics +
+                                   #   business/forecast/insight read-model queries
         aggregation.py            # pure computation, testable without Celery (Part 1)
                                    # + Part 3: new_guest_count, shared with Guest Analytics
         dashboard_aggregation.py   # Part 2: growth points, snapshot summation helpers
@@ -192,21 +243,44 @@ backend/
                                    #   plus build_auth_method_breakdown/
                                    #   device_breakdown_response (moved here from
                                    #   dashboard_service.py for reuse -- see FLOW.md §29)
+        trends.py                   # Part 4: the Trend Engine -- extract_metric_series/
+                                     #   growth_point_response/build_growth_trend (a
+                                     #   de-duplication of Part 2/3's own near-identical
+                                     #   trend code, see FLOW.md §§36-37)/
+                                     #   compute_snapshot_metric_growth/
+                                     #   count_trailing_consecutive_increases
+        forecast.py                  # Part 4: the Forecast Engine's pure math --
+                                      #   fit_linear_trend (real OLS), forecast_linear_series,
+                                      #   project_upward_threshold_crossing,
+                                      #   assess_router_failure_risk (the heuristic, not ML)
+        insights.py                   # Part 4: the Insight Engine's pure rule functions
+                                       #   (Business Insights + Operational Recommendations)
         peak_concurrency.py        # Part 2: the peak-concurrent-sessions sweep-line
         router_availability.py      # Part 3: the Internet Availability proxy signal
         health_score.py            # Part 2: the Organization Health Score formula
         dashboard_scope.py          # Part 2: DashboardScope + DashboardScopeResolver
-                                     #   (reused as-is by Part 3)
+                                     #   (reused as-is by Part 3/4)
         dashboard_audit.py           # Part 2: dashboard-view audit throttling
-                                      #   (reused as-is by Part 3)
+                                      #   (reused as-is by Part 3/4)
         service.py                 # AnalyticsService: persist + batch pipeline (Part 1)
         dashboard_service.py        # Part 2: DashboardService (the 3 dashboards)
+                                     #   + Part 4: refactored to compose trends.py
         domain_analytics_service.py  # Part 3: DomainAnalyticsService (the 4 endpoints)
+                                      #   + Part 4: refactored to compose trends.py
+        business_service.py           # Part 4: BusinessAnalyticsService
+        forecast_service.py            # Part 4: ForecastService
+        insight_service.py              # Part 4: InsightService
         tasks.py                   # thin Celery task wrappers (the async bridge)
         dependencies.py             # + Part 3: get_domain_analytics_service
+                                     # + Part 4: get_business_analytics_service/
+                                     #   get_forecast_service/get_insight_service
         router.py                  # GET /analytics/snapshots, POST .../trigger,
                                    # + Part 2: GET /dashboard/super-admin|organization|location
                                    # + Part 3: GET /analytics/routers|network|guests|authentication
+                                   # + Part 4: GET /analytics/business,
+                                   #   /analytics/forecast/bandwidth|capacity|
+                                   #   router-failure-risk|guest-growth|network-load,
+                                   #   /analytics/insights/business|operational
       guest/
         models.py                # + Part 2: GuestSession.user_agent
                                    # + Part 3: GuestSession.accept_language
@@ -214,6 +288,9 @@ backend/
                                    #   the two login endpoints
         service.py                 # + Part 2/3: thread user_agent/accept_language
                                    #   through session creation
+    core/
+      config.py                  # + Part 4: 22 new Settings fields (every Forecast/
+                                   #   Insight Engine threshold -- see FLOW.md §42)
   docs/
     analytics/
       README.md                    # this file
@@ -224,6 +301,7 @@ backend/
       test_analytics.py
       test_analytics_router_network_guest_auth.py  # Part 3
       test_analytics_dashboards.py  # Part 2
+      test_analytics_forecast_insights.py  # Part 4
 ```
 
 ## Running a Worker + Beat Locally (for real, once Redis is up)
