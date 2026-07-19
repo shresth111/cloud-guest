@@ -212,3 +212,75 @@ matching `0022`'s own dependency-ordered convention.
 
 Same as Part 1 -- this part's only RBAC edit is additive `AuditAction`
 values (`SUBSCRIPTION_*`/`COUPON_*`), no migration needed.
+
+---
+
+# BE-013 Part 3: Payment Service + Real Stripe/Razorpay Integration + Webhooks
+
+Migration: `alembic/versions/0024_create_billing_payment_tables.py` (revises
+`0023_create_billing_subscription_coupon_tables`). Two new tables, both
+extending `BaseModel`. No `alembic/env.py` edit was needed -- same reason
+as Part 2 (that file already imports `app.domains.billing.models` as a
+whole module).
+
+## `payments`
+
+One row per real (or honestly-failed) charge attempt -- and, per this
+part's own explicit decision, the **entire** "Payment History" query
+surface (see FLOW.md §27 -- no second, append-only history table).
+
+| Column | Type | Notes |
+|---|---|---|
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable | |
+| `subscription_id` | UUID, FK `subscriptions.id` (`SET NULL`), nullable | set when this charge is a subscription renewal/manual retry; null for a standalone one-off charge |
+| `amount` | **Numeric(12, 2)**, not nullable | never `Float` |
+| `currency` | String(3), not nullable | |
+| `status` | String(20), not nullable | `constants.PaymentStatus` -- `pending`/`succeeded`/`failed`/`refunded`/`partially_refunded` |
+| `provider` | String(20), not nullable | `constants.PaymentProvider` -- `stripe`/`razorpay` |
+| `provider_payment_id` | String(255), nullable | the external charge/payment-intent id -- unknown (`NULL`) until the provider assigns one |
+| `idempotency_key` | String(255), not nullable, **unique** | the real, database-enforced backstop behind this module's "same key never double-charges" guarantee -- see FLOW.md §22 |
+| `failure_reason` | Text, nullable | |
+| `refunded_amount` | **Numeric(12, 2)**, not nullable, default `0` | running total across every `refund_payment` call against this row |
+
+Indexes: `organization_id`, `subscription_id`, `status`, `provider`,
+`provider_payment_id`, `idempotency_key` (unique, `uq_payments_idempotency_key`
++ `ix_payments_idempotency_key`), plus base-model indexes.
+
+## `payment_methods`
+
+A tokenized reference to a payment instrument -- **never** raw card data
+(see FLOW.md §28 for the full "token only" discipline).
+
+| Column | Type | Notes |
+|---|---|---|
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable | |
+| `provider` | String(20), not nullable | `constants.PaymentProvider` |
+| `provider_payment_method_id` | String(255), not nullable | the provider's own opaque token (e.g. a Stripe `pm_...` id) -- never a raw card number |
+| `method_type` | String(20), not nullable | `constants.PaymentMethodType` -- `card`/`bank_account`/`upi`/`other` |
+| `last4` | String(4), nullable | display-only, never used in any charge decision |
+| `is_default` | Boolean, not nullable, default `false` | at most one `true` per organization -- enforced by `PaymentMethodRepository.set_as_default`, not a DB constraint (a real atomic `UPDATE` unsets every sibling first) |
+| `is_active` | Boolean, not nullable, default `true` | |
+
+`UniqueConstraint(organization_id, provider, provider_payment_method_id)`
+(`uq_payment_methods_org_provider_token`) prevents registering the exact
+same provider token twice for the same organization. Indexes:
+`organization_id`, `provider`, `is_default`, `is_active`, plus base-model
+indexes.
+
+## Table creation order
+
+`payments` (needs `organizations`/`subscriptions`) -> `payment_methods`
+(needs `organizations` only) -- the migration's `upgrade()`/`downgrade()`
+follow this order (and its exact reverse).
+
+## No further RBAC schema change
+
+Same as Parts 1-2 -- this part's only RBAC edit is additive `AuditAction`
+values (`PAYMENT_*`), no migration needed. `PermissionModule.BILLING` (no
+new module) covers every Part 3 endpoint -- see FLOW.md §32.
+
+## Event-id dedup: Redis, not a table
+
+Webhook event-id dedup (`webhooks.RedisWebhookEventDedup`) is deliberately
+**not** a table at all -- see FLOW.md §24 for the full "Redis + TTL vs. a
+dedicated table" write-up.

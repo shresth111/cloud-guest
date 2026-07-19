@@ -189,6 +189,76 @@ class ExpiryReminderSent:
     occurred_at: datetime = field(default_factory=_now)
 
 
+# ============================================================================
+# BE-013 Part 3: Payment Service + Real Stripe/Razorpay Integration + Webhooks
+# ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentSucceeded:
+    payment_id: uuid.UUID
+    organization_id: uuid.UUID
+    provider: str
+    amount: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentFailed:
+    payment_id: uuid.UUID
+    organization_id: uuid.UUID
+    provider: str
+    reason: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentRefunded:
+    payment_id: uuid.UUID
+    organization_id: uuid.UUID
+    refunded_amount: str
+    full: bool
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentRetried:
+    payment_id: uuid.UUID
+    organization_id: uuid.UUID
+    succeeded: bool
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentMethodRegistered:
+    payment_method_id: uuid.UUID
+    organization_id: uuid.UUID
+    provider: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentMethodRemoved:
+    payment_method_id: uuid.UUID
+    organization_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookProcessed:
+    provider: str
+    event_id: str
+    event_type: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookSignatureInvalid:
+    provider: str
+    reason: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "LicenseAssigned",
     "LicenseActivated",
@@ -210,4 +280,12 @@ __all__ = [
     "CouponValidationFailed",
     "RenewalReminderSent",
     "ExpiryReminderSent",
+    "PaymentSucceeded",
+    "PaymentFailed",
+    "PaymentRefunded",
+    "PaymentRetried",
+    "PaymentMethodRegistered",
+    "PaymentMethodRemoved",
+    "WebhookProcessed",
+    "WebhookSignatureInvalid",
 ]

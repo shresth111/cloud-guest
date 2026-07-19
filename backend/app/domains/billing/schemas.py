@@ -24,6 +24,9 @@ from .constants import (
     DiscountType,
     LicenseChangeType,
     LicenseStatus,
+    PaymentMethodType,
+    PaymentProvider,
+    PaymentStatus,
     PlanFeatureKey,
     PlanFeatureType,
     PlanType,
@@ -56,6 +59,13 @@ __all__ = [
     "CouponListResponse",
     "CouponValidateRequest",
     "CouponValidateResponse",
+    "PaymentInitiateRequest",
+    "PaymentRefundRequest",
+    "PaymentResponse",
+    "PaymentListResponse",
+    "PaymentMethodRegisterRequest",
+    "PaymentMethodResponse",
+    "PaymentMethodListResponse",
 ]
 
 
@@ -406,3 +416,132 @@ class CouponValidateResponse(BaseModel):
         default=None,
         description="Only populated when the request included base_amount.",
     )
+
+
+# ============================================================================
+# Payment / PaymentMethod (BE-013 Part 3)
+# ============================================================================
+
+
+class PaymentInitiateRequest(BaseModel):
+    organization_id: uuid.UUID
+    subscription_id: uuid.UUID | None = Field(
+        default=None,
+        description="Set when this charge is a manual renewal retry/one-off "
+        "against an existing subscription; omit for a standalone one-off "
+        "charge.",
+    )
+    amount: Decimal = Field(..., gt=0)
+    currency: str = Field(default="USD", min_length=3, max_length=3)
+    provider: PaymentProvider
+    idempotency_key: str = Field(
+        ...,
+        min_length=8,
+        max_length=255,
+        description=(
+            "Caller-supplied idempotency key. The SAME key presented twice "
+            "always resolves to the SAME Payment row -- this platform "
+            "never double-charges for a repeated key, enforced by a real "
+            "database unique constraint (see models.Payment's own "
+            "docstring)."
+        ),
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "organization_id": "11111111-1111-1111-1111-111111111111",
+                "amount": "49.99",
+                "currency": "USD",
+                "provider": "stripe",
+                "idempotency_key": "checkout-9f3e2a1b4c5d",
+            }
+        }
+    )
+
+
+class PaymentRefundRequest(BaseModel):
+    amount: Decimal | None = Field(
+        default=None,
+        gt=0,
+        description="Omit for a full refund of the remaining chargeable "
+        "amount; set for a partial refund.",
+    )
+
+
+class PaymentResponse(BaseModel):
+    id: str
+    organization_id: str
+    subscription_id: str | None
+    amount: Decimal
+    currency: str
+    status: PaymentStatus
+    provider: PaymentProvider
+    provider_payment_id: str | None
+    idempotency_key: str
+    failure_reason: str | None
+    refunded_amount: Decimal
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PaymentListResponse(BaseModel):
+    items: list[PaymentResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+class PaymentMethodRegisterRequest(BaseModel):
+    organization_id: uuid.UUID
+    provider: PaymentProvider
+    provider_payment_method_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description=(
+            "The provider's own opaque tokenized reference (e.g. a Stripe "
+            "'pm_...' id) -- NEVER a raw card number/CVV. This platform "
+            "never handles or stores raw card data."
+        ),
+    )
+    method_type: PaymentMethodType
+    last4: str | None = Field(default=None, min_length=4, max_length=4)
+    is_default: bool = False
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "organization_id": "11111111-1111-1111-1111-111111111111",
+                "provider": "stripe",
+                "provider_payment_method_id": "pm_1NExampleToken",
+                "method_type": "card",
+                "last4": "4242",
+                "is_default": True,
+            }
+        }
+    )
+
+
+class PaymentMethodResponse(BaseModel):
+    id: str
+    organization_id: str
+    provider: PaymentProvider
+    provider_payment_method_id: str
+    method_type: PaymentMethodType
+    last4: str | None
+    is_default: bool
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PaymentMethodListResponse(BaseModel):
+    items: list[PaymentMethodResponse]

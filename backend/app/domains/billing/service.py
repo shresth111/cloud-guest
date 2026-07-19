@@ -53,6 +53,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
+from app.database.exceptions import DuplicateRecordError
 from app.domains.otp.constants import OtpChannel
 from app.domains.rbac.enums import AuditAction
 
@@ -62,6 +63,7 @@ from .constants import (
     DiscountType,
     LicenseChangeType,
     LicenseStatus,
+    PaymentStatus,
     PlanFeatureType,
     PlanType,
     SubscriptionStatus,
@@ -77,6 +79,12 @@ from .events import (
     LicenseExpired,
     LicenseSuspended,
     LicenseUpgraded,
+    PaymentFailed,
+    PaymentMethodRegistered,
+    PaymentMethodRemoved,
+    PaymentRefunded,
+    PaymentRetried,
+    PaymentSucceeded,
     SubscriptionCancelled,
     SubscriptionCreated,
     SubscriptionPaused,
@@ -101,16 +109,24 @@ from .exceptions import (
     InvalidSubscriptionStatusTransitionError,
     LicenseNotActiveError,
     LicenseNotFoundError,
+    PaymentMethodNotFoundError,
+    PaymentNotFoundError,
+    PaymentNotRefundableError,
+    PaymentNotRetryableError,
     PlanInactiveError,
     PlanNotFoundError,
+    RefundExceedsRefundableAmountError,
     SamePlanError,
     SubscriptionNotFoundError,
     SubscriptionReactivationNotAllowedError,
+    UnsupportedPaymentProviderError,
 )
 from .models import (
     Coupon,
     License,
     LicenseChangeLog,
+    Payment,
+    PaymentMethod,
     Plan,
     PlanFeature,
     Subscription,
@@ -119,6 +135,8 @@ from .models import (
 from .repository import (
     CouponRepositoryProtocol,
     LicenseRepositoryProtocol,
+    PaymentMethodRepositoryProtocol,
+    PaymentRepositoryProtocol,
     PlanRepositoryProtocol,
     SubscriptionRepositoryProtocol,
     UsageRepositoryProtocol,
@@ -1723,6 +1741,404 @@ class SubscriptionService:
         logger.info("billing_subscription_audit_event", extra={"action": action.value})
 
 
+# ============================================================================
+# Payment / PaymentMethod (BE-013 Part 3)
+# ============================================================================
+
+
+class PaymentGatewayAdminProtocol(Protocol):
+    """The narrow surface ``PaymentService`` needs from each concrete
+    gateway (``payment_gateways.StripePaymentGateway``/
+    ``RazorpayPaymentGateway``) -- kept as a locally-defined ``Protocol``
+    (rather than importing ``payment_gateways.PaymentGatewayAdminProtocol``
+    as a concrete dependency type) for the exact same "avoid a construction
+    cycle / keep the dependency structural" reasoning
+    ``LicenseLifecycleProtocol`` above already establishes for the
+    identical ``SubscriptionService`` <-> ``LicenseService`` relationship:
+    ``payment_gateways.py`` imports ``renewal_service.PaymentGatewayProtocol``,
+    and ``renewal_service.py`` imports this module's own
+    ``LicenseLifecycleProtocol``/``AuditLogWriter`` -- importing
+    ``payment_gateways`` back into this module would close that import
+    cycle. Every method here already exists on both concrete gateway
+    classes, unmodified -- this is a structural typing seam, not a second
+    implementation of anything."""
+
+    async def charge_via_provider(self, payment: Payment) -> Payment: ...
+
+    async def refund(self, payment: Payment, amount: Decimal | None) -> Payment: ...
+
+    async def retry(self, payment: Payment) -> Payment: ...
+
+
+class PaymentService:
+    """Payment initiation (real idempotency-key enforcement), refund,
+    retry, and "payment history" (see ``models.Payment``'s own "doubles as
+    history" docstring for why this is a query surface, not a second
+    table).
+
+    ## Real idempotency enforcement -- see ``initiate_payment``
+
+    ``models.Payment.idempotency_key`` is unique, not nullable. This class
+    checks for an existing row first (the fast path for the overwhelming
+    majority of calls -- no two concurrent requests), then relies on the
+    real database unique constraint as the backstop against a genuine
+    race: if two concurrent requests both pass that initial check before
+    either commits, the loser's ``INSERT`` collides with the constraint,
+    ``GenericRepository._flush_or_raise`` translates it into
+    ``app.database.exceptions.DuplicateRecordError``, and this class
+    catches exactly that to re-read and return the winning row -- the same
+    ``idempotency_key`` presented twice always resolves to the same
+    ``Payment`` row, never a double charge, enforced at the database
+    level.
+    """
+
+    def __init__(
+        self,
+        payment_repository: PaymentRepositoryProtocol,
+        payment_method_repository: PaymentMethodRepositoryProtocol,
+        *,
+        gateways: dict[str, PaymentGatewayAdminProtocol],
+        audit_writer: AuditLogWriter | None = None,
+    ) -> None:
+        self.payment_repository = payment_repository
+        self.payment_method_repository = payment_method_repository
+        self.gateways = gateways
+        self.audit_writer = audit_writer
+
+    def _gateway_for(self, provider: str) -> PaymentGatewayAdminProtocol:
+        gateway = self.gateways.get(provider)
+        if gateway is None:
+            raise UnsupportedPaymentProviderError(provider)
+        return gateway
+
+    async def get_payment(
+        self, payment_id: uuid.UUID, *, organization_id: uuid.UUID | None = None
+    ) -> Payment:
+        """``organization_id``, when supplied, enforces tenant isolation --
+        a payment that exists but belongs to a different organization is
+        reported as not-found, never leaking its existence."""
+        payment = await self.payment_repository.get_by_id(payment_id)
+        if payment is None or (
+            organization_id is not None and payment.organization_id != organization_id
+        ):
+            raise PaymentNotFoundError(payment_id)
+        return payment
+
+    async def list_payments(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 25,
+        organization_id: uuid.UUID | None = None,
+        status: str | None = None,
+        provider: str | None = None,
+    ):
+        return await self.payment_repository.list_payments(
+            page=page,
+            page_size=page_size,
+            organization_id=organization_id,
+            status=status,
+            provider=provider,
+        )
+
+    async def list_failed_payments(
+        self, organization_id: uuid.UUID | None = None
+    ) -> list[Payment]:
+        return await self.payment_repository.list_failed_payments(organization_id)
+
+    async def initiate_payment(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        organization_id: uuid.UUID,
+        subscription_id: uuid.UUID | None,
+        amount: Decimal,
+        currency: str,
+        provider: str,
+        idempotency_key: str,
+    ) -> Payment:
+        existing = await self.payment_repository.get_by_idempotency_key(idempotency_key)
+        if existing is not None:
+            return existing
+
+        gateway = self._gateway_for(provider)
+        try:
+            payment = await self.payment_repository.create_payment(
+                organization_id=organization_id,
+                subscription_id=subscription_id,
+                amount=amount,
+                currency=currency,
+                status=PaymentStatus.PENDING.value,
+                provider=provider,
+                provider_payment_id=None,
+                idempotency_key=idempotency_key,
+                refunded_amount=Decimal("0"),
+                created_by=actor_user_id,
+            )
+        except DuplicateRecordError:
+            # A concurrent request raced this one and won -- see class
+            # docstring for the full write-up of why this is the real
+            # enforcement backstop, not the primary check.
+            winner = await self.payment_repository.get_by_idempotency_key(
+                idempotency_key
+            )
+            if winner is None:  # pragma: no cover - defensive
+                raise
+            return winner
+
+        await self._audit(
+            actor_user_id,
+            AuditAction.PAYMENT_INITIATED,
+            payment,
+            description=f"Payment {payment.id} initiated for organization "
+            f"{organization_id} ({amount} {currency} via {provider})",
+        )
+
+        payment = await gateway.charge_via_provider(payment)
+
+        if payment.status == PaymentStatus.SUCCEEDED.value:
+            event = PaymentSucceeded(
+                payment_id=payment.id,
+                organization_id=organization_id,
+                provider=provider,
+                amount=str(payment.amount),
+            )
+            logger.info("billing_payment_succeeded", extra=_event_extra(event))
+            await self._audit(
+                actor_user_id,
+                AuditAction.PAYMENT_SUCCEEDED,
+                payment,
+                description=f"Payment {payment.id} succeeded",
+            )
+        elif payment.status == PaymentStatus.FAILED.value:
+            event = PaymentFailed(
+                payment_id=payment.id,
+                organization_id=organization_id,
+                provider=provider,
+                reason=payment.failure_reason or "unknown",
+            )
+            logger.warning("billing_payment_failed", extra=_event_extra(event))
+            await self._audit(
+                actor_user_id,
+                AuditAction.PAYMENT_FAILED,
+                payment,
+                description=f"Payment {payment.id} failed: {payment.failure_reason}",
+            )
+        return payment
+
+    async def refund_payment(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        payment_id: uuid.UUID,
+        amount: Decimal | None = None,
+    ) -> Payment:
+        payment = await self.get_payment(payment_id)
+        if payment.status not in (
+            PaymentStatus.SUCCEEDED.value,
+            PaymentStatus.PARTIALLY_REFUNDED.value,
+        ):
+            raise PaymentNotRefundableError(payment_id, payment.status)
+
+        refundable = payment.amount - payment.refunded_amount
+        refund_amount = amount if amount is not None else refundable
+        if refund_amount <= 0 or refund_amount > refundable:
+            raise RefundExceedsRefundableAmountError(
+                payment_id, refund_amount, refundable
+            )
+
+        gateway = self._gateway_for(payment.provider)
+        updated = await gateway.refund(payment, refund_amount)
+
+        full = updated.status == PaymentStatus.REFUNDED.value
+        event = PaymentRefunded(
+            payment_id=updated.id,
+            organization_id=updated.organization_id,
+            refunded_amount=str(updated.refunded_amount),
+            full=full,
+        )
+        logger.info("billing_payment_refunded", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.PAYMENT_REFUNDED,
+            updated,
+            description=f"Payment {updated.id} refunded {refund_amount} "
+            f"({'full' if full else 'partial'})",
+        )
+        return updated
+
+    async def retry_failed_payment(
+        self, *, actor_user_id: uuid.UUID | None, payment_id: uuid.UUID
+    ) -> Payment:
+        payment = await self.get_payment(payment_id)
+        if payment.status != PaymentStatus.FAILED.value:
+            raise PaymentNotRetryableError(payment_id, payment.status)
+
+        gateway = self._gateway_for(payment.provider)
+        updated = await gateway.retry(payment)
+
+        succeeded = updated.status == PaymentStatus.SUCCEEDED.value
+        event = PaymentRetried(
+            payment_id=updated.id,
+            organization_id=updated.organization_id,
+            succeeded=succeeded,
+        )
+        logger.info("billing_payment_retried", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.PAYMENT_RETRIED,
+            updated,
+            description=f"Payment {updated.id} retried "
+            f"({'succeeded' if succeeded else 'failed again'})",
+        )
+        return updated
+
+    async def _audit(
+        self,
+        actor_user_id: uuid.UUID | None,
+        action: AuditAction,
+        payment: Payment,
+        *,
+        description: str,
+    ) -> None:
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=actor_user_id,
+                action=action.value,
+                entity_type="payment",
+                entity_id=payment.id,
+                description=description,
+                event_metadata={},
+                organization_id=payment.organization_id,
+                location_id=None,
+            )
+        logger.info("billing_payment_audit_event", extra={"action": action.value})
+
+
+class PaymentMethodService:
+    """Registration/listing/removal of tokenized payment-method references
+    -- see ``models.PaymentMethod``'s own docstring for the "token only,
+    never raw card data" discipline this class never deviates from (it has
+    no code path that accepts or stores anything but an opaque
+    ``provider_payment_method_id`` string)."""
+
+    def __init__(
+        self,
+        repository: PaymentMethodRepositoryProtocol,
+        *,
+        audit_writer: AuditLogWriter | None = None,
+    ) -> None:
+        self.repository = repository
+        self.audit_writer = audit_writer
+
+    async def register_payment_method(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        organization_id: uuid.UUID,
+        provider: str,
+        provider_payment_method_id: str,
+        method_type: str,
+        last4: str | None,
+        is_default: bool,
+    ) -> PaymentMethod:
+        payment_method = await self.repository.create_payment_method(
+            organization_id=organization_id,
+            provider=provider,
+            provider_payment_method_id=provider_payment_method_id,
+            method_type=method_type,
+            last4=last4,
+            is_default=False,
+            is_active=True,
+            created_by=actor_user_id,
+        )
+        if is_default:
+            payment_method = await self.repository.set_as_default(payment_method)
+
+        event = PaymentMethodRegistered(
+            payment_method_id=payment_method.id,
+            organization_id=organization_id,
+            provider=provider,
+        )
+        logger.info("billing_payment_method_registered", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.PAYMENT_METHOD_REGISTERED,
+            payment_method,
+            description=f"Payment method {payment_method.id} registered for "
+            f"organization {organization_id}",
+        )
+        return payment_method
+
+    async def list_payment_methods(
+        self, organization_id: uuid.UUID
+    ) -> list[PaymentMethod]:
+        return await self.repository.list_for_organization(organization_id)
+
+    async def get_payment_method(
+        self,
+        payment_method_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None = None,
+    ) -> PaymentMethod:
+        payment_method = await self.repository.get_by_id(payment_method_id)
+        if payment_method is None or (
+            organization_id is not None
+            and payment_method.organization_id != organization_id
+        ):
+            raise PaymentMethodNotFoundError(payment_method_id)
+        return payment_method
+
+    async def remove_payment_method(
+        self, *, actor_user_id: uuid.UUID | None, payment_method_id: uuid.UUID
+    ) -> PaymentMethod:
+        payment_method = await self.get_payment_method(payment_method_id)
+        updated = await self.repository.update_payment_method(
+            payment_method,
+            {
+                "is_active": False,
+                "is_default": False,
+                "updated_by": actor_user_id,
+            },
+        )
+        updated = await self.repository.soft_delete_payment_method(updated)
+
+        event = PaymentMethodRemoved(
+            payment_method_id=updated.id, organization_id=updated.organization_id
+        )
+        logger.info("billing_payment_method_removed", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.PAYMENT_METHOD_REMOVED,
+            updated,
+            description=f"Payment method {updated.id} removed",
+        )
+        return updated
+
+    async def _audit(
+        self,
+        actor_user_id: uuid.UUID | None,
+        action: AuditAction,
+        payment_method: PaymentMethod,
+        *,
+        description: str,
+    ) -> None:
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=actor_user_id,
+                action=action.value,
+                entity_type="payment_method",
+                entity_id=payment_method.id,
+                description=description,
+                event_metadata={},
+                organization_id=payment_method.organization_id,
+                location_id=None,
+            )
+        logger.info(
+            "billing_payment_method_audit_event", extra={"action": action.value}
+        )
+
+
 def _event_extra(event: object) -> dict[str, object]:
     """Flattens a frozen, ``slots=True`` ``events.py`` dataclass into
     ``logger.info(extra=)``-friendly, JSON-serializable keys -- identical
@@ -1752,4 +2168,6 @@ __all__ = [
     "UsageValidationResult",
     "CouponService",
     "SubscriptionService",
+    "PaymentService",
+    "PaymentMethodService",
 ]

@@ -672,6 +672,145 @@ class CouponUsage(BaseModel):
         )
 
 
+# ============================================================================
+# BE-013 Part 3: Payment Service + Real Stripe/Razorpay Integration + Webhooks
+# ============================================================================
+
+
+class Payment(BaseModel):
+    """One real (or honestly-failed) charge attempt -- and, per this part's
+    own explicit "Payment History" decision, the entire query surface for
+    an organization's payment history. There is no second, append-only
+    ``PaymentHistory`` table: every ``Payment`` row already is a permanent,
+    timestamped, status-tracked record of one charge attempt (created once,
+    mutated only by its own real lifecycle -- refund/retry -- never
+    deleted), so "payment history" is simply
+    ``PaymentRepository.list_payments(organization_id=...)`` ordered by
+    ``created_at`` -- the identical "a query surface over existing rows,
+    not a second table" judgment call ``UsageMetric``/``LicenseChangeLog``
+    already establish elsewhere in this domain for their own read
+    surfaces. See ``payment_gateways.py``'s module docstring for exactly
+    how a row moves through ``constants.PaymentStatus``'s transition graph.
+
+    ## Idempotency: a real, DB-unique-constraint-backed guarantee
+
+    ``idempotency_key`` is **unique, not nullable** -- this is the actual
+    enforcement mechanism, not a comment: ``service.PaymentService
+    .initiate_payment`` checks for an existing row with the same key
+    first (the common-case fast path), and if a concurrent request racing
+    against it also passes that check before either commits, the *second*
+    ``INSERT`` collides with this real unique constraint, is translated by
+    ``GenericRepository._flush_or_raise`` into
+    ``app.database.exceptions.DuplicateRecordError``, and
+    ``PaymentService.initiate_payment`` catches exactly that to re-read and
+    return the winning row instead of ever attempting a second charge --
+    see that method's own docstring for the full write-up. The same
+    ``idempotency_key`` presented twice therefore always resolves to the
+    same ``Payment`` row, enforced at the database level, not merely an
+    application-level check that a race could still slip past.
+
+    ``provider_payment_id`` is nullable until the provider assigns one (it
+    is unknown at ``PENDING`` row-creation time, before the real SDK call
+    returns). ``refunded_amount`` defaults to ``0`` and is the running
+    total of every ``refund_payment`` call against this row -- never reset,
+    never re-derived from a second table.
+    """
+
+    __tablename__ = "payments"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subscription_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    provider_payment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True
+    )
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    refunded_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0"), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_payments_idempotency_key"),
+        Index("ix_payments_organization_id", "organization_id"),
+        Index("ix_payments_subscription_id", "subscription_id"),
+        Index("ix_payments_status", "status"),
+        Index("ix_payments_provider", "provider"),
+        Index("ix_payments_provider_payment_id", "provider_payment_id"),
+        Index("ix_payments_idempotency_key", "idempotency_key", unique=True),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Payment(id={self.id}, organization_id={self.organization_id}, "
+            f"status={self.status}, provider={self.provider})>"
+        )
+
+
+class PaymentMethod(BaseModel):
+    """A tokenized reference to a payment instrument -- **never** a raw
+    card number/CVV/full payment credential. ``provider_payment_method_id``
+    is the provider's own opaque token (e.g. a Stripe ``pm_...`` id, or a
+    Razorpay saved-card token id) -- this table stores only what the
+    provider hands back after its own (client-side, PCI-scoped) tokenization
+    flow, exactly the discipline this codebase's real secrets already
+    follow one level over: ``app.domains.router.crypto`` at least
+    encrypts a real, recoverable secret at rest because this platform must
+    open a live RouterOS connection with it; this table does not even need
+    that, since it stores no recoverable secret at all, only an opaque
+    reference the provider itself resolves. ``last4`` is nullable,
+    display-only (never used for any charge decision).
+
+    ``is_default`` is enforced as **at most one per organization** by
+    ``repository.PaymentMethodRepository.set_as_default`` (unsets every
+    sibling row in the same transaction) -- see that method's own
+    docstring."""
+
+    __tablename__ = "payment_methods"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    provider_payment_method_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    method_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    last4: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "provider",
+            "provider_payment_method_id",
+            name="uq_payment_methods_org_provider_token",
+        ),
+        Index("ix_payment_methods_organization_id", "organization_id"),
+        Index("ix_payment_methods_provider", "provider"),
+        Index("ix_payment_methods_is_default", "is_default"),
+        Index("ix_payment_methods_is_active", "is_active"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PaymentMethod(id={self.id}, organization_id="
+            f"{self.organization_id}, provider={self.provider})>"
+        )
+
+
 __all__ = [
     "Plan",
     "PlanFeature",
@@ -682,4 +821,6 @@ __all__ = [
     "Coupon",
     "CouponPlan",
     "CouponUsage",
+    "Payment",
+    "PaymentMethod",
 ]

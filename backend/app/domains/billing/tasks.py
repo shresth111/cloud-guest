@@ -14,13 +14,19 @@ running event loop underneath it).
 ## Payment gateway wiring in a Celery worker process
 
 ``renewal_service.RenewalService`` is constructed here with
-``dependencies.get_payment_gateway()`` -- the exact same, single seam
-function the FastAPI dependency graph uses (``dependencies
-.get_renewal_service``). This keeps exactly one place in this codebase that
-decides which ``PaymentGatewayProtocol`` implementation is live: BE-013
-Part 3 overriding that one function's body wires its real gateway into both
-the HTTP API path and this Celery worker path simultaneously, with zero
-changes needed here.
+``dependencies.build_payment_gateway(db=session, settings=settings)`` --
+the exact same, single provider-selection function the FastAPI dependency
+graph's ``get_payment_gateway`` calls (``dependencies.get_renewal_service``).
+This keeps exactly one place in this codebase that decides which real
+``PaymentGatewayProtocol`` implementation (Stripe vs. Razorpay) is live:
+BE-013 Part 3's ``build_payment_gateway`` wires the same real gateway into
+both the HTTP API path and this Celery worker path simultaneously. This
+task passes its own already-open ``session``/``settings`` explicitly
+rather than calling the FastAPI dependency function with no arguments --
+``get_payment_gateway``'s parameters merely *default* to
+``Depends(get_db_session)``/``Depends(get_settings)``, which are only ever
+resolved by FastAPI's own DI container, not by a bare function call from
+plain Python code such as this task body.
 """
 
 from __future__ import annotations
@@ -36,7 +42,7 @@ from app.domains.organization.service import OrganizationService
 from app.domains.rbac.repository import RBACRepository
 
 from .constants import TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP
-from .dependencies import get_payment_gateway
+from .dependencies import build_payment_gateway
 from .renewal_service import RenewalService, RenewalSweepReport
 from .repository import LicenseRepository, PlanRepository, SubscriptionRepository
 from .service import LicenseService
@@ -70,7 +76,7 @@ async def _run_renewal_sweep_async() -> RenewalSweepReport:
                 plan_repository,
                 license_service=license_service,
                 organization_lookup=organization_service,
-                payment_gateway=get_payment_gateway(),
+                payment_gateway=build_payment_gateway(db=session, settings=settings),
                 audit_writer=audit_repository,
                 grace_period_days=settings.subscription_renewal_grace_period_days,
                 renewal_reminder_days_before=(

@@ -343,6 +343,90 @@ DEFAULT_PLAN_CURRENCY = "USD"
 # every "*_MB" metric key name.
 BYTES_PER_MB = 1024 * 1024
 
+# ============================================================================
+# BE-013 Part 3: Payment Service + Real Stripe/Razorpay Integration + Webhooks
+# ============================================================================
+
+
+class PaymentProvider(StrEnum):
+    """The two real, supported payment gateways. See ``payment_gateways.py``
+    for each provider's concrete ``renewal_service.PaymentGatewayProtocol``
+    implementation, and ``dependencies.build_payment_gateway`` for how
+    ``Settings.payment_default_provider`` selects between them."""
+
+    STRIPE = "stripe"
+    RAZORPAY = "razorpay"
+
+
+class PaymentStatus(StrEnum):
+    """The full :class:`~.models.Payment` lifecycle -- see ``service.py``'s
+    ``_PAYMENT_TRANSITIONS`` for the exact, explicit transition graph (same
+    "define every legal transition, reject everything else" rigor as
+    ``LicenseStatus``/``SubscriptionStatus``).
+
+    * ``PENDING`` -- a charge attempt has been recorded but the provider has
+      not yet confirmed an outcome (e.g. an async Stripe confirmation still
+      in flight, or a genuinely not-yet-attempted row).
+    * ``SUCCEEDED`` -- the provider confirmed the charge captured.
+    * ``FAILED`` -- the provider declined/errored, or the gateway was not
+      configured (a real, honest terminal-for-this-attempt outcome --
+      ``retry_failed_payment`` is the real, explicit path back out of this
+      state, not an automatic retry).
+    * ``REFUNDED`` -- ``refunded_amount == amount``.
+    * ``PARTIALLY_REFUNDED`` -- ``0 < refunded_amount < amount``.
+    """
+
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    REFUNDED = "refunded"
+    PARTIALLY_REFUNDED = "partially_refunded"
+
+
+class PaymentMethodType(StrEnum):
+    """The tokenized-reference shape a :class:`~.models.PaymentMethod`
+    represents -- never raw card data, only a provider token (see that
+    model's own docstring)."""
+
+    CARD = "card"
+    BANK_ACCOUNT = "bank_account"
+    UPI = "upi"
+    OTHER = "other"
+
+
+# Real, well-known "zero-decimal currency" exception set both Stripe and
+# Razorpay document identically: for every currency NOT in this set, both
+# providers require amounts as an integer count of the currency's smallest
+# unit (e.g. USD cents: $12.34 -> 1234); for a currency in this set, the
+# smallest unit IS the whole unit (e.g. JPY has no sub-unit: JPY 1234 ->
+# 1234, not 123400). See validators.to_minor_units.
+ZERO_DECIMAL_CURRENCIES: frozenset[str] = frozenset(
+    {
+        "BIF",
+        "CLP",
+        "DJF",
+        "GNF",
+        "JPY",
+        "KMF",
+        "KRW",
+        "MGA",
+        "PYG",
+        "RWF",
+        "UGX",
+        "VND",
+        "VUV",
+        "XAF",
+        "XOF",
+        "XPF",
+    }
+)
+
+# Redis key prefix for the webhook event-id dedup set (webhooks.py's
+# RedisWebhookEventDedup) -- see FLOW.md §24 for the full write-up of why a
+# Redis-backed, TTL'd dedup set was chosen over a dedicated table.
+WEBHOOK_EVENT_DEDUP_KEY_PREFIX = "billing:webhook_event"
+
+
 __all__ = [
     "PlanType",
     "BillingCycle",
@@ -366,4 +450,9 @@ __all__ = [
     "USAGE_METRIC_TO_LIMIT_FEATURE",
     "DEFAULT_PLAN_CURRENCY",
     "BYTES_PER_MB",
+    "PaymentProvider",
+    "PaymentStatus",
+    "PaymentMethodType",
+    "ZERO_DECIMAL_CURRENCIES",
+    "WEBHOOK_EVENT_DEDUP_KEY_PREFIX",
 ]

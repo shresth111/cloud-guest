@@ -88,15 +88,68 @@ All responses use the standard ``ApiResponse``/``build_response`` envelope.
   organization's subscription-relevant state" action ``GET /subscriptions/
   {organization_id}`` already is, just phrased as a check instead of a
   fetch.
+
+## BE-013 Part 3 additions: Payments + Payment Methods + Webhooks
+
+* **Payments** reuse ``billing.*`` -- a payment is fundamentally a
+  billing-admin action with no dedicated ``create``/``delete`` seeded
+  action (the same "reuse the closest seeded action" precedent Plans/
+  Coupons already establish above): ``POST /payments`` (initiate) ->
+  ``billing.manage``; ``POST /payments/{id}/refund``/``POST
+  /payments/{id}/retry`` -> ``billing.manage`` (both are consequential,
+  revenue-impacting writes); every read -> ``billing.read``. No
+  ``scope=ScopeType.GLOBAL`` pin -- unlike the platform-wide pricing
+  catalog (Plans/Coupons), a ``Payment`` is a real, tenant-owned resource
+  (``organization_id`` on every row), so ordinary inferred, tenant-scoped
+  resolution applies, exactly like Licenses/Subscriptions. ``GET
+  /payments``/``GET /payments/{id}`` both additionally enforce real tenant
+  isolation in the service layer (``PaymentService.get_payment``'s
+  ``organization_id`` filter, resolved from the caller's ``X-Organization-
+  Id`` header via ``RequireOrganization``) -- a payment belonging to a
+  different organization reports as not-found, never leaking its
+  existence.
+* **Payment Methods** reuse ``billing.*`` identically: register/remove ->
+  ``billing.manage`` (a tokenized-reference write, security-sensitive);
+  list -> ``billing.read``. ``POST``/``GET /payments/methods`` and
+  ``DELETE /payments/methods/{id}`` are registered **before**
+  ``GET /payments/{payment_id}``/its siblings in this file -- mirrors
+  ``GET /licenses/me``'s identical "the more specific literal path must be
+  registered before the wildcard path it could otherwise be shadowed by"
+  ordering requirement already established above in this same router.
+* **Webhooks** (``POST /webhooks/stripe``/``POST /webhooks/razorpay``) are
+  **provider-authenticated via real HMAC-SHA256 signature verification,
+  not RBAC** -- the identical "no platform-user identity for this caller"
+  reasoning BE-008's device check-in and BE-010's RADIUS endpoints already
+  establish for a non-human caller this codebase still must accept
+  requests from. Raw request bodies are read via ``await request.body()``
+  (never a Pydantic-parsed body model, since signature verification
+  covers the exact raw bytes) and passed through
+  ``webhooks.verify_stripe_event``/``webhooks.verify_razorpay_signature``
+  before any processing. Response shape: a plain ``{"received": True}``
+  dict on success (status ``200``) -- not the standard ``ApiResponse``
+  envelope, since neither provider parses the response body at all, only
+  the status code, and Stripe's own documented example payload is exactly
+  this shape. An invalid signature raises ``WebhookSignatureInvalidError``
+  (a real ``CloudGuestError`` -- ``400``, rendered via the same global
+  exception handler every other domain's errors already go through, since
+  there is no reason for this one error case to bypass that uniform
+  machinery). Any *other* unhandled exception during processing propagates
+  to a ``500`` -- a deliberate choice: both providers' own real retry
+  policies re-deliver on a ``5xx``, which is exactly the right behavior
+  for a genuine, possibly-transient internal failure (a database blip),
+  whereas a permanently-invalid signature (``400``) is correctly never
+  retried into succeeding.
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.core.config import Settings, get_settings
 from app.domains.auth.dependencies import get_current_user
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
@@ -108,15 +161,32 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.rbac.enums import ScopeType
 
-from .constants import DiscountType, PlanType
+from .constants import DiscountType, PaymentStatus, PlanType
 from .dependencies import (
     get_coupon_service,
     get_license_service,
+    get_payment_method_service,
+    get_payment_repository,
+    get_payment_service,
     get_plan_service,
+    get_renewal_service,
     get_subscription_service,
     get_usage_service,
+    get_webhook_event_dedup,
 )
-from .models import Coupon, License, LicenseChangeLog, Plan, PlanFeature, Subscription
+from .exceptions import WebhookSignatureInvalidError
+from .models import (
+    Coupon,
+    License,
+    LicenseChangeLog,
+    Payment,
+    PaymentMethod,
+    Plan,
+    PlanFeature,
+    Subscription,
+)
+from .renewal_service import RenewalService
+from .repository import PaymentRepositoryProtocol
 from .schemas import (
     CouponCreateRequest,
     CouponListResponse,
@@ -130,6 +200,13 @@ from .schemas import (
     LicenseResponse,
     LicenseSuspendRequest,
     LicenseUpgradeRequest,
+    PaymentInitiateRequest,
+    PaymentListResponse,
+    PaymentMethodListResponse,
+    PaymentMethodRegisterRequest,
+    PaymentMethodResponse,
+    PaymentRefundRequest,
+    PaymentResponse,
     PlanCreateRequest,
     PlanFeatureResponse,
     PlanListResponse,
@@ -145,12 +222,22 @@ from .schemas import (
 from .service import (
     CouponService,
     LicenseService,
+    PaymentMethodService,
+    PaymentService,
     PlanService,
     SubscriptionService,
     UsageService,
     UsageValidationResult,
 )
 from .validators import compute_discount_amount
+from .webhooks import (
+    WebhookEventDedupProtocol,
+    log_signature_failure,
+    process_razorpay_event,
+    process_stripe_event,
+    verify_razorpay_signature,
+    verify_stripe_event,
+)
 
 router = APIRouter(tags=["Billing"])
 
@@ -1067,6 +1154,331 @@ async def validate_coupon(
         data=response.model_dump(mode="json"),
         request_id=_request_id(request),
     )
+
+
+# ============================================================================
+# Payments (BE-013 Part 3) -- see module docstring for the full RBAC/scope
+# write-up.
+# ============================================================================
+
+
+def _payment_response(payment: Payment) -> PaymentResponse:
+    return PaymentResponse(
+        id=str(payment.id),
+        organization_id=str(payment.organization_id),
+        subscription_id=(
+            str(payment.subscription_id) if payment.subscription_id else None
+        ),
+        amount=payment.amount,
+        currency=payment.currency,
+        status=payment.status,
+        provider=payment.provider,
+        provider_payment_id=payment.provider_payment_id,
+        idempotency_key=payment.idempotency_key,
+        failure_reason=payment.failure_reason,
+        refunded_amount=payment.refunded_amount,
+        created_at=payment.created_at,
+        updated_at=payment.updated_at,
+    )
+
+
+def _payment_method_response(payment_method: PaymentMethod) -> PaymentMethodResponse:
+    return PaymentMethodResponse(
+        id=str(payment_method.id),
+        organization_id=str(payment_method.organization_id),
+        provider=payment_method.provider,
+        provider_payment_method_id=payment_method.provider_payment_method_id,
+        method_type=payment_method.method_type,
+        last4=payment_method.last4,
+        is_default=payment_method.is_default,
+        is_active=payment_method.is_active,
+        created_at=payment_method.created_at,
+        updated_at=payment_method.updated_at,
+    )
+
+
+@router.post(
+    "/payments",
+    response_model=ApiResponse[PaymentResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("billing.manage"))],
+)
+async def initiate_payment(
+    request: Request,
+    payload: PaymentInitiateRequest,
+    user: AuthUser = Depends(get_current_user),
+    service: PaymentService = Depends(get_payment_service),
+):
+    payment = await service.initiate_payment(
+        actor_user_id=uuid.UUID(user.id),
+        organization_id=payload.organization_id,
+        subscription_id=payload.subscription_id,
+        amount=payload.amount,
+        currency=payload.currency,
+        provider=payload.provider.value,
+        idempotency_key=payload.idempotency_key,
+    )
+    return build_response(
+        success=True,
+        message="Payment initiated",
+        data=_payment_response(payment).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/payments",
+    response_model=ApiResponse[PaymentListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.read"))],
+)
+async def list_payments(
+    request: Request,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    status_filter: PaymentStatus | None = Query(default=None, alias="status"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    service: PaymentService = Depends(get_payment_service),
+):
+    items, meta = await service.list_payments(
+        page=page,
+        page_size=page_size,
+        organization_id=organization_id,
+        status=status_filter.value if status_filter else None,
+    )
+    payload = PaymentListResponse(
+        items=[_payment_response(payment) for payment in items],
+        page=meta.page,
+        page_size=meta.page_size,
+        total_items=meta.total_items,
+        total_pages=meta.total_pages,
+        has_next=meta.has_next,
+        has_previous=meta.has_previous,
+    )
+    return build_response(
+        success=True,
+        message="Payments retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+# ----------------------------------------------------------------------------
+# Payment Methods -- registered BEFORE /payments/{payment_id} below; see
+# module docstring for why (mirrors /licenses/me's identical ordering
+# requirement).
+# ----------------------------------------------------------------------------
+
+
+@router.post(
+    "/payments/methods",
+    response_model=ApiResponse[PaymentMethodResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("billing.manage"))],
+)
+async def register_payment_method(
+    request: Request,
+    payload: PaymentMethodRegisterRequest,
+    user: AuthUser = Depends(get_current_user),
+    service: PaymentMethodService = Depends(get_payment_method_service),
+):
+    payment_method = await service.register_payment_method(
+        actor_user_id=uuid.UUID(user.id),
+        organization_id=payload.organization_id,
+        provider=payload.provider.value,
+        provider_payment_method_id=payload.provider_payment_method_id,
+        method_type=payload.method_type.value,
+        last4=payload.last4,
+        is_default=payload.is_default,
+    )
+    return build_response(
+        success=True,
+        message="Payment method registered",
+        data=_payment_method_response(payment_method).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/payments/methods",
+    response_model=ApiResponse[PaymentMethodListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.read"))],
+)
+async def list_payment_methods(
+    request: Request,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: PaymentMethodService = Depends(get_payment_method_service),
+):
+    items = await service.list_payment_methods(organization_id)
+    payload = PaymentMethodListResponse(
+        items=[_payment_method_response(payment_method) for payment_method in items]
+    )
+    return build_response(
+        success=True,
+        message="Payment methods retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.delete(
+    "/payments/methods/{payment_method_id}",
+    response_model=ApiResponse[MessageResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.manage"))],
+)
+async def remove_payment_method(
+    request: Request,
+    payment_method_id: uuid.UUID,
+    user: AuthUser = Depends(get_current_user),
+    service: PaymentMethodService = Depends(get_payment_method_service),
+):
+    await service.remove_payment_method(
+        actor_user_id=uuid.UUID(user.id), payment_method_id=payment_method_id
+    )
+    return build_response(
+        success=True,
+        message="Payment method removed",
+        data=MessageResponse(message="Payment method removed").model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+# ----------------------------------------------------------------------------
+# /payments/{payment_id} and its sub-actions -- see the ordering note above.
+# ----------------------------------------------------------------------------
+
+
+@router.get(
+    "/payments/{payment_id}",
+    response_model=ApiResponse[PaymentResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.read"))],
+)
+async def get_payment(
+    request: Request,
+    payment_id: uuid.UUID,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: PaymentService = Depends(get_payment_service),
+):
+    payment = await service.get_payment(payment_id, organization_id=organization_id)
+    return build_response(
+        success=True,
+        message="Payment retrieved",
+        data=_payment_response(payment).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/payments/{payment_id}/refund",
+    response_model=ApiResponse[PaymentResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.manage"))],
+)
+async def refund_payment(
+    request: Request,
+    payment_id: uuid.UUID,
+    payload: PaymentRefundRequest,
+    user: AuthUser = Depends(get_current_user),
+    service: PaymentService = Depends(get_payment_service),
+):
+    payment = await service.refund_payment(
+        actor_user_id=uuid.UUID(user.id), payment_id=payment_id, amount=payload.amount
+    )
+    return build_response(
+        success=True,
+        message="Payment refunded",
+        data=_payment_response(payment).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/payments/{payment_id}/retry",
+    response_model=ApiResponse[PaymentResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.manage"))],
+)
+async def retry_payment(
+    request: Request,
+    payment_id: uuid.UUID,
+    user: AuthUser = Depends(get_current_user),
+    service: PaymentService = Depends(get_payment_service),
+):
+    payment = await service.retry_failed_payment(
+        actor_user_id=uuid.UUID(user.id), payment_id=payment_id
+    )
+    return build_response(
+        success=True,
+        message="Payment retried",
+        data=_payment_response(payment).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# Webhooks (BE-013 Part 3) -- provider-authenticated via real signature
+# verification, NOT RBAC. See module docstring for the full write-up.
+# ============================================================================
+
+
+@router.post("/webhooks/stripe", status_code=status.HTTP_200_OK)
+async def stripe_webhook(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    payment_repository: PaymentRepositoryProtocol = Depends(get_payment_repository),
+    renewal_service: RenewalService = Depends(get_renewal_service),
+    dedup: WebhookEventDedupProtocol = Depends(get_webhook_event_dedup),
+):
+    payload = await request.body()
+    signature_header = request.headers.get("stripe-signature", "")
+    try:
+        event = verify_stripe_event(
+            payload,
+            signature_header=signature_header,
+            secret=settings.stripe_webhook_secret,
+            tolerance_seconds=settings.stripe_webhook_tolerance_seconds,
+        )
+    except WebhookSignatureInvalidError as exc:
+        log_signature_failure("stripe", str(exc))
+        raise
+    await process_stripe_event(
+        event,
+        payment_repository=payment_repository,
+        renewal_service=renewal_service,
+        dedup=dedup,
+    )
+    return {"received": True}
+
+
+@router.post("/webhooks/razorpay", status_code=status.HTTP_200_OK)
+async def razorpay_webhook(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    payment_repository: PaymentRepositoryProtocol = Depends(get_payment_repository),
+    renewal_service: RenewalService = Depends(get_renewal_service),
+    dedup: WebhookEventDedupProtocol = Depends(get_webhook_event_dedup),
+):
+    payload = await request.body()
+    signature = request.headers.get("x-razorpay-signature", "")
+    try:
+        verify_razorpay_signature(
+            payload, signature=signature, secret=settings.razorpay_webhook_secret
+        )
+    except WebhookSignatureInvalidError as exc:
+        log_signature_failure("razorpay", str(exc))
+        raise
+    body = json.loads(payload or b"{}")
+    body["_event_id"] = request.headers.get("x-razorpay-event-id", "")
+    await process_razorpay_event(
+        body,
+        payment_repository=payment_repository,
+        renewal_service=renewal_service,
+        dedup=dedup,
+    )
+    return {"received": True}
 
 
 __all__ = ["router"]

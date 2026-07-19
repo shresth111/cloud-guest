@@ -1552,3 +1552,111 @@ increments `current_uses` (the mutating counterpart,
 `POST /subscriptions`). When `base_amount` is supplied, the response
 includes the real computed `estimated_discount_amount`.
 
+## Billing Endpoints (Module 013 Part 3: Payment Service + Real Stripe/Razorpay Integration + Webhooks)
+
+See `docs/billing/FLOW.md` §22-§34 for the full design write-up --
+including the real idempotency-key enforcement mechanism, the exact
+Stripe/Razorpay webhook signature verification schemes, the Redis-backed
+event-id dedup, the per-provider refund/retry idempotency-key strategy,
+the provider-selection model, and the honest "no real credentials in this
+sandbox, but real SDK code" framing.
+
+### Payments (`billing.*`, reused -- no new `PermissionModule`)
+
+`POST /payments` -- requires `billing.manage`. Body: `organization_id`,
+optional `subscription_id` (set for a manual renewal retry against an
+existing subscription), `amount` (`Decimal`, `> 0`), `currency`,
+`provider` (`stripe`|`razorpay`), `idempotency_key` (caller-supplied, 8-255
+chars). **The same `idempotency_key` presented twice always returns/
+references the same `Payment` row** -- a real database unique constraint
+is the actual enforcement mechanism (see FLOW.md §22), not merely an
+application-level check. If the selected provider is not configured (no
+real API key anywhere in this sandbox), returns `503`
+(`PaymentGatewayNotConfiguredError`) -- the `Payment` row is still created
+and recorded as `failed` with a clear reason, a real history entry, not a
+silently-dropped attempt.
+
+`GET /payments` -- requires `billing.read` plus a resolved
+`X-Organization-Id` (`RequireOrganization`). Tenant-scoped payment history
+(see FLOW.md §27 for why this is the entire "Payment History" surface, not
+a second table) -- filterable by `status`, paginated.
+
+`GET /payments/{payment_id}` -- requires `billing.read` plus
+`X-Organization-Id`. A payment belonging to a different organization
+reports `404`, never leaking its existence (real tenant isolation,
+enforced in `PaymentService.get_payment`).
+
+`POST /payments/{payment_id}/refund` -- requires `billing.manage`. Body:
+optional `amount` (omit for a full refund of the remaining chargeable
+amount). Rejects (`409`) a refund of a payment not currently
+`succeeded`/`partially_refunded`, or a refund amount exceeding the
+remaining refundable amount. Real SDK refund call
+(`stripe.Refund.create`/`client.payment.refund`) through the same
+not-configured-safe guard as `POST /payments`; updates `refunded_amount`
+and transitions to `refunded`/`partially_refunded` accordingly.
+
+`POST /payments/{payment_id}/retry` -- requires `billing.manage`.
+Re-attempts a charge for a `failed` payment, reusing the **same** `Payment`
+row (never a new one -- see FLOW.md §27). Rejects (`409`) a retry of a
+payment not currently `failed`. Stripe retries with a **fresh, derived**
+idempotency key (Stripe's own guidance -- reusing the original key would
+return the cached original decline, never actually retrying); Razorpay's
+installed SDK exposes no client-supplied idempotency parameter at all, so
+its retry is unconditionally a fresh provider-side attempt regardless (see
+FLOW.md §25 for the full per-provider write-up). The `Payment
+.idempotency_key` **column** itself never changes across a retry -- only
+the wire-level key Stripe receives does.
+
+### Payment Methods (`billing.*`, reused -- no new `PermissionModule`)
+
+`POST /payments/methods` -- requires `billing.manage`. Body:
+`organization_id`, `provider`, `provider_payment_method_id` (the
+provider's own opaque token -- e.g. a Stripe `pm_...` id -- **never** a
+raw card number/CVV, this platform never handles or stores raw card
+data), `method_type` (`card`|`bank_account`|`upi`|`other`), optional
+`last4` (display-only), `is_default`. At most one payment method may be
+`is_default=true` per organization -- setting a new default atomically
+unsets every sibling (`PaymentMethodRepository.set_as_default`).
+
+`GET /payments/methods` -- requires `billing.read` plus
+`X-Organization-Id`. Lists this organization's active payment methods.
+
+`DELETE /payments/methods/{payment_method_id}` -- requires
+`billing.manage`. Deactivates (`is_active=false`, `is_default=false` +
+soft delete), never a hard delete.
+
+### Webhooks (provider-authenticated via real signature verification -- NOT RBAC)
+
+`POST /webhooks/stripe` -- verifies the real `Stripe-Signature` header
+(timestamped HMAC-SHA256, via the installed `stripe` SDK's own
+`stripe.Webhook.construct_event`; rejects a signature older than
+`Settings.stripe_webhook_tolerance_seconds`, default 300s) against the raw
+request body. Handles `payment_intent.succeeded`/
+`payment_intent.payment_failed` -- updates the matching `Payment` row (by
+`provider_payment_id`) and, when that payment is tied to a subscription
+renewal, calls `RenewalService.confirm_renewal_payment_succeeded`/
+`confirm_renewal_payment_failed` (two small, additive Part 3 methods that
+compose with -- never reimplement -- the existing `_mark_renewed`/
+`_mark_past_due` transitions `process_renewal`'s own synchronous path
+already uses). Every other event type is acknowledged and ignored. An
+invalid signature is a real `400`
+(`WebhookSignatureInvalidError`); an internal processing error is a real
+`500` (both providers' own retry policies re-deliver on a `5xx`, which is
+the correct behavior for a transient failure). Success response: a plain
+`{"received": true}`, not the standard `ApiResponse` envelope (neither
+provider parses the response body, only the status code).
+
+`POST /webhooks/razorpay` -- verifies the real `X-Razorpay-Signature`
+header (HMAC-SHA256 of the raw body, via the installed `razorpay` SDK's
+own `razorpay.Utility.verify_webhook_signature`; Razorpay's real scheme
+has no timestamp/replay-tolerance component at all). Handles
+`payment.captured`/`payment.failed` with the identical
+`Payment`-row-update + `RenewalService` composition as the Stripe handler
+above. Same response/error-status conventions.
+
+Both webhook endpoints track processed event ids in Redis
+(`webhooks.RedisWebhookEventDedup`, `Settings
+.payment_webhook_event_dedup_ttl_seconds`, default 7 days) -- the same
+event id delivered twice (a real, documented behavior of both providers)
+is only ever actually applied once (see FLOW.md §24).
+

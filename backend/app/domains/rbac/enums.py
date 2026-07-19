@@ -381,3 +381,33 @@ class AuditAction(StrEnum):
     COUPON_UPDATED = "coupon_updated"
     COUPON_DEACTIVATED = "coupon_deactivated"
     COUPON_APPLIED = "coupon_applied"
+
+    # Billing domain events (Module 013 Part 3: Payment Service + real
+    # Stripe/Razorpay Integration + Webhooks) -- written through this same
+    # table by ``app.domains.billing.service.PaymentService`` via the same
+    # narrow ``AuditLogWriter`` protocol shape Part 1/2's own services
+    # already use (see ``AuditLogEntry``'s "other domains could plausibly
+    # reuse it" design) -- an existing domain's later Part extending its own
+    # additive block, the same precedent Part 2 itself already followed for
+    # Part 1. Every payment lifecycle transition a human/API-caller
+    # initiated (initiate/refund/retry) and every PaymentMethod
+    # registration/removal is audited -- the same moderate-volume,
+    # admin- or billing-event-attributable profile Parts 1-2's own actions
+    # already cover this way. A payment outcome *confirmed asynchronously by
+    # a provider webhook* (PAYMENT_SUCCEEDED/PAYMENT_FAILED when the
+    # triggering call was ``RenewalService``'s own automatic sweep, not a
+    # human-initiated ``POST /payments``) is audited with ``actor_user_id=
+    # None``, mirroring ``LICENSE_EXPIRED``'s identical "a real system-
+    # attributed event, not a human one" precedent. Webhook signature
+    # verification failures and successful-but-unhandled-event-type receipts
+    # are logged via the structured logger only (see
+    # ``webhooks.py``'s own module docstring) -- an adversarial/noise signal
+    # a SOC/ops dashboard cares about, not a billable state change this
+    # domain's own audit trail is for.
+    PAYMENT_INITIATED = "payment_initiated"
+    PAYMENT_SUCCEEDED = "payment_succeeded"
+    PAYMENT_FAILED = "payment_failed"
+    PAYMENT_REFUNDED = "payment_refunded"
+    PAYMENT_RETRIED = "payment_retried"
+    PAYMENT_METHOD_REGISTERED = "payment_method_registered"
+    PAYMENT_METHOD_REMOVED = "payment_method_removed"

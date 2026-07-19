@@ -315,6 +315,51 @@ class RenewalService:
             subscriptions_checked=len(due), renewed=renewed, failed=failed
         )
 
+    # ========================================================================
+    # BE-013 Part 3: real-gateway webhook confirmation seam
+    #
+    # A real Stripe charge is not always synchronous -- an off-session
+    # renewal charge can require additional authentication (SCA/3-D Secure)
+    # and only resolve, asynchronously, via a later
+    # payment_intent.succeeded/payment_intent.payment_failed webhook (see
+    # payment_gateways.py's own module docstring). These two narrow,
+    # additive public methods are the composition point
+    # webhooks.py's handlers call once a provider webhook confirms that
+    # outcome -- they do nothing but call this class's own existing,
+    # already-tested _mark_renewed/_mark_past_due transitions (never a
+    # second, parallel reimplementation of period-extension/past-due
+    # bookkeeping).
+    # ========================================================================
+
+    async def confirm_renewal_payment_succeeded(
+        self, subscription_id: uuid.UUID
+    ) -> Subscription:
+        """Called by ``webhooks.py`` once a provider webhook confirms an
+        (async) charge tied to this subscription's renewal succeeded.
+        Composes with -- never reimplements -- ``_mark_renewed``, the exact
+        same transition ``process_renewal``'s own synchronous success path
+        already performs."""
+        subscription = await self.repository.get_by_id(subscription_id)
+        if subscription is None:
+            raise SubscriptionNotFoundError(subscription_id)
+        plan = await self.plan_repository.get_by_id(subscription.plan_id)
+        if plan is None:
+            raise PlanNotFoundError(subscription.plan_id)
+        return await self._mark_renewed(subscription, plan, plan.base_price)
+
+    async def confirm_renewal_payment_failed(
+        self, subscription_id: uuid.UUID, *, reason: str
+    ) -> Subscription:
+        """Called by ``webhooks.py`` once a provider webhook confirms an
+        (async) charge tied to this subscription's renewal failed. Composes
+        with -- never reimplements -- ``_mark_past_due``, the exact same
+        transition ``process_renewal``'s own synchronous failure path
+        already performs."""
+        subscription = await self.repository.get_by_id(subscription_id)
+        if subscription is None:
+            raise SubscriptionNotFoundError(subscription_id)
+        return await self._mark_past_due(subscription, reason=reason)
+
     async def _mark_renewed(
         self, subscription: Subscription, plan: object, charge_amount: Decimal
     ) -> Subscription:

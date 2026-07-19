@@ -8,12 +8,14 @@ service layer can call before touching the database.
 from __future__ import annotations
 
 import calendar
+import uuid
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from .constants import (
     FEATURE_KEY_TYPE,
     MAX_PERCENTAGE_DISCOUNT_VALUE,
+    ZERO_DECIMAL_CURRENCIES,
     BillingCycle,
     DiscountType,
     PlanFeatureKey,
@@ -172,6 +174,41 @@ def _add_months(dt: datetime, months: int) -> datetime:
     return dt.replace(year=year, month=month, day=day)
 
 
+# ============================================================================
+# BE-013 Part 3: Payment Service + Real Stripe/Razorpay Integration + Webhooks
+# ============================================================================
+
+
+def to_minor_units(amount: Decimal, currency: str) -> int:
+    """Real Stripe/Razorpay requirement: both providers' APIs take charge
+    amounts as an integer count of the currency's smallest unit (e.g. USD
+    cents -- ``$12.34`` -> ``1234``), **except** for a small, well-known
+    "zero-decimal currency" set both providers document identically (e.g.
+    JPY has no sub-unit: ``JPY 1234`` -> ``1234``, never ``123400``) -- see
+    ``constants.ZERO_DECIMAL_CURRENCIES``. Rounds half-up on the rare input
+    that has more than 2 (or 0, for a zero-decimal currency) decimal places
+    -- this domain's own ``Numeric(12, 2)`` money columns never produce
+    such an input in practice, this is a defensive backstop, not a code
+    path expected to be exercised."""
+    if currency.upper() in ZERO_DECIMAL_CURRENCIES:
+        return int(amount.to_integral_value(rounding=ROUND_HALF_UP))
+    return int((amount * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def derive_retry_idempotency_key(original_idempotency_key: str) -> str:
+    """The wire-level idempotency key a gateway passes to Stripe on
+    ``retry_failed_payment`` -- **deliberately a fresh, derived value, never
+    a reuse of the original key** (see ``payment_gateways.py``'s own module
+    docstring for the full per-provider write-up of why: Stripe caches a
+    key's outcome, including a genuine decline, for a real window --
+    resubmitting the *same* key for an intentional retry would just return
+    the cached decline again, never actually attempting a new charge). The
+    original ``Payment.idempotency_key`` column itself is never mutated by
+    a retry -- it remains this row's own permanent identity; only the
+    value handed to the provider's SDK call changes."""
+    return f"{original_idempotency_key}:retry:{uuid.uuid4().hex[:12]}"
+
+
 __all__ = [
     "normalize_slug",
     "expected_feature_type",
@@ -180,4 +217,6 @@ __all__ = [
     "validate_discount_value",
     "compute_discount_amount",
     "add_billing_cycle",
+    "to_minor_units",
+    "derive_retry_idempotency_key",
 ]

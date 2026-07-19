@@ -580,3 +580,332 @@ long has this subscription been unpaid" has no other real source.
 `RenewalReminderSent`/`ExpiryReminderSent` events are logged (not
 audited, mirroring every other domain's "reads/notifications aren't
 audited" convention) on every real send.
+
+---
+
+# BE-013 Part 3: Payment Service + Real Stripe/Razorpay Integration + Webhooks
+
+## Honesty framing (read this first)
+
+There are no real Stripe/Razorpay API keys or test credentials anywhere in
+this sandbox, and there never will be -- neither gateway can make a real
+network call to either provider's live/sandbox API and get a real response
+back, in this environment. What *is* real: `stripe`==15.3.1/`razorpay`==2.0.1
+are the official, installable Python SDKs (added to `requirements.txt`/
+`pyproject.toml`), and every request shape this part writes against them
+(parameter names, units, idempotency handling, exception types, the exact
+webhook-signature-verification scheme) was verified by introspecting the
+*installed* packages' own source directly while writing this code -- not
+recalled from memory. `Settings.stripe_secret_key`/`razorpay_key_id`/
+`razorpay_key_secret`/`*_webhook_secret` all default to empty strings; when
+empty (as they always are here), `payment_gateways.StripePaymentGateway`/
+`RazorpayPaymentGateway` raise Part 2's exact
+`exceptions.PaymentGatewayNotConfiguredError` before any network attempt --
+reused verbatim, never a parallel exception. Webhook **signature
+verification**, in contrast, is pure, deterministic HMAC-SHA256
+cryptography that needs no live API access at all -- it is implemented and
+tested for real, end to end, against real HMAC fixtures this codebase's own
+test suite computes the same way each provider actually does it.
+
+## §22. Idempotency-key enforcement mechanism: real, DB-unique-constraint-backed
+
+`models.Payment.idempotency_key` is **unique, not nullable**. This is the
+actual enforcement mechanism, not a comment:
+
+1. `service.PaymentService.initiate_payment` checks
+   `PaymentRepository.get_by_idempotency_key(key)` first -- the fast path
+   for the overwhelming majority of calls (no concurrent racer).
+2. If two concurrent requests both pass that check before either commits
+   (a genuine race), the *second* `INSERT` collides with the real database
+   unique constraint. `GenericRepository._flush_or_raise` (unmodified,
+   Part 1's own infrastructure) translates that into
+   `app.database.exceptions.DuplicateRecordError` exactly the way it
+   already does for every other unique column in this codebase.
+3. `PaymentService.initiate_payment` catches exactly that exception, re-reads
+   by `idempotency_key`, and returns the *winning* row -- never a second
+   charge attempt, never a raised error the caller has to handle specially.
+
+The same `idempotency_key` presented twice therefore **always** resolves to
+the same `Payment` row, enforced at the database level -- proven in
+`tests/unit/test_billing_payments_webhooks.py::TestPaymentIdempotency
+.test_concurrent_race_is_resolved_by_the_real_db_constraint`, which forces
+exactly this race (a `FakeRacyPaymentRepository` whose first
+`get_by_idempotency_key` lookup reports "not found" even though the row
+already exists, combined with a real duplicate-detecting `create_payment`)
+and asserts the gateway is never invoked a second time.
+
+The narrow `renewal_service.PaymentGatewayProtocol.charge()` seam method
+(no `idempotency_key` parameter in its signature -- it cannot change, see
+§15) generates its own key internally
+(`f"renewal:{subscription_id}:{uuid4().hex}"`) each call -- a fresh value
+per invocation is *correct* here, not a gap: each `process_renewal` call is
+a genuinely new billing event (a new period), so there is no "same logical
+attempt, retry with the same key" concept for this specific seam the way
+there is for the explicit, caller-driven `POST /payments` (which threads a
+real, caller-supplied key straight through).
+
+## §23. Webhook signature verification -- exact real schemes
+
+Both implemented in `webhooks.py`, verified directly against the source of
+the installed SDKs (not recalled from memory):
+
+* **Stripe** (`verify_stripe_event`) -- uses the real, installed `stripe`
+  SDK's `stripe.Webhook.construct_event` (`stripe._webhook
+  .WebhookSignature.verify_header`'s source was read directly while writing
+  this module). The `Stripe-Signature` header is
+  `t=<unix-timestamp>,v1=<hex-hmac>[,v0=<hex-hmac>...]`; the *signed
+  payload* is `f"{timestamp}.{raw_body}"`; the expected signature is
+  `hmac.new(secret.encode(), signed_payload.encode(), sha256).hexdigest()`;
+  comparison against every `v1=` value uses a constant-time compare
+  (`hmac.compare_digest`); a request whose timestamp is older than
+  `tolerance` seconds (default 300, `Settings.stripe_webhook_tolerance_seconds`)
+  is rejected as a replay. Using the SDK's own real implementation directly
+  (rather than a hand-rolled reimplementation that could subtly drift from
+  it over time) was judged the more honest, more correct choice.
+* **Razorpay** (`verify_razorpay_signature`) -- uses the real, installed
+  `razorpay` SDK's `razorpay.Utility.verify_webhook_signature` (source read
+  directly: `hmac.new(secret.encode(), raw_body.encode(), sha256).hexdigest()`,
+  compared via `hmac.compare_digest` against the `X-Razorpay-Signature`
+  header). Razorpay's real webhook scheme has **no** timestamp/replay-
+  tolerance component at all (confirmed against the installed SDK -- there
+  is simply none to check), so none is invented here.
+
+Both are tested in `tests/unit/test_billing_payments_webhooks.py` against
+real HMAC fixtures the test file computes independently (its own
+`_stripe_signature_header`/`_razorpay_signature_header` helpers, not a call
+into the module under test) -- valid signature accepted, tampered payload
+rejected, wrong secret rejected, garbage signature rejected, and (Stripe
+only, since Razorpay's scheme has none) an expired timestamp rejected.
+
+## §24. Webhook event-id dedup: Redis + TTL, not a dedicated table
+
+Both providers really do redeliver the same webhook event more than once
+(timeout, an ambiguous `2xx`, a manual "resend" from either dashboard) --
+webhook handlers must be idempotent themselves. `webhooks
+.RedisWebhookEventDedup.mark_processed_if_new` tracks processed
+`(provider, event_id)` pairs in Redis (reusing, never modifying,
+`app.database.redis.get_redis_client` -- the same Redis instance every
+other domain's own caching already uses) via a single atomic
+`SET key value NX EX ttl`: the first delivery sets the key and proceeds;
+every redelivery finds the key already set and is a no-op. `Settings
+.payment_webhook_event_dedup_ttl_seconds` (default 7 days) is used rather
+than a permanent record because (1) both providers' own real
+redelivery/retry windows are measured in hours to a few days, not forever,
+so a multi-day TTL comfortably covers every real redelivery without an
+ever-growing key set, and (2) a dedicated `processed_webhook_events` table
+would need its own migration and its own cleanup sweep to avoid unbounded
+growth, buying no correctness a single atomic Redis command doesn't already
+provide -- the same "simplest real mechanism, no new table for its own
+sake" judgment call `events.py`'s own "no event bus" decision already makes
+elsewhere in this domain. A dedicated table (unique constraint on
+`(provider, event_id)`) was a real, legitimate alternative, equally atomic;
+Redis was chosen for the free TTL-based cleanup alone.
+
+## §25. Refund/retry idempotency-key strategy -- differs by provider, on purpose
+
+`retry_failed_payment` re-attempts a charge for a `FAILED` `Payment`,
+**reusing the same row** (this part's own "Payment doubles as history"
+decision, §27) -- but what wire-level idempotency key each provider's SDK
+call receives differs, deliberately:
+
+* **Stripe** -- a **fresh, derived** key
+  (`validators.derive_retry_idempotency_key`, `f"{original}:retry:{uuid4}"`).
+  This is Stripe's own real, documented guidance: reusing an idempotency
+  key returns the *cached* result of the original request, including a
+  genuine decline, for a real window (currently 24h) -- resubmitting the
+  same key for an intentional retry (e.g. after the customer updated their
+  card) would silently just return the old decline again, never actually
+  attempting a new charge.
+* **Razorpay** -- moot at the wire level. The installed `razorpay` SDK's
+  `Payment.createRecurring`/`Order.create`/`Payment.refund` resources
+  expose **no** client-supplied idempotency parameter at all (confirmed by
+  introspecting `razorpay.resources.Payment`/`Order` directly) -- so a
+  retry is unconditionally a fresh provider-side attempt regardless of any
+  key. All of this provider's idempotency protection is therefore enforced
+  at this module's own `Payment.idempotency_key` unique-constraint level,
+  not at Stripe's kind of SDK-native, provider-side deduplication.
+
+Either way, `Payment.idempotency_key` **the column** never changes across a
+retry -- it is this row's own permanent identity (the caller-facing "same
+key -> same row" guarantee), not a per-attempt value. Only the value handed
+to Stripe's own SDK call changes.
+
+## §26. Both real gateways preserve the zero-amount auto-success shortcut
+
+`renewal_service.UnconfiguredPaymentGateway.charge` auto-succeeds a
+zero-(or negative-)amount charge with no configuration check at all (a
+`FREE_TRIAL` renewal, or any plan whose `base_price` is genuinely `0`,
+needs no real payment processor). `StripePaymentGateway`/
+`RazorpayPaymentGateway.charge` preserve this **exact** short-circuit,
+before even checking `_is_configured`. This is not cosmetic: a `TRIALING`
+subscription on a cyclic (`MONTHLY`/`YEARLY`) billing cycle can reach
+`process_renewal` via the hourly sweep before its trial ever converts to a
+real paid plan, and it must not start raising
+`PaymentGatewayNotConfiguredError` for a genuinely free renewal just
+because Part 3 wired in a real (but still-unconfigured, in this sandbox)
+gateway in place of Part 2's honest placeholder. Tested directly in
+`TestGatewayNotConfigured.test_zero_amount_charge_auto_succeeds_even_when_not_configured`.
+
+## §27. `Payment` doubles as "Payment History" -- a query surface, not a second table
+
+The spec asks for both a `Payment` model and a "Payment History" surface.
+This module builds exactly one table: every `Payment` row is already a
+permanent, timestamped, status-tracked record of one charge attempt
+(created once, mutated only by its own real lifecycle -- refund status/
+retry -- never deleted). "Payment history" is simply
+`PaymentRepository.list_payments(organization_id=...)` ordered by
+`created_at` -- the identical "a query surface over existing rows, not a
+second table" judgment call `UsageMetric`/`LicenseChangeLog` already
+establish elsewhere in this domain for their own read surfaces. A second,
+append-only `PaymentHistory` table would either duplicate every column
+`Payment` already has, or need its own synchronization logic to stay
+current -- neither buys anything a single, real, well-indexed table
+doesn't already provide.
+
+## §28. `PaymentMethod`: token-only storage, never raw card data
+
+`PaymentMethod.provider_payment_method_id` is the provider's own opaque
+token (e.g. a Stripe `pm_...` id, or a Razorpay saved-card token id) -- this
+table stores only what the provider hands back after its own (client-side,
+PCI-scoped) tokenization flow. Nowhere in this module -- models, schemas,
+service, gateways -- does any code path accept, parse, log, or persist a
+raw card number, CVV, or expiry date; the closest thing to a "look at the
+card" field is `last4` (nullable, display-only, never used in any charge
+decision). `is_default` is enforced as **at most one per organization** by
+`PaymentMethodRepository.set_as_default` (a real, atomic
+`UPDATE ... WHERE organization_id = :id` unsetting every sibling before
+setting the target, mirroring `CouponRepository.increment_current_uses`'s
+own "real statement, not a read-then-write-in-Python race" discipline).
+
+A documented, honest scope simplification: neither `PaymentMethod` nor any
+other model in this part persists a separate provider-side Customer object
+id (a Stripe `cus_...`, or the equivalent Razorpay customer concept) that a
+saved token is attached to -- BE-013's own column list for `PaymentMethod`
+does not include one, and this part does not invent one out of scope (see
+`payment_gateways.py`'s own module docstring for the full write-up). Both
+gateways pass the stored token directly to their real charge APIs, which is
+a valid call shape either provider's API accepts, though a fully mature
+production rollout would typically also persist and pass a Customer id.
+Neither code path is ever actually exercised end to end in this sandbox
+regardless, since `_is_configured` always short-circuits first.
+
+## §29. Provider-selection model: one platform-wide default
+
+`dependencies.build_payment_gateway` selects Stripe vs. Razorpay via a
+single `Settings.payment_default_provider` -- not a per-organization or
+per-plan choice. Neither `Organization` nor `Plan` carries any "preferred
+payment provider" column today, and inventing one now, with no real
+multi-provider deployment to justify it and no way to actually exercise a
+per-org routing decision against real credentials in this sandbox anyway,
+would be speculative scope beyond what this part asks for. A future part
+could add a nullable `Organization.preferred_payment_provider` (or similar)
+and `build_payment_gateway` would become the one place that reads it -- the
+seam is already isolated there for exactly that reason.
+
+## §30. Wiring the seam for real -- `get_payment_gateway`, and the Celery-task gotcha
+
+Part 2 explicitly deferred one function's body: `dependencies
+.get_payment_gateway`. This part replaces it -- but not by simply changing
+that one function's return value, because `tasks.py`'s Celery bridge calls
+`get_payment_gateway` **directly** (`payment_gateway=get_payment_gateway()`
+in the original Part 2 code), not through FastAPI's dependency-injection
+container. If `get_payment_gateway`'s parameters needed real, resolved
+`AsyncSession`/`Settings` objects (which building a real gateway does), a
+bare call with no arguments from plain Celery-task Python code would pass
+`fastapi.params.Depends` *instances* themselves as if they were real
+values -- silently wrong, not an error. The fix: a new, plain,
+DI-framework-free function, `dependencies.build_payment_gateway(*, db,
+settings)`, holds the actual provider-selection logic; `get_payment_gateway`
+is now a thin FastAPI-dependency wrapper around it (its own parameters
+still default to `Depends(get_db_session)`/`Depends(get_settings)`, but only
+ever resolved by FastAPI itself), and `tasks.py` was updated to call
+`build_payment_gateway(db=session, settings=settings)` directly with its own
+already-open session/settings, explicitly. Since no real API key is ever
+actually configured in this sandbox, both concrete gateways' own
+`_is_configured` guard means the platform's real, observed behavior is
+byte-for-byte unchanged from Part 2's `UnconfiguredPaymentGateway` in
+practice -- this is the entire "wire it in for real" step Part 2 deferred.
+
+## §31. A genuine circular-import fix: a locally-defined Protocol, not a shared import
+
+`service.py` needed a narrow, structural type for the richer surface
+`PaymentService` calls on each gateway (`charge_via_provider`/`refund`/
+`retry`) -- `payment_gateways.PaymentGatewayAdminProtocol` already defines
+exactly this. Importing it directly into `service.py`, however, closes a
+real import cycle: `payment_gateways.py` imports
+`renewal_service.PaymentGatewayProtocol`, and `renewal_service.py` imports
+this module's own `LicenseLifecycleProtocol`/`AuditLogWriter` from
+`service.py`. The fix mirrors this codebase's own established precedent
+for the identical shape of problem (`service.LicenseLifecycleProtocol`'s
+own docstring, written by Part 2, already explains this exact "avoid a
+construction cycle / keep the dependency structural" reasoning for the
+`SubscriptionService` <-> `LicenseService` relationship): `service.py`
+defines its own local `PaymentGatewayAdminProtocol` (same method
+signatures, same name, zero import from `payment_gateways.py`) that both
+concrete gateway classes already satisfy structurally, since Python
+`Protocol`s are duck-typed. No behavior changed; only where the type is
+*defined* changed.
+
+## §32. RBAC permission-key reuse (Part 3)
+
+No new `PermissionModule`. Payments/Payment Methods reuse `billing.*`
+exactly like Plans/Coupons/Usage before them: `billing.manage` for every
+write with no dedicated seeded action (initiate/refund/retry a payment,
+register/remove a payment method), `billing.read` for every read. Unlike
+Plans/Coupons (a platform-wide pricing catalog, pinned to
+`scope=ScopeType.GLOBAL`), a `Payment`/`PaymentMethod` is a real,
+tenant-owned resource (`organization_id` on every row) -- ordinary
+inferred, tenant-scoped resolution applies, exactly like Licenses/
+Subscriptions. `GET /payments`/`GET /payments/{id}` additionally enforce
+real tenant isolation in the service layer
+(`PaymentService.get_payment`'s `organization_id` filter) -- a payment
+belonging to a different organization reports as not-found, never leaking
+its existence (tested in `TestTenantIsolation`). Webhook endpoints are
+provider-authenticated via real signature verification, **not** RBAC -- the
+identical "no platform-user identity for this caller" reasoning BE-008's
+device check-in and BE-010's RADIUS endpoints already establish.
+
+## §33. Webhook response shape: plain dict, not the standard `ApiResponse` envelope
+
+`POST /webhooks/stripe`/`POST /webhooks/razorpay` return a plain
+`{"received": True}` dict on success (status `200`), not this codebase's
+usual `ApiResponse`/`build_response` envelope -- neither provider parses
+the response body at all, only the status code, and this is exactly the
+minimal shape Stripe's own documented webhook-handler examples return. An
+invalid signature raises `exceptions.WebhookSignatureInvalidError` (a real
+`CloudGuestError`, `400`) rendered through the same global exception
+handler every other domain's errors already go through -- there is no
+reason for this one error case to bypass that uniform machinery just
+because the success path is unwrapped. Any *other* unhandled exception
+during processing propagates to a `500` -- deliberate: both providers' own
+real retry policies re-deliver on a `5xx`, which is exactly right for a
+genuine, possibly-transient internal failure (a database blip), whereas a
+permanently-invalid signature (`400`) is correctly never retried into
+succeeding.
+
+## §34. Webhook-confirms-a-renewal composition -- two small, additive `RenewalService` methods
+
+The spec asks for a succeeded webhook payment tied to a subscription
+renewal to trigger `RenewalService`'s existing renewal-success path. Since
+`renewal_service.RenewalService._mark_renewed`/`_mark_past_due` (Part 2,
+unmodified) are private, this part adds exactly two small, additive public
+methods to `RenewalService` --
+`confirm_renewal_payment_succeeded`/`confirm_renewal_payment_failed` --
+that do nothing but resolve the `Subscription`/`Plan` and call those same
+existing private methods. No period-extension/past-due bookkeeping is
+reimplemented anywhere in `webhooks.py`. Proven in
+`TestWebhookRenewalComposition`, which drives a real `RenewalService`
+(wired to fake repositories, exactly like Part 2's own test file) through
+`webhooks.process_stripe_event`/`process_razorpay_event` and asserts the
+subscription's real state transition (`PAST_DUE` -> `ACTIVE`, period
+extended; or `PAST_DUE` with a fresh `past_due_at`) -- the exact same
+transition `process_renewal`'s own synchronous path already produces.
+
+This composition point exists because a real Stripe charge is not always
+synchronous: an off-session renewal charge can require additional
+authentication (SCA/3-D Secure) and only resolve asynchronously via a
+later `payment_intent.succeeded`/`payment_intent.payment_failed` webhook.
+`StripePaymentGateway`/`RazorpayPaymentGateway`'s own charge path leaves
+such an intermediate-status `Payment` row `PENDING` (never fabricating a
+final outcome); the corresponding webhook, once it arrives, is what
+resolves it.

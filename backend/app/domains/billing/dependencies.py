@@ -19,9 +19,11 @@ other than ``OrganizationService``'s own new, additive
 from __future__ import annotations
 
 from fastapi import Depends
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
+from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.analytics.dependencies import get_analytics_repository
 from app.domains.analytics.repository import AnalyticsRepositoryProtocol
@@ -32,16 +34,18 @@ from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
-from .renewal_service import (
-    PaymentGatewayProtocol,
-    RenewalService,
-    UnconfiguredPaymentGateway,
-)
+from .constants import PaymentProvider
+from .payment_gateways import RazorpayPaymentGateway, StripePaymentGateway
+from .renewal_service import PaymentGatewayProtocol, RenewalService
 from .repository import (
     CouponRepository,
     CouponRepositoryProtocol,
     LicenseRepository,
     LicenseRepositoryProtocol,
+    PaymentMethodRepository,
+    PaymentMethodRepositoryProtocol,
+    PaymentRepository,
+    PaymentRepositoryProtocol,
     PlanRepository,
     PlanRepositoryProtocol,
     SubscriptionRepository,
@@ -52,10 +56,13 @@ from .repository import (
 from .service import (
     CouponService,
     LicenseService,
+    PaymentMethodService,
+    PaymentService,
     PlanService,
     SubscriptionService,
     UsageService,
 )
+from .webhooks import RedisWebhookEventDedup, WebhookEventDedupProtocol
 
 
 def get_plan_repository(
@@ -158,14 +165,123 @@ def get_subscription_service(
     )
 
 
-def get_payment_gateway() -> PaymentGatewayProtocol:
-    """The exact seam BE-013 Part 3 overrides via dependency injection --
-    see ``renewal_service``'s own module docstring for the full write-up.
-    Part 3 replaces this function's body (or overrides it via FastAPI's
-    ``app.dependency_overrides``) to return a real Stripe/Razorpay-backed
-    ``PaymentGatewayProtocol`` implementation; nothing else in this module
-    needs to change."""
-    return UnconfiguredPaymentGateway()
+def build_payment_gateway(
+    *, db: AsyncSession, settings: Settings
+) -> PaymentGatewayProtocol:
+    """Plain, FastAPI-DI-framework-free constructor for the real gateway
+    selection -- the actual "wire it in for real" logic BE-013 Part 3 adds,
+    called both by the FastAPI dependency ``get_payment_gateway`` below
+    *and* directly by ``tasks.py``'s Celery bridge (which already owns its
+    own open ``AsyncSession`` and cannot resolve FastAPI's ``Depends(...)``
+    outside the framework -- calling a function whose parameters merely
+    *default* to ``Depends(...)`` works fine as long as every such
+    parameter is passed explicitly, which this one always is).
+
+    ## Provider-selection model: one platform-wide default, not per-org/plan
+
+    A single ``Settings.payment_default_provider`` selects Stripe vs.
+    Razorpay for the entire platform -- not a per-organization or per-plan
+    choice. This was judged the simpler, equally defensible model for this
+    part: neither ``Organization`` nor ``Plan`` (Part 1) carries any
+    "preferred payment provider" column today, and inventing one now, with
+    no real multi-provider deployment to justify it and no way to actually
+    exercise a per-org routing decision against real credentials in this
+    sandbox anyway, would be speculative scope beyond what Part 3 asks for.
+    A future part could add a nullable ``Organization.preferred_payment_provider``
+    (or similar) and this function would become the one place that reads
+    it -- the seam is already isolated here for exactly that reason.
+
+    Since no real API key is ever actually configured in this sandbox,
+    both concrete gateways' own ``_is_configured`` guard means the
+    platform's real, observed behavior is byte-for-byte unchanged from
+    Part 2's ``UnconfiguredPaymentGateway`` in practice -- this function is
+    the entire "wire it in for real" step Part 2 explicitly deferred.
+    """
+    payment_repository = PaymentRepository(db)
+    payment_method_repository = PaymentMethodRepository(db)
+    stripe_gateway = StripePaymentGateway(
+        settings=settings,
+        payment_repository=payment_repository,
+        payment_method_repository=payment_method_repository,
+    )
+    razorpay_gateway = RazorpayPaymentGateway(
+        settings=settings,
+        payment_repository=payment_repository,
+        payment_method_repository=payment_method_repository,
+    )
+    if settings.payment_default_provider == PaymentProvider.RAZORPAY.value:
+        return razorpay_gateway
+    return stripe_gateway
+
+
+def get_payment_gateway(
+    db: AsyncSession = Depends(get_db_session),
+    settings: Settings = Depends(get_settings),
+) -> PaymentGatewayProtocol:
+    """The exact seam BE-013 Part 2 deferred, wired for real here -- see
+    ``renewal_service``'s own module docstring for the seam's full
+    write-up, and ``build_payment_gateway``'s own docstring immediately
+    above for the provider-selection model and the "still-unconfigured-in-
+    this-sandbox" honesty note."""
+    return build_payment_gateway(db=db, settings=settings)
+
+
+def get_payment_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> PaymentRepositoryProtocol:
+    return PaymentRepository(db)
+
+
+def get_payment_method_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> PaymentMethodRepositoryProtocol:
+    return PaymentMethodRepository(db)
+
+
+def get_payment_service(
+    db: AsyncSession = Depends(get_db_session),
+    settings: Settings = Depends(get_settings),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> PaymentService:
+    payment_repository = PaymentRepository(db)
+    payment_method_repository = PaymentMethodRepository(db)
+    stripe_gateway = StripePaymentGateway(
+        settings=settings,
+        payment_repository=payment_repository,
+        payment_method_repository=payment_method_repository,
+    )
+    razorpay_gateway = RazorpayPaymentGateway(
+        settings=settings,
+        payment_repository=payment_repository,
+        payment_method_repository=payment_method_repository,
+    )
+    return PaymentService(
+        payment_repository,
+        payment_method_repository,
+        gateways={
+            PaymentProvider.STRIPE.value: stripe_gateway,
+            PaymentProvider.RAZORPAY.value: razorpay_gateway,
+        },
+        audit_writer=audit_repository,
+    )
+
+
+def get_payment_method_service(
+    repository: PaymentMethodRepositoryProtocol = Depends(
+        get_payment_method_repository
+    ),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> PaymentMethodService:
+    return PaymentMethodService(repository, audit_writer=audit_repository)
+
+
+def get_webhook_event_dedup(
+    redis: Redis = Depends(get_redis_client),
+    settings: Settings = Depends(get_settings),
+) -> WebhookEventDedupProtocol:
+    return RedisWebhookEventDedup(
+        redis, ttl_seconds=settings.payment_webhook_event_dedup_ttl_seconds
+    )
 
 
 def get_renewal_service(
@@ -201,6 +317,12 @@ __all__ = [
     "get_coupon_repository",
     "get_coupon_service",
     "get_subscription_service",
+    "build_payment_gateway",
     "get_payment_gateway",
     "get_renewal_service",
+    "get_payment_repository",
+    "get_payment_method_repository",
+    "get_payment_service",
+    "get_payment_method_service",
+    "get_webhook_event_dedup",
 ]

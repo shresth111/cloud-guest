@@ -300,6 +300,115 @@ class PaymentGatewayNotConfiguredError(BillingError):
         )
 
 
+# -- Payment / PaymentMethod / Webhook (BE-013 Part 3) ---------------------------
+
+
+class PaymentNotFoundError(BillingError):
+    def __init__(self, identifier: object) -> None:
+        super().__init__(
+            f"Payment not found: {identifier}", status_code=status.HTTP_404_NOT_FOUND
+        )
+
+
+class PaymentMethodNotFoundError(BillingError):
+    def __init__(self, identifier: object) -> None:
+        super().__init__(
+            f"Payment method not found: {identifier}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class InvalidPaymentStatusTransitionError(BillingError):
+    def __init__(self, current_status: str, target: str) -> None:
+        super().__init__(
+            f"Cannot transition a payment from '{current_status}' to '{target}'",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class PaymentNotRefundableError(BillingError):
+    """Raised when ``refund_payment`` is attempted against a ``Payment``
+    whose status is not ``SUCCEEDED``/``PARTIALLY_REFUNDED``."""
+
+    def __init__(self, payment_id: uuid.UUID, current_status: str) -> None:
+        super().__init__(
+            f"Payment {payment_id} cannot be refunded from status "
+            f"'{current_status}'",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class RefundExceedsRefundableAmountError(BillingError):
+    def __init__(
+        self, payment_id: uuid.UUID, requested: object, refundable: object
+    ) -> None:
+        super().__init__(
+            f"Payment {payment_id}: refund of {requested} exceeds the "
+            f"refundable remaining amount of {refundable}",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class PaymentNotRetryableError(BillingError):
+    """Raised when ``retry_failed_payment`` is attempted against a
+    ``Payment`` whose status is not ``FAILED``."""
+
+    def __init__(self, payment_id: uuid.UUID, current_status: str) -> None:
+        super().__init__(
+            f"Payment {payment_id} cannot be retried from status "
+            f"'{current_status}' -- only a FAILED payment may be retried",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class NoDefaultPaymentMethodError(BillingError):
+    """Raised by a gateway's ``charge_via_provider``/``charge`` when the
+    payment gateway itself *is* configured but the organization has no
+    saved, active ``PaymentMethod`` to charge -- distinct from
+    ``PaymentGatewayNotConfiguredError`` (an infrastructure/configuration
+    state), this is a real, organization-specific data gap."""
+
+    def __init__(self, organization_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Organization {organization_id} has no default, active "
+            "payment method on file",
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        )
+
+
+class UnsupportedPaymentProviderError(BillingError):
+    def __init__(self, provider: str) -> None:
+        super().__init__(
+            f"Unsupported payment provider: '{provider}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class PaymentProviderError(BillingError):
+    """A genuine, unexpected provider-side error during a refund/retry
+    attempt (a network/API error, rate limit, provider-side outage) --
+    distinct from a legitimate business decline (which a gateway's charge
+    path captures as ``Payment.status = FAILED`` rather than raising).
+    ``502 Bad Gateway`` -- this platform's own upstream dependency failed,
+    not the caller's request."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_502_BAD_GATEWAY)
+
+
+class WebhookSignatureInvalidError(BillingError):
+    """Raised by ``webhooks.py``'s real HMAC-SHA256 signature verification
+    (Stripe's timestamped-payload scheme, Razorpay's raw-body scheme) --
+    an invalid signature, a tampered payload, or a timestamp outside the
+    replay-protection tolerance window all raise this same error."""
+
+    def __init__(self, provider: str, reason: str) -> None:
+        super().__init__(
+            f"{provider} webhook signature verification failed: {reason}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 __all__ = [
     "BillingError",
     "PlanNotFoundError",
@@ -329,4 +438,14 @@ __all__ = [
     "CouponNotApplicableToOrganizationError",
     "CouponNotApplicableToPlanError",
     "PaymentGatewayNotConfiguredError",
+    "PaymentNotFoundError",
+    "PaymentMethodNotFoundError",
+    "InvalidPaymentStatusTransitionError",
+    "PaymentNotRefundableError",
+    "RefundExceedsRefundableAmountError",
+    "PaymentNotRetryableError",
+    "NoDefaultPaymentMethodError",
+    "UnsupportedPaymentProviderError",
+    "PaymentProviderError",
+    "WebhookSignatureInvalidError",
 ]

@@ -479,6 +479,103 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ========================================================================
+    # BE-013 Part 3: Payment Service + real Stripe/Razorpay Integration +
+    # Webhooks
+    #
+    # Every key/secret below defaults to an empty string -- "unconfigured" is
+    # the honest, expected state of every field here in this sandbox (there
+    # are no real Stripe/Razorpay credentials anywhere in it, and there
+    # never will be). app.domains.billing.payment_gateways.StripePaymentGateway/
+    # RazorpayPaymentGateway each check their own provider's key(s) before
+    # any network attempt and raise a clear
+    # app.domains.billing.exceptions.PaymentGatewayNotConfiguredError instead
+    # of hanging or failing confusingly. Must be set via a real environment
+    # variable (CLOUDGUEST_STRIPE_SECRET_KEY, etc.) in any real deployment.
+    # ========================================================================
+
+    stripe_secret_key: str = Field(
+        default="",
+        description=(
+            "Stripe secret API key (sk_live_.../sk_test_...). Empty = "
+            "unconfigured -- StripePaymentGateway raises "
+            "PaymentGatewayNotConfiguredError for any real charge attempt "
+            "rather than making a network call. Must be set via "
+            "CLOUDGUEST_STRIPE_SECRET_KEY in any real deployment."
+        ),
+    )
+    stripe_webhook_secret: str = Field(
+        default="",
+        description=(
+            "Stripe webhook signing secret (whsec_...) used to verify the "
+            "Stripe-Signature header on POST /api/v1/webhooks/stripe -- see "
+            "app.domains.billing.webhooks's module docstring for the exact, "
+            "real HMAC-SHA256 verification scheme."
+        ),
+    )
+    stripe_webhook_tolerance_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=3600,
+        description=(
+            "Replay-protection tolerance window (seconds) for Stripe "
+            "webhook signature verification -- a request whose embedded "
+            "timestamp is older than this is rejected. 300s (5 minutes) "
+            "matches stripe.Webhook.DEFAULT_TOLERANCE in the installed "
+            "stripe SDK."
+        ),
+    )
+    razorpay_key_id: str = Field(
+        default="",
+        description=(
+            "Razorpay API key id. Empty = unconfigured (alongside "
+            "razorpay_key_secret) -- RazorpayPaymentGateway raises "
+            "PaymentGatewayNotConfiguredError for any real charge attempt. "
+            "Must be set via CLOUDGUEST_RAZORPAY_KEY_ID in any real "
+            "deployment."
+        ),
+    )
+    razorpay_key_secret: str = Field(
+        default="",
+        description=(
+            "Razorpay API key secret. Must be set via "
+            "CLOUDGUEST_RAZORPAY_KEY_SECRET in any real deployment."
+        ),
+    )
+    razorpay_webhook_secret: str = Field(
+        default="",
+        description=(
+            "Razorpay webhook secret used to verify the "
+            "X-Razorpay-Signature header on POST /api/v1/webhooks/razorpay "
+            "-- see app.domains.billing.webhooks's module docstring for the "
+            "exact, real HMAC-SHA256 verification scheme (no timestamp/"
+            "replay-tolerance component -- Razorpay's own real scheme has "
+            "none)."
+        ),
+    )
+    payment_default_provider: str = Field(
+        default="stripe",
+        description=(
+            "The single, platform-wide default payment provider "
+            "('stripe'/'razorpay') app.domains.billing.dependencies"
+            ".build_payment_gateway selects when no other signal is given -- "
+            "see docs/billing/FLOW.md for why a single platform default "
+            "(rather than a per-organization/per-plan choice) was judged the "
+            "right model for this part."
+        ),
+    )
+    payment_webhook_event_dedup_ttl_seconds: int = Field(
+        default=604_800,
+        ge=60,
+        le=2_592_000,
+        description=(
+            "TTL (seconds) for the Redis-backed webhook event-id dedup set "
+            "(app.domains.billing.webhooks.RedisWebhookEventDedup) -- "
+            "default 7 days, comfortably longer than either provider's own "
+            "real webhook redelivery/retry window."
+        ),
+    )
+
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None,
         description=(
