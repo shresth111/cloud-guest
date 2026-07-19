@@ -19,6 +19,7 @@ from .constants import (
     ZERO_DECIMAL_CURRENCIES,
     BillingCycle,
     DiscountType,
+    PaymentStatus,
     PlanFeatureKey,
     PlanFeatureType,
     SupportTier,
@@ -176,6 +177,29 @@ def _add_months(dt: datetime, months: int) -> datetime:
     return dt.replace(year=year, month=month, day=day)
 
 
+def subtract_months(dt: datetime, months: int) -> datetime:
+    """The calendar-correct inverse of ``add_billing_cycle``'s own month
+    arithmetic -- reuses ``_add_months`` (this module's private helper)
+    with a negated count rather than writing a second month-arithmetic
+    routine. Used by BE-013 Part 5's Super Admin Revenue Dashboard to
+    compute "N months ago" trend-window boundaries (``_add_months``'s own
+    floor-division-based year/month rollover already handles a negative
+    ``months`` correctly -- no special-casing needed)."""
+    return _add_months(dt, -months)
+
+
+def current_month_period(now: datetime) -> tuple[datetime, datetime]:
+    """The ``[period_start, period_end]`` window for "the calendar month
+    ``now`` falls in" -- ``period_start`` is midnight on the 1st,
+    ``period_end`` is ``now`` itself (an in-progress month has no fixed end
+    yet). The single shared definition of "current month" this domain uses
+    -- ``service.UsageService`` (usage-metric snapshotting) and BE-013 Part
+    5's churn-rate computation both call this same function rather than
+    each defining their own "start of this month" arithmetic."""
+    period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return period_start, now
+
+
 # ============================================================================
 # BE-013 Part 3: Payment Service + Real Stripe/Razorpay Integration + Webhooks
 # ============================================================================
@@ -223,6 +247,19 @@ def compute_renewal_charge_amount(plan: object) -> Decimal:
     ``plan: object`` parameter.
     """
     return plan.base_price
+
+
+def is_payment_retry_eligible(status: str) -> bool:
+    """The one, real rule for "may this ``Payment`` be retried" --
+    ``status == PaymentStatus.FAILED`` -- factored out of
+    ``service.PaymentService.retry_failed_payment``'s own
+    ``PaymentNotRetryableError`` guard into this single, named, pure
+    function so BE-013 Part 5's Failed Payments Dashboard can flag each
+    listed row's retry-eligibility using the *exact same* rule
+    ``retry_failed_payment`` itself enforces, rather than a second,
+    independently-maintained copy of "which statuses are retryable" that
+    could silently drift out of sync with it."""
+    return status == PaymentStatus.FAILED.value
 
 
 def derive_retry_idempotency_key(original_idempotency_key: str) -> str:
@@ -378,7 +415,10 @@ __all__ = [
     "validate_discount_value",
     "compute_discount_amount",
     "add_billing_cycle",
+    "subtract_months",
+    "current_month_period",
     "to_minor_units",
+    "is_payment_retry_eligible",
     "derive_retry_idempotency_key",
     "compute_renewal_charge_amount",
     "GstBreakdown",

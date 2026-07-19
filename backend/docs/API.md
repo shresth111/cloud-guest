@@ -1755,3 +1755,88 @@ invoice's own frozen `billing_snapshot` (see FLOW.md §41).
 
 `GET /billing/profile/{organization_id}` -- requires `billing.read`.
 
+## Billing Endpoints (Module 013 Part 5: Super Admin + Customer Billing Dashboards -- completes BE-013)
+
+See `docs/billing/FLOW.md` §47-§55 for the full design write-up --
+including the exact MRR/ARR/churn-rate formulas, the honest multi-currency
+caveat, why this domain's own new Revenue Dashboard is a **separate**
+capability from `app.domains.analytics`'s still-untouched
+`RevenueMetricsResponse` placeholder, the customer self-service upgrade/
+downgrade finding + fix, and the dashboard-view audit-throttling decision.
+No new tables, no new migration.
+
+### Super Admin Billing Dashboard
+
+`GET /billing/dashboard/super-admin` -- requires `billing.read` at
+`scope=GLOBAL` (mirrors every other platform-wide dashboard in this
+codebase; a non-GLOBAL-scoped caller is rejected with a real `403` before
+any dashboard logic runs). Query params: `months` (`1`-`36`, default `12`
+-- the Revenue trend window), `page`/`page_size` (applied to both the
+Customer Billing rows and the Failed Payments listing),
+`failed_payments_organization_id` (optional filter). Returns one composite
+payload with four real, computed sections:
+
+* `revenue` -- `total_revenue`/`total_refunded` (net of every "captured
+  money" `Payment` status, not just `SUCCEEDED` -- see FLOW.md §48),
+  `mrr`/`arr` (summed over currently-`ACTIVE` subscriptions, normalized by
+  `billing_cycle`), `active_paying_subscription_count`, a month-by-month
+  `trend`, and an honest `currency_note` (no FX-conversion exists anywhere
+  in this codebase -- every sum is raw, un-converted).
+* `subscriptions` -- `counts_by_status`, `counts_by_plan_type`, and
+  `churn` (`period_start`/`period_end`, `active_at_period_start`,
+  `cancelled_this_period`, `churn_rate` -- `null`, never a fabricated
+  `0.0`, when there is no active base to measure against; see FLOW.md
+  §49 for the exact formula).
+* `customers` -- paginated per-organization summary rows (`organization_id`/
+  `name`, current `plan_id`/`name`/`slug`, `subscription_status`,
+  `lifetime_revenue`, `outstanding_invoice_count`).
+* `failed_payments` -- a listing of `FAILED` payments (reusing Part 3's
+  own `PaymentService.list_failed_payments` verbatim), each flagged with
+  `retry_eligible` (reusing the exact rule
+  `PaymentService.retry_failed_payment` itself enforces), plus
+  `counts_by_provider`.
+
+### Customer Billing Dashboard (tenant-scoped)
+
+`GET /billing/dashboard/me` -- requires `billing.read` plus
+`X-Organization-Id` (`RequireOrganization` -- real, active-membership-
+checked tenant resolution, mirrors `GET /billing/profile/me`'s identical
+twin-route shape). `GET /billing/dashboard/{organization_id}` -- requires
+`billing.read` (ordinary inferred scope, mirrors `GET
+/billing/profile/{organization_id}`). Both return a unified summary --
+pure composition over six already-built Parts 1-4 service methods, nothing
+recomputed (see FLOW.md §47): current `license`/`plan` status, active
+`subscription` details (period, `auto_renew`, next renewal date), a real
+`usage` vs-limit snapshot (`UsageService.validate_usage_against_license`),
+`recent_invoices`/`recent_payments` (capped to a dashboard-summary limit --
+the full history is already available at `GET /invoices`/`GET /payments`),
+and registered `payment_methods`.
+
+### Renewal Settings (`subscriptions.update`, reused)
+
+`PATCH /subscriptions/{subscription_id}/renewal-settings` -- requires
+`subscriptions.update` plus `X-Organization-Id`. Body: `auto_renew`
+(`bool`). Confirmed genuinely missing from Parts 1-4 -- updates
+`Subscription.auto_renew` in place (no new column; that field has existed
+since Part 2). Unlike every other `/subscriptions/{id}/*` mutator in this
+domain, this endpoint **does** enforce a real tenant check: a caller
+supplying an `organization_id` that does not own the target subscription
+gets an honest `404`, never a leak (see FLOW.md §52 for why this endpoint
+specifically breaks from the "operate on the entity by id" precedent the
+others establish).
+
+### Customer self-service upgrade/downgrade (fix, no new endpoint)
+
+`POST /licenses/{license_id}/upgrade`/`downgrade` (Part 1) now accept
+**either** `subscriptions.update` **or** `billing.update` at whichever
+scope the request's own `X-Organization-Id` header implies -- a real,
+confirmed RBAC seed-data gap (`Organization Owner`/`Admin` hold only
+`SUBSCRIPTIONS: READ`) meant neither role could previously self-serve a
+plan change, despite the endpoint itself already being tenant-capable.
+Fixed entirely inside `app.domains.billing` (no RBAC seed edit) by
+accepting `billing.update` -- which `Organization Owner` already holds --
+as an alternative. See FLOW.md §51 for the full write-up, including why
+the underlying RBAC seed-data gap itself is left as an honest, documented
+follow-up rather than fixed directly (out of this Part's own directory-rule
+boundary).
+

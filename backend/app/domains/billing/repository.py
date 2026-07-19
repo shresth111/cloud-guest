@@ -34,6 +34,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from decimal import Decimal
 from typing import Protocol
 
 from sqlalchemy import func, select, update
@@ -42,16 +43,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
-from app.database.utils.pagination import PaginationMeta
+from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 from app.domains.location.models import Location
+from app.domains.organization.models import Organization
 from app.domains.otp.models import OtpRequest
 from app.domains.router.models import Router
 
 from .constants import (
     CYCLIC_BILLING_CYCLES,
+    DASHBOARD_CAPTURED_PAYMENT_STATUSES,
     RENEWABLE_SUBSCRIPTION_STATUSES,
     InvoiceStatus,
     PaymentStatus,
+    SubscriptionStatus,
 )
 from .models import (
     BillingProfile,
@@ -1094,6 +1098,228 @@ class CreditDebitNoteRepository:
         )
 
 
+# ============================================================================
+# BE-013 Part 5: Super Admin + Customer Billing Dashboards
+# ============================================================================
+
+
+class BillingDashboardRepositoryProtocol(Protocol):
+    async def sum_captured_payments(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> tuple[Decimal, Decimal]: ...
+
+    async def revenue_by_month(
+        self, *, start: datetime, end: datetime
+    ) -> list[tuple[datetime, Decimal, Decimal]]: ...
+
+    async def list_active_subscription_plans(self) -> list[tuple[Plan, str]]: ...
+
+    async def count_subscriptions_by_status(self) -> list[tuple[str, int]]: ...
+
+    async def count_subscriptions_by_plan_type(self) -> list[tuple[str, int]]: ...
+
+    async def count_subscriptions_active_before(self, cutoff: datetime) -> int: ...
+
+    async def count_subscriptions_cancelled_between(
+        self, start: datetime, end: datetime
+    ) -> int: ...
+
+    async def paginate_subscriptions_with_org_and_plan(
+        self, *, page: int, page_size: int
+    ) -> tuple[list[tuple[Subscription, Organization, Plan]], PaginationMeta]: ...
+
+
+class BillingDashboardRepository:
+    """Concrete, SQLAlchemy-backed implementation of
+    ``BillingDashboardRepositoryProtocol`` -- the real aggregate ``SELECT``s
+    backing BE-013 Part 5's Super Admin dashboards. Every method here is a
+    genuinely new aggregation (no Part 1-4 method already computes a sum/
+    group-by over these tables), so nothing here duplicates an existing
+    query -- see ``service.py``'s own Part 5 section for exactly how each
+    result composes into a dashboard response.
+
+    ``paginate_subscriptions_with_org_and_plan`` reads
+    ``app.domains.organization.models.Organization`` directly (a read-only
+    join, never that domain's service/repository layer) -- the identical
+    "read another domain's table directly for a narrow, read-only
+    composition" precedent this module's own ``UsageRepository`` already
+    establishes for ``Location``/``Router``/``OtpRequest`` (see this file's
+    own module docstring), and the same precedent
+    ``app.domains.rbac.dependencies.CurrentOrganization`` already
+    establishes for this exact model. No file inside ``organization`` is
+    edited to make this work.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def sum_captured_payments(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> tuple[Decimal, Decimal]:
+        """``(sum(amount), sum(refunded_amount))`` over every ``Payment``
+        row whose status is in ``constants.DASHBOARD_CAPTURED_PAYMENT_
+        STATUSES`` -- see that constant's own docstring for exactly why
+        this status set (not a literal ``status = SUCCEEDED`` reading of
+        the module brief) is the correct one. Optionally scoped to one
+        organization (the Customer Billing Dashboard's own per-row
+        "lifetime revenue" figure reuses this same method)."""
+        statement = select(
+            func.coalesce(func.sum(Payment.amount), 0),
+            func.coalesce(func.sum(Payment.refunded_amount), 0),
+        ).where(
+            Payment.is_deleted.is_(False),
+            Payment.status.in_(
+                [status.value for status in DASHBOARD_CAPTURED_PAYMENT_STATUSES]
+            ),
+        )
+        if organization_id is not None:
+            statement = statement.where(Payment.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        gross, refunded = result.one()
+        return Decimal(gross), Decimal(refunded)
+
+    async def revenue_by_month(
+        self, *, start: datetime, end: datetime
+    ) -> list[tuple[datetime, Decimal, Decimal]]:
+        """One ``(month_start, gross_amount, refunded_amount)`` row per
+        calendar month with at least one captured ``Payment`` in
+        ``[start, end]`` -- the real, grouped revenue-trend query behind
+        the Revenue Dashboard's month-by-month chart."""
+        month_bucket = func.date_trunc("month", Payment.created_at)
+        statement = (
+            select(
+                month_bucket.label("month"),
+                func.coalesce(func.sum(Payment.amount), 0),
+                func.coalesce(func.sum(Payment.refunded_amount), 0),
+            )
+            .where(
+                Payment.is_deleted.is_(False),
+                Payment.status.in_(
+                    [status.value for status in DASHBOARD_CAPTURED_PAYMENT_STATUSES]
+                ),
+                Payment.created_at >= start,
+                Payment.created_at <= end,
+            )
+            .group_by(month_bucket)
+            .order_by(month_bucket.asc())
+        )
+        result = await self.session.execute(statement)
+        return [(row[0], Decimal(row[1]), Decimal(row[2])) for row in result.all()]
+
+    async def list_active_subscription_plans(self) -> list[tuple[Plan, str]]:
+        """One ``(Plan, subscription.billing_cycle)`` pair per currently
+        ``ACTIVE`` ``Subscription`` -- the real per-subscription input to
+        the MRR/ARR computation (see ``service``'s own docstring for the
+        exact formula, which calls ``validators.compute_renewal_charge_
+        amount`` against each returned ``Plan`` row rather than
+        recomputing a charge amount here)."""
+        statement = (
+            select(Plan, Subscription.billing_cycle)
+            .join(Subscription, Subscription.plan_id == Plan.id)
+            .where(
+                Subscription.is_deleted.is_(False),
+                Plan.is_deleted.is_(False),
+                Subscription.status == SubscriptionStatus.ACTIVE.value,
+            )
+        )
+        result = await self.session.execute(statement)
+        return [(row[0], row[1]) for row in result.all()]
+
+    async def count_subscriptions_by_status(self) -> list[tuple[str, int]]:
+        statement = (
+            select(Subscription.status, func.count())
+            .where(Subscription.is_deleted.is_(False))
+            .group_by(Subscription.status)
+        )
+        result = await self.session.execute(statement)
+        return [(row[0], int(row[1])) for row in result.all()]
+
+    async def count_subscriptions_by_plan_type(self) -> list[tuple[str, int]]:
+        statement = (
+            select(Plan.plan_type, func.count())
+            .select_from(Subscription)
+            .join(Plan, Subscription.plan_id == Plan.id)
+            .where(Subscription.is_deleted.is_(False), Plan.is_deleted.is_(False))
+            .group_by(Plan.plan_type)
+        )
+        result = await self.session.execute(statement)
+        return [(row[0], int(row[1])) for row in result.all()]
+
+    async def count_subscriptions_active_before(self, cutoff: datetime) -> int:
+        """The honest "active at period start" heuristic BE-013 Part 5's
+        churn-rate formula uses as its denominator: every ``Subscription``
+        that had already started (``started_at <= cutoff``) and had not
+        yet been cancelled as of ``cutoff`` (``cancelled_at IS NULL`` or
+        strictly after it). This module keeps no per-day historical
+        status-snapshot table (unlike ``app.domains.analytics
+        .AnalyticsSnapshot``), so this is computed directly from each
+        subscription's own ``started_at``/``cancelled_at`` columns rather
+        than a stored point-in-time count -- see ``service.py``'s own
+        churn-rate docstring for the full write-up of why this is judged an
+        honest, real (not fabricated) heuristic, the same rigor
+        ``app.domains.analytics.health_score`` already established for a
+        similarly judgment-based metric."""
+        statement = (
+            select(func.count())
+            .select_from(Subscription)
+            .where(
+                Subscription.is_deleted.is_(False),
+                Subscription.started_at <= cutoff,
+            )
+            .where(
+                (Subscription.cancelled_at.is_(None))
+                | (Subscription.cancelled_at > cutoff)
+            )
+        )
+        result = await self.session.execute(statement)
+        return int(result.scalar_one())
+
+    async def count_subscriptions_cancelled_between(
+        self, start: datetime, end: datetime
+    ) -> int:
+        statement = (
+            select(func.count())
+            .select_from(Subscription)
+            .where(
+                Subscription.is_deleted.is_(False),
+                Subscription.cancelled_at.isnot(None),
+                Subscription.cancelled_at >= start,
+                Subscription.cancelled_at <= end,
+            )
+        )
+        result = await self.session.execute(statement)
+        return int(result.scalar_one())
+
+    async def paginate_subscriptions_with_org_and_plan(
+        self, *, page: int, page_size: int
+    ) -> tuple[list[tuple[Subscription, Organization, Plan]], PaginationMeta]:
+        """The real, paginated driving query for the Customer Billing
+        Dashboard's per-organization summary rows -- ``Subscription`` is
+        the natural driving table (one row per organization, ever -- see
+        ``models.Subscription``'s own cardinality docstring), joined to its
+        owning ``Organization`` (for a display name) and current ``Plan``
+        (for plan name/slug)."""
+        params = PageParams(page=page, page_size=page_size)
+        count_statement = (
+            select(func.count())
+            .select_from(Subscription)
+            .where(Subscription.is_deleted.is_(False))
+        )
+        total_result = await self.session.execute(count_statement)
+        total_items = int(total_result.scalar_one())
+
+        statement = (
+            select(Subscription, Organization, Plan)
+            .join(Organization, Subscription.organization_id == Organization.id)
+            .join(Plan, Subscription.plan_id == Plan.id)
+            .where(Subscription.is_deleted.is_(False))
+            .order_by(Subscription.created_at.desc())
+        )
+        result = await self.session.execute(paginate(statement, params))
+        rows = [(row[0], row[1], row[2]) for row in result.all()]
+        return rows, PaginationMeta.from_total(params, total_items)
+
+
 __all__ = [
     "PlanRepositoryProtocol",
     "PlanRepository",
@@ -1118,4 +1344,6 @@ __all__ = [
     "InvoiceRepository",
     "CreditDebitNoteRepositoryProtocol",
     "CreditDebitNoteRepository",
+    "BillingDashboardRepositoryProtocol",
+    "BillingDashboardRepository",
 ]

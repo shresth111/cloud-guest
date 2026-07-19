@@ -1,8 +1,20 @@
 # BE-013: Billing & Subscription Module
 
-**Parts 1-4 of 5** in the Billing & Subscription module (BE-013), all
-living in `app.domains.billing` (one domain, extended, not a new one per
-part).
+**BE-013 is now complete, across five parts.** This section is a short
+table of contents for the whole module; each part's own "In One Paragraph"
+section below (and `FLOW.md`'s numbered §§) carries the full detail --
+this is deliberately not a rewrite of any of it.
+
+| Part | Name | What it contributed |
+|---|---|---|
+| 1 | Plan + License + Usage Core | The pricing/entitlement catalog (`Plan`/`PlanFeature`), what an organization is actually entitled to (`License`/`LicenseChangeLog`), real composed usage tracking (`UsageMetric`) |
+| 2 | Subscription + Renewal + Coupon Engines | `Subscription` lifecycle, the Renewal Engine (due-date detection, the `PaymentGatewayProtocol` seam, grace-period-then-expire, reminder emails), the Coupon Engine |
+| 3 | Payment Service + Real Stripe/Razorpay + Webhooks | Real `StripePaymentGateway`/`RazorpayPaymentGateway`, `Payment`/`PaymentMethod`, real HMAC-SHA256 webhook verification + Redis dedup, refund/retry |
+| 4 | Invoice Engine + Tax/GST | `TaxRate`/`BillingProfile`/`Invoice`/`InvoiceItem`/`CreditDebitNote`, the real CGST/SGST/IGST GST split, a DB-atomic number generator, a `reportlab` invoice PDF renderer |
+| 5 | Super Admin + Customer Billing Dashboards | Real Revenue/MRR/ARR + churn-rate dashboards, a unified Customer Billing Dashboard, the customer self-service upgrade/downgrade permission fix, `PATCH /subscriptions/{id}/renewal-settings` |
+
+All five parts live in `app.domains.billing` -- one domain, extended, not
+a new one per part.
 
 * **Part 1** (this doc's original scope): the pricing/entitlement catalog
   (`Plan`/`PlanFeature`), what an organization is actually entitled to
@@ -35,12 +47,19 @@ part).
   `GET /invoices`/`{id}`/`{id}/download`, `POST`/`GET`/`PUT
   /billing/tax-rates`, and `POST`/`GET /billing/profile` API surface.
 
-Later BE-013 part (not built here) layers Super Admin + Customer
-dashboards (Part 5) on top of this foundation.
+* **Part 5** (this doc's final addition): the Super Admin Billing
+  Dashboard (`GET /billing/dashboard/super-admin` -- real Revenue/MRR/ARR,
+  Subscription counts + a real churn-rate formula, paginated Customer
+  Billing summary rows, a Failed Payments listing with retry-eligibility
+  flagged), the Customer Billing Dashboard (`GET /billing/dashboard/me` /
+  `/{organization_id}` -- a unified, pure-composition summary), the
+  confirmed-and-fixed customer self-service upgrade/downgrade gap, and the
+  genuinely-missing `PATCH /subscriptions/{id}/renewal-settings` endpoint.
+  No new tables, no new migration.
 
 See `FLOW.md` for every design decision in full detail (§1-§11 Part 1,
-§12-§21 Part 2, §22-§34 Part 3, §35-§46 Part 4) and `DATABASE.md` for the
-schema reference. This file is a short orientation.
+§12-§21 Part 2, §22-§34 Part 3, §35-§46 Part 4, §47-§55 Part 5) and
+`DATABASE.md` for the schema reference. This file is a short orientation.
 
 ## In One Paragraph (Part 1)
 
@@ -169,7 +188,50 @@ legally-defined layout (CGST/SGST/IGST shown as separate lines, never
 lumped) does not fit that renderer's own deliberately flexible, variable-
 shaped report-section model (`FLOW.md` §43).
 
-## What This Module Does NOT Do (as of Part 4)
+## In One Paragraph (Part 5 -- final part)
+
+No new tables, no new migration. `service.SuperAdminBillingDashboardService`
+composes a new `repository.BillingDashboardRepository` (real, hand-written
+aggregate `SELECT`s -- `sum_captured_payments`, `revenue_by_month`,
+`list_active_subscription_plans`, `count_subscriptions_by_status`/
+`by_plan_type`, `count_subscriptions_active_before`/
+`cancelled_between`, `paginate_subscriptions_with_org_and_plan`) into four
+real dashboard sections: total revenue nets out refunds across every
+"captured money" `Payment` status, not just `SUCCEEDED` (`FLOW.md` §48
+explains exactly why the module brief's own literal wording would
+undercount a partially-refunded payment); MRR/ARR sums every currently-
+`ACTIVE` subscription's `validators.compute_renewal_charge_amount(plan)`,
+normalized to a monthly figure by `billing_cycle` (`FLOW.md` §48); a real,
+defined, documented churn-rate formula
+(`cancelled_this_period / active_at_period_start` over the current
+calendar month, `None` -- never a fabricated `0.0` -- when there is no
+active base, `FLOW.md` §49); and a Failed Payments listing reusing Part
+3's own `PaymentService.list_failed_payments` verbatim, with each row's
+retry-eligibility reusing the exact rule
+`PaymentService.retry_failed_payment` itself enforces
+(`validators.is_payment_retry_eligible`, factored out of that existing
+method rather than duplicated). `service.CustomerBillingDashboardService
+.get_dashboard` is pure composition over six already-built Parts 1-4
+service methods -- nothing is recomputed. This domain's own new Revenue
+Dashboard is explicitly a **separate** capability from
+`app.domains.analytics`'s own, still-untouched `RevenueMetricsResponse`
+placeholder (`FLOW.md` §50). Two real findings from investigating the
+module brief's own customer-self-service requirements: (1) `Organization
+Owner`/`Admin` hold only `SUBSCRIPTIONS: READ` in RBAC's seed data,
+blocking self-service upgrade/downgrade -- confirmed, and fixed *without*
+touching RBAC internals by having `router
+._require_subscription_self_service_permission` accept `billing.update`
+(which `Organization Owner` already holds) as an alternative to
+`subscriptions.update` (`FLOW.md` §51); (2) no endpoint existed to update
+`Subscription.auto_renew` post-creation -- fixed by adding `PATCH
+/subscriptions/{id}/renewal-settings`, the one subscription mutator in
+this file that deliberately DOES enforce a real tenant check, since it is
+explicitly a customer self-service action (`FLOW.md` §52). Dashboard views
+are audited via the same throttled-Redis-dedup middle ground
+`app.domains.analytics.dashboard_audit` already established, re-implemented
+locally rather than imported (`FLOW.md` §53).
+
+## What This Module Does NOT Do (as of Part 5 -- final)
 
 * **It cannot actually charge real money in this sandbox.** There are no
   real Stripe/Razorpay credentials anywhere in it, and there never will
@@ -184,8 +246,26 @@ shaped report-section model (`FLOW.md` §43).
   see `FLOW.md` §28's honest write-up of this scope simplification.
 * **It does not re-apply a coupon on renewal.** A coupon is redeemed once,
   at subscription creation -- see `FLOW.md` §17 (unchanged by Part 3).
-* **It does not build Super Admin / Customer dashboards.** Those are
-  BE-013 Part 5.
+* **It does not fix `app.domains.analytics`'s own `RevenueMetricsResponse`
+  placeholder.** That is a separate, pre-existing, still-honest
+  `available=False` placeholder in a different domain -- this Part builds
+  its own, distinct Revenue Dashboard entirely inside `app.domains.billing`
+  instead. See `FLOW.md` §50 for the full clarification; fixing Analytics'
+  own placeholder (from inside `app.domains.analytics` itself) is an
+  honest, explicitly out-of-scope follow-up for a future part/module.
+* **It does not fix RBAC's own `Organization Owner`/`Admin` seed-data gap
+  directly.** Those roles' `SUBSCRIPTIONS: READ`-only override (in
+  `app.domains.rbac.seed.py`, outside this Part's directory) is what
+  originally blocked customer self-service upgrade/downgrade. This Part
+  works around it entirely from inside its own directory (accepting
+  `billing.update` as an alternative permission -- see `FLOW.md` §51)
+  rather than editing RBAC's seed data; a future RBAC-owning change could
+  still loosen that override directly.
+* **It does not sum revenue across currencies with real FX conversion.**
+  No FX-conversion table or service exists anywhere in this codebase;
+  every revenue/MRR/ARR figure is a raw sum across whatever `Plan.currency`/
+  `Payment.currency` values are present, surfaced honestly via a
+  `currency_note` -- see `FLOW.md` §48.
 * **It does not add a new `PermissionModule` for tax rates/billing
   profile.** `billing.*` covers `/billing/tax-rates`/`/billing/profile`
   exactly like Plans/Coupons/Payments before them; `/invoices` reuses
@@ -208,7 +288,16 @@ shaped report-section model (`FLOW.md` §43).
   an opaque provider token (see `FLOW.md` §28). Part 4 does not add any
   column to `app.domains.organization.models.Organization` -- billing
   address/GSTIN lives entirely in this domain's own `BillingProfile` table
-  (see `FLOW.md` §36).
+  (see `FLOW.md` §36). Part 5 touches no file inside `app.domains
+  .analytics`/`rbac`/`organization`/`otp`/`monitoring` at all -- not even
+  an additive `AuditAction` enum value (see `FLOW.md` §54) -- with one
+  narrow, read-only exception: `repository
+  .BillingDashboardRepository.paginate_subscriptions_with_org_and_plan`
+  reads `app.domains.organization.models.Organization` directly for a
+  display name (the identical read-only, no-service-layer precedent
+  `UsageRepository.count_locations`/`count_routers` already establish for
+  `Location`/`Router`, and `app.domains.rbac.dependencies
+  .CurrentOrganization` already establishes for this exact model).
 
 ## Folder Structure
 
@@ -247,17 +336,38 @@ backend/
                            #   NoteType, INVOICE_NUMBER_PREFIX, CREDIT_NOTE_NUMBER_PREFIX,
                            #   DEBIT_NOTE_NUMBER_PREFIX, NUMBER_SEQUENCE_DIGITS,
                            #   TASK_RUN_INVOICE_OVERDUE_SWEEP
+                           # + Part 5: DASHBOARD_CAPTURED_PAYMENT_STATUSES,
+                           #   DEFAULT/MIN/MAX_DASHBOARD_REVENUE_TREND_MONTHS,
+                           #   CUSTOMER_DASHBOARD_RECENT_INVOICES/PAYMENTS_LIMIT,
+                           #   BILLING_DASHBOARD_AUDIT_THROTTLE_MINUTES/KEY_TEMPLATE,
+                           #   AUDIT_ACTION_DASHBOARD_SUPER_ADMIN_VIEWED/CUSTOMER_VIEWED/
+                           #   AUDIT_ACTION_SUBSCRIPTION_RENEWAL_SETTINGS_UPDATED
       schemas.py           # + Subscription*/Coupon*/Payment*/PaymentMethod* request/
                            #   response models, TaxRate*/BillingProfile*/Invoice*/
                            #   CreditDebitNote*/CreditNoteIssueRequest/DebitNoteIssueRequest
+                           # + Part 5: SubscriptionRenewalSettingsUpdateRequest,
+                           #   SuperAdminRevenueDashboardResponse/
+                           #   SuperAdminSubscriptionDashboardResponse/
+                           #   SuperAdminCustomerBillingDashboardResponse/
+                           #   SuperAdminFailedPaymentsDashboardResponse/
+                           #   SuperAdminBillingDashboardResponse,
+                           #   CustomerBillingDashboardResponse
       repository.py        # + SubscriptionRepository, CouponRepository (atomic increment),
                             #   PaymentRepository, PaymentMethodRepository (atomic
                             #   set_as_default), NumberCounterRepository (atomic UPSERT),
                             #   TaxRateRepository, BillingProfileRepository,
                             #   InvoiceRepository, CreditDebitNoteRepository
+                            # + Part 5: BillingDashboardRepository (sum_captured_payments,
+                            #   revenue_by_month, list_active_subscription_plans,
+                            #   count_subscriptions_by_status/by_plan_type,
+                            #   count_subscriptions_active_before/cancelled_between,
+                            #   paginate_subscriptions_with_org_and_plan)
       service.py             # + SubscriptionService, CouponService, PaymentService,
                               #   PaymentMethodService, TaxRateService,
                               #   BillingProfileService, InvoiceService
+                              # + Part 5: SuperAdminBillingDashboardService,
+                              #   CustomerBillingDashboardService,
+                              #   SubscriptionService.update_renewal_settings
       number_generator.py      # generate_invoice_number/generate_credit_note_number/
                                 # generate_debit_note_number -- see the real, atomic
                                 # concurrency-safety mechanism in its own module docstring
@@ -280,17 +390,29 @@ backend/
                                   #   /webhooks/razorpay, /invoices, /invoices/{id}/
                                   #   download|void|credit-note|debit-note,
                                   #   /billing/tax-rates, /billing/profile endpoints
+                                  # + Part 5: /billing/dashboard/super-admin,
+                                  #   /billing/dashboard/me, /billing/dashboard/{organization_id},
+                                  #   PATCH /subscriptions/{id}/renewal-settings;
+                                  #   _require_subscription_self_service_permission
+                                  #   (the upgrade/downgrade self-service fix)
       validators.py                # + normalize_coupon_code, validate_discount_value,
                                     #   compute_discount_amount, add_billing_cycle,
                                     #   to_minor_units, derive_retry_idempotency_key,
                                     #   compute_renewal_charge_amount, normalize_region,
                                     #   compute_tax_breakdown, GstBreakdown
+                                    # + Part 5: subtract_months, current_month_period
+                                    #   (moved here from a private service.py helper),
+                                    #   is_payment_retry_eligible (factored out of
+                                    #   PaymentService.retry_failed_payment)
       dependencies.py                # + get_subscription_service, get_coupon_service,
                                       #   build_payment_gateway, get_payment_gateway,
                                       #   get_renewal_service, get_payment_service,
                                       #   get_payment_method_service,
                                       #   get_webhook_event_dedup, get_tax_rate_service,
                                       #   get_billing_profile_service, get_invoice_service
+                                      # + Part 5: get_billing_dashboard_repository,
+                                      #   get_super_admin_billing_dashboard_service,
+                                      #   get_customer_billing_dashboard_service
       exceptions.py                    # + Subscription*/Coupon*/PaymentGatewayNotConfiguredError/
                                         #   Payment*/PaymentMethodNotFoundError/
                                         #   WebhookSignatureInvalidError/PaymentProviderError/
@@ -298,11 +420,17 @@ backend/
                                         #   BillingProfileNotFoundError/InvoiceNotFoundError/
                                         #   InvalidInvoiceStatusTransitionError/
                                         #   InvalidNoteAmountError
+                                        # (Part 5 adds no new exception -- reuses
+                                        #   SubscriptionNotFoundError for the renewal-
+                                        #   settings tenant-mismatch case)
       events.py                         # + Subscription*/Coupon*/RenewalReminderSent/
                                          #   ExpiryReminderSent/Payment*/WebhookProcessed/
                                          #   WebhookSignatureInvalid/Invoice*/
                                          #   CreditNoteIssued/DebitNoteIssued/TaxRate*/
                                          #   BillingProfileUpdated dataclasses
+                                         # (Part 5 adds no new event -- see FLOW.md §53
+                                         #   for its own structured-log-only dashboard
+                                         #   view logging)
   docs/billing/
     README.md   # this file
     FLOW.md
@@ -312,7 +440,9 @@ backend/
     test_billing_subscriptions_renewals_coupons.py
     test_billing_payments_webhooks.py
     test_billing_invoices_tax.py
-  requirements.txt / pyproject.toml   # + stripe==15.3.1, razorpay==2.0.1 (no new
-                                       #   dependency for Part 4 -- reportlab already
-                                       #   present from BE-012 Part 5)
+    test_billing_dashboards.py   # Part 5
+  requirements.txt / pyproject.toml   # + stripe==15.3.1, razorpay==2.0.1 (Part 3; no
+                                       #   new dependency for Part 4 -- reportlab already
+                                       #   present from BE-012 Part 5). Part 5 adds no
+                                       #   new dependency either.
 ```

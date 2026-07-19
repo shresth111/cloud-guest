@@ -38,6 +38,8 @@ from .constants import PaymentProvider
 from .payment_gateways import RazorpayPaymentGateway, StripePaymentGateway
 from .renewal_service import PaymentGatewayProtocol, RenewalService
 from .repository import (
+    BillingDashboardRepository,
+    BillingDashboardRepositoryProtocol,
     BillingProfileRepository,
     BillingProfileRepositoryProtocol,
     CouponRepository,
@@ -65,12 +67,14 @@ from .repository import (
 from .service import (
     BillingProfileService,
     CouponService,
+    CustomerBillingDashboardService,
     InvoiceService,
     LicenseService,
     PaymentMethodService,
     PaymentService,
     PlanService,
     SubscriptionService,
+    SuperAdminBillingDashboardService,
     TaxRateService,
     UsageService,
 )
@@ -403,6 +407,57 @@ def get_invoice_service(
     )
 
 
+# ============================================================================
+# BE-013 Part 5: Super Admin + Customer Billing Dashboards
+# ============================================================================
+
+
+def get_billing_dashboard_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> BillingDashboardRepositoryProtocol:
+    return BillingDashboardRepository(db)
+
+
+def get_super_admin_billing_dashboard_service(
+    repository: BillingDashboardRepositoryProtocol = Depends(
+        get_billing_dashboard_repository
+    ),
+    payment_service: PaymentService = Depends(get_payment_service),
+    invoice_service: InvoiceService = Depends(get_invoice_service),
+    redis: Redis = Depends(get_redis_client),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> SuperAdminBillingDashboardService:
+    return SuperAdminBillingDashboardService(
+        repository,
+        payment_service,
+        invoice_service,
+        redis=redis,
+        audit_writer=audit_repository,
+    )
+
+
+def get_customer_billing_dashboard_service(
+    license_service: LicenseService = Depends(get_license_service),
+    plan_service: PlanService = Depends(get_plan_service),
+    subscription_service: SubscriptionService = Depends(get_subscription_service),
+    usage_service: UsageService = Depends(get_usage_service),
+    invoice_service: InvoiceService = Depends(get_invoice_service),
+    payment_service: PaymentService = Depends(get_payment_service),
+    payment_method_service: PaymentMethodService = Depends(get_payment_method_service),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> CustomerBillingDashboardService:
+    return CustomerBillingDashboardService(
+        license_service=license_service,
+        plan_service=plan_service,
+        subscription_service=subscription_service,
+        usage_service=usage_service,
+        invoice_service=invoice_service,
+        payment_service=payment_service,
+        payment_method_service=payment_method_service,
+        audit_writer=audit_repository,
+    )
+
+
 __all__ = [
     "get_plan_repository",
     "get_license_repository",
@@ -430,4 +485,7 @@ __all__ = [
     "get_credit_debit_note_repository",
     "get_number_counter_repository",
     "get_invoice_service",
+    "get_billing_dashboard_repository",
+    "get_super_admin_billing_dashboard_service",
+    "get_customer_billing_dashboard_service",
 ]

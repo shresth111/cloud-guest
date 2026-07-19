@@ -81,6 +81,17 @@ __all__ = [
     "DebitNoteIssueRequest",
     "InvoiceResponse",
     "InvoiceListResponse",
+    "SubscriptionRenewalSettingsUpdateRequest",
+    "RevenueTrendPointResponse",
+    "SuperAdminRevenueDashboardResponse",
+    "ChurnRateResponse",
+    "SuperAdminSubscriptionDashboardResponse",
+    "CustomerBillingSummaryRowResponse",
+    "SuperAdminCustomerBillingDashboardResponse",
+    "FailedPaymentRowResponse",
+    "SuperAdminFailedPaymentsDashboardResponse",
+    "SuperAdminBillingDashboardResponse",
+    "CustomerBillingDashboardResponse",
 ]
 
 
@@ -730,3 +741,131 @@ class InvoiceListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+# ============================================================================
+# BE-013 Part 5: Super Admin + Customer Billing Dashboards
+# ============================================================================
+
+
+class SubscriptionRenewalSettingsUpdateRequest(BaseModel):
+    auto_renew: bool = Field(
+        ...,
+        description=(
+            "Whether this subscription should be automatically charged/"
+            "renewed at the end of its current billing period."
+        ),
+    )
+
+
+class RevenueTrendPointResponse(BaseModel):
+    month: str = Field(..., description='"YYYY-MM" label.')
+    gross_amount: Decimal
+    refunded_amount: Decimal
+    net_amount: Decimal
+
+
+class SuperAdminRevenueDashboardResponse(BaseModel):
+    """This domain's OWN real Revenue Dashboard -- composed entirely from
+    this domain's own ``Payment``/``Subscription``/``Plan`` tables. This is
+    a distinct capability from, and does not modify,
+    ``app.domains.analytics.dashboard_schemas.RevenueMetricsResponse``
+    (a separate, pre-existing, still-honest ``available=False`` placeholder
+    -- see ``service.py``'s own Part 5 section docstring for the full
+    write-up of why the two are deliberately kept separate)."""
+
+    total_revenue: Decimal
+    total_refunded: Decimal
+    mrr: Decimal
+    arr: Decimal
+    active_paying_subscription_count: int
+    trend: list[RevenueTrendPointResponse]
+    currency_note: str
+
+
+class ChurnRateResponse(BaseModel):
+    period_start: datetime
+    period_end: datetime
+    active_at_period_start: int
+    cancelled_this_period: int
+    churn_rate: float | None = Field(
+        default=None,
+        description=(
+            "cancelled_this_period / active_at_period_start. null when "
+            "active_at_period_start is 0 -- an honest 'not computable' "
+            "outcome, never a fabricated 0.0."
+        ),
+    )
+
+
+class SuperAdminSubscriptionDashboardResponse(BaseModel):
+    counts_by_status: dict[str, int]
+    counts_by_plan_type: dict[str, int]
+    churn: ChurnRateResponse
+
+
+class CustomerBillingSummaryRowResponse(BaseModel):
+    organization_id: str
+    organization_name: str
+    plan_id: str
+    plan_name: str
+    plan_slug: str
+    subscription_status: str
+    lifetime_revenue: Decimal
+    outstanding_invoice_count: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SuperAdminCustomerBillingDashboardResponse(BaseModel):
+    items: list[CustomerBillingSummaryRowResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+class FailedPaymentRowResponse(BaseModel):
+    payment: PaymentResponse
+    retry_eligible: bool = Field(
+        ...,
+        description=(
+            "Reuses the exact same rule PaymentService.retry_failed_payment "
+            "itself enforces (status == FAILED)."
+        ),
+    )
+
+
+class SuperAdminFailedPaymentsDashboardResponse(BaseModel):
+    items: list[FailedPaymentRowResponse]
+    page: int
+    page_size: int
+    total_items: int
+    counts_by_provider: dict[str, int]
+
+
+class SuperAdminBillingDashboardResponse(BaseModel):
+    """The full, composite Super Admin Billing Dashboard -- mirrors
+    ``app.domains.analytics.dashboard_schemas.SuperAdminDashboardResponse``'s
+    own "one endpoint, one composite payload" shape."""
+
+    revenue: SuperAdminRevenueDashboardResponse
+    subscriptions: SuperAdminSubscriptionDashboardResponse
+    customers: SuperAdminCustomerBillingDashboardResponse
+    failed_payments: SuperAdminFailedPaymentsDashboardResponse
+
+
+class CustomerBillingDashboardResponse(BaseModel):
+    """The unified, tenant-scoped "Customer Billing Dashboard" -- current
+    License/Plan/Subscription status, a real usage-vs-limit snapshot,
+    recent invoices/payments, and registered payment methods."""
+
+    license: LicenseResponse
+    plan: PlanResponse
+    subscription: SubscriptionResponse
+    usage: UsageSummaryResponse
+    recent_invoices: list[InvoiceResponse]
+    payment_methods: list[PaymentMethodResponse]
+    recent_payments: list[PaymentResponse]

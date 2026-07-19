@@ -154,7 +154,9 @@ from app.domains.auth.dependencies import get_current_user
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
 from app.domains.rbac.authorization import AccessValidator
+from app.domains.rbac.context import ScopeContext
 from app.domains.rbac.dependencies import (
+    CurrentOrganization,
     RequireOrganization,
     RequirePermission,
     get_access_validator,
@@ -165,6 +167,7 @@ from .constants import DiscountType, InvoiceStatus, PaymentStatus, PlanType
 from .dependencies import (
     get_billing_profile_service,
     get_coupon_service,
+    get_customer_billing_dashboard_service,
     get_invoice_service,
     get_license_service,
     get_payment_method_service,
@@ -173,6 +176,7 @@ from .dependencies import (
     get_plan_service,
     get_renewal_service,
     get_subscription_service,
+    get_super_admin_billing_dashboard_service,
     get_tax_rate_service,
     get_usage_service,
     get_webhook_event_dedup,
@@ -199,6 +203,7 @@ from .repository import PaymentRepositoryProtocol
 from .schemas import (
     BillingProfileResponse,
     BillingProfileUpsertRequest,
+    ChurnRateResponse,
     CouponCreateRequest,
     CouponListResponse,
     CouponResponse,
@@ -207,7 +212,10 @@ from .schemas import (
     CouponValidateResponse,
     CreditDebitNoteResponse,
     CreditNoteIssueRequest,
+    CustomerBillingDashboardResponse,
+    CustomerBillingSummaryRowResponse,
     DebitNoteIssueRequest,
+    FailedPaymentRowResponse,
     InvoiceItemResponse,
     InvoiceListResponse,
     InvoiceResponse,
@@ -229,9 +237,16 @@ from .schemas import (
     PlanListResponse,
     PlanResponse,
     PlanUpdateRequest,
+    RevenueTrendPointResponse,
     SubscriptionCancelRequest,
     SubscriptionCreateRequest,
+    SubscriptionRenewalSettingsUpdateRequest,
     SubscriptionResponse,
+    SuperAdminBillingDashboardResponse,
+    SuperAdminCustomerBillingDashboardResponse,
+    SuperAdminFailedPaymentsDashboardResponse,
+    SuperAdminRevenueDashboardResponse,
+    SuperAdminSubscriptionDashboardResponse,
     TaxRateCreateRequest,
     TaxRateListResponse,
     TaxRateResponse,
@@ -243,12 +258,14 @@ from .schemas import (
 from .service import (
     BillingProfileService,
     CouponService,
+    CustomerBillingDashboardService,
     InvoiceService,
     LicenseService,
     PaymentMethodService,
     PaymentService,
     PlanService,
     SubscriptionService,
+    SuperAdminBillingDashboardService,
     TaxRateService,
     UsageService,
     UsageValidationResult,
@@ -407,6 +424,80 @@ def _usage_summary_response(
         ],
         any_limit_exceeded=result.any_limit_exceeded,
     )
+
+
+async def _require_subscription_self_service_permission(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    access_validator: AccessValidator = Depends(get_access_validator),
+) -> AuthUser:
+    """Gate for ``POST /licenses/{id}/upgrade``/``downgrade`` -- see
+    ``docs/billing/FLOW.md``'s "customer self-service upgrade/downgrade"
+    section for the full write-up of the finding this fixes.
+
+    ## The finding
+
+    Part 1's ``upgrade_license``/``downgrade_license`` endpoints were
+    already tenant-capable in principle -- no ``scope=ScopeType.GLOBAL``
+    pin, ordinary inferred (``X-Organization-Id``-driven) scope resolution,
+    exactly like every other tenant-owned write in this domain. The actual
+    blocker is RBAC's own seed data (``app.domains.rbac.seed.SYSTEM_ROLES``,
+    a file explicitly outside this part's own directory-rule boundary --
+    "do not touch rbac internals"): ``Organization Owner``/``Organization
+    Admin`` -- the two roles an organization's own customer-side admin
+    actually holds -- both carry an explicit ``SUBSCRIPTIONS: GrantLevel
+    .READ`` override, so neither holds ``subscriptions.update`` at their own
+    ``ORGANIZATION`` scope at all, regardless of this endpoint's own scope
+    handling. That seed-data gap cannot be fixed from inside this part
+    without violating its own directory rule, so it is documented here and
+    in ``docs/billing/FLOW.md`` as an honest, left-as-is follow-up for a
+    future RBAC-owning change -- **not** silently worked around by loosening
+    this domain's own permission-key mapping.
+
+    ## The fix this part CAN make, entirely inside its own directory
+
+    ``Organization Owner`` (unlike ``Organization Admin``) already holds
+    ``billing.update`` at ``ORGANIZATION`` scope (an ``_M.BILLING:
+    GrantLevel.OPERATE`` override in that same seed data) -- billing
+    profile / payment method management was always meant to be
+    self-serviceable by an organization's own owner. This dependency
+    accepts **either** ``subscriptions.update`` (the existing, unchanged
+    check -- e.g. a GLOBAL-scoped Billing Manager) **or** ``billing.update``
+    (what an Organization Owner already has) at whichever scope the
+    request's own ``X-Organization-Id`` header implies (``ORGANIZATION``
+    when present, ``GLOBAL`` otherwise -- the identical inference
+    ``RequirePermission`` itself performs when given no explicit
+    ``scope=``). This is composed entirely from
+    ``AccessValidator.check``/``has_permission`` -- the same "check an
+    extra, independent permission inline in the route" pattern
+    ``list_plans`` above already establishes in this exact file -- and adds
+    no new permission key, no RBAC seed edit, and no change to any
+    existing caller's behavior (a caller who already holds
+    ``subscriptions.update`` keeps working exactly as before)."""
+    scope_context = (
+        ScopeContext.for_organization(organization_id)
+        if organization_id is not None
+        else ScopeContext.global_scope()
+    )
+    scope_type = (
+        ScopeType.ORGANIZATION if organization_id is not None else ScopeType.GLOBAL
+    )
+    user_id = uuid.UUID(user.id)
+    if await access_validator.has_permission(
+        user_id,
+        "subscriptions.update",
+        scope_type=scope_type,
+        scope_context=scope_context,
+    ):
+        return user
+    # Falls through to the real ``.check()`` call (which raises and logs a
+    # denial) for the alternate permission, so a caller holding NEITHER
+    # gets the same real 403 either check alone would produce.
+    await access_validator.check(
+        user_id, "billing.update", scope_type=scope_type, scope_context=scope_context
+    )
+    return user
 
 
 # ============================================================================
@@ -740,7 +831,7 @@ async def cancel_license(
     "/licenses/{license_id}/upgrade",
     response_model=ApiResponse[LicenseResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+    dependencies=[Depends(_require_subscription_self_service_permission)],
 )
 async def upgrade_license(
     request: Request,
@@ -767,7 +858,7 @@ async def upgrade_license(
     "/licenses/{license_id}/downgrade",
     response_model=ApiResponse[LicenseResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+    dependencies=[Depends(_require_subscription_self_service_permission)],
 )
 async def downgrade_license(
     request: Request,
@@ -977,6 +1068,41 @@ async def resume_subscription(
     return build_response(
         success=True,
         message="Subscription resumed",
+        data=_subscription_response(subscription).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.patch(
+    "/subscriptions/{subscription_id}/renewal-settings",
+    response_model=ApiResponse[SubscriptionResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+)
+async def update_subscription_renewal_settings(
+    request: Request,
+    subscription_id: uuid.UUID,
+    payload: SubscriptionRenewalSettingsUpdateRequest,
+    user: AuthUser = Depends(get_current_user),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: SubscriptionService = Depends(get_subscription_service),
+):
+    """BE-013 Part 5's "Renewal Settings" customer feature -- confirmed
+    genuinely missing from Parts 1-4 (no ``PATCH``/``PUT`` on
+    ``/subscriptions/{id}`` existed beyond the cancel/reactivate/pause/
+    resume state-transition actions). Tenant-scoped via ``RequireOrganization``
+    -- see ``SubscriptionService.update_renewal_settings``'s own docstring
+    for why this is a deliberate exception to this file's usual "operate on
+    the entity by id, no tenant check" precedent for subscription mutators."""
+    subscription = await service.update_renewal_settings(
+        actor_user_id=uuid.UUID(user.id),
+        subscription_id=subscription_id,
+        organization_id=organization_id,
+        auto_renew=payload.auto_renew,
+    )
+    return build_response(
+        success=True,
+        message="Subscription renewal settings updated",
         data=_subscription_response(subscription).model_dump(mode="json"),
         request_id=_request_id(request),
     )
@@ -1975,6 +2101,218 @@ async def get_billing_profile(
         success=True,
         message="Billing profile retrieved",
         data=_billing_profile_response(profile).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# BE-013 Part 5: Super Admin + Customer Billing Dashboards
+#
+# ## RBAC scope
+#
+# Super Admin dashboard: ``billing.read`` pinned to ``scope=ScopeType.GLOBAL``
+# -- the same "only a Super-Admin-class, platform-scoped role" rule
+# Plans/Coupons/TaxRates already establish for their own platform-wide
+# writes in this file, applied here to a platform-wide *read*. A
+# non-super-admin caller (no ``billing.read`` grant at ``GLOBAL`` scope) is
+# rejected with the same real 403 every other ``RequirePermission`` check
+# in this file produces.
+#
+# Customer dashboard (``/me`` / ``/{organization_id}``): ordinary inferred
+# ``billing.read`` -- mirrors ``/billing/profile/me``'s identical twin-route
+# shape exactly (the more specific ``/me`` literal path registered before
+# the ``/{organization_id}`` wildcard it would otherwise be shadowed by).
+#
+# Nothing in ``app.domains.analytics`` is read, imported, or modified here --
+# see ``service.py``'s own Part 5 section docstring for the explicit
+# "this is a separate capability from Analytics' own RevenueMetricsResponse
+# placeholder" clarification.
+# ============================================================================
+
+
+def _revenue_dashboard_response(
+    result: object,
+) -> SuperAdminRevenueDashboardResponse:
+    return SuperAdminRevenueDashboardResponse(
+        total_revenue=result.total_revenue,
+        total_refunded=result.total_refunded,
+        mrr=result.mrr,
+        arr=result.arr,
+        active_paying_subscription_count=result.active_paying_subscription_count,
+        trend=[
+            RevenueTrendPointResponse(
+                month=point.month,
+                gross_amount=point.gross_amount,
+                refunded_amount=point.refunded_amount,
+                net_amount=point.net_amount,
+            )
+            for point in result.trend
+        ],
+        currency_note=result.currency_note,
+    )
+
+
+def _subscription_dashboard_response(
+    result: object,
+) -> SuperAdminSubscriptionDashboardResponse:
+    return SuperAdminSubscriptionDashboardResponse(
+        counts_by_status=result.counts_by_status,
+        counts_by_plan_type=result.counts_by_plan_type,
+        churn=ChurnRateResponse(
+            period_start=result.churn.period_start,
+            period_end=result.churn.period_end,
+            active_at_period_start=result.churn.active_at_period_start,
+            cancelled_this_period=result.churn.cancelled_this_period,
+            churn_rate=result.churn.churn_rate,
+        ),
+    )
+
+
+def _customer_billing_summary_row_response(
+    row: object,
+) -> CustomerBillingSummaryRowResponse:
+    return CustomerBillingSummaryRowResponse(
+        organization_id=str(row.organization_id),
+        organization_name=row.organization_name,
+        plan_id=str(row.plan_id),
+        plan_name=row.plan_name,
+        plan_slug=row.plan_slug,
+        subscription_status=row.subscription_status,
+        lifetime_revenue=row.lifetime_revenue,
+        outstanding_invoice_count=row.outstanding_invoice_count,
+    )
+
+
+def _failed_payments_dashboard_response(
+    result: object, *, page: int, page_size: int
+) -> SuperAdminFailedPaymentsDashboardResponse:
+    return SuperAdminFailedPaymentsDashboardResponse(
+        items=[
+            FailedPaymentRowResponse(
+                payment=_payment_response(row.payment),
+                retry_eligible=row.retry_eligible,
+            )
+            for row in result.items
+        ],
+        page=page,
+        page_size=page_size,
+        total_items=result.total_items,
+        counts_by_provider=result.counts_by_provider,
+    )
+
+
+@router.get(
+    "/billing/dashboard/super-admin",
+    response_model=ApiResponse[SuperAdminBillingDashboardResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.read", scope=ScopeType.GLOBAL))],
+)
+async def get_super_admin_billing_dashboard(
+    request: Request,
+    months: int = Query(default=12, ge=1, le=36),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    failed_payments_organization_id: uuid.UUID | None = Query(default=None),
+    user: AuthUser = Depends(get_current_user),
+    service: SuperAdminBillingDashboardService = Depends(
+        get_super_admin_billing_dashboard_service
+    ),
+):
+    user_id = uuid.UUID(user.id)
+    revenue = await service.get_revenue_dashboard(user_id=user_id, months=months)
+    subscriptions = await service.get_subscription_dashboard(user_id=user_id)
+    customer_rows, customer_meta = await service.get_customer_billing_dashboard(
+        user_id=user_id, page=page, page_size=page_size
+    )
+    failed_payments = await service.get_failed_payments_dashboard(
+        user_id=user_id,
+        page=page,
+        page_size=page_size,
+        organization_id=failed_payments_organization_id,
+    )
+
+    payload = SuperAdminBillingDashboardResponse(
+        revenue=_revenue_dashboard_response(revenue),
+        subscriptions=_subscription_dashboard_response(subscriptions),
+        customers=SuperAdminCustomerBillingDashboardResponse(
+            items=[
+                _customer_billing_summary_row_response(row) for row in customer_rows
+            ],
+            page=customer_meta.page,
+            page_size=customer_meta.page_size,
+            total_items=customer_meta.total_items,
+            total_pages=customer_meta.total_pages,
+            has_next=customer_meta.has_next,
+            has_previous=customer_meta.has_previous,
+        ),
+        failed_payments=_failed_payments_dashboard_response(
+            failed_payments, page=page, page_size=page_size
+        ),
+    )
+    return build_response(
+        success=True,
+        message="Super Admin Billing dashboard retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+def _customer_billing_dashboard_response(
+    result: object,
+) -> CustomerBillingDashboardResponse:
+    return CustomerBillingDashboardResponse(
+        license=_license_response(result.license),
+        plan=_plan_response(result.plan, []),
+        subscription=_subscription_response(result.subscription),
+        usage=_usage_summary_response(result.usage.organization_id, result.usage),
+        recent_invoices=[
+            _invoice_response(invoice, [], []) for invoice in result.recent_invoices
+        ],
+        payment_methods=[_payment_method_response(pm) for pm in result.payment_methods],
+        recent_payments=[_payment_response(p) for p in result.recent_payments],
+    )
+
+
+@router.get(
+    "/billing/dashboard/me",
+    response_model=ApiResponse[CustomerBillingDashboardResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.read"))],
+)
+async def get_my_billing_dashboard(
+    request: Request,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: CustomerBillingDashboardService = Depends(
+        get_customer_billing_dashboard_service
+    ),
+):
+    result = await service.get_dashboard(organization_id)
+    return build_response(
+        success=True,
+        message="Billing dashboard retrieved",
+        data=_customer_billing_dashboard_response(result).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/billing/dashboard/{organization_id}",
+    response_model=ApiResponse[CustomerBillingDashboardResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.read"))],
+)
+async def get_billing_dashboard(
+    request: Request,
+    organization_id: uuid.UUID,
+    service: CustomerBillingDashboardService = Depends(
+        get_customer_billing_dashboard_service
+    ),
+):
+    result = await service.get_dashboard(organization_id)
+    return build_response(
+        success=True,
+        message="Billing dashboard retrieved",
+        data=_customer_billing_dashboard_response(result).model_dump(mode="json"),
         request_id=_request_id(request),
     )
 

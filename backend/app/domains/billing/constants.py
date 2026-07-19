@@ -518,6 +518,84 @@ NUMBER_SEQUENCE_DIGITS = 5
 TASK_RUN_INVOICE_OVERDUE_SWEEP = "app.domains.billing.tasks.run_invoice_overdue_sweep"
 
 
+# ============================================================================
+# BE-013 Part 5: Super Admin + Customer Billing Dashboards
+# ============================================================================
+
+# Which PaymentStatus values represent money this platform actually
+# captured (at least once) -- used by ``repository.BillingDashboardRepository``
+# / ``service`` dashboard aggregates to compute "total revenue"/"lifetime
+# revenue"/the monthly revenue trend as ``SUM(amount) - SUM(refunded_amount)``
+# over exactly this status set. This is a deliberate generalization of the
+# module brief's own "sum of Payment.amount where status=SUCCEEDED, minus
+# refunded_amount" wording: once ANY refund (full or partial) is recorded
+# against a Payment, ``PaymentService.refund_payment`` moves its ``status``
+# to ``PARTIALLY_REFUNDED``/``REFUNDED`` -- it no longer reads ``SUCCEEDED``
+# at all (see that method's own docstring). Reading the brief's formula
+# completely literally (``status = SUCCEEDED`` only) would therefore make a
+# partially-refunded payment's entire original amount vanish from "total
+# revenue" the instant it is even partly refunded, rather than correctly
+# netting down by only the refunded portion -- an undercounting bug, not a
+# faithful implementation of the brief's own intent. Including
+# ``PARTIALLY_REFUNDED``/``REFUNDED`` in the summed set (still subtracting
+# ``refunded_amount`` from each) preserves the brief's intent ("real money
+# captured, minus what was given back") while fixing that gap. ``PENDING``/
+# ``FAILED`` never captured any money and are correctly excluded.
+DASHBOARD_CAPTURED_PAYMENT_STATUSES: frozenset[PaymentStatus] = frozenset(
+    {
+        PaymentStatus.SUCCEEDED,
+        PaymentStatus.PARTIALLY_REFUNDED,
+        PaymentStatus.REFUNDED,
+    }
+)
+
+# Default lookback window (in whole calendar months, inclusive of the
+# current in-progress month) for the Super Admin Revenue Dashboard's
+# month-by-month trend -- a reasonable default "recent history" view; the
+# router accepts a caller-supplied ``months`` override within
+# ``MIN_DASHBOARD_REVENUE_TREND_MONTHS``..``MAX_DASHBOARD_REVENUE_TREND_MONTHS``.
+DEFAULT_DASHBOARD_REVENUE_TREND_MONTHS = 12
+MIN_DASHBOARD_REVENUE_TREND_MONTHS = 1
+MAX_DASHBOARD_REVENUE_TREND_MONTHS = 36
+
+# How many of a customer's own most-recent Invoice/Payment rows the
+# Customer Billing Dashboard ("me") surfaces -- a dashboard summary, not a
+# full paginated history (that already exists at GET /invoices, GET
+# /payments for a caller who wants the complete list).
+CUSTOMER_DASHBOARD_RECENT_INVOICES_LIMIT = 10
+CUSTOMER_DASHBOARD_RECENT_PAYMENTS_LIMIT = 10
+
+# Dashboard-view audit throttling -- see ``service.py``'s own
+# ``_should_write_dashboard_audit`` docstring for the full volume-tiering
+# write-up (mirrors ``app.domains.analytics.dashboard_audit``'s identical
+# reasoning and Redis SET-NX-EX idiom, re-implemented here rather than
+# imported so this domain's own dashboard auditing has no runtime import-time
+# coupling to another domain's module -- the same "each domain owns its own
+# copy of this small idiom" precedent ``app.domains.otp``'s/
+# ``app.domains.voucher``'s own independent rate limiters already establish
+# for an structurally-identical Redis check-and-mark pattern).
+BILLING_DASHBOARD_AUDIT_THROTTLE_MINUTES = 15
+BILLING_DASHBOARD_AUDIT_THROTTLE_KEY_TEMPLATE = "billing:dashboard_audit_throttle:{key}"
+
+# Plain, domain-local audit-action label strings -- not members of the
+# shared ``app.domains.rbac.enums.AuditAction`` ``StrEnum`` (that enum lives
+# outside this module's own directory-rule boundary, and
+# ``AuditLogWriter.create_audit_log_entry``'s ``action`` field is a plain
+# string column with no FK/enum constraint tying it to that shared type --
+# see ``app.domains.analytics.constants``'s own identical
+# ``AUDIT_ACTION_DASHBOARD_*`` precedent for a dashboard-view action that
+# is real, audited, and yet deliberately not added to the shared enum).
+AUDIT_ACTION_DASHBOARD_SUPER_ADMIN_VIEWED = "billing_dashboard_super_admin_viewed"
+AUDIT_ACTION_DASHBOARD_CUSTOMER_VIEWED = "billing_dashboard_customer_viewed"
+# Likewise for the new customer-initiated renewal-settings update -- no
+# existing AuditAction member fits "toggled auto_renew" without being
+# misleading (see docs/billing/FLOW.md's Part 5 section for the full
+# write-up of this choice).
+AUDIT_ACTION_SUBSCRIPTION_RENEWAL_SETTINGS_UPDATED = (
+    "subscription_renewal_settings_updated"
+)
+
+
 __all__ = [
     "PlanType",
     "BillingCycle",
@@ -554,4 +632,15 @@ __all__ = [
     "DEBIT_NOTE_NUMBER_PREFIX",
     "NUMBER_SEQUENCE_DIGITS",
     "TASK_RUN_INVOICE_OVERDUE_SWEEP",
+    "DASHBOARD_CAPTURED_PAYMENT_STATUSES",
+    "DEFAULT_DASHBOARD_REVENUE_TREND_MONTHS",
+    "MIN_DASHBOARD_REVENUE_TREND_MONTHS",
+    "MAX_DASHBOARD_REVENUE_TREND_MONTHS",
+    "CUSTOMER_DASHBOARD_RECENT_INVOICES_LIMIT",
+    "CUSTOMER_DASHBOARD_RECENT_PAYMENTS_LIMIT",
+    "BILLING_DASHBOARD_AUDIT_THROTTLE_MINUTES",
+    "BILLING_DASHBOARD_AUDIT_THROTTLE_KEY_TEMPLATE",
+    "AUDIT_ACTION_DASHBOARD_SUPER_ADMIN_VIEWED",
+    "AUDIT_ACTION_DASHBOARD_CUSTOMER_VIEWED",
+    "AUDIT_ACTION_SUBSCRIPTION_RENEWAL_SETTINGS_UPDATED",
 ]

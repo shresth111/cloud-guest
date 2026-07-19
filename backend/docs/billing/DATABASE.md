@@ -414,3 +414,22 @@ values (`INVOICE_*`/`CREDIT_NOTE_ISSUED`/`DEBIT_NOTE_ISSUED`/`TAX_RATE_*`/
 .INVOICES` was already seeded since BE-004 (create/read/update/delete/
 export/approve/manage); no new permission group/action/scope row is
 seeded by this part -- see FLOW.md §44.
+
+## Part 5: no new tables, no new columns, no migration
+
+BE-013 Part 5 (Super Admin + Customer Billing Dashboards) is pure
+computation/aggregation over the tables already described above --
+`Payment`/`Subscription`/`Plan`/`Invoice`, plus a read-only join against
+`app.domains.organization.models.Organization` for a display name on the
+Customer Billing Dashboard's per-organization rows (the identical
+read-another-domain's-table-directly precedent `usage_metrics`' own
+`UsageRepository.count_locations`/`count_routers` already establish for
+`Location`/`Router`). Nothing new is persisted by this part, so
+`alembic/versions/` gains no new revision file, and no column is added to
+any existing billing table -- including `Subscription.auto_renew`, which
+the new `PATCH /subscriptions/{id}/renewal-settings` endpoint updates in
+place (that column has existed since migration
+`0023_create_billing_subscription_coupon_tables`, Part 2). No new
+`AuditAction` enum member is added either (see FLOW.md §54's own write-up
+of why this part's new audit-action labels are plain, domain-local string
+constants instead).

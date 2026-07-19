@@ -53,13 +53,26 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
+from redis.asyncio import Redis
+
 from app.database.exceptions import DuplicateRecordError
+from app.database.utils.pagination import PaginationMeta
 from app.domains.otp.constants import OtpChannel
 from app.domains.rbac.enums import AuditAction
 
 from .constants import (
+    AUDIT_ACTION_DASHBOARD_CUSTOMER_VIEWED,
+    AUDIT_ACTION_DASHBOARD_SUPER_ADMIN_VIEWED,
+    AUDIT_ACTION_SUBSCRIPTION_RENEWAL_SETTINGS_UPDATED,
+    BILLING_DASHBOARD_AUDIT_THROTTLE_KEY_TEMPLATE,
+    BILLING_DASHBOARD_AUDIT_THROTTLE_MINUTES,
     BYTES_PER_MB,
+    CUSTOMER_DASHBOARD_RECENT_INVOICES_LIMIT,
+    CUSTOMER_DASHBOARD_RECENT_PAYMENTS_LIMIT,
+    MAX_DASHBOARD_REVENUE_TREND_MONTHS,
+    MIN_DASHBOARD_REVENUE_TREND_MONTHS,
     USAGE_METRIC_TO_LIMIT_FEATURE,
+    BillingCycle,
     DiscountType,
     InvoiceStatus,
     LicenseChangeType,
@@ -162,6 +175,7 @@ from .number_generator import (
     generate_invoice_number,
 )
 from .repository import (
+    BillingDashboardRepositoryProtocol,
     BillingProfileRepositoryProtocol,
     CouponRepositoryProtocol,
     CreditDebitNoteRepositoryProtocol,
@@ -179,8 +193,11 @@ from .validators import (
     compute_discount_amount,
     compute_renewal_charge_amount,
     compute_tax_breakdown,
+    current_month_period,
+    is_payment_retry_eligible,
     normalize_coupon_code,
     normalize_slug,
+    subtract_months,
     validate_discount_value,
     validate_feature_value,
 )
@@ -892,11 +909,6 @@ class UsageValidationResult:
         return any(check.exceeded for check in self.limit_checks)
 
 
-def _current_month_period(now: datetime) -> tuple[datetime, datetime]:
-    period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return period_start, now
-
-
 class UsageService:
     """Real, composed usage tracking -- every metric is computed from
     existing domains' own real data, never fabricated.
@@ -960,11 +972,11 @@ class UsageService:
         self, organization_id: uuid.UUID
     ) -> list[UsageMetric]:
         """Computes and persists (upserting the current calendar-month
-        bucket -- see ``_current_month_period``) every ``UsageMetricKey``
+        bucket -- see ``validators.current_month_period``) every ``UsageMetricKey``
         for this organization from real, composed data. See module
         docstring for the exact source of each metric."""
         now = datetime.now(UTC)
-        period_start, period_end = _current_month_period(now)
+        period_start, period_end = current_month_period(now)
 
         organization = await self.organization_lookup.get_organization(organization_id)
         children: list[object] = []
@@ -1046,7 +1058,7 @@ class UsageService:
         """Reads the current month's already-recorded usage, computing it
         fresh (via ``record_current_usage``) only if nothing has been
         recorded yet this period."""
-        period_start, _ = _current_month_period(datetime.now(UTC))
+        period_start, _ = current_month_period(datetime.now(UTC))
         existing = await self.repository.list_current_period_metrics(
             organization_id, period_start
         )
@@ -1754,6 +1766,70 @@ class SubscriptionService:
         )
         return updated
 
+    async def update_renewal_settings(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        subscription_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        auto_renew: bool,
+    ) -> Subscription:
+        """BE-013 Part 5's "Renewal Settings" customer feature: updates
+        ``Subscription.auto_renew`` post-creation -- confirmed genuinely
+        missing from Parts 1-4 (no ``PATCH``/``PUT`` on ``/subscriptions/
+        {id}`` existed beyond the state-transition actions
+        cancel/reactivate/pause/resume).
+
+        ## A deliberate exception to this file's own "no tenant check"
+        ## precedent for subscription mutators
+
+        Every other ``Subscription`` mutator above (``cancel_subscription``/
+        ``reactivate_subscription``/``pause_subscription``/
+        ``resume_subscription``) operates directly on ``subscription_id``
+        with no ``organization_id`` cross-check -- the same "an admin action
+        operating on the entity by id" precedent
+        ``PaymentService.refund_payment``/``retry_failed_payment`` and
+        ``InvoiceService.void_invoice``/``issue_credit_note`` already
+        establish (see ``router.py``'s own Part 4 module docstring for the
+        explicit write-up of that precedent). This method deliberately
+        breaks from it: it is the one subscription mutator this part frames
+        as **customer self-service** (the spec's own "Renewal Settings"
+        feature, gated behind ``RequireOrganization`` at the router), so a
+        real tenant check is required here specifically -- otherwise a
+        caller holding ``subscriptions.update`` at their own organization's
+        scope could toggle a *different* organization's auto-renewal
+        setting merely by guessing/enumerating its ``subscription_id``.
+        Mirrors ``PaymentService.get_payment``'s own "not found, never a
+        leak" convention on mismatch.
+        """
+        subscription = await self.get_subscription(subscription_id)
+        if subscription.organization_id != organization_id:
+            raise SubscriptionNotFoundError(subscription_id)
+        updated = await self.repository.update_subscription(
+            subscription, {"auto_renew": auto_renew, "updated_by": actor_user_id}
+        )
+        logger.info(
+            "billing_subscription_renewal_settings_updated",
+            extra={
+                "subscription_id": str(updated.id),
+                "organization_id": str(updated.organization_id),
+                "auto_renew": updated.auto_renew,
+            },
+        )
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=actor_user_id,
+                action=AUDIT_ACTION_SUBSCRIPTION_RENEWAL_SETTINGS_UPDATED,
+                entity_type="subscription",
+                entity_id=updated.id,
+                description=f"Subscription {updated.id} renewal settings updated "
+                f"(auto_renew={updated.auto_renew})",
+                event_metadata={},
+                organization_id=updated.organization_id,
+                location_id=None,
+            )
+        return updated
+
     async def _audit(
         self,
         actor_user_id: uuid.UUID | None,
@@ -2006,7 +2082,7 @@ class PaymentService:
         self, *, actor_user_id: uuid.UUID | None, payment_id: uuid.UUID
     ) -> Payment:
         payment = await self.get_payment(payment_id)
-        if payment.status != PaymentStatus.FAILED.value:
+        if not is_payment_retry_eligible(payment.status):
             raise PaymentNotRetryableError(payment_id, payment.status)
 
         gateway = self._gateway_for(payment.provider)
@@ -2866,6 +2942,596 @@ class InvoiceService:
         logger.info("billing_invoice_audit_event", extra={"action": action.value})
 
 
+# ============================================================================
+# BE-013 Part 5: Super Admin + Customer Billing Dashboards
+#
+# ## This domain's own Revenue Dashboard vs. Analytics' RevenueMetricsResponse
+#
+# ``app.domains.analytics.dashboard_schemas.RevenueMetricsResponse`` is a
+# separate, PRE-EXISTING, still-honest placeholder (``available=False``,
+# every figure ``None``) that BE-012 Part 5 built at a time when no billing
+# domain existed anywhere in this codebase to compute real revenue/MRR/ARR
+# from. That module, and every one of its own files, is explicitly untouched
+# by this part (this module's own directory rule forbids editing anything
+# under ``app.domains.analytics``). The ``SuperAdminBillingDashboardService``
+# below is a DISTINCT, new capability that lives entirely inside this
+# domain, composing exclusively this domain's own ``Payment``/
+# ``Subscription``/``Plan``/``Invoice`` tables -- it is not a fix to
+# Analytics' placeholder (a future part/module, working inside
+# ``app.domains.analytics`` itself, could wire that placeholder up to call
+# into this domain's own public service methods -- that is explicitly out
+# of THIS part's scope, and is not attempted here).
+#
+# ## Dashboard-view audit-throttling decision
+#
+# These are read-heavy, pollable dashboard endpoints -- the identical shape
+# ``app.domains.analytics.dashboard_audit``'s own module docstring already
+# reasons about at length (a routine, repeatable, no-state-change read that
+# a real admin UI is expected to refresh/poll, not click once). This module
+# applies the same middle-ground judgment, re-implemented locally (see
+# ``constants.BILLING_DASHBOARD_AUDIT_THROTTLE_MINUTES``'s own docstring for
+# why a fresh, domain-local copy was chosen over importing analytics' class
+# directly): every dashboard view is logged via the structured logger
+# unconditionally; at most one row is written into RBAC's shared
+# ``audit_log_entries`` table per ``(user_id, dashboard_kind, scope_key)``
+# per ``BILLING_DASHBOARD_AUDIT_THROTTLE_MINUTES`` window, via a real,
+# Redis-backed ``SET ... NX EX`` dedup (``_should_write_dashboard_audit``
+# below) -- not a fabricated "always audit" nor a "never audit" default.
+# ============================================================================
+
+
+class DashboardAuditLogWriter(Protocol):
+    """Identical shape to ``AuditLogWriter`` above -- kept as its own named
+    ``Protocol`` purely so the two dashboard services' own constructors read
+    self-documentingly without implying they share ``PlanService``'s/
+    ``LicenseService``'s etc. broader audit conventions."""
+
+    async def create_audit_log_entry(self, **fields: object) -> object: ...
+
+
+async def _should_write_dashboard_audit(
+    redis: Redis,
+    *,
+    user_id: uuid.UUID,
+    dashboard_kind: str,
+    scope_key: str,
+    window_minutes: int = BILLING_DASHBOARD_AUDIT_THROTTLE_MINUTES,
+) -> bool:
+    """Returns ``True`` (and marks the window consumed) the first time this
+    exact ``(user_id, dashboard_kind, scope_key)`` combination is seen
+    within the current window; ``False`` on every subsequent call inside
+    that same window. See module section docstring above for the full
+    volume-tiering write-up."""
+    key = BILLING_DASHBOARD_AUDIT_THROTTLE_KEY_TEMPLATE.format(
+        key=f"{user_id}:{dashboard_kind}:{scope_key}"
+    )
+    was_set = await redis.set(key, "1", nx=True, ex=window_minutes * 60)
+    return bool(was_set)
+
+
+@dataclass(frozen=True, slots=True)
+class RevenueTrendPoint:
+    """One calendar month's real, computed net revenue -- ``month`` is an
+    ``"YYYY-MM"`` label."""
+
+    month: str
+    gross_amount: Decimal
+    refunded_amount: Decimal
+    net_amount: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class RevenueDashboardResult:
+    """The Super Admin Revenue Dashboard's real, computed figures -- see
+    ``SuperAdminBillingDashboardService.get_revenue_dashboard``'s own
+    docstring for the exact MRR/ARR formula."""
+
+    total_revenue: Decimal
+    total_refunded: Decimal
+    mrr: Decimal
+    arr: Decimal
+    active_paying_subscription_count: int
+    trend: list[RevenueTrendPoint]
+    currency_note: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChurnRateResult:
+    """The real, computed churn-rate figures for one period -- see
+    ``get_subscription_dashboard``'s own docstring for the exact formula
+    and its honest "cannot be computed" (``None``) case."""
+
+    period_start: datetime
+    period_end: datetime
+    active_at_period_start: int
+    cancelled_this_period: int
+    churn_rate: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionDashboardResult:
+    counts_by_status: dict[str, int]
+    counts_by_plan_type: dict[str, int]
+    churn: ChurnRateResult
+
+
+@dataclass(frozen=True, slots=True)
+class CustomerBillingSummaryRow:
+    """One organization's summary row on the Customer Billing Dashboard."""
+
+    organization_id: uuid.UUID
+    organization_name: str
+    plan_id: uuid.UUID
+    plan_name: str
+    plan_slug: str
+    subscription_status: str
+    lifetime_revenue: Decimal
+    outstanding_invoice_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class FailedPaymentRow:
+    """One failed ``Payment``, with its real retry-eligibility flag (see
+    ``validators.is_payment_retry_eligible``'s own docstring for why this
+    is the *same* rule ``PaymentService.retry_failed_payment`` itself
+    enforces, not a second, independently-maintained copy of it)."""
+
+    payment: Payment
+    retry_eligible: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FailedPaymentsDashboardResult:
+    items: list[FailedPaymentRow]
+    total_items: int
+    counts_by_provider: dict[str, int]
+
+
+class SuperAdminBillingDashboardService:
+    """The Super Admin Revenue / Subscription / Customer Billing / Failed
+    Payments dashboards -- ``GLOBAL``-scope-only (enforced by the router's
+    own ``RequirePermission(..., scope=ScopeType.GLOBAL)``, mirroring every
+    other platform-wide dashboard already built in this codebase).
+
+    Every figure here is a real, composed aggregate over this domain's own
+    ``Payment``/``Subscription``/``Plan``/``Invoice`` tables -- reused via
+    ``BillingDashboardRepositoryProtocol`` (new aggregate queries this part
+    adds) and ``PaymentService.list_failed_payments`` (Part 3's own,
+    already-built method, reused verbatim here rather than re-queried a
+    second way).
+    """
+
+    def __init__(
+        self,
+        repository: BillingDashboardRepositoryProtocol,
+        payment_service: PaymentService,
+        invoice_service: InvoiceService,
+        *,
+        redis: Redis | None = None,
+        audit_writer: DashboardAuditLogWriter | None = None,
+    ) -> None:
+        self.repository = repository
+        self.payment_service = payment_service
+        self.invoice_service = invoice_service
+        self.redis = redis
+        self.audit_writer = audit_writer
+
+    async def get_revenue_dashboard(
+        self, *, user_id: uuid.UUID, months: int = 12
+    ) -> RevenueDashboardResult:
+        """Real total revenue, real MRR/ARR, and a real month-by-month
+        trend.
+
+        ## Total revenue
+
+        ``SUM(Payment.amount) - SUM(Payment.refunded_amount)`` over every
+        ``Payment`` in ``constants.DASHBOARD_CAPTURED_PAYMENT_STATUSES``
+        (see that constant's own docstring for exactly why this status set,
+        not a literal ``status = SUCCEEDED`` reading of the module brief).
+
+        ## MRR / ARR formula
+
+        ``MRR = sum, over every currently-ACTIVE Subscription, of
+        validators.compute_renewal_charge_amount(plan)`` normalized to a
+        monthly figure by that subscription's own ``billing_cycle``
+        (``MONTHLY`` -> unchanged; ``YEARLY`` -> divided by 12; ``NONE`` --
+        a cycle-less trial/bespoke arrangement, see ``BillingCycle.NONE``'s
+        own docstring -- excluded, since it has no fixed recurring cadence
+        to annualize). ``ARR = MRR * 12``. Only ``ACTIVE`` subscriptions
+        count -- deliberately excludes ``TRIALING`` (never yet actually
+        billed) and ``PAST_DUE`` (its most recent renewal attempt already
+        failed to collect this period's charge -- counting it would
+        overstate *realized* recurring revenue). This mirrors the standard
+        SaaS "MRR = revenue from currently active, paying subscriptions"
+        definition, applied conservatively.
+
+        ## Multi-currency honesty note
+
+        This platform supports more than one ``Plan.currency``/
+        ``Payment.currency`` (e.g. USD/INR, for GST support) and has no
+        FX-conversion table or service anywhere in this codebase. Every sum
+        here is a raw, un-converted sum across whatever currencies are
+        present -- meaningful at face value only if the platform's real
+        payment activity is effectively single-currency in practice. This
+        is surfaced honestly via ``currency_note`` rather than silently
+        blended, the same "honest caveat over a fabricated precise number"
+        discipline this domain already applies elsewhere (e.g.
+        ``TaxRateRepository.get_active_for_country``'s "no active rate ==
+        honest zero tax" outcome).
+        """
+        gross, refunded = await self.repository.sum_captured_payments()
+
+        plan_cycle_pairs = await self.repository.list_active_subscription_plans()
+        mrr = Decimal("0.00")
+        for plan, billing_cycle in plan_cycle_pairs:
+            charge = compute_renewal_charge_amount(plan)
+            if billing_cycle == BillingCycle.MONTHLY.value:
+                mrr += charge
+            elif billing_cycle == BillingCycle.YEARLY.value:
+                mrr += (charge / Decimal(12)).quantize(Decimal("0.01"))
+            # BillingCycle.NONE -- no fixed cadence, excluded (see docstring).
+        arr = (mrr * Decimal(12)).quantize(Decimal("0.01"))
+
+        now = datetime.now(UTC)
+        clamped_months = max(
+            MIN_DASHBOARD_REVENUE_TREND_MONTHS,
+            min(months, MAX_DASHBOARD_REVENUE_TREND_MONTHS),
+        )
+        window_start = subtract_months(now, clamped_months - 1).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        monthly_rows = await self.repository.revenue_by_month(
+            start=window_start, end=now
+        )
+        trend = [
+            RevenueTrendPoint(
+                month=month_start.strftime("%Y-%m"),
+                gross_amount=gross_month,
+                refunded_amount=refunded_month,
+                net_amount=(gross_month - refunded_month).quantize(Decimal("0.01")),
+            )
+            for month_start, gross_month, refunded_month in monthly_rows
+        ]
+
+        await self._maybe_audit(
+            user_id,
+            dashboard_kind="super_admin_revenue",
+            scope_key="global",
+            description="Super Admin Revenue Dashboard viewed",
+        )
+
+        return RevenueDashboardResult(
+            total_revenue=(gross - refunded).quantize(Decimal("0.01")),
+            total_refunded=refunded.quantize(Decimal("0.01")),
+            mrr=mrr,
+            arr=arr,
+            active_paying_subscription_count=len(plan_cycle_pairs),
+            trend=trend,
+            currency_note=(
+                "Figures are a raw sum across every Plan/Payment currency in "
+                "use on this platform -- no FX-conversion table or service "
+                "exists anywhere in this codebase. Meaningful at face value "
+                "only if real payment activity is effectively single-currency."
+            ),
+        )
+
+    async def get_subscription_dashboard(
+        self, *, user_id: uuid.UUID
+    ) -> SubscriptionDashboardResult:
+        """Counts by ``Subscription.status`` / ``Plan.plan_type``, and a
+        real churn-rate computation.
+
+        ## Churn-rate formula (define-and-document, per this part's own
+        ## instruction)
+
+        For the **current calendar month** (``validators.current_month_
+        period`` -- the same "start of this month" definition
+        ``UsageService`` already uses elsewhere in this domain):
+
+        ``churn_rate = cancelled_this_period / active_at_period_start``
+
+        * ``active_at_period_start`` -- every ``Subscription`` that had
+          already ``started_at <= period_start`` and had not yet been
+          cancelled as of that moment (``cancelled_at IS NULL`` or later
+          than ``period_start``) -- see ``BillingDashboardRepository
+          .count_subscriptions_active_before``'s own docstring for why this
+          is an honest, real heuristic (this domain keeps no historical
+          per-day subscription-status-snapshot table), the same
+          "judgment-based but real, not fabricated" rigor
+          ``app.domains.analytics.health_score`` already establishes for a
+          similarly judgment-based metric elsewhere in this codebase.
+        * ``cancelled_this_period`` -- every ``Subscription`` whose
+          ``cancelled_at`` falls within ``[period_start, period_end]``.
+        * ``churn_rate`` is ``None`` (never a fabricated ``0.0``) when
+          ``active_at_period_start == 0`` -- there is no honest rate to
+          report for a period with no active base to measure churn
+          against.
+        """
+        status_rows = await self.repository.count_subscriptions_by_status()
+        plan_type_rows = await self.repository.count_subscriptions_by_plan_type()
+
+        now = datetime.now(UTC)
+        period_start, period_end = current_month_period(now)
+        active_at_start = await self.repository.count_subscriptions_active_before(
+            period_start
+        )
+        cancelled_this_period = (
+            await self.repository.count_subscriptions_cancelled_between(
+                period_start, period_end
+            )
+        )
+        churn_rate = (
+            cancelled_this_period / active_at_start if active_at_start > 0 else None
+        )
+
+        await self._maybe_audit(
+            user_id,
+            dashboard_kind="super_admin_subscriptions",
+            scope_key="global",
+            description="Super Admin Subscription Dashboard viewed",
+        )
+
+        return SubscriptionDashboardResult(
+            counts_by_status=dict(status_rows),
+            counts_by_plan_type=dict(plan_type_rows),
+            churn=ChurnRateResult(
+                period_start=period_start,
+                period_end=period_end,
+                active_at_period_start=active_at_start,
+                cancelled_this_period=cancelled_this_period,
+                churn_rate=churn_rate,
+            ),
+        )
+
+    async def get_customer_billing_dashboard(
+        self, *, user_id: uuid.UUID, page: int = 1, page_size: int = 25
+    ) -> tuple[list[CustomerBillingSummaryRow], PaginationMeta]:
+        """Paginated per-organization summary rows -- see
+        ``BillingDashboardRepository
+        .paginate_subscriptions_with_org_and_plan``'s own docstring for the
+        real, joined driving query. Each row's ``lifetime_revenue``/
+        ``outstanding_invoice_count`` are computed by reusing this same
+        module's existing aggregate/list methods (never a hand-rolled
+        second query per row)."""
+        rows, meta = await self.repository.paginate_subscriptions_with_org_and_plan(
+            page=page, page_size=page_size
+        )
+        summary_rows: list[CustomerBillingSummaryRow] = []
+        for subscription, organization, plan in rows:
+            gross, refunded = await self.repository.sum_captured_payments(
+                organization_id=organization.id
+            )
+            outstanding = 0
+            for invoice_status in (InvoiceStatus.ISSUED, InvoiceStatus.OVERDUE):
+                _, invoice_meta = await self.invoice_service.list_invoices(
+                    page=1,
+                    page_size=1,
+                    organization_id=organization.id,
+                    status=invoice_status.value,
+                )
+                outstanding += invoice_meta.total_items
+            summary_rows.append(
+                CustomerBillingSummaryRow(
+                    organization_id=organization.id,
+                    organization_name=organization.name,
+                    plan_id=plan.id,
+                    plan_name=plan.name,
+                    plan_slug=plan.slug,
+                    subscription_status=subscription.status,
+                    lifetime_revenue=(gross - refunded).quantize(Decimal("0.01")),
+                    outstanding_invoice_count=outstanding,
+                )
+            )
+
+        await self._maybe_audit(
+            user_id,
+            dashboard_kind="super_admin_customers",
+            scope_key="global",
+            description="Super Admin Customer Billing Dashboard viewed",
+        )
+        return summary_rows, meta
+
+    async def get_failed_payments_dashboard(
+        self,
+        *,
+        user_id: uuid.UUID,
+        page: int = 1,
+        page_size: int = 25,
+        organization_id: uuid.UUID | None = None,
+    ) -> FailedPaymentsDashboardResult:
+        """Reuses ``PaymentService.list_failed_payments`` (Part 3's own,
+        already-built query -- never re-queried a second way here), sliced
+        in Python for this dashboard's own page/page_size (that existing
+        method was not itself built with repository-level pagination, and
+        widening its signature is out of this part's own narrow scope).
+        Each row's ``retry_eligible`` flag reuses
+        ``validators.is_payment_retry_eligible`` -- the exact same rule
+        ``PaymentService.retry_failed_payment`` itself enforces."""
+        all_failed = await self.payment_service.list_failed_payments(
+            organization_id=organization_id
+        )
+        counts_by_provider: dict[str, int] = {}
+        for payment in all_failed:
+            counts_by_provider[payment.provider] = (
+                counts_by_provider.get(payment.provider, 0) + 1
+            )
+
+        start = (max(page, 1) - 1) * max(page_size, 1)
+        page_items = all_failed[start : start + page_size]
+        rows = [
+            FailedPaymentRow(
+                payment=payment,
+                retry_eligible=is_payment_retry_eligible(payment.status),
+            )
+            for payment in page_items
+        ]
+
+        await self._maybe_audit(
+            user_id,
+            dashboard_kind="super_admin_failed_payments",
+            scope_key=str(organization_id) if organization_id else "global",
+            description="Super Admin Failed Payments Dashboard viewed",
+        )
+        return FailedPaymentsDashboardResult(
+            items=rows,
+            total_items=len(all_failed),
+            counts_by_provider=counts_by_provider,
+        )
+
+    async def _maybe_audit(
+        self,
+        user_id: uuid.UUID,
+        *,
+        dashboard_kind: str,
+        scope_key: str,
+        description: str,
+    ) -> None:
+        logger.info(
+            "billing_dashboard_viewed",
+            extra={"dashboard_kind": dashboard_kind, "scope_key": scope_key},
+        )
+        if self.redis is None:
+            return
+        should_write = await _should_write_dashboard_audit(
+            self.redis,
+            user_id=user_id,
+            dashboard_kind=dashboard_kind,
+            scope_key=scope_key,
+        )
+        if not should_write or self.audit_writer is None:
+            return
+        await self.audit_writer.create_audit_log_entry(
+            actor_user_id=user_id,
+            action=AUDIT_ACTION_DASHBOARD_SUPER_ADMIN_VIEWED,
+            entity_type="billing_dashboard",
+            entity_id=user_id,
+            description=description,
+            event_metadata={"dashboard_kind": dashboard_kind},
+            organization_id=None,
+            location_id=None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CustomerBillingDashboardResult:
+    """The unified customer billing summary -- see
+    ``CustomerBillingDashboardService.get_dashboard``'s own docstring for
+    exactly which existing service method backs each field (nothing here
+    is recomputed a second way)."""
+
+    license: License
+    plan: Plan
+    subscription: Subscription
+    usage: UsageValidationResult
+    recent_invoices: list[Invoice]
+    payment_methods: list[PaymentMethod]
+    recent_payments: list[Payment]
+
+
+class CustomerBillingDashboardService:
+    """The tenant-scoped, customer-facing "unified billing summary" -- pure
+    composition over six already-built services from Parts 1-4, never a
+    second, independent recomputation of any figure they already provide."""
+
+    def __init__(
+        self,
+        *,
+        license_service: LicenseService,
+        plan_service: PlanService,
+        subscription_service: SubscriptionService,
+        usage_service: UsageService,
+        invoice_service: InvoiceService,
+        payment_service: PaymentService,
+        payment_method_service: PaymentMethodService,
+        audit_writer: DashboardAuditLogWriter | None = None,
+    ) -> None:
+        self.license_service = license_service
+        self.plan_service = plan_service
+        self.subscription_service = subscription_service
+        self.usage_service = usage_service
+        self.invoice_service = invoice_service
+        self.payment_service = payment_service
+        self.payment_method_service = payment_method_service
+        self.audit_writer = audit_writer
+
+    async def get_dashboard(
+        self, organization_id: uuid.UUID
+    ) -> CustomerBillingDashboardResult:
+        """Composes -- never recomputes:
+
+        * current ``License``/``Plan`` status -- ``LicenseService
+          .get_license_for_organization`` + ``PlanService.get_plan``.
+        * active ``Subscription`` details (period, ``auto_renew``, next
+          renewal date) -- ``SubscriptionService
+          .get_subscription_for_organization``.
+        * a real usage-vs-limit snapshot -- ``UsageService
+          .validate_usage_against_license`` (Part 1's own existing method,
+          called here verbatim).
+        * recent invoices/payments -- ``InvoiceService.list_invoices``/
+          ``PaymentService.list_payments``, each capped to this module's
+          own dashboard-summary limit (``constants
+          .CUSTOMER_DASHBOARD_RECENT_INVOICES_LIMIT``/
+          ``_RECENT_PAYMENTS_LIMIT`` -- a summary, not the full paginated
+          history already available at ``GET /invoices``/``GET
+          /payments``).
+        * registered payment methods -- ``PaymentMethodService
+          .list_payment_methods``.
+        """
+        license_ = await self.license_service.get_license_for_organization(
+            organization_id
+        )
+        plan = await self.plan_service.get_plan(license_.plan_id)
+        subscription = (
+            await self.subscription_service.get_subscription_for_organization(
+                organization_id
+            )
+        )
+        usage = await self.usage_service.validate_usage_against_license(organization_id)
+        invoices, _ = await self.invoice_service.list_invoices(
+            organization_id=organization_id,
+            page=1,
+            page_size=CUSTOMER_DASHBOARD_RECENT_INVOICES_LIMIT,
+        )
+        payment_methods = await self.payment_method_service.list_payment_methods(
+            organization_id
+        )
+        payments, _ = await self.payment_service.list_payments(
+            organization_id=organization_id,
+            page=1,
+            page_size=CUSTOMER_DASHBOARD_RECENT_PAYMENTS_LIMIT,
+        )
+
+        logger.info(
+            "billing_dashboard_viewed",
+            extra={
+                "dashboard_kind": "customer",
+                "organization_id": str(organization_id),
+            },
+        )
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=None,
+                action=AUDIT_ACTION_DASHBOARD_CUSTOMER_VIEWED,
+                entity_type="billing_dashboard",
+                entity_id=organization_id,
+                description=f"Customer billing dashboard viewed for organization "
+                f"{organization_id}",
+                event_metadata={},
+                organization_id=organization_id,
+                location_id=None,
+            )
+
+        return CustomerBillingDashboardResult(
+            license=license_,
+            plan=plan,
+            subscription=subscription,
+            usage=usage,
+            recent_invoices=invoices,
+            payment_methods=payment_methods,
+            recent_payments=payments,
+        )
+
+
 def _event_extra(event: object) -> dict[str, object]:
     """Flattens a frozen, ``slots=True`` ``events.py`` dataclass into
     ``logger.info(extra=)``-friendly, JSON-serializable keys -- identical
@@ -2900,4 +3566,15 @@ __all__ = [
     "TaxRateService",
     "BillingProfileService",
     "InvoiceService",
+    "DashboardAuditLogWriter",
+    "RevenueTrendPoint",
+    "RevenueDashboardResult",
+    "ChurnRateResult",
+    "SubscriptionDashboardResult",
+    "CustomerBillingSummaryRow",
+    "FailedPaymentRow",
+    "FailedPaymentsDashboardResult",
+    "SuperAdminBillingDashboardService",
+    "CustomerBillingDashboardResult",
+    "CustomerBillingDashboardService",
 ]
