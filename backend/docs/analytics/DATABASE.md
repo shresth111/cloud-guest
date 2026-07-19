@@ -224,3 +224,64 @@ Growth, Network Load, Capacity) reuses `AnalyticsRepository.list_snapshots`
 -- a method that already existed since Part 1 -- with no new query needed;
 `trends.extract_metric_series`/`forecast.forecast_linear_series` do all the
 new work in pure Python over an already-real, already-fetched snapshot list.
+
+---
+
+# BE-012 Part 5 schema additions
+
+Migration: `alembic/versions/0021_create_report_tables.py` (revises
+`0020_add_accept_language_to_guest_sessions`). Two new tables, both
+extending `BaseModel` the same way `analytics_snapshots` does -- no changes
+to any existing table's columns. No RBAC FK follow-up migration needed --
+`reports.*` permission keys were already seeded since Part 1 (see
+`0018_create_analytics_tables`'s own note on this).
+
+## `report_templates`
+
+A reusable, persisted definition of what a report contains.
+
+| Column | Type | Notes |
+|---|---|---|
+| `name` | String(200), not nullable | |
+| `description` | String(2000), nullable | |
+| `organization_id` | UUID, FK `organizations.id` (`SET NULL`), nullable | `NULL` = platform-wide system template |
+| `report_type` | String(30), not nullable | `constants.ReportType` -- `dashboard`/`organization`/`location`/`router`/`guest`/`network`/`revenue`/`health` |
+| `config` | JSONB, not nullable, default `{}` | Composition defaults: `location_id`, `window_days`, `include_router_failure_risk` -- see `FLOW.md` |
+| `is_active` | Boolean, not nullable, default `true` | |
+| `created_by_user_id` | UUID, nullable | |
+
+Indexes: `organization_id`, `report_type`, `is_active` (plus the standard
+`BaseModel` indexes).
+
+## `scheduled_reports`
+
+A recurring render of one `report_templates` row.
+
+| Column | Type | Notes |
+|---|---|---|
+| `template_id` | UUID, FK `report_templates.id` (`CASCADE`), not nullable | |
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable | Unlike `report_templates.organization_id`, never `NULL` -- see `FLOW.md`'s manual-vs-scheduled write-up |
+| `frequency` | String(20), not nullable | `constants.ReportFrequency` -- `daily`/`weekly`/`monthly` |
+| `recipient_emails` | JSONB, not nullable, default `[]` | List of email address strings |
+| `export_format` | String(10), not nullable | `constants.ExportFormat` -- `pdf`/`csv`/`excel`/`json` |
+| `next_run_at` | DateTime(tz), not nullable | Always populated -- computed at creation and after every run |
+| `last_run_at` | DateTime(tz), nullable | `NULL` until the first run |
+| `last_run_status` | String(10), nullable | `constants.ReportRunStatus` -- `success`/`failed`, `NULL` until the first run |
+| `is_active` | Boolean, not nullable, default `true` | |
+| `created_by_user_id` | UUID, nullable | |
+
+Indexes: `template_id`, `organization_id`, and a composite
+`(is_active, next_run_at)` index -- the primary query pattern for
+`report_tasks.run_scheduled_reports`'s hourly "which schedules are due"
+sweep (`WHERE is_active = true AND next_run_at <= now()`), the same
+equality-then-range composite-index rationale
+`analytics_snapshots`' own `(organization_id, snapshot_type, period_start)`
+index already establishes.
+
+## No other schema changes
+
+Every figure in a generated report comes from an already-existing
+`AnalyticsSnapshot`/`RouterHealthSnapshot`/`Alert`/... query Parts 1-4
+already added -- the Report Engine (`report_service.py`) and Export Engine
+(`export.py`) are pure composition/rendering layers with no repository
+queries of their own beyond `report_templates`/`scheduled_reports` CRUD.

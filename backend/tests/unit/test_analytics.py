@@ -743,7 +743,14 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     assert celery_app.conf.accept_content == ["json"]
     assert celery_app.conf.result_serializer == "json"
     schedule_names = set(celery_app.conf.beat_schedule.keys())
-    assert schedule_names == {"analytics-rolling-today", "analytics-finalize-yesterday"}
+    # BE-012 Part 5 adds a third Beat entry ("reports-run-scheduled") for
+    # the Report Engine's scheduler -- see
+    # app.domains.analytics.report_tasks's own module docstring.
+    assert schedule_names == {
+        "analytics-rolling-today",
+        "analytics-finalize-yesterday",
+        "reports-run-scheduled",
+    }
 
 
 def test_ping_celery_workers_returns_pong_dict_when_worker_responds(monkeypatch):

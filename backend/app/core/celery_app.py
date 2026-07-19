@@ -70,6 +70,14 @@ Both schedule entries call the exact same Beat-scheduled task
 (``app.domains.analytics.tasks.run_daily_aggregation_for_all_organizations``),
 parameterized only by which day to compute -- see that task's own docstring.
 
+**BE-012 Part 5 adds a third cadence, hourly** (``reports-run-scheduled``):
+checks for due ``ScheduledReport`` rows and generates/renders/emails each
+one. See ``app.domains.analytics.report_tasks``'s own module docstring for
+why hourly (not every 15 minutes) is the right granularity for a task whose
+own coarsest supported frequency is daily, and for its per-schedule
+failure-isolation contract (mirroring this same module's own
+per-organization isolation for the two tasks above).
+
 ## The async-in-a-sync-worker bridge
 
 Celery workers execute task bodies as plain, synchronous Python callables
@@ -98,7 +106,9 @@ from celery.schedules import crontab
 
 from app.core.config import get_settings
 from app.domains.analytics.constants import (
+    SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS,
     TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS,
+    TASK_RUN_SCHEDULED_REPORTS,
 )
 
 _settings = get_settings()
@@ -119,11 +129,11 @@ celery_app = Celery(
     # docstring's "no new config knob" write-up.
     broker=str(_settings.redis_url),
     backend=str(_settings.redis_url),
-    # Tasks are defined in app.domains.analytics.tasks; imported eagerly by
-    # a real worker process (`celery -A app.core.celery_app worker`) so
-    # they are registered without a caller needing to import that module
-    # first.
-    include=["app.domains.analytics.tasks"],
+    # Tasks are defined in app.domains.analytics.tasks/report_tasks;
+    # imported eagerly by a real worker process
+    # (`celery -A app.core.celery_app worker`) so they are registered
+    # without a caller needing to import either module first.
+    include=["app.domains.analytics.tasks", "app.domains.analytics.report_tasks"],
 )
 
 celery_app.conf.update(
@@ -153,6 +163,18 @@ celery_app.conf.update(
             "task": TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS,
             "schedule": crontab(hour=0, minute=10),
             "kwargs": {"days_ago": 1},
+        },
+        # BE-012 Part 5: Report Engine scheduler -- hourly, not every 15
+        # minutes like the rolling aggregation tick above. See
+        # ``app.domains.analytics.report_tasks``'s own module docstring for
+        # why hourly is the right granularity for a task whose own
+        # coarsest supported ``ScheduledReport.frequency`` is `daily`, and
+        # for the per-schedule failure-isolation contract mirroring
+        # ``run_daily_aggregation_for_all_organizations``'s own
+        # per-organization isolation.
+        "reports-run-scheduled": {
+            "task": TASK_RUN_SCHEDULED_REPORTS,
+            "schedule": SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS,
         },
     },
 )

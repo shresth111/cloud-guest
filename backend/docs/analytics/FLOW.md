@@ -1376,3 +1376,303 @@ This part is pure read/computation over already-existing data --
 existed, only new read-only queries added), `Organization.subscription_tier`
 (already existed, unpopulated). No new table, no new column, no schema
 change of any kind. `alembic/versions/` is untouched by this part.
+
+---
+
+# BE-012 Part 5: Report Engine + Export Engine
+
+## 47. Composition, not recomputation: the exact `ReportType` -> service-call mapping
+
+`report_service.ReportGenerationService.generate` contains zero metric
+arithmetic. Every `constants.ReportType` maps onto exactly one (or, for
+`HEALTH`, up to three) existing call(s) into Parts 2-4's own services --
+this table is the complete mapping:
+
+| `ReportType` | Calls | Requires |
+|---|---|---|
+| `DASHBOARD` | `DashboardService.get_super_admin_dashboard` | nothing (GLOBAL) |
+| `ORGANIZATION` | `DashboardService.get_organization_dashboard` | `organization_id` |
+| `LOCATION` | `DashboardService.get_location_dashboard` | `location_id` |
+| `ROUTER` | `DomainAnalyticsService.get_router_analytics` | `organization_id` |
+| `GUEST` | `DomainAnalyticsService.get_guest_analytics` | `organization_id` |
+| `NETWORK` | `DomainAnalyticsService.get_network_analytics` | `organization_id` |
+| `REVENUE` | `BusinessAnalyticsService.get_business_analytics` | nothing (GLOBAL) -- Part 4's honest placeholder fields ride along unchanged, never fabricated |
+| `HEALTH` | `InsightService.get_business_insights` + `get_operational_recommendations`, plus `ForecastService.get_router_failure_risk` **only when `organization_id` is supplied** | nothing required; `organization_id` optional |
+
+Each composed response's own `.model_dump(mode="json")` becomes one
+`report_types.ReportSection.data`, embedded verbatim -- proven in
+`tests/unit/test_analytics_reports.py` via spies that assert the exact
+service method was called with the exact arguments, and that a composed
+response's own nested list field (e.g. an organization dashboard's location
+rollup) survives into the report section unchanged.
+
+Every scope check (`DashboardScope.require_global`/`require_organization`/
+`require_location`) is performed by whichever composed service is called --
+`ReportGenerationService` adds no second, parallel scope check of its own.
+A caller without visibility into the requested organization/location gets
+the exact same `DashboardScopeForbiddenError` the underlying dashboard/
+analytics endpoint would raise directly.
+
+### Why `HEALTH` composes the Insight Engine, not `dashboard_service`'s own Health Score
+
+Part 2's `HealthScoreResponse` (a single organization's weighted health
+score) is already included whenever `report_type=ORGANIZATION` is
+generated (it lives inside `OrganizationDashboardResponse`). `HEALTH` as
+its own report type is deliberately the platform/organization-wide **rule
+engine** view instead -- Business Insights + Operational Recommendations
+(Part 4's `InsightService`), plus, when the caller also supplies an
+`organization_id`, that organization's Router Failure Risk heuristic
+(Part 4's `ForecastService`) -- three genuinely different signals (a
+platform-wide rule sweep, an operational rule sweep, and a per-router risk
+heuristic) than one organization's single weighted score. This also
+demonstrates the Report Engine composing across *two* of Part 4's engines
+(Insight + Forecast) in one report, not just one.
+
+## 48. Manual vs. scheduled report modeling: no `manual_report_runs` table
+
+The module brief's own report-category list also names "Manual Reports"
+and "Dashboard Reports" alongside the persisted, recurring
+`ScheduledReport`. Both turn out to be the same thing from this domain's
+own data-modeling perspective: an on-demand, unscheduled *render* of a
+`ReportTemplate` (or of an ad-hoc `report_type` + params with no template
+at all) -- there is no additional state to persist for the *act* of
+generating one beyond what already exists:
+
+* **`ReportTemplate`** (persisted) -- the reusable *definition* (what
+  sections, which defaults).
+* **`audit_log_entries`** (already exists, RBAC's shared table) -- the
+  permanent record that a specific generation happened, written
+  unconditionally by every call to `ReportGenerationService.generate` (see
+  §52) -- `actor_user_id`, `report_type`, `export_format`, `organization_id`/
+  `location_id`, and (when a template was used) `entity_id=template_id`.
+
+A `manual_report_runs` table would duplicate `audit_log_entries` for no
+queryable benefit this domain's existing audit trail doesn't already
+provide -- it is not modeled. A **recurring** render, by contrast,
+genuinely needs its own row: *which* template, *how often*, *who* to
+email, *when* it last/next runs, and its last outcome -- exactly
+`ScheduledReport`'s five non-FK columns
+(`frequency`/`recipient_emails`/`export_format`/`next_run_at`/
+`last_run_at`/`last_run_status`). `POST /reports` (manual) and
+`report_tasks.run_scheduled_reports` (scheduled) both ultimately call the
+exact same `ReportGenerationService.generate` method with the exact same
+contract -- see §51.
+
+## 49. The CSV/Excel flattening convention
+
+A CSV file is fundamentally one flat grid; a report payload
+(`report_types.ReportPayload`) is a tree of named sections, each an
+arbitrarily nested JSON object (whatever a composed Pydantic response's
+own `model_dump(mode="json")` produced). Rather than silently dropping
+nested data or inventing a bespoke nested-CSV dialect no spreadsheet tool
+understands, this domain adopts one explicit convention, implemented once
+(`report_types.flatten_scalar_fields`/`extract_tabular_blocks`) and shared
+by both the CSV and Excel renderers (`export.py`):
+
+1. **Every scalar leaf**, across every section, dotted-path-flattened
+   through nested dicts (e.g. `organization_dashboard.health_score.score`),
+   becomes one `(section, field, value)` row in a single `Summary`
+   block/sheet. A list of plain scalars (e.g. `recipient_emails`) counts as
+   one scalar leaf, `"; "`-joined into a single string value.
+2. **Every list-of-objects field**, anywhere in the payload (a report's own
+   genuinely tabular data -- an organization dashboard's per-location
+   rollup, a guest analytics response's Top Devices), becomes its own
+   block: in CSV, a blank line + a `"## <section>.<dotted.path>"` marker
+   row + a column-header row (the union of every row's own keys, missing
+   cells rendering as `""`) + one row per item, all in the same file; in
+   Excel, its own dedicated sheet (name sanitized/truncated to Excel's
+   31-character limit, de-duplicated on collision), one sheet per
+   `constants.ExportFormat.EXCEL` render **in addition to** the one
+   `Summary` sheet -- satisfying "at least one sheet per major report
+   section" with room for a section to have zero, one, or several tabular
+   sheets of its own.
+
+This is exactly the module brief's own invited strategy: "only export the
+sections that are genuinely tabular, or a documented flattening
+convention" -- here, both: a flattened key/value summary for everything,
+plus a real, separate tabular export for anything that actually is a
+table.
+
+## 50. PDF library choice: `reportlab`, not `fpdf2`/`weasyprint`
+
+Three real, mature options were weighed for real PDF generation:
+
+* **`reportlab`** (chosen) -- the most widely deployed pure-Python PDF
+  generator, no system-level dependency (no headless browser, no Cairo/
+  Pango install), and its `platypus` layout engine handles page-breaking
+  real tables natively -- exactly what this domain's own Router/Guest/
+  Network-analytics-sized tabular sections need (a table that might span
+  many rows must be able to flow across a page break without extra code
+  from this domain).
+* **`fpdf2`** -- also pure-Python and dependency-free, but its table
+  support is comparatively low-level (manual cell-by-cell positioning);
+  workable, but `reportlab`'s `Table`/`TableStyle` primitives map onto this
+  domain's own "one table of metrics/rows per section" shape more directly,
+  with less custom layout code in `export.py`.
+* **`weasyprint`** -- produces excellent PDFs from HTML/CSS, but depends on
+  Cairo/Pango (system-level, non-Python packages) -- a real installation
+  risk this sandbox's "confirm it actually installs and imports cleanly on
+  Python 3.13" verification mandate specifically warns against introducing
+  for a dependency that a pure-Python alternative already satisfies.
+
+`reportlab==4.4.4` was installed and its generated PDF bytes verified
+(`%PDF` magic header, a genuine `%%EOF` trailer, real title/heading/table
+content) in `tests/unit/test_analytics_reports.py` -- not merely "did not
+raise an exception".
+
+## 51. The scheduler: hourly cadence, per-schedule failure isolation
+
+`report_tasks.run_scheduled_reports` mirrors `tasks.py`'s own exact
+async-bridge pattern (a synchronous `@celery_app.task` body delegating via
+`asyncio.run` to a module-level async function that opens a fresh
+`AsyncSession`/Redis client, builds the real repository/service graph,
+commits, and returns a plain JSON-serializable result -- see §7 for the
+original write-up of why `asyncio.run` is safe here).
+
+**Why hourly, not every 15 minutes** (`analytics-rolling-today`'s own
+cadence): a `ScheduledReport`'s coarsest supported cadence is `DAILY` --
+checking every 15 minutes would mean up to 96 no-op sweeps per real
+delivery, for no freshness benefit anyone asked for (nobody watches a
+report email the way they watch a dashboard tile auto-refresh). An hourly
+sweep still delivers every `DAILY`/`WEEKLY`/`MONTHLY` schedule within an
+hour of its `next_run_at`.
+
+**Per-schedule failure isolation** mirrors
+`AnalyticsService.run_daily_aggregation_for_all_organizations`'s own
+per-organization guarantee exactly, with the identical testability split:
+the real isolation loop (`report_tasks.run_scheduled_report_batch`) is a
+plain, standalone async function taking already-constructed dependencies
+(a `ReportRepositoryProtocol`, a `ReportGenerationService`, an
+`EmailProviderProtocol`, and an already-fetched list of due schedules) --
+unit-testable with fakes, no live database required. Only
+`_run_scheduled_reports_async` (the piece that actually needs a real
+session) constructs the full repository/service graph and calls it. One
+schedule's `generate`/render/send failing (an archived organization, a
+malformed `config`, a transient email error) is caught, logged, and
+recorded (`last_run_status=FAILED`) without aborting the batch; **the
+schedule is still rescheduled forward** (`next_run_at` recomputed from
+`compute_next_run_at`) even on failure -- a persistently broken schedule
+retries at its own normal cadence next time, not on every single hourly
+tick forever (a real backoff, not a busy-loop). `next_run_at` computation
+itself (`compute_next_run_at`) reuses this domain's own existing
+`WEEKLY_WINDOW_DAYS`/`MONTHLY_WINDOW_DAYS` constants (Part 2's "how many
+days is a week/month" figures) rather than re-deriving them; `MONTHLY` is
+a fixed 30-day cadence, the same honest approximation those constants
+already make elsewhere, not a calendar-month-aware "same day next month".
+
+## 52. Full, never-throttled report-generation auditing
+
+Every call to `ReportGenerationService.generate` -- manual or scheduled --
+writes exactly one `audit_log_entries` row, unconditionally. This is a
+deliberately different volume-tiering decision than Part 2's own
+dashboard-view audit (`dashboard_audit.DashboardAuditThrottle`, at most one
+row per 15-minute window per `(user, dashboard_kind, scope)`, see §22):
+
+* A dashboard *view* is a routine, no-state-change read a real admin UI is
+  expected to poll/auto-refresh -- throttling it is what keeps
+  `audit_log_entries` from flooding under identical, seconds-apart reads
+  with zero new signal.
+* A report *generation* has no equivalent polling profile: nothing
+  auto-regenerates a report the way a dashboard tile auto-refreshes.
+  Manual generation is always a deliberate, one-off action; scheduled
+  generation is capped by however many `ScheduledReport` rows exist and
+  their own cadence (at most once per `frequency` each). The volume this
+  event produces is inherently much lower than a dashboard view's, and the
+  module brief is explicit that "who generated what report, for which
+  organization, in what format, and when" is exactly the kind of event
+  compliance/security visibility cares about.
+
+Unconditional auditing is therefore the correct call for this specific
+event, not an inconsistency with Part 2's own throttling -- both decisions
+follow the same underlying principle (throttle high-frequency, no-new-
+signal reads; fully audit low-frequency, meaningful actions), applied to
+two events with genuinely different volume profiles.
+
+## 53. RBAC scope design for `/reports*`
+
+`PermissionModule.REPORTS` (`read`/`export`/`view`/`manage`) was already
+seeded since Part 1 (in anticipation of exactly this part -- see
+`0018_create_analytics_tables`'s own migration docstring), so no RBAC file
+is touched by this part.
+
+**Permission-action choice for `POST /reports`: `reports.export`.** This
+endpoint always produces a concrete rendered artifact -- even the `JSON`
+format is "exporting" the composed payload, not merely displaying an
+already-stored resource -- squarely what the seeded `export` action names
+elsewhere in this same catalog (`ANALYTICS`/`AUDIT_LOGS`/`BILLING`'s own
+`export` actions), and distinct from `reports.read` (browsing template/
+schedule metadata) or `reports.manage` (authoring templates/schedules).
+`reports.read` was the module brief's other named candidate; `export` was
+chosen for the reason above.
+
+**Scope inference, not one hard-coded `scope=`.** Every Part 1-4 endpoint
+hard-codes one explicit `scope=ScopeType.X` because each answers exactly
+one kind of question at exactly one scope. This part's own endpoints do
+not have that luxury -- `POST /reports` generates any `ReportType`
+(some inherently GLOBAL, others ORGANIZATION, one LOCATION), and template/
+schedule list/get/update/delete serve both platform-wide and
+organization-scoped rows through the same route. Rather than reinventing
+scope resolution, `report_router.py` relies on RBAC's own existing scope
+**inference** (`app.domains.rbac.dependencies._infer_scope_type` -- already
+used, unmodified, by Part 1's own `GET /analytics/snapshots`): when no
+explicit `scope=` is given, the required scope is derived from whichever
+of `X-Organization-Id`/`X-Location-Id` headers the request carries,
+falling back to GLOBAL when neither is present. `organization_id`/
+`location_id` themselves are always resolved from those same headers via
+RBAC's `CurrentOrganization`/`CurrentLocation`/`RequireOrganization`
+dependencies -- never trusted from a request body field, mirroring every
+other tenant-scoped endpoint in this codebase (this is why
+`ReportTemplateCreateRequest`/`GenerateReportRequest`/
+`ScheduledReportCreateRequest` do **not** carry an `organization_id`/
+`location_id` body field). `POST /reports/schedule` is the one exception,
+with an explicit, fixed `scope=ScopeType.ORGANIZATION`: a `ScheduledReport`
+is never platform-wide (§48/§56), so its required scope is always
+ORGANIZATION.
+
+## 54. Export routing: one `POST /reports`, no separate `GET .../export`
+
+The module brief offered a choice between a dedicated
+`GET /analytics/reports/export` and folding format selection into
+`POST /reports` via a request field. This module folds it in
+(`GenerateReportRequest.export_format`): report generation already
+composes several existing services' own queries per request -- never free,
+never idempotently cacheable the way a plain `GET` implies -- so "generate
+a report already rendered in format X" is one `POST` action, not a `GET`
+with side-channel format selection and not two separate round-trips
+(generate, then separately export). This keeps exactly one code path and
+one set of validation rules for every supported format, and is RESTfully
+honest about the real work a report generation call does.
+
+## 55. Email delivery: real dispatch, honest attachment limitation
+
+`report_tasks.py` reuses `app.domains.otp.service.EmailProviderProtocol`/
+`LoggingEmailProvider` exactly as they already exist -- no second email
+abstraction is built for this part, per the module brief's own explicit
+instruction. That protocol's contract is `send(email, subject, body) ->
+None`: three strings, no attachment parameter. The rendered report's bytes
+(`export.render_report`'s own output) are real and correct regardless of
+format; what a scheduled-report notification honestly cannot do is attach
+them to the email, since the shared protocol was never built with a
+MIME/attachment concept. The notification therefore describes the
+generated report (title, format, byte size, generation time) rather than
+attaching it -- an honest limitation of composing with the existing
+protocol exactly as specified, not a shortcut around building a proper
+one. Wiring a real transactional-email provider with attachment support
+is a natural follow-up; it is out of this part's own scope (this part's
+directory rule reuses `otp`'s existing public interface, it does not
+extend it).
+
+## 56. Migration: two new tables, no RBAC follow-up
+
+`alembic/versions/0021_create_report_tables.py` adds `report_templates`
+and `scheduled_reports`, both extending `BaseModel` the same way
+`analytics_snapshots` already does (see `DATABASE.md`'s Part 5 section for
+the full column/index reference). No RBAC follow-up migration is needed --
+`reports.*` permission keys were already seeded since Part 1, a config-only
+fact with no schema impact. `alembic/env.py` needed no edit either: it
+already imports `app.domains.analytics.models` as a whole module (for
+`AnalyticsSnapshot`'s own autogenerate registration since Part 1), so
+adding `ReportTemplate`/`ScheduledReport` to that same file registers them
+on `Base.metadata` automatically -- confirmed directly
+(`Base.metadata.tables` contains both new table names after only importing
+`app.domains.analytics.models`, no other import needed).

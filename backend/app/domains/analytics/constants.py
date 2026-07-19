@@ -163,6 +163,112 @@ AUDIT_ACTION_FORECAST_VIEWED = "forecast_viewed"
 AUDIT_ACTION_BUSINESS_INSIGHTS_VIEWED = "business_insights_viewed"
 AUDIT_ACTION_OPERATIONAL_RECOMMENDATIONS_VIEWED = "operational_recommendations_viewed"
 
+# ============================================================================
+# BE-012 Part 5: Report Engine + Export Engine
+# ============================================================================
+
+
+class ReportType(StrEnum):
+    """Which of this domain's existing analytics services one
+    :class:`~.models.ReportTemplate`/generated report composes -- see
+    ``report_service.ReportGenerationService.generate``'s own docstring for
+    the exact section(s) each value assembles. Every value reuses an
+    already-built Part 2/3/4 service; none recomputes a metric a different
+    way.
+
+    * ``DASHBOARD`` -- the platform-wide Super Admin Dashboard
+      (``DashboardService.get_super_admin_dashboard``).
+    * ``ORGANIZATION`` -- one organization's dashboard
+      (``DashboardService.get_organization_dashboard``).
+    * ``LOCATION`` -- one location's dashboard
+      (``DashboardService.get_location_dashboard``).
+    * ``ROUTER`` -- Part 3's Router Analytics
+      (``DomainAnalyticsService.get_router_analytics``).
+    * ``GUEST`` -- Part 3's Guest Analytics
+      (``DomainAnalyticsService.get_guest_analytics``).
+    * ``NETWORK`` -- Part 3's Network Analytics
+      (``DomainAnalyticsService.get_network_analytics``).
+    * ``REVENUE`` -- Part 4's Business Analytics
+      (``BusinessAnalyticsService.get_business_analytics``) -- reuses that
+      part's honest Revenue/Subscription/Churn/Renewal/License-Utilization
+      placeholders verbatim; this part fabricates no new figures for them.
+    * ``HEALTH`` -- Part 4's rule-based Insight Engine, both Business
+      Insights and Operational Recommendations
+      (``InsightService.get_business_insights``/
+      ``get_operational_recommendations``), plus -- when an
+      ``organization_id`` is supplied -- that organization's Router Failure
+      Risk (``ForecastService.get_router_failure_risk``). See
+      ``report_service.py``'s module docstring for why this is the
+      "platform/organization health" composition rather than re-deriving
+      ``dashboard_service.py``'s own ``HealthScoreResponse`` (already
+      included whenever ``report_type=ORGANIZATION`` is generated).
+    """
+
+    DASHBOARD = "dashboard"
+    ORGANIZATION = "organization"
+    LOCATION = "location"
+    ROUTER = "router"
+    GUEST = "guest"
+    NETWORK = "network"
+    REVENUE = "revenue"
+    HEALTH = "health"
+
+
+class ReportFrequency(StrEnum):
+    """How often a :class:`~.models.ScheduledReport` recurs. Mirrors
+    ``AnalyticsGranularity``'s plain-``String``-column posture (see that
+    enum's own docstring) -- adding a new cadence later never needs an
+    ``ALTER TYPE`` migration."""
+
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+
+
+class ExportFormat(StrEnum):
+    """Every format ``export.py`` can render a
+    :class:`~.report_service.ReportPayload` into. ``JSON`` is the also the
+    standard ``ApiResponse`` envelope's own native shape (see
+    ``export.py``'s module docstring)."""
+
+    PDF = "pdf"
+    CSV = "csv"
+    EXCEL = "excel"
+    JSON = "json"
+
+
+class ReportRunStatus(StrEnum):
+    """The outcome of a :class:`~.models.ScheduledReport`'s most recent
+    Beat-scheduled run (``report_tasks.run_scheduled_reports``)."""
+
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+# Celery task name -- same "kept as a constant, never re-derived" posture as
+# ``TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS`` above, so
+# ``app.core.celery_app``'s ``beat_schedule`` and ``report_tasks.py``'s
+# ``@celery_app.task(name=...)`` decorator can never silently drift apart.
+TASK_RUN_SCHEDULED_REPORTS = "app.domains.analytics.report_tasks.run_scheduled_reports"
+
+# How often the Beat schedule checks for due ``ScheduledReport`` rows -- see
+# ``report_tasks.py``'s module docstring for why hourly (rather than
+# ``analytics-rolling-today``'s 15-minute cadence) is the right granularity
+# for a task whose own coarsest supported frequency is ``DAILY``.
+SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS = 3600.0
+
+# ``audit_log_entries.action`` value written for **every** report generated
+# (manual or scheduled) -- see ``report_service.py``'s module docstring for
+# why this one is never throttled (contrast with Part 2's
+# ``DASHBOARD_AUDIT_THROTTLE_MINUTES``-gated dashboard-view auditing above).
+AUDIT_ACTION_REPORT_GENERATED = "report_generated"
+AUDIT_ACTION_REPORT_TEMPLATE_CREATED = "report_template_created"
+AUDIT_ACTION_REPORT_TEMPLATE_UPDATED = "report_template_updated"
+AUDIT_ACTION_REPORT_TEMPLATE_DELETED = "report_template_deleted"
+AUDIT_ACTION_SCHEDULED_REPORT_CREATED = "scheduled_report_created"
+AUDIT_ACTION_SCHEDULED_REPORT_UPDATED = "scheduled_report_updated"
+AUDIT_ACTION_SCHEDULED_REPORT_DELETED = "scheduled_report_deleted"
+
 __all__ = [
     "AnalyticsSnapshotType",
     "AnalyticsGranularity",
@@ -191,4 +297,17 @@ __all__ = [
     "AUDIT_ACTION_FORECAST_VIEWED",
     "AUDIT_ACTION_BUSINESS_INSIGHTS_VIEWED",
     "AUDIT_ACTION_OPERATIONAL_RECOMMENDATIONS_VIEWED",
+    "ReportType",
+    "ReportFrequency",
+    "ExportFormat",
+    "ReportRunStatus",
+    "TASK_RUN_SCHEDULED_REPORTS",
+    "SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS",
+    "AUDIT_ACTION_REPORT_GENERATED",
+    "AUDIT_ACTION_REPORT_TEMPLATE_CREATED",
+    "AUDIT_ACTION_REPORT_TEMPLATE_UPDATED",
+    "AUDIT_ACTION_REPORT_TEMPLATE_DELETED",
+    "AUDIT_ACTION_SCHEDULED_REPORT_CREATED",
+    "AUDIT_ACTION_SCHEDULED_REPORT_UPDATED",
+    "AUDIT_ACTION_SCHEDULED_REPORT_DELETED",
 ]

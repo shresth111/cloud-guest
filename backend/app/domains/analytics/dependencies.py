@@ -37,6 +37,12 @@ from .dashboard_service import DashboardService
 from .domain_analytics_service import DomainAnalyticsService
 from .forecast_service import ForecastService
 from .insight_service import InsightService
+from .report_repository import ReportRepository, ReportRepositoryProtocol
+from .report_service import (
+    ReportGenerationService,
+    ReportTemplateService,
+    ScheduledReportService,
+)
 from .repository import AnalyticsRepository, AnalyticsRepositoryProtocol
 from .service import AnalyticsService
 
@@ -167,6 +173,64 @@ def get_insight_service(
     )
 
 
+def get_report_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> ReportRepositoryProtocol:
+    return ReportRepository(db)
+
+
+def get_report_generation_service(
+    dashboard_service: DashboardService = Depends(get_dashboard_service),
+    domain_analytics_service: DomainAnalyticsService = Depends(
+        get_domain_analytics_service
+    ),
+    business_analytics_service: BusinessAnalyticsService = Depends(
+        get_business_analytics_service
+    ),
+    forecast_service: ForecastService = Depends(get_forecast_service),
+    insight_service: InsightService = Depends(get_insight_service),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> ReportGenerationService:
+    """Wires BE-012 Part 5's ``ReportGenerationService`` -- reuses every one
+    of Parts 2-4's own already-wired services (via their own existing
+    ``Depends`` factories above) rather than rebuilding their own
+    repository/scope-resolver/Redis composition a second time; see
+    ``report_service.py``'s own module docstring for why this service
+    itself contains no metric computation."""
+    return ReportGenerationService(
+        dashboard_service,
+        domain_analytics_service,
+        business_analytics_service,
+        forecast_service,
+        insight_service,
+        audit_writer=audit_repository,
+    )
+
+
+def get_report_template_service(
+    repository: ReportRepositoryProtocol = Depends(get_report_repository),
+    scope_resolver: DashboardScopeResolver = Depends(get_dashboard_scope_resolver),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> ReportTemplateService:
+    return ReportTemplateService(
+        repository, scope_resolver, audit_writer=audit_repository
+    )
+
+
+def get_scheduled_report_service(
+    repository: ReportRepositoryProtocol = Depends(get_report_repository),
+    scope_resolver: DashboardScopeResolver = Depends(get_dashboard_scope_resolver),
+    template_service: ReportTemplateService = Depends(get_report_template_service),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> ScheduledReportService:
+    return ScheduledReportService(
+        repository,
+        scope_resolver,
+        template_service,
+        audit_writer=audit_repository,
+    )
+
+
 __all__ = [
     "get_analytics_repository",
     "get_analytics_service",
@@ -176,4 +240,8 @@ __all__ = [
     "get_business_analytics_service",
     "get_forecast_service",
     "get_insight_service",
+    "get_report_repository",
+    "get_report_generation_service",
+    "get_report_template_service",
+    "get_scheduled_report_service",
 ]

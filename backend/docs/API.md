@@ -1273,3 +1273,108 @@ organization) -- each producing one insight per qualifying entity, never a
 single rolled-up sentence (see FLOW.md §42's own write-up of this
 consistency choice).
 
+## Report Engine + Export Engine (Module 012 Part 5, completes BE-012)
+
+See `docs/analytics/FLOW.md` §§47-56 for the full design write-up (the
+exact `ReportType` -> composed-service mapping, the manual-vs-scheduled
+modeling decision, the CSV/Excel flattening convention, the `reportlab`
+PDF library choice, the hourly Beat-scheduled task's per-schedule
+failure-isolation pattern, the full-vs-throttled audit reasoning, the RBAC
+scope-inference design, the export-routing design, and the honest
+email-attachment limitation). This part adds **no new metric
+computation** -- every figure in a generated report comes from an
+already-existing Module 012 Part 2/3/4 endpoint's own response, composed
+verbatim.
+
+Two new dependencies: `openpyxl==3.1.5` (real `.xlsx` generation) and
+`reportlab==4.4.4` (real PDF generation, chosen over `fpdf2`/`weasyprint` --
+see FLOW.md §50).
+
+### `POST /reports/templates`
+
+Requires `reports.manage`. Creates a `ReportTemplate`
+(`name`/`description`/`report_type`/`config`/`is_active`). `organization_id`
+is resolved from the `X-Organization-Id` header (via `CurrentOrganization`,
+optional) -- omitted for a platform-wide system template (requires a
+GLOBAL-scoped `reports.manage` grant), present to scope it to that
+organization (requires an ORGANIZATION-scoped grant covering it).
+`report_type` is one of `dashboard`/`organization`/`location`/`router`/
+`guest`/`network`/`revenue`/`health`.
+
+### `GET /reports/templates` / `GET /reports/templates/{template_id}`
+
+Requires `reports.read`. Lists (paginated) or fetches one template --
+platform-wide system templates are always visible; organization-scoped
+ones only to a caller whose resolved `DashboardScope` covers that
+organization (a GLOBAL-scoped caller sees every template). A template
+outside the caller's scope reads as `404`, identical to one that does not
+exist.
+
+### `PUT /reports/templates/{template_id}` / `DELETE /reports/templates/{template_id}`
+
+Requires `reports.manage`. Partial update / soft delete, same visibility
+rule as the `GET` endpoints above. Every mutation writes its own
+`audit_log_entries` row (`report_template_created`/`_updated`/`_deleted`).
+
+### `POST /reports` (generate a report, manual or on-demand)
+
+Requires `reports.export` (see FLOW.md §53 for why `export`, not `read`).
+Either `template_id` (loads a persisted `ReportTemplate`'s `report_type`/
+`config`) or an ad-hoc `report_type` must be supplied.
+`organization_id`/`location_id` are resolved from the `X-Organization-Id`/
+`X-Location-Id` headers (never a request body field -- see FLOW.md §53),
+so the required RBAC scope is inferred from whichever of those headers is
+present (GLOBAL if neither, ORGANIZATION if `X-Organization-Id`, LOCATION
+if `X-Location-Id`). `start_date`/`end_date` narrow the window for
+`ROUTER`/`GUEST`/`NETWORK` report types (defaults to a trailing window
+otherwise). `export_format` (`json`/`csv`/`excel`/`pdf`, default `json`)
+selects the rendered output -- see FLOW.md §54 for why format selection is
+folded into this one endpoint rather than a separate
+`GET .../export`. Response: for `json`, the standard `ApiResponse`
+envelope wrapping the assembled report payload; for `csv`/`excel`/`pdf`,
+the real rendered file bytes with the correct `Content-Type` and a
+`Content-Disposition: attachment` header naming the file. Every call --
+regardless of format -- writes one unconditional `audit_log_entries` row
+(`report_generated`, see FLOW.md §52 for why this is never throttled).
+
+### `POST /reports/schedule`
+
+Requires `reports.manage` at `ORGANIZATION` scope (the one endpoint in
+this part with a fixed, explicit scope -- a `ScheduledReport` is never
+platform-wide). `organization_id` is resolved from the mandatory
+`X-Organization-Id` header via `RequireOrganization`. Body:
+`template_id` (must reference a template visible to the caller),
+`frequency` (`daily`/`weekly`/`monthly`), `recipient_emails` (non-empty
+list), `export_format` (default `pdf`). `next_run_at` is always computed
+server-side from `frequency` (never trusted from the request).
+
+### `GET /reports/schedule` / `GET /reports/schedule/{schedule_id}`
+
+Requires `reports.read`. Lists (paginated, GLOBAL-scoped callers see every
+organization's schedules) or fetches one schedule -- an out-of-scope
+schedule reads as `404`.
+
+### `PUT /reports/schedule/{schedule_id}` / `DELETE /reports/schedule/{schedule_id}`
+
+Requires `reports.manage`. Partial update (changing `frequency`
+recomputes `next_run_at` from "now" under the new cadence rather than
+leaving it stale) / soft delete. Every mutation writes its own
+`audit_log_entries` row.
+
+### Beat-scheduled report delivery (no HTTP surface)
+
+Every hour (`reports-run-scheduled` in `app.core.celery_app`'s
+`beat_schedule`), `report_tasks.run_scheduled_reports` sweeps for every
+active `ScheduledReport` whose `next_run_at` has arrived, and for each:
+generates the report (the exact same `ReportGenerationService.generate`
+`POST /reports` itself calls), renders it in the schedule's own
+`export_format`, "sends" it via `app.domains.otp`'s existing
+`EmailProviderProtocol`/`LoggingEmailProvider` (reused verbatim -- see
+FLOW.md §55 for the resulting honest attachment limitation: the shared
+protocol has no attachment parameter, so the notification email describes
+the report rather than attaching its bytes) to every `recipient_emails`
+address, and updates `last_run_at`/`last_run_status`/`next_run_at`. One
+schedule failing never blocks the rest of the hourly batch -- see FLOW.md
+§51 for the exact per-schedule failure-isolation contract (mirroring
+Module 012 Part 1's own per-organization aggregation-batch isolation).
+

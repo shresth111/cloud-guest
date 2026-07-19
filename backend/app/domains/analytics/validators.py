@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from .constants import DEFAULT_ANALYTICS_WINDOW_DAYS
 from .exceptions import InvalidAnalyticsDateRangeError
 
 
@@ -58,4 +59,30 @@ def day_bounds_utc(
     return day_start, day_start + timedelta(days=1)
 
 
-__all__ = ["validate_date_range", "day_bounds_utc"]
+def resolve_analytics_window(
+    start_date: datetime | None,
+    end_date: datetime | None,
+    *,
+    default_window_days: int = DEFAULT_ANALYTICS_WINDOW_DAYS,
+) -> tuple[datetime, datetime]:
+    """The shared ``[start, end]`` window resolution every organization-
+    scoped analytics endpoint uses: an explicit, validated caller-supplied
+    range when both bounds are given, else a trailing ``default_window_
+    days``-day window ending now.
+
+    This is the same three-line rule ``app.domains.analytics.router
+    ._resolve_window`` already establishes for Part 3/4's own HTTP routes
+    -- lifted here, as a public, reusable function, so
+    ``report_service.ReportGenerationService`` (Part 5) can share it rather
+    than re-deriving the identical default. ``router.py``'s own private
+    helper is left as-is (delegating to this one would be a needless risk
+    to already-passing route tests for zero behavioral change); both simply
+    apply the same rule.
+    """
+    validate_date_range(start_date, end_date)
+    end = end_date or datetime.now(UTC)
+    start = start_date or (end - timedelta(days=default_window_days))
+    return start, end
+
+
+__all__ = ["validate_date_range", "day_bounds_utc", "resolve_analytics_window"]

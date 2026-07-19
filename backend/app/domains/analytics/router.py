@@ -105,6 +105,7 @@ from .insight_schemas import (
 )
 from .insight_service import InsightService
 from .models import AnalyticsSnapshot
+from .report_router import router as report_router
 from .schemas import (
     AnalyticsSnapshotListResponse,
     AnalyticsSnapshotResponse,
@@ -656,6 +657,19 @@ async def get_operational_recommendations(
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )
+
+
+# ============================================================================
+# BE-012 Part 5: Report Engine + Export Engine
+#
+# All of ``/reports*``'s own routes live in ``report_router.py`` (its own
+# module docstring covers the RBAC scope-inference design those routes
+# rely on) -- included here so they reach the API through this domain's
+# one existing ``app/api/v1/router.py`` registration, with no second,
+# separate top-level ``include_router`` call needed for this part.
+# ============================================================================
+
+router.include_router(report_router)
 
 
 __all__ = ["router"]
