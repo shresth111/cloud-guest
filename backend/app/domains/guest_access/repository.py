@@ -110,9 +110,7 @@ class GuestAccessRepository:
     async def create_guest_rule(self, **fields: object) -> GuestAccessRule:
         return await self.guest_rules.create(fields)
 
-    async def get_guest_rule_by_id(
-        self, rule_id: uuid.UUID
-    ) -> GuestAccessRule | None:
+    async def get_guest_rule_by_id(self, rule_id: uuid.UUID) -> GuestAccessRule | None:
         return await self.guest_rules.get_by_id(rule_id)
 
     async def update_guest_rule(
@@ -156,9 +154,7 @@ class GuestAccessRepository:
         plus an ``expires_at IS NULL OR expires_at > now`` bound."""
         scope_clause = GuestAccessRule.location_id.is_(None)
         if location_id is not None:
-            scope_clause = or_(
-                scope_clause, GuestAccessRule.location_id == location_id
-            )
+            scope_clause = or_(scope_clause, GuestAccessRule.location_id == location_id)
         statement = select(GuestAccessRule).where(
             GuestAccessRule.organization_id == organization_id,
             GuestAccessRule.identifier == identifier,

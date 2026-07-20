@@ -104,9 +104,7 @@ def upgrade() -> None:
         sa.Column("rule_type", sa.String(20), nullable=False),
         sa.Column("reason", sa.Text(), nullable=True),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column(
-            "is_active", sa.Boolean(), nullable=False, server_default=sa.true()
-        ),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
         sa.ForeignKeyConstraint(
             ["organization_id"],
             ["organizations.id"],
@@ -148,9 +146,7 @@ def upgrade() -> None:
         sa.Column("rule_type", sa.String(20), nullable=False),
         sa.Column("reason", sa.Text(), nullable=True),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column(
-            "is_active", sa.Boolean(), nullable=False, server_default=sa.true()
-        ),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
         sa.ForeignKeyConstraint(
             ["organization_id"],
             ["organizations.id"],
@@ -185,12 +181,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_device_access_rules_is_active", table_name="device_access_rules"
-    )
-    op.drop_index(
-        "ix_device_access_rules_rule_type", table_name="device_access_rules"
-    )
+    op.drop_index("ix_device_access_rules_is_active", table_name="device_access_rules")
+    op.drop_index("ix_device_access_rules_rule_type", table_name="device_access_rules")
     op.drop_index(
         "ix_device_access_rules_mac_address", table_name="device_access_rules"
     )
@@ -206,9 +198,7 @@ def downgrade() -> None:
     op.drop_index("ix_guest_access_rules_is_active", table_name="guest_access_rules")
     op.drop_index("ix_guest_access_rules_rule_type", table_name="guest_access_rules")
     op.drop_index("ix_guest_access_rules_identifier", table_name="guest_access_rules")
-    op.drop_index(
-        "ix_guest_access_rules_location_id", table_name="guest_access_rules"
-    )
+    op.drop_index("ix_guest_access_rules_location_id", table_name="guest_access_rules")
     op.drop_index(
         "ix_guest_access_rules_organization_id", table_name="guest_access_rules"
     )

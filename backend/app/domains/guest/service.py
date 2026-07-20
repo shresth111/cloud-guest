@@ -1292,9 +1292,7 @@ class GuestService:
         ``ACTIVE`` session (see its docstring) and only ever derives a new
         row when the guest currently holds zero active sessions, so it can
         never itself push a guest over the limit."""
-        active_count = await self.repository.count_active_sessions_for_guest(
-            guest_id
-        )
+        active_count = await self.repository.count_active_sessions_for_guest(guest_id)
         if is_concurrent_session_limit_reached(
             active_count=active_count,
             limit=DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,

@@ -517,8 +517,7 @@ class FakeGuestRepository:
         return sum(
             1
             for s in self.sessions.values()
-            if s.guest_id == guest_id
-            and s.status == GuestSessionStatus.ACTIVE.value
+            if s.guest_id == guest_id and s.status == GuestSessionStatus.ACTIVE.value
         )
 
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]:
@@ -1384,9 +1383,7 @@ class TestConcurrentSessionLimit:
             location_id=fx.location_id,
             router_id=fx.router.id,
         )
-        count = await fx.repository.count_active_sessions_for_guest(
-            first.guest.id
-        )
+        count = await fx.repository.count_active_sessions_for_guest(first.guest.id)
         assert count == 2
 
         await fx.guest_service.disconnect_session(session_id=first.session.id)

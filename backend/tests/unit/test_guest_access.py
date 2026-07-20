@@ -342,9 +342,7 @@ class TestAccessDecisionResolver:
         resolver = AccessDecisionResolver()
         blocklist = _guest_rule(AccessRuleType.BLOCKLIST)
         temporary = _guest_rule(AccessRuleType.TEMPORARY)
-        decision = resolver.resolve(
-            guest_rules=[blocklist, temporary], device_rules=[]
-        )
+        decision = resolver.resolve(guest_rules=[blocklist, temporary], device_rules=[])
         assert decision.allowed is True
         assert decision.rule_type == AccessRuleType.TEMPORARY
 
