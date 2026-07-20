@@ -2154,3 +2154,94 @@ A read-model aggregating the job's own step transitions and log entries
 into one chronological list -- no separate timeline table.
 
 `GET /provision/{job_id}` -- requires `provisioning_engine.read`.
+
+
+## Queue Management Engine Endpoints
+
+See `docs/queue_management/FLOW.md` for the full design write-up -- the
+vendor-agnostic bandwidth/QoS orchestrator (a new domain,
+`app.domains.queue_management`, composing `router`/`policy` rather than
+duplicating either). Every route below requires `bandwidth.*` -- this
+domain reuses the pre-existing `PermissionModule.BANDWIDTH` permission key
+(seeded ahead of any real domain, specifically for this concern) rather
+than minting a new one, and is registered under `/queue`.
+
+`POST /queue/profiles` -- requires `bandwidth.create`. Body: `name`,
+`download_rate_kbps`/`upload_rate_kbps` (kbps; `0` means unlimited --
+RouterOS's own real `max-limit` semantics), optional burst fields,
+`priority` (1-8, RouterOS's own real range), `queue_type`
+(`simple`/`pcq`/`tree`), `is_system_profile` (platform-wide vs. this
+organization's own).
+
+`GET /queue/profiles` -- requires `bandwidth.read`. Paginated; every row
+visible to the caller's own organization plus every system profile
+(`organization_id IS NULL`).
+
+`GET /queue/profiles/{profile_id}` / `PUT` / `DELETE` -- requires
+`bandwidth.read`/`update`/`delete` respectively.
+
+`POST /queue/assign` -- requires `bandwidth.create`. Body: `target_type`
+(one of `organization`/`location`/`router`/`guest_team`/`guest`/`voucher`/
+`device`/`session`), `target_id` (required unless `target_type` is
+`organization`), `router_id` (required for every device-bound target
+type), `device_target` (the RouterOS `target` string -- an IP/CIDR or
+interface), `queue_profile_id`, optional `queue_schedule_id`/
+`priority_override`/`expires_at`. Created `pending` -- not yet pushed to
+any device.
+
+`PUT /queue/assign/{assignment_id}` -- requires `bandwidth.execute`. Body:
+optional `new_queue_profile_id`/`new_queue_schedule_id`, `auto_apply`
+(default `true`). "Move Queue" -- creates a **new** assignment row (never
+mutates the existing one) and marks the old one `expired` with
+`superseded_by_assignment_id` set.
+
+`DELETE /queue/assign/{assignment_id}` -- requires `bandwidth.execute`.
+Expires the assignment -- removes it from the device first if currently
+`active`.
+
+`GET /queue/assignments` -- requires `bandwidth.read`. Paginated,
+filterable by `target_type`/`target_id`/`router_id`/`status`. Registered
+before `GET /queue/assignments/{assignment_id}` -- load-bearing route
+ordering (see `router.py`'s own module docstring).
+
+`GET /queue/assignments/{assignment_id}` -- requires `bandwidth.read`.
+
+`POST /queue/apply` -- requires `bandwidth.execute`. Body:
+`assignment_id`. Pushes the assignment's profile to the real device
+(`pending`/`disabled`/`suspended` -> `active`) -- "enabling" a queue *is*
+applying it, the identical real device operation. If the assignment is
+scoped to a `QueueSchedule` whose window is not currently open, transitions
+straight to `suspended` instead, without ever attempting a device
+connection.
+
+`POST /queue/remove` -- requires `bandwidth.execute`. Body:
+`assignment_id`. Pulls the live queue off the device (`active` ->
+`disabled`) -- "disabling" a queue *is* removing it, keeping the row for a
+later re-apply.
+
+`POST /queue/reset` -- requires `bandwidth.execute`. Body: `assignment_id`.
+Remove-then-reapply the same profile -- a real RouterOS operation that
+clears the queue's own accumulated byte/packet counters.
+
+`GET /queue/history` -- requires `bandwidth.read`. Query params:
+`target_type` (required), optional `target_id`. Every past assignment
+(original and every "Move Queue" supersession) for one target,
+chronological -- a read-model, not a separate table.
+
+`GET /queue/templates` -- requires `bandwidth.read`.
+
+`POST /queue/templates` -- requires `bandwidth.create`. Body: `name`,
+`persona` (hotel_guest/vip_guest/staff/corporate/student/premium/trial/
+unlimited), optional `queue_profile_id`/`default_queue_schedule_id` --
+composes an existing profile/schedule, never duplicates either.
+
+`GET /queue/schedules` -- requires `bandwidth.read`.
+
+`POST /queue/schedules` -- requires `bandwidth.create`. Body: `name`,
+`schedule_type` (office_hours/night_mode/weekend/holiday/custom),
+`days_of_week`/`start_time`/`end_time` for recurring windows (with correct
+overnight wrap-around, e.g. Night Mode 22:00-06:00), or `specific_dates`
+for `holiday`. A schedule-bound assignment is automatically suspended/
+resumed as its window closes/opens, both at `apply_queue` time and by a
+real, Beat-scheduled background sweep (every 5 minutes) -- see
+`app.domains.queue_management.tasks`'s own module docstring.

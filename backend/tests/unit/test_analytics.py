@@ -760,6 +760,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # ("provisioning-engine-drain-queue") for its own provision-job queue
     # drain -- see app.domains.provisioning_engine.tasks's own module
     # docstring.
+    # Queue Management Engine adds an eighth Beat entry
+    # ("queue-management-sweep-schedule-transitions") for its own time-
+    # based auto suspend/resume sweep -- see
+    # app.domains.queue_management.tasks's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -768,6 +772,7 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "billing-invoice-overdue-sweep",
         "guest-session-timeout-sweep",
         "provisioning-engine-drain-queue",
+        "queue-management-sweep-schedule-transitions",
     }
 
 

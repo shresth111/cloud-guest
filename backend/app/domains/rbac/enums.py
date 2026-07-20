@@ -551,3 +551,24 @@ class AuditAction(StrEnum):
     PROVISION_JOB_ROLLED_BACK = "provision_job_rolled_back"
     PROVISION_JOB_SUCCEEDED = "provision_job_succeeded"
     PROVISION_JOB_FAILED = "provision_job_failed"
+
+    # Queue Management Engine domain events -- written through this same
+    # table by
+    # ``app.domains.queue_management.service.QueueManagementService`` via
+    # the same narrow ``AuditLogWriter`` protocol shape every other
+    # domain's service uses. Queue Management is a brand-new, additive
+    # domain (a vendor-agnostic bandwidth/QoS orchestrator composing
+    # Router/Policy, never duplicating their own lifecycle events) -- the
+    # same "add its own additive block directly here" precedent every
+    # prior brand-new domain has followed at its own first Part. Every
+    # value here matches the module brief's own named audit events
+    # (Queue Created/Updated/Deleted/Applied/Removed/Expired/Assignment
+    # Changed) exactly.
+    QUEUE_PROFILE_CREATED = "queue_profile_created"
+    QUEUE_PROFILE_UPDATED = "queue_profile_updated"
+    QUEUE_PROFILE_DELETED = "queue_profile_deleted"
+    QUEUE_ASSIGNMENT_CREATED = "queue_assignment_created"
+    QUEUE_APPLIED = "queue_applied"
+    QUEUE_REMOVED = "queue_removed"
+    QUEUE_ASSIGNMENT_CHANGED = "queue_assignment_changed"
+    QUEUE_ASSIGNMENT_EXPIRED = "queue_assignment_expired"

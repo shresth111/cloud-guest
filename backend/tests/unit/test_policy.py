@@ -484,7 +484,7 @@ class TestRulesValidation:
                 rules={"max_attempts_per_window": -1, "window_minutes": 1},
             )
 
-    async def test_generic_policy_type_accepts_any_object(self) -> None:
+    async def test_bandwidth_rules_validates_against_typed_schema(self) -> None:
         service, _, org_lookup, _ = _build_service()
         org = org_lookup.add()
         policy = await service.create_policy(
@@ -493,6 +493,91 @@ class TestRulesValidation:
             organization_id=org.id,
             policy_type=PolicyType.BANDWIDTH,
             name="Bandwidth",
+            description=None,
+        )
+        version = await service.create_version(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={"download_rate_kbps": 5000, "upload_rate_kbps": 1000},
+        )
+        assert version.rules["download_rate_kbps"] == 5000
+        assert version.rules["burst_download_kbps"] is None
+
+    async def test_bandwidth_rules_rejects_missing_required_field(self) -> None:
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.BANDWIDTH,
+            name="Bandwidth",
+            description=None,
+        )
+        with pytest.raises(PolicyRulesValidationError):
+            await service.create_version(
+                policy_id=policy.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                rules={"download_rate_kbps": 5000},
+            )
+
+    async def test_bandwidth_rules_rejects_unexpected_field(self) -> None:
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.BANDWIDTH,
+            name="Bandwidth",
+            description=None,
+        )
+        with pytest.raises(PolicyRulesValidationError):
+            await service.create_version(
+                policy_id=policy.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                rules={
+                    "download_rate_kbps": 5000,
+                    "upload_rate_kbps": 1000,
+                    "unexpected": True,
+                },
+            )
+
+    async def test_qos_rules_validates_against_typed_schema(self) -> None:
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.QOS,
+            name="QoS",
+            description=None,
+        )
+        version = await service.create_version(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={"traffic_class": "voice", "guaranteed_bandwidth_kbps": 256},
+        )
+        assert version.rules["traffic_class"] == "voice"
+        assert version.rules["dscp_marking"] is None
+
+    async def test_generic_policy_type_accepts_any_object(self) -> None:
+        # PolicyType.FUP has no concrete rule schema (unlike BANDWIDTH/QOS,
+        # which gained typed schemas for app.domains.queue_management) --
+        # see schemas.GenericPolicyRules.
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.FUP,
+            name="Fair Usage",
             description=None,
         )
         version = await service.create_version(
@@ -510,8 +595,8 @@ class TestRulesValidation:
             actor_user_id=None,
             requesting_organization_id=org.id,
             organization_id=org.id,
-            policy_type=PolicyType.BANDWIDTH,
-            name="Bandwidth",
+            policy_type=PolicyType.FUP,
+            name="Fair Usage",
             description=None,
         )
         v1 = await service.create_version(

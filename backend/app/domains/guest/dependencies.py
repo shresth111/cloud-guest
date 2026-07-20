@@ -32,6 +32,8 @@ from app.domains.monitoring.dependencies import get_monitoring_service
 from app.domains.monitoring.service import MonitoringService
 from app.domains.otp.dependencies import get_otp_service
 from app.domains.otp.service import OtpService
+from app.domains.queue_management.dependencies import get_queue_management_service
+from app.domains.queue_management.service import QueueManagementService
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
@@ -66,6 +68,9 @@ def get_guest_service(
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     monitoring_service: MonitoringService = Depends(get_monitoring_service),
     guest_access_service: GuestAccessService = Depends(get_guest_access_service),
+    queue_management_service: QueueManagementService = Depends(
+        get_queue_management_service
+    ),
 ) -> GuestService:
     """BE-011 Part 3 addition: wires ``MonitoringService`` in as
     ``GuestService``'s optional ``monitoring_hook`` (see that class's own
@@ -84,7 +89,14 @@ def get_guest_service(
     ``guest_access`` rules in the running application. See
     ``GuestService.__init__``'s own docstring for why this hook, unlike
     ``monitoring_hook``, can change the login's outcome (a real
-    authorization gate, not a best-effort side broadcast)."""
+    authorization gate, not a best-effort side broadcast).
+
+    Queue Management Engine addition: wires ``QueueManagementService`` in as
+    ``GuestService``'s optional ``queue_assignment_hook`` the identical way
+    ``monitoring_hook`` is wired -- the one DI-wiring edit required for a
+    real bandwidth queue to actually get pushed to the guest's router on
+    every login, in the running application, rather than this being dead
+    code no request path ever exercises."""
     return GuestService(
         repository,
         otp_service,
@@ -94,6 +106,7 @@ def get_guest_service(
         audit_writer=audit_repository,
         monitoring_hook=monitoring_service,
         access_control_hook=guest_access_service,
+        queue_assignment_hook=queue_management_service,
     )
 
 

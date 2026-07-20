@@ -55,7 +55,7 @@ Cell values are the *default grant level* for that role x module pair: `-` (none
 | DHCP | create, read, update, delete, manage |
 | DNS | create, read, update, delete, manage |
 | Hotspot | create, read, update, delete, manage, execute |
-| Bandwidth | read, update, manage |
+| Bandwidth | create, read, update, delete, execute, manage |
 | Analytics | read, export, view |
 | Reports | read, export, view, manage |
 | Monitoring | read, view, manage |

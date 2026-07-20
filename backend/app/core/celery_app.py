@@ -123,6 +123,10 @@ from app.domains.provisioning_engine.constants import (
     PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
     TASK_DRAIN_PROVISION_QUEUE,
 )
+from app.domains.queue_management.constants import (
+    SCHEDULE_SWEEP_INTERVAL_SECONDS,
+    TASK_SWEEP_SCHEDULE_TRANSITIONS,
+)
 
 _settings = get_settings()
 
@@ -152,6 +156,7 @@ celery_app = Celery(
         "app.domains.billing.tasks",
         "app.domains.guest.tasks",
         "app.domains.provisioning_engine.tasks",
+        "app.domains.queue_management.tasks",
     ],
 )
 
@@ -256,6 +261,19 @@ celery_app.conf.update(
         "provisioning-engine-drain-queue": {
             "task": TASK_DRAIN_PROVISION_QUEUE,
             "schedule": PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
+        },
+        # Queue Management Engine: re-evaluates every ACTIVE/SUSPENDED
+        # QueueAssignment scoped to a QueueSchedule and flips its device
+        # state the moment a time window opens or closes -- the real
+        # background executor behind "Automatically change assigned
+        # queues based on time". See
+        # app.domains.queue_management.tasks's own module docstring and
+        # app.domains.queue_management.constants
+        # .SCHEDULE_SWEEP_INTERVAL_SECONDS's own docstring for the cadence
+        # reasoning.
+        "queue-management-sweep-schedule-transitions": {
+            "task": TASK_SWEEP_SCHEDULE_TRANSITIONS,
+            "schedule": SCHEDULE_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

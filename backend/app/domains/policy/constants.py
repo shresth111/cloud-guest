@@ -29,19 +29,30 @@ keeping ``policy`` acyclic, not an oversight.
 
 ``PolicyType`` covers every policy type ``docs/ARCHITECTURE_DESIGN.md`` §6.1
 names (authN/session/bandwidth/FUP/business-hours/access/VLAN/QoS/routing).
-Only ``SESSION`` and ``AUTHN`` have a seeded ``PLATFORM_DEFAULT_RULES`` entry
-and a typed Pydantic schema in ``schemas.py``'s ``POLICY_RULE_SCHEMAS``
-registry, because those are the only two types this gap analysis found real,
-already-hardcoded platform constants for. The rest
-(``BANDWIDTH``/``FUP``/``BUSINESS_HOURS``/``ACCESS``/``VLAN``/``QOS``/
-``ROUTING``) are fully functional -- a ``Policy``/``PolicyVersion`` of any of
-those types can be created, versioned, published, and assigned today -- but
-have no seeded platform default and validate their ``rules`` JSONB payload
-only as "a JSON object" (see ``schemas.GenericPolicyRules``), honestly
-reflecting that no existing hardcoded constant in this codebase justifies a
-specific default shape for them yet (the same "real check without a fake
-opinion" discipline this codebase already applies to e.g. Celery health's
-``UNKNOWN`` status before a worker was ever wired in).
+``SESSION``/``AUTHN`` have a seeded ``PLATFORM_DEFAULT_RULES`` entry *and* a
+typed Pydantic schema in ``schemas.py``'s ``POLICY_RULE_SCHEMAS`` registry,
+because those are the two types this gap analysis found real,
+already-hardcoded platform constants for. ``BANDWIDTH``/``QOS`` also gained a
+typed schema (``schemas.BandwidthPolicyRules``/``QoSPolicyRules``) when
+``app.domains.queue_management`` (the Queue Management Engine) was built --
+that domain composes these two policy types for real, so their ``rules``
+shape needed real validation -- but **no seeded platform default**: no
+existing hardcoded constant anywhere in this codebase names a bandwidth cap
+to mirror, so inventing one here would be a fake opinion, not a real
+default (the same "real check without a fake opinion" discipline this
+codebase already applies to e.g. Celery health's ``UNKNOWN`` status before a
+worker was ever wired in). A ``BANDWIDTH``/``QOS`` policy with no assignment
+at any scope resolves to an empty ``rules`` dict
+(``PLATFORM_DEFAULT_RULES.get(policy_type, {})``) -- it is
+``queue_management``'s own job to fall back to a sensible default
+``QueueProfile`` (e.g. "Unlimited") when that happens, not this module's.
+The rest (``FUP``/``BUSINESS_HOURS``/``ACCESS``/``VLAN``/``ROUTING``) are
+fully functional -- a ``Policy``/``PolicyVersion`` of any of those types can
+be created, versioned, published, and assigned today -- but have no seeded
+platform default and validate their ``rules`` JSONB payload only as "a JSON
+object" (see ``schemas.GenericPolicyRules``), honestly reflecting that no
+existing hardcoded constant in this codebase justifies a specific default
+shape for them yet.
 """
 
 from __future__ import annotations

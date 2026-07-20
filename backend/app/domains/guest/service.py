@@ -191,6 +191,7 @@ from app.domains.location.models import Location
 from app.domains.monitoring.constants import RealtimeMessageType
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
+from app.domains.queue_management.constants import QueueTargetType
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.crypto import (
     RouterCredentialDecryptionError,
@@ -422,6 +423,34 @@ class AccessDecisionProtocol(Protocol):
     ) -> AccessDecision: ...
 
 
+class QueueAssignmentProtocol(Protocol):
+    """The single method ``GuestService``'s optional
+    ``queue_assignment_hook`` needs from the real
+    ``app.domains.queue_management.service.QueueManagementService`` --
+    reused directly, never reimplemented, the identical composition
+    ``GuestSessionBroadcastProtocol``/``AccessDecisionProtocol`` above
+    already establish for their own real collaborators. Additive
+    (``None``-by-default, best-effort, wrapped in a blanket try/except --
+    see ``_assign_guest_queue``'s own docstring): a bandwidth-assignment
+    failure must never block a guest's login, the identical posture
+    ``monitoring_hook`` already established, **not**
+    ``access_control_hook``'s "a real gate" posture -- queueing is a
+    quality-of-service concern, not an authorization decision."""
+
+    async def resolve_and_assign_queue(
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        target_type: QueueTargetType,
+        target_id: uuid.UUID,
+        device_target: str,
+        actor_user_id: uuid.UUID | None = None,
+        auto_apply: bool = True,
+    ) -> object: ...
+
+
 # ============================================================================
 # Read models
 # ============================================================================
@@ -524,6 +553,22 @@ class GuestService:
     concurrent-session check or OTP/voucher verification -- see
     ``_enforce_access_control``'s own docstring for the exact placement
     reasoning.
+
+    ``queue_assignment_hook`` (Queue Management Engine) is a third,
+    independently optional, ``None``-by-default constructor parameter --
+    additive for the identical three reasons ``monitoring_hook`` is,
+    above, and duck-typed against
+    ``app.domains.queue_management.service.QueueManagementService`` via
+    ``QueueAssignmentProtocol``. Like ``monitoring_hook`` (and **unlike**
+    ``access_control_hook``), its call is wrapped in a blanket try/except
+    that only ever logs a warning, never raises -- a bandwidth-queue
+    assignment failure (a MikroTik queue command failing, the router
+    being briefly unreachable) is a quality-of-service concern, not an
+    authorization decision, and must never block a real guest's login.
+    Called from ``login_via_otp``/``login_via_voucher`` immediately after
+    ``_broadcast_guest_session_started``, once the real session row (and
+    its own ``ip_address``, the only thing that makes a real device queue
+    assignment possible) already exists.
     """
 
     def __init__(
@@ -537,6 +582,7 @@ class GuestService:
         audit_writer: AuditLogWriter | None = None,
         monitoring_hook: GuestSessionBroadcastProtocol | None = None,
         access_control_hook: AccessDecisionProtocol | None = None,
+        queue_assignment_hook: QueueAssignmentProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.otp_service = otp_service
@@ -546,6 +592,7 @@ class GuestService:
         self.audit_writer = audit_writer
         self.monitoring_hook = monitoring_hook
         self.access_control_hook = access_control_hook
+        self.queue_assignment_hook = queue_assignment_hook
 
     async def _broadcast_guest_session_started(
         self,
@@ -577,6 +624,40 @@ class GuestService:
         except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
             logger.warning(
                 "guest_session_broadcast_failed",
+                extra={"session_id": str(session.id), "error": str(exc)},
+            )
+
+    async def _assign_guest_queue(
+        self,
+        *,
+        session: GuestSession,
+        router: Router,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+    ) -> None:
+        """Best-effort, additive dynamic bandwidth-queue assignment -- see
+        ``QueueAssignmentProtocol``'s own docstring for the full write-up.
+        A no-op when no ``queue_assignment_hook`` was wired (the default);
+        never raises. Targets the newly-created ``session`` itself (not
+        the guest) -- a real RouterOS ``/queue simple`` entry is tied to
+        one concrete IP address, and ``session.ip_address`` is the only
+        one that is actually correct *right now*; a guest-level
+        assignment would go stale the moment they reconnect with a new
+        DHCP lease."""
+        if self.queue_assignment_hook is None or not session.ip_address:
+            return
+        try:
+            await self.queue_assignment_hook.resolve_and_assign_queue(
+                requesting_organization_id=organization_id,
+                location_id=location_id,
+                router_id=router.id,
+                target_type=QueueTargetType.SESSION,
+                target_id=session.id,
+                device_target=session.ip_address,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "guest_queue_assignment_failed",
                 extra={"session_id": str(session.id), "error": str(exc)},
             )
 
@@ -681,6 +762,12 @@ class GuestService:
             organization_id=resolved_org_id,
             auth_method=auth_method.value,
             is_new_guest=is_new,
+        )
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
         )
         await self._bump_guest_visit(guest)
         await self._record_login_success(
@@ -796,6 +883,12 @@ class GuestService:
             organization_id=resolved_org_id,
             auth_method=GuestAuthMethod.VOUCHER.value,
             is_new_guest=is_new,
+        )
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
         )
         await self._bump_guest_visit(guest)
         await self._record_login_success(

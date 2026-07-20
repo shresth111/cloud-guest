@@ -20,6 +20,7 @@ from app.domains.organization.router import router as organization_router
 from app.domains.otp.router import router as otp_router
 from app.domains.policy.router import router as policy_router
 from app.domains.provisioning_engine.router import router as provisioning_engine_router
+from app.domains.queue_management.router import router as queue_management_router
 from app.domains.rbac.router import router as rbac_router
 from app.domains.router.router import router as router_router
 from app.domains.router_agent.router import router as router_agent_router
@@ -56,3 +57,4 @@ api_v1_router.include_router(analytics_router)
 api_v1_router.include_router(billing_router)
 api_v1_router.include_router(policy_router)
 api_v1_router.include_router(provisioning_engine_router)
+api_v1_router.include_router(queue_management_router)

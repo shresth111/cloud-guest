@@ -196,7 +196,23 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.MANAGE,
         _A.EXECUTE,
     ),
-    PermissionModule.BANDWIDTH: (_A.READ, _A.UPDATE, _A.MANAGE),
+    # Extended for the Queue Management Engine (a vendor-agnostic
+    # bandwidth/QoS orchestrator) -- this key was already seeded, ahead of
+    # any real domain existing, specifically for this concern, but with a
+    # narrower action tuple than a full-CRUD+execute domain needs. CREATE/
+    # DELETE (QueueProfile CRUD) and EXECUTE (apply/remove/reset a queue
+    # on a real device, mirroring ROUTER_PROVISIONING's/
+    # PROVISIONING_ENGINE's own identical "device-affecting action" use of
+    # EXECUTE) are additive here -- no existing role's own grants change
+    # shape, only what this module's own actions expand into.
+    PermissionModule.BANDWIDTH: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.EXECUTE,
+        _A.MANAGE,
+    ),
     PermissionModule.ANALYTICS: (_A.READ, _A.EXPORT, _A.VIEW),
     PermissionModule.REPORTS: (_A.READ, _A.EXPORT, _A.VIEW, _A.MANAGE),
     PermissionModule.MONITORING: (_A.READ, _A.VIEW, _A.MANAGE),
