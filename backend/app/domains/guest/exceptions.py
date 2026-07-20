@@ -36,6 +36,9 @@ __all__ = [
     "RadiusNasClientNotFoundError",
     "RadiusNasAuthenticationError",
     "RadiusNasAlreadyRegisteredError",
+    "RadiusNasNotFoundError",
+    "CrossOrganizationNasAccessError",
+    "InvalidNasStatusTransitionError",
     "InvalidAnalyticsDateRangeError",
     "ConcurrentSessionLimitExceededError",
 ]
@@ -192,6 +195,43 @@ class RadiusNasAlreadyRegisteredError(GuestError):
     def __init__(self, router_id: uuid.UUID | str) -> None:
         super().__init__(
             f"Router {router_id} already has a registered RADIUS NAS client",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class RadiusNasNotFoundError(GuestError):
+    """No ``RadiusNasClient`` exists with this primary-key id -- the
+    admin-facing CRUD 404, distinct from ``RadiusNasClientNotFoundError``
+    (used along the RADIUS wire-protocol path, keyed by
+    ``nas_identifier`` instead)."""
+
+    def __init__(self, nas_id: uuid.UUID | str) -> None:
+        super().__init__(
+            f"RADIUS NAS client not found: {nas_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class CrossOrganizationNasAccessError(GuestError):
+    """A caller acting within organization A attempted to read/mutate a
+    NAS belonging to organization B -- mirrors
+    ``app.domains.guest_teams.exceptions.CrossOrganizationGuestTeamAccessError``."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a RADIUS NAS client belonging to another organization",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class InvalidNasStatusTransitionError(GuestError):
+    """Raised when a requested status change is not a legal edge in
+    ``constants.NAS_STATUS_TRANSITIONS``."""
+
+    def __init__(self, current_status: str, requested_status: str) -> None:
+        super().__init__(
+            f"Cannot transition NAS from '{current_status}' to "
+            f"'{requested_status}'",
             status_code=status.HTTP_409_CONFLICT,
         )
 

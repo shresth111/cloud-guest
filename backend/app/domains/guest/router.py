@@ -49,14 +49,15 @@ from app.domains.rbac.dependencies import (
     RequirePermission,
 )
 
-from .constants import GuestSessionStatus
+from .constants import GuestSessionStatus, NasStatus
 from .dependencies import (
     CurrentNas,
     get_guest_analytics_service,
     get_guest_service,
     get_radius_service,
 )
-from .models import Guest, GuestDevice, GuestSession
+from .exceptions import RadiusNasNotFoundError
+from .models import Guest, GuestDevice, GuestSession, RadiusNasClient
 from .schemas import (
     GuestAnalyticsSummaryResponse,
     GuestBlockRequest,
@@ -75,8 +76,12 @@ from .schemas import (
     RadiusAccountingResponse,
     RadiusAuthorizeRequest,
     RadiusAuthorizeResponse,
+    RadiusNasCreatedResponse,
+    RadiusNasDisableRequest,
+    RadiusNasListResponse,
     RadiusNasRegisterRequest,
     RadiusNasResponse,
+    RadiusNasUpdateRequest,
     SessionDisconnectRequest,
     SessionReconnectRequest,
     SessionTerminateRequest,
@@ -96,6 +101,8 @@ from .service import (
 guest_router = APIRouter(prefix="/guest", tags=["Guest"])
 admin_router = APIRouter(tags=["Guest Admin"])
 radius_router = APIRouter(prefix="/radius", tags=["RADIUS"])
+nas_router = APIRouter(prefix="/radius/nas", tags=["RADIUS NAS Admin"])
+nas_cross_reference_router = APIRouter(tags=["RADIUS NAS Admin"])
 analytics_router = APIRouter(prefix="/guest-analytics", tags=["Guest Analytics"])
 
 
@@ -135,6 +142,25 @@ def _session_response(session: GuestSession) -> GuestSessionResponse:
         session_timeout_minutes=session.session_timeout_minutes,
         disconnect_reason=session.disconnect_reason,
         created_at=session.created_at,
+    )
+
+
+def _nas_response(nas_client: RadiusNasClient) -> RadiusNasResponse:
+    return RadiusNasResponse(
+        id=str(nas_client.id),
+        nas_code=nas_client.nas_code,
+        router_id=str(nas_client.router_id),
+        organization_id=str(nas_client.organization_id),
+        location_id=str(nas_client.location_id),
+        nas_identifier=nas_client.nas_identifier,
+        status=nas_client.status,
+        is_active=nas_client.is_active,
+        name=nas_client.name,
+        description=nas_client.description,
+        ip_address=nas_client.ip_address,
+        vendor=nas_client.vendor,
+        created_at=nas_client.created_at,
+        updated_at=nas_client.updated_at,
     )
 
 
@@ -560,14 +586,17 @@ async def reconnect_guest_session(
 
 
 # ============================================================================
-# RADIUS-facing endpoints -- NAS shared-secret authenticated, see module
-# docstring
+# NAS admin management endpoints -- ordinary RBAC-gated admin CRUD, see
+# schemas.py's own "NAS admin-management schemas" section docstring for why
+# these (unlike Authorize/Accounting below) use the standard ApiResponse
+# envelope. Mounted under /radius/nas (nas_router) plus two cross-reference
+# lookups mounted at their own natural prefixes (nas_cross_reference_router).
 # ============================================================================
 
 
-@radius_router.post(
-    "/nas",
-    response_model=ApiResponse[RadiusNasResponse],
+@nas_router.post(
+    "",
+    response_model=ApiResponse[RadiusNasCreatedResponse],
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(RequirePermission("radius.create"))],
 )
@@ -578,25 +607,303 @@ async def register_radius_nas(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RadiusService = Depends(get_radius_service),
 ):
-    nas_client = await service.register_nas(
+    result = await service.register_nas(
         actor_user_id=uuid.UUID(user.id),
         router_id=payload.router_id,
         nas_identifier=payload.nas_identifier,
         shared_secret=payload.shared_secret,
+        name=payload.name,
+        description=payload.description,
+        ip_address=payload.ip_address,
         requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
         message="RADIUS NAS client registered",
-        data=RadiusNasResponse(
-            id=str(nas_client.id),
-            router_id=str(nas_client.router_id),
-            nas_identifier=nas_client.nas_identifier,
-            is_active=nas_client.is_active,
-            created_at=nas_client.created_at,
+        data=RadiusNasCreatedResponse(
+            **_nas_response(result.nas_client).model_dump(),
+            shared_secret=result.shared_secret,
         ).model_dump(),
         request_id=_request_id(request),
     )
+
+
+@nas_router.get(
+    "",
+    response_model=ApiResponse[RadiusNasListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.read"))],
+)
+async def list_radius_nas(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    location_id: uuid.UUID | None = Query(default=None),
+    router_id: uuid.UUID | None = Query(default=None),
+    status_filter: NasStatus | None = Query(default=None, alias="status"),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+):
+    nas_clients, meta = await service.list_nas_clients(
+        requesting_organization_id=requesting_organization_id,
+        location_id=location_id,
+        router_id=router_id,
+        status=status_filter,
+        page=page,
+        page_size=page_size,
+    )
+    payload = RadiusNasListResponse(
+        items=[_nas_response(n) for n in nas_clients],
+        page=meta.page,
+        page_size=meta.page_size,
+        total_items=meta.total_items,
+        total_pages=meta.total_pages,
+        has_next=meta.has_next,
+        has_previous=meta.has_previous,
+    )
+    return build_response(
+        success=True,
+        message="RADIUS NAS clients retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_router.get(
+    "/{nas_id}",
+    response_model=ApiResponse[RadiusNasResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.read"))],
+)
+async def get_radius_nas(
+    request: Request,
+    nas_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+):
+    nas_client = await service.get_nas_client(
+        nas_id, requesting_organization_id=requesting_organization_id
+    )
+    return build_response(
+        success=True,
+        message="RADIUS NAS client retrieved",
+        data=_nas_response(nas_client).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_router.put(
+    "/{nas_id}",
+    response_model=ApiResponse[RadiusNasResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.update"))],
+)
+async def update_radius_nas(
+    request: Request,
+    nas_id: uuid.UUID,
+    payload: RadiusNasUpdateRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+):
+    nas_client = await service.update_nas_client(
+        nas_id=nas_id,
+        requesting_organization_id=requesting_organization_id,
+        actor_user_id=uuid.UUID(user.id),
+        name=payload.name,
+        description=payload.description,
+        ip_address=payload.ip_address,
+    )
+    return build_response(
+        success=True,
+        message="RADIUS NAS client updated",
+        data=_nas_response(nas_client).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_router.delete(
+    "/{nas_id}",
+    response_model=ApiResponse[RadiusNasResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.delete"))],
+)
+async def delete_radius_nas(
+    request: Request,
+    nas_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+):
+    nas_client = await service.delete_nas(
+        nas_id=nas_id,
+        requesting_organization_id=requesting_organization_id,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="RADIUS NAS client deleted",
+        data=_nas_response(nas_client).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_router.post(
+    "/{nas_id}/activate",
+    response_model=ApiResponse[RadiusNasResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.execute"))],
+)
+async def activate_radius_nas(
+    request: Request,
+    nas_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+):
+    nas_client = await service.activate_nas(
+        nas_id=nas_id,
+        requesting_organization_id=requesting_organization_id,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="RADIUS NAS client activated",
+        data=_nas_response(nas_client).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_router.post(
+    "/{nas_id}/disable",
+    response_model=ApiResponse[RadiusNasResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.execute"))],
+)
+async def disable_radius_nas(
+    request: Request,
+    nas_id: uuid.UUID,
+    payload: RadiusNasDisableRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+):
+    nas_client = await service.disable_nas(
+        nas_id=nas_id,
+        requesting_organization_id=requesting_organization_id,
+        actor_user_id=uuid.UUID(user.id),
+        reason=payload.reason,
+    )
+    return build_response(
+        success=True,
+        message="RADIUS NAS client disabled",
+        data=_nas_response(nas_client).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_router.post(
+    "/{nas_id}/regenerate-secret",
+    response_model=ApiResponse[RadiusNasCreatedResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.execute"))],
+)
+async def regenerate_radius_nas_secret(
+    request: Request,
+    nas_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+):
+    result = await service.regenerate_secret(
+        nas_id=nas_id,
+        requesting_organization_id=requesting_organization_id,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="RADIUS NAS client shared secret regenerated",
+        data=RadiusNasCreatedResponse(
+            **_nas_response(result.nas_client).model_dump(),
+            shared_secret=result.shared_secret,
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_cross_reference_router.get(
+    "/locations/{location_id}/nas",
+    response_model=ApiResponse[RadiusNasListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.read"))],
+)
+async def list_radius_nas_for_location(
+    request: Request,
+    location_id: uuid.UUID,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+):
+    nas_clients, meta = await service.list_nas_clients(
+        requesting_organization_id=requesting_organization_id,
+        location_id=location_id,
+        page=page,
+        page_size=page_size,
+    )
+    payload = RadiusNasListResponse(
+        items=[_nas_response(n) for n in nas_clients],
+        page=meta.page,
+        page_size=meta.page_size,
+        total_items=meta.total_items,
+        total_pages=meta.total_pages,
+        has_next=meta.has_next,
+        has_previous=meta.has_previous,
+    )
+    return build_response(
+        success=True,
+        message="RADIUS NAS clients retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_cross_reference_router.get(
+    "/routers/{router_id}/nas",
+    response_model=ApiResponse[RadiusNasResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.read"))],
+)
+async def get_radius_nas_for_router(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+):
+    """A router has at most one NAS (one-to-one, see
+    ``models.RadiusNasClient``'s own docstring) -- this returns that single
+    object, not a list, even though the module brief's own route shape
+    named it ``/routers/{router_id}/nas``."""
+    nas_clients, _meta = await service.list_nas_clients(
+        requesting_organization_id=requesting_organization_id,
+        router_id=router_id,
+        page=1,
+        page_size=1,
+    )
+    if not nas_clients:
+        raise RadiusNasNotFoundError(router_id)
+    return build_response(
+        success=True,
+        message="RADIUS NAS client retrieved",
+        data=_nas_response(nas_clients[0]).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# RADIUS-facing endpoints -- NAS shared-secret authenticated, see module
+# docstring
+# ============================================================================
 
 
 @radius_router.post(
@@ -824,4 +1131,11 @@ async def get_voucher_usage(
     )
 
 
-__all__ = ["guest_router", "admin_router", "radius_router", "analytics_router"]
+__all__ = [
+    "guest_router",
+    "admin_router",
+    "radius_router",
+    "nas_router",
+    "nas_cross_reference_router",
+    "analytics_router",
+]

@@ -185,6 +185,100 @@ RADIUS_ACCT_STATUS_START = "start"
 RADIUS_ACCT_STATUS_INTERIM_UPDATE = "interim-update"
 RADIUS_ACCT_STATUS_STOP = "stop"
 
+# ============================================================================
+# NAS lifecycle -- extends RadiusNasClient (originally a bare
+# router_id/nas_identifier/shared_secret_encrypted/is_active row) with a
+# real status graph, a human-readable ``nas_code``, and the fields a
+# dashboard/admin API needs without joining through ``Router`` for every
+# read. See ``models.py``'s own ``RadiusNasClient`` docstring and
+# ``docs/guest/NAS_EXTENSION.md`` for the full design write-up.
+# ============================================================================
+
+
+class NasStatus(StrEnum):
+    """Lifecycle status of a :class:`~.models.RadiusNasClient`.
+
+    * ``PENDING`` -- registered but not yet confirmed ready to serve
+      RADIUS traffic. Not the default for ``RadiusService.register_nas``
+      (see that method's own docstring for why -- unlike ``Router``'s own
+      ``PENDING_PROVISIONING``, a NAS registration has no genuine
+      multi-step hardware provisioning gate; its only prerequisite,
+      correct credentials, already exists at creation time), but a real,
+      reachable status for a future caller (e.g. an automated
+      router-provisioning flow) that wants to stage a NAS before its
+      router finishes its own provisioning.
+    * ``ACTIVE`` -- the default status a NAS is registered in.
+      ``RadiusService.authenticate_nas`` only accepts a NAS in this
+      status.
+    * ``DISABLED`` -- an explicit, reversible administrative pause
+      (``RadiusService.disable_nas`` / ``.activate_nas``).
+    * ``SUSPENDED`` -- a stronger restriction than ``DISABLED`` (e.g. a
+      security incident or billing hold) -- modeled here as a real,
+      validated status with its own legal transitions for structural
+      completeness, but this build exposes no dedicated
+      ``POST /radius/nas/{id}/suspend`` endpoint of its own (only
+      ``activate``/``disable``/``regenerate-secret`` were in this
+      extension's own scope) -- see ``docs/guest/NAS_EXTENSION.md``.
+    * ``DELETED`` -- terminal. Reached only via
+      ``RadiusService.delete_nas``, which also sets the row's ordinary
+      ``BaseModel`` soft-delete fields (``is_deleted``/``deleted_at``) so
+      it disappears from every normal listing the same way every other
+      domain's soft-deleted rows already do -- ``status`` alone is not
+      what hides it.
+    """
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    DISABLED = "disabled"
+    SUSPENDED = "suspended"
+    DELETED = "deleted"
+
+
+# The explicit, exhaustive legal-transition graph for
+# ``RadiusNasClient.status`` -- mirrors
+# ``GUEST_SESSION_STATUS_TRANSITIONS``'s/``app.domains.voucher.constants
+# .VOUCHER_BATCH_STATUS_TRANSITIONS``'s identical dict-of-frozenset shape.
+# ``DELETED`` is terminal (no outgoing edges, not even to itself).
+NAS_STATUS_TRANSITIONS: dict[NasStatus, frozenset[NasStatus]] = {
+    NasStatus.PENDING: frozenset(
+        {NasStatus.ACTIVE, NasStatus.DISABLED, NasStatus.DELETED}
+    ),
+    NasStatus.ACTIVE: frozenset(
+        {NasStatus.DISABLED, NasStatus.SUSPENDED, NasStatus.DELETED}
+    ),
+    NasStatus.DISABLED: frozenset({NasStatus.ACTIVE, NasStatus.DELETED}),
+    NasStatus.SUSPENDED: frozenset({NasStatus.ACTIVE, NasStatus.DELETED}),
+    NasStatus.DELETED: frozenset(),
+}
+
+# Human-readable NAS code prefix/digit-width -- see
+# ``nas_number_generator.py``'s own module docstring for the full
+# "why this format, not the module brief's imagined one" write-up.
+# ``"NAS-<location_code>-<sequence>"``.
+NAS_CODE_PREFIX = "NAS"
+NAS_CODE_SEQUENCE_DIGITS = 4
+
+# Bound on how many (in-memory-generate, then DB-existence-check) rounds a
+# fallback identifier attempt would need -- unlike the voucher/guest-team
+# join-code generators, ``nas_code`` generation is not a random-retry
+# scheme (it is a real, atomic, collision-free Postgres sequence via
+# ``NAS_CODE_PREFIX``/``RadiusNasCodeCounter``), so no retry-round constant
+# is needed here at all -- noted for readers expecting one by analogy with
+# ``voucher.constants.CODE_GENERATION_MAX_ROUNDS``.
+
+# Default length (bytes of entropy before base64url-encoding, via
+# ``secrets.token_urlsafe``) for an auto-generated RADIUS shared secret when
+# an admin does not supply one explicitly. 32 bytes -> a 43-character
+# URL-safe string, comfortably exceeding
+# ``schemas.RadiusNasRegisterRequest.shared_secret``'s existing
+# ``min_length=8`` floor by a wide margin, and matching this codebase's own
+# existing precedent for cryptographically-random secret material (e.g.
+# ``app.domains.wireguard``'s key generation) of preferring the OS CSPRNG
+# over a shorter, human-typed value whenever a human does not need to
+# transcribe it (a RADIUS shared secret is configured once into
+# FreeRADIUS's own config and never manually retyped afterward).
+NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES = 32
+
 __all__ = [
     "GuestAuthMethod",
     "GuestSessionStatus",
@@ -201,4 +295,9 @@ __all__ = [
     "RADIUS_ACCT_STATUS_START",
     "RADIUS_ACCT_STATUS_INTERIM_UPDATE",
     "RADIUS_ACCT_STATUS_STOP",
+    "NasStatus",
+    "NAS_STATUS_TRANSITIONS",
+    "NAS_CODE_PREFIX",
+    "NAS_CODE_SEQUENCE_DIGITS",
+    "NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES",
 ]

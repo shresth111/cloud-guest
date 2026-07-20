@@ -3,7 +3,7 @@ domain in BE-010, which composes ``app.domains.otp``, ``app.domains
 .voucher``, ``app.domains.captive_portal``, and ``app.domains.router`` into
 the actual guest WiFi login journey.
 
-All six models extend ``app.database.base.BaseModel`` (UUID PK, timestamps,
+All models extend ``app.database.base.BaseModel`` (UUID PK, timestamps,
 soft-delete, audit, version columns) for the same reason every other domain
 does -- Alembic autogenerate, ``GenericRepository``, and cross-domain FKs all
 keep working uniformly.
@@ -26,7 +26,12 @@ keep working uniformly.
   terms and conditions.
 * :class:`RadiusNasClient` -- a router's registered FreeRADIUS NAS identity
   for the ``rlm_rest``-style integration (see ``service.py``'s module
-  docstring for the full architectural write-up).
+  docstring for the full architectural write-up), extended with a real
+  status lifecycle, denormalized tenant columns, and a human-readable
+  ``nas_code`` (see that class's own docstring and
+  ``docs/guest/NAS_EXTENSION.md``).
+* :class:`RadiusNasCodeCounter` -- the atomic per-location sequence counter
+  backing ``RadiusNasClient.nas_code`` generation.
 
 ## MAC address uniqueness: globally unique, guest_id reassignable
 
@@ -103,13 +108,15 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-from .constants import GuestSessionStatus
+from .constants import GuestSessionStatus, NasStatus
 
 
 class Guest(BaseModel):
@@ -400,7 +407,11 @@ class GuestConsent(BaseModel):
 class RadiusNasClient(BaseModel):
     """A router's registered FreeRADIUS NAS identity -- a router *is* a
     RADIUS NAS (Network Access Server), one-to-one. See ``service.py``'s
-    module docstring for the full ``rlm_rest`` architectural write-up.
+    module docstring for the full ``rlm_rest`` architectural write-up, and
+    ``docs/guest/NAS_EXTENSION.md`` for the full write-up behind every field
+    added below this class's original four columns
+    (``router_id``/``nas_identifier``/``shared_secret_encrypted``/
+    ``is_active``).
 
     ``shared_secret_encrypted`` is Fernet-encrypted via
     ``app.domains.router.crypto.encrypt_secret`` (reused, not
@@ -411,6 +422,22 @@ class RadiusNasClient(BaseModel):
     ``app.domains.router.models.Router.api_credentials_encrypted`` already
     established for RouterOS API credentials (a live connection needs the
     plaintext back, not just a yes/no hash comparison).
+
+    ``organization_id``/``location_id`` are denormalized from ``Router`` at
+    registration time (never re-derived by join thereafter), the same
+    "denormalize onto every child table at write time" convention every
+    other domain in this codebase already follows for tenant-scoped
+    queries -- the original four-column table predated this and required a
+    join through ``Router`` for every tenant check; this closes that gap.
+
+    ``is_active`` is kept (never dropped -- this codebase makes no
+    destructive changes to existing columns) as a **derived, synced mirror**
+    of ``status == NasStatus.ACTIVE``, updated by every status-mutating
+    service method alongside ``status`` itself, for any external reader
+    still keyed on the original boolean. ``status`` (see
+    ``constants.NasStatus``) is the actual source of truth --
+    ``RadiusService.authenticate_nas`` checks ``status``, not ``is_active``,
+    as of this extension.
     """
 
     __tablename__ = "radius_nas_clients"
@@ -421,20 +448,108 @@ class RadiusNasClient(BaseModel):
         nullable=False,
         unique=True,
     )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Human-readable, immutable, auto-generated -- see
+    # nas_number_generator.py's own module docstring. Distinct from
+    # nas_identifier: that field is the RADIUS wire-protocol identifier
+    # (freeform, configured into FreeRADIUS itself); this one is a
+    # dashboard/ops-facing label, never used in the RADIUS protocol path.
+    # Nullable, mirroring ``app.domains.location.models.Location
+    # .location_code``'s identical convention: this column was added onto
+    # an already-existing table by this extension, and pre-existing rows
+    # (registered before this extension) are never retroactively backfilled
+    # with a generated value -- only new registrations get one. The
+    # partial unique index below (``WHERE nas_code IS NOT NULL``) is what
+    # makes several NULL rows coexist safely alongside real, unique codes.
+    nas_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     nas_identifier: Mapped[str] = mapped_column(
         String(255), nullable=False, unique=True
     )
     shared_secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), default=NasStatus.ACTIVE.value, nullable=False
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The RADIUS NAS-IP-Address attribute value -- defaults to the
+    # router's own public_ip_address (falling back to
+    # management_ip_address) at registration time, but is its own column,
+    # not re-derived by join, since it can legitimately diverge later (a
+    # router's own IP changing does not necessarily mean FreeRADIUS's
+    # configured NAS-IP-Address should silently follow without an admin
+    # decision).
+    ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    # Every Router in this codebase is a MikroTik RouterOS device today
+    # (see app.domains.router.models.Router's own docstring) -- "MikroTik"
+    # is a real, true default, not a fabricated placeholder value, and
+    # this column exists as a genuine extensibility seam for whenever
+    # multi-vendor support is added. Deliberately NOT paired with a
+    # separate `device_type` column: Router.model already serves that
+    # exact purpose (reachable via router_id); duplicating it here would
+    # create a second, driftable source of truth.
+    vendor: Mapped[str] = mapped_column(String(50), default="MikroTik", nullable=False)
 
     __table_args__ = (
         Index("ix_radius_nas_clients_router_id", "router_id", unique=True),
+        Index("ix_radius_nas_clients_organization_id", "organization_id"),
+        Index("ix_radius_nas_clients_location_id", "location_id"),
+        Index(
+            "uq_radius_nas_clients_nas_code",
+            "nas_code",
+            unique=True,
+            postgresql_where=text("nas_code IS NOT NULL"),
+        ),
         Index("ix_radius_nas_clients_nas_identifier", "nas_identifier", unique=True),
+        Index("ix_radius_nas_clients_status", "status"),
         Index("ix_radius_nas_clients_is_active", "is_active"),
     )
 
     def __repr__(self) -> str:
-        return f"<RadiusNasClient(id={self.id}, nas_identifier={self.nas_identifier})>"
+        return (
+            f"<RadiusNasClient(id={self.id}, nas_code={self.nas_code}, "
+            f"nas_identifier={self.nas_identifier}, status={self.status})>"
+        )
+
+
+class RadiusNasCodeCounter(BaseModel):
+    """The dedicated, real, DB-level-atomic counter table backing
+    ``RadiusNasClient.nas_code`` generation -- mirrors
+    ``app.domains.location.models.LocationCodeCounter`` exactly (same
+    ``counter_key`` unique-column + single atomic
+    ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING`` mechanism, see
+    ``nas_number_generator.py``'s own module docstring for the full
+    concurrency-safety write-up).
+
+    ``counter_key`` is ``"nas:<location_id>"`` -- one row per location, so
+    the sequence is "the Nth NAS ever registered at this location",
+    independent of every other location's own count.
+    """
+
+    __tablename__ = "radius_nas_code_counters"
+
+    counter_key: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    last_value: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("counter_key", name="uq_radius_nas_code_counters_counter_key"),
+        Index("ix_radius_nas_code_counters_counter_key", "counter_key", unique=True),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<RadiusNasCodeCounter(counter_key={self.counter_key}, "
+            f"last_value={self.last_value})>"
+        )
 
 
 __all__ = [
@@ -444,4 +559,5 @@ __all__ = [
     "GuestLoginHistory",
     "GuestConsent",
     "RadiusNasClient",
+    "RadiusNasCodeCounter",
 ]

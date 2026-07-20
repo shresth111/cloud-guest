@@ -105,6 +105,37 @@ class RadiusNasRegistered:
     occurred_at: datetime = field(default_factory=_now)
 
 
+@dataclass(frozen=True, slots=True)
+class RadiusNasActivated:
+    nas_client_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class RadiusNasDisabled:
+    nas_client_id: uuid.UUID
+    reason: str | None
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class RadiusNasSecretRegenerated:
+    nas_client_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class RadiusNasUpdated:
+    nas_client_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class RadiusNasDeleted:
+    nas_client_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "GuestLoggedIn",
     "GuestLoginFailed",
@@ -116,4 +147,9 @@ __all__ = [
     "GuestUnblocked",
     "GuestConsentRecorded",
     "RadiusNasRegistered",
+    "RadiusNasActivated",
+    "RadiusNasDisabled",
+    "RadiusNasSecretRegenerated",
+    "RadiusNasUpdated",
+    "RadiusNasDeleted",
 ]

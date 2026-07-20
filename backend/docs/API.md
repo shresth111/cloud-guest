@@ -2012,3 +2012,54 @@ every assignment (active and inactive) for the policy.
 `policy.execute`. Deactivates the assignment (`is_active=false`) -- it is
 immediately excluded from future resolution, but the row itself is kept for
 history.
+
+
+## RADIUS NAS Admin Endpoints
+
+See `docs/guest/NAS_EXTENSION.md` for the full design write-up -- this
+extends `app.domains.guest`'s pre-existing `RadiusNasClient` (a router's
+registered FreeRADIUS NAS identity, already wired into a real
+`rlm_rest` integration) rather than introducing a second, parallel NAS
+concept. `POST/GET /radius/authorize`/`/radius/accounting` (the RADIUS
+wire-protocol endpoints) are unchanged by this extension and remain
+unauthenticated (NAS shared-secret via `CurrentNas`) -- everything below is
+new, RBAC-gated (`radius.*`) admin management.
+
+`POST /radius/nas` -- requires `radius.create`. Body: `router_id`,
+`nas_identifier`, optional `shared_secret` (omit to auto-generate a
+cryptographically-random one), optional `name`/`description`/`ip_address`
+(defaults from the router's own public/management IP). Response includes
+`shared_secret` in plaintext -- the only time it is ever exposed again
+after this call.
+
+`GET /radius/nas` -- requires `radius.read`. Paginated, filterable by
+`location_id`/`router_id`/`status`.
+
+`GET /radius/nas/{nas_id}` -- requires `radius.read`.
+
+`PUT /radius/nas/{nas_id}` -- requires `radius.update`. Cosmetic-only:
+`name`/`description`/`ip_address`. Status transitions go through the
+dedicated endpoints below, never this one.
+
+`DELETE /radius/nas/{nas_id}` -- requires `radius.delete`. Transitions to
+the terminal `deleted` status and sets the row's ordinary soft-delete
+fields -- it disappears from `GET /radius/nas` afterward, the same as
+every other domain's own soft-deleted rows.
+
+`POST /radius/nas/{nas_id}/activate` -- requires `radius.execute`.
+
+`POST /radius/nas/{nas_id}/disable` -- requires `radius.execute`. Body:
+optional `reason`. A disabled NAS fails `authenticate_nas` (RADIUS
+Authorize/Accounting calls from it are rejected) until reactivated.
+
+`POST /radius/nas/{nas_id}/regenerate-secret` -- requires `radius.execute`.
+Immediately invalidates the old secret. Response includes the new
+plaintext `shared_secret`, the same one-time-exposure contract as
+registration. Does not require or change the NAS's own status.
+
+`GET /locations/{location_id}/nas` -- requires `radius.read`. Every NAS
+registered at that location, paginated.
+
+`GET /routers/{router_id}/nas` -- requires `radius.read`. A router has at
+most one NAS (`router_id` is unique on `radius_nas_clients`) -- returns
+that single object, not a list, despite the route's own plural shape.

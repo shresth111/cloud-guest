@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
@@ -37,6 +38,7 @@ from .models import (
     GuestLoginHistory,
     GuestSession,
     RadiusNasClient,
+    RadiusNasCodeCounter,
 )
 
 # ============================================================================
@@ -164,9 +166,23 @@ class GuestRepositoryProtocol(Protocol):
         self, router_id: uuid.UUID
     ) -> RadiusNasClient | None: ...
 
+    async def get_nas_client_by_id(
+        self, nas_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> RadiusNasClient | None: ...
+
     async def update_nas_client(
         self, nas_client: RadiusNasClient, data: dict[str, object]
     ) -> RadiusNasClient: ...
+
+    async def list_nas_clients(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        filters: dict[str, object] | None = None,
+        sort_by: str = DEFAULT_SORT_FIELD,
+        sort_order: SortOrder = SortOrder.DESC,
+    ) -> tuple[list[RadiusNasClient], PaginationMeta]: ...
 
     # -- analytics -----------------------------------------------------------------
     async def get_session_aggregate(
@@ -445,10 +461,32 @@ class GuestRepository:
         )
         return results[0] if results else None
 
+    async def get_nas_client_by_id(
+        self, nas_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> RadiusNasClient | None:
+        return await self.nas_clients.get_by_id(nas_id, include_deleted=include_deleted)
+
     async def update_nas_client(
         self, nas_client: RadiusNasClient, data: dict[str, object]
     ) -> RadiusNasClient:
         return await self.nas_clients.update(nas_client, data)
+
+    async def list_nas_clients(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        filters: dict[str, object] | None = None,
+        sort_by: str = DEFAULT_SORT_FIELD,
+        sort_order: SortOrder = SortOrder.DESC,
+    ) -> tuple[list[RadiusNasClient], PaginationMeta]:
+        return await self.nas_clients.paginate(
+            page=page,
+            page_size=page_size,
+            filters=filters,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
 
     # -- analytics -----------------------------------------------------------------
 
@@ -685,9 +723,38 @@ class GuestRepository:
         )
 
 
+class RadiusNasCodeCounterRepository:
+    """Concrete, SQLAlchemy-backed implementation of
+    ``nas_number_generator.NasCodeCounterRepositoryProtocol`` -- mirrors
+    ``app.domains.location.repository.LocationCodeCounterRepository``
+    exactly (see ``nas_number_generator.py``'s own module docstring for the
+    full concurrency-safety write-up)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def increment_and_get_next(self, counter_key: str) -> int:
+        statement = (
+            pg_insert(RadiusNasCodeCounter)
+            .values(counter_key=counter_key, last_value=1)
+            .on_conflict_do_update(
+                index_elements=[RadiusNasCodeCounter.counter_key],
+                set_={
+                    "last_value": RadiusNasCodeCounter.last_value + 1,
+                    "version": RadiusNasCodeCounter.version + 1,
+                },
+            )
+            .returning(RadiusNasCodeCounter.last_value)
+        )
+        result = await self.session.execute(statement)
+        await self.session.flush()
+        return int(result.scalar_one())
+
+
 __all__ = [
     "GuestRepositoryProtocol",
     "GuestRepository",
+    "RadiusNasCodeCounterRepository",
     "SessionAggregate",
     "LocationSessionCount",
     "DeviceSessionCount",

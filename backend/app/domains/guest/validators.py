@@ -12,10 +12,13 @@ from datetime import datetime
 from .constants import (
     BYTES_PER_MB,
     GUEST_SESSION_STATUS_TRANSITIONS,
+    NAS_STATUS_TRANSITIONS,
     GuestSessionStatus,
+    NasStatus,
 )
 from .exceptions import (
     InvalidAnalyticsDateRangeError,
+    InvalidNasStatusTransitionError,
     InvalidSessionStatusTransitionError,
 )
 from .models import GuestSession
@@ -52,6 +55,17 @@ def validate_session_status_transition(
     legal_targets = GUEST_SESSION_STATUS_TRANSITIONS.get(current, frozenset())
     if target not in legal_targets:
         raise InvalidSessionStatusTransitionError(current.value, target.value)
+
+
+def validate_nas_status_transition(*, current: NasStatus, target: NasStatus) -> None:
+    """Consults the exhaustive ``NAS_STATUS_TRANSITIONS`` graph. Deliberately
+    has no "same status is a no-op" shortcut -- e.g. disabling an
+    already-``DISABLED`` NAS must raise (``DELETED`` has no outgoing edges
+    at all, including to itself), mirroring
+    ``validate_session_status_transition``'s identical discipline."""
+    legal_targets = NAS_STATUS_TRANSITIONS.get(current, frozenset())
+    if target not in legal_targets:
+        raise InvalidNasStatusTransitionError(current.value, target.value)
 
 
 def is_session_timed_out(session: GuestSession, *, now: datetime) -> bool:
@@ -103,6 +117,7 @@ __all__ = [
     "normalize_mac_address",
     "normalize_identifier",
     "validate_session_status_transition",
+    "validate_nas_status_transition",
     "is_session_timed_out",
     "is_quota_exceeded",
     "validate_date_range",

@@ -187,6 +187,7 @@ from app.common.exceptions import CloudGuestError
 from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.guest_access.exceptions import GuestAccessDeniedError
 from app.domains.guest_access.service import AccessDecision
+from app.domains.location.models import Location
 from app.domains.monitoring.constants import RealtimeMessageType
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
@@ -203,10 +204,12 @@ from app.domains.voucher.models import Voucher, VoucherBatch
 from .constants import (
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
+    NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
     RECONNECT_GRACE_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
     GuestAuthMethod,
     GuestSessionStatus,
+    NasStatus,
 )
 from .events import (
     GuestBlocked,
@@ -218,11 +221,17 @@ from .events import (
     GuestSessionExpired,
     GuestSessionTerminated,
     GuestUnblocked,
+    RadiusNasActivated,
+    RadiusNasDeleted,
+    RadiusNasDisabled,
     RadiusNasRegistered,
+    RadiusNasSecretRegenerated,
+    RadiusNasUpdated,
 )
 from .exceptions import (
     ConcurrentSessionLimitExceededError,
     CrossOrganizationGuestAccessError,
+    CrossOrganizationNasAccessError,
     GuestAuthMethodNotEnabledError,
     GuestBlockedError,
     GuestNotFoundError,
@@ -230,10 +239,16 @@ from .exceptions import (
     NoReconnectableSessionError,
     RadiusNasAlreadyRegisteredError,
     RadiusNasAuthenticationError,
+    RadiusNasNotFoundError,
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
 )
 from .models import Guest, GuestConsent, GuestDevice, GuestSession, RadiusNasClient
+from .nas_number_generator import (
+    NasCodeCounterRepositoryProtocol,
+    generate_nas_code,
+    generate_shared_secret,
+)
 from .repository import (
     DeviceSessionCount,
     GuestRepositoryProtocol,
@@ -246,6 +261,7 @@ from .validators import (
     normalize_identifier,
     normalize_mac_address,
     validate_date_range,
+    validate_nas_status_transition,
     validate_session_status_transition,
 )
 
@@ -337,6 +353,22 @@ class RouterLookupProtocol(Protocol):
         requesting_organization_id: uuid.UUID | None = None,
         include_deleted: bool = False,
     ) -> Router: ...
+
+
+class LocationLookupProtocol(Protocol):
+    """The narrow surface ``RadiusService`` needs to resolve a router's own
+    ``Location.location_code`` for ``nas_number_generator.generate_nas_code``
+    -- satisfied structurally by the real ``LocationService``, the same
+    "narrow Protocol, composed via dependency injection" shape every other
+    cross-domain composition in this codebase already uses."""
+
+    async def get_location(
+        self,
+        location_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
+    ) -> Location: ...
 
 
 class AuditLogWriter(Protocol):
@@ -1495,28 +1527,60 @@ class GuestService:
 # ============================================================================
 
 
+@dataclass(frozen=True, slots=True)
+class RadiusNasRegistrationResult:
+    """``register_nas``'s return value -- carries the plaintext shared
+    secret back to the caller exactly once (whether admin-supplied or
+    server-generated), the same "show it once at issuance, never again"
+    posture any real secret/API-key issuance flow needs. Never persisted or
+    logged anywhere in plaintext -- only ``nas_client.shared_secret_encrypted``
+    is stored."""
+
+    nas_client: RadiusNasClient
+    shared_secret: str
+
+
+@dataclass(frozen=True, slots=True)
+class RadiusNasSecretRegenerationResult:
+    """``regenerate_secret``'s return value -- see
+    ``RadiusNasRegistrationResult``'s identical one-time-plaintext
+    reasoning."""
+
+    nas_client: RadiusNasClient
+    shared_secret: str
+
+
 class RadiusService:
     """FreeRADIUS ``rlm_rest`` HTTP integration -- see module docstring for
-    the full architectural write-up."""
+    the full architectural write-up -- extended with real NAS lifecycle
+    management (list/get/update/activate/disable/regenerate-secret/delete).
+    See ``docs/guest/NAS_EXTENSION.md`` for the full design write-up behind
+    every method added below the original four
+    (``authenticate_nas``/``register_nas``/``authorize``/accounting).
+    """
 
     def __init__(
         self,
         repository: GuestRepositoryProtocol,
         guest_service: GuestService,
         router_lookup: RouterLookupProtocol,
+        location_lookup: LocationLookupProtocol,
+        nas_code_counter_repository: NasCodeCounterRepositoryProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
     ) -> None:
         self.repository = repository
         self.guest_service = guest_service
         self.router_lookup = router_lookup
+        self.location_lookup = location_lookup
+        self.nas_code_counter_repository = nas_code_counter_repository
         self.audit_writer = audit_writer
 
     async def authenticate_nas(
         self, *, nas_identifier: str, shared_secret: str
     ) -> RadiusNasClient:
         nas_client = await self.repository.get_nas_client_by_identifier(nas_identifier)
-        if nas_client is None or not nas_client.is_active:
+        if nas_client is None or NasStatus(nas_client.status) != NasStatus.ACTIVE:
             raise RadiusNasAuthenticationError()
         try:
             decrypted = decrypt_secret(nas_client.shared_secret_encrypted)
@@ -1532,9 +1596,27 @@ class RadiusService:
         actor_user_id: uuid.UUID | None,
         router_id: uuid.UUID,
         nas_identifier: str,
-        shared_secret: str,
+        shared_secret: str | None = None,
+        shared_secret_length_bytes: int = NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
+        name: str | None = None,
+        description: str | None = None,
+        ip_address: str | None = None,
+        initial_status: NasStatus = NasStatus.ACTIVE,
         requesting_organization_id: uuid.UUID | None = None,
-    ) -> RadiusNasClient:
+    ) -> RadiusNasRegistrationResult:
+        """Registers ``router_id`` as a RADIUS NAS. ``shared_secret`` is
+        optional -- if omitted, a cryptographically-random one is generated
+        (see ``nas_number_generator.generate_shared_secret``); either way
+        the plaintext is returned exactly once via
+        ``RadiusNasRegistrationResult.shared_secret``, never persisted.
+        ``initial_status`` defaults to ``ACTIVE`` (immediately usable,
+        preserving this method's original behavior) rather than ``PENDING``
+        -- see ``constants.NasStatus.PENDING``'s own docstring for why a NAS
+        registration has no genuine provisioning gate to default-stage
+        behind, unlike ``Router``'s own ``PENDING_PROVISIONING``.
+        ``organization_id``/``location_id`` are denormalized from the
+        resolved ``Router`` at this exact moment (see ``models
+        .RadiusNasClient``'s own docstring)."""
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
@@ -1542,11 +1624,33 @@ class RadiusService:
         if existing is not None:
             raise RadiusNasAlreadyRegisteredError(router.id)
 
+        location = await self.location_lookup.get_location(
+            router.location_id, requesting_organization_id=router.organization_id
+        )
+        nas_code = await generate_nas_code(
+            self.nas_code_counter_repository,
+            location_id=router.location_id,
+            location_code=location.location_code,
+        )
+        plaintext_secret = shared_secret or generate_shared_secret(
+            shared_secret_length_bytes
+        )
+        resolved_ip_address = (
+            ip_address or router.public_ip_address or router.management_ip_address
+        )
+
         nas_client = await self.repository.create_nas_client(
             router_id=router.id,
+            organization_id=router.organization_id,
+            location_id=router.location_id,
+            nas_code=nas_code,
             nas_identifier=nas_identifier,
-            shared_secret_encrypted=encrypt_secret(shared_secret),
-            is_active=True,
+            shared_secret_encrypted=encrypt_secret(plaintext_secret),
+            status=initial_status.value,
+            is_active=initial_status == NasStatus.ACTIVE,
+            name=name,
+            description=description,
+            ip_address=resolved_ip_address,
             created_by=actor_user_id,
         )
         event = RadiusNasRegistered(
@@ -1555,18 +1659,284 @@ class RadiusService:
             nas_identifier=nas_identifier,
         )
         logger.info("radius_nas_registered", extra=_event_extra(event))
-        if self.audit_writer is not None:
-            await self.audit_writer.create_audit_log_entry(
-                actor_user_id=actor_user_id,
-                action=AuditAction.RADIUS_NAS_REGISTERED.value,
-                entity_type="radius_nas_client",
-                entity_id=nas_client.id,
-                description=f"RADIUS NAS client registered for router {router.id}",
-                event_metadata={"nas_identifier": nas_identifier},
-                organization_id=router.organization_id,
-                location_id=router.location_id,
-            )
+        await self._audit_nas(
+            actor_user_id,
+            AuditAction.RADIUS_NAS_REGISTERED,
+            nas_client=nas_client,
+            description=(
+                f"RADIUS NAS client '{nas_code}' registered for router {router.id}"
+            ),
+            event_metadata={"nas_identifier": nas_identifier, "nas_code": nas_code},
+        )
+        return RadiusNasRegistrationResult(
+            nas_client=nas_client, shared_secret=plaintext_secret
+        )
+
+    # ========================================================================
+    # NAS lifecycle: read/list/update/activate/disable/regenerate/delete
+    # ========================================================================
+
+    async def get_nas_client(
+        self,
+        nas_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> RadiusNasClient:
+        nas_client = await self.repository.get_nas_client_by_id(nas_id)
+        if nas_client is None:
+            raise RadiusNasNotFoundError(nas_id)
+        self._enforce_nas_tenant_scope(
+            nas_client.organization_id, requesting_organization_id
+        )
         return nas_client
+
+    async def list_nas_clients(
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
+        router_id: uuid.UUID | None = None,
+        status: NasStatus | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[RadiusNasClient], object]:
+        filters: dict[str, object] = {}
+        if requesting_organization_id is not None:
+            filters["organization_id"] = requesting_organization_id
+        if location_id is not None:
+            filters["location_id"] = location_id
+        if router_id is not None:
+            filters["router_id"] = router_id
+        if status is not None:
+            filters["status"] = status.value
+        return await self.repository.list_nas_clients(
+            page=page, page_size=page_size, filters=filters or None
+        )
+
+    async def update_nas_client(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None,
+        name: str | None = None,
+        description: str | None = None,
+        ip_address: str | None = None,
+    ) -> RadiusNasClient:
+        """Cosmetic-only update -- ``name``/``description``/``ip_address``.
+        Status transitions go through ``activate_nas``/``disable_nas``/
+        ``delete_nas`` instead, never through this method, so every status
+        change is independently validated against
+        ``constants.NAS_STATUS_TRANSITIONS``."""
+        nas_client = await self.get_nas_client(
+            nas_id, requesting_organization_id=requesting_organization_id
+        )
+        data: dict[str, object] = {"updated_by": actor_user_id}
+        if name is not None:
+            data["name"] = name
+        if description is not None:
+            data["description"] = description
+        if ip_address is not None:
+            data["ip_address"] = ip_address
+        updated = await self.repository.update_nas_client(nas_client, data)
+        event = RadiusNasUpdated(nas_client_id=updated.id)
+        logger.info("radius_nas_updated", extra=_event_extra(event))
+        await self._audit_nas(
+            actor_user_id,
+            AuditAction.RADIUS_NAS_UPDATED,
+            nas_client=updated,
+            description=f"RADIUS NAS client '{self._nas_display(updated)}' updated",
+        )
+        return updated
+
+    async def activate_nas(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> RadiusNasClient:
+        nas_client = await self.get_nas_client(
+            nas_id, requesting_organization_id=requesting_organization_id
+        )
+        current = NasStatus(nas_client.status)
+        validate_nas_status_transition(current=current, target=NasStatus.ACTIVE)
+        updated = await self.repository.update_nas_client(
+            nas_client,
+            {
+                "status": NasStatus.ACTIVE.value,
+                "is_active": True,
+                "updated_by": actor_user_id,
+            },
+        )
+        event = RadiusNasActivated(nas_client_id=updated.id)
+        logger.info("radius_nas_activated", extra=_event_extra(event))
+        await self._audit_nas(
+            actor_user_id,
+            AuditAction.RADIUS_NAS_ACTIVATED,
+            nas_client=updated,
+            description=f"RADIUS NAS client '{self._nas_display(updated)}' activated",
+        )
+        return updated
+
+    async def disable_nas(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None,
+        reason: str | None = None,
+    ) -> RadiusNasClient:
+        nas_client = await self.get_nas_client(
+            nas_id, requesting_organization_id=requesting_organization_id
+        )
+        current = NasStatus(nas_client.status)
+        validate_nas_status_transition(current=current, target=NasStatus.DISABLED)
+        updated = await self.repository.update_nas_client(
+            nas_client,
+            {
+                "status": NasStatus.DISABLED.value,
+                "is_active": False,
+                "updated_by": actor_user_id,
+            },
+        )
+        event = RadiusNasDisabled(nas_client_id=updated.id, reason=reason)
+        logger.info("radius_nas_disabled", extra=_event_extra(event))
+        description = f"RADIUS NAS client '{self._nas_display(updated)}' disabled"
+        if reason:
+            description += f": {reason}"
+        await self._audit_nas(
+            actor_user_id,
+            AuditAction.RADIUS_NAS_DISABLED,
+            nas_client=updated,
+            description=description,
+        )
+        return updated
+
+    async def regenerate_secret(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None,
+        length_bytes: int = NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
+    ) -> RadiusNasSecretRegenerationResult:
+        """Generates a brand-new shared secret and immediately overwrites
+        ``shared_secret_encrypted`` -- the old secret is never recoverable
+        again after this call (Fernet-encrypted, not hashed, but the
+        plaintext itself is never retained anywhere once this method
+        returns). Does not require any particular current ``status`` -- an
+        operator may want to rotate a compromised secret on a
+        currently-``DISABLED``/``SUSPENDED`` NAS too, and this action never
+        changes ``status`` itself."""
+        nas_client = await self.get_nas_client(
+            nas_id, requesting_organization_id=requesting_organization_id
+        )
+        plaintext_secret = generate_shared_secret(length_bytes)
+        updated = await self.repository.update_nas_client(
+            nas_client,
+            {
+                "shared_secret_encrypted": encrypt_secret(plaintext_secret),
+                "updated_by": actor_user_id,
+            },
+        )
+        event = RadiusNasSecretRegenerated(nas_client_id=updated.id)
+        logger.info("radius_nas_secret_regenerated", extra=_event_extra(event))
+        await self._audit_nas(
+            actor_user_id,
+            AuditAction.RADIUS_NAS_SECRET_REGENERATED,
+            nas_client=updated,
+            description=(
+                f"RADIUS NAS client '{self._nas_display(updated)}' shared "
+                "secret regenerated"
+            ),
+        )
+        return RadiusNasSecretRegenerationResult(
+            nas_client=updated, shared_secret=plaintext_secret
+        )
+
+    async def delete_nas(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> RadiusNasClient:
+        """Transitions to the terminal ``DELETED`` status *and* sets the
+        row's ordinary ``BaseModel`` soft-delete fields
+        (``is_deleted``/``deleted_at``), so it disappears from every normal
+        listing the same way every other domain's soft-deleted rows already
+        do -- ``status`` alone is not what hides it (see
+        ``constants.NasStatus.DELETED``'s own docstring)."""
+        nas_client = await self.get_nas_client(
+            nas_id, requesting_organization_id=requesting_organization_id
+        )
+        current = NasStatus(nas_client.status)
+        validate_nas_status_transition(current=current, target=NasStatus.DELETED)
+        now = datetime.now(UTC)
+        updated = await self.repository.update_nas_client(
+            nas_client,
+            {
+                "status": NasStatus.DELETED.value,
+                "is_active": False,
+                "is_deleted": True,
+                "deleted_at": now,
+                "updated_by": actor_user_id,
+            },
+        )
+        event = RadiusNasDeleted(nas_client_id=updated.id)
+        logger.info("radius_nas_deleted", extra=_event_extra(event))
+        await self._audit_nas(
+            actor_user_id,
+            AuditAction.RADIUS_NAS_DELETED,
+            nas_client=updated,
+            description=f"RADIUS NAS client '{self._nas_display(updated)}' deleted",
+        )
+        return updated
+
+    # ========================================================================
+    # Internal helpers
+    # ========================================================================
+
+    @staticmethod
+    def _nas_display(nas_client: RadiusNasClient) -> str:
+        """``nas_code`` if this row has one, else the guaranteed-non-null
+        ``nas_identifier`` -- see ``models.RadiusNasClient.nas_code``'s own
+        docstring for why a pre-existing row can have ``nas_code is None``."""
+        return nas_client.nas_code or nas_client.nas_identifier
+
+    def _enforce_nas_tenant_scope(
+        self,
+        organization_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> None:
+        if (
+            requesting_organization_id is not None
+            and organization_id != requesting_organization_id
+        ):
+            raise CrossOrganizationNasAccessError()
+
+    async def _audit_nas(
+        self,
+        actor_user_id: uuid.UUID | None,
+        action: AuditAction,
+        *,
+        nas_client: RadiusNasClient,
+        description: str,
+        event_metadata: dict[str, object] | None = None,
+    ) -> None:
+        if self.audit_writer is None:
+            return
+        await self.audit_writer.create_audit_log_entry(
+            actor_user_id=actor_user_id,
+            action=action.value,
+            entity_type="radius_nas_client",
+            entity_id=nas_client.id,
+            description=description,
+            event_metadata=event_metadata or {},
+            organization_id=nas_client.organization_id,
+            location_id=nas_client.location_id,
+        )
 
     async def authorize(
         self, *, nas_client: RadiusNasClient, username: str

@@ -162,7 +162,14 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXPORT,
         _A.MANAGE,
     ),
-    PermissionModule.RADIUS: (_A.CREATE, _A.READ, _A.UPDATE, _A.DELETE, _A.MANAGE),
+    PermissionModule.RADIUS: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.EXECUTE,
+        _A.MANAGE,
+    ),
     PermissionModule.WIREGUARD: (
         _A.CREATE,
         _A.READ,

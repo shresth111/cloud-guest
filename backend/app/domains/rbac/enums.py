@@ -337,6 +337,16 @@ class AuditAction(StrEnum):
     GUEST_SESSION_DISCONNECTED = "guest_session_disconnected"
     GUEST_SESSION_TERMINATED = "guest_session_terminated"
     RADIUS_NAS_REGISTERED = "radius_nas_registered"
+    # NAS lifecycle-management additions (NAS extension of RadiusNasClient)
+    # -- the same "always audited, low-volume, admin-driven infrastructure
+    # change" profile ``RADIUS_NAS_REGISTERED`` above already established.
+    # ``resolve``/list/get reads are never audited, mirroring every other
+    # domain's own read-vs-write audit posture.
+    RADIUS_NAS_ACTIVATED = "radius_nas_activated"
+    RADIUS_NAS_DISABLED = "radius_nas_disabled"
+    RADIUS_NAS_SECRET_REGENERATED = "radius_nas_secret_regenerated"
+    RADIUS_NAS_UPDATED = "radius_nas_updated"
+    RADIUS_NAS_DELETED = "radius_nas_deleted"
 
     # Guest Access Control domain events (Phase 1) -- written through this
     # same table by

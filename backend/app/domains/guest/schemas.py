@@ -39,7 +39,11 @@ __all__ = [
     "GuestListResponse",
     "GuestConsentResponse",
     "RadiusNasRegisterRequest",
+    "RadiusNasUpdateRequest",
+    "RadiusNasDisableRequest",
     "RadiusNasResponse",
+    "RadiusNasCreatedResponse",
+    "RadiusNasListResponse",
     "RadiusAuthorizeRequest",
     "RadiusAuthorizeResponse",
     "RadiusAccountingRequest",
@@ -232,25 +236,86 @@ class GuestConsentResponse(BaseModel):
 
 
 # ============================================================================
-# RADIUS-facing schemas -- minimal, documented JSON contract (see module
-# docstring)
+# NAS admin-management schemas -- unlike the raw Authorize/Accounting
+# contract further below, these ARE wrapped in the standard
+# ``ApiResponse``/``build_response`` envelope by ``router.py``, the same as
+# every other domain's admin-facing schema, since these are ordinary
+# RBAC-gated admin CRUD, not a FreeRADIUS ``rlm_rest`` wire contract.
 # ============================================================================
 
 
 class RadiusNasRegisterRequest(BaseModel):
     router_id: uuid.UUID
     nas_identifier: str = Field(..., min_length=1, max_length=255)
-    shared_secret: str = Field(..., min_length=8, max_length=255)
+    shared_secret: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=255,
+        description="Omit to auto-generate a cryptographically-random "
+        "secret -- returned once, in the response, either way.",
+    )
+    name: str | None = Field(default=None, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    ip_address: str | None = Field(
+        default=None,
+        max_length=45,
+        description="Defaults to the router's own public/management IP if " "omitted.",
+    )
+
+
+class RadiusNasUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    ip_address: str | None = Field(default=None, max_length=45)
+
+
+class RadiusNasDisableRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class RadiusNasResponse(BaseModel):
     id: str
+    nas_code: str | None
     router_id: str
+    organization_id: str
+    location_id: str
     nas_identifier: str
+    status: str
     is_active: bool
+    name: str | None
+    description: str | None
+    ip_address: str | None
+    vendor: str
     created_at: datetime
+    updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class RadiusNasCreatedResponse(RadiusNasResponse):
+    """Returned only from ``POST /radius/nas`` and
+    ``POST /radius/nas/{id}/regenerate-secret`` -- the one and only moment
+    the plaintext shared secret is ever exposed (see ``service.py``'s
+    ``RadiusNasRegistrationResult``/``RadiusNasSecretRegenerationResult``
+    docstrings)."""
+
+    shared_secret: str
+
+
+class RadiusNasListResponse(BaseModel):
+    items: list[RadiusNasResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+# ============================================================================
+# RADIUS-facing schemas -- minimal, documented JSON contract (see module
+# docstring)
+# ============================================================================
 
 
 class RadiusAuthorizeRequest(BaseModel):

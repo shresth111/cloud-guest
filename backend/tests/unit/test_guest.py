@@ -35,16 +35,20 @@ from app.domains.guest.constants import (
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
     GuestAuthMethod,
     GuestSessionStatus,
+    NasStatus,
 )
 from app.domains.guest.exceptions import (
     ConcurrentSessionLimitExceededError,
     CrossOrganizationGuestAccessError,
+    CrossOrganizationNasAccessError,
     GuestAuthMethodNotEnabledError,
     GuestBlockedError,
     GuestSessionNotFoundError,
+    InvalidNasStatusTransitionError,
     InvalidSessionStatusTransitionError,
     NoReconnectableSessionError,
     RadiusNasAuthenticationError,
+    RadiusNasNotFoundError,
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
 )
@@ -71,8 +75,10 @@ from app.domains.guest.validators import (
     is_concurrent_session_limit_reached,
     is_quota_exceeded,
     is_session_timed_out,
+    validate_nas_status_transition,
 )
 from app.domains.guest_access.exceptions import GuestAccessDeniedError
+from app.domains.location.models import Location
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.exceptions import OtpCodeMismatchError
 from app.domains.router.crypto import encrypt_secret
@@ -253,19 +259,25 @@ class FakeRouterService:
     routers: dict[uuid.UUID, Router] = field(default_factory=dict)
 
     def add(
-        self, *, organization_id: uuid.UUID, status: str = RouterStatus.ONLINE.value
+        self,
+        *,
+        organization_id: uuid.UUID,
+        status: str = RouterStatus.ONLINE.value,
+        location_id: uuid.UUID | None = None,
+        public_ip_address: str | None = None,
+        management_ip_address: str | None = None,
     ) -> Router:
         router = Router(
             **_base_fields(
-                location_id=uuid.uuid4(),
+                location_id=location_id or uuid.uuid4(),
                 organization_id=organization_id,
                 name="Lobby AP",
                 serial_number=f"SN-{uuid.uuid4()}",
                 mac_address=f"AA:BB:CC:{uuid.uuid4().hex[:2]}:00:01",
                 model="hAP ac2",
                 routeros_version=None,
-                management_ip_address=None,
-                public_ip_address=None,
+                management_ip_address=management_ip_address,
+                public_ip_address=public_ip_address,
                 status=status,
                 last_seen_at=None,
                 last_health_check_at=None,
@@ -289,6 +301,65 @@ class FakeRouterService:
         if router is None:
             raise RouterNotFoundError(router_id)
         return router
+
+
+@dataclass
+class FakeLocationLookup:
+    """Stand-in for ``RadiusService``'s ``LocationLookupProtocol``.
+    ``FakeRouterService.add`` generates each router's own ``location_id``
+    independently (no shared registry with ``Fixture.location_id``), so
+    this fake auto-vivifies a synthetic ``Location`` (with
+    ``location_code=None``, exercising ``nas_number_generator``'s own
+    fallback-to-location-id-prefix path) for any id asked about, rather
+    than requiring pre-registration -- a real ``LocationService`` would
+    always resolve a real router's real ``location_id`` in production."""
+
+    locations: dict[uuid.UUID, Location] = field(default_factory=dict)
+
+    async def get_location(
+        self,
+        location_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
+    ) -> Location:
+        if location_id not in self.locations:
+            self.locations[location_id] = Location(
+                **_base_fields(
+                    organization_id=requesting_organization_id or uuid.uuid4(),
+                    name="Test Location",
+                    slug=f"loc-{uuid.uuid4()}",
+                    status="active",
+                    address_line1="1 Main St",
+                    address_line2=None,
+                    city="Austin",
+                    state_province="TX",
+                    postal_code="78701",
+                    country="US",
+                    timezone="UTC",
+                    latitude=None,
+                    longitude=None,
+                    contact_name=None,
+                    contact_phone=None,
+                    contact_email=None,
+                    settings={},
+                )
+            )
+        return self.locations[location_id]
+
+
+@dataclass
+class FakeNasCodeCounterRepository:
+    """Stand-in for ``nas_number_generator.NasCodeCounterRepositoryProtocol``
+    -- a plain in-memory counter, mirroring the real atomic-UPSERT
+    repository's externally-visible behavior (monotonic per ``counter_key``)
+    without a real database."""
+
+    counters: dict[str, int] = field(default_factory=dict)
+
+    async def increment_and_get_next(self, counter_key: str) -> int:
+        self.counters[counter_key] = self.counters.get(counter_key, 0) + 1
+        return self.counters[counter_key]
 
 
 @dataclass
@@ -563,6 +634,14 @@ class FakeGuestRepository:
                 return client
         return None
 
+    async def get_nas_client_by_id(
+        self, nas_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> RadiusNasClient | None:
+        client = self.nas_clients.get(nas_id)
+        if client is None or (client.is_deleted and not include_deleted):
+            return None
+        return client
+
     async def update_nas_client(
         self, nas_client: RadiusNasClient, data: dict[str, object]
     ) -> RadiusNasClient:
@@ -570,6 +649,31 @@ class FakeGuestRepository:
             setattr(nas_client, key, value)
         nas_client.version += 1
         return nas_client
+
+    async def list_nas_clients(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        filters: dict[str, object] | None = None,
+        sort_by: str = "created_at",
+        sort_order: object = None,
+    ) -> tuple[list[RadiusNasClient], object]:
+        items = [c for c in self.nas_clients.values() if not c.is_deleted]
+        for key, value in (filters or {}).items():
+            items = [i for i in items if getattr(i, key) == value]
+        total = len(items)
+
+        class _Meta:
+            def __init__(self, total_items: int) -> None:
+                self.page = page
+                self.page_size = page_size
+                self.total_items = total_items
+                self.total_pages = 1
+                self.has_next = False
+                self.has_previous = False
+
+        return items, _Meta(total)
 
     # -- analytics -----------------------------------------------------------------
     def _in_scope_sessions(
@@ -754,6 +858,8 @@ class Fixture:
     voucher_service: FakeVoucherService
     captive_portal_service: FakeCaptivePortalService
     router_service: FakeRouterService
+    location_lookup: FakeLocationLookup
+    nas_code_counter_repository: FakeNasCodeCounterRepository
     audit_writer: FakeAuditLogWriter
     guest_service: GuestService
     radius_service: RadiusService
@@ -775,6 +881,8 @@ def make_fixture(
     voucher_service = FakeVoucherService()
     captive_portal_service = FakeCaptivePortalService()
     router_service = FakeRouterService()
+    location_lookup = FakeLocationLookup()
+    nas_code_counter_repository = FakeNasCodeCounterRepository()
     audit_writer = FakeAuditLogWriter()
 
     organization_id = uuid.uuid4()
@@ -797,7 +905,12 @@ def make_fixture(
         access_control_hook=access_control_hook,
     )
     radius_service = RadiusService(
-        repository, guest_service, router_service, audit_writer=audit_writer
+        repository,
+        guest_service,
+        router_service,
+        location_lookup,
+        nas_code_counter_repository,
+        audit_writer=audit_writer,
     )
     analytics_service = GuestAnalyticsService(repository)
 
@@ -807,6 +920,8 @@ def make_fixture(
         voucher_service=voucher_service,
         captive_portal_service=captive_portal_service,
         router_service=router_service,
+        location_lookup=location_lookup,
+        nas_code_counter_repository=nas_code_counter_repository,
         audit_writer=audit_writer,
         guest_service=guest_service,
         radius_service=radius_service,
@@ -1659,7 +1774,9 @@ class TestRadius:
         fx = make_fixture()
         await self._register_nas(fx, secret="s3cr3t-value")
         nas_client = await fx.repository.get_nas_client_by_identifier("nas-1")
-        await fx.repository.update_nas_client(nas_client, {"is_active": False})
+        await fx.repository.update_nas_client(
+            nas_client, {"status": NasStatus.DISABLED.value, "is_active": False}
+        )
         with pytest.raises(RadiusNasAuthenticationError):
             await fx.radius_service.authenticate_nas(
                 nas_identifier="nas-1", shared_secret="s3cr3t-value"
@@ -1794,6 +1911,390 @@ class TestRadius:
             await fx.radius_service.accounting_start(
                 nas_client=nas_client, session_id=uuid.uuid4()
             )
+
+
+# ============================================================================
+# NAS extension: nas_code generation, shared-secret auto-generation, full
+# lifecycle (list/get/update/activate/disable/regenerate-secret/delete),
+# tenant isolation, and organization_id/location_id denormalization.
+# ============================================================================
+
+
+class TestNasCodeGeneration:
+    async def test_uses_real_location_code_when_present(self) -> None:
+        fx = make_fixture()
+        fx.location_lookup.locations[fx.router.location_id] = Location(
+            **_base_fields(
+                organization_id=fx.organization_id,
+                name="HQ",
+                slug="hq",
+                status="active",
+                address_line1="1 Main St",
+                address_line2=None,
+                city="Austin",
+                state_province="TX",
+                postal_code="78701",
+                country="US",
+                timezone="UTC",
+                latitude=None,
+                longitude=None,
+                contact_name=None,
+                contact_phone=None,
+                contact_email=None,
+                settings={},
+                location_code="LOC-2026-000001",
+            )
+        )
+        result = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=fx.router.id, nas_identifier="nas-x"
+        )
+        assert result.nas_client.nas_code == "NAS-LOC-2026-000001-0001"
+
+    async def test_falls_back_to_location_id_prefix_when_no_location_code(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        result = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=fx.router.id, nas_identifier="nas-x"
+        )
+        assert result.nas_client.nas_code == (
+            f"NAS-{str(fx.router.location_id)[:8]}-0001"
+        )
+
+    async def test_codes_increment_per_location(self) -> None:
+        fx = make_fixture()
+        router_b = fx.router_service.add(
+            organization_id=fx.organization_id, location_id=fx.router.location_id
+        )
+        result_a = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=fx.router.id, nas_identifier="nas-a"
+        )
+        result_b = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=router_b.id, nas_identifier="nas-b"
+        )
+        assert result_a.nas_client.nas_code.endswith("-0001")
+        assert result_b.nas_client.nas_code.endswith("-0002")
+
+    async def test_different_locations_each_start_at_one(self) -> None:
+        fx = make_fixture()
+        router_b = fx.router_service.add(organization_id=fx.organization_id)
+        result_a = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=fx.router.id, nas_identifier="nas-a"
+        )
+        result_b = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=router_b.id, nas_identifier="nas-b"
+        )
+        assert result_a.nas_client.nas_code.endswith("-0001")
+        assert result_b.nas_client.nas_code.endswith("-0001")
+
+
+class TestSharedSecretGeneration:
+    async def test_omitted_secret_is_auto_generated_and_usable(self) -> None:
+        fx = make_fixture()
+        result = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=fx.router.id, nas_identifier="nas-x"
+        )
+        assert len(result.shared_secret) >= 32
+        nas_client = await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-x", shared_secret=result.shared_secret
+        )
+        assert nas_client.id == result.nas_client.id
+
+    async def test_supplied_secret_is_used_verbatim(self) -> None:
+        fx = make_fixture()
+        result = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=fx.router.id,
+            nas_identifier="nas-x",
+            shared_secret="my-own-secret-123",
+        )
+        assert result.shared_secret == "my-own-secret-123"
+
+    async def test_ip_address_defaults_from_router_public_ip(self) -> None:
+        fx = make_fixture()
+        router_b = fx.router_service.add(
+            organization_id=fx.organization_id, public_ip_address="203.0.113.5"
+        )
+        result = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=router_b.id, nas_identifier="nas-y"
+        )
+        assert result.nas_client.ip_address == "203.0.113.5"
+
+    async def test_ip_address_explicit_override_wins(self) -> None:
+        fx = make_fixture()
+        router_b = fx.router_service.add(
+            organization_id=fx.organization_id, public_ip_address="203.0.113.5"
+        )
+        result = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_b.id,
+            nas_identifier="nas-z",
+            ip_address="198.51.100.9",
+        )
+        assert result.nas_client.ip_address == "198.51.100.9"
+
+
+class TestNasLifecycle:
+    async def _register(self, fx: Fixture, **overrides: object):
+        overrides.setdefault("nas_identifier", "nas-x")
+        return await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=fx.router.id, **overrides
+        )
+
+    async def test_get_nas_client(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx)
+        fetched = await fx.radius_service.get_nas_client(
+            result.nas_client.id, requesting_organization_id=fx.organization_id
+        )
+        assert fetched.id == result.nas_client.id
+
+    async def test_get_unknown_nas_raises(self) -> None:
+        fx = make_fixture()
+        with pytest.raises(RadiusNasNotFoundError):
+            await fx.radius_service.get_nas_client(
+                uuid.uuid4(), requesting_organization_id=fx.organization_id
+            )
+
+    async def test_list_filters_by_status(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx)
+        await fx.radius_service.disable_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        active, _ = await fx.radius_service.list_nas_clients(
+            requesting_organization_id=fx.organization_id, status=NasStatus.ACTIVE
+        )
+        disabled, _ = await fx.radius_service.list_nas_clients(
+            requesting_organization_id=fx.organization_id, status=NasStatus.DISABLED
+        )
+        assert active == []
+        assert len(disabled) == 1
+
+    async def test_update_cosmetic_fields(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx)
+        updated = await fx.radius_service.update_nas_client(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+            name="Front Desk NAS",
+            description="Lobby router",
+            ip_address="10.0.0.5",
+        )
+        assert updated.name == "Front Desk NAS"
+        assert updated.description == "Lobby router"
+        assert updated.ip_address == "10.0.0.5"
+
+    async def test_activate_disable_round_trip(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx)
+        disabled = await fx.radius_service.disable_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+            reason="maintenance",
+        )
+        assert disabled.status == NasStatus.DISABLED.value
+        assert disabled.is_active is False
+        activated = await fx.radius_service.activate_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        assert activated.status == NasStatus.ACTIVE.value
+        assert activated.is_active is True
+
+    async def test_disabling_already_disabled_raises(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx)
+        await fx.radius_service.disable_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        with pytest.raises(InvalidNasStatusTransitionError):
+            await fx.radius_service.disable_nas(
+                nas_id=result.nas_client.id,
+                requesting_organization_id=fx.organization_id,
+                actor_user_id=uuid.uuid4(),
+            )
+
+    async def test_disabled_nas_cannot_authenticate(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx, shared_secret="s3cr3t")
+        await fx.radius_service.disable_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        with pytest.raises(RadiusNasAuthenticationError):
+            await fx.radius_service.authenticate_nas(
+                nas_identifier=result.nas_client.nas_identifier,
+                shared_secret="s3cr3t",
+            )
+
+    async def test_regenerate_secret_invalidates_old_one(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx, shared_secret="original-secret")
+        regen = await fx.radius_service.regenerate_secret(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        assert regen.shared_secret != "original-secret"
+        with pytest.raises(RadiusNasAuthenticationError):
+            await fx.radius_service.authenticate_nas(
+                nas_identifier=result.nas_client.nas_identifier,
+                shared_secret="original-secret",
+            )
+        authenticated = await fx.radius_service.authenticate_nas(
+            nas_identifier=result.nas_client.nas_identifier,
+            shared_secret=regen.shared_secret,
+        )
+        assert authenticated.id == result.nas_client.id
+
+    async def test_regenerate_secret_does_not_change_status(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx)
+        await fx.radius_service.disable_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        regen = await fx.radius_service.regenerate_secret(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        assert regen.nas_client.status == NasStatus.DISABLED.value
+
+    async def test_delete_sets_terminal_status_and_soft_delete(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx)
+        deleted = await fx.radius_service.delete_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        assert deleted.status == NasStatus.DELETED.value
+        assert deleted.is_deleted is True
+        assert deleted.deleted_at is not None
+
+    async def test_deleted_nas_is_unreachable_via_get_by_id(self) -> None:
+        """Once ``delete_nas`` sets ``is_deleted=True``, the row becomes
+        unreachable via ``get_nas_client`` (``RadiusNasNotFoundError``, not
+        ``InvalidNasStatusTransitionError``) -- the same "a soft-deleted row
+        is invisible to plain get-by-id" convention every other domain's own
+        ``get_policy``/``get_team`` already establishes, rather than a NAS-
+        specific exception."""
+        fx = make_fixture()
+        result = await self._register(fx)
+        await fx.radius_service.delete_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        with pytest.raises(RadiusNasNotFoundError):
+            await fx.radius_service.delete_nas(
+                nas_id=result.nas_client.id,
+                requesting_organization_id=fx.organization_id,
+                actor_user_id=uuid.uuid4(),
+            )
+
+    async def test_disabled_nas_cannot_be_deleted_twice_via_status_graph(
+        self,
+    ) -> None:
+        """Direct unit coverage of ``NAS_STATUS_TRANSITIONS``'s own
+        terminal-state rule, independent of soft-delete visibility (see
+        ``test_deleted_nas_is_unreachable_via_get_by_id`` for why exercising
+        this through ``delete_nas`` twice can't observe it)."""
+        validate_nas_status_transition(
+            current=NasStatus.DISABLED, target=NasStatus.DELETED
+        )  # legal, does not raise
+        with pytest.raises(InvalidNasStatusTransitionError):
+            validate_nas_status_transition(
+                current=NasStatus.DELETED, target=NasStatus.DELETED
+            )
+
+    async def test_pending_nas_can_be_deleted_directly(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx, initial_status=NasStatus.PENDING)
+        deleted = await fx.radius_service.delete_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        assert deleted.status == NasStatus.DELETED.value
+
+    async def test_lifecycle_actions_are_audited(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx)
+        await fx.radius_service.disable_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+            reason="test",
+        )
+        await fx.radius_service.activate_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        await fx.radius_service.regenerate_secret(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        await fx.radius_service.update_nas_client(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+            name="X",
+        )
+        await fx.radius_service.delete_nas(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        actions = [e["action"] for e in fx.audit_writer.entries]
+        assert "radius_nas_disabled" in actions
+        assert "radius_nas_activated" in actions
+        assert "radius_nas_secret_regenerated" in actions
+        assert "radius_nas_updated" in actions
+        assert "radius_nas_deleted" in actions
+
+
+class TestNasTenantIsolationAndDenormalization:
+    async def test_organization_and_location_denormalized_from_router(self) -> None:
+        fx = make_fixture()
+        result = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=fx.router.id, nas_identifier="nas-x"
+        )
+        assert result.nas_client.organization_id == fx.router.organization_id
+        assert result.nas_client.location_id == fx.router.location_id
+
+    async def test_cross_organization_get_raises(self) -> None:
+        fx = make_fixture()
+        result = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=fx.router.id, nas_identifier="nas-x"
+        )
+        with pytest.raises(CrossOrganizationNasAccessError):
+            await fx.radius_service.get_nas_client(
+                result.nas_client.id, requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_list_scopes_by_organization(self) -> None:
+        fx = make_fixture()
+        await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(), router_id=fx.router.id, nas_identifier="nas-x"
+        )
+        items, _ = await fx.radius_service.list_nas_clients(
+            requesting_organization_id=uuid.uuid4()
+        )
+        assert items == []
 
 
 # ============================================================================

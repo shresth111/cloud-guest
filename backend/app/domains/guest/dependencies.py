@@ -26,6 +26,8 @@ from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.guest_access.dependencies import get_guest_access_service
 from app.domains.guest_access.service import GuestAccessService
+from app.domains.location.dependencies import get_location_service
+from app.domains.location.service import LocationService
 from app.domains.monitoring.dependencies import get_monitoring_service
 from app.domains.monitoring.service import MonitoringService
 from app.domains.otp.dependencies import get_otp_service
@@ -40,7 +42,12 @@ from app.domains.voucher.service import VoucherService
 from .constants import RADIUS_NAS_IDENTIFIER_HEADER, RADIUS_SHARED_SECRET_HEADER
 from .exceptions import RadiusNasAuthenticationError
 from .models import RadiusNasClient
-from .repository import GuestRepository, GuestRepositoryProtocol
+from .nas_number_generator import NasCodeCounterRepositoryProtocol
+from .repository import (
+    GuestRepository,
+    GuestRepositoryProtocol,
+    RadiusNasCodeCounterRepository,
+)
 from .service import GuestAnalyticsService, GuestService, RadiusService
 
 
@@ -90,16 +97,28 @@ def get_guest_service(
     )
 
 
+def get_nas_code_counter_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> NasCodeCounterRepositoryProtocol:
+    return RadiusNasCodeCounterRepository(db)
+
+
 def get_radius_service(
     repository: GuestRepositoryProtocol = Depends(get_guest_repository),
     guest_service: GuestService = Depends(get_guest_service),
     router_service: RouterService = Depends(get_router_service),
+    location_service: LocationService = Depends(get_location_service),
+    nas_code_counter_repository: NasCodeCounterRepositoryProtocol = Depends(
+        get_nas_code_counter_repository
+    ),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ) -> RadiusService:
     return RadiusService(
         repository,
         guest_service,
         router_service,
+        location_service,
+        nas_code_counter_repository,
         audit_writer=audit_repository,
     )
 
@@ -130,6 +149,7 @@ __all__ = [
     "get_guest_repository",
     "get_guest_service",
     "get_radius_service",
+    "get_nas_code_counter_repository",
     "get_guest_analytics_service",
     "CurrentNas",
 ]

@@ -25,6 +25,15 @@
 > `monitoring_hook`, this hook can change a login's outcome -- a resolved
 > `BLOCKLIST` decision raises `GuestAccessDeniedError` and blocks the
 > login, checked immediately after the existing `Guest.is_blocked` check.
+>
+> **NAS extension addendum:** `RadiusNasClient` (previously a bare
+> `router_id`/`nas_identifier`/`shared_secret_encrypted`/`is_active` row)
+> gained a real status lifecycle (`constants.NasStatus`), a human-readable
+> `nas_code`, denormalized `organization_id`/`location_id`, and full admin
+> CRUD/lifecycle endpoints (list/get/update/delete/activate/disable/
+> regenerate-secret). See `NAS_EXTENSION.md` for the full write-up --
+> including why this extends the existing NAS row rather than building a
+> second, parallel one.
 
 The Guest domain (`app.domains.guest`) is BE-010's **final** module -- the
 one that actually ties `app.domains.otp` (Part 1), `app.domains.voucher`
@@ -81,31 +90,36 @@ backend/
   alembic/
     versions/
       0015_create_guest_tables.py
+      0030_extend_radius_nas_clients.py
   app/
     domains/
       guest/
         __init__.py
-        constants.py       # GuestAuthMethod, GuestSessionStatus, defaults, RADIUS headers
+        constants.py       # GuestAuthMethod, GuestSessionStatus, NasStatus, defaults, RADIUS headers
         models.py           # Guest, GuestDevice, GuestSession, GuestLoginHistory,
-                             # GuestConsent, RadiusNasClient (see DATABASE.md)
+                             # GuestConsent, RadiusNasClient, RadiusNasCodeCounter (see DATABASE.md)
         exceptions.py         # GuestError subclasses (CloudGuestError)
         events.py              # Plain dataclasses, logged synchronously by service.py
         validators.py            # Pure MAC/identifier normalization, transition/date checks
         repository.py             # GuestRepositoryProtocol + repo (incl. analytics SQL)
-        service.py                 # GuestService, RadiusService, GuestAnalyticsService
-        schemas.py                  # Pydantic request/response DTOs
-        dependencies.py               # FastAPI dependency wiring, CurrentNas
-        router.py                     # guest_router/admin_router/radius_router/analytics_router
+        nas_number_generator.py    # nas_code generation, shared-secret generation
+        service.py                  # GuestService, RadiusService, GuestAnalyticsService
+        schemas.py                   # Pydantic request/response DTOs
+        dependencies.py                # FastAPI dependency wiring, CurrentNas
+        router.py                      # guest_router/admin_router/radius_router/
+                                        # nas_router/nas_cross_reference_router/analytics_router
       rbac/
-        enums.py                     # AuditAction gained 5 additive GUEST_*/RADIUS_* values
+        enums.py                     # AuditAction gained additive GUEST_*/RADIUS_* values;
+                                      # PermissionModule.RADIUS gained the EXECUTE action
     api/
       v1/
-        router.py                    # all four guest routers registered
+        router.py                    # all six guest routers registered
   docs/
     guest/
       README.md
       FLOW.md
       DATABASE.md
+      NAS_EXTENSION.md
   tests/
     unit/
       test_guest.py
@@ -136,13 +150,26 @@ POST /api/v1/guest-sessions/{id}/disconnect    guest_sessions.execute
 POST /api/v1/guest-sessions/{id}/terminate     guest_sessions.execute
 ```
 
-RADIUS-facing (NAS shared-secret authenticated, except `/radius/nas` which
-is RBAC-gated -- see `FLOW.md` §7):
+RADIUS-facing (NAS shared-secret authenticated):
 
 ```text
-POST /api/v1/radius/nas          radius.create   (RBAC-gated, admin)
 POST /api/v1/radius/authorize    NAS shared secret
 POST /api/v1/radius/accounting   NAS shared secret
+```
+
+NAS admin management (RBAC-gated -- see `NAS_EXTENSION.md`):
+
+```text
+POST   /api/v1/radius/nas                            radius.create
+GET    /api/v1/radius/nas                             radius.read
+GET    /api/v1/radius/nas/{id}                         radius.read
+PUT    /api/v1/radius/nas/{id}                          radius.update
+DELETE /api/v1/radius/nas/{id}                           radius.delete
+POST   /api/v1/radius/nas/{id}/activate                  radius.execute
+POST   /api/v1/radius/nas/{id}/disable                   radius.execute
+POST   /api/v1/radius/nas/{id}/regenerate-secret         radius.execute
+GET    /api/v1/locations/{location_id}/nas              radius.read
+GET    /api/v1/routers/{router_id}/nas                 radius.read
 ```
 
 Analytics (RBAC `analytics.read`):
@@ -180,6 +207,10 @@ GET /api/v1/guest-analytics/voucher-usage
 * The FreeRADIUS `rlm_rest` HTTP integration pattern (`/radius/authorize`,
   `/radius/accounting`) -- BE-010's first (and only) RADIUS-facing surface.
 * `GuestAnalyticsService`'s real SQL aggregate queries.
+* NAS extension: `RadiusNasCodeCounter` (new table), `NasStatus`'s real
+  status lifecycle, `nas_number_generator`'s `nas_code`/shared-secret
+  generation, and every NAS admin CRUD/lifecycle endpoint -- see
+  `NAS_EXTENSION.md`.
 
 ## Testing
 
@@ -203,5 +234,16 @@ integration, the full RADIUS `authenticate_nas`/`authorize`/
 (including wrong-secret/unknown-NAS/inactive-NAS/cross-router rejection),
 analytics aggregate correctness (visitors/unique/returning guests,
 bandwidth, top locations/devices, OTP success rate, voucher usage, empty
-range), and tenant isolation. All 432 previously-passing tests continue to
-pass unmodified, plus 50 new tests here (482 total).
+range), and tenant isolation.
+
+**NAS extension addendum:** further coverage for `nas_code` generation
+(real `location_code` embedding, the location-id-prefix fallback,
+per-location sequence increments, independent sequences per location),
+shared-secret auto-generation/explicit-override, `ip_address` defaulting
+from the router's own public IP, the full lifecycle (get/list-by-status/
+update/activate/disable/regenerate-secret/delete, status-transition
+rejection, a disabled NAS failing authentication, a regenerated secret
+invalidating the old one, deletion setting both the terminal status and
+the ordinary soft-delete fields, every lifecycle action being audited), and
+tenant isolation/denormalization correctness -- all against the same
+in-memory fakes, no live Postgres/Redis required.

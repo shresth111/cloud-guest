@@ -100,14 +100,34 @@ A record of a guest accepting a captive portal's terms and conditions.
 ## `radius_nas_clients`
 
 A router's registered FreeRADIUS NAS identity -- a router *is* a RADIUS
-NAS, one-to-one.
+NAS, one-to-one. Extended by migration `0030` -- see `NAS_EXTENSION.md` for
+the full design write-up behind every column below the original four
+(`router_id`/`nas_identifier`/`shared_secret_encrypted`/`is_active`).
 
 | Column | Type | Notes |
 |---|---|---|
 | `router_id` | UUID, FK `routers.id` (`CASCADE`), **unique** | One-to-one with `routers` |
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable | Denormalized from `router.organization_id` at registration time; backfilled for pre-existing rows |
+| `location_id` | UUID, FK `locations.id` (`CASCADE`), not nullable | Denormalized from `router.location_id`; backfilled for pre-existing rows |
+| `nas_code` | String(80), nullable, **partial unique** (`WHERE nas_code IS NOT NULL`) | Human-readable, e.g. `"NAS-LOC-2026-000001-0001"`. Nullable and never backfilled for pre-existing rows -- mirrors `Location.location_code`'s identical convention |
 | `nas_identifier` | String(255), **unique** | The identifier FreeRADIUS's `rlm_rest` presents |
 | `shared_secret_encrypted` | Text, not nullable | Fernet-encrypted via `app.domains.router.crypto.encrypt_secret` -- reused, not a new encryption mechanism; recoverable (not hashed), since a live comparison needs the plaintext back |
-| `is_active` | Boolean, default `true` | |
+| `status` | String(20), default `active` | `pending`/`active`/`disabled`/`suspended`/`deleted` -- see `constants.NasStatus`. Backfilled from `is_active` for pre-existing rows |
+| `is_active` | Boolean, default `true` | Kept as a synced, derived mirror of `status == active` -- `status` is the real source of truth as of this extension |
+| `name` | String(200), nullable | Admin-facing label, distinct from `router.name` |
+| `description` | Text, nullable | |
+| `ip_address` | String(45), nullable | The RADIUS NAS-IP-Address value; defaults from `router.public_ip_address`/`management_ip_address` at registration, its own column thereafter |
+| `vendor` | String(50), default `MikroTik` | A real, true default (every `Router` today is MikroTik) -- an extensibility seam, not a fabricated value |
+
+## `radius_nas_code_counters` (new table)
+
+The dedicated, atomic counter table backing `nas_code` generation --
+structurally identical to `location_code_counters`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `counter_key` | String(80), **unique** | `"nas:<location_id>"` -- one row per location |
+| `last_value` | Integer, default `0` | Incremented via a single atomic `INSERT ... ON CONFLICT DO UPDATE ... RETURNING` |
 
 ## Facts genuinely new vs. reused from elsewhere
 
@@ -139,6 +159,8 @@ locations     --< guest_login_history (location_id, nullable)
 guests        --< guest_consents (guest_id, NOT NULL)
 captive_portal_configs --< guest_consents (captive_portal_config_id, nullable)
 routers       --- radius_nas_clients (router_id, UNIQUE -- one-to-one)
+organizations --< radius_nas_clients (organization_id, NOT NULL, denormalized)
+locations     --< radius_nas_clients (location_id, NOT NULL, denormalized)
 ```
 
 No other existing table gained a new column or FK for this module -- like
