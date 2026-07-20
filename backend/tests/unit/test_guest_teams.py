@@ -260,6 +260,13 @@ class FakeGuestRepository:
         items.sort(key=lambda s: s.started_at, reverse=True)
         return items[:limit] if limit else items
 
+    async def get_nas_client_by_router(self, router_id: uuid.UUID):
+        """``GuestTeamService`` never registers a RADIUS NAS -- always
+        ``None``, so ``service.issue_live_disconnect`` (called by
+        ``terminate_session``) is always a no-op here, exactly as it would
+        be against a real, un-registered router."""
+        return None
+
     def add_session(
         self,
         *,

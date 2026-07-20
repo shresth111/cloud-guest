@@ -65,7 +65,7 @@ from .dependencies import (
     get_voucher_manage_bypass,
     get_voucher_service,
 )
-from .models import Voucher, VoucherBatch
+from .models import Voucher, VoucherBatch, VoucherPlan, VoucherSeries
 from .schemas import (
     VoucherBatchCreate,
     VoucherBatchListResponse,
@@ -76,9 +76,15 @@ from .schemas import (
     VoucherImportRequest,
     VoucherImportResponse,
     VoucherListResponse,
+    VoucherPlanCreateRequest,
+    VoucherPlanListResponse,
+    VoucherPlanResponse,
     VoucherRedeemRequest,
     VoucherRedeemResponse,
     VoucherResponse,
+    VoucherSeriesCreateRequest,
+    VoucherSeriesListResponse,
+    VoucherSeriesResponse,
     VoucherValidateRequest,
     VoucherValidateResponse,
 )
@@ -97,6 +103,8 @@ def _batch_response(batch: VoucherBatch) -> VoucherBatchResponse:
         name=batch.name,
         organization_id=str(batch.organization_id),
         location_id=str(batch.location_id) if batch.location_id else None,
+        plan_id=str(batch.plan_id) if batch.plan_id else None,
+        series_id=str(batch.series_id) if batch.series_id else None,
         quantity=batch.quantity,
         code_length=batch.code_length,
         code_prefix=batch.code_prefix,
@@ -122,6 +130,7 @@ def _voucher_response(voucher: Voucher) -> VoucherResponse:
     return VoucherResponse(
         id=str(voucher.id),
         batch_id=str(voucher.batch_id),
+        plan_id=str(voucher.plan_id) if voucher.plan_id else None,
         code=voucher.code,
         status=voucher.status,
         use_count=voucher.use_count,
@@ -130,6 +139,219 @@ def _voucher_response(voucher: Voucher) -> VoucherResponse:
         redeemed_identifier=voucher.redeemed_identifier,
         expires_at=voucher.expires_at,
         created_at=voucher.created_at,
+    )
+
+
+def _plan_response(plan: VoucherPlan) -> VoucherPlanResponse:
+    return VoucherPlanResponse(
+        id=str(plan.id),
+        name=plan.name,
+        organization_id=str(plan.organization_id) if plan.organization_id else None,
+        description=plan.description,
+        queue_profile_id=str(plan.queue_profile_id) if plan.queue_profile_id else None,
+        default_validity_minutes=plan.default_validity_minutes,
+        default_data_limit_mb=plan.default_data_limit_mb,
+        default_max_uses_per_voucher=plan.default_max_uses_per_voucher,
+        is_active=plan.is_active,
+        created_at=plan.created_at,
+        updated_at=plan.updated_at,
+    )
+
+
+def _series_response(series: VoucherSeries) -> VoucherSeriesResponse:
+    return VoucherSeriesResponse(
+        id=str(series.id),
+        name=series.name,
+        organization_id=str(series.organization_id),
+        location_id=str(series.location_id) if series.location_id else None,
+        plan_id=str(series.plan_id),
+        description=series.description,
+        is_active=series.is_active,
+        created_at=series.created_at,
+        updated_at=series.updated_at,
+    )
+
+
+# ============================================================================
+# Admin-facing VoucherPlan / VoucherSeries management (Phase 1 BhaiFi-parity)
+# ============================================================================
+
+
+@router.post(
+    "/voucher-plans",
+    response_model=ApiResponse[VoucherPlanResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("voucher.create"))],
+)
+async def create_voucher_plan(
+    request: Request,
+    payload: VoucherPlanCreateRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: VoucherService = Depends(get_voucher_service),
+):
+    plan = await service.create_plan(
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+        organization_id=payload.organization_id,
+        name=payload.name,
+        description=payload.description,
+        queue_profile_id=payload.queue_profile_id,
+        default_validity_minutes=payload.default_validity_minutes,
+        default_data_limit_mb=payload.default_data_limit_mb,
+        default_max_uses_per_voucher=payload.default_max_uses_per_voucher,
+    )
+    return build_response(
+        success=True,
+        message="Voucher plan created",
+        data=_plan_response(plan).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/voucher-plans",
+    response_model=ApiResponse[VoucherPlanListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("voucher.read"))],
+)
+async def list_voucher_plans(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: VoucherService = Depends(get_voucher_service),
+):
+    plans, meta = await service.list_plans(
+        requesting_organization_id=requesting_organization_id,
+        page=page,
+        page_size=page_size,
+    )
+    payload = VoucherPlanListResponse(
+        items=[_plan_response(plan) for plan in plans],
+        page=meta.page,
+        page_size=meta.page_size,
+        total_items=meta.total_items,
+        total_pages=meta.total_pages,
+        has_next=meta.has_next,
+        has_previous=meta.has_previous,
+    )
+    return build_response(
+        success=True,
+        message="Voucher plans retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/voucher-plans/{plan_id}",
+    response_model=ApiResponse[VoucherPlanResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("voucher.read"))],
+)
+async def get_voucher_plan(
+    request: Request,
+    plan_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: VoucherService = Depends(get_voucher_service),
+):
+    plan = await service.get_plan(
+        plan_id, requesting_organization_id=requesting_organization_id
+    )
+    return build_response(
+        success=True,
+        message="Voucher plan retrieved",
+        data=_plan_response(plan).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/voucher-series",
+    response_model=ApiResponse[VoucherSeriesResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("voucher.create"))],
+)
+async def create_voucher_series(
+    request: Request,
+    payload: VoucherSeriesCreateRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: VoucherService = Depends(get_voucher_service),
+):
+    series = await service.create_series(
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+        organization_id=payload.organization_id,
+        location_id=payload.location_id,
+        plan_id=payload.plan_id,
+        name=payload.name,
+        description=payload.description,
+    )
+    return build_response(
+        success=True,
+        message="Voucher series created",
+        data=_series_response(series).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/voucher-series",
+    response_model=ApiResponse[VoucherSeriesListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("voucher.read"))],
+)
+async def list_voucher_series(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: VoucherService = Depends(get_voucher_service),
+):
+    series_items, meta = await service.list_series(
+        requesting_organization_id=requesting_organization_id,
+        page=page,
+        page_size=page_size,
+    )
+    payload = VoucherSeriesListResponse(
+        items=[_series_response(series) for series in series_items],
+        page=meta.page,
+        page_size=meta.page_size,
+        total_items=meta.total_items,
+        total_pages=meta.total_pages,
+        has_next=meta.has_next,
+        has_previous=meta.has_previous,
+    )
+    return build_response(
+        success=True,
+        message="Voucher series retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/voucher-series/{series_id}",
+    response_model=ApiResponse[VoucherSeriesResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("voucher.read"))],
+)
+async def get_voucher_series(
+    request: Request,
+    series_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: VoucherService = Depends(get_voucher_service),
+):
+    series = await service.get_series(
+        series_id, requesting_organization_id=requesting_organization_id
+    )
+    return build_response(
+        success=True,
+        message="Voucher series retrieved",
+        data=_series_response(series).model_dump(),
+        request_id=_request_id(request),
     )
 
 
@@ -167,6 +389,8 @@ async def create_voucher_batch(
         data_limit_mb=payload.data_limit_mb,
         notes=payload.notes,
         has_manage_permission=has_manage_permission,
+        plan_id=payload.plan_id,
+        series_id=payload.series_id,
     )
     return build_response(
         success=True,
@@ -344,6 +568,36 @@ async def export_voucher_batch(
         headers={
             "Content-Disposition": (
                 f'attachment; filename="voucher_batch_{batch_id}.csv"'
+            )
+        },
+    )
+
+
+@router.get(
+    "/voucher-batches/{batch_id}/download",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("voucher.export"))],
+)
+async def download_voucher_batch_pdf(
+    batch_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: VoucherService = Depends(get_voucher_service),
+) -> Response:
+    """Returns a real, printable voucher-card PDF -- raw bytes, not the
+    standard ``ApiResponse`` envelope, mirroring ``export_voucher_batch``'s
+    identical ``text/csv`` transport decision (see that endpoint's own
+    placement/reasoning above) and
+    ``app.domains.billing.router.download_invoice``'s identical
+    ``Content-Disposition: attachment`` shape."""
+    pdf_bytes = await service.export_batch_pdf(
+        batch_id=batch_id, requesting_organization_id=requesting_organization_id
+    )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="voucher_batch_{batch_id}.pdf"'
             )
         },
     )

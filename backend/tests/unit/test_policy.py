@@ -566,10 +566,7 @@ class TestRulesValidation:
         assert version.rules["traffic_class"] == "voice"
         assert version.rules["dscp_marking"] is None
 
-    async def test_generic_policy_type_accepts_any_object(self) -> None:
-        # PolicyType.FUP has no concrete rule schema (unlike BANDWIDTH/QOS,
-        # which gained typed schemas for app.domains.queue_management) --
-        # see schemas.GenericPolicyRules.
+    async def test_fup_rules_validates_against_typed_schema(self) -> None:
         service, _, org_lookup, _ = _build_service()
         org = org_lookup.add()
         policy = await service.create_policy(
@@ -578,6 +575,102 @@ class TestRulesValidation:
             organization_id=org.id,
             policy_type=PolicyType.FUP,
             name="Fair Usage",
+            description=None,
+        )
+        version = await service.create_version(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={"daily_data_limit_mb": 500, "monthly_data_limit_mb": 10000},
+        )
+        assert version.rules["daily_data_limit_mb"] == 500
+        assert version.rules["weekly_data_limit_mb"] is None
+
+    async def test_business_hours_rules_validates_named_windows(self) -> None:
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.BUSINESS_HOURS,
+            name="Business Hours",
+            description=None,
+        )
+        version = await service.create_version(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={
+                "night_mode": [
+                    {"days_of_week": [], "start_time": "22:00", "end_time": "06:00"}
+                ]
+            },
+        )
+        assert version.rules["night_mode"][0]["start_time"] == "22:00"
+        assert version.rules["peak_hours"] == []
+
+    async def test_voucher_rules_validates_against_typed_schema(self) -> None:
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.VOUCHER,
+            name="Voucher Rules",
+            description=None,
+        )
+        version = await service.create_version(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={"max_active_vouchers_per_guest": 2},
+        )
+        assert version.rules["max_active_vouchers_per_guest"] == 2
+        assert version.rules["allow_multi_use"] is True
+
+    async def test_device_rules_validates_against_typed_schema(self) -> None:
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.DEVICE,
+            name="Device Rules",
+            description=None,
+        )
+        version = await service.create_version(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={"max_devices_per_guest": 5},
+        )
+        assert version.rules["max_devices_per_guest"] == 5
+        assert version.rules["require_known_device"] is False
+
+    async def test_device_policy_has_a_seeded_platform_default(self) -> None:
+        service, _, org_lookup, _ = _build_service()
+        resolved = await service.resolve_effective_policy(
+            policy_type=PolicyType.DEVICE, organization_id=None, location_id=None
+        )
+        assert resolved.rules["max_devices_per_guest"] == 3
+        assert resolved.source == "platform_default"
+
+    async def test_generic_policy_type_accepts_any_object(self) -> None:
+        # PolicyType.ACCESS has no concrete rule schema (unlike BANDWIDTH/
+        # QOS/FUP/BUSINESS_HOURS/VOUCHER/DEVICE, which all gained typed
+        # schemas as their own composing domains were built) -- see
+        # schemas.GenericPolicyRules.
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.ACCESS,
+            name="Access",
             description=None,
         )
         version = await service.create_version(
@@ -595,8 +688,8 @@ class TestRulesValidation:
             actor_user_id=None,
             requesting_organization_id=org.id,
             organization_id=org.id,
-            policy_type=PolicyType.FUP,
-            name="Fair Usage",
+            policy_type=PolicyType.ACCESS,
+            name="Access",
             description=None,
         )
         v1 = await service.create_version(

@@ -43,6 +43,10 @@ __all__ = [
     "VoucherExhaustedError",
     "VoucherExpiredError",
     "VoucherRedemptionRateLimitExceededError",
+    "VoucherPlanNotFoundError",
+    "CrossOrganizationVoucherPlanAccessError",
+    "VoucherSeriesNotFoundError",
+    "CrossOrganizationVoucherSeriesAccessError",
 ]
 
 
@@ -183,4 +187,51 @@ class VoucherRedemptionRateLimitExceededError(VoucherError):
             f"Too many voucher attempts. Try again in {retry_after_seconds} seconds.",
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             data={"retry_after_seconds": retry_after_seconds},
+        )
+
+
+class VoucherPlanNotFoundError(VoucherError):
+    def __init__(self, plan_id: uuid.UUID | str) -> None:
+        super().__init__(
+            f"Voucher plan not found: {plan_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class CrossOrganizationVoucherPlanAccessError(VoucherError):
+    """A caller acting within organization A attempted to read/mutate a
+    voucher plan belonging to organization B -- mirrors
+    ``CrossOrganizationVoucherBatchAccessError``. A platform-wide plan
+    (``organization_id is None``) is never subject to this check -- any
+    organization may read it, the identical
+    ``app.domains.queue_management.models.QueueProfile.organization_id``
+    nullable-means-shared posture this plan's own model docstring mirrors."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a voucher plan belonging to another organization",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class VoucherSeriesNotFoundError(VoucherError):
+    def __init__(self, series_id: uuid.UUID | str) -> None:
+        super().__init__(
+            f"Voucher series not found: {series_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class CrossOrganizationVoucherSeriesAccessError(VoucherError):
+    """A caller acting within organization A attempted to read/mutate a
+    voucher series belonging to organization B -- mirrors
+    ``CrossOrganizationVoucherBatchAccessError``. Unlike a plan, a series
+    always has a real ``organization_id`` (never platform-wide -- see
+    ``models.VoucherSeries``'s own docstring), so this check applies
+    unconditionally."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a voucher series belonging to another organization",
+            status_code=status.HTTP_403_FORBIDDEN,
         )

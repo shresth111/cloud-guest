@@ -32,6 +32,8 @@ from app.domains.monitoring.dependencies import get_monitoring_service
 from app.domains.monitoring.service import MonitoringService
 from app.domains.otp.dependencies import get_otp_service
 from app.domains.otp.service import OtpService
+from app.domains.policy.dependencies import get_policy_service
+from app.domains.policy.service import PolicyService
 from app.domains.queue_management.dependencies import get_queue_management_service
 from app.domains.queue_management.service import QueueManagementService
 from app.domains.rbac.dependencies import get_rbac_repository
@@ -71,6 +73,7 @@ def get_guest_service(
     queue_management_service: QueueManagementService = Depends(
         get_queue_management_service
     ),
+    policy_service: PolicyService = Depends(get_policy_service),
 ) -> GuestService:
     """BE-011 Part 3 addition: wires ``MonitoringService`` in as
     ``GuestService``'s optional ``monitoring_hook`` (see that class's own
@@ -96,7 +99,14 @@ def get_guest_service(
     ``monitoring_hook`` is wired -- the one DI-wiring edit required for a
     real bandwidth queue to actually get pushed to the guest's router on
     every login, in the running application, rather than this being dead
-    code no request path ever exercises."""
+    code no request path ever exercises.
+
+    Phase 1 BhaiFi-parity addition: wires ``PolicyService`` in as
+    ``GuestService``'s optional ``policy_lookup`` -- the one DI-wiring edit
+    required for the real per-guest device limit
+    (``PolicyType.DEVICE``) to actually resolve from a configured policy in
+    the running application, rather than always falling back to
+    ``constants.DEFAULT_MAX_DEVICES_PER_GUEST``."""
     return GuestService(
         repository,
         otp_service,
@@ -107,6 +117,7 @@ def get_guest_service(
         monitoring_hook=monitoring_service,
         access_control_hook=guest_access_service,
         queue_assignment_hook=queue_management_service,
+        policy_lookup=policy_service,
     )
 
 
@@ -125,7 +136,16 @@ def get_radius_service(
         get_nas_code_counter_repository
     ),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    queue_management_service: QueueManagementService = Depends(
+        get_queue_management_service
+    ),
 ) -> RadiusService:
+    """Queue Management Engine addition: wires ``QueueManagementService`` in
+    as ``RadiusService``'s optional ``queue_lookup`` hook -- the one
+    DI-wiring edit required for a real ``Mikrotik-Rate-Limit`` reply
+    attribute to actually appear in the running application's RADIUS
+    Authorize response, rather than this being dead code no request path
+    ever exercises. See ``RadiusService.__init__``'s own docstring."""
     return RadiusService(
         repository,
         guest_service,
@@ -133,6 +153,7 @@ def get_radius_service(
         location_service,
         nas_code_counter_repository,
         audit_writer=audit_repository,
+        queue_lookup=queue_management_service,
     )
 
 

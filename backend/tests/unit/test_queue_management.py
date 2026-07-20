@@ -38,6 +38,7 @@ from app.domains.queue_management.constants import (
     QueueScheduleType,
     QueueStatus,
     QueueTargetType,
+    QueueType,
 )
 from app.domains.queue_management.device_adapters import (
     QueueDeviceStatus,
@@ -46,6 +47,7 @@ from app.domains.queue_management.exceptions import (
     CrossOrganizationQueueAccessError,
     QueueAssignmentNotApplicableError,
     QueueAssignmentNotRemovableError,
+    QueueDeviceOperationError,
     QueueMissingCredentialsError,
     QueueTargetIdNotAllowedError,
     QueueTargetIdRequiredError,
@@ -60,6 +62,7 @@ from app.domains.queue_management.models import (
 from app.domains.queue_management.router import router as queue_management_router
 from app.domains.queue_management.service import (
     QueueManagementService,
+    format_mikrotik_rate_limit,
     is_schedule_active_now,
 )
 from app.domains.router.exceptions import RouterNotFoundError
@@ -342,9 +345,12 @@ class FakeQueueDeviceAdapter:
     created_ids: list[str] = field(default_factory=list)
     updated_calls: list[dict[str, object]] = field(default_factory=list)
     removed_ids: list[str] = field(default_factory=list)
+    create_should_fail: bool = False
     _counter: int = 0
 
     async def create_simple_queue(self, credentials, **kwargs) -> str:
+        if self.create_should_fail:
+            raise QueueDeviceOperationError("create_simple_queue", "simulated failure")
         self._counter += 1
         device_id = f"*{self._counter}"
         self.created_ids.append(device_id)
@@ -402,12 +408,12 @@ class Harness:
     device_adapter: FakeQueueDeviceAdapter
 
 
-def make_harness() -> Harness:
+def make_harness(*, device_adapter: FakeQueueDeviceAdapter | None = None) -> Harness:
     repository = FakeQueueManagementRepository()
     router_lookup = FakeRouterLookup()
     policy_lookup = FakePolicyLookup()
     audit_writer = FakeAuditLogWriter()
-    adapter = FakeQueueDeviceAdapter()
+    adapter = device_adapter or FakeQueueDeviceAdapter()
 
     service = QueueManagementService(
         repository,
@@ -916,6 +922,57 @@ class TestMoveQueue:
         assert old_refetched.status == QueueStatus.EXPIRED.value
         assert old_refetched.superseded_by_assignment_id == new_assignment.id
 
+    async def test_move_rolls_back_when_new_assignment_fails_to_apply(self) -> None:
+        """A failed device push for the new profile must never leave the
+        target with zero bandwidth -- the old, already-working assignment
+        stays exactly as it was: still ACTIVE, still on the device, never
+        marked superseded."""
+        adapter = FakeQueueDeviceAdapter()
+        h = make_harness(device_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        profile_a = await h.service.create_profile(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            name="A",
+            download_rate_kbps=1000,
+            upload_rate_kbps=500,
+        )
+        profile_b = await h.service.create_profile(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            name="B",
+            download_rate_kbps=9000,
+            upload_rate_kbps=3000,
+        )
+        old = await h.service.create_assignment(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            target_type=QueueTargetType.SESSION,
+            target_id=uuid.uuid4(),
+            router_id=router.id,
+            device_target="10.0.0.5/32",
+            queue_profile_id=profile_a.id,
+        )
+        await h.service.apply_queue(
+            old.id, actor_user_id=None, requesting_organization_id=None
+        )
+        old_device_queue_id = old.device_queue_id
+
+        adapter.create_should_fail = True
+        with pytest.raises(QueueDeviceOperationError):
+            await h.service.move_queue(
+                old.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+                new_queue_profile_id=profile_b.id,
+            )
+
+        old_refetched = await h.repository.get_assignment_by_id(old.id)
+        assert old_refetched.status == QueueStatus.ACTIVE.value
+        assert old_refetched.superseded_by_assignment_id is None
+        assert old_refetched.device_queue_id == old_device_queue_id
+        assert old_device_queue_id not in adapter.removed_ids
+
     async def test_history_returns_original_and_superseding_rows(self) -> None:
         h = make_harness()
         router = h.router_lookup.add(_make_router())
@@ -1197,6 +1254,86 @@ class TestSweepScheduleTransitions:
         assert result["resumed"] == 1
         refetched = await h.repository.get_assignment_by_id(assignment.id)
         assert refetched.status == QueueStatus.ACTIVE.value
+
+
+# ============================================================================
+# RADIUS reply-attribute integration
+# ============================================================================
+
+
+class TestFormatMikrotikRateLimit:
+    def test_formats_rx_tx_without_burst(self) -> None:
+        profile = QueueProfile(
+            **_base_fields(
+                organization_id=None,
+                name="5 Mbps",
+                description=None,
+                download_rate_kbps=5000,
+                upload_rate_kbps=1000,
+                burst_download_kbps=None,
+                burst_upload_kbps=None,
+                burst_threshold_kbps=None,
+                burst_time_seconds=None,
+                priority=8,
+                queue_type=QueueType.SIMPLE.value,
+                is_system_profile=False,
+                is_active=True,
+            )
+        )
+        assert format_mikrotik_rate_limit(profile) == "1000k/5000k"
+
+    def test_formats_with_burst_and_priority(self) -> None:
+        profile = QueueProfile(
+            **_base_fields(
+                organization_id=None,
+                name="5 Mbps burst",
+                description=None,
+                download_rate_kbps=5000,
+                upload_rate_kbps=1000,
+                burst_download_kbps=8000,
+                burst_upload_kbps=2000,
+                burst_threshold_kbps=4000,
+                burst_time_seconds=8,
+                priority=8,
+                queue_type=QueueType.SIMPLE.value,
+                is_system_profile=False,
+                is_active=True,
+            )
+        )
+        assert (
+            format_mikrotik_rate_limit(profile, priority_override=3)
+            == "1000k/5000k 2000k/8000k 4000k/4000k 8/8 3"
+        )
+
+
+class TestGetRateLimitReplyForSession:
+    async def test_returns_formatted_rate_limit_for_active_assignment(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        profile = await h.service.create_profile(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            name="5 Mbps",
+            download_rate_kbps=5000,
+            upload_rate_kbps=1000,
+        )
+        session_id = uuid.uuid4()
+        await h.service.create_assignment(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            target_type=QueueTargetType.SESSION,
+            target_id=session_id,
+            router_id=router.id,
+            device_target="10.0.0.5/32",
+            queue_profile_id=profile.id,
+        )
+        rate_limit = await h.service.get_rate_limit_reply_for_session(session_id)
+        assert rate_limit == "1000k/5000k"
+
+    async def test_returns_none_when_no_assignment_exists(self) -> None:
+        h = make_harness()
+        rate_limit = await h.service.get_rate_limit_reply_for_session(uuid.uuid4())
+        assert rate_limit is None
 
 
 # ============================================================================

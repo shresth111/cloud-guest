@@ -152,6 +152,8 @@ from .events import (
 )
 from .exceptions import (
     CrossOrganizationVoucherBatchAccessError,
+    CrossOrganizationVoucherPlanAccessError,
+    CrossOrganizationVoucherSeriesAccessError,
     VoucherBatchNotActiveError,
     VoucherBatchNotFoundError,
     VoucherBatchQuantityExceededError,
@@ -159,10 +161,12 @@ from .exceptions import (
     VoucherExhaustedError,
     VoucherExpiredError,
     VoucherNotFoundError,
+    VoucherPlanNotFoundError,
     VoucherRedemptionRateLimitExceededError,
     VoucherRevokedError,
+    VoucherSeriesNotFoundError,
 )
-from .models import Voucher, VoucherBatch
+from .models import Voucher, VoucherBatch, VoucherPlan, VoucherSeries
 from .repository import VoucherRepositoryProtocol
 from .validators import (
     normalize_redeemed_identifier,
@@ -170,6 +174,7 @@ from .validators import (
     validate_code_length,
     validate_quantity,
 )
+from .voucher_pdf import render_voucher_batch_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +325,8 @@ class VoucherService:
         data_limit_mb: int | None,
         notes: str | None,
         has_manage_permission: bool,
+        plan_id: uuid.UUID | None = None,
+        series_id: uuid.UUID | None = None,
     ) -> VoucherBatch:
         validate_quantity(quantity)
         validate_code_length(code_length)
@@ -334,11 +341,24 @@ class VoucherService:
             await self.location_lookup.get_location(
                 location_id, requesting_organization_id=organization.id
             )
+        if plan_id is not None:
+            # Existence-only check -- see VoucherPlan's own docstring for
+            # why a platform-wide plan (organization_id is None) is never
+            # subject to a cross-org check.
+            await self.get_plan(
+                plan_id, requesting_organization_id=requesting_organization_id
+            )
+        if series_id is not None:
+            await self.get_series(
+                series_id, requesting_organization_id=requesting_organization_id
+            )
 
         batch = await self.repository.create_batch(
             name=name,
             organization_id=organization.id,
             location_id=location_id,
+            plan_id=plan_id,
+            series_id=series_id,
             quantity=quantity,
             code_length=code_length,
             code_prefix=code_prefix,
@@ -371,6 +391,7 @@ class VoucherService:
             rows = [
                 {
                     "batch_id": batch.id,
+                    "plan_id": batch.plan_id,
                     "code": code,
                     "status": VoucherStatus.UNUSED.value,
                     "use_count": 0,
@@ -539,6 +560,192 @@ class VoucherService:
                 batch, {"status": VoucherBatchStatus.EXPIRED.value}
             )
         return batch
+
+    # ========================================================================
+    # VoucherPlan / VoucherSeries (Phase 1 BhaiFi-parity)
+    # ========================================================================
+
+    async def create_plan(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        organization_id: uuid.UUID | None,
+        name: str,
+        description: str | None,
+        queue_profile_id: uuid.UUID | None,
+        default_validity_minutes: int,
+        default_data_limit_mb: int | None,
+        default_max_uses_per_voucher: int,
+    ) -> VoucherPlan:
+        """Mirrors ``app.domains.policy.service.PolicyService
+        .create_policy``'s identical "organization_id is None means
+        platform-wide, only a platform-level caller may create one" gate --
+        see ``models.VoucherPlan``'s own docstring for why this plan may be
+        platform-wide, unlike ``VoucherSeries``."""
+        if organization_id is None:
+            if requesting_organization_id is not None:
+                raise CrossOrganizationVoucherPlanAccessError()
+        else:
+            organization = await self.organization_lookup.get_organization(
+                organization_id
+            )
+            if (
+                requesting_organization_id is not None
+                and organization.id != requesting_organization_id
+            ):
+                raise CrossOrganizationVoucherPlanAccessError()
+
+        plan = await self.repository.create_plan(
+            name=name,
+            organization_id=organization_id,
+            description=description,
+            queue_profile_id=queue_profile_id,
+            default_validity_minutes=default_validity_minutes,
+            default_data_limit_mb=default_data_limit_mb,
+            default_max_uses_per_voucher=default_max_uses_per_voucher,
+            is_active=True,
+            created_by=actor_user_id,
+        )
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=actor_user_id,
+                action=AuditAction.VOUCHER_PLAN_CREATED.value,
+                entity_type="voucher_plan",
+                entity_id=plan.id,
+                description=f"Voucher plan '{plan.name}' created",
+                event_metadata={"queue_profile_id": str(queue_profile_id)}
+                if queue_profile_id
+                else {},
+                organization_id=plan.organization_id,
+                location_id=None,
+            )
+        return plan
+
+    async def get_plan(
+        self,
+        plan_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> VoucherPlan:
+        plan = await self.repository.get_plan(plan_id)
+        if plan is None:
+            raise VoucherPlanNotFoundError(plan_id)
+        if (
+            plan.organization_id is not None
+            and requesting_organization_id is not None
+            and plan.organization_id != requesting_organization_id
+        ):
+            raise CrossOrganizationVoucherPlanAccessError()
+        return plan
+
+    async def get_plan_queue_profile_id(self, plan_id: uuid.UUID) -> uuid.UUID | None:
+        """The single, narrow read ``app.domains.guest.service.GuestService
+        ._assign_voucher_queue`` needs -- see that method's own docstring
+        for the full "who creates the real QueueAssignment, and why not
+        this module" write-up. Returns ``None`` both when the plan itself
+        carries no speed entitlement (``queue_profile_id is None``) and
+        when ``plan_id`` doesn't resolve to a real row at all (defensive;
+        should not happen in practice since ``Voucher.plan_id`` is only
+        ever set from an already-validated ``VoucherBatch.plan_id`` -- see
+        ``create_batch``) -- a redemption's speed-link is always
+        best-effort, never a reason to fail the login it decorates."""
+        plan = await self.repository.get_plan(plan_id)
+        return plan.queue_profile_id if plan is not None else None
+
+    async def list_plans(
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[VoucherPlan], object]:
+        filters: dict[str, object] = {}
+        if requesting_organization_id is not None:
+            filters["organization_id"] = requesting_organization_id
+        return await self.repository.list_plans(
+            page=page, page_size=page_size, filters=filters or None
+        )
+
+    async def create_series(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        plan_id: uuid.UUID,
+        name: str,
+        description: str | None,
+    ) -> VoucherSeries:
+        organization = await self.organization_lookup.get_organization(organization_id)
+        if (
+            requesting_organization_id is not None
+            and organization.id != requesting_organization_id
+        ):
+            raise CrossOrganizationVoucherSeriesAccessError()
+        if location_id is not None:
+            await self.location_lookup.get_location(
+                location_id, requesting_organization_id=organization.id
+            )
+        # Existence-only check -- a series's own plan may be a
+        # platform-wide template (organization_id is None) or one already
+        # confirmed to belong to this same organization; either way, no
+        # further cross-org check is needed beyond what get_plan already
+        # enforces.
+        await self.get_plan(plan_id, requesting_organization_id=organization.id)
+
+        series = await self.repository.create_series(
+            name=name,
+            organization_id=organization.id,
+            location_id=location_id,
+            plan_id=plan_id,
+            description=description,
+            is_active=True,
+            created_by=actor_user_id,
+        )
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=actor_user_id,
+                action=AuditAction.VOUCHER_SERIES_CREATED.value,
+                entity_type="voucher_series",
+                entity_id=series.id,
+                description=f"Voucher series '{series.name}' created",
+                event_metadata={"plan_id": str(plan_id)},
+                organization_id=series.organization_id,
+                location_id=series.location_id,
+            )
+        return series
+
+    async def get_series(
+        self,
+        series_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> VoucherSeries:
+        series = await self.repository.get_series(series_id)
+        if series is None:
+            raise VoucherSeriesNotFoundError(series_id)
+        if (
+            requesting_organization_id is not None
+            and series.organization_id != requesting_organization_id
+        ):
+            raise CrossOrganizationVoucherSeriesAccessError()
+        return series
+
+    async def list_series(
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[VoucherSeries], object]:
+        filters: dict[str, object] = {}
+        if requesting_organization_id is not None:
+            filters["organization_id"] = requesting_organization_id
+        return await self.repository.list_series(
+            page=page, page_size=page_size, filters=filters or None
+        )
 
     # ========================================================================
     # Code generation
@@ -808,6 +1015,30 @@ class VoucherService:
             )
         return buffer.getvalue()
 
+    async def export_batch_pdf(
+        self,
+        *,
+        batch_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> bytes:
+        """Phase 1 BhaiFi-parity (#20): renders ``batch``'s own vouchers as
+        a real, printable PDF (``voucher_pdf.render_voucher_batch_pdf``) --
+        mirrors ``export_batch_csv``'s identical "resolve the batch (tenant
+        check included), list its vouchers, hand both to a dedicated
+        renderer" shape, resolving the organization's display name via the
+        same ``organization_lookup`` composition ``create_batch`` already
+        uses (never re-derived/duplicated here)."""
+        batch = await self.get_batch(
+            batch_id, requesting_organization_id=requesting_organization_id
+        )
+        vouchers = await self.repository.list_all_vouchers_for_batch(batch.id)
+        organization = await self.organization_lookup.get_organization(
+            batch.organization_id
+        )
+        return render_voucher_batch_pdf(
+            batch, vouchers, organization_name=organization.name
+        )
+
     async def import_vouchers(
         self,
         *,
@@ -861,6 +1092,7 @@ class VoucherService:
             rows = [
                 {
                     "batch_id": batch.id,
+                    "plan_id": batch.plan_id,
                     "code": code,
                     "status": VoucherStatus.UNUSED.value,
                     "use_count": 0,

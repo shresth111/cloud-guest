@@ -19,6 +19,10 @@ keep working uniformly.
   scoping decision.
 * :class:`GuestSession` -- one continuous guest WiFi connection interval on
   one router. Append-only: see "Sessions are append-only" below.
+* :class:`GuestQuotaUsage` -- Phase 1 BhaiFi-parity: cumulative Fair Usage
+  Policy (FUP) data/time counters for one guest, one recurring period
+  (daily/weekly/monthly) at a time, spanning every session/device within
+  that period -- see that class's own docstring.
 * :class:`GuestLoginHistory` -- every login attempt (success or failure),
   including ones that never resolve to a real ``Guest`` row. See
   "``guest_id`` nullability" below.
@@ -313,6 +317,93 @@ class GuestSession(BaseModel):
 
     def total_bytes(self) -> int:
         return self.bytes_uploaded + self.bytes_downloaded
+
+
+class GuestQuotaUsage(BaseModel):
+    """Cumulative Fair Usage Policy (FUP) counters for one guest, one
+    recurring period type (daily/weekly/monthly) at a time -- Phase 1
+    BhaiFi-parity. ``GuestSession.bytes_uploaded``/``bytes_downloaded``
+    describe a single connection interval only (see module docstring's
+    "Sessions are append-only" write-up); a guest's *daily* data cap must
+    survive across many reconnects and devices within the same calendar
+    day, which no single session row can answer on its own -- this table
+    is the guest-level aggregate that closes that gap. See
+    ``schemas.FUPPolicyRules`` (``app.domains.policy``) for the policy
+    payload shape this composes against, and ``service.py``'s "FUP quota
+    tracking" section for exactly how a row is read, bumped, and rolled
+    over.
+
+    One row per ``(guest_id, period_type)`` -- never per-session. ``bytes_used``
+    is bumped incrementally on every RADIUS Interim-Update (see
+    ``service.GuestService.record_usage``), riding along for free on a call
+    that already happens; ``minutes_used`` counts guest-level wall-clock
+    *connected* time, accrued instead by a periodic sweep
+    (``tasks.run_fup_time_accrual_sweep``) since RADIUS has no equivalent
+    "elapsed time" push -- and is **not** summed across concurrent
+    sessions (a guest with two simultaneous devices connected for 10
+    minutes has used 10 minutes, not 20; see that task's own docstring for
+    why this is the correct semantics for a *time* quota, unlike a
+    per-session byte counter).
+
+    ``period_start`` is this row's own current period's boundary, always
+    stored as a UTC-aware timestamp computed from the guest's
+    organization's own ``Organization.timezone`` (see
+    ``validators.compute_period_start``) -- once real wall-clock time has
+    moved past it, the row's counters reset to zero and ``period_start``
+    advances to the next boundary. Both the lazy, request-triggered
+    rollover (``service._get_or_reset_quota_usage``, called from the
+    login-time enforcement check and from ``record_usage``) and the
+    proactive Beat sweep (``tasks.run_quota_reset_sweep``) apply the
+    *exact same* "has the period rolled over" comparison, so there is no
+    duplicated, potentially-divergent reset logic between the two call
+    paths."""
+
+    __tablename__ = "guest_quota_usages"
+
+    guest_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("guests.id", ondelete="CASCADE"), nullable=False
+    )
+    # Denormalized from Guest.organization_id at row-creation time --
+    # mirrors GuestSession.organization_id's identical rationale: every
+    # consumer of this table (FUP enforcement, the two sweep tasks above)
+    # needs an organization_id to resolve a PolicyType.FUP rule set/an
+    # Organization.timezone without an extra join through guests.
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    period_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    period_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    bytes_used: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    minutes_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # The last time run_fup_time_accrual_sweep added elapsed minutes into
+    # minutes_used for this row -- NULL until the first sweep tick (or
+    # immediately after a reset) ever touches it, in which case accrual
+    # falls back to counting from period_start instead. See that task's
+    # own docstring.
+    last_accrued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_guest_quota_usages_guest_id", "guest_id"),
+        Index("ix_guest_quota_usages_organization_id", "organization_id"),
+        Index(
+            "uq_guest_quota_usages_guest_id_period_type",
+            "guest_id",
+            "period_type",
+            unique=True,
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<GuestQuotaUsage(guest_id={self.guest_id}, "
+            f"period_type={self.period_type})>"
+        )
 
 
 class GuestLoginHistory(BaseModel):

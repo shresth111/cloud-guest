@@ -68,13 +68,121 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
 from .constants import VoucherBatchStatus, VoucherStatus
+
+
+class VoucherPlan(BaseModel):
+    """Phase 1 BhaiFi-parity: a reusable, named "voucher product"
+    definition (e.g. "1-Hour Premium", "Daily 5 Mbps Pass") -- the speed a
+    voucher grants once redeemed, plus the default post-redemption
+    validity/data-cap/use-count a :class:`VoucherBatch` created under this
+    plan carries. Mirrors ``app.domains.queue_management.models
+    .QueueProfile``'s own "reusable, named, org-scoped-or-platform-wide"
+    shape: ``organization_id`` nullable means a platform-wide template any
+    organization may use (identical to ``QueueProfile.organization_id``'s
+    own nullability), non-null means an organization's own private plan.
+
+    ``queue_profile_id`` is this plan's actual speed-link -- **not** a
+    literal rate-limit value duplicated here (this module never composes
+    ``queue_management`` directly, mirroring ``VoucherBatch.data_limit_mb``'s
+    own "stored, not enforced, here" scope note): it is a plain, unenforced
+    reference a redeeming caller (``app.domains.guest.service.GuestService
+    ._assign_voucher_queue``) resolves and composes with
+    ``queue_management.service.QueueManagementService`` to create a real
+    ``QueueAssignment`` (``QueueTargetType.VOUCHER``) -- see that method's
+    own docstring for the full "who creates the real assignment, and why
+    not this module" write-up. ``NULL`` means this plan carries no speed
+    entitlement at all (a plain validity/data-cap template with no
+    bandwidth tie-in).
+
+    Unlike ``VoucherBatch``/``Voucher``, a plan has no append-only
+    redemption history of its own to preserve -- ``is_active`` is a plain,
+    reversible toggle (mirrors ``QueueProfile.is_active``'s identical
+    "reusable definition, not a historical record" posture), not a status
+    transition graph.
+    """
+
+    __tablename__ = "voucher_plans"
+
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The speed this plan grants once redeemed -- see class docstring for
+    # why this is a plain, unenforced reference, not a duplicated rate.
+    queue_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("queue_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    default_validity_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    default_data_limit_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    default_max_uses_per_voucher: Mapped[int] = mapped_column(
+        Integer, default=1, nullable=False
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        Index("ix_voucher_plans_organization_id", "organization_id"),
+        Index("ix_voucher_plans_queue_profile_id", "queue_profile_id"),
+        Index("ix_voucher_plans_is_active", "is_active"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<VoucherPlan(id={self.id}, name={self.name})>"
+
+
+class VoucherSeries(BaseModel):
+    """Phase 1 BhaiFi-parity: a named, ongoing campaign generated under
+    exactly one :class:`VoucherPlan` -- e.g. "Q3 2026 Front Desk Vouchers",
+    across which an admin may create many separate :class:`VoucherBatch`
+    generation runs over time (a batch is one "generate N codes now"
+    request; a series is the durable label tying an arbitrary number of
+    those requests together for reporting -- "how many vouchers has this
+    campaign produced/redeemed in total", without a batch-by-batch manual
+    sum). Unlike ``VoucherPlan`` (which may be platform-wide),
+    ``organization_id`` is required -- a series is always one organization's
+    own campaign, never a shared platform template."""
+
+    __tablename__ = "voucher_series"
+
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("voucher_plans.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        Index("ix_voucher_series_organization_id", "organization_id"),
+        Index("ix_voucher_series_location_id", "location_id"),
+        Index("ix_voucher_series_plan_id", "plan_id"),
+        Index("ix_voucher_series_is_active", "is_active"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<VoucherSeries(id={self.id}, name={self.name})>"
 
 
 class VoucherBatch(BaseModel):
@@ -94,6 +202,22 @@ class VoucherBatch(BaseModel):
     location_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    # Phase 1 BhaiFi-parity additions: optional links to the reusable
+    # "product" (VoucherPlan) and/or ongoing campaign (VoucherSeries) this
+    # generation run belongs to -- see those classes' own docstrings.
+    # Additive and nullable: every batch created before this addition (and
+    # any batch an admin creates with no plan/series in mind) simply has
+    # both as NULL, exactly today's behavior.
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("voucher_plans.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    series_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("voucher_series.id", ondelete="SET NULL"),
         nullable=True,
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -132,6 +256,8 @@ class VoucherBatch(BaseModel):
         Index("ix_voucher_batches_location_id", "location_id"),
         Index("ix_voucher_batches_status", "status"),
         Index("ix_voucher_batches_batch_expires_at", "batch_expires_at"),
+        Index("ix_voucher_batches_plan_id", "plan_id"),
+        Index("ix_voucher_batches_series_id", "series_id"),
     )
 
     def is_batch_expired(self, *, now: datetime) -> bool:
@@ -164,6 +290,16 @@ class Voucher(BaseModel):
         ForeignKey("voucher_batches.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # Denormalized from VoucherBatch.plan_id at voucher-creation time (see
+    # VoucherBatch.plan_id's own docstring) -- lets a redeeming caller
+    # (GuestService._assign_voucher_queue) resolve this voucher's own
+    # speed-link directly off the row already in hand (redeem_voucher
+    # already loads the Voucher), no join through the batch needed.
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("voucher_plans.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     code: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     status: Mapped[str] = mapped_column(
         String(20), default=VoucherStatus.UNUSED.value, nullable=False
@@ -184,6 +320,7 @@ class Voucher(BaseModel):
 
     __table_args__ = (
         Index("ix_vouchers_batch_id", "batch_id"),
+        Index("ix_vouchers_plan_id", "plan_id"),
         Index("ix_vouchers_code", "code", unique=True),
         Index("ix_vouchers_status", "status"),
     )
@@ -195,4 +332,4 @@ class Voucher(BaseModel):
         return f"<Voucher(id={self.id}, code={self.code}, status={self.status})>"
 
 
-__all__ = ["VoucherBatch", "Voucher"]
+__all__ = ["VoucherPlan", "VoucherSeries", "VoucherBatch", "Voucher"]

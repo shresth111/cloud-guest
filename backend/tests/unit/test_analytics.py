@@ -764,6 +764,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # ("queue-management-sweep-schedule-transitions") for its own time-
     # based auto suspend/resume sweep -- see
     # app.domains.queue_management.tasks's own module docstring.
+    # Phase 1 BhaiFi-parity adds a ninth and tenth Beat entry
+    # ("guest-fup-time-accrual-sweep"/"guest-quota-reset-sweep") for the
+    # FUP quota engine's time-accrual and proactive reset sweeps -- see
+    # app.domains.guest.tasks's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -773,6 +777,8 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "guest-session-timeout-sweep",
         "provisioning-engine-drain-queue",
         "queue-management-sweep-schedule-transitions",
+        "guest-fup-time-accrual-sweep",
+        "guest-quota-reset-sweep",
     }
 
 

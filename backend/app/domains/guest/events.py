@@ -77,6 +77,26 @@ class GuestSessionExpired:
 
 
 @dataclass(frozen=True, slots=True)
+class GuestSessionPaused:
+    session_id: uuid.UUID
+    reason: str | None
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class GuestSessionResumed:
+    session_id: uuid.UUID
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class GuestSessionExtended:
+    session_id: uuid.UUID
+    additional_minutes: int
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
 class GuestBlocked:
     guest_id: uuid.UUID
     reason: str | None
@@ -143,6 +163,9 @@ __all__ = [
     "GuestSessionDisconnected",
     "GuestSessionTerminated",
     "GuestSessionExpired",
+    "GuestSessionPaused",
+    "GuestSessionResumed",
+    "GuestSessionExtended",
     "GuestBlocked",
     "GuestUnblocked",
     "GuestConsentRecorded",

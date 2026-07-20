@@ -80,6 +80,35 @@ reassigning a target to a different profile (`move_queue`) never edits an
 `superseded_by_assignment_id` set -- so "Queue History" is simply every
 `QueueAssignment` row for a target, chronological, never a second table.
 
+**Phase 1 BhaiFi-parity: real rollback safety on failure.**
+`move_queue` applies the **new** assignment to the device *before* ever
+touching the old one -- if `apply_queue` on the new row raises, the method
+propagates the exception without marking the old assignment superseded or
+removing its own live device queue, so a failed move leaves the target
+exactly as it was (never a strictly-worse "zero bandwidth" state mid-move).
+This is a genuine correctness fix (caught by a new adversarial test,
+`test_move_rolls_back_when_new_assignment_fails_to_apply`), not merely a
+reordering for its own sake -- the "new row, not mutate" convention above
+was originally about historical auditability; this extends it to also be
+failure-order-safe.
+
+## 5a. `Mikrotik-Rate-Limit` RADIUS reply attribute (Phase 1 BhaiFi-parity)
+
+`QueueManagementService.get_rate_limit_reply_for_session`/module-level
+`format_mikrotik_rate_limit` compose with `app.domains.guest` to put a real
+`rx-rate/tx-rate [burst... priority]` string (RouterOS's own
+`Mikrotik-Rate-Limit` VSA grammar) into RADIUS Authorize's reply -- see
+`docs/guest/FLOW.md` §5 for the wiring (a narrow, optional
+`queue_lookup` hook on `RadiusService`, best-effort, never blocking
+authorization on failure). `rx` is the client's upload (received by the
+router), `tx` is the client's download (transmitted to the client) -- the
+real RouterOS convention, not this codebase's own `download_rate_kbps`/
+`upload_rate_kbps` field-name order. Burst/priority fields are only
+appended as a block when at least one burst value is actually set,
+mirroring `device_adapters._burst_fields`'s own "all or nothing"
+convention -- no fake zero-value placeholders in the common
+"no burst, custom priority" case.
+
 ## 6. Time-based policies: `PENDING`/`ACTIVE` <-> `SUSPENDED`, and a real
 ## background sweep
 

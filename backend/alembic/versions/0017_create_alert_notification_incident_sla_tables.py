@@ -188,10 +188,15 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["notification_channel_id"],
             ["notification_channels.id"],
-            name=(
-                "fk_alert_rule_notification_channels_notification_channel_id_"
-                "notification_channels"
-            ),
+            # Shortened from the naming convention's literal
+            # "fk_alert_rule_notification_channels_notification_channel_id_
+            # notification_channels" (81 characters), which exceeds
+            # Postgres's 63-character identifier limit and fails at
+            # DDL-compile time (verified via `alembic upgrade head --sql`)
+            # -- fixed in place for the same reason
+            # `0015_create_guest_tables.py`'s own identical fix documents:
+            # this table has never been created against a real database.
+            name="fk_arnc_notification_channel_id_notification_channels",
             ondelete="CASCADE",
         ),
         sa.UniqueConstraint(

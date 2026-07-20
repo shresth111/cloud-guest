@@ -571,6 +571,31 @@ class QueueManagementService:
             page_size=page_size,
         )
 
+    async def get_rate_limit_reply_for_session(
+        self, session_id: uuid.UUID
+    ) -> str | None:
+        """The single method ``app.domains.guest.service.RadiusService
+        .authorize``'s optional ``queue_lookup`` hook needs -- returns a
+        real RouterOS ``Mikrotik-Rate-Limit`` RADIUS reply-attribute
+        string for this session's own current queue assignment (whatever
+        its device-push status -- a guest's *entitled* rate is a RADIUS
+        concern independent of whether that rate has actually finished
+        being pushed to the device yet), or ``None`` if the session has no
+        queue assignment at all. Never raises -- an absent/unresolvable
+        assignment is a normal, common case (e.g. no bandwidth policy
+        configured for this session's scope), not an error."""
+        assignment = await self.repository.get_active_assignment_for_target(
+            target_type=QueueTargetType.SESSION.value, target_id=session_id
+        )
+        if assignment is None or assignment.queue_profile_id is None:
+            return None
+        profile = await self.repository.get_profile_by_id(assignment.queue_profile_id)
+        if profile is None:
+            return None
+        return format_mikrotik_rate_limit(
+            profile, priority_override=assignment.priority_override
+        )
+
     # ========================================================================
     # Queue lifecycle: apply / remove / move / reset / expire
     # ========================================================================
@@ -796,16 +821,22 @@ class QueueManagementService:
         new_queue_schedule_id: uuid.UUID | None = None,
         auto_apply: bool = True,
     ) -> QueueAssignment:
+        """Real rollback on failure: the new assignment is applied to the
+        device **before** the old one is ever touched. If ``apply_queue``
+        below raises, this method propagates the exception without ever
+        marking ``old`` superseded or removing its own live device queue
+        -- the target is left exactly as it was, still served by its
+        previous, already-working rate, never with zero bandwidth in
+        between. Only once the new assignment is confirmed ``ACTIVE`` does
+        the old one get pulled off the device and marked ``EXPIRED``. When
+        ``auto_apply`` is ``False``, the old assignment's own live device
+        queue is deliberately left untouched (and *not* yet marked
+        superseded) until an admin explicitly calls ``apply_queue`` on the
+        new row -- the same "never leave a target with zero bandwidth"
+        principle, just deferred to a later, explicit action."""
         old = await self.get_assignment(
             assignment_id, requesting_organization_id=requesting_organization_id
         )
-        if QueueStatus(old.status) == QueueStatus.ACTIVE:
-            await self.remove_queue(
-                assignment_id,
-                actor_user_id=actor_user_id,
-                requesting_organization_id=requesting_organization_id,
-            )
-            old = await self.get_assignment(assignment_id)
 
         new_assignment = await self.create_assignment(
             actor_user_id=actor_user_id,
@@ -823,6 +854,25 @@ class QueueManagementService:
             expires_at=old.expires_at,
         )
 
+        if not auto_apply:
+            return new_assignment
+
+        # Apply first -- if this raises, `old` is never touched below. See
+        # this method's own docstring.
+        applied = await self.apply_queue(
+            new_assignment.id,
+            actor_user_id=actor_user_id,
+            requesting_organization_id=requesting_organization_id,
+        )
+
+        if QueueStatus(old.status) == QueueStatus.ACTIVE:
+            await self.remove_queue(
+                old.id,
+                actor_user_id=actor_user_id,
+                requesting_organization_id=requesting_organization_id,
+            )
+            old = await self.get_assignment(old.id)
+
         validate_status_transition(
             current=QueueStatus(old.status), target=QueueStatus.EXPIRED
         )
@@ -830,25 +880,18 @@ class QueueManagementService:
             old,
             {
                 "status": QueueStatus.EXPIRED.value,
-                "superseded_by_assignment_id": new_assignment.id,
+                "superseded_by_assignment_id": applied.id,
                 "updated_by": actor_user_id,
             },
         )
         await self._audit(
             actor_user_id,
             AuditAction.QUEUE_ASSIGNMENT_CHANGED,
-            organization_id=new_assignment.organization_id,
-            entity_id=new_assignment.id,
-            description=f"Queue assignment {old.id} moved to {new_assignment.id}",
+            organization_id=applied.organization_id,
+            entity_id=applied.id,
+            description=f"Queue assignment {old.id} moved to {applied.id}",
         )
-
-        if auto_apply:
-            return await self.apply_queue(
-                new_assignment.id,
-                actor_user_id=actor_user_id,
-                requesting_organization_id=requesting_organization_id,
-            )
-        return new_assignment
+        return applied
 
     async def expire_assignment(
         self,
@@ -1047,10 +1090,42 @@ def _parse_hhmm(value: str) -> time:
     return time(hour=int(hour_str), minute=int(minute_str))
 
 
+def format_mikrotik_rate_limit(
+    profile: QueueProfile, *, priority_override: int | None = None
+) -> str:
+    """Formats a real RouterOS ``Mikrotik-Rate-Limit`` RADIUS reply-
+    attribute value: ``rx-rate/tx-rate [rx-burst-rate/tx-burst-rate
+    rx-burst-threshold/tx-burst-threshold rx-burst-time/tx-burst-time
+    priority]`` -- RouterOS's own real attribute grammar (``rx`` = traffic
+    received by the router from the client, i.e. the client's *upload*;
+    ``tx`` = traffic transmitted to the client, i.e. the client's
+    *download* -- matching ``QueueProfile.upload_rate_kbps``/
+    ``download_rate_kbps``'s own ordering exactly). Priority is only
+    appended when at least one burst field is set -- the same "all or
+    nothing" convention ``device_adapters._burst_fields`` already
+    establishes for the equivalent local ``/queue simple`` command, and it
+    keeps the common "no burst, non-default priority" case from requiring
+    fake zero-value burst placeholders just to reach the priority slot
+    (RouterOS uses the profile's/queue's own default priority when the
+    attribute omits it entirely)."""
+    parts = [f"{profile.upload_rate_kbps}k/{profile.download_rate_kbps}k"]
+    if profile.burst_upload_kbps is not None or profile.burst_download_kbps is not None:
+        parts.append(
+            f"{profile.burst_upload_kbps or 0}k/{profile.burst_download_kbps or 0}k"
+        )
+        threshold = profile.burst_threshold_kbps or 0
+        parts.append(f"{threshold}k/{threshold}k")
+        burst_time = profile.burst_time_seconds or 0
+        parts.append(f"{burst_time}/{burst_time}")
+        parts.append(str(priority_override or profile.priority))
+    return " ".join(parts)
+
+
 __all__ = [
     "QueueManagementService",
     "RouterLookupProtocol",
     "PolicyLookupProtocol",
     "AuditLogWriter",
     "is_schedule_active_now",
+    "format_mikrotik_rate_limit",
 ]

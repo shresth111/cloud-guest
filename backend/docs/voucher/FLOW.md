@@ -302,6 +302,27 @@ bad rows. Importing into a batch that is `EXPIRED`/`REVOKED` is rejected
 outright (`VoucherBatchNotActiveError`) -- there is no reason to add
 codes to a batch that can never go live again.
 
+## 8a. Printable voucher PDF export (Phase 1 BhaiFi-parity)
+
+**Decision: `GET /voucher-batches/{id}/download` returns raw
+`application/pdf`, the identical "raw bytes + Content-Disposition, not
+`ApiResponse`" transport §8's own CSV export already establishes.**
+
+`voucher_pdf.render_voucher_batch_pdf` renders a real, printable PDF -- a
+two-column grid of boxed, cut-out-ready voucher cards (organization name,
+the code itself in large monospace type, its post-redemption validity
+window, its data cap) -- via `reportlab`/`platypus`, the same library and
+primitives `app.domains.billing.invoice_pdf` already uses for invoices
+(reused directly, no new dependency). It is a **dedicated** renderer, not a
+reuse of `invoice_pdf`/`analytics.export`'s own generic report-section
+walker: see `invoice_pdf.py`'s own module docstring for the general
+"reuse-vs-dedicated" reasoning this mirrors -- a voucher card's fixed,
+tiny layout has nothing in common with an invoice's line-item/tax-breakdown
+shape. `VoucherService.export_batch_pdf` resolves the batch (tenant check
+included, same as `export_batch_csv`), lists its vouchers, and resolves the
+organization's display name via the same `organization_lookup` composition
+`create_batch` already uses.
+
 ## 9. Audit-volume judgment call -- and why vouchers differ from OTP
 
 **Decision: batch lifecycle events (created/submitted/approved/activated/
@@ -362,6 +383,66 @@ resolved `requesting_organization_id` (from `X-Organization-Id`) doesn't
 match the batch's own `organization_id` -- mirroring
 `app.domains.router.exceptions.CrossOrganizationRouterAccessError`'s
 identical tenant-boundary check.
+
+## 11. `VoucherPlan`/`VoucherSeries` + speed-linked redemption (Phase 1 BhaiFi-parity)
+
+**Decision: a `VoucherPlan` is a reusable "product" definition (speed +
+default validity/data-cap/use-count); a `VoucherSeries` is a named,
+ongoing campaign generated under exactly one plan; a `VoucherBatch`
+optionally links to either (or both) via nullable `plan_id`/`series_id`.**
+
+`VoucherPlan.queue_profile_id` is the speed a voucher redeemed under that
+plan grants -- a plain, unenforced reference this module itself never acts
+on directly (`voucher` stays a dependency-free leaf: it never imports or
+calls `app.domains.queue_management`). Redemption-time enforcement lives
+entirely in `app.domains.guest.service.GuestService._assign_voucher_queue`
+(see `docs/guest/FLOW.md` §14 for the full write-up), which:
+
+1. Reads `Voucher.plan_id` off the already-loaded row `redeem_voucher`
+   returned (denormalized from `VoucherBatch.plan_id` at voucher-creation
+   time -- see `DATABASE.md`).
+2. Resolves `VoucherService.get_plan_queue_profile_id(plan_id)` -- the
+   **one** narrow, read-only method this module exposes for that
+   composition, deliberately not a general `VoucherPlan` CRUD surface
+   exposed to `guest`.
+3. If resolved, creates and applies a real `QueueAssignment`
+   (`QueueTargetType.VOUCHER`) via the real `router_id`/`device_target`
+   only `GuestService` has in hand at that point (a voucher code by
+   itself names no router).
+
+`VoucherService.create_batch` accepts optional `plan_id`/`series_id` and
+validates both exist (`get_plan`/`get_series`, the identical
+existence-and-tenant check every other batch field already gets) before
+inserting the batch row; every generated/imported `Voucher` row then
+copies `batch.plan_id` onto its own denormalized column. `VoucherPlan`
+creation is gated identically to `PolicyService.create_policy`'s own
+"`organization_id is None` means platform-wide, only a platform-level
+caller may create one" rule; `VoucherSeries.organization_id` is always
+required (never platform-wide, since a campaign always belongs to one
+organization's own marketing effort).
+
+## 12. Voucher redemption analytics read-model (Phase 1 BhaiFi-parity)
+
+`GET /analytics/voucher-redemptions` (in `app.domains.analytics`, gated by
+`analytics.read` at `ScopeType.ORGANIZATION`) composes
+`VoucherRepositoryProtocol` **directly** -- the one deliberate exception,
+in this codebase, to "an analytics Protocol composes a domain's own
+service" (every other analytics composition reads through a service, e.g.
+`GuestAnalyticsLookupProtocol` -> `GuestAnalyticsService`, so that domain's
+own authorization/business logic runs first). Defensible specifically
+here: `count_vouchers_issued`/`count_vouchers_redeemed`/
+`get_redemption_counts_by_plan` are pure, read-only aggregate counts (each
+a `JOIN voucher_batches` for tenant scoping, since `Voucher` itself carries
+no `organization_id`/`location_id` of its own) with no state-mutating
+business rule to bypass -- unlike e.g. `redeem_voucher`'s real validation/
+rate-limiting/audit side effects. See
+`app.domains.analytics.voucher_analytics.py`'s own module docstring, and
+`app.domains.voucher.repository.py`'s matching write-up on the query side,
+for the full reasoning. **Honest scope limitation:** unlike
+`/analytics/routers`/`/analytics/network`, this endpoint has no
+`DashboardScopeResolver` layered underneath RBAC's own route-level gate --
+an MSP parent organization cannot see its children's aggregated
+voucher-redemption figures through this endpoint yet.
 
 ## End-to-End Flow
 

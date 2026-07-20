@@ -3,17 +3,21 @@ and the per-``PolicyType`` ``rules`` payload schemas (``POLICY_RULE_SCHEMAS``)
 ``validators.validate_rules`` checks every ``create_version`` call against.
 
 See ``constants.py``'s module docstring for why ``SESSION``/``AUTHN``/
-``BANDWIDTH``/``QOS`` have a concrete schema below -- every other
-``PolicyType`` still falls back to ``GenericPolicyRules`` (accepts any JSON
-object, no further shape validation), honestly reflecting that no existing
-hardcoded platform constant justifies a specific schema for those types yet.
+``BANDWIDTH``/``QOS``/``FUP``/``BUSINESS_HOURS``/``VOUCHER``/``DEVICE`` have
+a concrete schema below -- every other ``PolicyType`` still falls back to
+``GenericPolicyRules`` (accepts any JSON object, no further shape
+validation), honestly reflecting that no existing hardcoded platform
+constant justifies a specific schema for those types yet.
 ``BandwidthPolicyRules``/``QoSPolicyRules`` were added for
 ``app.domains.queue_management`` (the Queue Management Engine) to compose
 via ``PolicyService.resolve_effective_policy`` -- raw rate-limit/traffic-
 classification values, never a reference to a ``queue_management`` row:
 this module stays a dependency-free leaf (see ``constants.py``'s own
-docstring); it is ``queue_management`` that depends on ``policy``, not the
-reverse.
+docstring); it is ``queue_management``/``guest``/``voucher`` that depend on
+``policy``, not the reverse. ``FUPPolicyRules``/``BusinessHoursPolicyRules``/
+``VoucherPolicyRules``/``DevicePolicyRules`` follow the identical
+composition direction for ``app.domains.guest``'s quota enforcement/device-
+limit and ``app.domains.voucher``'s redemption rules.
 """
 
 from __future__ import annotations
@@ -31,6 +35,11 @@ __all__ = [
     "AuthNPolicyRules",
     "BandwidthPolicyRules",
     "QoSPolicyRules",
+    "FUPPolicyRules",
+    "TimeWindow",
+    "BusinessHoursPolicyRules",
+    "VoucherPolicyRules",
+    "DevicePolicyRules",
     "GenericPolicyRules",
     "POLICY_RULE_SCHEMAS",
     "PolicyCreateRequest",
@@ -103,6 +112,91 @@ class QoSPolicyRules(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class FUPPolicyRules(BaseModel):
+    """Validated shape of a ``PolicyType.FUP`` (Fair Usage Policy)
+    version's ``rules`` payload -- daily/weekly/monthly data and time
+    caps. ``app.domains.guest`` composes this via
+    ``PolicyService.resolve_effective_policy`` to enforce cumulative usage
+    limits (see ``app.domains.guest.models.GuestQuotaUsage``) -- a
+    period's limit field left ``None`` means "no cap for that period",
+    not zero. A guest may be subject to more than one period's limit
+    simultaneously (e.g. both a daily and a monthly cap)."""
+
+    daily_data_limit_mb: int | None = Field(default=None, ge=0)
+    weekly_data_limit_mb: int | None = Field(default=None, ge=0)
+    monthly_data_limit_mb: int | None = Field(default=None, ge=0)
+    daily_time_limit_minutes: int | None = Field(default=None, ge=0)
+    weekly_time_limit_minutes: int | None = Field(default=None, ge=0)
+    monthly_time_limit_minutes: int | None = Field(default=None, ge=0)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TimeWindow(BaseModel):
+    """A single named recurring time window -- structurally mirrors
+    ``app.domains.queue_management.models.QueueSchedule``'s own
+    ``days_of_week``/``start_time``/``end_time`` shape, but is an
+    independently-defined schema: ``policy`` stays a dependency-free leaf
+    (see ``constants.py``'s own docstring) and never imports
+    ``queue_management``. ``days_of_week`` uses the identical ISO weekday
+    convention (``0``=Monday..``6``=Sunday); an empty list means "every
+    day"."""
+
+    days_of_week: list[int] = Field(default_factory=list)
+    start_time: str = Field(..., description='24-hour "HH:MM" string.')
+    end_time: str = Field(..., description='24-hour "HH:MM" string.')
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class BusinessHoursPolicyRules(BaseModel):
+    """Validated shape of a ``PolicyType.BUSINESS_HOURS`` version's
+    ``rules`` payload -- named time-of-day windows (peak hours/night mode/
+    happy hours) a consuming domain resolves and acts on. This is the
+    *policy* (which windows exist, and what they're named) -- the actual
+    automatic bandwidth switching a "Night Mode" queue needs is
+    ``app.domains.queue_management.models.QueueSchedule``'s own job (see
+    that domain's ``FLOW.md`` §6); this schema informs *which*
+    ``QueueTemplate``/``QueueSchedule`` combination should be used during
+    each named window, it does not re-implement a second time-window
+    engine."""
+
+    peak_hours: list[TimeWindow] = Field(default_factory=list)
+    night_mode: list[TimeWindow] = Field(default_factory=list)
+    happy_hours: list[TimeWindow] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class VoucherPolicyRules(BaseModel):
+    """Validated shape of a ``PolicyType.VOUCHER`` version's ``rules``
+    payload -- redemption-time rules ``app.domains.voucher.service
+    .VoucherService.redeem_voucher`` composes via
+    ``PolicyService.resolve_effective_policy``, distinct from
+    ``AuthNPolicyRules``'s own redemption-attempt *rate limiting* (a
+    different concern: how many active vouchers a guest may simultaneously
+    hold, not how fast they may attempt redemptions)."""
+
+    max_active_vouchers_per_guest: int | None = Field(default=None, ge=1)
+    allow_multi_use: bool = True
+    default_validity_minutes_override: int | None = Field(default=None, ge=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class DevicePolicyRules(BaseModel):
+    """Validated shape of a ``PolicyType.DEVICE`` version's ``rules``
+    payload -- ``app.domains.guest.service.GuestService`` composes this to
+    resolve the real per-guest device-count limit (see that module's own
+    login-method enforcement, mirroring its existing concurrent-session-
+    limit precedent) instead of a hardcoded constant."""
+
+    max_devices_per_guest: int = Field(default=3, ge=1)
+    require_known_device: bool = False
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class GenericPolicyRules(BaseModel):
     """Fallback schema for every ``PolicyType`` with no concrete rule schema
     yet -- accepts any JSON object as-is, no further shape validation. See
@@ -118,12 +212,14 @@ POLICY_RULE_SCHEMAS: dict[PolicyType, type[BaseModel]] = {
     PolicyType.SESSION: SessionPolicyRules,
     PolicyType.AUTHN: AuthNPolicyRules,
     PolicyType.BANDWIDTH: BandwidthPolicyRules,
-    PolicyType.FUP: GenericPolicyRules,
-    PolicyType.BUSINESS_HOURS: GenericPolicyRules,
+    PolicyType.FUP: FUPPolicyRules,
+    PolicyType.BUSINESS_HOURS: BusinessHoursPolicyRules,
     PolicyType.ACCESS: GenericPolicyRules,
     PolicyType.VLAN: GenericPolicyRules,
     PolicyType.QOS: QoSPolicyRules,
     PolicyType.ROUTING: GenericPolicyRules,
+    PolicyType.VOUCHER: VoucherPolicyRules,
+    PolicyType.DEVICE: DevicePolicyRules,
 }
 
 

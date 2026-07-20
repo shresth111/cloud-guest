@@ -29,6 +29,8 @@ __all__ = [
     "GuestBlockRequest",
     "SessionDisconnectRequest",
     "SessionTerminateRequest",
+    "SessionPauseRequest",
+    "SessionExtendRequest",
     "SessionReconnectRequest",
     "GuestDeviceResponse",
     "GuestSessionResponse",
@@ -127,6 +129,14 @@ class SessionDisconnectRequest(BaseModel):
 
 class SessionTerminateRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=255)
+
+
+class SessionPauseRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class SessionExtendRequest(BaseModel):
+    additional_minutes: int = Field(..., gt=0, le=10080)
 
 
 class SessionReconnectRequest(BaseModel):
@@ -336,6 +346,15 @@ class RadiusAuthorizeResponse(BaseModel):
     )
     data_limit_mb: int | None = Field(
         default=None, description="Bandwidth/data policy reply hint."
+    )
+    rate_limit: str | None = Field(
+        default=None,
+        description=(
+            "Real Mikrotik-Rate-Limit reply attribute (rx-rate/tx-rate "
+            "[burst fields...]), resolved from the session's current "
+            "Queue Management Engine assignment -- None if no queue "
+            "assignment exists for this session."
+        ),
     )
     reply_message: str
 

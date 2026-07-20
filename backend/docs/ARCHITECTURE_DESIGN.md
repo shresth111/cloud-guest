@@ -438,6 +438,15 @@ with the rest of the codebase's Protocol pattern:
   e.g. `GuestSession.applied_session_policy_version_id` — additive nullable column).
 - Until Phase 2 ships, Phase 1 modules (`guest`, `guest_teams`) use their nullable FK/local default
   and simply have no policy source to resolve — no blocking dependency, no stub module needed.
+  **Update (Phase 1 BhaiFi-parity):** `guest` now *does* wire the real `policy` module in for two
+  concerns via an optional, `None`-by-default `policy_lookup` hook on `GuestService` — per-guest
+  device limits (`PolicyType.DEVICE`, falling back to a plain constant when no Policy Engine is
+  configured) and Fair Usage Policy data/time quotas (`PolicyType.FUP`, with no fallback constant
+  at all — enforcement is a no-op until a real FUP policy is assigned). `queue_management` was
+  already composing `PolicyType.BANDWIDTH`/`PolicyType.QOS` from its own earlier phase. The
+  "no blocking dependency" framing above still holds (both hooks default to `None` and are purely
+  additive), but "simply have no policy source to resolve" is no longer accurate for these two
+  specific concerns as of this pass.
 
 ---
 

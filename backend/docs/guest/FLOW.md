@@ -269,6 +269,28 @@ Document §13 ("Policy Engine Integration") for why full configurability is
 deliberately deferred to the Phase 2 `policy` module rather than added here
 as a one-off `Organization.settings` key.
 
+## 6b. Per-guest device limit (Phase 1 BhaiFi-parity)
+
+`login_via_otp`/`login_via_voucher` also reject a login with
+`GuestDeviceLimitExceededError` (`409`) if registering the presented MAC
+against the resolved guest would push their distinct-device count to or
+past the resolved limit. Unlike §6a's concurrent-session limit, this one
+**is** wired through the real Policy Engine:
+
+* `GuestService._resolve_device_limit` calls
+  `PolicyService.resolve_effective_policy(policy_type=PolicyType.DEVICE,
+  ...)` when a `policy_lookup` hook is wired (see
+  `app.domains.policy.schemas.DevicePolicyRules.max_devices_per_guest`),
+  falling back to `constants.DEFAULT_MAX_DEVICES_PER_GUEST` (`3`) only when
+  no Policy Engine is configured at all, or the resolved rules omit the
+  field.
+* `_enforce_device_limit` is a no-op when `device_mac` is absent (nothing
+  to register) or when the MAC already belongs to this exact guest (a
+  returning device, not a new one) -- checked via `get_device_by_mac`
+  without mutating anything.
+* Placed in the identical "reject before OTP verification/voucher
+  redemption" position §6a's own check occupies.
+
 ## 7. `data_limit_mb`/`session_timeout_minutes`: copied, not referenced
 
 Mirrors `app.domains.voucher.models.Voucher.expires_at`'s identical
@@ -368,3 +390,127 @@ All other analytics queries (`get_summary`, `get_top_locations`,
 mirrors `app.domains.router.models.Router.organization_id`'s identical
 denormalization rationale, avoiding a join through `locations` on every
 tenant-scoped analytics call), never a Python-side loop over fetched rows.
+
+## 12. FUP (Fair Usage Policy) quota tracking (Phase 1 BhaiFi-parity)
+
+`models.GuestQuotaUsage` holds one row per `(guest_id, period_type)`
+(daily/weekly/monthly) -- the guest-level aggregate a single
+`GuestSession`'s own byte counters cannot answer on their own (see §3's
+"append-only" write-up: a session describes one connection interval, not a
+calendar period spanning many reconnects/devices).
+
+* **Rollover** goes through one shared function,
+  `service.get_or_reset_quota_usage`, which checks whether real wall-clock
+  time (in the guest's own organization's `Organization.timezone`, via
+  `validators.compute_period_start`) has carried a row past its own
+  `period_start` -- if so, the row's counters reset to zero and
+  `period_start` advances, before the caller ever sees it. Both
+  request-triggered call sites (`_enforce_fup_quota`, `record_usage`) and
+  the two Beat sweeps below call this exact function, so there is one
+  non-divergent definition of "has this guest's day/week/month rolled
+  over" in the codebase.
+* **Bytes** are bumped incrementally on every RADIUS Interim-Update
+  (`record_usage` -> `_track_fup_data_usage`), riding for free on a call
+  that already happens. **Minutes** count guest-level wall-clock connected
+  time -- deliberately **not** summed across a guest's concurrent sessions
+  (two simultaneous devices connected for 10 minutes is 10 minutes of
+  usage, not 20) -- accrued instead by
+  `tasks.run_fup_time_accrual_sweep` (Celery Beat, every 5 minutes), since
+  RADIUS has no equivalent "elapsed time" push the way it does for bytes.
+* **Enforcement**: `_enforce_fup_quota` (the real, never-swallowed
+  checkpoint) runs once at the start of `login_via_otp`/`login_via_voucher`,
+  in the identical position §6a/§6b's own checks occupy -- but only when a
+  `policy_lookup` hook is wired **and** a `PolicyType.FUP` rule resolves a
+  concrete limit; there is no platform-wide fallback constant here at all
+  (unlike `DEFAULT_MAX_DEVICES_PER_GUEST`), since no existing hardcoded
+  constant anywhere in this codebase ever named a daily/weekly/monthly cap
+  to honestly mirror. Mid-session, both a data cap (`record_usage`) and a
+  time cap (`run_fup_time_accrual_sweep`) crossing lead to the same
+  outcome: the offending session(s) flip to `EXPIRED` (mirrors
+  `enforce_session_timeouts`'s own system-initiated `EXPIRED`, never
+  `DISCONNECTED`) -- best-effort, additive tightening on top of the
+  login-time gate, never a replacement for it.
+* **`tasks.run_quota_reset_sweep`** (Celery Beat, hourly) proactively rolls
+  every `GuestQuotaUsage` row over the moment its own period boundary
+  passes, so e.g. an admin's "quota remaining" view reflects a fresh
+  allowance even for a guest who hasn't reconnected yet in the new period --
+  idempotent (a row already reset for the current period is a no-op).
+
+## 13. Session Pause/Resume/Extend + real RADIUS Disconnect-Request (Phase 1 BhaiFi-parity)
+
+`constants.GuestSessionStatus.PAUSED` is the one status with an outgoing
+edge back to `ACTIVE` (see §"Status transition graph" in `DATABASE.md`) --
+an admin-driven, *reversible* temporary suspension, distinct from
+`terminate_session`'s permanent kill:
+
+* `pause_session` validates `ACTIVE -> PAUSED`, updates the row in place
+  (never a new session, unlike reconnect -- see §3), and issues a real live
+  RADIUS Disconnect-Request (below) to actually cut the guest's network
+  access, not just flip a database flag.
+* `resume_session` reverses it (`PAUSED -> ACTIVE`), refreshing
+  `last_activity_at` so a just-resumed session is never immediately
+  eligible for the timeout sweep. **Honest scope limitation:** this only
+  flips CloudGuest's own authorization state back to `ACTIVE` (so the
+  *next* RADIUS Authorize call succeeds again) -- it cannot force the
+  guest's device to reassociate with the NAS on its own; the guest
+  reconnects the same way any client does after any Disconnect-Request.
+* `extend_session` pushes `session_timeout_minutes` forward by an
+  admin-specified amount (legal on `ACTIVE` or `PAUSED`) -- a DB-level
+  extension only, mirroring §6's "reporting mechanism, not live
+  enforcement" posture; no RADIUS attribute is pushed for this one (unlike
+  pause's Disconnect-Request, there is no universally-supported CoA
+  equivalent for "extend remaining time" against a typical RouterOS
+  hotspot deployment).
+
+**Real RADIUS Disconnect-Request, replacing §5/§6's own documented
+no-op:** `app.domains.guest.radius_coa` builds a genuine, wire-correct RFC
+2865/5176 Disconnect-Request packet (Code/Identifier/Length header, an MD5
+Request Authenticator, User-Name/Acct-Session-Id/NAS-IP-Address/
+Framed-IP-Address attributes) and sends it via a real UDP socket
+(`asyncio.to_thread`-wrapped, mirroring `app.core.celery_app
+.ping_celery_workers`'s identical "blocking network call, bridged for
+async callers" posture). `service.issue_live_disconnect` -- a module-level,
+best-effort function shared by `disconnect_session`/`terminate_session`/
+`pause_session` **and** the two system-driven sweeps
+(`enforce_session_timeouts`/`run_fup_time_accrual`) -- resolves the
+session's `RadiusNasClient`, decrypts its shared secret, and sends the
+packet, never raising: an unreachable/misconfigured NAS must never prevent
+a session from ending in this platform's own records. What remains honest
+about "no live counterpart in this sandbox": there is no real FreeRADIUS/
+RouterOS device here to return a real Disconnect-ACK, so `send_packet`
+timing out (`None`) is this function's expected, non-fatal common case --
+see `radius_coa.py`'s own module docstring for the full "what's real, what
+isn't" write-up. Deliberately **no** Message-Authenticator (RFC 3579
+attribute 80): most FreeRADIUS/RouterOS deployments accept a
+Disconnect-Request authenticated by the Request Authenticator alone, and
+adding a second crypto primitive for a packet type this sandbox can never
+round-trip test against a live NAS anyway would be complexity without
+verifiable payoff.
+
+## 14. Speed-linked voucher redemption (Phase 1 BhaiFi-parity)
+
+`login_via_voucher` composes with `app.domains.voucher`'s new
+`VoucherPlan`/`VoucherSeries` (see `docs/voucher/FLOW.md`) via
+`_assign_voucher_queue`: when the redeemed `Voucher.plan_id` resolves (via
+`VoucherService.get_plan_queue_profile_id`, a narrow, read-only method --
+`voucher` never composes `queue_management` itself) to a plan carrying a
+real `queue_profile_id`, this method creates **and applies** a real
+`QueueAssignment` (`QueueTargetType.VOUCHER`, `target_id=voucher.id`) via
+`QueueManagementService.create_assignment`/`apply_queue` -- **not**
+`resolve_and_assign_queue` (the mechanism `_assign_guest_queue`'s own
+per-`SESSION` assignment already uses), since that method always resolves
+`PolicyType.BANDWIDTH` internally and has no override for an already-known,
+explicit profile. Best-effort and additive (mirrors `_assign_guest_queue`'s
+identical posture): a no-op when no `queue_assignment_hook` is wired, the
+voucher has no `plan_id`, the plan has no `queue_profile_id`, or
+`session.ip_address` is unknown; never raises.
+
+**Why this composition lives in `GuestService`, not
+`VoucherService.redeem_voucher`:** a `QueueTargetType.VOUCHER` assignment
+is device-bound (requires a real `router_id`/`device_target`, per
+`queue_management.validators.validate_target`'s
+`DEVICE_BOUND_TARGET_TYPES` check) -- `redeem_voucher` is deliberately
+router-agnostic (a voucher code by itself names no router; only the guest
+login redeeming it does), so only `GuestService`, which already has the
+session's real router in hand after session creation, can supply what a
+real assignment needs.

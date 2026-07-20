@@ -83,6 +83,8 @@ from .schemas import (
     RadiusNasResponse,
     RadiusNasUpdateRequest,
     SessionDisconnectRequest,
+    SessionExtendRequest,
+    SessionPauseRequest,
     SessionReconnectRequest,
     SessionTerminateRequest,
     TopDeviceItem,
@@ -557,6 +559,88 @@ async def terminate_guest_session(
 
 
 @admin_router.post(
+    "/guest-sessions/{session_id}/pause",
+    response_model=ApiResponse[GuestSessionResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_sessions.execute"))],
+)
+async def pause_guest_session(
+    request: Request,
+    session_id: uuid.UUID,
+    payload: SessionPauseRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestService = Depends(get_guest_service),
+):
+    session = await service.pause_session(
+        session_id=session_id,
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+        reason=payload.reason,
+    )
+    return build_response(
+        success=True,
+        message="Guest session paused",
+        data=_session_response(session).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.post(
+    "/guest-sessions/{session_id}/resume",
+    response_model=ApiResponse[GuestSessionResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_sessions.execute"))],
+)
+async def resume_guest_session(
+    request: Request,
+    session_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestService = Depends(get_guest_service),
+):
+    session = await service.resume_session(
+        session_id=session_id,
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Guest session resumed",
+        data=_session_response(session).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.post(
+    "/guest-sessions/{session_id}/extend",
+    response_model=ApiResponse[GuestSessionResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_sessions.execute"))],
+)
+async def extend_guest_session(
+    request: Request,
+    session_id: uuid.UUID,
+    payload: SessionExtendRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestService = Depends(get_guest_service),
+):
+    session = await service.extend_session(
+        session_id=session_id,
+        additional_minutes=payload.additional_minutes,
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Guest session extended",
+        data=_session_response(session).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.post(
     "/guests/{guest_id}/reconnect",
     response_model=ApiResponse[GuestSessionResponse],
     status_code=status.HTTP_200_OK,
@@ -921,6 +1005,7 @@ async def radius_authorize(
         authorized=result.authorized,
         session_timeout_seconds=result.session_timeout_seconds,
         data_limit_mb=result.data_limit_mb,
+        rate_limit=result.rate_limit,
         reply_message="accept" if result.authorized else "reject",
     )
 

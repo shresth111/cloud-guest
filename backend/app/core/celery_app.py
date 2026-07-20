@@ -116,7 +116,11 @@ from app.domains.billing.constants import (
     TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
 )
 from app.domains.guest.constants import (
+    FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
+    QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
     SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
+    TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
 )
 from app.domains.provisioning_engine.constants import (
@@ -245,6 +249,28 @@ celery_app.conf.update(
         "guest-session-timeout-sweep": {
             "task": TASK_RUN_SESSION_TIMEOUT_SWEEP,
             "schedule": SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
+        },
+        # Phase 1 BhaiFi-parity: FUP (Fair Usage Policy) time-quota accrual
+        # -- every 5 minutes, the same cadence as the session-timeout sweep
+        # above, since a guest who has just crossed a configured
+        # daily/weekly/monthly *time* cap is exactly as operationally
+        # visible (should be disconnected promptly) as a timed-out session.
+        # See ``app.domains.guest.tasks.run_fup_time_accrual_sweep``'s own
+        # docstring and ``app.domains.guest.constants
+        # .FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS``'s docstring.
+        "guest-fup-time-accrual-sweep": {
+            "task": TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
+            "schedule": FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
+        },
+        # Phase 1 BhaiFi-parity: proactive FUP quota-reset sweep -- hourly,
+        # not every 5 minutes, since a day/week/month rollover boundary
+        # never needs finer-than-hourly reset latency. See
+        # ``app.domains.guest.tasks.run_quota_reset_sweep``'s own docstring
+        # and ``app.domains.guest.constants
+        # .QUOTA_RESET_SWEEP_INTERVAL_SECONDS``'s docstring.
+        "guest-quota-reset-sweep": {
+            "task": TASK_RUN_QUOTA_RESET_SWEEP,
+            "schedule": QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
         },
         # Provisioning Engine: drains the real "Postgres row + Redis
         # wake-up signal" queue app.domains.provisioning_engine

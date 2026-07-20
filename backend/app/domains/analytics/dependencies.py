@@ -28,6 +28,8 @@ from app.domains.organization.service import OrganizationService
 from app.domains.rbac.authorization import RoleResolver
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
+from app.domains.voucher.dependencies import get_voucher_repository
+from app.domains.voucher.repository import VoucherRepositoryProtocol
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
@@ -45,6 +47,7 @@ from .report_service import (
 )
 from .repository import AnalyticsRepository, AnalyticsRepositoryProtocol
 from .service import AnalyticsService
+from .voucher_analytics_service import VoucherAnalyticsService
 
 
 def get_analytics_repository(
@@ -231,6 +234,21 @@ def get_scheduled_report_service(
     )
 
 
+def get_voucher_analytics_service(
+    voucher_repository: VoucherRepositoryProtocol = Depends(get_voucher_repository),
+) -> VoucherAnalyticsService:
+    """Phase 1 BhaiFi-parity: composes the real ``VoucherRepository``
+    directly (via ``app.domains.voucher``'s own already-public
+    ``get_voucher_repository`` factory -- no file inside that domain is
+    edited to make this work), satisfying
+    ``voucher_analytics.VoucherRedemptionLookupProtocol``'s three
+    read-only aggregate methods. See that module's own docstring for why
+    this composes the voucher *repository* directly rather than
+    ``VoucherService`` -- the one deliberate exception to every other
+    factory in this file's "compose a domain's own service" convention."""
+    return VoucherAnalyticsService(voucher_repository)
+
+
 __all__ = [
     "get_analytics_repository",
     "get_analytics_service",
@@ -244,4 +262,5 @@ __all__ = [
     "get_report_generation_service",
     "get_report_template_service",
     "get_scheduled_report_service",
+    "get_voucher_analytics_service",
 ]

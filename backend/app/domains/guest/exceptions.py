@@ -41,6 +41,9 @@ __all__ = [
     "InvalidNasStatusTransitionError",
     "InvalidAnalyticsDateRangeError",
     "ConcurrentSessionLimitExceededError",
+    "GuestDeviceLimitExceededError",
+    "FairUsagePolicyExceededError",
+    "InvalidExtensionMinutesError",
 ]
 
 
@@ -266,4 +269,89 @@ class ConcurrentSessionLimitExceededError(GuestError):
             "is the maximum allowed at once",
             status_code=status.HTTP_409_CONFLICT,
             data={"max_concurrent_sessions": limit},
+        )
+
+
+class GuestDeviceLimitExceededError(GuestError):
+    """The guest already has ``limit`` (or more) distinct
+    :class:`~.models.GuestDevice` rows registered -- raised by
+    ``service._enforce_device_limit`` before a *new* device would be
+    registered (or an existing device reassigned to this guest) via
+    ``login_via_otp``/``login_via_voucher``. ``limit`` is resolved through
+    the real ``PolicyType.DEVICE`` seam when a ``policy_lookup`` hook is
+    wired (``app.domains.policy.schemas.DevicePolicyRules
+    .max_devices_per_guest``), falling back to
+    ``constants.DEFAULT_MAX_DEVICES_PER_GUEST`` otherwise -- mirrors
+    ``ConcurrentSessionLimitExceededError``'s identical shape and "surface
+    the limit back to the caller as structured ``data``" convention. MAC
+    uniqueness itself is unchanged by this check -- it only gates *how
+    many* devices one guest may hold, never which physical device a MAC
+    address belongs to."""
+
+    def __init__(self, *, guest_id: uuid.UUID | str, limit: int) -> None:
+        self.limit = limit
+        super().__init__(
+            f"Guest {guest_id} already has {limit} device(s) registered, "
+            "which is the maximum allowed",
+            status_code=status.HTTP_409_CONFLICT,
+            data={"max_devices_per_guest": limit},
+        )
+
+
+class FairUsagePolicyExceededError(GuestError):
+    """The guest already meets or exceeds a configured ``PolicyType.FUP``
+    (Fair Usage Policy) ``daily``/``weekly``/``monthly`` data or time cap --
+    raised by ``service.GuestService._enforce_fup_quota`` before a new
+    session is created via ``login_via_otp``/``login_via_voucher``, exactly
+    mirroring ``GuestDeviceLimitExceededError``'s/
+    ``ConcurrentSessionLimitExceededError``'s "reject before touching
+    OTP/voucher verification" placement and structured-``data`` shape.
+    Unlike those two, there is no platform-wide fallback limit here at
+    all -- this is only ever raised when a real ``PolicyType.FUP`` rule
+    resolved a concrete cap for the guest's own organization (see
+    ``app.domains.policy.constants``'s "no seeded default" write-up for
+    ``FUP``); a deployment with no Policy Engine configured, or one with
+    no FUP policy assigned, never raises this at all. ``metric``
+    distinguishes a data cap (``"data"``, ``limit``/``used`` in MB) from a
+    time cap (``"time"``, ``limit``/``used`` in minutes)."""
+
+    def __init__(
+        self,
+        *,
+        guest_id: uuid.UUID | str,
+        period_type: str,
+        metric: str,
+        limit: int,
+        used: int,
+    ) -> None:
+        self.period_type = period_type
+        self.metric = metric
+        self.limit = limit
+        self.used = used
+        unit = "MB" if metric == "data" else "minute(s)"
+        super().__init__(
+            f"Guest {guest_id} has used {used} {unit} of their {period_type} "
+            f"{metric} allowance ({limit} {unit}), which is the maximum "
+            "allowed for this period",
+            status_code=status.HTTP_409_CONFLICT,
+            data={
+                "period_type": period_type,
+                "metric": metric,
+                "limit": limit,
+                "used": used,
+            },
+        )
+
+
+class InvalidExtensionMinutesError(GuestError):
+    """``GuestService.extend_session`` was called with a non-positive
+    ``additional_minutes`` -- mirrors ``InvalidAnalyticsDateRangeError``'s
+    identical minimal input-validation shape. Extending by zero or a
+    negative amount would either be a no-op or silently shorten the
+    session, neither of which is what an admin calling "extend" means."""
+
+    def __init__(self, additional_minutes: int) -> None:
+        super().__init__(
+            f"additional_minutes must be positive, got {additional_minutes}",
+            status_code=status.HTTP_400_BAD_REQUEST,
         )

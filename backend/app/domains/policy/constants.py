@@ -28,12 +28,14 @@ keeping ``policy`` acyclic, not an oversight.
 ## Rule types not yet seeded
 
 ``PolicyType`` covers every policy type ``docs/ARCHITECTURE_DESIGN.md`` §6.1
-names (authN/session/bandwidth/FUP/business-hours/access/VLAN/QoS/routing).
-``SESSION``/``AUTHN`` have a seeded ``PLATFORM_DEFAULT_RULES`` entry *and* a
-typed Pydantic schema in ``schemas.py``'s ``POLICY_RULE_SCHEMAS`` registry,
-because those are the two types this gap analysis found real,
-already-hardcoded platform constants for. ``BANDWIDTH``/``QOS`` also gained a
-typed schema (``schemas.BandwidthPolicyRules``/``QoSPolicyRules``) when
+names (authN/session/bandwidth/FUP/business-hours/access/VLAN/QoS/routing),
+plus two additive types this codebase's own Phase 1 BhaiFi-parity work
+added: ``VOUCHER``/``DEVICE`` (see below). ``SESSION``/``AUTHN`` have a
+seeded ``PLATFORM_DEFAULT_RULES`` entry *and* a typed Pydantic schema in
+``schemas.py``'s ``POLICY_RULE_SCHEMAS`` registry, because those are the two
+types this gap analysis found real, already-hardcoded platform constants
+for. ``BANDWIDTH``/``QOS`` also gained a typed schema
+(``schemas.BandwidthPolicyRules``/``QoSPolicyRules``) when
 ``app.domains.queue_management`` (the Queue Management Engine) was built --
 that domain composes these two policy types for real, so their ``rules``
 shape needed real validation -- but **no seeded platform default**: no
@@ -46,13 +48,27 @@ at any scope resolves to an empty ``rules`` dict
 (``PLATFORM_DEFAULT_RULES.get(policy_type, {})``) -- it is
 ``queue_management``'s own job to fall back to a sensible default
 ``QueueProfile`` (e.g. "Unlimited") when that happens, not this module's.
-The rest (``FUP``/``BUSINESS_HOURS``/``ACCESS``/``VLAN``/``ROUTING``) are
-fully functional -- a ``Policy``/``PolicyVersion`` of any of those types can
-be created, versioned, published, and assigned today -- but have no seeded
-platform default and validate their ``rules`` JSONB payload only as "a JSON
-object" (see ``schemas.GenericPolicyRules``), honestly reflecting that no
-existing hardcoded constant in this codebase justifies a specific default
-shape for them yet.
+
+``FUP``/``BUSINESS_HOURS`` gained typed schemas
+(``schemas.FUPPolicyRules``/``BusinessHoursPolicyRules``) for
+``app.domains.guest``'s own quota-enforcement composition -- likewise no
+seeded platform default (no existing hardcoded daily/weekly/monthly cap or
+named time window to mirror). ``DEVICE`` gained a typed schema
+(``schemas.DevicePolicyRules``) *and* a real seeded platform default,
+mirroring ``app.domains.guest.constants.DEFAULT_MAX_DEVICES_PER_GUEST``
+exactly (that constant's own docstring names this module as its intended
+resolver, the identical "the seam this constant was always waiting for"
+posture ``DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` established for
+``SESSION`` before it). ``VOUCHER`` gained a typed schema
+(``schemas.VoucherPolicyRules``) but **no seeded default** -- no existing
+hardcoded "max active vouchers per guest" constant exists anywhere to
+mirror. The rest (``ACCESS``/``VLAN``/``ROUTING``) remain fully functional --
+a ``Policy``/``PolicyVersion`` of any of those types can be created,
+versioned, published, and assigned today -- but have no seeded platform
+default and validate their ``rules`` JSONB payload only as "a JSON object"
+(see ``schemas.GenericPolicyRules``), honestly reflecting that no existing
+hardcoded constant in this codebase justifies a specific default shape for
+them yet.
 """
 
 from __future__ import annotations
@@ -77,6 +93,10 @@ class PolicyType(StrEnum):
     VLAN = "vlan"
     QOS = "qos"
     ROUTING = "routing"
+    # Phase 1 BhaiFi-parity additions -- see module docstring's "Rule types
+    # not yet seeded" section for the full write-up.
+    VOUCHER = "voucher"
+    DEVICE = "device"
 
 
 class PolicyVersionStatus(StrEnum):
@@ -135,6 +155,16 @@ PLATFORM_DEFAULT_RULES: dict[PolicyType, dict[str, Any]] = {
         # this policy type is meant to govern.
         "max_attempts_per_window": 30,
         "window_minutes": 1,
+    },
+    PolicyType.DEVICE: {
+        # Mirrors app.domains.guest.constants
+        # .DEFAULT_MAX_DEVICES_PER_GUEST -- that constant's own docstring
+        # explicitly names this module as its intended resolver, the
+        # identical "the seam this constant was always waiting for"
+        # posture PolicyType.SESSION's own entry above already
+        # establishes.
+        "max_devices_per_guest": 3,
+        "require_known_device": False,
     },
 }
 

@@ -8,7 +8,7 @@ for the full design reasoning behind each decision below.
 | Column                | Type            | Nullable | Notes                                                                                          |
 |-----------------------|-----------------|----------|-----------------------------------------------------------------------------------------------------|
 | `organization_id`     | `UUID`          | Yes      | FK -> `organizations.id`, `ondelete="CASCADE"`. `NULL` means a platform-wide policy definition (mirrors `notification_templates.organization_id`'s identical convention). |
-| `policy_type`         | `VARCHAR(30)`   | No       | One of `constants.PolicyType`'s values (`session`/`authn`/`bandwidth`/`fup`/`business_hours`/`access`/`vlan`/`qos`/`routing`). |
+| `policy_type`         | `VARCHAR(30)`   | No       | One of `constants.PolicyType`'s values (`session`/`authn`/`bandwidth`/`fup`/`business_hours`/`access`/`vlan`/`qos`/`routing`, plus `voucher`/`device` added additively for Phase 1 BhaiFi-parity -- a plain `String` column, so new values are code-only, no migration). |
 | `name`                | `VARCHAR(200)`  | No       | Display name.                                                                                        |
 | `description`         | `TEXT`          | Yes      |                                                                                                        |
 | `is_active`           | `BOOLEAN`       | No       | `server_default true`. Flipped to `false` by `deactivate_policy` -- a retired definition, not deleted. |
@@ -75,6 +75,18 @@ real, one-column operation.
 
 ## Not migrated
 
+* **Phase 1 BhaiFi-parity**: `PolicyType.VOUCHER`/`PolicyType.DEVICE` (two
+  new enum members) and typed `rules` schemas for `FUP`/`BUSINESS_HOURS`/
+  `VOUCHER`/`DEVICE` (`schemas.FUPPolicyRules`/`BusinessHoursPolicyRules`/
+  `VoucherPolicyRules`/`DevicePolicyRules`, validated in Python by
+  `validators.validate_rules` against the existing `rules JSONB` column --
+  no schema change). `DEVICE` also gained a seeded
+  `PLATFORM_DEFAULT_RULES` entry mirroring
+  `app.domains.guest.constants.DEFAULT_MAX_DEVICES_PER_GUEST`'s own
+  magnitude -- `VOUCHER`/`FUP`/`BUSINESS_HOURS` deliberately did not (no
+  existing hardcoded constant to honestly mirror for those). See
+  `FLOW.md`'s own module docstring and `constants.py`'s "Rule types not
+  yet seeded" section for the full write-up.
 * `app.domains.rbac.enums.PermissionModule.POLICY` and `AuditAction`'s new
   `policy_*` members -- both are plain `String` columns/enum members
   underneath (`permission_groups.key`, `permissions.key`,

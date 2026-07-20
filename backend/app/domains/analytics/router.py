@@ -85,6 +85,7 @@ from .dependencies import (
     get_domain_analytics_service,
     get_forecast_service,
     get_insight_service,
+    get_voucher_analytics_service,
 )
 from .domain_analytics_schemas import (
     AuthenticationAnalyticsResponse,
@@ -114,6 +115,8 @@ from .schemas import (
 )
 from .service import AnalyticsService
 from .validators import validate_date_range
+from .voucher_analytics_schemas import VoucherRedemptionAnalyticsResponse
+from .voucher_analytics_service import VoucherAnalyticsService
 
 router = APIRouter(tags=["Analytics"])
 
@@ -435,6 +438,50 @@ async def get_authentication_analytics(
     return build_response(
         success=True,
         message="Authentication analytics retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# Phase 1 BhaiFi-parity: Voucher Redemption Analytics
+#
+# Gated like every other organization-scoped domain analytics endpoint above
+# (RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION) +
+# RequireOrganization), but -- unlike those -- with no additional
+# DashboardScopeResolver check layered underneath; see
+# voucher_analytics_service.py's own module docstring for the honest scope
+# limitation this implies (no MSP-parent roll-up visibility, in this first
+# pass).
+# ============================================================================
+
+
+@router.get(
+    "/analytics/voucher-redemptions",
+    response_model=ApiResponse[VoucherRedemptionAnalyticsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def get_voucher_redemption_analytics(
+    request: Request,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    start_date: datetime | None = Query(default=None),
+    end_date: datetime | None = Query(default=None),
+    service: VoucherAnalyticsService = Depends(get_voucher_analytics_service),
+):
+    start, end = _resolve_window(start_date, end_date)
+    payload = await service.get_voucher_redemption_analytics(
+        organization_id=organization_id,
+        location_id=location_id,
+        start=start,
+        end=end,
+    )
+    return build_response(
+        success=True,
+        message="Voucher redemption analytics retrieved",
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )

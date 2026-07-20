@@ -29,6 +29,7 @@ from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.location.models import Location
+from app.domains.organization.models import Organization
 
 from .constants import GuestSessionStatus
 from .models import (
@@ -36,6 +37,7 @@ from .models import (
     GuestConsent,
     GuestDevice,
     GuestLoginHistory,
+    GuestQuotaUsage,
     GuestSession,
     RadiusNasClient,
     RadiusNasCodeCounter,
@@ -76,6 +78,26 @@ class AuthMethodOutcomeCounts:
     successful_attempts: int
 
 
+@dataclass(frozen=True, slots=True)
+class ActiveGuestOrgPair:
+    """One distinct ``(guest_id, organization_id)`` pair drawn from
+    currently ``ACTIVE`` ``GuestSession`` rows -- see
+    ``GuestRepository.list_active_guest_org_pairs``'s own docstring."""
+
+    guest_id: uuid.UUID
+    organization_id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaUsageWithOrgTimezone:
+    """A ``GuestQuotaUsage`` row paired with its own organization's
+    ``timezone`` -- see ``GuestRepository
+    .list_all_quota_usages_with_org_timezone``'s own docstring."""
+
+    usage: GuestQuotaUsage
+    organization_timezone: str
+
+
 class GuestRepositoryProtocol(Protocol):
     # -- guests ----------------------------------------------------------------
     async def create_guest(self, **fields: object) -> Guest: ...
@@ -111,6 +133,8 @@ class GuestRepositoryProtocol(Protocol):
     async def update_device(
         self, device: GuestDevice, data: dict[str, object]
     ) -> GuestDevice: ...
+
+    async def count_devices_for_guest(self, guest_id: uuid.UUID) -> int: ...
 
     # -- sessions ------------------------------------------------------------------
     async def create_session(self, **fields: object) -> GuestSession: ...
@@ -148,6 +172,29 @@ class GuestRepositoryProtocol(Protocol):
     async def count_active_sessions_for_guest(self, guest_id: uuid.UUID) -> int: ...
 
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]: ...
+
+    async def list_active_sessions_for_guest(
+        self, guest_id: uuid.UUID
+    ) -> list[GuestSession]: ...
+
+    async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]: ...
+
+    # -- FUP quota usage ---------------------------------------------------------
+    async def get_quota_usage(
+        self, guest_id: uuid.UUID, period_type: str
+    ) -> GuestQuotaUsage | None: ...
+
+    async def create_quota_usage(self, **fields: object) -> GuestQuotaUsage: ...
+
+    async def update_quota_usage(
+        self, usage: GuestQuotaUsage, data: dict[str, object]
+    ) -> GuestQuotaUsage: ...
+
+    async def list_all_quota_usages_with_org_timezone(
+        self,
+    ) -> list[QuotaUsageWithOrgTimezone]: ...
+
+    async def get_organization_timezone(self, organization_id: uuid.UUID) -> str: ...
 
     # -- login history ---------------------------------------------------------
     async def create_login_history(self, **fields: object) -> GuestLoginHistory: ...
@@ -254,6 +301,7 @@ class GuestRepository:
         self.login_history = GenericRepository(GuestLoginHistory, session)
         self.consents = GenericRepository(GuestConsent, session)
         self.nas_clients = GenericRepository(RadiusNasClient, session)
+        self.quota_usages = GenericRepository(GuestQuotaUsage, session)
 
     # -- guests ----------------------------------------------------------------
 
@@ -328,6 +376,14 @@ class GuestRepository:
         self, device: GuestDevice, data: dict[str, object]
     ) -> GuestDevice:
         return await self.devices.update(device, data)
+
+    async def count_devices_for_guest(self, guest_id: uuid.UUID) -> int:
+        """Guest Session Engine (Phase 1): how many distinct
+        :class:`~.models.GuestDevice` rows currently belong to
+        ``guest_id`` -- backs ``GuestService._enforce_device_limit``. A
+        plain equality-filtered count, mirroring
+        ``count_active_sessions_for_guest``'s identical shape."""
+        return await self.devices.count(filters={"guest_id": guest_id})
 
     # -- sessions ------------------------------------------------------------------
 
@@ -429,6 +485,88 @@ class GuestRepository:
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    async def list_active_sessions_for_guest(
+        self, guest_id: uuid.UUID
+    ) -> list[GuestSession]:
+        """Every currently ``ACTIVE`` session for ``guest_id`` -- backs
+        ``tasks.run_fup_time_accrual_sweep``'s "disconnect every active
+        session" step once a guest's cumulative time usage has just
+        crossed a configured FUP limit."""
+        return await self.sessions.get_all(
+            filters={"guest_id": guest_id, "status": GuestSessionStatus.ACTIVE.value}
+        )
+
+    async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]:
+        """Every distinct ``(guest_id, organization_id)`` pair with at
+        least one currently ``ACTIVE`` session -- backs
+        ``tasks.run_fup_time_accrual_sweep``'s per-guest sweep loop.
+        ``organization_id`` comes straight off ``GuestSession`` itself (see
+        that model's own denormalization docstring) -- no join through
+        ``guests`` needed at all."""
+        statement = (
+            select(GuestSession.guest_id, GuestSession.organization_id)
+            .where(
+                GuestSession.status == GuestSessionStatus.ACTIVE.value,
+                GuestSession.is_deleted.is_(False),
+            )
+            .distinct()
+        )
+        result = await self.session.execute(statement)
+        return [
+            ActiveGuestOrgPair(guest_id=row[0], organization_id=row[1])
+            for row in result.all()
+        ]
+
+    # -- FUP quota usage ---------------------------------------------------------
+
+    async def get_quota_usage(
+        self, guest_id: uuid.UUID, period_type: str
+    ) -> GuestQuotaUsage | None:
+        results = await self.quota_usages.get_all(
+            filters={"guest_id": guest_id, "period_type": period_type}, limit=1
+        )
+        return results[0] if results else None
+
+    async def create_quota_usage(self, **fields: object) -> GuestQuotaUsage:
+        return await self.quota_usages.create(fields)
+
+    async def update_quota_usage(
+        self, usage: GuestQuotaUsage, data: dict[str, object]
+    ) -> GuestQuotaUsage:
+        return await self.quota_usages.update(usage, data)
+
+    async def list_all_quota_usages_with_org_timezone(
+        self,
+    ) -> list[QuotaUsageWithOrgTimezone]:
+        """Every non-deleted ``GuestQuotaUsage`` row, paired with its own
+        organization's ``timezone`` in a single joined query -- backs
+        ``tasks.run_quota_reset_sweep``'s proactive rollover walk, avoiding
+        an N+1 organization lookup per row."""
+        statement = select(GuestQuotaUsage, Organization.timezone).join(
+            Organization, Organization.id == GuestQuotaUsage.organization_id
+        )
+        result = await self.session.execute(statement)
+        return [
+            QuotaUsageWithOrgTimezone(usage=row[0], organization_timezone=row[1])
+            for row in result.all()
+        ]
+
+    async def get_organization_timezone(self, organization_id: uuid.UUID) -> str:
+        """A single-column read of ``Organization.timezone`` -- used by the
+        two request-triggered FUP call sites (login-time enforcement,
+        ``record_usage``'s per-accounting-call bump) that only have an
+        ``organization_id`` on hand, not a joined row. Falls back to
+        ``"UTC"`` if the organization row is somehow missing (defensive;
+        every caller's ``organization_id`` was already resolved via a real
+        FK earlier in the same request) -- mirrors
+        ``Organization.timezone``'s own ``default="UTC"``."""
+        statement = select(Organization.timezone).where(
+            Organization.id == organization_id
+        )
+        result = await self.session.execute(statement)
+        timezone = result.scalar_one_or_none()
+        return timezone or "UTC"
 
     # -- login history ---------------------------------------------------------
 

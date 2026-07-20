@@ -21,6 +21,12 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
+    "VoucherPlanCreateRequest",
+    "VoucherPlanResponse",
+    "VoucherPlanListResponse",
+    "VoucherSeriesCreateRequest",
+    "VoucherSeriesResponse",
+    "VoucherSeriesListResponse",
     "VoucherBatchCreate",
     "VoucherBatchRevokeRequest",
     "VoucherImportRequest",
@@ -38,6 +44,88 @@ __all__ = [
 
 
 # ============================================================================
+# VoucherPlan / VoucherSeries schemas (Phase 1 BhaiFi-parity)
+# ============================================================================
+
+
+class VoucherPlanCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    organization_id: uuid.UUID | None = Field(
+        default=None,
+        description="Omit (or null) for a platform-wide plan template. Only "
+        "a platform-level caller (no requesting organization) may create "
+        "one of those.",
+    )
+    description: str | None = Field(default=None, max_length=2000)
+    queue_profile_id: uuid.UUID | None = Field(
+        default=None,
+        description="The QueueProfile a voucher redeemed under this plan "
+        "grants -- null means no speed entitlement at all.",
+    )
+    default_validity_minutes: int = Field(..., ge=1)
+    default_data_limit_mb: int | None = Field(default=None, ge=0)
+    default_max_uses_per_voucher: int = Field(default=1, ge=1)
+
+
+class VoucherPlanResponse(BaseModel):
+    id: str
+    name: str
+    organization_id: str | None
+    description: str | None
+    queue_profile_id: str | None
+    default_validity_minutes: int
+    default_data_limit_mb: int | None
+    default_max_uses_per_voucher: int
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class VoucherPlanListResponse(BaseModel):
+    items: list[VoucherPlanResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+class VoucherSeriesCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    organization_id: uuid.UUID
+    location_id: uuid.UUID | None = None
+    plan_id: uuid.UUID
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class VoucherSeriesResponse(BaseModel):
+    id: str
+    name: str
+    organization_id: str
+    location_id: str | None
+    plan_id: str
+    description: str | None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class VoucherSeriesListResponse(BaseModel):
+    items: list[VoucherSeriesResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+# ============================================================================
 # Request schemas
 # ============================================================================
 
@@ -46,6 +134,15 @@ class VoucherBatchCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     organization_id: uuid.UUID
     location_id: uuid.UUID | None = None
+    plan_id: uuid.UUID | None = Field(
+        default=None,
+        description="Optional VoucherPlan this batch's vouchers speed-link "
+        "to at redemption time -- see app.domains.voucher.models.VoucherPlan.",
+    )
+    series_id: uuid.UUID | None = Field(
+        default=None,
+        description="Optional VoucherSeries campaign this batch belongs to.",
+    )
     quantity: int = Field(
         ...,
         ge=0,
@@ -136,6 +233,8 @@ class VoucherBatchResponse(BaseModel):
     name: str
     organization_id: str
     location_id: str | None
+    plan_id: str | None
+    series_id: str | None
     quantity: int
     code_length: int
     code_prefix: str | None
@@ -167,6 +266,7 @@ class VoucherBatchListResponse(BaseModel):
 class VoucherResponse(BaseModel):
     id: str
     batch_id: str
+    plan_id: str | None
     code: str
     status: str
     use_count: int

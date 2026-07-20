@@ -62,10 +62,14 @@ NAS). Append-only -- see `FLOW.md` §3.
 | `session_timeout_minutes` | Integer, nullable | Same "copied, not referenced" reasoning |
 | `disconnect_reason` | String(255), nullable | e.g. `"inactivity_timeout"`, `"data_limit_exceeded"`, `"radius_accounting_stop"` |
 
-Status transition graph (`constants.GUEST_SESSION_STATUS_TRANSITIONS`):
+Status transition graph (`constants.GUEST_SESSION_STATUS_TRANSITIONS`),
+extended for Phase 1 BhaiFi-parity with `PAUSED` (see `FLOW.md` §11 for the
+full Pause/Resume/Extend write-up -- `PAUSED` is the sole status with an
+outgoing edge back to `ACTIVE`; every other status remains terminal):
 
 ```text
-ACTIVE -> DISCONNECTED | EXPIRED | TERMINATED
+ACTIVE  -> DISCONNECTED | EXPIRED | TERMINATED | PAUSED
+PAUSED  -> ACTIVE | DISCONNECTED | TERMINATED
 DISCONNECTED, EXPIRED, TERMINATED -> (terminal, no outgoing edges)
 ```
 
@@ -119,6 +123,28 @@ the full design write-up behind every column below the original four
 | `ip_address` | String(45), nullable | The RADIUS NAS-IP-Address value; defaults from `router.public_ip_address`/`management_ip_address` at registration, its own column thereafter |
 | `vendor` | String(50), default `MikroTik` | A real, true default (every `Router` today is MikroTik) -- an extensibility seam, not a fabricated value |
 
+## `guest_quota_usages` (new table -- Phase 1 BhaiFi-parity)
+
+Migration `0034_create_guest_quota_usage_table.py` (revises
+`0033_create_queue_management_tables`). Cumulative Fair Usage Policy (FUP)
+data/time counters for one guest, one recurring period (daily/weekly/
+monthly) at a time -- the guest-level aggregate `guest_sessions`' own
+per-session `bytes_uploaded`/`bytes_downloaded` cannot answer on its own.
+See `FLOW.md` §12 for the full read/bump/rollover write-up.
+
+| Column | Type | Notes |
+|---|---|---|
+| `guest_id` | UUID, FK `guests.id` (`CASCADE`), not nullable | |
+| `organization_id` | UUID, FK `organizations.id` (`CASCADE`), not nullable | Denormalized from `guests.organization_id` -- avoids a join to resolve `PolicyType.FUP`/`Organization.timezone` |
+| `period_type` | String(20), not nullable | `constants.QuotaPeriodType` -- `daily`/`weekly`/`monthly` |
+| `period_start` | DateTime(tz), not nullable | This row's current period boundary, computed from the guest's org's own `Organization.timezone` (`validators.compute_period_start`) |
+| `bytes_used` | BigInteger, default `0` | Bumped on every RADIUS Interim-Update (`GuestService.record_usage`) |
+| `minutes_used` | Integer, default `0` | Guest-level wall-clock connected time -- **not** summed across concurrent sessions; accrued by a periodic sweep (`tasks.run_fup_time_accrual_sweep`), not per-request |
+| `last_accrued_at` | DateTime(tz), nullable | Last time the accrual sweep touched `minutes_used`; `NULL` until the first tick (or immediately after a reset) |
+
+Unique index: `uq_guest_quota_usages_guest_id_period_type` on
+`(guest_id, period_type)` -- one row per guest per period type.
+
 ## `radius_nas_code_counters` (new table)
 
 The dedicated, atomic counter table backing `nas_code` generation --
@@ -131,15 +157,19 @@ structurally identical to `location_code_counters`.
 
 ## Facts genuinely new vs. reused from elsewhere
 
-* **New** (no existing column anywhere): every column on all six tables --
-  nothing elsewhere in this codebase models a guest identity, device,
-  session, login history, consent, or RADIUS NAS client.
+* **New** (no existing column anywhere): every column on all six original
+  tables -- nothing elsewhere in this codebase models a guest identity,
+  device, session, login history, consent, or RADIUS NAS client. Phase 1
+  BhaiFi-parity adds a seventh table (`guest_quota_usages`) plus
+  `PAUSED` (a new `guest_sessions.status` value, no column change).
 * **Reused, not duplicated**: `organizations.id`/`locations.id`/
   `routers.id`/`vouchers.id`/`captive_portal_configs.id` as FK targets (no
   schema change to any of them); `audit_log_entries` (RBAC) as the audit
-  sink, via 5 additive `AuditAction` values -- no new audit table;
-  `app.domains.router.crypto` for `RadiusNasClient.shared_secret_encrypted`
-  -- no new encryption mechanism.
+  sink, via additive `AuditAction` values (5 original +
+  `GUEST_SESSION_PAUSED`/`_RESUMED`/`_EXTENDED` for Phase 1) -- no new
+  audit table; `app.domains.router.crypto` for
+  `RadiusNasClient.shared_secret_encrypted` -- no new encryption
+  mechanism.
 
 ## Entity-relationship summary
 
@@ -161,8 +191,15 @@ captive_portal_configs --< guest_consents (captive_portal_config_id, nullable)
 routers       --- radius_nas_clients (router_id, UNIQUE -- one-to-one)
 organizations --< radius_nas_clients (organization_id, NOT NULL, denormalized)
 locations     --< radius_nas_clients (location_id, NOT NULL, denormalized)
+guests        --< guest_quota_usages (guest_id, NOT NULL)
+organizations --< guest_quota_usages (organization_id, NOT NULL, denormalized)
 ```
 
-No other existing table gained a new column or FK for this module -- like
-Module 010 Parts 1-3, none of these six tables are referenced by any RBAC
-scope column, so no RBAC follow-up migration is needed here.
+No other existing table gained a new column or FK for the original six
+tables -- like Module 010 Parts 1-3, none of them are referenced by any
+RBAC scope column, so no RBAC follow-up migration was needed there. Phase 1
+BhaiFi-parity's `guest_quota_usages` addition is likewise additive-only
+(a new table, no existing column touched) and needs no RBAC schema change
+of its own -- it has no dedicated admin CRUD endpoints (read/written
+entirely by `GuestService`'s login-time enforcement, RADIUS accounting
+bump, and the two new Celery Beat sweeps).

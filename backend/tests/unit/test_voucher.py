@@ -44,6 +44,8 @@ from app.domains.voucher.constants import (
 )
 from app.domains.voucher.exceptions import (
     CrossOrganizationVoucherBatchAccessError,
+    CrossOrganizationVoucherPlanAccessError,
+    CrossOrganizationVoucherSeriesAccessError,
     InvalidBatchStatusTransitionError,
     InvalidCodeLengthError,
     VoucherBatchNotActiveError,
@@ -52,10 +54,12 @@ from app.domains.voucher.exceptions import (
     VoucherExhaustedError,
     VoucherExpiredError,
     VoucherNotFoundError,
+    VoucherPlanNotFoundError,
     VoucherRedemptionRateLimitExceededError,
     VoucherRevokedError,
+    VoucherSeriesNotFoundError,
 )
-from app.domains.voucher.models import Voucher, VoucherBatch
+from app.domains.voucher.models import Voucher, VoucherBatch, VoucherPlan, VoucherSeries
 from app.domains.voucher.service import VoucherRedemptionRateLimiter, VoucherService
 
 # ============================================================================
@@ -175,6 +179,86 @@ class FakeLocationLookup:
 class FakeVoucherRepository:
     batches: dict[uuid.UUID, VoucherBatch] = field(default_factory=dict)
     vouchers: dict[uuid.UUID, Voucher] = field(default_factory=dict)
+    plans: dict[uuid.UUID, VoucherPlan] = field(default_factory=dict)
+    series: dict[uuid.UUID, VoucherSeries] = field(default_factory=dict)
+
+    # -- plans -------------------------------------------------------------------
+
+    async def create_plan(self, **fields: object) -> VoucherPlan:
+        plan = VoucherPlan(**_base_fields(**fields))
+        self.plans[plan.id] = plan
+        return plan
+
+    async def get_plan(self, plan_id: uuid.UUID) -> VoucherPlan | None:
+        return self.plans.get(plan_id)
+
+    async def update_plan(
+        self, plan: VoucherPlan, data: dict[str, object]
+    ) -> VoucherPlan:
+        for key, value in data.items():
+            setattr(plan, key, value)
+        plan.version += 1
+        return plan
+
+    async def list_plans(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        filters: dict[str, object] | None = None,
+        sort_by: str = "created_at",
+        sort_order: SortOrder = SortOrder.DESC,
+    ) -> tuple[list[VoucherPlan], PaginationMeta]:
+        items = list(self.plans.values())
+        for key, value in (filters or {}).items():
+            items = [item for item in items if getattr(item, key) == value]
+        items.sort(
+            key=lambda item: getattr(item, sort_by),
+            reverse=(sort_order == SortOrder.DESC),
+        )
+        params = PageParams(page=page, page_size=page_size)
+        total = len(items)
+        page_items = items[params.offset : params.offset + params.page_size]
+        return page_items, PaginationMeta.from_total(params, total)
+
+    # -- series ------------------------------------------------------------------
+
+    async def create_series(self, **fields: object) -> VoucherSeries:
+        series = VoucherSeries(**_base_fields(**fields))
+        self.series[series.id] = series
+        return series
+
+    async def get_series(self, series_id: uuid.UUID) -> VoucherSeries | None:
+        return self.series.get(series_id)
+
+    async def update_series(
+        self, series: VoucherSeries, data: dict[str, object]
+    ) -> VoucherSeries:
+        for key, value in data.items():
+            setattr(series, key, value)
+        series.version += 1
+        return series
+
+    async def list_series(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        filters: dict[str, object] | None = None,
+        sort_by: str = "created_at",
+        sort_order: SortOrder = SortOrder.DESC,
+    ) -> tuple[list[VoucherSeries], PaginationMeta]:
+        items = list(self.series.values())
+        for key, value in (filters or {}).items():
+            items = [item for item in items if getattr(item, key) == value]
+        items.sort(
+            key=lambda item: getattr(item, sort_by),
+            reverse=(sort_order == SortOrder.DESC),
+        )
+        params = PageParams(page=page, page_size=page_size)
+        total = len(items)
+        page_items = items[params.offset : params.offset + params.page_size]
+        return page_items, PaginationMeta.from_total(params, total)
 
     # -- batches -------------------------------------------------------------
 
@@ -349,6 +433,8 @@ async def _create_batch(
     batch_expires_at: datetime | None = None,
     max_uses_per_voucher: int = 1,
     has_manage_permission: bool = False,
+    plan_id: uuid.UUID | None = None,
+    series_id: uuid.UUID | None = None,
 ) -> VoucherBatch:
     return await fx.service.create_batch(
         actor_user_id=uuid.uuid4(),
@@ -365,6 +451,8 @@ async def _create_batch(
         data_limit_mb=None,
         notes=None,
         has_manage_permission=has_manage_permission,
+        plan_id=plan_id,
+        series_id=series_id,
     )
 
 
@@ -484,6 +572,308 @@ class TestBatchLifecycle:
             batch.id, requesting_organization_id=fx.organization.id
         )
         assert refreshed.status == VoucherBatchStatus.EXPIRED.value
+
+
+# ============================================================================
+# VoucherPlan / VoucherSeries (Phase 1 BhaiFi-parity)
+# ============================================================================
+
+
+class TestVoucherPlan:
+    async def test_create_plan_for_an_organization(self) -> None:
+        fx = make_service()
+        queue_profile_id = uuid.uuid4()
+        plan = await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            name="Daily 5 Mbps Pass",
+            description=None,
+            queue_profile_id=queue_profile_id,
+            default_validity_minutes=1440,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+        assert plan.organization_id == fx.organization.id
+        assert plan.queue_profile_id == queue_profile_id
+        assert plan.is_active is True
+        actions = [e["action"] for e in fx.audit_writer.entries]
+        assert "voucher_plan_created" in actions
+
+    async def test_create_platform_wide_plan_with_no_requesting_organization(
+        self,
+    ) -> None:
+        fx = make_service()
+        plan = await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=None,
+            organization_id=None,
+            name="Platform Standard Plan",
+            description=None,
+            queue_profile_id=None,
+            default_validity_minutes=60,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+        assert plan.organization_id is None
+
+    async def test_creating_a_platform_wide_plan_from_a_tenant_context_raises(
+        self,
+    ) -> None:
+        fx = make_service()
+        with pytest.raises(CrossOrganizationVoucherPlanAccessError):
+            await fx.service.create_plan(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=fx.organization.id,
+                organization_id=None,
+                name="Sneaky Platform Plan",
+                description=None,
+                queue_profile_id=None,
+                default_validity_minutes=60,
+                default_data_limit_mb=None,
+                default_max_uses_per_voucher=1,
+            )
+
+    async def test_get_plan_not_found_raises(self) -> None:
+        fx = make_service()
+        with pytest.raises(VoucherPlanNotFoundError):
+            await fx.service.get_plan(uuid.uuid4())
+
+    async def test_get_platform_wide_plan_is_never_cross_org_blocked(self) -> None:
+        fx = make_service()
+        plan = await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=None,
+            organization_id=None,
+            name="Platform Plan",
+            description=None,
+            queue_profile_id=None,
+            default_validity_minutes=60,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+        # A different organization may still freely read a platform-wide plan.
+        other_org_id = uuid.uuid4()
+        fetched = await fx.service.get_plan(
+            plan.id, requesting_organization_id=other_org_id
+        )
+        assert fetched.id == plan.id
+
+    async def test_get_plan_cross_org_raises(self) -> None:
+        fx = make_service()
+        plan = await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            name="Org Plan",
+            description=None,
+            queue_profile_id=None,
+            default_validity_minutes=60,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+        with pytest.raises(CrossOrganizationVoucherPlanAccessError):
+            await fx.service.get_plan(plan.id, requesting_organization_id=uuid.uuid4())
+
+    async def test_get_plan_queue_profile_id_returns_none_for_no_speed_link(
+        self,
+    ) -> None:
+        fx = make_service()
+        plan = await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            name="No Speed Plan",
+            description=None,
+            queue_profile_id=None,
+            default_validity_minutes=60,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+        assert await fx.service.get_plan_queue_profile_id(plan.id) is None
+
+    async def test_get_plan_queue_profile_id_returns_none_for_unknown_plan(
+        self,
+    ) -> None:
+        fx = make_service()
+        assert await fx.service.get_plan_queue_profile_id(uuid.uuid4()) is None
+
+    async def test_get_plan_queue_profile_id_resolves_the_real_link(self) -> None:
+        fx = make_service()
+        queue_profile_id = uuid.uuid4()
+        plan = await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            name="Speed Plan",
+            description=None,
+            queue_profile_id=queue_profile_id,
+            default_validity_minutes=60,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+        assert await fx.service.get_plan_queue_profile_id(plan.id) == queue_profile_id
+
+    async def test_list_plans_scoped_to_requesting_organization(self) -> None:
+        fx = make_service()
+        await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            name="Org Plan",
+            description=None,
+            queue_profile_id=None,
+            default_validity_minutes=60,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+        other_org = fx.organization_lookup.add()
+        await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=other_org.id,
+            organization_id=other_org.id,
+            name="Other Org Plan",
+            description=None,
+            queue_profile_id=None,
+            default_validity_minutes=60,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+        plans, meta = await fx.service.list_plans(
+            requesting_organization_id=fx.organization.id
+        )
+        assert meta.total_items == 1
+        assert plans[0].organization_id == fx.organization.id
+
+
+class TestVoucherSeries:
+    async def _create_plan(self, fx: Fixture) -> VoucherPlan:
+        return await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            name="Backing Plan",
+            description=None,
+            queue_profile_id=None,
+            default_validity_minutes=60,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+
+    async def test_create_series_under_a_plan(self) -> None:
+        fx = make_service()
+        plan = await self._create_plan(fx)
+        series = await fx.service.create_series(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            location_id=None,
+            plan_id=plan.id,
+            name="Q3 2026 Front Desk Vouchers",
+            description=None,
+        )
+        assert series.organization_id == fx.organization.id
+        assert series.plan_id == plan.id
+        actions = [e["action"] for e in fx.audit_writer.entries]
+        assert "voucher_series_created" in actions
+
+    async def test_create_series_with_unknown_plan_raises(self) -> None:
+        fx = make_service()
+        with pytest.raises(VoucherPlanNotFoundError):
+            await fx.service.create_series(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=fx.organization.id,
+                organization_id=fx.organization.id,
+                location_id=None,
+                plan_id=uuid.uuid4(),
+                name="Orphan Series",
+                description=None,
+            )
+
+    async def test_get_series_cross_org_raises(self) -> None:
+        fx = make_service()
+        plan = await self._create_plan(fx)
+        series = await fx.service.create_series(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            location_id=None,
+            plan_id=plan.id,
+            name="Series",
+            description=None,
+        )
+        with pytest.raises(CrossOrganizationVoucherSeriesAccessError):
+            await fx.service.get_series(
+                series.id, requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_get_series_not_found_raises(self) -> None:
+        fx = make_service()
+        with pytest.raises(VoucherSeriesNotFoundError):
+            await fx.service.get_series(uuid.uuid4())
+
+
+class TestSpeedLinkedVouchers:
+    async def test_batch_created_with_plan_id_denormalizes_onto_every_voucher(
+        self,
+    ) -> None:
+        fx = make_service()
+        queue_profile_id = uuid.uuid4()
+        plan = await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            name="Speed Plan",
+            description=None,
+            queue_profile_id=queue_profile_id,
+            default_validity_minutes=60,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+        batch = await _create_batch(fx, quantity=3, plan_id=plan.id)
+        assert batch.plan_id == plan.id
+        vouchers = await fx.service.repository.list_all_vouchers_for_batch(batch.id)
+        assert len(vouchers) == 3
+        assert all(v.plan_id == plan.id for v in vouchers)
+
+    async def test_batch_created_with_unknown_plan_id_raises(self) -> None:
+        fx = make_service()
+        with pytest.raises(VoucherPlanNotFoundError):
+            await _create_batch(fx, plan_id=uuid.uuid4())
+
+    async def test_batch_created_with_no_plan_id_leaves_vouchers_unlinked(
+        self,
+    ) -> None:
+        fx = make_service()
+        batch = await _create_batch(fx, quantity=2)
+        assert batch.plan_id is None
+        vouchers = await fx.service.repository.list_all_vouchers_for_batch(batch.id)
+        assert all(v.plan_id is None for v in vouchers)
+
+    async def test_batch_created_with_series_id_links_the_batch(self) -> None:
+        fx = make_service()
+        plan = await fx.service.create_plan(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            name="Plan",
+            description=None,
+            queue_profile_id=None,
+            default_validity_minutes=60,
+            default_data_limit_mb=None,
+            default_max_uses_per_voucher=1,
+        )
+        series = await fx.service.create_series(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+            organization_id=fx.organization.id,
+            location_id=None,
+            plan_id=plan.id,
+            name="Series",
+            description=None,
+        )
+        batch = await _create_batch(fx, series_id=series.id)
+        assert batch.series_id == series.id
 
 
 # ============================================================================
@@ -838,6 +1228,31 @@ class TestExportCsv:
         assert data_row[0] == voucher.code
         assert data_row[1] == VoucherStatus.EXHAUSTED.value
         assert data_row[7] == "guest@example.com"
+
+
+class TestExportPdf:
+    async def test_export_produces_a_real_pdf(self) -> None:
+        fx = make_service()
+        batch = await _create_batch(fx, quantity=3, has_manage_permission=True)
+        pdf_bytes = await fx.service.export_batch_pdf(
+            batch_id=batch.id, requesting_organization_id=fx.organization.id
+        )
+        assert pdf_bytes[:4] == b"%PDF"
+
+    async def test_export_cross_organization_raises(self) -> None:
+        fx = make_service()
+        batch = await _create_batch(fx, quantity=1, has_manage_permission=True)
+        with pytest.raises(CrossOrganizationVoucherBatchAccessError):
+            await fx.service.export_batch_pdf(
+                batch_id=batch.id, requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_export_batch_not_found_raises(self) -> None:
+        fx = make_service()
+        with pytest.raises(VoucherBatchNotFoundError):
+            await fx.service.export_batch_pdf(
+                batch_id=uuid.uuid4(), requesting_organization_id=fx.organization.id
+            )
 
 
 # ============================================================================

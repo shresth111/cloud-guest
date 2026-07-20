@@ -286,6 +286,11 @@ class AuditAction(StrEnum):
     VOUCHER_CODES_IMPORTED = "voucher_codes_imported"
     VOUCHER_REDEEMED = "voucher_redeemed"
     VOUCHER_REDEMPTION_FAILED = "voucher_redemption_failed"
+    # Phase 1 BhaiFi-parity additions: VoucherPlan/VoucherSeries creation --
+    # the identical "moderate-volume, human-attributable, admin-reviewable"
+    # profile every lifecycle event above already carries.
+    VOUCHER_PLAN_CREATED = "voucher_plan_created"
+    VOUCHER_SERIES_CREATED = "voucher_series_created"
 
     # Captive Portal domain events (Module 010 Part 3) -- written through
     # this same table by
@@ -337,6 +342,15 @@ class AuditAction(StrEnum):
     GUEST_UNBLOCKED = "guest_unblocked"
     GUEST_SESSION_DISCONNECTED = "guest_session_disconnected"
     GUEST_SESSION_TERMINATED = "guest_session_terminated"
+    # Phase 1 BhaiFi-parity additions: Pause/Resume/Extend are always
+    # admin-initiated (there is no system-driven equivalent, unlike
+    # ``GUEST_SESSION_DISCONNECTED``'s dual system/admin origin), so all
+    # three are always audited, the identical "always audited, low-volume,
+    # admin-driven" profile ``GUEST_SESSION_TERMINATED`` already
+    # established.
+    GUEST_SESSION_PAUSED = "guest_session_paused"
+    GUEST_SESSION_RESUMED = "guest_session_resumed"
+    GUEST_SESSION_EXTENDED = "guest_session_extended"
     RADIUS_NAS_REGISTERED = "radius_nas_registered"
     # NAS lifecycle-management additions (NAS extension of RadiusNasClient)
     # -- the same "always audited, low-volume, admin-driven infrastructure

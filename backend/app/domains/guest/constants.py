@@ -58,19 +58,33 @@ class GuestSessionStatus(StrEnum):
       and ``service.GuestService.terminate_session``'s docstring for the
       distinction from ``DISCONNECTED`` and the reconnect cooldown it
       imposes.
+    * ``PAUSED`` -- Phase 1 BhaiFi-parity: an admin-driven, *reversible*
+      temporary suspension (``service.GuestService.pause_session``),
+      distinct from every status above in being the only one with an
+      outgoing edge back to ``ACTIVE`` (``resume_session``). A live RADIUS
+      Disconnect-Request is issued the same way ``DISCONNECTED``/
+      ``TERMINATED``/``EXPIRED`` already trigger one (see
+      ``service.issue_live_disconnect``) -- pausing immediately cuts the
+      guest's live network access, but (unlike ``TERMINATED``) the
+      ``GuestSession`` row itself survives so ``resume_session`` can flip
+      it back to ``ACTIVE`` rather than requiring a brand-new session.
 
-    All three are terminal: once reached, a ``GuestSession`` row is never
-    transitioned again. See ``service.py``'s module docstring for why
-    "reconnect" always creates a **new** row rather than resurrecting an
-    old one (sessions are append-only history, mirroring
-    ``app.domains.voucher.models.Voucher``'s own append-only-per-code
-    convention and ``OtpRequest.is_consumed``'s one-way state).
+    ``DISCONNECTED``/``EXPIRED``/``TERMINATED`` are terminal: once reached,
+    a ``GuestSession`` row is never transitioned again. See ``service.py``'s
+    module docstring for why "reconnect" always creates a **new** row
+    rather than resurrecting an old one (sessions are append-only history,
+    mirroring ``app.domains.voucher.models.Voucher``'s own
+    append-only-per-code convention and ``OtpRequest.is_consumed``'s
+    one-way state) -- ``PAUSED`` is the sole, deliberate exception to that
+    append-only posture, since a pause is explicitly meant to be undone in
+    place, not replaced by a new row.
     """
 
     ACTIVE = "active"
     DISCONNECTED = "disconnected"
     EXPIRED = "expired"
     TERMINATED = "terminated"
+    PAUSED = "paused"
 
 
 # The explicit, exhaustive legal-transition graph for GuestSession.status --
@@ -78,8 +92,9 @@ class GuestSessionStatus(StrEnum):
 # ``validators.validate_session_status_transition`` with
 # ``InvalidSessionStatusTransitionError``. Mirrors
 # ``app.domains.router.enums.ROUTER_STATUS_TRANSITIONS``'s identical
-# dict-of-frozenset shape. Every non-ACTIVE status is terminal (no outgoing
-# edges at all, including to itself) -- see GuestSessionStatus's docstring.
+# dict-of-frozenset shape. Every status except ACTIVE/PAUSED is terminal (no
+# outgoing edges at all, including to itself) -- see GuestSessionStatus's
+# docstring for why PAUSED alone has an edge back to ACTIVE.
 GUEST_SESSION_STATUS_TRANSITIONS: dict[
     GuestSessionStatus, frozenset[GuestSessionStatus]
 ] = {
@@ -87,6 +102,14 @@ GUEST_SESSION_STATUS_TRANSITIONS: dict[
         {
             GuestSessionStatus.DISCONNECTED,
             GuestSessionStatus.EXPIRED,
+            GuestSessionStatus.TERMINATED,
+            GuestSessionStatus.PAUSED,
+        }
+    ),
+    GuestSessionStatus.PAUSED: frozenset(
+        {
+            GuestSessionStatus.ACTIVE,
+            GuestSessionStatus.DISCONNECTED,
             GuestSessionStatus.TERMINATED,
         }
     ),
@@ -144,6 +167,28 @@ BYTES_PER_MB = 1024 * 1024
 DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST = 3
 
 # ============================================================================
+# Device limit -- Guest Session Engine (Phase 1).
+# ============================================================================
+
+# The maximum number of distinct ``GuestDevice`` rows (by MAC address) one
+# guest may have registered at once, enforced by
+# ``service._enforce_device_limit`` at the start of both
+# ``login_via_otp``/``login_via_voucher``. Unlike
+# ``DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` above (which predates
+# ``app.domains.policy`` and was only ever a plain constant), this value is
+# resolved through the real ``PolicyType.DEVICE`` seam
+# (``schemas.DevicePolicyRules.max_devices_per_guest``) via
+# ``PolicyService.resolve_effective_policy`` -- this constant is what
+# ``constants.PLATFORM_DEFAULT_RULES[PolicyType.DEVICE]`` mirrors as its own
+# platform-wide fallback (see that module's own docstring on why the value
+# is duplicated as a literal there, not imported), and what
+# ``_enforce_device_limit`` falls back to if no ``queue_lookup``-style
+# policy composition is wired at all. Same 3-device magnitude as the
+# concurrent-session limit above -- a reasonable, real default for the
+# hotel/hotspot use case this platform targets, not an arbitrary number.
+DEFAULT_MAX_DEVICES_PER_GUEST = 3
+
+# ============================================================================
 # Session timeout sweep -- Celery Beat task wiring (Guest Session Engine,
 # Phase 1). See ``tasks.py``'s module docstring: ``GuestService
 # .enforce_timeouts`` already existed as a callable status-transition sweep
@@ -162,6 +207,60 @@ TASK_RUN_SESSION_TIMEOUT_SWEEP = "app.domains.guest.tasks.run_session_timeout_sw
 # (an admin's "live sessions" view showing a session that is, in practice,
 # long idle) rather than merely a reporting staleness window.
 SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS = 300.0
+
+# ============================================================================
+# Fair Usage Policy (FUP) quota tracking -- Phase 1 BhaiFi-parity.
+# See ``models.GuestQuotaUsage``'s own docstring and ``service.py``'s "FUP
+# quota tracking" section for the full read/bump/rollover write-up.
+# ============================================================================
+
+
+class QuotaPeriodType(StrEnum):
+    """Which recurring calendar period a :class:`~.models.GuestQuotaUsage`
+    row tracks -- one row per ``(guest_id, period_type)``, each with its own
+    independent rollover cadence. Mirrors ``schemas.FUPPolicyRules``'s own
+    ``daily_*``/``weekly_*``/``monthly_*`` field naming one-for-one."""
+
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+
+
+# ============================================================================
+# FUP time-accrual + enforcement sweep -- Celery Beat task wiring.
+# Guest-level wall-clock connected time (not summed across concurrent
+# sessions -- see ``tasks.run_fup_time_accrual_sweep``'s own docstring) can
+# only be measured by periodically walking every currently ``ACTIVE``
+# session, unlike byte usage (which rides along for free on every RADIUS
+# Interim-Update -- see ``service.GuestService.record_usage``). Same 5-minute
+# cadence as ``SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS`` -- a guest who has
+# just crossed a configured daily/weekly/monthly time cap is exactly as
+# operationally visible (should be disconnected promptly) as a timed-out
+# session.
+# ============================================================================
+
+TASK_RUN_FUP_TIME_ACCRUAL_SWEEP = "app.domains.guest.tasks.run_fup_time_accrual_sweep"
+
+FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS = 300.0
+
+# ============================================================================
+# Quota-reset sweep -- Celery Beat task wiring. Proactively rolls every
+# ``GuestQuotaUsage`` row over to a fresh period the moment its own
+# organization's local calendar day/week/month boundary passes, so e.g. an
+# admin's "quota remaining" view reflects a guest's fresh allowance even
+# before that guest's next login/accounting call opportunistically triggers
+# the identical rollover (see ``service._get_or_reset_quota_usage``, the one
+# shared function both this sweep and every lazy, request-triggered call
+# site delegate to). Hourly, not every 5 minutes like the two sweeps above --
+# a day/week/month boundary never needs finer-than-hourly reset latency, the
+# same "cadence matches the underlying data's own granularity" reasoning
+# ``app.domains.billing.constants.SUBSCRIPTION_RENEWAL_SWEEP_INTERVAL_SECONDS``'s
+# own docstring already establishes for billing's day/month/year periods.
+# ============================================================================
+
+TASK_RUN_QUOTA_RESET_SWEEP = "app.domains.guest.tasks.run_quota_reset_sweep"
+
+QUOTA_RESET_SWEEP_INTERVAL_SECONDS = 3600.0
 
 # ============================================================================
 # FreeRADIUS ``rlm_rest``-style integration -- see ``service.py``'s module
@@ -288,8 +387,14 @@ __all__ = [
     "RECONNECT_GRACE_MINUTES",
     "BYTES_PER_MB",
     "DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST",
+    "DEFAULT_MAX_DEVICES_PER_GUEST",
+    "QuotaPeriodType",
     "TASK_RUN_SESSION_TIMEOUT_SWEEP",
     "SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_FUP_TIME_ACCRUAL_SWEEP",
+    "FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_QUOTA_RESET_SWEEP",
+    "QUOTA_RESET_SWEEP_INTERVAL_SECONDS",
     "RADIUS_NAS_IDENTIFIER_HEADER",
     "RADIUS_SHARED_SECRET_HEADER",
     "RADIUS_ACCT_STATUS_START",

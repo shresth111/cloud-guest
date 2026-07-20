@@ -30,20 +30,25 @@ from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.guest.constants import (
     BYTES_PER_MB,
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+    DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
     RECONNECT_GRACE_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
     GuestAuthMethod,
     GuestSessionStatus,
     NasStatus,
+    QuotaPeriodType,
 )
 from app.domains.guest.exceptions import (
     ConcurrentSessionLimitExceededError,
     CrossOrganizationGuestAccessError,
     CrossOrganizationNasAccessError,
+    FairUsagePolicyExceededError,
     GuestAuthMethodNotEnabledError,
     GuestBlockedError,
+    GuestDeviceLimitExceededError,
     GuestSessionNotFoundError,
+    InvalidExtensionMinutesError,
     InvalidNasStatusTransitionError,
     InvalidSessionStatusTransitionError,
     NoReconnectableSessionError,
@@ -57,22 +62,32 @@ from app.domains.guest.models import (
     GuestConsent,
     GuestDevice,
     GuestLoginHistory,
+    GuestQuotaUsage,
     GuestSession,
     RadiusNasClient,
 )
 from app.domains.guest.repository import (
+    ActiveGuestOrgPair,
     AuthMethodOutcomeCounts,
     DeviceSessionCount,
     LocationSessionCount,
+    QuotaUsageWithOrgTimezone,
     SessionAggregate,
 )
 from app.domains.guest.service import (
     GuestAnalyticsService,
     GuestService,
     RadiusService,
+    get_or_reset_quota_usage,
+    issue_live_disconnect,
+    run_fup_time_accrual,
+    run_quota_reset,
 )
 from app.domains.guest.validators import (
+    compute_period_start,
     is_concurrent_session_limit_reached,
+    is_device_limit_reached,
+    is_fup_usage_exceeded,
     is_quota_exceeded,
     is_session_timed_out,
     validate_nas_status_transition,
@@ -81,6 +96,7 @@ from app.domains.guest_access.exceptions import GuestAccessDeniedError
 from app.domains.location.models import Location
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.exceptions import OtpCodeMismatchError
+from app.domains.queue_management.constants import QueueTargetType
 from app.domains.router.crypto import encrypt_secret
 from app.domains.router.enums import RouterStatus
 from app.domains.router.exceptions import RouterNotFoundError
@@ -138,15 +154,23 @@ class FakeVoucherService:
     """Stand-in for ``VoucherRedeemProtocol``."""
 
     vouchers: dict[str, tuple[Voucher, VoucherBatch]] = field(default_factory=dict)
+    plan_queue_profiles: dict[uuid.UUID, uuid.UUID | None] = field(default_factory=dict)
 
     def register(
-        self, code: str, *, data_limit_mb: int | None, validity_minutes: int
+        self,
+        code: str,
+        *,
+        data_limit_mb: int | None,
+        validity_minutes: int,
+        plan_id: uuid.UUID | None = None,
     ) -> tuple[Voucher, VoucherBatch]:
         batch = VoucherBatch(
             **_base_fields(
                 name="Batch",
                 organization_id=uuid.uuid4(),
                 location_id=None,
+                plan_id=plan_id,
+                series_id=None,
                 quantity=1,
                 code_length=8,
                 code_prefix=None,
@@ -164,6 +188,7 @@ class FakeVoucherService:
         voucher = Voucher(
             **_base_fields(
                 batch_id=batch.id,
+                plan_id=plan_id,
                 code=code,
                 status="unused",
                 use_count=0,
@@ -176,12 +201,20 @@ class FakeVoucherService:
         self.vouchers[code] = (voucher, batch)
         return voucher, batch
 
+    def register_plan_queue_profile(
+        self, plan_id: uuid.UUID, queue_profile_id: uuid.UUID | None
+    ) -> None:
+        self.plan_queue_profiles[plan_id] = queue_profile_id
+
     async def redeem_voucher(
         self, *, code: str, identifier: str, source: str
     ) -> tuple[Voucher, VoucherBatch]:
         if code not in self.vouchers:
             raise VoucherNotFoundError()
         return self.vouchers[code]
+
+    async def get_plan_queue_profile_id(self, plan_id: uuid.UUID) -> uuid.UUID | None:
+        return self.plan_queue_profiles.get(plan_id)
 
 
 @dataclass
@@ -416,6 +449,107 @@ class FakeAccessControlHook:
 
 
 @dataclass
+class FakeDevicePolicyLookup:
+    """Stand-in for ``PolicyLookupProtocol`` -- lets device-limit tests
+    exercise ``GuestService._resolve_device_limit``'s "real policy wired"
+    branch without constructing a real ``PolicyService``/repository.
+    ``max_devices_per_guest is None`` (the default) means "no override",
+    letting ``_resolve_device_limit`` fall through to its own
+    ``DEFAULT_MAX_DEVICES_PER_GUEST`` fallback exactly as if no rule had
+    been configured -- mirrors a real resolved ``GenericPolicyRules``
+    payload that simply omits the field."""
+
+    max_devices_per_guest: int | None = None
+
+    async def resolve_effective_policy(
+        self,
+        *,
+        policy_type: object,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ):
+        class _Resolved:
+            def __init__(self, rules: dict[str, object]) -> None:
+                self.rules = rules
+
+        rules = (
+            {}
+            if self.max_devices_per_guest is None
+            else {"max_devices_per_guest": self.max_devices_per_guest}
+        )
+        return _Resolved(rules)
+
+
+@dataclass
+class FakeFupPolicyLookup:
+    """Stand-in for ``PolicyLookupProtocol`` -- lets FUP quota tests
+    exercise ``GuestService._enforce_fup_quota``/``_track_fup_data_usage``/
+    ``service.run_fup_time_accrual``'s "real policy wired" branch without
+    constructing a real ``PolicyService``/repository. ``fup_rules`` is an
+    empty dict by default -- mirrors a resolved ``FUPPolicyRules`` payload
+    with every period's cap left ``None`` (no limit configured at all),
+    exactly ``_enforce_fup_quota``'s own "skip entirely" no-op case."""
+
+    fup_rules: dict[str, object] = field(default_factory=dict)
+
+    async def resolve_effective_policy(
+        self,
+        *,
+        policy_type: object,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ):
+        class _Resolved:
+            def __init__(self, rules: dict[str, object]) -> None:
+                self.rules = rules
+
+        return _Resolved(dict(self.fup_rules))
+
+
+@dataclass
+class FakeQueueAssignmentHook:
+    """Stand-in for ``QueueAssignmentProtocol`` -- lets speed-linked-voucher
+    tests exercise ``GuestService._assign_voucher_queue``'s
+    ``create_assignment``/``apply_queue`` composition without constructing
+    a real ``QueueManagementService``/repository. Tracks every call so
+    tests can assert on the exact ``target_type``/``target_id``/
+    ``queue_profile_id``/``device_target`` a call site supplied."""
+
+    create_assignment_calls: list[dict[str, object]] = field(default_factory=list)
+    apply_queue_calls: list[dict[str, object]] = field(default_factory=list)
+    resolve_and_assign_queue_calls: list[dict[str, object]] = field(
+        default_factory=list
+    )
+    raise_on_create: Exception | None = None
+
+    async def resolve_and_assign_queue(self, **kwargs: object):
+        self.resolve_and_assign_queue_calls.append(kwargs)
+
+        class _Assignment:
+            id = uuid.uuid4()
+
+        return _Assignment()
+
+    async def create_assignment(self, **kwargs: object):
+        if self.raise_on_create is not None:
+            raise self.raise_on_create
+        self.create_assignment_calls.append(kwargs)
+
+        class _Assignment:
+            id = uuid.uuid4()
+
+        return _Assignment()
+
+    async def apply_queue(self, assignment_id: uuid.UUID, **kwargs: object):
+        self.apply_queue_calls.append({"assignment_id": assignment_id, **kwargs})
+
+        class _Assignment:
+            id = assignment_id
+
+        return _Assignment()
+
+
+@dataclass
 class FakeGuestRepository:
     """In-memory stand-in for ``GuestRepositoryProtocol`` -- including the
     analytics aggregate methods, computed in pure Python to mirror what the
@@ -429,6 +563,8 @@ class FakeGuestRepository:
     login_history: list[GuestLoginHistory] = field(default_factory=list)
     consents: dict[uuid.UUID, GuestConsent] = field(default_factory=dict)
     nas_clients: dict[uuid.UUID, RadiusNasClient] = field(default_factory=dict)
+    quota_usages: dict[uuid.UUID, GuestQuotaUsage] = field(default_factory=dict)
+    organization_timezones: dict[uuid.UUID, str] = field(default_factory=dict)
 
     # -- guests ----------------------------------------------------------------
     async def create_guest(self, **fields: object) -> Guest:
@@ -506,6 +642,9 @@ class FakeGuestRepository:
             if device.mac_address == mac_address:
                 return device
         return None
+
+    async def count_devices_for_guest(self, guest_id: uuid.UUID) -> int:
+        return sum(1 for d in self.devices.values() if d.guest_id == guest_id)
 
     async def update_device(
         self, device: GuestDevice, data: dict[str, object]
@@ -599,6 +738,71 @@ class FakeGuestRepository:
             and s.session_timeout_minutes is not None
             and is_session_timed_out(s, now=now)
         ]
+
+    async def list_active_sessions_for_guest(
+        self, guest_id: uuid.UUID
+    ) -> list[GuestSession]:
+        return [
+            s
+            for s in self.sessions.values()
+            if s.guest_id == guest_id and s.status == GuestSessionStatus.ACTIVE.value
+        ]
+
+    async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]:
+        seen: set[tuple[uuid.UUID, uuid.UUID]] = set()
+        pairs: list[ActiveGuestOrgPair] = []
+        for s in self.sessions.values():
+            if s.status != GuestSessionStatus.ACTIVE.value:
+                continue
+            key = (s.guest_id, s.organization_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(
+                ActiveGuestOrgPair(
+                    guest_id=s.guest_id, organization_id=s.organization_id
+                )
+            )
+        return pairs
+
+    # -- FUP quota usage ---------------------------------------------------------
+
+    async def get_quota_usage(
+        self, guest_id: uuid.UUID, period_type: str
+    ) -> GuestQuotaUsage | None:
+        for usage in self.quota_usages.values():
+            if usage.guest_id == guest_id and usage.period_type == period_type:
+                return usage
+        return None
+
+    async def create_quota_usage(self, **fields: object) -> GuestQuotaUsage:
+        usage = GuestQuotaUsage(**_base_fields(**fields))
+        self.quota_usages[usage.id] = usage
+        return usage
+
+    async def update_quota_usage(
+        self, usage: GuestQuotaUsage, data: dict[str, object]
+    ) -> GuestQuotaUsage:
+        for key, value in data.items():
+            setattr(usage, key, value)
+        usage.version += 1
+        return usage
+
+    async def list_all_quota_usages_with_org_timezone(
+        self,
+    ) -> list[QuotaUsageWithOrgTimezone]:
+        return [
+            QuotaUsageWithOrgTimezone(
+                usage=usage,
+                organization_timezone=self.organization_timezones.get(
+                    usage.organization_id, "UTC"
+                ),
+            )
+            for usage in self.quota_usages.values()
+        ]
+
+    async def get_organization_timezone(self, organization_id: uuid.UUID) -> str:
+        return self.organization_timezones.get(organization_id, "UTC")
 
     # -- login history ---------------------------------------------------------
     async def create_login_history(self, **fields: object) -> GuestLoginHistory:
@@ -875,6 +1079,9 @@ def make_fixture(
     voucher_enabled: bool = True,
     router_status: str = RouterStatus.ONLINE.value,
     access_control_hook: object | None = None,
+    queue_lookup: object | None = None,
+    policy_lookup: object | None = None,
+    queue_assignment_hook: object | None = None,
 ) -> Fixture:
     repository = FakeGuestRepository()
     otp_service = FakeOtpService()
@@ -903,6 +1110,8 @@ def make_fixture(
         router_service,
         audit_writer=audit_writer,
         access_control_hook=access_control_hook,
+        policy_lookup=policy_lookup,
+        queue_assignment_hook=queue_assignment_hook,
     )
     radius_service = RadiusService(
         repository,
@@ -911,6 +1120,7 @@ def make_fixture(
         location_lookup,
         nas_code_counter_repository,
         audit_writer=audit_writer,
+        queue_lookup=queue_lookup,
     )
     analytics_service = GuestAnalyticsService(repository)
 
@@ -1124,6 +1334,119 @@ class TestVoucherLogin:
         assert fx.repository.login_history[0].success is False
 
 
+class TestSpeedLinkedVoucherQueueAssignment:
+    async def test_creates_and_applies_a_voucher_targeted_assignment(self) -> None:
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        plan_id = uuid.uuid4()
+        queue_profile_id = uuid.uuid4()
+        fx.voucher_service.register_plan_queue_profile(plan_id, queue_profile_id)
+        voucher, _ = fx.voucher_service.register(
+            "SPEEDV1", data_limit_mb=None, validity_minutes=60, plan_id=plan_id
+        )
+        result = await fx.guest_service.login_via_voucher(
+            code="SPEEDV1",
+            identifier="guest@example.com",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            ip_address="10.0.0.5",
+        )
+        hook = fx.guest_service.queue_assignment_hook
+        assert len(hook.create_assignment_calls) == 1
+        call = hook.create_assignment_calls[0]
+        assert call["target_type"] == QueueTargetType.VOUCHER
+        assert call["target_id"] == voucher.id
+        assert call["queue_profile_id"] == queue_profile_id
+        assert call["router_id"] == fx.router.id
+        assert call["device_target"] == "10.0.0.5"
+        assert len(hook.apply_queue_calls) == 1
+        assert result.session.voucher_id == voucher.id
+
+    async def test_no_op_when_voucher_has_no_plan(self) -> None:
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        fx.voucher_service.register("SPEEDV2", data_limit_mb=None, validity_minutes=60)
+        await fx.guest_service.login_via_voucher(
+            code="SPEEDV2",
+            identifier="guest2@example.com",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            ip_address="10.0.0.6",
+        )
+        hook = fx.guest_service.queue_assignment_hook
+        assert hook.create_assignment_calls == []
+
+    async def test_no_op_when_plan_has_no_queue_profile(self) -> None:
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        plan_id = uuid.uuid4()
+        fx.voucher_service.register_plan_queue_profile(plan_id, None)
+        fx.voucher_service.register(
+            "SPEEDV3", data_limit_mb=None, validity_minutes=60, plan_id=plan_id
+        )
+        await fx.guest_service.login_via_voucher(
+            code="SPEEDV3",
+            identifier="guest3@example.com",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            ip_address="10.0.0.7",
+        )
+        hook = fx.guest_service.queue_assignment_hook
+        assert hook.create_assignment_calls == []
+
+    async def test_no_op_when_no_queue_assignment_hook_wired(self) -> None:
+        fx = make_fixture()
+        plan_id = uuid.uuid4()
+        fx.voucher_service.register_plan_queue_profile(plan_id, uuid.uuid4())
+        fx.voucher_service.register(
+            "SPEEDV4", data_limit_mb=None, validity_minutes=60, plan_id=plan_id
+        )
+        result = await fx.guest_service.login_via_voucher(
+            code="SPEEDV4",
+            identifier="guest4@example.com",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            ip_address="10.0.0.8",
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_no_op_when_no_ip_address_known(self) -> None:
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        plan_id = uuid.uuid4()
+        fx.voucher_service.register_plan_queue_profile(plan_id, uuid.uuid4())
+        fx.voucher_service.register(
+            "SPEEDV5", data_limit_mb=None, validity_minutes=60, plan_id=plan_id
+        )
+        await fx.guest_service.login_via_voucher(
+            code="SPEEDV5",
+            identifier="guest5@example.com",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        hook = fx.guest_service.queue_assignment_hook
+        assert hook.create_assignment_calls == []
+
+    async def test_never_raises_when_the_hook_explodes(self) -> None:
+        hook = FakeQueueAssignmentHook(raise_on_create=RuntimeError("boom"))
+        fx = make_fixture(queue_assignment_hook=hook)
+        plan_id = uuid.uuid4()
+        fx.voucher_service.register_plan_queue_profile(plan_id, uuid.uuid4())
+        fx.voucher_service.register(
+            "SPEEDV6", data_limit_mb=None, validity_minutes=60, plan_id=plan_id
+        )
+        result = await fx.guest_service.login_via_voucher(
+            code="SPEEDV6",
+            identifier="guest6@example.com",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            ip_address="10.0.0.9",
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+
 # ============================================================================
 # Device MAC-address handling
 # ============================================================================
@@ -1332,6 +1655,298 @@ class TestSessionLifecycle:
             location_id=fx.location_id,
         )
         assert reconnected.status == GuestSessionStatus.ACTIVE.value
+
+
+class TestPauseResumeExtend:
+    async def _login(
+        self, fx: Fixture, identifier: str = "+15551112000"
+    ) -> GuestSession:
+        result = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        return result.session
+
+    async def test_pause_flips_status_and_is_reversible_via_resume(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        paused = await fx.guest_service.pause_session(
+            session_id=session.id, actor_user_id=uuid.uuid4(), reason="admin pause"
+        )
+        assert paused.status == GuestSessionStatus.PAUSED.value
+
+        resumed = await fx.guest_service.resume_session(
+            session_id=session.id, actor_user_id=uuid.uuid4()
+        )
+        assert resumed.status == GuestSessionStatus.ACTIVE.value
+        assert resumed.id == session.id  # same row, not a new one
+
+    async def test_pause_is_always_audited(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        await fx.guest_service.pause_session(
+            session_id=session.id, actor_user_id=uuid.uuid4(), reason="abuse"
+        )
+        actions = [e["action"] for e in fx.audit_writer.entries]
+        assert "guest_session_paused" in actions
+
+    async def test_resume_is_always_audited(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        await fx.guest_service.pause_session(
+            session_id=session.id, actor_user_id=uuid.uuid4()
+        )
+        await fx.guest_service.resume_session(
+            session_id=session.id, actor_user_id=uuid.uuid4()
+        )
+        actions = [e["action"] for e in fx.audit_writer.entries]
+        assert "guest_session_resumed" in actions
+
+    async def test_resume_refreshes_last_activity_at(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        await fx.guest_service.pause_session(
+            session_id=session.id, actor_user_id=uuid.uuid4()
+        )
+        session.last_activity_at = _now() - timedelta(hours=2)
+        resumed = await fx.guest_service.resume_session(
+            session_id=session.id, actor_user_id=uuid.uuid4()
+        )
+        assert (_now() - resumed.last_activity_at).total_seconds() < 5
+
+    async def test_resuming_an_already_active_session_raises(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        with pytest.raises(InvalidSessionStatusTransitionError):
+            await fx.guest_service.resume_session(
+                session_id=session.id, actor_user_id=uuid.uuid4()
+            )
+
+    async def test_pausing_a_terminal_session_raises(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+        with pytest.raises(InvalidSessionStatusTransitionError):
+            await fx.guest_service.pause_session(
+                session_id=session.id, actor_user_id=uuid.uuid4()
+            )
+
+    async def test_paused_session_can_still_be_terminated(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        await fx.guest_service.pause_session(
+            session_id=session.id, actor_user_id=uuid.uuid4()
+        )
+        terminated = await fx.guest_service.terminate_session(
+            session_id=session.id, actor_user_id=uuid.uuid4()
+        )
+        assert terminated.status == GuestSessionStatus.TERMINATED.value
+
+    async def test_extend_increases_session_timeout_minutes(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        original_timeout = session.session_timeout_minutes
+        extended = await fx.guest_service.extend_session(
+            session_id=session.id,
+            additional_minutes=30,
+            actor_user_id=uuid.uuid4(),
+        )
+        assert extended.session_timeout_minutes == original_timeout + 30
+
+    async def test_extend_seeds_a_timeout_when_none_previously_set(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        session.session_timeout_minutes = None  # an unlimited-grant session
+        extended = await fx.guest_service.extend_session(
+            session_id=session.id,
+            additional_minutes=45,
+            actor_user_id=uuid.uuid4(),
+        )
+        assert extended.session_timeout_minutes == 45
+
+    async def test_extend_is_always_audited(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        await fx.guest_service.extend_session(
+            session_id=session.id,
+            additional_minutes=15,
+            actor_user_id=uuid.uuid4(),
+        )
+        actions = [e["action"] for e in fx.audit_writer.entries]
+        assert "guest_session_extended" in actions
+
+    async def test_extend_rejects_non_positive_minutes(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        with pytest.raises(InvalidExtensionMinutesError):
+            await fx.guest_service.extend_session(
+                session_id=session.id,
+                additional_minutes=0,
+                actor_user_id=uuid.uuid4(),
+            )
+
+    async def test_extend_rejects_a_terminal_session(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        await fx.guest_service.disconnect_session(session_id=session.id)
+        with pytest.raises(InvalidSessionStatusTransitionError):
+            await fx.guest_service.extend_session(
+                session_id=session.id,
+                additional_minutes=10,
+                actor_user_id=uuid.uuid4(),
+            )
+
+    async def test_extend_allowed_on_a_paused_session(self) -> None:
+        fx = make_fixture()
+        session = await self._login(fx)
+        await fx.guest_service.pause_session(
+            session_id=session.id, actor_user_id=uuid.uuid4()
+        )
+        extended = await fx.guest_service.extend_session(
+            session_id=session.id,
+            additional_minutes=20,
+            actor_user_id=uuid.uuid4(),
+        )
+        assert extended.status == GuestSessionStatus.PAUSED.value
+
+
+class TestLiveDisconnect:
+    async def _login_with_registered_nas(
+        self, fx: Fixture, *, ip_address: str | None = "203.0.113.10"
+    ) -> GuestSession:
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15551113000",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=fx.router.id,
+            nas_identifier="nas-live-disconnect",
+            shared_secret="s3cr3t-value",
+            ip_address=ip_address,
+        )
+        return result.session
+
+    async def test_no_op_when_no_nas_is_registered_for_the_router(self) -> None:
+        fx = make_fixture()
+        session = await fx.guest_service.login_via_otp(
+            identifier="+15551114000",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        result = await issue_live_disconnect(fx.repository, session=session.session)
+        assert result is None
+
+    async def test_no_op_when_the_registered_nas_has_no_ip_address(self) -> None:
+        fx = make_fixture()
+        session = await self._login_with_registered_nas(fx, ip_address=None)
+        result = await issue_live_disconnect(fx.repository, session=session)
+        assert result is None
+
+    async def test_returns_true_once_a_real_disconnect_ack_comes_back(
+        self, monkeypatch
+    ) -> None:
+        from app.domains.guest import service as service_module
+        from app.domains.guest.radius_coa import RADIUS_CODE_DISCONNECT_ACK
+
+        fx = make_fixture()
+        session = await self._login_with_registered_nas(fx)
+
+        sent: dict[str, object] = {}
+
+        def _fake_send_packet(packet: bytes, *, host: str, **kwargs: object):
+            sent["packet"] = packet
+            sent["host"] = host
+            return bytes([RADIUS_CODE_DISCONNECT_ACK])
+
+        monkeypatch.setattr(service_module, "send_packet", _fake_send_packet)
+
+        result = await issue_live_disconnect(fx.repository, session=session)
+        assert result is True
+        assert sent["host"] == "203.0.113.10"
+
+    async def test_returns_false_on_a_disconnect_nak(self, monkeypatch) -> None:
+        from app.domains.guest import service as service_module
+        from app.domains.guest.radius_coa import RADIUS_CODE_DISCONNECT_NAK
+
+        fx = make_fixture()
+        session = await self._login_with_registered_nas(fx)
+
+        monkeypatch.setattr(
+            service_module,
+            "send_packet",
+            lambda packet, *, host, **kwargs: bytes([RADIUS_CODE_DISCONNECT_NAK]),
+        )
+
+        result = await issue_live_disconnect(fx.repository, session=session)
+        assert result is False
+
+    async def test_returns_none_on_a_timeout(self, monkeypatch) -> None:
+        """Mirrors ``radius_coa.send_packet``'s own real "no live NAS
+        listening" outcome -- a timeout, surfaced as ``None``, never an
+        exception."""
+        from app.domains.guest import service as service_module
+
+        fx = make_fixture()
+        session = await self._login_with_registered_nas(fx)
+
+        monkeypatch.setattr(
+            service_module, "send_packet", lambda packet, *, host, **kwargs: None
+        )
+
+        result = await issue_live_disconnect(fx.repository, session=session)
+        assert result is None
+
+    async def test_never_raises_when_the_send_itself_explodes(
+        self, monkeypatch
+    ) -> None:
+        from app.domains.guest import service as service_module
+
+        fx = make_fixture()
+        session = await self._login_with_registered_nas(fx)
+
+        def _exploding_send_packet(packet: bytes, *, host: str, **kwargs: object):
+            raise OSError("network unreachable")
+
+        monkeypatch.setattr(service_module, "send_packet", _exploding_send_packet)
+
+        result = await issue_live_disconnect(fx.repository, session=session)
+        assert result is None
+
+    async def test_disconnect_session_attempts_a_live_disconnect(
+        self, monkeypatch
+    ) -> None:
+        """Integration-level proof that ``disconnect_session`` itself
+        (not just ``issue_live_disconnect`` called directly) triggers the
+        real send."""
+        from app.domains.guest import service as service_module
+        from app.domains.guest.radius_coa import RADIUS_CODE_DISCONNECT_ACK
+
+        fx = make_fixture()
+        session = await self._login_with_registered_nas(fx)
+
+        calls: list[str] = []
+
+        def _fake_send_packet(packet: bytes, *, host: str, **kwargs: object):
+            calls.append(host)
+            return bytes([RADIUS_CODE_DISCONNECT_ACK])
+
+        monkeypatch.setattr(service_module, "send_packet", _fake_send_packet)
+
+        updated = await fx.guest_service.disconnect_session(session_id=session.id)
+        assert updated.status == GuestSessionStatus.DISCONNECTED.value
+        assert calls == ["203.0.113.10"]
 
 
 # ============================================================================
@@ -1629,6 +2244,828 @@ class TestConcurrentSessionLimit:
         assert again.id == result.session.id  # idempotent no-op, not a new row
 
 
+class TestDeviceLimit:
+    def test_is_device_limit_reached_pure_function(self) -> None:
+        assert is_device_limit_reached(device_count=2, limit=3) is False
+        assert is_device_limit_reached(device_count=3, limit=3) is True
+        assert is_device_limit_reached(device_count=4, limit=3) is True
+
+    async def test_count_devices_for_guest_counts_distinct_macs(self) -> None:
+        fx = make_fixture()
+        identifier = "+15559990010"
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:01",
+        )
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:02",
+        )
+        count = await fx.repository.count_devices_for_guest(first.guest.id)
+        assert count == 2
+
+    async def test_login_raises_once_device_limit_reached(self) -> None:
+        fx = make_fixture()
+        identifier = "+15559990011"
+        for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
+            result = await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac=f"AA:BB:CC:DD:EE:{index:02d}",
+            )
+            # Disconnected between iterations so the (same-valued) concurrent
+            # session limit never trips before the device limit does -- see
+            # this class's own module-level discussion in the roadmap
+            # write-up. Disconnecting frees the session slot but leaves the
+            # GuestDevice row (and thus the device count) intact.
+            await fx.guest_service.disconnect_session(session_id=result.session.id)
+        devices_before = len(fx.repository.devices)
+
+        with pytest.raises(GuestDeviceLimitExceededError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="AA:BB:CC:DD:EE:FF",
+            )
+        assert exc_info.value.limit == DEFAULT_MAX_DEVICES_PER_GUEST
+        # No new device row was created for the rejected attempt.
+        assert len(fx.repository.devices) == devices_before
+
+    async def test_login_rejected_before_otp_verification_is_attempted(self) -> None:
+        """Mirrors ``TestConcurrentSessionLimit``'s identical-named test:
+        a guest already at the device limit must never spend a real OTP
+        verification attempt on a login that was always going to be
+        rejected -- see ``GuestService._enforce_device_limit``'s call-site
+        placement in ``login_via_otp``."""
+        fx = make_fixture()
+        identifier = "+15559990012"
+        for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
+            result = await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac=f"BB:CC:DD:EE:FF:{index:02d}",
+            )
+            await fx.guest_service.disconnect_session(session_id=result.session.id)
+
+        with pytest.raises(GuestDeviceLimitExceededError):
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="WRONG",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="BB:CC:DD:EE:FF:FF",
+            )
+
+    async def test_returning_device_never_counts_against_the_limit(self) -> None:
+        """The same MAC logging in repeatedly is a *returning* device, not
+        a new one -- ``_enforce_device_limit`` recognizes it via
+        ``get_device_by_mac`` + ``guest_id`` match and never raises,
+        regardless of how many times it reconnects."""
+        fx = make_fixture()
+        identifier = "+15559990013"
+        mac = "CC:DD:EE:FF:00:01"
+        for _ in range(DEFAULT_MAX_DEVICES_PER_GUEST + 2):
+            result = await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac=mac,
+            )
+            await fx.guest_service.disconnect_session(session_id=result.session.id)
+        count = await fx.repository.count_devices_for_guest(result.guest.id)
+        assert count == 1
+
+    async def test_device_limit_check_is_skipped_when_no_device_mac(self) -> None:
+        """A login with no ``device_mac`` at all registers no device, so it
+        must never be rejected on the device limit's account -- even after
+        the guest is already sitting at the limit via other, MAC-bearing
+        logins."""
+        fx = make_fixture()
+        identifier = "+15559990014"
+        for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
+            result = await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac=f"DD:EE:FF:00:11:{index:02d}",
+            )
+            await fx.guest_service.disconnect_session(session_id=result.session.id)
+
+        no_mac_result = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert no_mac_result.session.status == GuestSessionStatus.ACTIVE.value
+        assert no_mac_result.device is None
+
+    async def test_policy_lookup_overrides_the_default_limit(self) -> None:
+        """When a ``policy_lookup`` hook is wired and resolves a
+        ``max_devices_per_guest`` override, that value governs instead of
+        ``DEFAULT_MAX_DEVICES_PER_GUEST`` -- see
+        ``GuestService._resolve_device_limit``."""
+        fx = make_fixture(policy_lookup=FakeDevicePolicyLookup(max_devices_per_guest=1))
+        identifier = "+15559990015"
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="EE:FF:00:11:22:01",
+        )
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+
+        with pytest.raises(GuestDeviceLimitExceededError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="EE:FF:00:11:22:02",
+            )
+        assert exc_info.value.limit == 1
+
+    async def test_new_guest_login_skips_the_check_entirely(self) -> None:
+        """Mirrors ``TestConcurrentSessionLimit``'s identical-named test: a
+        never-before-seen identifier has no ``existing_guest`` yet, so the
+        device limit check is skipped rather than counting devices against
+        a guest_id that doesn't exist."""
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990016",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="FF:00:11:22:33:01",
+        )
+        assert result.is_new_guest is True
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+
+# ============================================================================
+# FUP (Fair Usage Policy) quota tracking (Phase 1 BhaiFi-parity)
+# ============================================================================
+
+
+class TestComputePeriodStart:
+    def test_daily_boundary_in_utc(self) -> None:
+        now = datetime(2026, 7, 18, 15, 30, tzinfo=UTC)
+        start = compute_period_start(QuotaPeriodType.DAILY, now=now, tz_name="UTC")
+        assert start == datetime(2026, 7, 18, 0, 0, tzinfo=UTC)
+
+    def test_daily_boundary_respects_organization_timezone(self) -> None:
+        """2026-07-18 02:00 UTC is still 2026-07-17 evening in
+        America/Los_Angeles (UTC-7 under DST in July) -- the returned
+        boundary must be *that* local day's midnight, converted back to
+        UTC, not the UTC calendar day's midnight."""
+        now = datetime(2026, 7, 18, 2, 0, tzinfo=UTC)
+        start = compute_period_start(
+            QuotaPeriodType.DAILY, now=now, tz_name="America/Los_Angeles"
+        )
+        assert start == datetime(2026, 7, 17, 7, 0, tzinfo=UTC)
+
+    def test_weekly_boundary_starts_monday(self) -> None:
+        """2026-07-18 is a Saturday; the week's boundary is Monday
+        2026-07-13 -- mirrors ``schemas.TimeWindow.days_of_week``'s own
+        0=Monday ISO convention."""
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        start = compute_period_start(QuotaPeriodType.WEEKLY, now=now, tz_name="UTC")
+        assert start == datetime(2026, 7, 13, 0, 0, tzinfo=UTC)
+
+    def test_monthly_boundary_starts_on_day_one(self) -> None:
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        start = compute_period_start(QuotaPeriodType.MONTHLY, now=now, tz_name="UTC")
+        assert start == datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+
+    def test_unknown_timezone_falls_back_to_utc(self) -> None:
+        now = datetime(2026, 7, 18, 15, 30, tzinfo=UTC)
+        start = compute_period_start(
+            QuotaPeriodType.DAILY, now=now, tz_name="Not/AZone"
+        )
+        assert start == datetime(2026, 7, 18, 0, 0, tzinfo=UTC)
+
+
+class TestIsFupUsageExceeded:
+    def test_pure_function_boundary(self) -> None:
+        assert is_fup_usage_exceeded(used=99, limit=100) is False
+        assert is_fup_usage_exceeded(used=100, limit=100) is True
+        assert is_fup_usage_exceeded(used=101, limit=100) is True
+
+
+class TestGetOrResetQuotaUsage:
+    async def test_creates_a_fresh_row_when_none_exists(self) -> None:
+        fx = make_fixture()
+        guest_id = uuid.uuid4()
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=guest_id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        assert usage.guest_id == guest_id
+        assert usage.period_type == QuotaPeriodType.DAILY.value
+        assert usage.bytes_used == 0
+        assert usage.minutes_used == 0
+        assert usage.period_start == datetime(2026, 7, 18, 0, 0, tzinfo=UTC)
+
+    async def test_returns_the_same_row_unchanged_within_the_same_period(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        guest_id = uuid.uuid4()
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        first = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=guest_id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        await fx.repository.update_quota_usage(first, {"bytes_used": 500})
+        later_same_day = datetime(2026, 7, 18, 23, 0, tzinfo=UTC)
+        second = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=guest_id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=later_same_day,
+        )
+        assert second.id == first.id
+        assert second.bytes_used == 500
+
+    async def test_resets_counters_once_the_period_has_rolled_over(self) -> None:
+        fx = make_fixture()
+        guest_id = uuid.uuid4()
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        first = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=guest_id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        await fx.repository.update_quota_usage(
+            first, {"bytes_used": 999, "minutes_used": 42}
+        )
+        next_day = datetime(2026, 7, 19, 1, 0, tzinfo=UTC)
+        rolled = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=guest_id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=next_day,
+        )
+        assert rolled.id == first.id  # same row, reset in place -- not a new one
+        assert rolled.bytes_used == 0
+        assert rolled.minutes_used == 0
+        assert rolled.period_start == datetime(2026, 7, 19, 0, 0, tzinfo=UTC)
+
+
+class TestEnforceFupQuotaLoginGate:
+    async def test_no_policy_lookup_wired_is_a_no_op(self) -> None:
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990020",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_policy_wired_with_no_fup_limits_configured_is_a_no_op(
+        self,
+    ) -> None:
+        fx = make_fixture(policy_lookup=FakeFupPolicyLookup(fup_rules={}))
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990021",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_raises_once_a_configured_daily_data_cap_is_already_met(
+        self,
+    ) -> None:
+        fx = make_fixture(
+            policy_lookup=FakeFupPolicyLookup(fup_rules={"daily_data_limit_mb": 100})
+        )
+        identifier = "+15559990022"
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        # Directly drive the guest's own daily usage row to the configured
+        # cap -- mirrors driving GuestSession.bytes_uploaded directly in
+        # existing quota tests rather than sending real accounting deltas.
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=first.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=datetime.now(UTC),
+        )
+        await fx.repository.update_quota_usage(
+            usage, {"bytes_used": 100 * BYTES_PER_MB}
+        )
+
+        with pytest.raises(FairUsagePolicyExceededError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert exc_info.value.period_type == QuotaPeriodType.DAILY.value
+        assert exc_info.value.metric == "data"
+        assert exc_info.value.limit == 100
+
+    async def test_raises_once_a_configured_daily_time_cap_is_already_met(
+        self,
+    ) -> None:
+        fx = make_fixture(
+            policy_lookup=FakeFupPolicyLookup(
+                fup_rules={"daily_time_limit_minutes": 60}
+            )
+        )
+        identifier = "+15559990023"
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=first.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=datetime.now(UTC),
+        )
+        await fx.repository.update_quota_usage(usage, {"minutes_used": 60})
+
+        with pytest.raises(FairUsagePolicyExceededError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert exc_info.value.metric == "time"
+        assert exc_info.value.limit == 60
+
+    async def test_login_succeeds_when_usage_is_still_under_the_cap(self) -> None:
+        fx = make_fixture(
+            policy_lookup=FakeFupPolicyLookup(fup_rules={"daily_data_limit_mb": 100})
+        )
+        identifier = "+15559990024"
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=first.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=datetime.now(UTC),
+        )
+        await fx.repository.update_quota_usage(usage, {"bytes_used": 1 * BYTES_PER_MB})
+
+        second = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert second.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_rejected_before_otp_verification_is_attempted(self) -> None:
+        fx = make_fixture(
+            policy_lookup=FakeFupPolicyLookup(fup_rules={"daily_data_limit_mb": 100})
+        )
+        identifier = "+15559990025"
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=first.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=datetime.now(UTC),
+        )
+        await fx.repository.update_quota_usage(
+            usage, {"bytes_used": 100 * BYTES_PER_MB}
+        )
+
+        with pytest.raises(FairUsagePolicyExceededError):
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="WRONG",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_new_guest_login_skips_the_check_entirely(self) -> None:
+        fx = make_fixture(
+            policy_lookup=FakeFupPolicyLookup(fup_rules={"daily_data_limit_mb": 0})
+        )
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990026",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.is_new_guest is True
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+
+class TestRecordUsageFupTracking:
+    async def test_bumps_all_three_period_rows_when_policy_lookup_wired(
+        self,
+    ) -> None:
+        fx = make_fixture(policy_lookup=FakeFupPolicyLookup(fup_rules={}))
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990030",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.record_usage(
+            session_id=result.session.id,
+            bytes_uploaded_delta=1000,
+            bytes_downloaded_delta=2000,
+        )
+        for period_type in QuotaPeriodType:
+            usage = await fx.repository.get_quota_usage(
+                result.guest.id, period_type.value
+            )
+            assert usage is not None
+            assert usage.bytes_used == 3000
+
+    async def test_no_op_when_no_policy_lookup_wired(self) -> None:
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990031",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.record_usage(
+            session_id=result.session.id,
+            bytes_uploaded_delta=1000,
+            bytes_downloaded_delta=2000,
+        )
+        assert (
+            await fx.repository.get_quota_usage(
+                result.guest.id, QuotaPeriodType.DAILY.value
+            )
+            is None
+        )
+
+    async def test_expires_session_once_a_configured_data_cap_is_crossed(
+        self,
+    ) -> None:
+        fx = make_fixture(
+            policy_lookup=FakeFupPolicyLookup(fup_rules={"weekly_data_limit_mb": 1})
+        )
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990032",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        updated = await fx.guest_service.record_usage(
+            session_id=result.session.id,
+            bytes_uploaded_delta=BYTES_PER_MB,
+            bytes_downloaded_delta=BYTES_PER_MB,
+        )
+        assert updated.status == GuestSessionStatus.EXPIRED.value
+        assert updated.disconnect_reason == "fup_data_quota_exceeded_weekly"
+
+    async def test_never_raises_when_the_policy_lookup_itself_fails(self) -> None:
+        class ExplodingPolicyLookup:
+            async def resolve_effective_policy(self, **kwargs: object):
+                raise RuntimeError("policy service unreachable")
+
+        fx = make_fixture(policy_lookup=ExplodingPolicyLookup())
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990033",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        updated = await fx.guest_service.record_usage(
+            session_id=result.session.id,
+            bytes_uploaded_delta=1000,
+            bytes_downloaded_delta=0,
+        )
+        assert updated.status == GuestSessionStatus.ACTIVE.value
+
+
+class TestRunFupTimeAccrual:
+    async def test_skips_guests_whose_org_has_no_time_limit_configured(self) -> None:
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990040",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        policy_lookup = FakeFupPolicyLookup(fup_rules={})
+        summary = await run_fup_time_accrual(
+            fx.repository, policy_lookup, now=datetime.now(UTC)
+        )
+        assert summary == {"accrued_rows": 0, "expired_sessions": 0}
+        assert (
+            await fx.repository.get_quota_usage(
+                result.guest.id, QuotaPeriodType.DAILY.value
+            )
+            is None
+        )
+
+    async def test_accrues_elapsed_minutes_since_last_accrual(self) -> None:
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990041",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        policy_lookup = FakeFupPolicyLookup(
+            fup_rules={"daily_time_limit_minutes": 999_999}
+        )
+        now = datetime.now(UTC)
+        # Pre-seed the row with a known last_accrued_at baseline (rather
+        # than letting the first sweep tick accrue from period_start,
+        # which -- at whatever real wall-clock time this test happens to
+        # run -- could itself already be hundreds of minutes, an
+        # unpredictable number to assert against).
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        await fx.repository.update_quota_usage(usage, {"last_accrued_at": now})
+
+        later = now + timedelta(minutes=10)
+        await run_fup_time_accrual(fx.repository, policy_lookup, now=later)
+        usage_after = await fx.repository.get_quota_usage(
+            result.guest.id, QuotaPeriodType.DAILY.value
+        )
+        assert usage_after.minutes_used == 10
+
+    async def test_disconnects_every_active_session_once_the_cap_is_crossed(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        identifier = "+15559990042"
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:11:22:33:44:01",
+        )
+        policy_lookup = FakeFupPolicyLookup(fup_rules={"daily_time_limit_minutes": 5})
+        now = datetime.now(UTC)
+        summary = await run_fup_time_accrual(
+            fx.repository, policy_lookup, now=now + timedelta(minutes=10)
+        )
+        assert summary["expired_sessions"] == 1
+        updated_session = await fx.repository.get_session_by_id(first.session.id)
+        assert updated_session.status == GuestSessionStatus.EXPIRED.value
+        assert updated_session.disconnect_reason == "fup_time_quota_exceeded_daily"
+
+    async def test_guest_level_time_is_not_doubled_across_concurrent_sessions(
+        self,
+    ) -> None:
+        """Two simultaneous devices connected for the same wall-clock
+        window must accrue as one guest's worth of connected time, not
+        two -- see ``models.GuestQuotaUsage``'s own docstring."""
+        fx = make_fixture()
+        identifier = "+15559990043"
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:11:22:33:44:02",
+        )
+        await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:11:22:33:44:03",
+        )
+        policy_lookup = FakeFupPolicyLookup(
+            fup_rules={"daily_time_limit_minutes": 999_999}
+        )
+        now = datetime.now(UTC)
+        # Pre-seed a known last_accrued_at baseline -- see the identical
+        # note in test_accrues_elapsed_minutes_since_last_accrual.
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=first.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        await fx.repository.update_quota_usage(usage, {"last_accrued_at": now})
+
+        later = now + timedelta(minutes=15)
+        await run_fup_time_accrual(fx.repository, policy_lookup, now=later)
+        usage_after = await fx.repository.get_quota_usage(
+            first.guest.id, QuotaPeriodType.DAILY.value
+        )
+        # Exactly one guest-worth of the 15-minute window is accrued, not
+        # two, despite two concurrent ACTIVE sessions.
+        assert usage_after.minutes_used == 15
+
+
+class TestRunQuotaReset:
+    async def test_resets_rows_whose_period_has_rolled_over(self) -> None:
+        fx = make_fixture()
+        guest_id = uuid.uuid4()
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=guest_id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        await fx.repository.update_quota_usage(usage, {"bytes_used": 500})
+
+        next_day = datetime(2026, 7, 19, 1, 0, tzinfo=UTC)
+        summary = await run_quota_reset(fx.repository, now=next_day)
+        assert summary == {"reset_count": 1}
+        reset_usage = await fx.repository.get_quota_usage(
+            guest_id, QuotaPeriodType.DAILY.value
+        )
+        assert reset_usage.bytes_used == 0
+        assert reset_usage.period_start == datetime(2026, 7, 19, 0, 0, tzinfo=UTC)
+
+    async def test_is_idempotent_within_the_same_period(self) -> None:
+        fx = make_fixture()
+        guest_id = uuid.uuid4()
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=guest_id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        later_same_day = datetime(2026, 7, 18, 23, 0, tzinfo=UTC)
+        summary = await run_quota_reset(fx.repository, now=later_same_day)
+        assert summary == {"reset_count": 0}
+
+
+def test_run_fup_time_accrual_sweep_task_bridges_into_async(monkeypatch) -> None:
+    """Mirrors ``test_run_session_timeout_sweep_task_bridges_into_async``'s
+    identical pattern."""
+    from app.domains.guest import tasks as tasks_module
+
+    async def _fake_run_fup_time_accrual_sweep_async() -> dict[str, int]:
+        return {"accrued_rows": 2, "expired_sessions": 1}
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_run_fup_time_accrual_sweep_async",
+        _fake_run_fup_time_accrual_sweep_async,
+    )
+
+    result = tasks_module.run_fup_time_accrual_sweep()
+    assert result == {"accrued_rows": 2, "expired_sessions": 1}
+
+
+def test_run_quota_reset_sweep_task_bridges_into_async(monkeypatch) -> None:
+    """Mirrors ``test_run_session_timeout_sweep_task_bridges_into_async``'s
+    identical pattern."""
+    from app.domains.guest import tasks as tasks_module
+
+    async def _fake_run_quota_reset_sweep_async() -> dict[str, int]:
+        return {"reset_count": 4}
+
+    monkeypatch.setattr(
+        tasks_module, "_run_quota_reset_sweep_async", _fake_run_quota_reset_sweep_async
+    )
+
+    result = tasks_module.run_quota_reset_sweep()
+    assert result == {"reset_count": 4}
+
+
 # ============================================================================
 # Guest Access Control enforcement hook (Phase 1)
 # ============================================================================
@@ -1809,6 +3246,56 @@ class TestRadius:
         assert authz.authorized is True
         assert authz.session_timeout_seconds == DEFAULT_SESSION_TIMEOUT_MINUTES * 60
         assert result.session.status == GuestSessionStatus.ACTIVE.value
+        assert authz.rate_limit is None  # no queue_lookup wired
+
+    async def test_authorize_returns_rate_limit_when_queue_lookup_wired(self) -> None:
+        class FakeQueueLookup:
+            async def get_rate_limit_reply_for_session(self, session_id: uuid.UUID):
+                return "1000k/5000k"
+
+        fx = make_fixture(queue_lookup=FakeQueueLookup())
+        await self._register_nas(fx)
+        await fx.guest_service.login_via_otp(
+            identifier="+15553334444",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        nas_client = await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-1", shared_secret="supersecret123"
+        )
+        authz = await fx.radius_service.authorize(
+            nas_client=nas_client, username="+15553334444"
+        )
+        assert authz.rate_limit == "1000k/5000k"
+
+    async def test_authorize_rate_limit_lookup_failure_never_blocks_authorization(
+        self,
+    ) -> None:
+        class ExplodingQueueLookup:
+            async def get_rate_limit_reply_for_session(self, session_id: uuid.UUID):
+                raise RuntimeError("queue service unreachable")
+
+        fx = make_fixture(queue_lookup=ExplodingQueueLookup())
+        await self._register_nas(fx)
+        await fx.guest_service.login_via_otp(
+            identifier="+15553334444",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        nas_client = await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-1", shared_secret="supersecret123"
+        )
+        authz = await fx.radius_service.authorize(
+            nas_client=nas_client, username="+15553334444"
+        )
+        assert authz.authorized is True
+        assert authz.rate_limit is None
 
     async def test_authorize_rejects_unknown_guest(self) -> None:
         fx = make_fixture()

@@ -314,7 +314,16 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["captive_portal_config_id"],
             ["captive_portal_configs.id"],
-            name="fk_guest_consents_captive_portal_config_id_captive_portal_configs",
+            # Shortened from the naming convention's literal
+            # "fk_guest_consents_captive_portal_config_id_captive_portal_configs"
+            # (65 characters), which exceeds Postgres's 63-character
+            # identifier limit and fails at DDL-compile time (verified via
+            # `alembic upgrade head --sql`) -- a genuine bug in this
+            # migration, fixed in place rather than via a later corrective
+            # migration since this table has never been created against a
+            # real database (no live Postgres has run this migration chain
+            # yet in any environment this project has verified against).
+            name="fk_guest_consents_cp_config_id_captive_portal_configs",
             ondelete="SET NULL",
         ),
     )
