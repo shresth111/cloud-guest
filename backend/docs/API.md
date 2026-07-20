@@ -1889,3 +1889,55 @@ the underlying RBAC seed-data gap itself is left as an honest, documented
 follow-up rather than fixed directly (out of this Part's own directory-rule
 boundary).
 
+
+## Guest Teams Endpoints
+
+See `docs/guest_teams/FLOW.md` for the full design write-up -- team status
+lifecycle, join/removal/revocation semantics, the RBAC permission-module
+decision (`PermissionModule.GUEST_TEAMS`, a new additive module), and the
+shared-quota check's real scope vs. enforcement. Guest Teams is an
+extension of `app.domains.guest`, composing its real `GuestService` (guest
+identity resolution, session termination) rather than duplicating any of
+it.
+
+### Guest-facing
+
+`POST /guest-teams/join` -- no RBAC (mirrors OTP's/Voucher's/Guest's own
+identical guest-facing precedent: the caller is a guest presenting a
+team's join code, with no platform-user identity RBAC could ever grant a
+permission to). Body: `team_code`, `identifier`, optional `device_mac`/
+`device_name`. Idempotent if the identifier already resolves to an active
+member of the team; rejects an over-capacity team (`max_members`), an
+expired team (checked lazily on this same call), or a revoked team.
+Rejoining after a prior removal is allowed and creates a new membership
+row (see FLOW.md §4.3).
+
+### Admin-facing (tenant-scoped via `X-Organization-Id`)
+
+`POST /guest-teams` -- requires `guest_teams.create`. Body: `organization_id`,
+optional `location_id` (omit for an org-wide team), `name`, optional
+`max_members`/`shared_data_limit_mb`/`expires_at`. Generates a unique join
+code (reusing the voucher domain's own print-friendly alphabet) and creates
+the team `ACTIVE`.
+
+`GET /guest-teams` -- requires `guest_teams.read`. Paginated, filterable by
+`location_id`/`status`.
+
+`GET /guest-teams/{team_id}` -- requires `guest_teams.read`. Returns the
+team plus a real summary: member count, active-session count, cumulative
+(all-time) bandwidth usage, and -- if `shared_data_limit_mb` is set --
+remaining shared quota and whether it has been exceeded.
+
+`DELETE /guest-teams/{team_id}/members/{guest_id}` -- requires
+`guest_teams.execute` (not `.delete` -- mirrors `guest_sessions.execute`'s
+own choice for disconnect/terminate, see FLOW.md §10). Removes one member
+from the roster and also terminates that guest's currently-active
+session(s) (a real, argued design decision -- see FLOW.md §5), with
+session-termination failures logged but never blocking the removal itself.
+
+`POST /guest-teams/{team_id}/revoke` -- requires `guest_teams.execute`.
+Transitions the whole team to `revoked` and terminates every currently-
+active member's active session(s) via the real
+`GuestService.terminate_session`, with per-member failure isolation (one
+member's termination failure never stops the rest -- see FLOW.md §6).
+Response includes `terminated_session_ids` and `failed_member_ids`.

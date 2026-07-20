@@ -78,6 +78,7 @@ class PermissionModule(StrEnum):
     GUEST_USERS = "guest_users"
     GUEST_SESSIONS = "guest_sessions"
     GUEST_ACCESS = "guest_access"
+    GUEST_TEAMS = "guest_teams"
     OTP = "otp"
     VOUCHER = "voucher"
     CAMPAIGNS = "campaigns"
@@ -466,3 +467,30 @@ class AuditAction(StrEnum):
     TAX_RATE_CREATED = "tax_rate_created"
     TAX_RATE_UPDATED = "tax_rate_updated"
     BILLING_PROFILE_UPDATED = "billing_profile_updated"
+
+    # Guest Teams domain events -- written through this same table by
+    # ``app.domains.guest_teams.service.GuestTeamService`` via the same
+    # narrow ``AuditLogWriter`` protocol shape every other domain's service
+    # uses (see ``AuditLogEntry``'s "other domains could plausibly reuse it"
+    # design). Guest Teams is a brand-new domain (an extension of
+    # ``app.domains.guest``, composing its real ``GuestService`` rather than
+    # sharing its module), not a later Part of an already-existing one -- the
+    # precedent followed here is the one every brand-new domain in this
+    # codebase's history has followed at its own first Part: add its own
+    # additive block of ``AuditAction`` values directly here, never a
+    # domain-local constants shadow of this same enum. Team lifecycle
+    # (create/revoke) and individual member removal are always admin-
+    # initiated, moderate-volume, human-attributable actions -- audited, the
+    # same profile every other domain's own lifecycle events already meet.
+    # ``join_team`` (a guest presenting a team's join code) is deliberately
+    # **not** audited at all, and deliberately has no placeholder value here
+    # either -- it is high-volume, guest-facing, unauthenticated traffic,
+    # the identical profile ``app.domains.guest``'s own
+    # ``login_via_otp``/``login_via_voucher`` already establish for guest
+    # logins (which likewise have zero corresponding ``AuditAction`` values,
+    # not even an unused placeholder -- see this enum's own "Guest domain
+    # events" comment above). See ``app.domains.guest_teams.service``'s
+    # module docstring for the full audit-volume judgment call.
+    GUEST_TEAM_CREATED = "guest_team_created"
+    GUEST_TEAM_MEMBER_REMOVED = "guest_team_member_removed"
+    GUEST_TEAM_REVOKED = "guest_team_revoked"
