@@ -125,6 +125,45 @@ RECONNECT_GRACE_MINUTES = 30
 BYTES_PER_MB = 1024 * 1024
 
 # ============================================================================
+# Concurrent session limit -- Guest Session Engine (Phase 1).
+# ============================================================================
+
+# The maximum number of simultaneously ``ACTIVE`` GuestSession rows one
+# guest (one ``Guest.id``) may hold at once, enforced by
+# ``service._enforce_concurrent_session_limit`` at the start of both
+# ``login_via_otp``/``login_via_voucher`` (never at ``reconnect``, which is
+# already idempotent against the guest's own existing ACTIVE session -- see
+# ``GuestService.reconnect``'s docstring). Deliberately a plain module
+# constant, not a new ``Organization.settings``/``Settings`` field: full
+# per-organization/location configurability is the Policy Engine's job
+# (Phase 2 ``policy`` module, ``PolicyType.SESSION`` -- see
+# ``docs/ARCHITECTURE_DESIGN.md`` §13), so this stays a single, honest,
+# platform-wide default until that seam exists, exactly the same "additive
+# default now, resolver-driven override later" posture
+# ``DEFAULT_SESSION_TIMEOUT_MINUTES`` above already establishes.
+DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST = 3
+
+# ============================================================================
+# Session timeout sweep -- Celery Beat task wiring (Guest Session Engine,
+# Phase 1). See ``tasks.py``'s module docstring: ``GuestService
+# .enforce_timeouts`` already existed as a callable status-transition sweep
+# but, before this, was never actually scheduled anywhere -- these two
+# constants are what let ``app.core.celery_app`` register and periodically
+# fire it, mirroring ``app.domains.analytics.constants
+# .TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS``'s identical
+# task-name-as-constant convention.
+# ============================================================================
+
+TASK_RUN_SESSION_TIMEOUT_SWEEP = "app.domains.guest.tasks.run_session_timeout_sweep"
+
+# Every 5 minutes -- shorter than analytics' 15-minute rolling aggregation
+# cadence (``SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS``-adjacent), because an
+# expired-but-not-yet-flipped session is guest-facing/operationally visible
+# (an admin's "live sessions" view showing a session that is, in practice,
+# long idle) rather than merely a reporting staleness window.
+SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS = 300.0
+
+# ============================================================================
 # FreeRADIUS ``rlm_rest``-style integration -- see ``service.py``'s module
 # docstring for the full architectural write-up on why HTTP (rlm_rest), not
 # raw RADIUS-UDP.
@@ -154,6 +193,9 @@ __all__ = [
     "TERMINATION_RECONNECT_COOLDOWN_MINUTES",
     "RECONNECT_GRACE_MINUTES",
     "BYTES_PER_MB",
+    "DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST",
+    "TASK_RUN_SESSION_TIMEOUT_SWEEP",
+    "SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS",
     "RADIUS_NAS_IDENTIFIER_HEADER",
     "RADIUS_SHARED_SECRET_HEADER",
     "RADIUS_ACCT_STATUS_START",

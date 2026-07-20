@@ -1,5 +1,31 @@
 # Module 010 Part 4: Guest
 
+> **Guest Session Engine (Phase 1 roadmap item) addendum:** a gap analysis
+> against the roadmap's "Guest Session Engine" requirements found this
+> module already implemented live sessions, session history, accounting
+> (including RADIUS interim-update), idle/session timeout detection,
+> disconnect, and force logout (`terminate_session`) -- see the Architecture
+> Design Document for the full analysis. Only two real gaps existed and were
+> closed here, with **no new tables and no migration** (a deliberate
+> finding, not an oversight):
+>
+> 1. **Concurrent session limit** -- previously unenforced; see FLOW.md §6a.
+> 2. **The timeout sweep was dead code** -- `enforce_timeouts` existed and
+>    was tested but nothing ever scheduled it; it now runs every 5 minutes
+>    via Celery Beat. See FLOW.md §6's addendum and `tasks.py`.
+>
+> "Live Sessions" and "Session History" needed no new code at all -- both
+> are already `GET /guest-sessions` (`?status=active` for the former, any/no
+> filter for the latter).
+>
+> **Guest Access Control addendum:** `GuestService` gained a second
+> optional hook, `access_control_hook` (mirrors `monitoring_hook`'s
+> additive pattern), composing with the new `app.domains.guest_access`
+> module. See `docs/guest_access/README.md` for the full write-up. Unlike
+> `monitoring_hook`, this hook can change a login's outcome -- a resolved
+> `BLOCKLIST` decision raises `GuestAccessDeniedError` and blocks the
+> login, checked immediately after the existing `Guest.is_blocked` check.
+
 The Guest domain (`app.domains.guest`) is BE-010's **final** module -- the
 one that actually ties `app.domains.otp` (Part 1), `app.domains.voucher`
 (Part 2), `app.domains.captive_portal` (Part 3), and `app.domains.router`

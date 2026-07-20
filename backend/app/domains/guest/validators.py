@@ -87,6 +87,18 @@ def validate_date_range(start: datetime, end: datetime) -> None:
         raise InvalidAnalyticsDateRangeError()
 
 
+def is_concurrent_session_limit_reached(*, active_count: int, limit: int) -> bool:
+    """Guest Session Engine (Phase 1): a pure, in-memory comparison used by
+    ``GuestService._enforce_concurrent_session_limit`` after the
+    repository's own ``count_active_sessions_for_guest`` has already fetched
+    ``active_count`` -- mirrors ``is_session_timed_out``'s/
+    ``is_quota_exceeded``'s identical "repository fetches, this module
+    decides" split. A guest with exactly ``limit`` active sessions has
+    *reached* the limit (the next login would exceed it), so this is
+    ``>=``, not ``>``."""
+    return active_count >= limit
+
+
 __all__ = [
     "normalize_mac_address",
     "normalize_identifier",
@@ -94,4 +106,5 @@ __all__ = [
     "is_session_timed_out",
     "is_quota_exceeded",
     "validate_date_range",
+    "is_concurrent_session_limit_reached",
 ]

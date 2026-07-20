@@ -77,6 +77,7 @@ class PermissionModule(StrEnum):
     GUEST_WIFI = "guest_wifi"
     GUEST_USERS = "guest_users"
     GUEST_SESSIONS = "guest_sessions"
+    GUEST_ACCESS = "guest_access"
     OTP = "otp"
     VOUCHER = "voucher"
     CAMPAIGNS = "campaigns"
@@ -334,6 +335,18 @@ class AuditAction(StrEnum):
     GUEST_SESSION_DISCONNECTED = "guest_session_disconnected"
     GUEST_SESSION_TERMINATED = "guest_session_terminated"
     RADIUS_NAS_REGISTERED = "radius_nas_registered"
+
+    # Guest Access Control domain events (Phase 1) -- written through this
+    # same table by
+    # ``app.domains.guest_access.service.GuestAccessService`` via the same
+    # narrow ``AuditLogWriter`` protocol shape every other domain above
+    # uses. Rule create/delete are always audited (low-volume,
+    # admin-initiated); deactivation (a reversible ``is_active`` toggle,
+    # not a delete) is not audited on its own -- mirrors this table's
+    # existing "state-changing writes get an audit row, a lighter-weight
+    # flag flip doesn't need a dedicated one" judgment call.
+    GUEST_ACCESS_RULE_CREATED = "guest_access_rule_created"
+    GUEST_ACCESS_RULE_DELETED = "guest_access_rule_deleted"
 
     # Billing domain events (Module 013 Part 1: Plan + License + Usage Core)
     # -- written through this same table by

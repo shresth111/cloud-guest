@@ -37,6 +37,7 @@ __all__ = [
     "RadiusNasAuthenticationError",
     "RadiusNasAlreadyRegisteredError",
     "InvalidAnalyticsDateRangeError",
+    "ConcurrentSessionLimitExceededError",
 ]
 
 
@@ -200,4 +201,29 @@ class InvalidAnalyticsDateRangeError(GuestError):
         super().__init__(
             "start_date must be before or equal to end_date",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ConcurrentSessionLimitExceededError(GuestError):
+    """The guest already holds
+    ``constants.DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` (or more)
+    ``ACTIVE`` sessions -- raised by
+    ``service._enforce_concurrent_session_limit`` before a new session is
+    created via ``login_via_otp``/``login_via_voucher``. Mirrors
+    ``GuestBlockedError``'s "reject before touching OTP/voucher
+    verification" placement in the caller, and ``SessionTerminationCooldownError``'s
+    shape of surfacing the limit back to the caller as structured ``data``
+    rather than only in the message string. An admin can free a slot with
+    the existing ``terminate_session``/``disconnect_session`` endpoints --
+    this module deliberately does not auto-evict the oldest session on the
+    guest's behalf, so a guest never loses an active connection they didn't
+    ask to end."""
+
+    def __init__(self, *, guest_id: uuid.UUID | str, limit: int) -> None:
+        self.limit = limit
+        super().__init__(
+            f"Guest {guest_id} already has {limit} active session(s), which "
+            "is the maximum allowed at once",
+            status_code=status.HTTP_409_CONFLICT,
+            data={"max_concurrent_sessions": limit},
         )

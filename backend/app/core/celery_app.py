@@ -115,6 +115,10 @@ from app.domains.billing.constants import (
     TASK_RUN_INVOICE_OVERDUE_SWEEP,
     TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
 )
+from app.domains.guest.constants import (
+    SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_SESSION_TIMEOUT_SWEEP,
+)
 
 _settings = get_settings()
 
@@ -142,6 +146,7 @@ celery_app = Celery(
         "app.domains.analytics.tasks",
         "app.domains.analytics.report_tasks",
         "app.domains.billing.tasks",
+        "app.domains.guest.tasks",
     ],
 )
 
@@ -214,6 +219,22 @@ celery_app.conf.update(
         "billing-invoice-overdue-sweep": {
             "task": TASK_RUN_INVOICE_OVERDUE_SWEEP,
             "schedule": crontab(hour=1, minute=0),
+        },
+        # Guest Session Engine (Phase 1): the session-timeout sweep --
+        # every 5 minutes, shorter than every other cadence in this
+        # schedule, because a stale ``ACTIVE`` session is guest-facing/
+        # operationally visible (an admin's live-sessions view) rather than
+        # merely a reporting staleness window. See
+        # ``app.domains.guest.tasks.run_session_timeout_sweep``'s own
+        # docstring and ``app.domains.guest.constants
+        # .SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS``'s docstring for the
+        # full reasoning -- this is the entry that turns
+        # ``GuestService.enforce_timeouts``/``service
+        # .enforce_session_timeouts`` from a callable-but-never-called
+        # mechanism into a real, running sweep.
+        "guest-session-timeout-sweep": {
+            "task": TASK_RUN_SESSION_TIMEOUT_SWEEP,
+            "schedule": SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

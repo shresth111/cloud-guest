@@ -753,12 +753,16 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # BE-013 Part 4 adds a fifth Beat entry
     # ("billing-invoice-overdue-sweep") for the Invoice Engine's overdue
     # sweep -- see app.core.celery_app's own module docstring.
+    # Guest Session Engine (Phase 1) adds a sixth Beat entry
+    # ("guest-session-timeout-sweep") for the idle/session-timeout sweep --
+    # see app.domains.guest.tasks's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
         "reports-run-scheduled",
         "billing-subscription-renewal-sweep",
         "billing-invoice-overdue-sweep",
+        "guest-session-timeout-sweep",
     }
 
 

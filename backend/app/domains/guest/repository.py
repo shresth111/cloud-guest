@@ -143,6 +143,8 @@ class GuestRepositoryProtocol(Protocol):
         self, guest_id: uuid.UUID
     ) -> GuestSession | None: ...
 
+    async def count_active_sessions_for_guest(self, guest_id: uuid.UUID) -> int: ...
+
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]: ...
 
     # -- login history ---------------------------------------------------------
@@ -376,6 +378,22 @@ class GuestRepository:
         )
         result = await self.session.execute(statement)
         return result.scalars().first()
+
+    async def count_active_sessions_for_guest(self, guest_id: uuid.UUID) -> int:
+        """Guest Session Engine (Phase 1): how many ``ACTIVE`` sessions
+        ``guest_id`` currently holds -- backs
+        ``GuestService._enforce_concurrent_session_limit``. A plain
+        equality-filtered count ``GenericRepository.count`` already
+        supports natively; no hand-written SQL needed, unlike
+        ``get_batch_status_counts``'s grouped-count shape in
+        ``app.domains.voucher.repository`` (that one needs a `GROUP BY`
+        this single-status count does not)."""
+        return await self.sessions.count(
+            filters={
+                "guest_id": guest_id,
+                "status": GuestSessionStatus.ACTIVE.value,
+            }
+        )
 
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]:
         """Active sessions whose ``last_activity_at`` plus their own

@@ -200,17 +200,32 @@ bus that does not exist anywhere else in this codebase either.
 ## 6. Timeout/quota: a reporting mechanism, not live enforcement
 
 There is no live RADIUS daemon in this sandbox actually disconnecting
-devices. `GuestService.enforce_timeouts` is a status-transition/reporting
-mechanism: it queries `ACTIVE` sessions whose `last_activity_at` plus their
-own `session_timeout_minutes` has already passed "now" (a real SQL
-predicate using Postgres's `make_interval`, not a Python-side scan) and
-flips them to `EXPIRED` -- the same honest, "simulated, DB-tracked signal"
-posture `app.domains.wireguard`'s tunnel-health computation and
-`app.domains.router`'s heartbeat-derived online/offline status already
-document. A real deployment would pair this with FreeRADIUS's own
-`Session-Timeout` reply attribute (already returned by `RadiusService
-.authorize`) and/or a scheduled sweep calling `enforce_timeouts`; nothing in
-this module ever issues a live CoA-Disconnect packet to a real NAS.
+devices. `GuestService.enforce_timeouts` (a thin delegation to the
+module-level `service.enforce_session_timeouts` -- see the Phase 1 addendum
+below) is a status-transition/reporting mechanism: it queries `ACTIVE`
+sessions whose `last_activity_at` plus their own `session_timeout_minutes`
+has already passed "now" (a real SQL predicate using Postgres's
+`make_interval`, not a Python-side scan) and flips them to `EXPIRED` -- the
+same honest, "simulated, DB-tracked signal" posture `app.domains.wireguard`'s
+tunnel-health computation and `app.domains.router`'s heartbeat-derived
+online/offline status already document. A real deployment would pair this
+with FreeRADIUS's own `Session-Timeout` reply attribute (already returned by
+`RadiusService.authorize`); nothing in this module ever issues a live
+CoA-Disconnect packet to a real NAS.
+
+> **Guest Session Engine (Phase 1) addendum:** the "and/or a scheduled sweep
+> calling `enforce_timeouts`" this section used to describe as a future
+> possibility is now real. `app.domains.guest.tasks.run_session_timeout_sweep`
+> is registered with `app.core.celery_app` and fires every
+> `constants.SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS` (5 minutes) via Celery
+> Beat's `guest-session-timeout-sweep` entry. The sweep logic itself did not
+> change -- it was pulled from `GuestService.enforce_timeouts`'s method body
+> into a standalone `service.enforce_session_timeouts(repository)` function
+> so the Celery task can call it with just a `GuestRepository`, without
+> constructing a full `GuestService` and its unrelated
+> otp/voucher/captive-portal/router dependency chain. `GuestService
+> .enforce_timeouts` still exists, unchanged in signature/behavior, and now
+> simply delegates to that function.
 
 Quota enforcement (`validators.is_quota_exceeded`) is a pure, in-memory
 check of `bytes_uploaded + bytes_downloaded >= data_limit_mb * 1MB` -- it
@@ -220,6 +235,39 @@ session to `EXPIRED` the moment a reported usage delta crosses the limit.
 This is more "live" than the pure timeout sweep only because it piggybacks
 on an accounting call this module already receives -- there is still no
 independent, out-of-band mechanism polling live network usage.
+
+## 6a. Concurrent session limit (Guest Session Engine, Phase 1)
+
+`login_via_otp`/`login_via_voucher` now reject a login with
+`ConcurrentSessionLimitExceededError` (`409`) if the resolved guest already
+holds `constants.DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST` (currently `3`)
+`ACTIVE` sessions. The check:
+
+* Runs via `GuestService._enforce_concurrent_session_limit`, backed by
+  `GuestRepository.count_active_sessions_for_guest` (a plain
+  equality-filtered `GenericRepository.count` -- no hand-written SQL
+  needed) and the pure `validators.is_concurrent_session_limit_reached`.
+* Is placed **before** `OtpService.verify_otp`/`VoucherService
+  .redeem_voucher` are called, not after -- a guest already at the limit
+  never spends a real OTP attempt or a single-use voucher on a login that
+  was always going to be rejected.
+* Is skipped entirely for a never-before-seen identifier (`existing_guest
+  is None`): a brand-new guest trivially holds zero active sessions, so
+  there is no `guest_id` yet to count against.
+* Is **not** applied to `reconnect` -- that method is already idempotent
+  against the guest's own existing `ACTIVE` session (returns it unchanged,
+  see §3) and only ever derives a new row when the guest holds zero active
+  sessions, so it can never itself push a guest over the limit.
+* Does **not** auto-evict the guest's oldest session to make room. An admin
+  frees a slot with the existing `terminate_session`/`disconnect_session`
+  endpoints -- this module never ends a session the guest didn't ask to end
+  and an admin didn't explicitly choose to end.
+
+The limit is a single platform-wide constant in Phase 1, not yet
+per-organization/location configurable -- see the Architecture Design
+Document §13 ("Policy Engine Integration") for why full configurability is
+deliberately deferred to the Phase 2 `policy` module rather than added here
+as a one-off `Organization.settings` key.
 
 ## 7. `data_limit_mb`/`session_timeout_minutes`: copied, not referenced
 

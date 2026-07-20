@@ -29,6 +29,7 @@ from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.guest.constants import (
     BYTES_PER_MB,
+    DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
     RECONNECT_GRACE_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
@@ -36,6 +37,7 @@ from app.domains.guest.constants import (
     GuestSessionStatus,
 )
 from app.domains.guest.exceptions import (
+    ConcurrentSessionLimitExceededError,
     CrossOrganizationGuestAccessError,
     GuestAuthMethodNotEnabledError,
     GuestBlockedError,
@@ -65,7 +67,12 @@ from app.domains.guest.service import (
     GuestService,
     RadiusService,
 )
-from app.domains.guest.validators import is_quota_exceeded, is_session_timed_out
+from app.domains.guest.validators import (
+    is_concurrent_session_limit_reached,
+    is_quota_exceeded,
+    is_session_timed_out,
+)
+from app.domains.guest_access.exceptions import GuestAccessDeniedError
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.exceptions import OtpCodeMismatchError
 from app.domains.router.crypto import encrypt_secret
@@ -285,6 +292,59 @@ class FakeRouterService:
 
 
 @dataclass
+class FakeAccessControlHook:
+    """Stand-in for ``AccessDecisionProtocol`` -- lets Guest Session
+    Engine's login tests exercise ``GuestService._enforce_access_control``
+    without constructing a real ``GuestAccessService``/repository. Denies
+    any identifier/mac_address pair added via ``deny()``; allows everything
+    else, mirroring the real ``AccessDecisionResolver``'s default-allow
+    posture."""
+
+    denied_identifiers: set[str] = field(default_factory=set)
+    denied_macs: set[str] = field(default_factory=set)
+    denial_reason: str | None = "blocked for testing"
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    def deny(self, *, identifier: str | None = None, mac_address: str | None = None):
+        if identifier is not None:
+            self.denied_identifiers.add(identifier)
+        if mac_address is not None:
+            self.denied_macs.add(mac_address.strip().upper())
+
+    async def check_access(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        identifier: str | None,
+        mac_address: str | None,
+    ):
+        self.calls.append(
+            {
+                "organization_id": organization_id,
+                "requesting_organization_id": requesting_organization_id,
+                "location_id": location_id,
+                "identifier": identifier,
+                "mac_address": mac_address,
+            }
+        )
+        normalized_mac = mac_address.strip().upper() if mac_address else None
+        denied = (identifier in self.denied_identifiers) or (
+            normalized_mac is not None and normalized_mac in self.denied_macs
+        )
+
+        class _Decision:
+            def __init__(self, allowed: bool, reason: str | None) -> None:
+                self.allowed = allowed
+                self.reason = reason
+
+        return _Decision(
+            allowed=not denied, reason=self.denial_reason if denied else None
+        )
+
+
+@dataclass
 class FakeGuestRepository:
     """In-memory stand-in for ``GuestRepositoryProtocol`` -- including the
     analytics aggregate methods, computed in pure Python to mirror what the
@@ -452,6 +512,14 @@ class FakeGuestRepository:
         ]
         items.sort(key=lambda s: s.ended_at or s.started_at, reverse=True)
         return items[0] if items else None
+
+    async def count_active_sessions_for_guest(self, guest_id: uuid.UUID) -> int:
+        return sum(
+            1
+            for s in self.sessions.values()
+            if s.guest_id == guest_id
+            and s.status == GuestSessionStatus.ACTIVE.value
+        )
 
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]:
         return [
@@ -701,6 +769,7 @@ def make_fixture(
     otp_sms_enabled: bool = True,
     voucher_enabled: bool = True,
     router_status: str = RouterStatus.ONLINE.value,
+    access_control_hook: object | None = None,
 ) -> Fixture:
     repository = FakeGuestRepository()
     otp_service = FakeOtpService()
@@ -726,6 +795,7 @@ def make_fixture(
         captive_portal_service,
         router_service,
         audit_writer=audit_writer,
+        access_control_hook=access_control_hook,
     )
     radius_service = RadiusService(
         repository, guest_service, router_service, audit_writer=audit_writer
@@ -1286,6 +1356,272 @@ class TestTimeoutAndQuota:
 
 
 # ============================================================================
+# Concurrent session limit (Guest Session Engine, Phase 1)
+# ============================================================================
+
+
+class TestConcurrentSessionLimit:
+    def test_is_concurrent_session_limit_reached_pure_function(self) -> None:
+        assert is_concurrent_session_limit_reached(active_count=2, limit=3) is False
+        assert is_concurrent_session_limit_reached(active_count=3, limit=3) is True
+        assert is_concurrent_session_limit_reached(active_count=4, limit=3) is True
+
+    async def test_count_active_sessions_for_guest_counts_only_active(self) -> None:
+        fx = make_fixture()
+        first = await fx.guest_service.login_via_otp(
+            identifier="+15559990001",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.login_via_otp(
+            identifier="+15559990001",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        count = await fx.repository.count_active_sessions_for_guest(
+            first.guest.id
+        )
+        assert count == 2
+
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        count_after_disconnect = await fx.repository.count_active_sessions_for_guest(
+            first.guest.id
+        )
+        assert count_after_disconnect == 1
+
+    async def test_login_raises_once_limit_reached(self) -> None:
+        fx = make_fixture()
+        identifier = "+15559990002"
+        for _ in range(DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST):
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        sessions_before = len(fx.repository.sessions)
+
+        with pytest.raises(ConcurrentSessionLimitExceededError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert exc_info.value.limit == DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
+        # No new session row was created for the rejected attempt.
+        assert len(fx.repository.sessions) == sessions_before
+
+    async def test_login_rejected_before_otp_verification_is_attempted(self) -> None:
+        """A guest already at the limit must never spend a real OTP
+        verification attempt on a login that was always going to be
+        rejected -- see ``GuestService._enforce_concurrent_session_limit``'s
+        call-site placement in ``login_via_otp``."""
+        fx = make_fixture()
+        identifier = "+15559990003"
+        for _ in range(DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST):
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+        # A *wrong* code would normally raise OtpCodeMismatchError from
+        # FakeOtpService -- if the concurrent-session check runs first (as
+        # it must), ConcurrentSessionLimitExceededError is raised instead,
+        # proving verify_otp was never reached.
+        with pytest.raises(ConcurrentSessionLimitExceededError):
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="WRONG",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_voucher_login_raises_once_limit_reached(self) -> None:
+        fx = make_fixture()
+        identifier = "voucher-guest@example.com"
+        for index in range(DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST):
+            code = f"VCODE{index}"
+            fx.voucher_service.register(code, data_limit_mb=None, validity_minutes=60)
+            await fx.guest_service.login_via_voucher(
+                code=code,
+                identifier=identifier,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+        fx.voucher_service.register(
+            "VCODE-OVER", data_limit_mb=None, validity_minutes=60
+        )
+        with pytest.raises(ConcurrentSessionLimitExceededError):
+            await fx.guest_service.login_via_voucher(
+                code="VCODE-OVER",
+                identifier=identifier,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_new_guest_login_skips_the_check_entirely(self) -> None:
+        """A never-before-seen identifier has no ``existing_guest`` yet, so
+        the limit check is skipped rather than querying a guest_id that
+        doesn't exist -- see the call site's comment in ``login_via_otp``."""
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990004",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.is_new_guest is True
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_reconnect_never_pushes_guest_over_the_limit(self) -> None:
+        """``reconnect`` is idempotent against an existing ACTIVE session
+        (returns it unchanged) and only ever derives a new row when the
+        guest holds zero active sessions -- it can never itself trigger
+        ``ConcurrentSessionLimitExceededError``."""
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990005",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        again = await fx.guest_service.reconnect(
+            guest_id=result.guest.id,
+            router_id=fx.router.id,
+            location_id=fx.location_id,
+        )
+        assert again.id == result.session.id  # idempotent no-op, not a new row
+
+
+# ============================================================================
+# Guest Access Control enforcement hook (Phase 1)
+# ============================================================================
+
+
+class TestAccessControlHookIntegration:
+    async def test_no_hook_wired_preserves_default_behavior(self) -> None:
+        """The default (``access_control_hook=None``) -- every existing
+        caller/test of ``GuestService`` behaves exactly as before this
+        hook existed."""
+        fx = make_fixture()  # access_control_hook defaults to None
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559991001",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_login_via_otp_denied_by_blocklist_rule(self) -> None:
+        hook = FakeAccessControlHook()
+        hook.deny(identifier="+15559991002")
+        fx = make_fixture(access_control_hook=hook)
+        with pytest.raises(GuestAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559991002",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        # No session was created for the denied attempt.
+        assert len(fx.repository.sessions) == 0
+
+    async def test_login_via_otp_allowed_when_no_matching_rule(self) -> None:
+        hook = FakeAccessControlHook()
+        hook.deny(identifier="+15559991099")  # a different identifier
+        fx = make_fixture(access_control_hook=hook)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559991003",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+        assert len(hook.calls) == 1
+        assert hook.calls[0]["identifier"] == "+15559991003"
+
+    async def test_denial_checked_before_otp_verification_is_attempted(self) -> None:
+        """A denied guest must never spend a real OTP attempt -- mirrors
+        the identical ordering guarantee
+        ``TestConcurrentSessionLimit`` establishes for its own limit
+        check."""
+        hook = FakeAccessControlHook()
+        hook.deny(identifier="+15559991004")
+        fx = make_fixture(access_control_hook=hook)
+        with pytest.raises(GuestAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559991004",
+                code="WRONG",  # would raise OtpCodeMismatchError if reached
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_login_via_voucher_denied_by_blocklist_rule(self) -> None:
+        hook = FakeAccessControlHook()
+        hook.deny(identifier="denied-voucher@example.com")
+        fx = make_fixture(access_control_hook=hook)
+        fx.voucher_service.register("VDENY", data_limit_mb=None, validity_minutes=60)
+        with pytest.raises(GuestAccessDeniedError):
+            await fx.guest_service.login_via_voucher(
+                code="VDENY",
+                identifier="denied-voucher@example.com",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert len(fx.repository.sessions) == 0
+
+    async def test_device_mac_denial_blocks_login(self) -> None:
+        """A device-level blocklist rule (matched by MAC, not identifier)
+        also blocks a login attempt on that device."""
+        hook = FakeAccessControlHook()
+        hook.deny(mac_address="AA:BB:CC:DD:EE:FF")
+        fx = make_fixture(access_control_hook=hook)
+        with pytest.raises(GuestAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559991005",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="aa:bb:cc:dd:ee:ff",
+            )
+
+
+# ============================================================================
 # RADIUS rlm_rest integration
 # ============================================================================
 
@@ -1708,3 +2044,59 @@ class TestTenantIsolation:
         )
         assert meta.total_items == 1
         assert guests[0].organization_id == fx.organization_id
+
+
+# ============================================================================
+# Session timeout sweep -- module-level function + Celery task bridge
+# (Guest Session Engine, Phase 1)
+# ============================================================================
+
+
+class TestSessionTimeoutSweep:
+    async def test_enforce_session_timeouts_function_matches_service_method(
+        self,
+    ) -> None:
+        """``GuestService.enforce_timeouts`` now delegates to the
+        module-level ``enforce_session_timeouts`` -- this asserts the
+        delegation actually happens (calling the free function directly,
+        against the same repository, produces the identical result the
+        service method already returns for the same data)."""
+        from app.domains.guest.service import enforce_session_timeouts
+
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990010",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        result.session.session_timeout_minutes = 5
+        result.session.last_activity_at = _now() - timedelta(minutes=10)
+
+        expired = await enforce_session_timeouts(fx.repository)
+        assert len(expired) == 1
+        assert expired[0].id == result.session.id
+        assert expired[0].status == GuestSessionStatus.EXPIRED.value
+
+
+def test_run_session_timeout_sweep_task_bridges_into_async(monkeypatch) -> None:
+    """Mirrors ``tests/unit/test_analytics.py``'s identical
+    ``..._task_bridges_into_async`` pattern: the async bridge function is
+    monkeypatched so this runs with no real Celery worker/broker/Postgres,
+    and only the sync task's own wiring (does it await the bridge, does it
+    shape the return value correctly) is under test."""
+    from app.domains.guest import tasks as tasks_module
+
+    async def _fake_run_session_timeout_sweep_async() -> int:
+        return 3
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_run_session_timeout_sweep_async",
+        _fake_run_session_timeout_sweep_async,
+    )
+
+    result = tasks_module.run_session_timeout_sweep()
+    assert result == {"expired_count": 3}

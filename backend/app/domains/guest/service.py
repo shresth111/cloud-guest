@@ -185,6 +185,8 @@ from typing import Protocol
 
 from app.common.exceptions import CloudGuestError
 from app.domains.captive_portal.service import ResolvedPortalConfig
+from app.domains.guest_access.exceptions import GuestAccessDeniedError
+from app.domains.guest_access.service import AccessDecision
 from app.domains.monitoring.constants import RealtimeMessageType
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
@@ -199,6 +201,7 @@ from app.domains.router.models import Router
 from app.domains.voucher.models import Voucher, VoucherBatch
 
 from .constants import (
+    DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
     RECONNECT_GRACE_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
@@ -218,6 +221,7 @@ from .events import (
     RadiusNasRegistered,
 )
 from .exceptions import (
+    ConcurrentSessionLimitExceededError,
     CrossOrganizationGuestAccessError,
     GuestAuthMethodNotEnabledError,
     GuestBlockedError,
@@ -236,6 +240,7 @@ from .repository import (
     LocationSessionCount,
 )
 from .validators import (
+    is_concurrent_session_limit_reached,
     is_quota_exceeded,
     is_session_timed_out,
     normalize_identifier,
@@ -257,6 +262,45 @@ def _event_extra(event: object) -> dict[str, object]:
         else str(value)
         for f in dataclasses.fields(event)
     }
+
+
+async def enforce_session_timeouts(
+    repository: GuestRepositoryProtocol,
+) -> list[GuestSession]:
+    """Guest Session Engine (Phase 1): the actual idle/session-timeout
+    sweep, pulled out of ``GuestService.enforce_timeouts`` to module scope
+    so ``tasks.run_session_timeout_sweep`` (the Celery Beat-scheduled
+    caller -- see that module's own docstring for why this was previously
+    dead code) can invoke it with nothing but a ``GuestRepository`` bound to
+    a fresh session, rather than constructing a full ``GuestService`` and
+    its entire ``otp_service``/``voucher_service``/``captive_portal_service``/
+    ``router_lookup`` dependency chain purely to reach a method that never
+    actually touches any of them. ``GuestService.enforce_timeouts`` itself
+    now just delegates here, so every existing caller (including this
+    module's pre-existing tests) is unaffected.
+
+    See the module docstring's "a reporting mechanism, not live
+    enforcement" write-up for what this sweep does and does not do. Returns
+    every session just flipped to ``EXPIRED``.
+    """
+    now = datetime.now(UTC)
+    candidates = await repository.list_timed_out_sessions(now=now)
+    expired: list[GuestSession] = []
+    for session in candidates:
+        if not is_session_timed_out(session, now=now):
+            continue  # defensive re-check against the SQL-level filter
+        updated = await repository.update_session(
+            session,
+            {
+                "status": GuestSessionStatus.EXPIRED.value,
+                "ended_at": now,
+                "disconnect_reason": "inactivity_timeout",
+            },
+        )
+        event = GuestSessionExpired(session_id=updated.id)
+        logger.info("guest_session_expired_timeout", extra=_event_extra(event))
+        expired.append(updated)
+    return expired
 
 
 # ============================================================================
@@ -323,6 +367,27 @@ class GuestSessionBroadcastProtocol(Protocol):
         auth_method: str,
         is_new_guest: bool,
     ) -> None: ...
+
+
+class AccessDecisionProtocol(Protocol):
+    """Guest Access Control (Phase 1): the single method ``GuestService``'s
+    optional ``access_control_hook`` needs from the real
+    ``app.domains.guest_access.service.GuestAccessService`` -- reused
+    directly, never reimplemented, the identical composition
+    ``GuestSessionBroadcastProtocol``/``monitoring_hook`` above already
+    establishes for the Real-Time Engine. See
+    ``GuestService.__init__``'s docstring for why this hook is additive
+    (``None``-by-default) rather than a required dependency."""
+
+    async def check_access(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        identifier: str | None,
+        mac_address: str | None,
+    ) -> AccessDecision: ...
 
 
 # ============================================================================
@@ -409,6 +474,24 @@ class GuestService:
     method bodies, since guest login is reachable through more than one
     caller and every one of them should broadcast, not just whichever
     endpoint happens to call it first.
+
+    ``access_control_hook`` (Guest Access Control, Phase 1) is a second,
+    independently optional, ``None``-by-default constructor parameter --
+    additive for the identical three reasons ``monitoring_hook`` is,
+    above. It is duck-typed against
+    ``app.domains.guest_access.service.GuestAccessService`` via
+    ``AccessDecisionProtocol``. **Unlike** ``monitoring_hook``, a wired
+    ``access_control_hook`` can change ``login_via_otp``/
+    ``login_via_voucher``'s outcome: it is a real authorization gate, not a
+    best-effort side broadcast, so its call is deliberately **not**
+    wrapped in a blanket try/except -- a genuine
+    ``GuestAccessDeniedError`` from a resolved ``BLOCKLIST`` decision must
+    propagate and block the login, the same way ``GuestBlockedError``
+    already does for the guest-level ``Guest.is_blocked`` flag. It is
+    called immediately after that existing blocked-guest check, before any
+    concurrent-session check or OTP/voucher verification -- see
+    ``_enforce_access_control``'s own docstring for the exact placement
+    reasoning.
     """
 
     def __init__(
@@ -421,6 +504,7 @@ class GuestService:
         *,
         audit_writer: AuditLogWriter | None = None,
         monitoring_hook: GuestSessionBroadcastProtocol | None = None,
+        access_control_hook: AccessDecisionProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.otp_service = otp_service
@@ -429,6 +513,7 @@ class GuestService:
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
         self.monitoring_hook = monitoring_hook
+        self.access_control_hook = access_control_hook
 
     async def _broadcast_guest_session_started(
         self,
@@ -498,6 +583,20 @@ class GuestService:
             resolved_org_id, identifier
         )
         self._reject_if_blocked(existing_guest)
+        await self._enforce_access_control(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=device_mac,
+        )
+        if existing_guest is not None:
+            # A brand-new guest (``existing_guest is None``) trivially holds
+            # zero active sessions -- skip the query entirely rather than
+            # counting against a guest_id that doesn't exist yet. Checked
+            # before OTP verification below, not after, so a guest already
+            # at the limit never spends a real (rate-limited, one-time) OTP
+            # attempt on a login that was always going to be rejected.
+            await self._enforce_concurrent_session_limit(existing_guest.id)
 
         router = await self._get_eligible_router(router_id)
 
@@ -598,6 +697,19 @@ class GuestService:
             resolved_org_id, identifier
         )
         self._reject_if_blocked(existing_guest)
+        await self._enforce_access_control(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=device_mac,
+        )
+        if existing_guest is not None:
+            # See the identical comment in login_via_otp: skip the query for
+            # a brand-new guest, and check before the voucher is redeemed
+            # below, not after, so a guest already at the limit never
+            # spends a real (single-use) voucher on a login that was always
+            # going to be rejected.
+            await self._enforce_concurrent_session_limit(existing_guest.id)
 
         router = await self._get_eligible_router(router_id)
 
@@ -1084,25 +1196,13 @@ class GuestService:
     async def enforce_timeouts(self) -> list[GuestSession]:
         """See module docstring's "a reporting mechanism, not live
         enforcement" write-up. Returns every session just flipped to
-        ``EXPIRED``."""
-        now = datetime.now(UTC)
-        candidates = await self.repository.list_timed_out_sessions(now=now)
-        expired: list[GuestSession] = []
-        for session in candidates:
-            if not is_session_timed_out(session, now=now):
-                continue  # defensive re-check against the SQL-level filter
-            updated = await self.repository.update_session(
-                session,
-                {
-                    "status": GuestSessionStatus.EXPIRED.value,
-                    "ended_at": now,
-                    "disconnect_reason": "inactivity_timeout",
-                },
-            )
-            event = GuestSessionExpired(session_id=updated.id)
-            logger.info("guest_session_expired_timeout", extra=_event_extra(event))
-            expired.append(updated)
-        return expired
+        ``EXPIRED``. A thin delegation to the module-level
+        ``enforce_session_timeouts`` -- kept as a method (rather than
+        removed) so every existing caller of ``GuestService.enforce_timeouts``
+        (including this module's own pre-existing test suite) keeps working
+        unchanged. See that function's own docstring for why the real logic
+        was pulled out to module scope."""
+        return await enforce_session_timeouts(self.repository)
 
     # ========================================================================
     # Internal helpers
@@ -1139,6 +1239,69 @@ class GuestService:
     def _reject_if_blocked(self, guest: Guest | None) -> None:
         if guest is not None and guest.is_blocked:
             raise GuestBlockedError(guest.blocked_reason)
+
+    async def _enforce_access_control(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        identifier: str,
+        device_mac: str | None,
+    ) -> None:
+        """Guest Access Control (Phase 1): a no-op when no
+        ``access_control_hook`` was wired (the default -- see
+        ``GuestService``'s own docstring). When wired, calls
+        ``AccessDecisionResolver`` (via ``GuestAccessService.check_access``)
+        and raises ``GuestAccessDeniedError`` on a resolved ``BLOCKLIST``
+        decision.
+
+        Placement: called from ``login_via_otp``/``login_via_voucher``
+        immediately after ``_reject_if_blocked`` and before
+        ``_enforce_concurrent_session_limit``/OTP verification/voucher
+        redemption -- a guest denied by an access-control rule should never
+        reach a real OTP attempt or spend a voucher, the identical
+        "reject before touching anything with a side effect" ordering
+        ``_reject_if_blocked``/``_enforce_concurrent_session_limit`` already
+        establish. ``organization_id`` is passed as both ``organization_id``
+        and ``requesting_organization_id`` to ``check_access`` -- this is an
+        internal, trusted call on behalf of the already-resolved captive
+        portal's own organization, not a cross-tenant admin request, so
+        there is no separate "requesting" identity to distinguish."""
+        if self.access_control_hook is None:
+            return
+        decision: AccessDecision = await self.access_control_hook.check_access(
+            organization_id=organization_id,
+            requesting_organization_id=organization_id,
+            location_id=location_id,
+            identifier=identifier,
+            mac_address=device_mac,
+        )
+        if not decision.allowed:
+            raise GuestAccessDeniedError(decision.reason)
+
+    async def _enforce_concurrent_session_limit(self, guest_id: uuid.UUID) -> None:
+        """Guest Session Engine (Phase 1): raises
+        ``ConcurrentSessionLimitExceededError`` if ``guest_id`` already holds
+        ``constants.DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` (or more)
+        ``ACTIVE`` sessions. Called from ``login_via_otp``/
+        ``login_via_voucher`` after the guest identity is resolved but
+        before a new ``GuestSession`` row is created -- mirrors
+        ``_reject_if_blocked``'s placement (reject before any further
+        side effect). Deliberately **not** called from ``reconnect``: that
+        method is already idempotent against the guest's own existing
+        ``ACTIVE`` session (see its docstring) and only ever derives a new
+        row when the guest currently holds zero active sessions, so it can
+        never itself push a guest over the limit."""
+        active_count = await self.repository.count_active_sessions_for_guest(
+            guest_id
+        )
+        if is_concurrent_session_limit_reached(
+            active_count=active_count,
+            limit=DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+        ):
+            raise ConcurrentSessionLimitExceededError(
+                guest_id=guest_id, limit=DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
+            )
 
     async def _get_or_create_guest(
         self,

@@ -24,6 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.session import get_db_session
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
+from app.domains.guest_access.dependencies import get_guest_access_service
+from app.domains.guest_access.service import GuestAccessService
 from app.domains.monitoring.dependencies import get_monitoring_service
 from app.domains.monitoring.service import MonitoringService
 from app.domains.otp.dependencies import get_otp_service
@@ -56,6 +58,7 @@ def get_guest_service(
     router_service: RouterService = Depends(get_router_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     monitoring_service: MonitoringService = Depends(get_monitoring_service),
+    guest_access_service: GuestAccessService = Depends(get_guest_access_service),
 ) -> GuestService:
     """BE-011 Part 3 addition: wires ``MonitoringService`` in as
     ``GuestService``'s optional ``monitoring_hook`` (see that class's own
@@ -65,7 +68,16 @@ def get_guest_service(
     the running application -- without it, ``GuestService`` would only ever
     be constructed with ``monitoring_hook=None`` and the real-time guest-
     session broadcast would be dead code that no request path ever
-    exercises."""
+    exercises.
+
+    Guest Access Control (Phase 1) addition: wires ``GuestAccessService`` in
+    as ``GuestService``'s optional ``access_control_hook`` the identical
+    way -- the one DI-wiring edit required for
+    ``login_via_otp``/``login_via_voucher`` to actually enforce
+    ``guest_access`` rules in the running application. See
+    ``GuestService.__init__``'s own docstring for why this hook, unlike
+    ``monitoring_hook``, can change the login's outcome (a real
+    authorization gate, not a best-effort side broadcast)."""
     return GuestService(
         repository,
         otp_service,
@@ -74,6 +86,7 @@ def get_guest_service(
         router_service,
         audit_writer=audit_repository,
         monitoring_hook=monitoring_service,
+        access_control_hook=guest_access_service,
     )
 
 
