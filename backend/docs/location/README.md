@@ -18,6 +18,16 @@ semantics, why no `LocationMember` table, the RBAC `location_id` FK
 `CurrentLocation` org-consistency check, and every judgment call made where
 the brief left room for one).
 
+**Smart Location Provisioning** (a later extension of this same domain --
+see `FLOW.md` for the full design write-up and `DATABASE.md` for the schema
+additions) adds `property_type`/`location_code` to `Location`, and a single
+orchestration entry point (`LocationProvisioningService.provision_location`)
+that composes Organization/User/RBAC/Router/Router Provisioning/WireGuard/
+Billing/Captive Portal/OTP into one real-transaction "Create Location" flow
+for a CloudGuest Super Admin. Explicitly *not* a separate
+`app/domains/onboarding/` module -- an earlier attempt built it that way and
+was rejected by the project owner.
+
 ## Folder Structure
 
 ```text
@@ -26,29 +36,43 @@ backend/
     versions/
       0005_create_location_tables.py
       0006_add_location_fk_to_rbac_tables.py
+      0026_add_location_provisioning.py
   app/
     domains/
       location/
         __init__.py
-        enums.py           # LocationStatus
-        models.py          # Location (SQLAlchemy ORM)
-        exceptions.py      # LocationError subclasses (CloudGuestError)
-        repository.py      # LocationRepositoryProtocol + LocationRepository
-        service.py         # LocationService: CRUD, hierarchy validation, lifecycle, audit
-        schemas.py         # Pydantic request/response DTOs
-        dependencies.py    # get_location_repository / get_location_service
-        router.py          # FastAPI routes
+        enums.py                       # LocationStatus, PropertyType
+        models.py                      # Location, LocationCodeCounter (SQLAlchemy ORM)
+        exceptions.py                  # LocationError subclasses (CloudGuestError)
+        repository.py                  # LocationRepositoryProtocol/LocationRepository,
+                                        #   LocationCodeCounterRepository
+        number_generator.py            # generate_location_code (atomic counter, mirrors billing)
+        service.py                     # LocationService: CRUD, hierarchy validation, lifecycle, audit
+        provisioning_service.py        # LocationProvisioningService: Smart Location Provisioning
+        schemas.py                     # Pydantic request/response DTOs (plain CRUD)
+        provisioning_schemas.py        # Pydantic request/response DTOs (provisioning)
+        dependencies.py                # get_location_repository / get_location_service
+        provisioning_dependencies.py   # get_location_provisioning_service (separate module -- see FLOW.md §3)
+        router.py                     # FastAPI routes (CRUD + provisioning)
+      billing/
+        constants.py       # PlanFeatureKey additively extended (see FLOW.md §5)
+      auth/
+        models.py           # User.must_change_password (see FLOW.md §9)
+        service.py          # AuthService.login/change_password/reset_password additions
       rbac/
         models.py          # location_id columns now carry a real FK (see below)
         dependencies.py    # CurrentLocation now validates real location + org-consistency
-        enums.py           # AuditAction gained location_* values
+        enums.py           # AuditAction gained location_*/provisioning-specific values
   docs/
     location/
       README.md
       LOCATION_ARCHITECTURE.md
+      FLOW.md              # Smart Location Provisioning design write-up
+      DATABASE.md          # Smart Location Provisioning schema additions
   tests/
     unit/
       test_location.py
+      test_location_provisioning.py
 ```
 
 ## API Surface
@@ -68,7 +92,14 @@ PUT    /api/v1/locations/{location_id}
 DELETE /api/v1/locations/{location_id}
 POST   /api/v1/locations/{location_id}/suspend
 POST   /api/v1/locations/{location_id}/activate
+POST   /api/v1/locations/provision                            # Smart Location Provisioning
+POST   /api/v1/locations/{location_id}/resend-welcome-email    # Smart Location Provisioning
 ```
+
+The last two are gated with `locations.manage` pinned at
+`ScopeType.GLOBAL` (Super-Admin-class roles only -- see `FLOW.md` §14),
+unlike every other endpoint above (which use the ordinary,
+scope-inferred-from-headers `RequirePermission` call).
 
 `DELETE /locations/{id}` archives (soft-deletes), it never hard-deletes.
 Every endpoint resolves `CurrentOrganization` (`X-Organization-Id`) and
@@ -112,3 +143,17 @@ the RBAC `location_id` FK follow-up is actually in place (plus that
 additionally verified by running the full pre-existing `tests/unit/test_rbac.py`
 suite (38 tests, all still passing unmodified) and `tests/unit/test_organization.py`
 (36 tests, all still passing unmodified).
+
+`tests/unit/test_location_provisioning.py` covers Smart Location
+Provisioning: the full happy-path flow (every composed step verified via
+protocol-conforming spy fakes, `LocationService` itself exercised as the
+real class), the existing-vs-new-organization conditional, the real
+single-transaction rollback proof (`TestTransactionalRollback`, see
+`FLOW.md` §2), `location_code` format/year-reset/concurrent-collision
+safety, the default-config-template resolution and honest gap, the
+billing feature-override/custom-plan-cloning behavior, username/temporary-
+password generation, the shown-once temporary-password discipline,
+`resend_welcome_email`'s owner lookup and password-omission behavior, the
+Super-Admin/GLOBAL-scope-only gating (a direct, seed-data-driven regression
+test, not fragile route introspection), and `must_change_password`
+enforcement (reusing `test_auth.py`'s own fakes).

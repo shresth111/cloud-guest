@@ -75,6 +75,27 @@ class EmailNotVerifiedError(AuthServiceError):
         super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
 
 
+class PasswordChangeRequiredError(AuthServiceError):
+    """Raised by ``AuthService.login`` instead of issuing a normal session
+    when ``User.must_change_password`` is set -- see that flag's own
+    docstring in ``app.domains.auth.models`` and ``docs/location/FLOW.md``
+    for why Smart Location Provisioning needed this narrow, additive check.
+    Mirrors ``EmailNotVerifiedError``'s identical shape (a distinct,
+    ``CloudGuestError``-flowing 403 raised *before* any token pair is
+    created), which is exactly the "minimally-invasive way to signal this"
+    precedent already established in this same method -- no rewriting of
+    the surrounding login logic was needed."""
+
+    def __init__(
+        self,
+        message: str = (
+            "Password change required. Use the forgot-password flow to set a new "
+            "password before logging in."
+        ),
+    ) -> None:
+        super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
+
+
 class PasswordReuseError(AuthServiceError):
     def __init__(self, message: str) -> None:
         super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
@@ -205,6 +226,16 @@ class AuthService:
             )
             raise EmailNotVerifiedError()
 
+        if user.must_change_password:
+            await self._record_attempt(
+                user.id,
+                email,
+                device_info,
+                success=False,
+                reason="password_change_required",
+            )
+            raise PasswordChangeRequiredError()
+
         await self.repository.update_user(
             user,
             failed_login_attempts=0,
@@ -294,7 +325,10 @@ class AuthService:
 
         new_hash = PasswordManager.hash(new_password)
         await self.repository.update_user(
-            user, password_hash=new_hash, password_changed_at=datetime.now(UTC)
+            user,
+            password_hash=new_hash,
+            password_changed_at=datetime.now(UTC),
+            must_change_password=False,
         )
         await self.repository.add_password_history(user_id, new_hash)
         await self.repository.revoke_all_sessions(user_id)
@@ -327,7 +361,10 @@ class AuthService:
 
         new_hash = PasswordManager.hash(new_password)
         await self.repository.update_user(
-            user, password_hash=new_hash, password_changed_at=datetime.now(UTC)
+            user,
+            password_hash=new_hash,
+            password_changed_at=datetime.now(UTC),
+            must_change_password=False,
         )
         await self.repository.add_password_history(user_id, new_hash)
         await self.repository.revoke_all_sessions(user_id)

@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from app.domains.auth.schemas import MessageResponse
 
-from .enums import LocationStatus
+from .enums import LocationStatus, PropertyType
 
 __all__ = [
     "MessageResponse",
@@ -59,6 +59,8 @@ class LocationResponse(BaseModel):
     name: str
     slug: str
     status: LocationStatus
+    property_type: PropertyType | None = None
+    location_code: str | None = None
     address_line1: str
     address_line2: str | None = None
     city: str
@@ -97,6 +99,7 @@ class LocationCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     slug: str = Field(..., min_length=1, max_length=150)
     status: LocationStatus = Field(default=LocationStatus.ACTIVE)
+    property_type: PropertyType | None = Field(default=None)
     address_line1: str = Field(..., min_length=1, max_length=255)
     address_line2: str | None = Field(default=None, max_length=255)
     city: str = Field(..., min_length=1, max_length=100)

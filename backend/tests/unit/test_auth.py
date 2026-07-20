@@ -111,6 +111,7 @@ class FakeAuthRepository:
             "password_changed_at": None,
             "timezone": "UTC",
             "language": "en",
+            "must_change_password": False,
         }
         user = User(
             id=uuid.uuid4(),

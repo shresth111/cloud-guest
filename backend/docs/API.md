@@ -145,6 +145,55 @@ non-archived location whose `organization_id` matches the resolved
 `X-Organization-Id` context, rather than trusted at face value -- see
 `LOCATION_ARCHITECTURE.md` §8.
 
+### Smart Location Provisioning (Module 006 extension)
+
+Extends this same Location domain (explicitly *not* a new
+`app/domains/onboarding/` module) with a single orchestrated "Create
+Location" flow that composes Organization/User/RBAC/Router/Router
+Provisioning/WireGuard/Billing/Captive Portal/OTP's provider protocols in
+one real database transaction. See `backend/docs/location/FLOW.md` for the
+full design write-up (the transactional mechanism, the billing feature-
+override design, the RBAC role choice, the `must_change_password` auth
+extension, the `location_code` generator, the default-router-config-
+template gap) and `backend/docs/location/DATABASE.md` for the schema
+changes.
+
+```text
+POST /api/v1/locations/provision
+POST /api/v1/locations/{location_id}/resend-welcome-email
+```
+
+Both endpoints require `locations.manage` pinned at `ScopeType.GLOBAL`
+(`RequirePermission("locations.manage", scope=ScopeType.GLOBAL)`) -- the
+identical Super-Admin-only gating pattern `app.domains.billing.router`
+already uses for Plan-catalog writes. Per the seeded `SYSTEM_ROLES` data,
+only `Super Admin`/`Platform Admin` hold that grant, matching the spec's
+"CloudGuest Super Admin" actor.
+
+`POST /locations/provision` request body: `existing_organization_id`
+**or** `new_organization` (exactly one), `location` (name/slug/
+`property_type`/address/timezone/lat-long/contact/settings), `owner`
+(name/email/optional username/phone/designation/etc., `send_welcome_sms`),
+`router` (name/serial/MAC/model/management+public IP/API credentials),
+`plan_id`, an optional `feature_overrides` list (each a
+`{feature_key, limit_value | is_enabled | tier_value}`), an optional
+`router_config_template_id`, and an optional `coupon_code`.
+
+Response: `organization_id`/`name`, `location_id`/`name`/`location_code`/
+`property_type`, `plan_id`/`name`, a resolved `feature_summary` (every
+`PlanFeatureKey` currently in effect for the org, after overrides),
+`router_id`/`name`, `tunnel_ip_address`, `owner_user_id`/`name`/`username`/
+`email`, an `owner_temporary_password` (returned **exactly once**, in this
+response only -- never logged, never persisted, never retrievable again),
+a `login_url`, and `provisioned_at`.
+
+`POST /locations/{id}/resend-welcome-email` re-sends the owner's welcome
+email (login URL + username) **without** the original temporary password
+(it is not retrievable) -- the email instead points the owner at the
+"Forgot password" flow if they no longer have it. 404s
+(`OwnerNotProvisionedError`) if the location was never provisioned through
+this flow.
+
 ## User Management Endpoints (Module 007)
 
 An aggregation/management layer over the existing `auth.User`,

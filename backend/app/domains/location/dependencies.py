@@ -23,7 +23,12 @@ from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
-from .repository import LocationRepository, LocationRepositoryProtocol
+from .number_generator import LocationCodeCounterRepositoryProtocol
+from .repository import (
+    LocationCodeCounterRepository,
+    LocationRepository,
+    LocationRepositoryProtocol,
+)
 from .service import LocationService
 
 
@@ -33,11 +38,23 @@ def get_location_repository(
     return LocationRepository(db)
 
 
+def get_location_code_counter_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> LocationCodeCounterRepositoryProtocol:
+    return LocationCodeCounterRepository(db)
+
+
 def get_location_service(
     repository: LocationRepositoryProtocol = Depends(get_location_repository),
     organization_service: OrganizationService = Depends(get_organization_service),
+    location_code_counter: LocationCodeCounterRepositoryProtocol = Depends(
+        get_location_code_counter_repository
+    ),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ) -> LocationService:
     return LocationService(
-        repository, organization_service, audit_writer=audit_repository
+        repository,
+        organization_service,
+        location_code_counter=location_code_counter,
+        audit_writer=audit_repository,
     )

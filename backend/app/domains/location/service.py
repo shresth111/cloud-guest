@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from app.common.exceptions import CloudGuestError
@@ -48,7 +49,7 @@ from app.domains.organization.exceptions import OrganizationArchivedError
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 
-from .enums import LocationStatus
+from .enums import LocationStatus, PropertyType
 from .exceptions import (
     CrossOrganizationLocationAccessError,
     DuplicateLocationSlugError,
@@ -56,6 +57,10 @@ from .exceptions import (
     LocationNotFoundError,
 )
 from .models import Location
+from .number_generator import (
+    LocationCodeCounterRepositoryProtocol,
+    generate_location_code,
+)
 from .repository import LocationRepositoryProtocol
 
 logger = logging.getLogger(__name__)
@@ -91,10 +96,12 @@ class LocationService:
         repository: LocationRepositoryProtocol,
         organization_lookup: OrganizationLookupProtocol,
         *,
+        location_code_counter: LocationCodeCounterRepositoryProtocol,
         audit_writer: AuditLogWriter | None = None,
     ) -> None:
         self.repository = repository
         self.organization_lookup = organization_lookup
+        self.location_code_counter = location_code_counter
         self.audit_writer = audit_writer
 
     # -- reads -----------------------------------------------------------------
@@ -167,6 +174,7 @@ class LocationService:
         contact_email: str | None = None,
         status: LocationStatus = LocationStatus.ACTIVE,
         settings: dict[str, Any] | None = None,
+        property_type: PropertyType | None = None,
     ) -> Location:
         await self._assert_organization_accessible(
             organization_id, requesting_organization_id
@@ -177,11 +185,22 @@ class LocationService:
         if await self.repository.get_by_slug(organization_id, normalized_slug):
             raise DuplicateLocationSlugError(organization_id, normalized_slug)
 
+        # ``location_code`` is auto-generated for *every* location, not just
+        # ones created through the Smart Location Provisioning orchestration
+        # -- see ``models.LocationCodeCounter``'s docstring for the real,
+        # DB-level-atomic mechanism (mirrors
+        # ``app.domains.billing.number_generator``'s identical pattern).
+        location_code = await generate_location_code(
+            self.location_code_counter, at=datetime.now(UTC)
+        )
+
         location = await self.repository.create_location(
             organization_id=organization_id,
             name=name,
             slug=normalized_slug,
             status=status.value,
+            property_type=property_type.value if property_type else None,
+            location_code=location_code,
             address_line1=address_line1,
             address_line2=address_line2,
             city=city,

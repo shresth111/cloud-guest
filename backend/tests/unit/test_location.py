@@ -64,6 +64,23 @@ def _base_fields(**overrides: object) -> dict[str, object]:
 
 
 @dataclass
+class FakeLocationCodeCounterRepository:
+    """In-memory stand-in for
+    ``number_generator.LocationCodeCounterRepositoryProtocol`` -- mirrors
+    ``test_billing_invoices_tax.py``'s own fake counter repository for
+    ``NumberCounterRepositoryProtocol``: real per-key increment behavior
+    (not just "always return 1"), so a test can genuinely exercise
+    sequential/collision-safety expectations against it."""
+
+    counters: dict[str, int] = field(default_factory=dict)
+
+    async def increment_and_get_next(self, counter_key: str) -> int:
+        next_value = self.counters.get(counter_key, 0) + 1
+        self.counters[counter_key] = next_value
+        return next_value
+
+
+@dataclass
 class FakeAuditLogWriter:
     """In-memory stand-in for the ``AuditLogWriter`` protocol, mirroring
     ``test_organization.py``'s own fake."""
@@ -153,6 +170,8 @@ class FakeLocationRepository:
 
     async def create_location(self, **fields: object) -> Location:
         defaults = {
+            "property_type": None,
+            "location_code": None,
             "address_line2": None,
             "latitude": None,
             "longitude": None,
@@ -220,7 +239,12 @@ def make_service(
     organization_lookup = org_lookup or FakeOrganizationLookup()
     audit_writer = FakeAuditLogWriter()
     return (
-        LocationService(repository, organization_lookup, audit_writer=audit_writer),
+        LocationService(
+            repository,
+            organization_lookup,
+            location_code_counter=FakeLocationCodeCounterRepository(),
+            audit_writer=audit_writer,
+        ),
         repository,
         organization_lookup,
         audit_writer,

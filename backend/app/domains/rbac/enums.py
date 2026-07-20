@@ -151,6 +151,22 @@ class AuditAction(StrEnum):
     LOCATION_SUSPENDED = "location_suspended"
     LOCATION_ACTIVATED = "location_activated"
 
+    # Smart Location Provisioning (Module 006 extension) -- written through
+    # this same table by
+    # ``app.domains.location.provisioning_service.LocationProvisioningService``
+    # via the same narrow ``AuditLogWriter`` protocol shape
+    # ``LocationService`` itself already uses. Every composed step this
+    # orchestration calls (organization/location/router/wireguard/plan/
+    # subscription/captive-portal creation, role assignment) already writes
+    # its *own* audit entry via its own existing service call -- this module
+    # adds exactly one additional entry for the overall provisioning event
+    # itself (see ``docs/location/FLOW.md`` "Audit logging" section), never
+    # duplicating any of those. ``LOCATION_WELCOME_EMAIL_SENT`` covers both
+    # the provisioning flow's own welcome email and the dedicated
+    # "resend welcome email" endpoint.
+    LOCATION_PROVISIONED = "location_provisioned"
+    LOCATION_WELCOME_EMAIL_SENT = "location_welcome_email_sent"
+
     # User management/aggregation events (Module 007) -- written through
     # this same table by ``app.domains.user.service.UserService`` via the
     # same narrow ``AuditLogWriter`` protocol shape ``OrganizationService``/

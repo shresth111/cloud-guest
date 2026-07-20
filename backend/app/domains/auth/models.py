@@ -88,6 +88,20 @@ class User(BaseModel):
         DateTime(timezone=True), nullable=True
     )
 
+    # Smart Location Provisioning addition (Module 006 extension) -- see
+    # ``app.domains.auth.service.AuthService.login``'s ``must_change_password``
+    # check and ``docs/location/FLOW.md``'s "must_change_password" section
+    # for the full write-up of why this narrow, additive column was judged
+    # necessary: a location-provisioning-created "Location Owner" account is
+    # handed a real, randomly-generated temporary password (see
+    # ``app.domains.location.provisioning_service``) that this codebase has
+    # no other existing mechanism to force a change of before first ordinary
+    # use. ``False`` by default (every pre-existing account, and every
+    # self-registered/``register()``-created account, is unaffected).
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
     sessions: Mapped[list[Session]] = relationship(
         "Session", back_populates="user", cascade="all, delete-orphan"
     )

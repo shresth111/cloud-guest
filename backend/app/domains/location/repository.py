@@ -15,12 +15,13 @@ import uuid
 from typing import Protocol
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 
-from .models import Location
+from .models import Location, LocationCodeCounter
 
 
 class LocationRepositoryProtocol(Protocol):
@@ -121,3 +122,31 @@ class LocationRepository:
         result = await self.session.execute(paginate(statement, params))
         rows = list(result.scalars().all())
         return rows, PaginationMeta.from_total(params, total_items)
+
+
+class LocationCodeCounterRepository:
+    """Concrete, SQLAlchemy-backed implementation of
+    ``number_generator.LocationCodeCounterRepositoryProtocol`` -- mirrors
+    ``app.domains.billing.repository.NumberCounterRepository`` exactly (see
+    ``number_generator.py``'s module docstring for the full concurrency-
+    safety write-up)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def increment_and_get_next(self, counter_key: str) -> int:
+        statement = (
+            pg_insert(LocationCodeCounter)
+            .values(counter_key=counter_key, last_value=1)
+            .on_conflict_do_update(
+                index_elements=[LocationCodeCounter.counter_key],
+                set_={
+                    "last_value": LocationCodeCounter.last_value + 1,
+                    "version": LocationCodeCounter.version + 1,
+                },
+            )
+            .returning(LocationCodeCounter.last_value)
+        )
+        result = await self.session.execute(statement)
+        await self.session.flush()
+        return int(result.scalar_one())

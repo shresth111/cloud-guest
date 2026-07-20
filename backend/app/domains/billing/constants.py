@@ -65,7 +65,17 @@ class BillingCycle(StrEnum):
 
 class PlanFeatureKey(StrEnum):
     """The closed, finite set of entitlements/limits a :class:`~.models.Plan`
-    can carry -- exactly the list the spec enumerates, no more, no less."""
+    can carry -- exactly the list the spec enumerates, no more, no less.
+
+    Extended by Smart Location Provisioning (``app.domains.location
+    .provisioning_service``) with the "Feature Access"/"Plan Limits" keys
+    that part's own onboarding spec names and BE-013 Part 1 had not yet
+    needed (``DASHBOARD`` through ``MULTI_LOCATION`` below, plus
+    ``MAX_CONCURRENT_SESSIONS``/``MAX_STAFF_USERS``/``MAX_API_KEYS``) -- see
+    ``docs/location/FLOW.md``'s "Feature Access / Plan Limits" section for
+    the full reasoning on why this is an additive extension of billing's own
+    existing, closed feature-key set rather than a second, parallel concept
+    invented in the ``location`` domain."""
 
     MAX_ORGANIZATIONS = "max_organizations"
     MAX_LOCATIONS = "max_locations"
@@ -83,6 +93,30 @@ class PlanFeatureKey(StrEnum):
     EMAIL_QUOTA = "email_quota"
     STORAGE_QUOTA_MB = "storage_quota_mb"
     SUPPORT_LEVEL = "support_level"
+
+    # -- Smart Location Provisioning additions: plan limits (LIMIT-typed) --
+    MAX_CONCURRENT_SESSIONS = "max_concurrent_sessions"
+    MAX_STAFF_USERS = "max_staff_users"
+    MAX_API_KEYS = "max_api_keys"
+
+    # -- Smart Location Provisioning additions: feature access
+    # (BOOLEAN-typed) --
+    DASHBOARD = "dashboard"
+    GUEST_WIFI = "guest_wifi"
+    CAPTIVE_PORTAL = "captive_portal"
+    FREERADIUS = "freeradius"
+    WIREGUARD = "wireguard"
+    REPORTS = "reports"
+    ALERTS = "alerts"
+    BILLING = "billing"
+    VOUCHER_LOGIN = "voucher_login"
+    QR_LOGIN = "qr_login"
+    SOCIAL_LOGIN = "social_login"
+    MOBILE_OTP = "mobile_otp"
+    NOTIFICATION_CENTER = "notification_center"
+    AUDIT_LOGS = "audit_logs"
+    MULTI_ROUTER = "multi_router"
+    MULTI_LOCATION = "multi_location"
 
 
 class PlanFeatureType(StrEnum):
@@ -118,6 +152,9 @@ LIMIT_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.SMS_QUOTA,
         PlanFeatureKey.EMAIL_QUOTA,
         PlanFeatureKey.STORAGE_QUOTA_MB,
+        PlanFeatureKey.MAX_CONCURRENT_SESSIONS,
+        PlanFeatureKey.MAX_STAFF_USERS,
+        PlanFeatureKey.MAX_API_KEYS,
     }
 )
 BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
@@ -129,6 +166,22 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.WHITE_LABEL,
         PlanFeatureKey.API_ACCESS,
         PlanFeatureKey.PMS_INTEGRATION,
+        PlanFeatureKey.DASHBOARD,
+        PlanFeatureKey.GUEST_WIFI,
+        PlanFeatureKey.CAPTIVE_PORTAL,
+        PlanFeatureKey.FREERADIUS,
+        PlanFeatureKey.WIREGUARD,
+        PlanFeatureKey.REPORTS,
+        PlanFeatureKey.ALERTS,
+        PlanFeatureKey.BILLING,
+        PlanFeatureKey.VOUCHER_LOGIN,
+        PlanFeatureKey.QR_LOGIN,
+        PlanFeatureKey.SOCIAL_LOGIN,
+        PlanFeatureKey.MOBILE_OTP,
+        PlanFeatureKey.NOTIFICATION_CENTER,
+        PlanFeatureKey.AUDIT_LOGS,
+        PlanFeatureKey.MULTI_ROUTER,
+        PlanFeatureKey.MULTI_LOCATION,
     }
 )
 TIER_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset({PlanFeatureKey.SUPPORT_LEVEL})

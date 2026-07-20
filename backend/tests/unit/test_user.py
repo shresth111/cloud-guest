@@ -109,6 +109,7 @@ class FakeIdentityRepository:
             "department": None,
             "employee_id": None,
             "password_hash": "unused-in-tests",
+            "must_change_password": False,
         }
         user = User(
             **_base_fields(
