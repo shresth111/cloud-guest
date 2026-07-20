@@ -9,9 +9,15 @@ tables, no changes to any existing table's columns (unlike Modules 005/006/
 new table references existing tables, none of them need a new FK pointed
 *at* them from RBAC).
 
+**Provisioning Engine addendum** (migration
+`alembic/versions/0031_add_vendor_to_router_and_template.py`, revises
+`0030_extend_radius_nas_clients`): adds `vendor` to both `config_templates`
+(below) and `routers` (see `docs/router/README.md`) -- see
+`PROVISIONING_ENGINE.md` for the full design write-up.
+
 ## `config_templates`
 
-A reusable RouterOS config script/template with `{{variable_name}}`
+A reusable device config script/template with `{{variable_name}}`
 placeholders.
 
 | Column | Type | Notes |
@@ -21,11 +27,12 @@ placeholders.
 | `description` | Text, nullable | |
 | `is_system_template` | Boolean | Always `organization_id IS NULL` (enforced in `validators.py`, not a DB `CHECK`) |
 | `applicable_router_model` | String(100), nullable | `NULL` = any model |
+| `vendor` | String(50), default `mikrotik` | Which device vendor's config language `template_content` is written in (migration `0031`) -- validated against the target router's own `vendor` by `adapters.get_provisioning_adapter` before assignment. Immutable after creation (not on `ConfigTemplateUpdateRequest`) |
 | `template_content` | Text | The template script itself |
 | `is_active` | Boolean | `DELETE` deactivates + soft-deletes, never hard-deletes |
 
 Indexes: `organization_id`, `is_system_template`, `applicable_router_model`,
-`is_active`, `name`.
+`vendor`, `is_active`, `name`.
 
 ## `config_variables`
 

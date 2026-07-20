@@ -40,6 +40,8 @@ __all__ = [
     "InvalidProvisioningJobStatusTransitionError",
     "ProvisioningJobRetryLimitExceededError",
     "ProvisioningJobRouterMismatchError",
+    "TemplateVendorMismatchError",
+    "UnsupportedVendorError",
 ]
 
 
@@ -287,4 +289,37 @@ class ProvisioningJobRouterMismatchError(RouterProvisioningError):
         super().__init__(
             f"Provisioning job {job_id} does not belong to router {router_id}",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+# ============================================================================
+# Provisioning Engine: vendor adapters (see adapters.py's own module docstring)
+# ============================================================================
+
+
+class TemplateVendorMismatchError(RouterProvisioningError):
+    """Raised by ``ProvisioningAdapterProtocol.validate_template_compatibility``
+    (via ``RouterProvisioningService.assign_profile``) when a template's own
+    ``vendor`` does not match the target router's ``vendor`` -- a real
+    compatibility gap that went entirely unenforced before this Provisioning
+    Engine extension."""
+
+    def __init__(self, template_vendor: str, router_vendor: str) -> None:
+        super().__init__(
+            f"Template is written for vendor '{template_vendor}' but the "
+            f"router is vendor '{router_vendor}'",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class UnsupportedVendorError(RouterProvisioningError):
+    """Raised by ``adapters.get_provisioning_adapter`` when no adapter is
+    registered for a given vendor string -- e.g. a router or template
+    created with a vendor no ``ProvisioningAdapterProtocol`` implementation
+    has been registered for yet."""
+
+    def __init__(self, vendor: str) -> None:
+        super().__init__(
+            f"No provisioning adapter registered for vendor '{vendor}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
         )

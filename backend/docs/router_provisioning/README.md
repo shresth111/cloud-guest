@@ -1,5 +1,16 @@
 # Module 009 Part 1: Router Provisioning
 
+> **Provisioning Engine addendum:** a request for a vendor-agnostic
+> "Enterprise Provisioning Engine" (Strategy/Adapter pattern, "never
+> hardcode MikroTik commands") found this constraint already trivially
+> satisfied -- zero command-execution code exists anywhere in this domain
+> or `router_agent`, for any vendor. The real, missing piece was a formal
+> seam for vendor identity: `Router.vendor`/`ConfigTemplate.vendor` (new
+> columns) and `adapters.ProvisioningAdapterProtocol` (a real Strategy
+> interface, one concrete `MikroTikProvisioningAdapter`, a registry a new
+> vendor plugs into with zero change to this module's own workflow code).
+> See `PROVISIONING_ENGINE.md` for the full write-up.
+
 The Router Provisioning domain extends BE-008 (`app.domains.router`) with
 everything that module explicitly left out: configuration template/profile/
 variable management, a versioned config-apply/rollback engine, a durable
@@ -43,30 +54,34 @@ backend/
   alembic/
     versions/
       0009_create_router_provisioning_tables.py
+      0031_add_vendor_to_router_and_template.py
   app/
     domains/
       router_provisioning/
         __init__.py
         constants.py      # StrEnums + state-transition graphs + template placeholder syntax
         models.py          # 8 SQLAlchemy ORM models (see DATABASE.md)
-        exceptions.py       # RouterProvisioningError subclasses (CloudGuestError)
-        events.py           # Plain dataclasses consumed synchronously by service.py
-        repository.py       # RouterProvisioningRepositoryProtocol + repo + Redis queue dispatcher
-        validators.py       # Pure business-rule checks (no I/O)
-        service.py           # RouterProvisioningService: the whole domain's business logic
-        schemas.py            # Pydantic request/response DTOs
-        dependencies.py        # FastAPI dependency wiring
-        router.py               # FastAPI routes
+        adapters.py         # ProvisioningAdapterProtocol (Strategy), MikroTikProvisioningAdapter
+        exceptions.py        # RouterProvisioningError subclasses (CloudGuestError)
+        events.py             # Plain dataclasses consumed synchronously by service.py
+        repository.py         # RouterProvisioningRepositoryProtocol + repo + Redis queue dispatcher
+        validators.py          # Pure business-rule checks (no I/O)
+        service.py              # RouterProvisioningService: the whole domain's business logic
+        schemas.py               # Pydantic request/response DTOs
+        dependencies.py           # FastAPI dependency wiring
+        router.py                 # FastAPI routes
       router/
-        enums.py                # ROUTER_STATUS_TRANSITIONS gained 2 additive edges (see FLOW.md)
-        service.py               # Gained one additive method: reset_to_pending_provisioning
+        models.py                 # Router gained one additive column: vendor
+        enums.py                   # ROUTER_STATUS_TRANSITIONS gained 2 additive edges (see FLOW.md)
+        service.py                  # Gained one additive method: reset_to_pending_provisioning
       rbac/
-        enums.py                 # AuditAction gained 9 new router_provisioning_* values
+        enums.py                     # AuditAction gained 9 new router_provisioning_* values
   docs/
     router_provisioning/
       README.md
       FLOW.md
       DATABASE.md
+      PROVISIONING_ENGINE.md
   tests/
     unit/
       test_router_provisioning.py

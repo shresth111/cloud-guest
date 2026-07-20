@@ -105,6 +105,8 @@ from .schemas import (
     RouterHealthSnapshotRequest,
     RouterHealthSnapshotResponse,
     RouterSecretRotationResponse,
+    VendorCapabilitiesListResponse,
+    VendorCapabilitiesResponse,
 )
 from .service import RouterProvisioningService
 
@@ -141,6 +143,7 @@ def _template_response(template: ConfigTemplate) -> ConfigTemplateResponse:
         name=template.name,
         description=template.description,
         applicable_router_model=template.applicable_router_model,
+        vendor=template.vendor,
         template_content=template.template_content,
         is_active=template.is_active,
         created_at=template.created_at,
@@ -271,6 +274,37 @@ def _event_response(event: RouterEvent) -> RouterEventResponse:
 
 
 # ============================================================================
+# Vendor adapters (Provisioning Engine extension -- see adapters.py)
+# ============================================================================
+
+
+@router.get(
+    "/router-provisioning/vendors",
+    response_model=ApiResponse[VendorCapabilitiesListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("router_provisioning.read"))],
+)
+async def list_vendor_capabilities(
+    request: Request,
+    service: RouterProvisioningService = Depends(get_router_provisioning_service),
+):
+    """Every registered ``ProvisioningAdapterProtocol`` implementation's
+    real, static capability description -- see ``adapters.py``'s own module
+    docstring for what this is (and is not: no live device connection, no
+    command execution)."""
+    capabilities = service.list_vendor_capabilities()
+    payload = VendorCapabilitiesListResponse(
+        items=[VendorCapabilitiesResponse(**c) for c in capabilities]
+    )
+    return build_response(
+        success=True,
+        message="Vendor capabilities retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
 # Config templates
 # ============================================================================
 
@@ -323,6 +357,7 @@ async def create_template(
         name=payload.name,
         description=payload.description,
         applicable_router_model=payload.applicable_router_model,
+        vendor=payload.vendor,
         template_content=payload.template_content,
         is_active=payload.is_active,
     )

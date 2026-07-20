@@ -27,6 +27,8 @@ from .constants import ConfigVariableScope
 
 __all__ = [
     "MessageResponse",
+    "VendorCapabilitiesResponse",
+    "VendorCapabilitiesListResponse",
     # Templates
     "ConfigTemplateCreateRequest",
     "ConfigTemplateUpdateRequest",
@@ -83,11 +85,22 @@ class ConfigTemplateCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     description: str | None = Field(default=None)
     applicable_router_model: str | None = Field(default=None, max_length=100)
+    vendor: str = Field(
+        default="mikrotik",
+        max_length=50,
+        description=(
+            "Which device vendor's config language template_content is "
+            "written in -- validated against the target router's own "
+            "vendor before this template may be assigned to it. Defaults "
+            "to mikrotik (every existing template targets it today)."
+        ),
+    )
     template_content: str = Field(
         ...,
         min_length=1,
         description=(
-            "RouterOS config script/template text. Supports "
+            "Device config script/template text (the syntax of whichever "
+            "vendor this template's own vendor field names). Supports "
             "'{{variable_name}}' placeholders, substituted at render time."
         ),
     )
@@ -109,6 +122,7 @@ class ConfigTemplateResponse(BaseModel):
     name: str
     description: str | None
     applicable_router_model: str | None
+    vendor: str
     template_content: str
     is_active: bool
     created_at: datetime
@@ -426,6 +440,24 @@ class RouterEventListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class VendorCapabilitiesResponse(BaseModel):
+    """One registered ``ProvisioningAdapterProtocol`` implementation's real,
+    static capability description -- see ``adapters.py``'s own module
+    docstring."""
+
+    vendor: str
+    config_format: str
+    apply_mechanism: str
+    supported_job_types: list[str]
+    supports_diff: bool
+    supports_rollback: bool
+    supports_health_snapshots: bool
+
+
+class VendorCapabilitiesListResponse(BaseModel):
+    items: list[VendorCapabilitiesResponse]
 
 
 ConfigVersionApplyResponse.model_rebuild()

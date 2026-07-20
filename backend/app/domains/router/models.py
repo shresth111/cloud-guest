@@ -7,15 +7,23 @@ keep working uniformly.
 
 Two models:
 
-* :class:`Router` -- a physical/virtual MikroTik RouterOS device deployed at
-  exactly one :class:`app.domains.location.models.Location` (CloudGuest
-  hierarchy: Organization -> Location -> Router -> Guest). Carries both
-  ``location_id`` (its direct parent) and ``organization_id`` (denormalized
-  from ``location.organization_id`` at creation time) -- see
+* :class:`Router` -- a physical/virtual network device deployed at exactly
+  one :class:`app.domains.location.models.Location` (CloudGuest hierarchy:
+  Organization -> Location -> Router -> Guest). Carries both ``location_id``
+  (its direct parent) and ``organization_id`` (denormalized from
+  ``location.organization_id`` at creation time) -- see
   ``docs/router/ROUTER_ARCHITECTURE.md`` §1 for why this denormalization was
   chosen (mirrors how RBAC's own scope columns, e.g. ``UserRole``, already
   carry both ``organization_id`` and ``location_id`` rather than deriving one
-  from the other via a join).
+  from the other via a join). Every device deployed on this platform today is
+  a MikroTik RouterOS device -- ``vendor`` (added by the Provisioning Engine
+  extension, see ``docs/router_provisioning/PROVISIONING_ENGINE.md``) records
+  this as a real, true default rather than an unqualified permanent
+  assumption, and is the extension point
+  ``app.domains.router_provisioning.adapters`` resolves against to select the
+  right vendor-specific provisioning behavior. ``routeros_version`` remains a
+  MikroTik-specific field (nullable, unset for any future non-MikroTik
+  vendor) rather than being generalized -- see that column's own comment.
 * :class:`RouterProvisioningToken` -- a single-use, hashed bearer credential
   the physical device presents at zero-touch-provisioning check-in. Only
   ``token_hash`` (a SHA-256 digest) is stored, never the plaintext -- see
@@ -63,6 +71,15 @@ class Router(BaseModel):
     serial_number: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     mac_address: Mapped[str] = mapped_column(String(17), nullable=False, unique=True)
     model: Mapped[str] = mapped_column(String(100), nullable=False)
+    # A real, true default -- every Router deployed today is MikroTik. The
+    # extensibility seam app.domains.router_provisioning.adapters resolves
+    # against; see module docstring.
+    vendor: Mapped[str] = mapped_column(String(50), default="mikrotik", nullable=False)
+    # MikroTik-specific: the RouterOS firmware version string. Left
+    # unrenamed/ungeneralized rather than invented into a fake
+    # vendor-neutral shape -- a future non-MikroTik router simply leaves
+    # this NULL, the same "nullable, unset for what doesn't apply"
+    # convention every other optional device fact on this row already uses.
     routeros_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
     management_ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
@@ -106,6 +123,7 @@ class Router(BaseModel):
         Index("ix_routers_mac_address", "mac_address"),
         Index("ix_routers_status", "status"),
         Index("ix_routers_name", "name"),
+        Index("ix_routers_vendor", "vendor"),
     )
 
     def __repr__(self) -> str:

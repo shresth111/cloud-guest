@@ -61,6 +61,7 @@ from app.domains.router.enums import RouterStatus
 from app.domains.router.exceptions import RouterDecommissionedError, RouterNotFoundError
 from app.domains.router.models import Router
 
+from .adapters import get_provisioning_adapter, list_supported_vendors
 from .constants import (
     DEFAULT_MAX_JOB_ATTEMPTS,
     ROTATED_SECRET_BYTES,
@@ -147,6 +148,7 @@ class RouterLookupProtocol(Protocol):
         serial_number: str,
         mac_address: str,
         model: str,
+        vendor: str = "mikrotik",
         management_ip_address: str | None = None,
         public_ip_address: str | None = None,
         api_username: str | None = None,
@@ -282,6 +284,7 @@ class RouterProvisioningService:
         template_content: str,
         description: str | None = None,
         applicable_router_model: str | None = None,
+        vendor: str = "mikrotik",
         is_active: bool = True,
     ) -> ConfigTemplate:
         is_system_template = requesting_organization_id is None
@@ -295,6 +298,7 @@ class RouterProvisioningService:
             description=description,
             is_system_template=is_system_template,
             applicable_router_model=applicable_router_model,
+            vendor=vendor,
             template_content=template_content,
             is_active=is_active,
             created_by=actor_user_id,
@@ -565,6 +569,9 @@ class RouterProvisioningService:
         if template is None or not template.is_active:
             raise ConfigTemplateNotFoundError(template_id)
         self._enforce_template_scope(template, router.organization_id)
+        get_provisioning_adapter(router.vendor).validate_template_compatibility(
+            template_vendor=template.vendor
+        )
 
         variables = await self.resolve_variables(router)
         rendered_content = render_template(template.template_content, variables)
@@ -775,11 +782,14 @@ class RouterProvisioningService:
         requested_by_user_id: uuid.UUID | None,
     ) -> ProvisioningJob:
         now = datetime.now(UTC)
+        adapter_payload = get_provisioning_adapter(router.vendor).build_job_payload(
+            job_type=job_type.value, base_payload=payload
+        )
         job = await self.repository.create_job(
             router_id=router.id,
             job_type=job_type.value,
             status=ProvisioningJobStatus.QUEUED.value,
-            payload=payload,
+            payload=adapter_payload,
             attempts=0,
             max_attempts=DEFAULT_MAX_JOB_ATTEMPTS,
             scheduled_at=now,
@@ -1158,6 +1168,20 @@ class RouterProvisioningService:
             description=f"API credentials rotated for router '{updated_router.name}'",
         )
         return updated_router, new_secret
+
+    # ========================================================================
+    # Vendor adapters (Provisioning Engine extension -- see adapters.py)
+    # ========================================================================
+
+    def list_vendor_capabilities(self) -> list[dict[str, object]]:
+        """A real, static capability description per registered vendor
+        adapter -- consumed by ``GET /router-provisioning/vendors``. Pure,
+        no I/O: every adapter's ``describe_capabilities`` is a plain
+        in-memory dict."""
+        return [
+            get_provisioning_adapter(vendor).describe_capabilities()
+            for vendor in list_supported_vendors()
+        ]
 
     # ========================================================================
     # Provisioning status

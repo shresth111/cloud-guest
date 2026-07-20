@@ -61,6 +61,7 @@ class RouterResponse(BaseModel):
     serial_number: str
     mac_address: str
     model: str
+    vendor: str
     routeros_version: str | None = None
     management_ip_address: str | None = None
     public_ip_address: str | None = None
@@ -136,6 +137,15 @@ class RouterCreateRequest(BaseModel):
     serial_number: str = Field(..., min_length=1, max_length=100)
     mac_address: str = Field(..., min_length=17, max_length=17)
     model: str = Field(..., min_length=1, max_length=100)
+    vendor: str = Field(
+        default="mikrotik",
+        max_length=50,
+        description=(
+            "Device vendor -- defaults to mikrotik (every device deployed "
+            "today is one). See app.domains.router_provisioning.adapters "
+            "for how a new vendor plugs into the provisioning workflow."
+        ),
+    )
     management_ip_address: str | None = Field(default=None, max_length=45)
     public_ip_address: str | None = Field(default=None, max_length=45)
     api_username: str | None = Field(default=None, max_length=100)

@@ -45,6 +45,11 @@ from app.domains.router.exceptions import (
 )
 from app.domains.router.models import Router, RouterProvisioningToken
 from app.domains.router.service import RouterService
+from app.domains.router_provisioning.adapters import (
+    MikroTikProvisioningAdapter,
+    get_provisioning_adapter,
+    list_supported_vendors,
+)
 from app.domains.router_provisioning.constants import (
     ConfigVariableScope,
     ConfigVersionStatus,
@@ -68,7 +73,9 @@ from app.domains.router_provisioning.exceptions import (
     RouterEnrollmentNotPendingError,
     RouterNotEligibleForConfigError,
     RouterNotEligibleForFactoryResetError,
+    TemplateVendorMismatchError,
     UnresolvedTemplateVariablesError,
+    UnsupportedVendorError,
 )
 from app.domains.router_provisioning.models import (
     ConfigProfile,
@@ -688,6 +695,7 @@ async def make_router(
     organization: Organization,
     *,
     status: RouterStatus = RouterStatus.PENDING_PROVISIONING,
+    vendor: str = "mikrotik",
 ) -> Router:
     location = location_lookup.add(organization_id=organization.id)
     router_device = await router_service.create_router(
@@ -698,6 +706,7 @@ async def make_router(
         serial_number=f"SN-{uuid.uuid4()}",
         mac_address=_unique_mac(),
         model="hAP ac2",
+        vendor=vendor,
     )
     if status != RouterStatus.PENDING_PROVISIONING:
         # Drive through the real transition graph via check-in/heartbeat/
@@ -2092,3 +2101,235 @@ class TestTenantIsolation:
         )
         with pytest.raises(ProvisioningJobRouterMismatchError):
             validate_job_belongs_to_router(job, router_b.id)
+
+
+# ============================================================================
+# Provisioning Engine extension: vendor adapters
+# ============================================================================
+
+
+class TestProvisioningAdapterRegistry:
+    def test_mikrotik_is_registered(self) -> None:
+        adapter = get_provisioning_adapter("mikrotik")
+        assert isinstance(adapter, MikroTikProvisioningAdapter)
+        assert adapter.vendor == "mikrotik"
+
+    def test_unknown_vendor_raises(self) -> None:
+        with pytest.raises(UnsupportedVendorError):
+            get_provisioning_adapter("opnsense")
+
+    def test_list_supported_vendors(self) -> None:
+        assert list_supported_vendors() == ["mikrotik"]
+
+
+class TestMikroTikProvisioningAdapter:
+    def test_validate_template_compatibility_matching_vendor_passes(self) -> None:
+        adapter = MikroTikProvisioningAdapter()
+        adapter.validate_template_compatibility(template_vendor="mikrotik")  # no raise
+
+    def test_validate_template_compatibility_mismatch_raises(self) -> None:
+        adapter = MikroTikProvisioningAdapter()
+        with pytest.raises(TemplateVendorMismatchError):
+            adapter.validate_template_compatibility(template_vendor="opnsense")
+
+    def test_build_job_payload_enriches_with_vendor_metadata(self) -> None:
+        adapter = MikroTikProvisioningAdapter()
+        enriched = adapter.build_job_payload(
+            job_type="config_push", base_payload={"config_version_id": "abc"}
+        )
+        assert enriched["config_version_id"] == "abc"
+        assert enriched["vendor"] == "mikrotik"
+        assert enriched["content_type"] == "routeros_script"
+        assert enriched["apply_mechanism"] == "import"
+
+    def test_describe_capabilities_is_real_and_static(self) -> None:
+        adapter = MikroTikProvisioningAdapter()
+        capabilities = adapter.describe_capabilities()
+        assert capabilities["vendor"] == "mikrotik"
+        assert "config_push" in capabilities["supported_job_types"]
+        assert "backup" in capabilities["supported_job_types"]
+        assert "factory_reset" in capabilities["supported_job_types"]
+        assert capabilities["supports_diff"] is True
+        assert capabilities["supports_rollback"] is True
+
+
+class TestVendorFieldOnRouterAndTemplate:
+    async def test_router_defaults_to_mikrotik_vendor(self) -> None:
+        (
+            _service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(router_service, location_lookup, organization)
+        assert router_device.vendor == "mikrotik"
+
+    async def test_template_defaults_to_mikrotik_vendor(self) -> None:
+        (service, *_rest) = make_services()
+        template = await service.create_template(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=None,
+            name="Basic",
+            template_content="no placeholders",
+        )
+        assert template.vendor == "mikrotik"
+
+    async def test_explicit_router_vendor_is_honored(self) -> None:
+        (
+            _service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(
+            router_service, location_lookup, organization, vendor="opnsense"
+        )
+        assert router_device.vendor == "opnsense"
+
+
+class TestAssignProfileVendorCompatibility:
+    async def test_matching_vendor_assigns_successfully(self) -> None:
+        (
+            service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(
+            router_service, location_lookup, organization, vendor="mikrotik"
+        )
+        template = await service.create_template(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=None,
+            name="Basic",
+            template_content="no placeholders",
+        )
+        profile, _version = await service.assign_profile(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            template_id=template.id,
+            requesting_organization_id=None,
+        )
+        assert profile.template_id == template.id
+
+    async def test_mismatched_vendor_raises(self) -> None:
+        (
+            service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        # Router stays the default, registered "mikrotik" vendor -- the
+        # mismatch comes from the template's own vendor tag instead (an
+        # unregistered router vendor would raise UnsupportedVendorError
+        # before ever reaching the template-compatibility check at all).
+        router_device = await make_router(router_service, location_lookup, organization)
+        template = await service.create_template(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=None,
+            name="OPNsense-only template",
+            template_content="no placeholders",
+            vendor="opnsense",
+        )
+        with pytest.raises(TemplateVendorMismatchError):
+            await service.assign_profile(
+                actor_user_id=uuid.uuid4(),
+                router_id=router_device.id,
+                template_id=template.id,
+                requesting_organization_id=None,
+            )
+
+    async def test_unregistered_router_vendor_raises_unsupported_vendor(self) -> None:
+        (
+            service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(
+            router_service, location_lookup, organization, vendor="opnsense"
+        )
+        template = await service.create_template(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=None,
+            name="Basic",
+            template_content="no placeholders",
+        )
+        with pytest.raises(UnsupportedVendorError):
+            await service.assign_profile(
+                actor_user_id=uuid.uuid4(),
+                router_id=router_device.id,
+                template_id=template.id,
+                requesting_organization_id=None,
+            )
+
+
+class TestJobPayloadVendorEnrichment:
+    async def test_apply_version_enriches_job_payload_with_vendor_metadata(
+        self,
+    ) -> None:
+        (
+            service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(
+            router_service, location_lookup, organization, status=RouterStatus.ONLINE
+        )
+        template = await service.create_template(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=None,
+            name="Basic",
+            template_content="no placeholders",
+        )
+        _profile, version = await service.assign_profile(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            template_id=template.id,
+            requesting_organization_id=None,
+        )
+        _updated_version, job = await service.apply_version(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            version_id=version.id,
+            requesting_organization_id=None,
+        )
+        assert job.payload["vendor"] == "mikrotik"
+        assert job.payload["content_type"] == "routeros_script"
+        assert job.payload["apply_mechanism"] == "import"
+        # The original, pre-adapter payload key is preserved.
+        assert job.payload["config_version_id"] == str(version.id)
+
+
+class TestVendorCapabilitiesIntrospection:
+    def test_list_vendor_capabilities_returns_real_static_data(self) -> None:
+        (service, *_rest) = make_services()
+        capabilities = service.list_vendor_capabilities()
+        assert len(capabilities) == 1
+        assert capabilities[0]["vendor"] == "mikrotik"
+        assert "supported_job_types" in capabilities[0]

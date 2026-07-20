@@ -125,6 +125,18 @@ class ConfigTemplate(BaseModel):
     column makes "list every system template" a plain equality filter
     instead of an IS NULL filter, and keeps the invariant self-documenting
     on the row itself.
+
+    ``vendor`` (Provisioning Engine extension -- see
+    ``docs/router_provisioning/PROVISIONING_ENGINE.md``) records which
+    device vendor's config language ``template_content`` is actually written
+    in (every existing template is ``"mikrotik"`` -- a real, true default,
+    backfilled for pre-existing rows since the value is unambiguous, unlike
+    e.g. ``RadiusNasClient.nas_code``'s own un-backfillable case).
+    ``RouterProvisioningService.assign_profile`` validates this against the
+    target router's own ``Router.vendor`` (via
+    ``app.domains.router_provisioning.adapters.get_provisioning_adapter``)
+    before ever assigning a template to a router -- a real, previously-
+    unenforced compatibility gap this extension closes.
     """
 
     __tablename__ = "config_templates"
@@ -143,6 +155,9 @@ class ConfigTemplate(BaseModel):
     applicable_router_model: Mapped[str | None] = mapped_column(
         String(100), nullable=True
     )
+    # See module docstring. Matched against Router.vendor by
+    # adapters.get_provisioning_adapter before this template may be assigned.
+    vendor: Mapped[str] = mapped_column(String(50), default="mikrotik", nullable=False)
     template_content: Mapped[str] = mapped_column(Text, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
@@ -150,6 +165,7 @@ class ConfigTemplate(BaseModel):
         Index("ix_config_templates_organization_id", "organization_id"),
         Index("ix_config_templates_is_system_template", "is_system_template"),
         Index("ix_config_templates_applicable_router_model", "applicable_router_model"),
+        Index("ix_config_templates_vendor", "vendor"),
         Index("ix_config_templates_is_active", "is_active"),
         Index("ix_config_templates_name", "name"),
     )

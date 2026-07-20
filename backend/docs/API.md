@@ -2063,3 +2063,20 @@ registered at that location, paginated.
 `GET /routers/{router_id}/nas` -- requires `radius.read`. A router has at
 most one NAS (`router_id` is unique on `radius_nas_clients`) -- returns
 that single object, not a list, despite the route's own plural shape.
+
+
+## Provisioning Engine: Vendor Capabilities Endpoint
+
+See `docs/router_provisioning/PROVISIONING_ENGINE.md` for the full design
+write-up -- a bounded Strategy/Adapter extension on top of the already-real
+`router_provisioning`/`router_agent` workflow/queue infrastructure, not a
+rebuild of it. `POST /locations/{id}/routers` and `POST /router-templates`
+both gained an optional `vendor` field (default `"mikrotik"`); no other
+existing endpoint's request/response shape changed.
+
+`GET /router-provisioning/vendors` -- requires `router_provisioning.read`.
+Returns every registered `ProvisioningAdapterProtocol` implementation's
+real, static capability description (supported job types, config format,
+diff/rollback/health-snapshot support). No live device connection or
+command execution -- see `PROVISIONING_ENGINE.md` §2 for what this
+introspection endpoint is (and is not).

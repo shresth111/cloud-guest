@@ -1,5 +1,12 @@
 # Module 008: Router Domain
 
+> **Provisioning Engine addendum:** `Router` gained one additive column,
+> `vendor` (default `"mikrotik"`, real and true -- every device deployed
+> today is one), the extension point
+> `app.domains.router_provisioning.adapters.get_provisioning_adapter`
+> resolves against. See `docs/router_provisioning/PROVISIONING_ENGINE.md`
+> for the full write-up.
+
 The Router domain models CloudGuest's MikroTik RouterOS device records:
 device registration, connection-credential storage, lifecycle/health
 tracking, and zero-touch provisioning (hierarchy: Organization -> Location

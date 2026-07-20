@@ -384,6 +384,34 @@ class TestRouterCRUD:
         assert router_device.mac_address == "AA:BB:CC:DD:EE:FF"
         assert any(e["action"] == "router_created" for e in audit.entries)
 
+    async def test_create_router_defaults_to_mikrotik_vendor(self) -> None:
+        """Provisioning Engine extension -- see
+        docs/router_provisioning/PROVISIONING_ENGINE.md."""
+        service, _repo, location_lookup, org_lookup, _audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+
+        router_device = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(),
+        )
+        assert router_device.vendor == "mikrotik"
+
+    async def test_create_router_honors_explicit_vendor(self) -> None:
+        service, _repo, location_lookup, org_lookup, _audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+
+        router_device = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(vendor="opnsense"),
+        )
+        assert router_device.vendor == "opnsense"
+
     async def test_create_router_normalizes_mac_address(self) -> None:
         service, _repo, location_lookup, org_lookup, _audit = make_service()
         organization = org_lookup.add()
