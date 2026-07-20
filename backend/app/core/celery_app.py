@@ -119,6 +119,10 @@ from app.domains.guest.constants import (
     SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
 )
+from app.domains.provisioning_engine.constants import (
+    PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
+    TASK_DRAIN_PROVISION_QUEUE,
+)
 
 _settings = get_settings()
 
@@ -147,6 +151,7 @@ celery_app = Celery(
         "app.domains.analytics.report_tasks",
         "app.domains.billing.tasks",
         "app.domains.guest.tasks",
+        "app.domains.provisioning_engine.tasks",
     ],
 )
 
@@ -235,6 +240,22 @@ celery_app.conf.update(
         "guest-session-timeout-sweep": {
             "task": TASK_RUN_SESSION_TIMEOUT_SWEEP,
             "schedule": SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
+        },
+        # Provisioning Engine: drains the real "Postgres row + Redis
+        # wake-up signal" queue app.domains.provisioning_engine
+        # .repository.RedisProvisionEngineQueueDispatcher.enqueue pushes
+        # onto -- the shortest cadence in this schedule (see
+        # app.domains.provisioning_engine.constants
+        # .PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS's own docstring for why a
+        # user-triggered "start provisioning now" request deserves a much
+        # tighter latency budget than every other read-model-recomputation
+        # sweep above). This is the task that closes
+        # app.domains.router_provisioning's own long-documented
+        # complete_provisioning_job seam -- see
+        # app.domains.provisioning_engine.tasks's own module docstring.
+        "provisioning-engine-drain-queue": {
+            "task": TASK_DRAIN_PROVISION_QUEUE,
+            "schedule": PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
         },
     },
 )

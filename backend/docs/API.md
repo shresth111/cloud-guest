@@ -2080,3 +2080,77 @@ real, static capability description (supported job types, config format,
 diff/rollback/health-snapshot support). No live device connection or
 command execution -- see `PROVISIONING_ENGINE.md` §2 for what this
 introspection endpoint is (and is not).
+
+
+## Provisioning Engine Orchestrator Endpoints
+
+See `docs/provisioning_engine/FLOW.md` for the full design write-up -- the
+end-to-end automation orchestrator (Discover -> Validate -> Generate
+Config -> Push Config -> Verify Config -> Health Check -> Register
+Monitoring), a brand-new domain (`app.domains.provisioning_engine`)
+composing `router`/`router_provisioning`/`policy`/`guest` rather than
+duplicating any of them. Distinct from the "Vendor Capabilities" endpoint
+above, which belongs to `router_provisioning`'s own, earlier, narrower
+adapter extension. Every route below requires `provisioning_engine.*` and
+is registered under `/provision`.
+
+`POST /provision` -- requires `provisioning_engine.create`. Body:
+`router_id`, optional `provision_template_id`, optional `max_retries`
+(default 3). Freezes the router's effective session `Policy` at creation
+time (`policy_snapshot`) -- a later `Policy` edit never silently changes an
+already-created job.
+
+`GET /provision/jobs` -- requires `provisioning_engine.read`. Paginated,
+filterable by `router_id`/`status`. Registered before
+`GET /provision/{job_id}` -- load-bearing route ordering (see `router.py`'s
+own module docstring).
+
+`GET /provision/history` -- requires `provisioning_engine.read`. Query
+param: `router_id` (required). Every past job (original, retries,
+rollbacks) for one router, chronological -- a read-model, not a separate
+table.
+
+`POST /provision/discover` -- requires `provisioning_engine.execute`. Body:
+`router_id`. Connects to the router via its real device adapter and
+returns vendor/model/serial/firmware/CPU/memory/uptime/interfaces/MAC --
+usable independently of a job, e.g. a dashboard's "test connection" button.
+
+`POST /provision/validate` -- requires `provisioning_engine.execute`.
+Body: `router_id`, optional `provision_template_id`. Raises on any real
+validation failure (missing device credentials, unsupported vendor, a
+template/router vendor mismatch); returns a plain success message
+otherwise.
+
+`POST /provision/configuration` -- requires `provisioning_engine.execute`.
+Body: `router_id`, `provision_template_id`. Seeds the template's `settings`
+as real `ConfigVariable` rows (idempotent), registers a NAS for the router
+if none exists yet, and returns a rendered configuration preview. Never
+creates a `ConfigVersion` itself -- that is `PUSH_CONFIG`'s job, within a
+real job run.
+
+`POST /provision/{job_id}/start` -- requires `provisioning_engine.execute`.
+Transitions a `pending` job to `queued` and enqueues it for
+`tasks.drain_provision_queue` to actually run.
+
+`POST /provision/{job_id}/retry` -- requires `provisioning_engine.execute`.
+Only a `failed` job may be retried, and only up to `max_retries`. Creates
+and starts a **new** job (`retry_of_job_id` set) -- the original row is
+never mutated.
+
+`POST /provision/{job_id}/rollback` -- requires
+`provisioning_engine.execute`. Only a `success`, not-yet-rolled-back job
+may be rolled back. Creates and starts a **new** job (`is_rollback=true`,
+`rollback_of_job_id` + `rollback_target_version_id` set) targeting the
+`ConfigVersion` immediately before the one the original job applied;
+rejects if there is no prior version.
+
+`POST /provision/{job_id}/cancel` -- requires
+`provisioning_engine.execute`. Body: optional `reason`. Cancellable from
+any non-terminal status; marks every not-yet-started step `skipped` rather
+than leaving them `pending` forever.
+
+`GET /provision/{job_id}/timeline` -- requires `provisioning_engine.read`.
+A read-model aggregating the job's own step transitions and log entries
+into one chronological list -- no separate timeline table.
+
+`GET /provision/{job_id}` -- requires `provisioning_engine.read`.

@@ -232,6 +232,11 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXECUTE,
         _A.MANAGE,
     ),
+    # Mirrors OTP's identical action shape: jobs are created and driven
+    # through their lifecycle (start/retry/rollback/cancel, all EXECUTE),
+    # never directly updated/deleted by a user -- there is no
+    # UPDATE/DELETE/APPROVE action for a ProvisionJob.
+    PermissionModule.PROVISIONING_ENGINE: (_A.CREATE, _A.READ, _A.EXECUTE, _A.MANAGE),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -274,6 +279,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.SYSTEM_SETTINGS: "System Settings",
     PermissionModule.AI_ASSISTANT: "AI Assistant",
     PermissionModule.POLICY: "Policy",
+    PermissionModule.PROVISIONING_ENGINE: "Provisioning Engine",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -319,6 +325,10 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     PermissionModule.SYSTEM_SETTINGS: ScopeType.GLOBAL,
     PermissionModule.AI_ASSISTANT: ScopeType.ORGANIZATION,
     PermissionModule.POLICY: ScopeType.LOCATION,
+    # Device-level orchestration, the same narrowest-scope profile
+    # ROUTER_PROVISIONING/RADIUS/WIREGUARD/FIREWALL/DHCP/DNS/HOTSPOT/
+    # MONITORING already share.
+    PermissionModule.PROVISIONING_ENGINE: ScopeType.ROUTER,
 }
 
 
@@ -535,6 +545,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         overrides={
             _M.ROUTERS: _L.FULL,
             _M.ROUTER_PROVISIONING: _L.FULL,
+            _M.PROVISIONING_ENGINE: _L.FULL,
             _M.RADIUS: _L.FULL,
             _M.WIREGUARD: _L.FULL,
             _M.FIREWALL: _L.FULL,

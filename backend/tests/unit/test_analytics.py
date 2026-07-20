@@ -756,6 +756,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # Guest Session Engine (Phase 1) adds a sixth Beat entry
     # ("guest-session-timeout-sweep") for the idle/session-timeout sweep --
     # see app.domains.guest.tasks's own module docstring.
+    # Provisioning Engine adds a seventh Beat entry
+    # ("provisioning-engine-drain-queue") for its own provision-job queue
+    # drain -- see app.domains.provisioning_engine.tasks's own module
+    # docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -763,6 +767,7 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "billing-subscription-renewal-sweep",
         "billing-invoice-overdue-sweep",
         "guest-session-timeout-sweep",
+        "provisioning-engine-drain-queue",
     }
 
 

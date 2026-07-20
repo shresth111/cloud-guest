@@ -103,6 +103,7 @@ class PermissionModule(StrEnum):
     SYSTEM_SETTINGS = "system_settings"
     AI_ASSISTANT = "ai_assistant"
     POLICY = "policy"
+    PROVISIONING_ENGINE = "provisioning_engine"
 
 
 class OverrideEffect(StrEnum):
@@ -527,3 +528,26 @@ class AuditAction(StrEnum):
     POLICY_ROLLED_BACK = "policy_rolled_back"
     POLICY_ASSIGNMENT_CREATED = "policy_assignment_created"
     POLICY_ASSIGNMENT_DEACTIVATED = "policy_assignment_deactivated"
+
+    # Provisioning Engine domain events -- written through this same table
+    # by ``app.domains.provisioning_engine.service.ProvisioningEngineService``
+    # via the same narrow ``AuditLogWriter`` protocol shape every other
+    # domain's service uses. Provisioning Engine is a brand-new, additive
+    # domain (an orchestrator composing Router/Router Provisioning/Policy/
+    # NAS, never duplicating their own lifecycle events) -- the same "add
+    # its own additive block directly here" precedent every prior brand-new
+    # domain has followed at its own first Part. Job creation/cancellation/
+    # retry/rollback/terminal outcome are always either admin-initiated or
+    # a genuinely job-defining state change -- audited, the same profile
+    # every other domain's own lifecycle events already meet. Individual
+    # step transitions and per-step logs are deliberately **not** audited
+    # here -- high-frequency, non-human-attributable orchestration detail,
+    # already fully captured in ``ProvisionStep``/``ProvisionLog`` (mirrors
+    # ``RouterEvent``'s/``GuestLoginHistory``'s own identical "high-volume
+    # detail lives in its own purpose-built table, not this one" split).
+    PROVISION_JOB_CREATED = "provision_job_created"
+    PROVISION_JOB_CANCELLED = "provision_job_cancelled"
+    PROVISION_JOB_RETRIED = "provision_job_retried"
+    PROVISION_JOB_ROLLED_BACK = "provision_job_rolled_back"
+    PROVISION_JOB_SUCCEEDED = "provision_job_succeeded"
+    PROVISION_JOB_FAILED = "provision_job_failed"
