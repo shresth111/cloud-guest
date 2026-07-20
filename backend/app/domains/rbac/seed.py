@@ -217,6 +217,14 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     PermissionModule.AUDIT_LOGS: (_A.READ, _A.EXPORT, _A.VIEW),
     PermissionModule.SYSTEM_SETTINGS: (_A.READ, _A.UPDATE, _A.MANAGE),
     PermissionModule.AI_ASSISTANT: (_A.READ, _A.EXECUTE, _A.VIEW, _A.MANAGE),
+    PermissionModule.POLICY: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.EXECUTE,
+        _A.MANAGE,
+    ),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -258,6 +266,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.AUDIT_LOGS: "Audit Logs",
     PermissionModule.SYSTEM_SETTINGS: "System Settings",
     PermissionModule.AI_ASSISTANT: "AI Assistant",
+    PermissionModule.POLICY: "Policy",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -302,6 +311,7 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     PermissionModule.AUDIT_LOGS: ScopeType.ORGANIZATION,
     PermissionModule.SYSTEM_SETTINGS: ScopeType.GLOBAL,
     PermissionModule.AI_ASSISTANT: ScopeType.ORGANIZATION,
+    PermissionModule.POLICY: ScopeType.LOCATION,
 }
 
 
@@ -525,6 +535,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DNS: _L.FULL,
             _M.HOTSPOT: _L.FULL,
             _M.BANDWIDTH: _L.FULL,
+            _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,
             _M.DASHBOARD: _L.READ,
@@ -552,6 +563,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.VOUCHER: _L.OPERATE,
             _M.CAMPAIGNS: _L.OPERATE,
             _M.OTP: _L.OPERATE,
+            _M.POLICY: _L.OPERATE,
             _M.DASHBOARD: _L.READ,
             _M.ANALYTICS: _L.READ,
             _M.REPORTS: _L.READ,
@@ -588,6 +600,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.GUEST_SESSIONS: _L.OPERATE,
             _M.GUEST_ACCESS: _L.READ,
             _M.GUEST_TEAMS: _L.READ,
+            _M.POLICY: _L.READ,
             _M.ALERTS: _L.READ,
             _M.NOTIFICATIONS: _L.READ,
             _M.MONITORING: _L.READ,

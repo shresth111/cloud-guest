@@ -102,6 +102,7 @@ class PermissionModule(StrEnum):
     AUDIT_LOGS = "audit_logs"
     SYSTEM_SETTINGS = "system_settings"
     AI_ASSISTANT = "ai_assistant"
+    POLICY = "policy"
 
 
 class OverrideEffect(StrEnum):
@@ -494,3 +495,25 @@ class AuditAction(StrEnum):
     GUEST_TEAM_CREATED = "guest_team_created"
     GUEST_TEAM_MEMBER_REMOVED = "guest_team_member_removed"
     GUEST_TEAM_REVOKED = "guest_team_revoked"
+
+    # Policy domain events -- written through this same table by
+    # ``app.domains.policy.service.PolicyService`` via the same narrow
+    # ``AuditLogWriter`` protocol shape every other domain's service uses.
+    # Policy is a brand-new, additive domain (see
+    # ``docs/ARCHITECTURE_DESIGN.md`` §6.1/§13) -- the same "add its own
+    # additive block directly here" precedent every prior brand-new domain
+    # in this codebase has followed at its own first Part. Every lifecycle
+    # action here (create/deactivate a policy, publish a version, roll a
+    # policy back, create/deactivate an assignment) is always admin-
+    # initiated, moderate-volume, human-attributable -- audited, the same
+    # profile every other domain's own lifecycle events already meet.
+    # ``resolve_effective_policy`` (a read, potentially called at high
+    # frequency by other domains/services) is deliberately **not** audited,
+    # the identical "reads aren't audited, lifecycle writes are" posture
+    # this table already applies everywhere else.
+    POLICY_CREATED = "policy_created"
+    POLICY_DEACTIVATED = "policy_deactivated"
+    POLICY_VERSION_PUBLISHED = "policy_version_published"
+    POLICY_ROLLED_BACK = "policy_rolled_back"
+    POLICY_ASSIGNMENT_CREATED = "policy_assignment_created"
+    POLICY_ASSIGNMENT_DEACTIVATED = "policy_assignment_deactivated"

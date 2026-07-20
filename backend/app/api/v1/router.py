@@ -16,6 +16,7 @@ from app.domains.location.router import router as location_router
 from app.domains.monitoring.router import router as monitoring_router
 from app.domains.organization.router import router as organization_router
 from app.domains.otp.router import router as otp_router
+from app.domains.policy.router import router as policy_router
 from app.domains.rbac.router import router as rbac_router
 from app.domains.router.router import router as router_router
 from app.domains.router_agent.router import router as router_agent_router
@@ -48,3 +49,4 @@ api_v1_router.include_router(guest_teams_admin_router)
 api_v1_router.include_router(monitoring_router)
 api_v1_router.include_router(analytics_router)
 api_v1_router.include_router(billing_router)
+api_v1_router.include_router(policy_router)

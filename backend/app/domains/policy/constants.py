@@ -1,0 +1,136 @@
+"""Enumerations and default rule payloads for the Policy domain.
+
+See this module's own ``docs/policy/FLOW.md`` for the full write-up. Two
+things worth knowing before reading the rest of this file:
+
+## ``policy`` is a leaf module -- no imports from ``app.domains.guest``/
+## ``app.domains.voucher``/``app.domains.otp``, not even for constants
+
+``PLATFORM_DEFAULT_RULES`` below mirrors several already-existing, hardcoded
+platform constants this session's own gap analysis found while auditing
+``app.domains.guest.constants``/``app.domains.voucher.constants`` for real
+per-organization-configurability candidates
+(``DEFAULT_SESSION_TIMEOUT_MINUTES``, ``TERMINATION_RECONNECT_COOLDOWN_MINUTES``,
+``RECONNECT_GRACE_MINUTES``, ``DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` --
+the last of these even carries its own docstring in ``guest.constants``
+explicitly deferring "full per-organization/location configurability" to
+"the Policy Engine's job", confirming this module's own scope). Those values
+are **duplicated here as literals, not imported** -- this codebase's own
+``docs/ARCHITECTURE_DESIGN.md`` §4/§13 is explicit that ``policy`` must stay a
+dependency-free leaf ("depends on nothing feature-specific") so that every
+other domain can depend on it without ever creating an import cycle back into
+a feature domain. Importing ``app.domains.guest.constants`` from here, even
+just for a numeric literal, would be exactly the kind of coupling that rule
+forbids. If ``guest``'s own constant is ever changed, this platform-default
+mirror must be updated by hand -- an accepted, documented trade-off of
+keeping ``policy`` acyclic, not an oversight.
+
+## Rule types not yet seeded
+
+``PolicyType`` covers every policy type ``docs/ARCHITECTURE_DESIGN.md`` §6.1
+names (authN/session/bandwidth/FUP/business-hours/access/VLAN/QoS/routing).
+Only ``SESSION`` and ``AUTHN`` have a seeded ``PLATFORM_DEFAULT_RULES`` entry
+and a typed Pydantic schema in ``schemas.py``'s ``POLICY_RULE_SCHEMAS``
+registry, because those are the only two types this gap analysis found real,
+already-hardcoded platform constants for. The rest
+(``BANDWIDTH``/``FUP``/``BUSINESS_HOURS``/``ACCESS``/``VLAN``/``QOS``/
+``ROUTING``) are fully functional -- a ``Policy``/``PolicyVersion`` of any of
+those types can be created, versioned, published, and assigned today -- but
+have no seeded platform default and validate their ``rules`` JSONB payload
+only as "a JSON object" (see ``schemas.GenericPolicyRules``), honestly
+reflecting that no existing hardcoded constant in this codebase justifies a
+specific default shape for them yet (the same "real check without a fake
+opinion" discipline this codebase already applies to e.g. Celery health's
+``UNKNOWN`` status before a worker was ever wired in).
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Any
+
+
+class PolicyType(StrEnum):
+    """Every policy type ``docs/ARCHITECTURE_DESIGN.md`` §6.1 names for the
+    Policy Engine. Stored as a plain ``String`` column on
+    ``models.Policy.policy_type`` -- never a native Postgres enum -- so a new
+    type is a purely additive ``StrEnum`` member, no migration, mirroring
+    every other domain's identical convention in this codebase."""
+
+    AUTHN = "authn"
+    SESSION = "session"
+    BANDWIDTH = "bandwidth"
+    FUP = "fup"
+    BUSINESS_HOURS = "business_hours"
+    ACCESS = "access"
+    VLAN = "vlan"
+    QOS = "qos"
+    ROUTING = "routing"
+
+
+class PolicyVersionStatus(StrEnum):
+    """Lifecycle of a :class:`~.models.PolicyVersion`.
+
+    ``DRAFT`` -> ``PUBLISHED`` is the only legal edge, and it is one-way and
+    terminal: once published, a version's ``rules`` payload is immutable
+    (see ``service.PolicyService.create_version``'s docstring) -- to change
+    rules, create a *new* ``DRAFT`` version and publish that one instead.
+    This mirrors ``app.domains.guest_teams.constants.GuestTeamStatus``'s/
+    ``app.domains.voucher.constants.VoucherBatchStatus``'s identical
+    "terminal states have no outgoing edges, not even to themselves"
+    discipline: publishing an already-published version is rejected, not a
+    silent no-op.
+    """
+
+    DRAFT = "draft"
+    PUBLISHED = "published"
+
+
+POLICY_VERSION_STATUS_TRANSITIONS: dict[
+    PolicyVersionStatus, frozenset[PolicyVersionStatus]
+] = {
+    PolicyVersionStatus.DRAFT: frozenset({PolicyVersionStatus.PUBLISHED}),
+    PolicyVersionStatus.PUBLISHED: frozenset(),
+}
+
+
+# ============================================================================
+# Platform-default rule payloads -- see module docstring's "duplicated, not
+# imported" write-up. Used by ``service.PolicyService.resolve_effective_policy``
+# as the final fallback tier when no ``PolicyAssignment`` matches at any
+# scope -- the exact "platform default" tier
+# ``docs/ARCHITECTURE_DESIGN.md`` §13's resolution order names last.
+# ============================================================================
+
+PLATFORM_DEFAULT_RULES: dict[PolicyType, dict[str, Any]] = {
+    PolicyType.SESSION: {
+        # Mirrors app.domains.guest.constants.DEFAULT_SESSION_TIMEOUT_MINUTES.
+        "session_timeout_minutes": 240,
+        # Mirrors app.domains.guest.constants
+        # .DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST -- that constant's own
+        # docstring explicitly names this module as its intended successor.
+        "max_concurrent_sessions_per_guest": 3,
+        # Mirrors app.domains.guest.constants
+        # .TERMINATION_RECONNECT_COOLDOWN_MINUTES.
+        "termination_reconnect_cooldown_minutes": 60,
+        # Mirrors app.domains.guest.constants.RECONNECT_GRACE_MINUTES.
+        "reconnect_grace_minutes": 30,
+    },
+    PolicyType.AUTHN: {
+        # Mirrors app.domains.voucher.constants
+        # .DEFAULT_REDEMPTION_MAX_ATTEMPTS_PER_WINDOW /
+        # .DEFAULT_REDEMPTION_WINDOW_MINUTES -- voucher redemption is an
+        # authentication-adjacent, rate-limited action, the same category
+        # this policy type is meant to govern.
+        "max_attempts_per_window": 30,
+        "window_minutes": 1,
+    },
+}
+
+
+__all__ = [
+    "PolicyType",
+    "PolicyVersionStatus",
+    "POLICY_VERSION_STATUS_TRANSITIONS",
+    "PLATFORM_DEFAULT_RULES",
+]

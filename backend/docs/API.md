@@ -1941,3 +1941,74 @@ active member's active session(s) via the real
 `GuestService.terminate_session`, with per-member failure isolation (one
 member's termination failure never stops the rest -- see FLOW.md §6).
 Response includes `terminated_session_ids` and `failed_member_ids`.
+
+
+## Policy Endpoints
+
+See `docs/policy/FLOW.md` for the full design write-up -- the leaf-module
+dependency rule, versioning/rollback semantics, resolution precedence, the
+RBAC permission-module decision (`PermissionModule.POLICY`, a new additive
+module), and exactly which existing platform constants this module's
+default ruleset mirrors. Policy is a brand-new, dependency-free leaf domain
+(`app.domains.organization`/`app.domains.location`/`app.domains.rbac`
+only) -- **every** route below is admin-facing; there is no guest-facing
+route in this domain at all.
+
+`GET /policies/resolve` -- requires `policy.read`. Query params:
+`policy_type` (required), optional `organization_id`/`location_id`. Returns
+the effective rule set for that scope: the winning assignment's rules if
+one matches (location beats organization beats global, tie-broken by
+`priority`), or `constants.PLATFORM_DEFAULT_RULES` with
+`source="platform_default"` if none does. Registered before
+`GET /policies/{policy_id}` -- load-bearing route ordering (see
+`router.py`'s own module docstring).
+
+`POST /policies` -- requires `policy.create`. Body: optional
+`organization_id` (omit for a platform-wide policy -- only a platform-level
+caller, one with no `X-Organization-Id`, may do this), `policy_type`,
+`name`, optional `description`. Created with no version yet
+(`current_version_id=null`).
+
+`GET /policies` -- requires `policy.read`. Paginated, filterable by
+`policy_type`, scoped to the caller's own organization (or platform-wide
+policies, if the caller is a platform-level caller).
+
+`GET /policies/{policy_id}` -- requires `policy.read`. Returns the policy
+plus its full version history and assignment list. A platform-wide policy
+(`organization_id=null`) is readable by any organization; an organization's
+own custom policy is only readable by that organization (or a
+platform-level caller).
+
+`POST /policies/{policy_id}/deactivate` -- requires `policy.execute`.
+Retires the policy definition (`is_active=false`) without deleting it or
+its version history.
+
+`POST /policies/{policy_id}/versions` -- requires `policy.update`. Body:
+`rules` (a JSON object). Validated against `schemas.POLICY_RULE_SCHEMAS
+[policy_type]` (a concrete schema for `session`/`authn`; any JSON object for
+every other type -- see FLOW.md §3/§9) before being persisted as a new
+`draft` version. Version numbers increment per policy (`1`, `2`, `3`, ...).
+
+`POST /policies/{policy_id}/versions/{version_id}/publish` -- requires
+`policy.execute`. Transitions a `draft` version to `published` and moves
+`Policy.current_version_id` to it. Publishing an already-published version
+is rejected, not a silent no-op.
+
+`POST /policies/{policy_id}/rollback` -- requires `policy.execute`. Query
+param: `target_version_id`. Re-points `current_version_id` at any earlier
+*already-published* version of the same policy -- rejects a `draft` target
+or a version belonging to a different policy. Never deletes or duplicates
+any version row (see FLOW.md §2).
+
+`POST /policies/{policy_id}/assignments` -- requires `policy.create`. Body:
+`scope_type` (one of `app.domains.rbac.enums.ScopeType`'s values), `scope_id`
+(required unless `scope_type` is `global`), optional `priority`. Requires
+the policy to already have a published version.
+
+`GET /policies/{policy_id}/assignments` -- requires `policy.read`. Lists
+every assignment (active and inactive) for the policy.
+
+`DELETE /policies/{policy_id}/assignments/{assignment_id}` -- requires
+`policy.execute`. Deactivates the assignment (`is_active=false`) -- it is
+immediately excluded from future resolution, but the row itself is kept for
+history.
