@@ -108,6 +108,7 @@ class PermissionModule(StrEnum):
     ISP_ROUTING = "isp_routing"
     VLAN = "vlan"
     MAC_AUTHORIZATION = "mac_authorization"
+    CONNECTED_DEVICES = "connected_devices"
 
 
 class OverrideEffect(StrEnum):
@@ -666,3 +667,18 @@ class AuditAction(StrEnum):
     MAC_AUTHORIZATION_ENTRY_CREATED = "mac_authorization_entry_created"
     MAC_AUTHORIZATION_ENTRY_UPDATED = "mac_authorization_entry_updated"
     MAC_AUTHORIZATION_ENTRY_DELETED = "mac_authorization_entry_deleted"
+
+    # Connected Device Management domain events -- written through this
+    # same table by
+    # ``app.domains.connected_devices.service.ConnectedDeviceService``
+    # via the same narrow ``AuditLogWriter`` protocol shape every other
+    # domain's service uses. Routine sync discovery/updates are
+    # deliberately not audited (high-volume, platform-wide) -- only real
+    # admin-initiated actions are (see that module's own module
+    # docstring for the full audit-volume judgment call).
+    CONNECTED_DEVICE_DISCONNECTED = "connected_device_disconnected"
+    CONNECTED_DEVICE_DELETED = "connected_device_deleted"
+    CONNECTED_DEVICE_COMMENT_ADDED = "connected_device_comment_added"
+    CONNECTED_DEVICE_BLOCKED = "connected_device_blocked"
+    CONNECTED_DEVICE_UNBLOCKED = "connected_device_unblocked"
+    CONNECTED_DEVICE_WHITELISTED = "connected_device_whitelisted"

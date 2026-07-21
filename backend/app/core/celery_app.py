@@ -115,6 +115,10 @@ from app.domains.billing.constants import (
     TASK_RUN_INVOICE_OVERDUE_SWEEP,
     TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
 )
+from app.domains.connected_devices.constants import (
+    CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
+)
 from app.domains.guest.constants import (
     FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
     QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
@@ -162,6 +166,7 @@ celery_app = Celery(
         "app.domains.analytics.tasks",
         "app.domains.analytics.report_tasks",
         "app.domains.billing.tasks",
+        "app.domains.connected_devices.tasks",
         "app.domains.guest.tasks",
         "app.domains.isp.tasks",
         "app.domains.provisioning_engine.tasks",
@@ -317,6 +322,18 @@ celery_app.conf.update(
         "isp-health-check-sweep": {
             "task": TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
             "schedule": ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
+        },
+        # Connected Device Management: real DHCP-lease/ARP/wireless
+        # registration-table sync sweep -- every 5 minutes, an
+        # operationally-visible (not safety-critical) cadence, see
+        # app.domains.connected_devices.constants
+        # .CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS's own docstring
+        # for the full reasoning. Per-router failure isolation mirrors
+        # app.domains.isp.service.run_health_check_sweep's identical
+        # contract.
+        "connected-device-sync-sweep": {
+            "task": TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
+            "schedule": CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

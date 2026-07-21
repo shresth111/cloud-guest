@@ -305,6 +305,18 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXPORT,
         _A.MANAGE,
     ),
+    # Connected Device Management: no CREATE -- rows only ever come into
+    # existence via a real device sync (see
+    # app.domains.connected_devices.service's own module docstring), so
+    # there is no user-facing "create a connected device" action. EXECUTE
+    # covers disconnect/refresh/sync/block/unblock/whitelist.
+    PermissionModule.CONNECTED_DEVICES: (
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.EXECUTE,
+        _A.MANAGE,
+    ),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -352,6 +364,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.ISP_ROUTING: "ISP Routing",
     PermissionModule.VLAN: "VLAN Management",
     PermissionModule.MAC_AUTHORIZATION: "MAC Authorization",
+    PermissionModule.CONNECTED_DEVICES: "Connected Devices",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -420,6 +433,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # closest analogous domain (also a MAC-address-keyed, org/location-
     # scoped concept).
     PermissionModule.MAC_AUTHORIZATION: ScopeType.LOCATION,
+    # A connected device is scoped to one router's own network -- same
+    # ScopeType.ROUTER reasoning as PermissionModule.ISP/VLAN/DHCP above.
+    PermissionModule.CONNECTED_DEVICES: ScopeType.ROUTER,
 }
 
 
@@ -648,6 +664,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.ISP: _L.FULL,
             _M.ISP_ROUTING: _L.FULL,
             _M.VLAN: _L.FULL,
+            _M.CONNECTED_DEVICES: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,

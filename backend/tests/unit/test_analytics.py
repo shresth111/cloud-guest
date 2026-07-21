@@ -772,6 +772,11 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # ("isp-health-check-sweep") for its own real RouterOS-backed WAN-link
     # health-check sweep -- see app.domains.isp.service
     # .run_health_check_sweep's own module docstring.
+    # Connected Device Management domain adds a twelfth Beat entry
+    # ("connected-device-sync-sweep") for its own real DHCP-lease/ARP/
+    # wireless registration-table sync sweep -- see
+    # app.domains.connected_devices.service.run_device_sync_sweep's own
+    # module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -784,6 +789,7 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "guest-fup-time-accrual-sweep",
         "guest-quota-reset-sweep",
         "isp-health-check-sweep",
+        "connected-device-sync-sweep",
     }
 
 
