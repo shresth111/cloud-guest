@@ -123,6 +123,10 @@ from app.domains.guest.constants import (
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
 )
+from app.domains.isp.constants import (
+    ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
+)
 from app.domains.provisioning_engine.constants import (
     PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
     TASK_DRAIN_PROVISION_QUEUE,
@@ -159,6 +163,7 @@ celery_app = Celery(
         "app.domains.analytics.report_tasks",
         "app.domains.billing.tasks",
         "app.domains.guest.tasks",
+        "app.domains.isp.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
     ],
@@ -300,6 +305,18 @@ celery_app.conf.update(
         "queue-management-sweep-schedule-transitions": {
             "task": TASK_SWEEP_SCHEDULE_TRANSITIONS,
             "schedule": SCHEDULE_SWEEP_INTERVAL_SECONDS,
+        },
+        # ISP Management domain: real RouterOS-backed health-check sweep --
+        # every 60 seconds, shorter than every other cadence in this
+        # schedule, since every guest at a site rides on whichever WAN
+        # uplink is currently active. See
+        # app.domains.isp.service.run_health_check_sweep's own docstring
+        # (per-link failure isolation) and app.domains.isp.constants
+        # .ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS's own docstring for the
+        # cadence reasoning.
+        "isp-health-check-sweep": {
+            "task": TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
+            "schedule": ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

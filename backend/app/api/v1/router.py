@@ -14,6 +14,7 @@ from app.domains.guest.router import radius_router as guest_radius_router
 from app.domains.guest_access.router import router as guest_access_router
 from app.domains.guest_teams.router import admin_router as guest_teams_admin_router
 from app.domains.guest_teams.router import guest_router as guest_teams_guest_router
+from app.domains.isp.router import router as isp_router
 from app.domains.location.router import router as location_router
 from app.domains.monitoring.router import router as monitoring_router
 from app.domains.organization.router import router as organization_router
@@ -58,3 +59,4 @@ api_v1_router.include_router(billing_router)
 api_v1_router.include_router(policy_router)
 api_v1_router.include_router(provisioning_engine_router)
 api_v1_router.include_router(queue_management_router)
+api_v1_router.include_router(isp_router)

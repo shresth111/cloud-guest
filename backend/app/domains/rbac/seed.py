@@ -253,6 +253,19 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # never directly updated/deleted by a user -- there is no
     # UPDATE/DELETE/APPROVE action for a ProvisionJob.
     PermissionModule.PROVISIONING_ENGINE: (_A.CREATE, _A.READ, _A.EXECUTE, _A.MANAGE),
+    # ISP Management: full CRUD on isp_links plus EXECUTE for the manual
+    # health-check/failover/failback triggers -- mirrors
+    # PermissionModule.BANDWIDTH's own identical CRUD+EXECUTE+MANAGE shape
+    # for the same "reusable inventory row + a real device-facing action"
+    # profile.
+    PermissionModule.ISP: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.EXECUTE,
+        _A.MANAGE,
+    ),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -296,6 +309,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.AI_ASSISTANT: "AI Assistant",
     PermissionModule.POLICY: "Policy",
     PermissionModule.PROVISIONING_ENGINE: "Provisioning Engine",
+    PermissionModule.ISP: "ISP Management",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -345,6 +359,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # ROUTER_PROVISIONING/RADIUS/WIREGUARD/FIREWALL/DHCP/DNS/HOTSPOT/
     # MONITORING already share.
     PermissionModule.PROVISIONING_ENGINE: ScopeType.ROUTER,
+    # An ISP link is physically terminated at one router -- same reasoning
+    # as PermissionModule.BANDWIDTH's own ScopeType.ROUTER entry above.
+    PermissionModule.ISP: ScopeType.ROUTER,
 }
 
 
@@ -569,6 +586,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DNS: _L.FULL,
             _M.HOTSPOT: _L.FULL,
             _M.BANDWIDTH: _L.FULL,
+            _M.ISP: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,

@@ -104,6 +104,7 @@ class PermissionModule(StrEnum):
     AI_ASSISTANT = "ai_assistant"
     POLICY = "policy"
     PROVISIONING_ENGINE = "provisioning_engine"
+    ISP = "isp"
 
 
 class OverrideEffect(StrEnum):
@@ -586,3 +587,28 @@ class AuditAction(StrEnum):
     QUEUE_REMOVED = "queue_removed"
     QUEUE_ASSIGNMENT_CHANGED = "queue_assignment_changed"
     QUEUE_ASSIGNMENT_EXPIRED = "queue_assignment_expired"
+
+    # ISP Management domain events -- written through this same table by
+    # ``app.domains.isp.service.IspService`` via the same narrow
+    # ``AuditLogWriter`` protocol shape every other domain's service uses.
+    # ISP Management is a brand-new, additive domain (a per-router WAN/ISP
+    # uplink inventory with real health monitoring and failover, composing
+    # Router, never duplicating its own lifecycle events) -- the same "add
+    # its own additive block directly here" precedent every prior
+    # brand-new domain has followed at its own first part. Link create/
+    # update/delete are audited for the same "moderate-volume, admin-
+    # relevant" reason every other domain's own lifecycle events are;
+    # failover/failback are audited unconditionally (even when
+    # system-triggered by the health-check sweep, not just admin-driven)
+    # since a guest network's live uplink changing is always operationally
+    # significant, mirroring ``GUEST_SESSION_TERMINATED``'s own "always
+    # audited" profile rather than ``GUEST_SESSION_DISCONNECTED``'s
+    # system-vs-admin split -- individual health-check *readings* are
+    # deliberately not audited at all (see
+    # ``app.domains.isp.service``'s own module docstring for the full
+    # audit-volume judgment call).
+    ISP_LINK_CREATED = "isp_link_created"
+    ISP_LINK_UPDATED = "isp_link_updated"
+    ISP_LINK_DELETED = "isp_link_deleted"
+    ISP_FAILOVER_TRIGGERED = "isp_failover_triggered"
+    ISP_FAILBACK_TRIGGERED = "isp_failback_triggered"
