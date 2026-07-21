@@ -115,6 +115,15 @@ class AuthRepositoryProtocol(Protocol):
         self, email: str, ip_address: str, *, minutes: int = 15
     ) -> list[LoginAttempt]: ...
 
+    async def list_login_attempts(
+        self,
+        *,
+        email: str | None = None,
+        success: bool | None = None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[LoginAttempt], PaginationMeta]: ...
+
 
 class AuthRepository:
     """Real, SQLAlchemy-backed implementation of :class:`AuthRepositoryProtocol`."""
@@ -333,6 +342,35 @@ class AuthRepository:
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    async def list_login_attempts(
+        self,
+        *,
+        email: str | None = None,
+        success: bool | None = None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[LoginAttempt], PaginationMeta]:
+        """Real, paginated ``LoginAttempt`` history -- the platform-wide
+        read source ``app.domains.controller_logs`` composes for its own
+        "Authentication Logs" (admin/user side) category. ``LoginAttempt``
+        has no ``organization_id`` column at all (confirmed by its own
+        field list -- a login attempt is recorded by email/IP, not scoped
+        to one organization), so this listing is genuinely platform-wide,
+        not tenant-filterable, unlike most other domains' own list
+        methods."""
+        filters: dict[str, object] = {}
+        if email is not None:
+            filters["email"] = email.lower()
+        if success is not None:
+            filters["success"] = success
+        return await self.login_attempts.paginate(
+            page=page,
+            page_size=page_size,
+            filters=filters or None,
+            sort_by="created_at",
+            sort_order=SortOrder.DESC,
+        )
 
     async def cleanup_old_login_attempts(self, *, days: int = 30) -> int:
         cutoff = datetime.now(UTC) - timedelta(days=days)

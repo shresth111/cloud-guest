@@ -288,6 +288,16 @@ class GuestRepositoryProtocol(Protocol):
         auth_method: str,
     ) -> SessionAggregate: ...
 
+    async def list_login_history(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
+        guest_id: uuid.UUID | None = None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[GuestLoginHistory], PaginationMeta]: ...
+
 
 class GuestRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -817,6 +827,36 @@ class GuestRepository:
         total, successful = result.one()
         return AuthMethodOutcomeCounts(
             total_attempts=int(total or 0), successful_attempts=int(successful or 0)
+        )
+
+    async def list_login_history(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
+        guest_id: uuid.UUID | None = None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[GuestLoginHistory], PaginationMeta]:
+        """Real, paginated ``GuestLoginHistory`` read -- the tenant-scoped
+        read source ``app.domains.controller_logs`` composes for its own
+        "Authentication Logs" (guest side) category. Unlike
+        ``app.domains.auth.LoginAttempt``, this table already carries
+        ``organization_id``/``location_id``, so it is genuinely
+        tenant-filterable."""
+        filters: dict[str, object] = {}
+        if organization_id is not None:
+            filters["organization_id"] = organization_id
+        if location_id is not None:
+            filters["location_id"] = location_id
+        if guest_id is not None:
+            filters["guest_id"] = guest_id
+        return await self.login_history.paginate(
+            page=page,
+            page_size=page_size,
+            filters=filters or None,
+            sort_by="attempted_at",
+            sort_order=SortOrder.DESC,
         )
 
     async def get_session_auth_method_aggregate(

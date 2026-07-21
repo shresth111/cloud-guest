@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.auth.jwt import InvalidTokenError, JWTManager, TokenExpiredError
 from app.domains.auth.models import LoginAttempt, PasswordHistory, Session, User
 from app.domains.auth.password import PasswordManager, PasswordStrengthError
@@ -240,6 +241,23 @@ class FakeAuthRepository:
             for a in self.login_attempts
             if a.email == email.lower() and a.ip_address == ip_address and not a.success
         ]
+
+    async def list_login_attempts(
+        self,
+        *,
+        email: str | None = None,
+        success: bool | None = None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[LoginAttempt], PaginationMeta]:
+        values = list(self.login_attempts)
+        if email is not None:
+            values = [a for a in values if a.email == email.lower()]
+        if success is not None:
+            values = [a for a in values if a.success == success]
+        params = PageParams(page=page, page_size=page_size)
+        paged = values[params.offset : params.offset + params.page_size]
+        return paged, PaginationMeta.from_total(params, len(values))
 
 
 def make_service() -> tuple[AuthService, FakeAuthRepository, FakeRedis]:
@@ -549,3 +567,54 @@ class TestAuthServiceRefreshAndSessions:
 
         with pytest.raises(PasswordReuseError):
             await service.change_password(user.id, STRONG_PASSWORD, STRONG_PASSWORD)
+
+
+# ============================================================================
+# Login attempt history (real read source for app.domains.controller_logs)
+# ============================================================================
+
+
+class TestListLoginAttempts:
+    async def test_lists_all_attempts_by_default(self) -> None:
+        service, repository, _redis = make_service()
+        await repository.record_login_attempt(
+            user_id=None,
+            email="a@example.com",
+            ip_address="10.0.0.1",
+            user_agent="agent",
+            success=True,
+        )
+        await repository.record_login_attempt(
+            user_id=None,
+            email="b@example.com",
+            ip_address="10.0.0.2",
+            user_agent="agent",
+            success=False,
+            failure_reason="bad_password",
+        )
+        attempts, meta = await service.list_login_attempts()
+        assert meta.total_items == 2
+        assert len(attempts) == 2
+
+    async def test_filters_by_email_and_success(self) -> None:
+        service, repository, _redis = make_service()
+        await repository.record_login_attempt(
+            user_id=None,
+            email="a@example.com",
+            ip_address="10.0.0.1",
+            user_agent="agent",
+            success=True,
+        )
+        await repository.record_login_attempt(
+            user_id=None,
+            email="a@example.com",
+            ip_address="10.0.0.1",
+            user_agent="agent",
+            success=False,
+            failure_reason="bad_password",
+        )
+        attempts, meta = await service.list_login_attempts(
+            email="a@example.com", success=False
+        )
+        assert meta.total_items == 1
+        assert attempts[0].success is False

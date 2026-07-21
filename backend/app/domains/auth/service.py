@@ -403,6 +403,20 @@ class AuthService:
     async def revoke_session(self, session_id: uuid.UUID) -> None:
         await self.repository.revoke_session(session_id)
 
+    # -- login attempts (real history read, for app.domains.controller_logs) ---
+
+    async def list_login_attempts(
+        self,
+        *,
+        email: str | None = None,
+        success: bool | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ):
+        return await self.repository.list_login_attempts(
+            email=email, success=success, page=page, page_size=page_size
+        )
+
     # -- internal helpers -------------------------------------------------------
 
     async def _register_failed_attempt(self, user: User) -> None:

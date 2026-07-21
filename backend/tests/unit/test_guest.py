@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.guest.constants import (
@@ -1019,6 +1020,27 @@ class FakeGuestRepository:
             total_attempts=len(items),
             successful_attempts=sum(1 for i in items if i.success),
         )
+
+    async def list_login_history(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
+        guest_id: uuid.UUID | None = None,
+        page: int,
+        page_size: int,
+    ):
+        values = list(self.login_history)
+        if organization_id is not None:
+            values = [v for v in values if v.organization_id == organization_id]
+        if location_id is not None:
+            values = [v for v in values if v.location_id == location_id]
+        if guest_id is not None:
+            values = [v for v in values if v.guest_id == guest_id]
+        values.sort(key=lambda v: v.attempted_at, reverse=True)
+        params = PageParams(page=page, page_size=page_size)
+        paged = values[params.offset : params.offset + params.page_size]
+        return paged, PaginationMeta.from_total(params, len(values))
 
     async def get_session_auth_method_aggregate(
         self,
