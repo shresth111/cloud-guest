@@ -287,6 +287,11 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.DELETE,
         _A.MANAGE,
     ),
+    # PermissionModule.DHCP's own action tuple already exists above
+    # (seeded ahead of any real domain, like PermissionModule.BANDWIDTH
+    # was for queue_management) -- this build reuses it as-is for
+    # app.domains.dhcp rather than minting a second key, and its shape
+    # already matches (CREATE/READ/UPDATE/DELETE/MANAGE, no EXECUTE).
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -311,7 +316,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.RADIUS: "Radius",
     PermissionModule.WIREGUARD: "WireGuard",
     PermissionModule.FIREWALL: "Firewall",
-    PermissionModule.DHCP: "DHCP",
+    PermissionModule.DHCP: "DHCP Pool Management",
     PermissionModule.DNS: "DNS",
     PermissionModule.HOTSPOT: "Hotspot",
     PermissionModule.BANDWIDTH: "Bandwidth",
@@ -391,6 +396,10 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # A VLAN is a router's own interface-level construct -- same
     # ScopeType.ROUTER reasoning as PermissionModule.ISP/ISP_ROUTING above.
     PermissionModule.VLAN: ScopeType.ROUTER,
+    # PermissionModule.DHCP's own ScopeType.ROUTER entry already exists
+    # above (seeded ahead of any real domain) and already matches this
+    # domain's own scoping (a DHCP pool is scoped to one router's own
+    # interfaces) -- reused as-is, no change needed.
 }
 
 

@@ -635,3 +635,13 @@ class AuditAction(StrEnum):
     VLAN_CREATED = "vlan_created"
     VLAN_UPDATED = "vlan_updated"
     VLAN_DELETED = "vlan_deleted"
+
+    # DHCP Pool Management domain events -- written through this same
+    # table by ``app.domains.dhcp.service.DhcpService`` via the same
+    # narrow ``AuditLogWriter`` protocol shape every other domain's
+    # service uses. A pure rules/inventory domain (no live device push in
+    # this pass -- see that module's own docstring), so create/update/
+    # delete are its only lifecycle events.
+    DHCP_POOL_CREATED = "dhcp_pool_created"
+    DHCP_POOL_UPDATED = "dhcp_pool_updated"
+    DHCP_POOL_DELETED = "dhcp_pool_deleted"
