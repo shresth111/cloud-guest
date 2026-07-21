@@ -266,6 +266,17 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXECUTE,
         _A.MANAGE,
     ),
+    # ISP Routing: a pure rules/inventory domain with no live device push
+    # in this pass (see app.domains.isp_routing.service's own module
+    # docstring) -- no EXECUTE action, unlike PermissionModule.ISP's own
+    # manual health-check/failover/failback triggers.
+    PermissionModule.ISP_ROUTING: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.MANAGE,
+    ),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -310,6 +321,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.POLICY: "Policy",
     PermissionModule.PROVISIONING_ENGINE: "Provisioning Engine",
     PermissionModule.ISP: "ISP Management",
+    PermissionModule.ISP_ROUTING: "ISP Routing",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -362,6 +374,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # An ISP link is physically terminated at one router -- same reasoning
     # as PermissionModule.BANDWIDTH's own ScopeType.ROUTER entry above.
     PermissionModule.ISP: ScopeType.ROUTER,
+    # A routing rule is scoped to one router's own uplinks -- same
+    # reasoning as PermissionModule.ISP's own ScopeType.ROUTER entry above.
+    PermissionModule.ISP_ROUTING: ScopeType.ROUTER,
 }
 
 
@@ -587,6 +602,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.HOTSPOT: _L.FULL,
             _M.BANDWIDTH: _L.FULL,
             _M.ISP: _L.FULL,
+            _M.ISP_ROUTING: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,

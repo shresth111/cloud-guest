@@ -105,6 +105,7 @@ class PermissionModule(StrEnum):
     POLICY = "policy"
     PROVISIONING_ENGINE = "provisioning_engine"
     ISP = "isp"
+    ISP_ROUTING = "isp_routing"
 
 
 class OverrideEffect(StrEnum):
@@ -612,3 +613,14 @@ class AuditAction(StrEnum):
     ISP_LINK_DELETED = "isp_link_deleted"
     ISP_FAILOVER_TRIGGERED = "isp_failover_triggered"
     ISP_FAILBACK_TRIGGERED = "isp_failback_triggered"
+
+    # ISP Routing domain events -- written through this same table by
+    # ``app.domains.isp_routing.service.IspRoutingService`` via the same
+    # narrow ``AuditLogWriter`` protocol shape every other domain's service
+    # uses. A pure rules/inventory domain (no live device push in this
+    # pass -- see that module's own docstring), so create/update/delete are
+    # its only lifecycle events; there is no failover/failback-style
+    # execute action here.
+    ISP_ROUTING_RULE_CREATED = "isp_routing_rule_created"
+    ISP_ROUTING_RULE_UPDATED = "isp_routing_rule_updated"
+    ISP_ROUTING_RULE_DELETED = "isp_routing_rule_deleted"
