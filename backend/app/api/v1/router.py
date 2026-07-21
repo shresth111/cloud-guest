@@ -18,6 +18,7 @@ from app.domains.guest.router import radius_router as guest_radius_router
 from app.domains.guest_access.router import router as guest_access_router
 from app.domains.guest_teams.router import admin_router as guest_teams_admin_router
 from app.domains.guest_teams.router import guest_router as guest_teams_guest_router
+from app.domains.hotspot.router import router as hotspot_router
 from app.domains.isp.router import router as isp_router
 from app.domains.isp_routing.router import router as isp_routing_router
 from app.domains.location.router import router as location_router
@@ -78,3 +79,4 @@ api_v1_router.include_router(connected_devices_router)
 api_v1_router.include_router(device_sync_router)
 api_v1_router.include_router(controller_logs_router)
 api_v1_router.include_router(network_config_router)
+api_v1_router.include_router(hotspot_router)

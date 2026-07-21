@@ -26,3 +26,4 @@ class NetworkConfigPreviewResponse(BaseModel):
     dhcp_pool_count: int
     vlan_count: int
     port_forwarding_rule_count: int
+    hotspot_profile_count: int

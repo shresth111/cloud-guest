@@ -123,6 +123,7 @@ async def preview_network_config(
         dhcp_pool_count=preview.dhcp_pool_count,
         vlan_count=preview.vlan_count,
         port_forwarding_rule_count=preview.port_forwarding_rule_count,
+        hotspot_profile_count=preview.hotspot_profile_count,
     )
     return build_response(
         success=True,

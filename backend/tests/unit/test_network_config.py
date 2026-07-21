@@ -1,10 +1,11 @@
 """Unit tests for the Network Configuration Management domain: RouterOS
-renderers (DHCP pool / VLAN / Port Forwarding -> real script text) and
-``NetworkConfigService``'s composition of ``app.domains.dhcp``/``app.domains
-.vlan``/``app.domains.port_forwarding``/``app.domains.router_provisioning``
-via small, hand-rolled in-memory fakes -- mirrors ``test_device_sync.py``'s
-own identical "fake the narrow Protocol boundary" precedent. A structural
-RBAC check confirms every route carries a permission dependency.
+renderers (DHCP pool / VLAN / Port Forwarding / Hotspot -> real script
+text) and ``NetworkConfigService``'s composition of ``app.domains.dhcp``/
+``app.domains.vlan``/``app.domains.port_forwarding``/``app.domains
+.hotspot``/``app.domains.router_provisioning`` via small, hand-rolled
+in-memory fakes -- mirrors ``test_device_sync.py``'s own identical "fake
+the narrow Protocol boundary" precedent. A structural RBAC check confirms
+every route carries a permission dependency.
 """
 
 from __future__ import annotations
@@ -16,14 +17,17 @@ from datetime import UTC, datetime
 import pytest
 
 from app.domains.dhcp.models import DhcpPool
+from app.domains.hotspot.models import HotspotProfile
 from app.domains.network_config.constants import (
     DHCP_SECTION_HEADER,
+    HOTSPOT_SECTION_HEADER,
     PORT_FORWARDING_SECTION_HEADER,
     VLAN_SECTION_HEADER,
 )
 from app.domains.network_config.exceptions import EmptyNetworkConfigError
 from app.domains.network_config.renderers import (
     render_dhcp_pool,
+    render_hotspot_profile,
     render_network_config,
     render_port_forwarding_rule,
     render_vlan,
@@ -111,6 +115,23 @@ def _make_rule(**overrides: object) -> PortForwardingRule:
     return PortForwardingRule(**_base_fields(**fields))
 
 
+def _make_hotspot_profile(**overrides: object) -> HotspotProfile:
+    fields = {
+        "router_id": uuid.uuid4(),
+        "organization_id": uuid.uuid4(),
+        "location_id": uuid.uuid4(),
+        "name": "Guest Hotspot",
+        "session_timeout_minutes": 240,
+        "idle_timeout_minutes": 15,
+        "upload_limit_kbps": 1024,
+        "download_limit_kbps": 4096,
+        "walled_garden_hosts": ["example.com"],
+        "is_enabled": True,
+    }
+    fields.update(overrides)
+    return HotspotProfile(**_base_fields(**fields))
+
+
 # ============================================================================
 # Renderers
 # ============================================================================
@@ -187,30 +208,82 @@ class TestRenderPortForwardingRule:
         assert "dst-address=203.0.113.5" in line
 
 
+class TestRenderHotspotProfile:
+    def test_renders_user_profile_and_walled_garden_lines(self) -> None:
+        lines = render_hotspot_profile(_make_hotspot_profile())
+        joined = "\n".join(lines)
+        assert "/ip hotspot user profile add" in joined
+        assert "session-timeout=240m" in joined
+        assert "idle-timeout=15m" in joined
+        assert "rate-limit=1024k/4096k" in joined
+        assert "/ip hotspot walled-garden add dst-host=example.com" in joined
+        assert 'comment="Guest Hotspot"' in joined
+
+    def test_omits_unset_timeout_and_rate_limit_fields(self) -> None:
+        (line,) = render_hotspot_profile(
+            _make_hotspot_profile(
+                session_timeout_minutes=None,
+                idle_timeout_minutes=None,
+                upload_limit_kbps=None,
+                download_limit_kbps=None,
+                walled_garden_hosts=[],
+            )
+        )
+        assert "session-timeout=" not in line
+        assert "idle-timeout=" not in line
+        assert "rate-limit=" not in line
+
+    def test_rate_limit_defaults_unset_half_to_zero(self) -> None:
+        (line, *_rest) = render_hotspot_profile(
+            _make_hotspot_profile(
+                upload_limit_kbps=512, download_limit_kbps=None, walled_garden_hosts=[]
+            )
+        )
+        assert "rate-limit=512k/0k" in line
+
+    def test_two_profiles_with_the_same_name_get_distinct_identifiers(self) -> None:
+        profile_a = _make_hotspot_profile(name="Guest Hotspot")
+        profile_b = _make_hotspot_profile(name="Guest Hotspot")
+        line_a = render_hotspot_profile(profile_a)[0]
+        line_b = render_hotspot_profile(profile_b)[0]
+        assert line_a != line_b
+
+
 class TestRenderNetworkConfig:
-    def test_combines_all_three_categories_with_section_headers(self) -> None:
+    def test_combines_all_four_categories_with_section_headers(self) -> None:
         rendered = render_network_config(
             dhcp_pools=[_make_pool()],
             vlans=[_make_vlan()],
             port_forwarding_rules=[_make_rule()],
+            hotspot_profiles=[_make_hotspot_profile()],
         )
         assert DHCP_SECTION_HEADER in rendered
         assert VLAN_SECTION_HEADER in rendered
         assert PORT_FORWARDING_SECTION_HEADER in rendered
+        assert HOTSPOT_SECTION_HEADER in rendered
 
     def test_returns_empty_string_for_no_input(self) -> None:
         assert (
-            render_network_config(dhcp_pools=[], vlans=[], port_forwarding_rules=[])
+            render_network_config(
+                dhcp_pools=[],
+                vlans=[],
+                port_forwarding_rules=[],
+                hotspot_profiles=[],
+            )
             == ""
         )
 
     def test_omits_a_section_header_for_an_empty_category(self) -> None:
         rendered = render_network_config(
-            dhcp_pools=[_make_pool()], vlans=[], port_forwarding_rules=[]
+            dhcp_pools=[_make_pool()],
+            vlans=[],
+            port_forwarding_rules=[],
+            hotspot_profiles=[],
         )
         assert DHCP_SECTION_HEADER in rendered
         assert VLAN_SECTION_HEADER not in rendered
         assert PORT_FORWARDING_SECTION_HEADER not in rendered
+        assert HOTSPOT_SECTION_HEADER not in rendered
 
 
 # ============================================================================
@@ -253,6 +326,16 @@ class FakePortForwardingLookup:
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> list[PortForwardingRule]:
         return [r for r in self.rules if r.router_id == router_id]
+
+
+@dataclass
+class FakeHotspotLookup:
+    profiles: list[HotspotProfile] = field(default_factory=list)
+
+    async def list_profiles_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[HotspotProfile]:
+        return [p for p in self.profiles if p.router_id == router_id]
 
 
 @dataclass
@@ -388,12 +471,14 @@ def _make_service(
     pools: list[DhcpPool] | None = None,
     vlans: list[Vlan] | None = None,
     rules: list[PortForwardingRule] | None = None,
+    hotspot_profiles: list[HotspotProfile] | None = None,
 ) -> tuple[NetworkConfigService, FakeRouterProvisioningLookup]:
     provisioning_lookup = FakeRouterProvisioningLookup()
     service = NetworkConfigService(
         FakeDhcpLookup(pools or []),
         FakeVlanLookup(vlans or []),
         FakePortForwardingLookup(rules or []),
+        FakeHotspotLookup(hotspot_profiles or []),
         provisioning_lookup,
     )
     return service, provisioning_lookup
@@ -411,6 +496,7 @@ class TestPreviewConfig:
             pools=[_make_pool(router_id=router_id)],
             vlans=[_make_vlan(router_id=router_id)],
             rules=[_make_rule(router_id=router_id)],
+            hotspot_profiles=[_make_hotspot_profile(router_id=router_id)],
         )
         preview = await service.preview_config(
             router_id, requesting_organization_id=uuid.uuid4()
@@ -418,7 +504,9 @@ class TestPreviewConfig:
         assert preview.dhcp_pool_count == 1
         assert preview.vlan_count == 1
         assert preview.port_forwarding_rule_count == 1
+        assert preview.hotspot_profile_count == 1
         assert DHCP_SECTION_HEADER in preview.rendered_content
+        assert HOTSPOT_SECTION_HEADER in preview.rendered_content
 
     async def test_excludes_disabled_rows(self) -> None:
         router_id = uuid.uuid4()

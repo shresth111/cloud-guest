@@ -44,6 +44,18 @@ RouterOS's ``/ip firewall nat`` rule matches every transport protocol when
 real RouterOS syntax. ``PortForwardingProtocol.BOTH`` is therefore rendered
 by omitting the parameter, the actual honest equivalent, not a fabricated
 keyword no real device would understand.
+
+## Hotspot: user-profile + walled-garden only, not the server bind
+
+Mirrors ``app.domains.hotspot.models.HotspotProfile``'s own module
+docstring: only RouterOS's ``/ip hotspot user profile`` (session-timeout/
+idle-timeout/rate-limit) and ``/ip hotspot walled-garden`` (allowed
+hosts) are rendered -- never a full ``/ip hotspot add`` server bind,
+which would need an interface/address-pool this table has no data for.
+``rate-limit`` mirrors ``app.domains.queue_management.service
+.format_mikrotik_rate_limit``'s own rx=upload/tx=download convention,
+substituting ``0`` (RouterOS's own "unlimited" value) for whichever half
+of the pair is unset.
 """
 
 from __future__ import annotations
@@ -51,12 +63,14 @@ from __future__ import annotations
 import ipaddress
 
 from app.domains.dhcp.models import DhcpPool
+from app.domains.hotspot.models import HotspotProfile
 from app.domains.port_forwarding.constants import PortForwardingProtocol
 from app.domains.port_forwarding.models import PortForwardingRule
 from app.domains.vlan.models import Vlan
 
 from .constants import (
     DHCP_SECTION_HEADER,
+    HOTSPOT_SECTION_HEADER,
     PORT_FORWARDING_SECTION_HEADER,
     VLAN_SECTION_HEADER,
 )
@@ -78,6 +92,12 @@ def _dhcp_identifier(pool: DhcpPool) -> str:
     name collision between two differently-configured pools that happen
     to share a display name."""
     return f"{_sanitize_identifier(pool.name)}-{str(pool.id)[:8]}"
+
+
+def _hotspot_identifier(profile: HotspotProfile) -> str:
+    """``HotspotProfile.name`` carries no uniqueness constraint -- same
+    reasoning as :func:`_dhcp_identifier`."""
+    return f"{_sanitize_identifier(profile.name)}-{str(profile.id)[:8]}"
 
 
 def _smallest_enclosing_network(
@@ -175,17 +195,41 @@ def render_port_forwarding_rule(rule: PortForwardingRule) -> list[str]:
     return [" ".join(parts)]
 
 
+def render_hotspot_profile(profile: HotspotProfile) -> list[str]:
+    """Renders one enabled ``HotspotProfile`` row -- see module docstring
+    for why only the user-profile/walled-garden slice is modeled."""
+    identifier = _hotspot_identifier(profile)
+    parts = [f"/ip hotspot user profile add name={identifier}"]
+    if profile.session_timeout_minutes is not None:
+        parts.append(f"session-timeout={profile.session_timeout_minutes}m")
+    if profile.idle_timeout_minutes is not None:
+        parts.append(f"idle-timeout={profile.idle_timeout_minutes}m")
+    if profile.upload_limit_kbps is not None or profile.download_limit_kbps is not None:
+        parts.append(
+            f"rate-limit={profile.upload_limit_kbps or 0}k/"
+            f"{profile.download_limit_kbps or 0}k"
+        )
+    lines = [" ".join(parts)]
+    for host in profile.walled_garden_hosts:
+        lines.append(
+            f"/ip hotspot walled-garden add dst-host={host} action=allow "
+            f'comment="{profile.name}"'
+        )
+    return lines
+
+
 def render_network_config(
     *,
     dhcp_pools: list[DhcpPool],
     vlans: list[Vlan],
     port_forwarding_rules: list[PortForwardingRule],
+    hotspot_profiles: list[HotspotProfile] | None = None,
 ) -> str:
-    """Combines every enabled row across all three categories into one
+    """Combines every enabled row across all four categories into one
     router-wide RouterOS script -- a full desired-state snapshot, mirroring
     how ``app.domains.router_provisioning.models.ConfigVersion`` already
     represents a router's *whole* config rather than an incremental diff.
-    Returns an empty string if all three inputs are empty -- callers
+    Returns an empty string if every input is empty -- callers
     (``service.py``) decide whether that is an error (a push) or a valid,
     informational result (a preview)."""
     sections: list[str] = []
@@ -201,6 +245,10 @@ def render_network_config(
         sections.append(PORT_FORWARDING_SECTION_HEADER)
         for rule in port_forwarding_rules:
             sections.extend(render_port_forwarding_rule(rule))
+    if hotspot_profiles:
+        sections.append(HOTSPOT_SECTION_HEADER)
+        for profile in hotspot_profiles:
+            sections.extend(render_hotspot_profile(profile))
     return "\n".join(sections)
 
 
@@ -208,5 +256,6 @@ __all__ = [
     "render_dhcp_pool",
     "render_vlan",
     "render_port_forwarding_rule",
+    "render_hotspot_profile",
     "render_network_config",
 ]

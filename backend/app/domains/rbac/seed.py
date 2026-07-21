@@ -355,7 +355,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.FIREWALL: "Firewall",
     PermissionModule.DHCP: "DHCP Pool Management",
     PermissionModule.DNS: "DNS",
-    PermissionModule.HOTSPOT: "Hotspot",
+    PermissionModule.HOTSPOT: "Hotspot Settings",
     PermissionModule.BANDWIDTH: "Bandwidth",
     PermissionModule.ANALYTICS: "Analytics",
     PermissionModule.REPORTS: "Reports",

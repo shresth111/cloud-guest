@@ -692,3 +692,13 @@ class AuditAction(StrEnum):
     # succeeds -- a router-wide sync is always an admin-triggered,
     # operationally significant action.
     DEVICE_SYNC_RUN_COMPLETED = "device_sync_run_completed"
+
+    # Hotspot Settings domain events -- written through this same table by
+    # ``app.domains.hotspot.service.HotspotService`` via the same narrow
+    # ``AuditLogWriter`` protocol shape every other domain's service uses.
+    # A pure rules/inventory domain (no live device push in this pass --
+    # see that module's own docstring), so create/update/delete are its
+    # only lifecycle events.
+    HOTSPOT_PROFILE_CREATED = "hotspot_profile_created"
+    HOTSPOT_PROFILE_UPDATED = "hotspot_profile_updated"
+    HOTSPOT_PROFILE_DELETED = "hotspot_profile_deleted"

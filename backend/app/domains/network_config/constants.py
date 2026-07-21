@@ -9,9 +9,11 @@ from __future__ import annotations
 DHCP_SECTION_HEADER = "# --- DHCP Pools (CloudGuest-managed) ---"
 VLAN_SECTION_HEADER = "# --- VLANs (CloudGuest-managed) ---"
 PORT_FORWARDING_SECTION_HEADER = "# --- Port Forwarding (CloudGuest-managed) ---"
+HOTSPOT_SECTION_HEADER = "# --- Hotspot Profiles (CloudGuest-managed) ---"
 
 __all__ = [
     "DHCP_SECTION_HEADER",
     "VLAN_SECTION_HEADER",
     "PORT_FORWARDING_SECTION_HEADER",
+    "HOTSPOT_SECTION_HEADER",
 ]

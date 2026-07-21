@@ -123,3 +123,19 @@ to `RouterProvisioningLookupProtocol`. `router.py` reuses
 `ConfigVersionApplyResponse` directly rather than redefining an identical
 shape -- the only schema this domain owns is `NetworkConfigPreviewResponse`,
 which has no analog anywhere else in the codebase.
+
+## 6. Hotspot: added as a fourth category in the same pass, not deferred
+
+Unlike DHCP/VLAN/Port Forwarding (each built independently, before this
+domain existed, each deferring real device provisioning to "the
+not-yet-built Network Configuration Management domain"), Hotspot
+Settings (`app.domains.hotspot.models.HotspotProfile`) was composed into
+this pipeline the moment it was built: `HotspotLookupProtocol`
+(`list_profiles_for_router`) is the fourth composed read, and
+`render_hotspot_profile` renders RouterOS `/ip hotspot user profile` +
+`/ip hotspot walled-garden` entries (see `renderers.py`'s own module
+docstring for why the server bind itself is out of scope, mirroring the
+DHCP subnet-mask gap's identical "document the real limit, don't
+fabricate a binding this table has no data for" posture). `rate-limit`
+mirrors `app.domains.queue_management.service
+.format_mikrotik_rate_limit`'s own rx=upload/tx=download convention.
