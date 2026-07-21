@@ -317,6 +317,11 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXECUTE,
         _A.MANAGE,
     ),
+    # Device Synchronization: read-only history plus EXECUTE (trigger a
+    # sync) -- no CREATE/UPDATE/DELETE, since DeviceSyncRun rows are
+    # immutable and only ever created by the sync action itself (see
+    # app.domains.device_sync.models's own module docstring).
+    PermissionModule.DEVICE_SYNC: (_A.READ, _A.EXECUTE, _A.MANAGE),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -365,6 +370,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.VLAN: "VLAN Management",
     PermissionModule.MAC_AUTHORIZATION: "MAC Authorization",
     PermissionModule.CONNECTED_DEVICES: "Connected Devices",
+    PermissionModule.DEVICE_SYNC: "Device Synchronization",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -436,6 +442,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # A connected device is scoped to one router's own network -- same
     # ScopeType.ROUTER reasoning as PermissionModule.ISP/VLAN/DHCP above.
     PermissionModule.CONNECTED_DEVICES: ScopeType.ROUTER,
+    # A device sync run is scoped to one router -- same ScopeType.ROUTER
+    # reasoning as PermissionModule.CONNECTED_DEVICES above.
+    PermissionModule.DEVICE_SYNC: ScopeType.ROUTER,
 }
 
 
@@ -665,6 +674,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.ISP_ROUTING: _L.FULL,
             _M.VLAN: _L.FULL,
             _M.CONNECTED_DEVICES: _L.FULL,
+            _M.DEVICE_SYNC: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,

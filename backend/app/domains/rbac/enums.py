@@ -109,6 +109,7 @@ class PermissionModule(StrEnum):
     VLAN = "vlan"
     MAC_AUTHORIZATION = "mac_authorization"
     CONNECTED_DEVICES = "connected_devices"
+    DEVICE_SYNC = "device_sync"
 
 
 class OverrideEffect(StrEnum):
@@ -682,3 +683,11 @@ class AuditAction(StrEnum):
     CONNECTED_DEVICE_BLOCKED = "connected_device_blocked"
     CONNECTED_DEVICE_UNBLOCKED = "connected_device_unblocked"
     CONNECTED_DEVICE_WHITELISTED = "connected_device_whitelisted"
+
+    # Device Synchronization domain events -- written through this same
+    # table by ``app.domains.device_sync.service.DeviceSyncService`` via
+    # the same narrow ``AuditLogWriter`` protocol shape every other
+    # domain's service uses. Always audited, even when every component
+    # succeeds -- a router-wide sync is always an admin-triggered,
+    # operationally significant action.
+    DEVICE_SYNC_RUN_COMPLETED = "device_sync_run_completed"

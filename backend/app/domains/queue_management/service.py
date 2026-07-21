@@ -63,7 +63,9 @@ window opens or closes -- see that module's own docstring.
 
 from __future__ import annotations
 
+import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from typing import Any, Protocol
 
@@ -135,6 +137,20 @@ class PolicyLookupProtocol(Protocol):
 
 class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class QueueReapplySummary:
+    """Read model for :meth:`QueueManagementService
+    .reapply_assignments_for_router` -- see that method's own docstring.
+    Consumed by ``app.domains.device_sync``'s own orchestrator, composed
+    rather than reimplemented."""
+
+    reapplied: int
+    failed: int
 
 
 # ============================================================================
@@ -810,6 +826,48 @@ class QueueManagementService:
             actor_user_id=actor_user_id,
             requesting_organization_id=requesting_organization_id,
         )
+
+    async def reapply_assignments_for_router(
+        self,
+        router_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> QueueReapplySummary:
+        """Force a fresh device push for every currently-``ACTIVE``
+        assignment on this router -- the real "sync queues for this
+        router" operation ``app.domains.device_sync``'s own orchestrator
+        composes, never reimplementing device I/O itself. Each
+        assignment is re-pushed via the exact same real
+        ``reset_queue`` (remove then re-apply) every other caller uses;
+        one assignment's own device failure is caught and counted, never
+        aborting the rest of the router's own assignments -- mirrors
+        ``app.domains.isp.service.run_health_check_sweep``'s identical
+        per-item isolation contract."""
+        assignments, _ = await self.list_assignments(
+            requesting_organization_id=requesting_organization_id,
+            router_id=router_id,
+            status=QueueStatus.ACTIVE,
+            page=1,
+            page_size=1000,
+        )
+        reapplied = 0
+        failed = 0
+        for assignment in assignments:
+            try:
+                await self.reset_queue(
+                    assignment.id,
+                    actor_user_id=actor_user_id,
+                    requesting_organization_id=requesting_organization_id,
+                )
+                reapplied += 1
+            except Exception as exc:  # noqa: BLE001 -- per-assignment isolation, see docstring
+                failed += 1
+                logger.warning(
+                    "queue_reapply_assignment_failed",
+                    extra={"assignment_id": str(assignment.id), "error": str(exc)},
+                )
+        return QueueReapplySummary(reapplied=reapplied, failed=failed)
 
     async def move_queue(
         self,

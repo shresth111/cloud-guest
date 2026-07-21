@@ -6,6 +6,7 @@ from app.domains.auth.router import router as auth_router
 from app.domains.billing.router import router as billing_router
 from app.domains.captive_portal.router import router as captive_portal_router
 from app.domains.connected_devices.router import router as connected_devices_router
+from app.domains.device_sync.router import router as device_sync_router
 from app.domains.dhcp.router import router as dhcp_router
 from app.domains.guest.router import admin_router as guest_admin_router
 from app.domains.guest.router import analytics_router as guest_analytics_router
@@ -72,3 +73,4 @@ api_v1_router.include_router(dhcp_router)
 api_v1_router.include_router(port_forwarding_router)
 api_v1_router.include_router(mac_authorization_router)
 api_v1_router.include_router(connected_devices_router)
+api_v1_router.include_router(device_sync_router)

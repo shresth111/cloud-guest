@@ -876,6 +876,80 @@ class TestApplyAndRemoveQueue:
         assert len(h.device_adapter.created_ids) == 2
 
 
+class TestReapplyAssignmentsForRouter:
+    async def test_reapplies_every_active_assignment_on_the_router(self) -> None:
+        h = make_harness()
+        assignment_a, router, profile = await self._create_assignment_with_profile(h)
+        assignment_b = await h.service.create_assignment(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            target_type=QueueTargetType.SESSION,
+            target_id=uuid.uuid4(),
+            router_id=router.id,
+            device_target="10.0.0.6/32",
+            queue_profile_id=profile.id,
+        )
+        await h.service.apply_queue(
+            assignment_a.id, actor_user_id=None, requesting_organization_id=None
+        )
+        await h.service.apply_queue(
+            assignment_b.id, actor_user_id=None, requesting_organization_id=None
+        )
+        assert len(h.device_adapter.created_ids) == 2
+
+        summary = await h.service.reapply_assignments_for_router(
+            router.id, actor_user_id=None, requesting_organization_id=None
+        )
+        assert summary.reapplied == 2
+        assert summary.failed == 0
+        # Each active assignment was removed then re-created (reset_queue).
+        assert len(h.device_adapter.removed_ids) == 2
+        assert len(h.device_adapter.created_ids) == 4
+
+    async def test_ignores_non_active_assignments(self) -> None:
+        h = make_harness()
+        assignment, router, _profile = await self._create_assignment_with_profile(h)
+        # Never applied -- stays PENDING.
+        summary = await h.service.reapply_assignments_for_router(
+            router.id, actor_user_id=None, requesting_organization_id=None
+        )
+        assert summary.reapplied == 0
+        assert summary.failed == 0
+
+    async def test_isolates_per_assignment_failures(self) -> None:
+        h = make_harness()
+        assignment, router, _profile = await self._create_assignment_with_profile(h)
+        await h.service.apply_queue(
+            assignment.id, actor_user_id=None, requesting_organization_id=None
+        )
+        h.device_adapter.create_should_fail = True
+        summary = await h.service.reapply_assignments_for_router(
+            router.id, actor_user_id=None, requesting_organization_id=None
+        )
+        assert summary.reapplied == 0
+        assert summary.failed == 1
+
+    async def _create_assignment_with_profile(self, h: Harness):
+        router = h.router_lookup.add(_make_router())
+        profile = await h.service.create_profile(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            name="5 Mbps",
+            download_rate_kbps=5000,
+            upload_rate_kbps=1000,
+        )
+        assignment = await h.service.create_assignment(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            target_type=QueueTargetType.SESSION,
+            target_id=uuid.uuid4(),
+            router_id=router.id,
+            device_target="10.0.0.5/32",
+            queue_profile_id=profile.id,
+        )
+        return assignment, router, profile
+
+
 class TestMoveQueue:
     async def test_move_creates_new_row_and_expires_old(self) -> None:
         h = make_harness()
