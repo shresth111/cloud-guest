@@ -782,6 +782,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # Campaign.status reasonably fresh for admin dashboards -- see
     # app.domains.campaigns.service.CampaignsService
     # .sweep_status_transitions's own module docstring.
+    # Notification domain adds a fourteenth Beat entry
+    # ("notification-dispatch-sweep") that drains due PENDING/RETRYING
+    # NotificationDelivery rows -- see
+    # app.domains.notification.service's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -796,6 +800,7 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
         "campaigns-sweep-status-transitions",
+        "notification-dispatch-sweep",
     }
 
 

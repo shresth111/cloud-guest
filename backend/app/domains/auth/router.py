@@ -26,6 +26,11 @@ from .schemas import (
     LoginResponse,
     LogoutRequest,
     MessageResponse,
+    MfaDisableRequest,
+    MfaEnrollResponse,
+    MfaRecoveryCodesResponse,
+    MfaRegenerateRecoveryCodesRequest,
+    MfaVerifyRequest,
     RefreshTokenRequest,
     RegisterRequest,
     RegisterResponse,
@@ -112,7 +117,7 @@ async def login(
         device_info.device_name = payload.device_name
 
     user, tokens, session_id = await auth_service.login(
-        payload.email, payload.password, device_info
+        payload.email, payload.password, device_info, mfa_code=payload.mfa_code
     )
 
     return build_response(
@@ -402,5 +407,104 @@ async def revoke_session(
         success=True,
         message="Session revoked",
         data=MessageResponse(message="Session revoked").model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# MFA/TOTP -- self-service only (no RBAC gate: a user manages their own
+# second factor, never another user's), mirroring /me's identical posture.
+# ============================================================================
+
+
+@router.post(
+    "/mfa/enroll",
+    response_model=ApiResponse[MfaEnrollResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def enroll_mfa(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    secret, provisioning_uri = await auth_service.enroll_mfa(uuid.UUID(user.id))
+    return build_response(
+        success=True,
+        message="Scan the provisioning URI with an authenticator app, then verify",
+        data=MfaEnrollResponse(
+            secret=secret, provisioning_uri=provisioning_uri
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/mfa/verify",
+    response_model=ApiResponse[MfaRecoveryCodesResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def verify_mfa(
+    request: Request,
+    payload: MfaVerifyRequest,
+    user: AuthUser = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    recovery_codes = await auth_service.verify_and_enable_mfa(
+        uuid.UUID(user.id), payload.code
+    )
+    return build_response(
+        success=True,
+        message=(
+            "MFA enabled -- store these recovery codes, they will not be "
+            "shown again"
+        ),
+        data=MfaRecoveryCodesResponse(recovery_codes=recovery_codes).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/mfa/disable",
+    response_model=ApiResponse[MessageResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def disable_mfa(
+    request: Request,
+    payload: MfaDisableRequest,
+    user: AuthUser = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    await auth_service.disable_mfa(
+        uuid.UUID(user.id), password=payload.password, code=payload.code
+    )
+    return build_response(
+        success=True,
+        message="MFA disabled",
+        data=MessageResponse(message="MFA disabled").model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/mfa/recovery-codes/regenerate",
+    response_model=ApiResponse[MfaRecoveryCodesResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def regenerate_mfa_recovery_codes(
+    request: Request,
+    payload: MfaRegenerateRecoveryCodesRequest,
+    user: AuthUser = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    recovery_codes = await auth_service.regenerate_recovery_codes(
+        uuid.UUID(user.id), code=payload.code
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Recovery codes regenerated -- store them, they will not be "
+            "shown again"
+        ),
+        data=MfaRecoveryCodesResponse(recovery_codes=recovery_codes).model_dump(),
         request_id=_request_id(request),
     )

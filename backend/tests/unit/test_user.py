@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+from starlette.requests import Request
 
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.auth.dependencies import get_current_user
@@ -737,8 +738,14 @@ class TestDeactivateReactivate:
 
         token, _jti = JWTManager.create_access_token(str(user.id), user.email)
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
 
         with pytest.raises(HTTPException) as exc_info:
-            await get_current_user(credentials=credentials, repository=identity)
+            await get_current_user(
+                request=request,
+                credentials=credentials,
+                repository=identity,
+                api_key_service=None,
+            )
 
         assert exc_info.value.status_code == 401

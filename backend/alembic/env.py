@@ -9,6 +9,7 @@ from app.database.base import Base
 # Import domain models so their tables are registered on Base.metadata
 # before autogenerate compares it against the database.
 from app.domains.analytics import models as analytics_models  # noqa: F401
+from app.domains.api_keys import models as api_keys_models  # noqa: F401
 from app.domains.auth import models as auth_models  # noqa: F401
 from app.domains.billing import models as billing_models  # noqa: F401
 from app.domains.captive_portal import models as captive_portal_models  # noqa: F401
@@ -17,6 +18,7 @@ from app.domains.guest_access import models as guest_access_models  # noqa: F401
 from app.domains.guest_teams import models as guest_teams_models  # noqa: F401
 from app.domains.location import models as location_models  # noqa: F401
 from app.domains.monitoring import models as monitoring_models  # noqa: F401
+from app.domains.notification import models as notification_models  # noqa: F401
 from app.domains.organization import models as organization_models  # noqa: F401
 from app.domains.otp import models as otp_models  # noqa: F401
 from app.domains.policy import models as policy_models  # noqa: F401

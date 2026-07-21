@@ -67,6 +67,20 @@ class VoucherBatchNotFoundError(VoucherError):
         )
 
 
+class VoucherEmailDeliveryNotConfiguredError(VoucherError):
+    """Raised by ``VoucherService.email_batch_pdf`` when no real
+    ``object_storage``/``notification_service`` was wired into this
+    service instance -- fails loudly rather than silently discarding the
+    export, mirroring this codebase's honesty mandate."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Emailing a voucher batch export requires object_storage and "
+            "notification_service to be configured on VoucherService",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
 class CrossOrganizationVoucherBatchAccessError(VoucherError):
     """A caller acting within organization A attempted to read/mutate a
     voucher batch belonging to organization B -- mirrors

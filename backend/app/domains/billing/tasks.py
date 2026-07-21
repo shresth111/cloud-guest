@@ -36,9 +36,16 @@ import asyncio
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.storage import get_object_storage
 from app.database.session import SessionLocal
+from app.domains.notification.repository import NotificationRepository
+from app.domains.notification.service import NotificationService
 from app.domains.organization.repository import OrganizationRepository
 from app.domains.organization.service import OrganizationService
+from app.domains.otp.service import (
+    get_configured_email_provider,
+    get_configured_sms_provider,
+)
 from app.domains.rbac.repository import RBACRepository
 
 from .constants import (
@@ -83,12 +90,21 @@ async def _run_renewal_sweep_async() -> RenewalSweepReport:
             organization_service = OrganizationService(
                 organization_repository, audit_writer=audit_repository
             )
+            notification_service = NotificationService(
+                NotificationRepository(session),
+                object_storage=get_object_storage(),
+                email_provider=get_configured_email_provider(settings),
+                sms_provider=get_configured_sms_provider(settings),
+                max_attempts=settings.notification_max_delivery_attempts,
+                retry_backoff_seconds=settings.notification_retry_backoff_seconds,
+            )
             renewal_service = RenewalService(
                 subscription_repository,
                 plan_repository,
                 license_service=license_service,
                 organization_lookup=organization_service,
                 payment_gateway=build_payment_gateway(db=session, settings=settings),
+                notification_service=notification_service,
                 audit_writer=audit_repository,
                 grace_period_days=settings.subscription_renewal_grace_period_days,
                 renewal_reminder_days_before=(

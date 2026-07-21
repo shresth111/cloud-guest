@@ -27,6 +27,15 @@ class LoginRequest(BaseModel):
         max_length=255,
         description="Device name, e.g. 'Chrome on Windows'",
     )
+    mfa_code: str | None = Field(
+        default=None,
+        description=(
+            "Required only if the account has MFA enabled: a 6-digit TOTP "
+            "code, or a recovery code. Omitting it on an MFA-enabled "
+            "account returns a distinct error -- retry the same call with "
+            "this field set."
+        ),
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -192,3 +201,30 @@ class SessionListResponse(BaseModel):
 class MessageResponse(BaseModel):
     message: str
     success: bool = True
+
+
+class MfaEnrollResponse(BaseModel):
+    """``secret`` is shown once for manual entry; ``provisioning_uri`` is
+    what an authenticator app's QR-code scan would encode."""
+
+    secret: str
+    provisioning_uri: str
+
+
+class MfaVerifyRequest(BaseModel):
+    code: str = Field(..., min_length=6, max_length=6, description="6-digit TOTP code")
+
+
+class MfaRecoveryCodesResponse(BaseModel):
+    """Shown exactly once -- only hashes are ever persisted."""
+
+    recovery_codes: list[str]
+
+
+class MfaDisableRequest(BaseModel):
+    password: str = Field(..., min_length=1)
+    code: str = Field(..., description="A current TOTP code or a recovery code")
+
+
+class MfaRegenerateRecoveryCodesRequest(BaseModel):
+    code: str = Field(..., description="A current TOTP code or a recovery code")

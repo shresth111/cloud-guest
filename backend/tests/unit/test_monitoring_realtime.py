@@ -173,6 +173,7 @@ class FakeUser:
     is_active: bool = True
     is_verified: bool = True
     data_masking_enabled: bool = True
+    mfa_enabled: bool = False
 
 
 @dataclass

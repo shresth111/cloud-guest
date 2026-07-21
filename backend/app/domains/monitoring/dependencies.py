@@ -19,6 +19,10 @@ from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.auth.dependencies import get_auth_repository
 from app.domains.auth.repository import AuthRepositoryProtocol
+from app.domains.otp.service import (
+    get_configured_email_provider,
+    get_configured_sms_provider,
+)
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
@@ -71,8 +75,14 @@ def get_notification_http_client() -> httpx.AsyncClient:
 def get_notification_service(
     repository: MonitoringRepositoryProtocol = Depends(get_monitoring_repository),
     http_client: httpx.AsyncClient = Depends(get_notification_http_client),
+    settings: Settings = Depends(get_settings),
 ) -> NotificationService:
-    return NotificationService(repository, http_client)
+    return NotificationService(
+        repository,
+        http_client,
+        sms_provider=get_configured_sms_provider(settings),
+        email_provider=get_configured_email_provider(settings),
+    )
 
 
 def get_alert_service(

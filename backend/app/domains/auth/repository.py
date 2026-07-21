@@ -41,7 +41,14 @@ from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 
-from .models import LoginAttempt, PasswordHistory, Session, User
+from .models import (
+    LoginAttempt,
+    PasswordHistory,
+    Session,
+    User,
+    UserMfaCredential,
+    UserMfaRecoveryCode,
+)
 
 
 class AuthRepositoryProtocol(Protocol):
@@ -124,6 +131,32 @@ class AuthRepositoryProtocol(Protocol):
         page_size: int,
     ) -> tuple[list[LoginAttempt], PaginationMeta]: ...
 
+    # -- MFA -------------------------------------------------------------
+
+    async def get_mfa_credential(
+        self, user_id: uuid.UUID
+    ) -> UserMfaCredential | None: ...
+
+    async def create_mfa_credential(self, **fields: object) -> UserMfaCredential: ...
+
+    async def update_mfa_credential(
+        self, credential: UserMfaCredential, data: dict[str, object]
+    ) -> UserMfaCredential: ...
+
+    async def delete_mfa_credential(self, credential: UserMfaCredential) -> None: ...
+
+    async def replace_recovery_codes(
+        self, user_id: uuid.UUID, code_hashes: list[str]
+    ) -> list[UserMfaRecoveryCode]: ...
+
+    async def get_active_recovery_code(
+        self, user_id: uuid.UUID, code_hash: str
+    ) -> UserMfaRecoveryCode | None: ...
+
+    async def mark_recovery_code_used(
+        self, recovery_code: UserMfaRecoveryCode
+    ) -> UserMfaRecoveryCode: ...
+
 
 class AuthRepository:
     """Real, SQLAlchemy-backed implementation of :class:`AuthRepositoryProtocol`."""
@@ -134,6 +167,8 @@ class AuthRepository:
         self.sessions = GenericRepository(Session, session)
         self.password_history = GenericRepository(PasswordHistory, session)
         self.login_attempts = GenericRepository(LoginAttempt, session)
+        self.mfa_credentials = GenericRepository(UserMfaCredential, session)
+        self.mfa_recovery_codes = GenericRepository(UserMfaRecoveryCode, session)
 
     # -- users ---------------------------------------------------------
 
@@ -380,3 +415,55 @@ class AuthRepository:
         for row in stale:
             await self.login_attempts.delete(row)
         return len(stale)
+
+    # -- MFA -------------------------------------------------------------
+
+    async def get_mfa_credential(self, user_id: uuid.UUID) -> UserMfaCredential | None:
+        results = await self.mfa_credentials.get_all(
+            filters={"user_id": user_id}, limit=1
+        )
+        return results[0] if results else None
+
+    async def create_mfa_credential(self, **fields: object) -> UserMfaCredential:
+        return await self.mfa_credentials.create(fields)
+
+    async def update_mfa_credential(
+        self, credential: UserMfaCredential, data: dict[str, object]
+    ) -> UserMfaCredential:
+        return await self.mfa_credentials.update(credential, data)
+
+    async def delete_mfa_credential(self, credential: UserMfaCredential) -> None:
+        await self.mfa_credentials.delete(credential)
+
+    async def replace_recovery_codes(
+        self, user_id: uuid.UUID, code_hashes: list[str]
+    ) -> list[UserMfaRecoveryCode]:
+        """Deletes every existing recovery code for ``user_id`` (used or
+        not) and creates a fresh set -- enrollment/regeneration always
+        invalidates whatever codes existed before, so a leaked old code
+        list can never remain valid after a regenerate."""
+        existing = await self.mfa_recovery_codes.get_all(filters={"user_id": user_id})
+        for row in existing:
+            await self.mfa_recovery_codes.delete(row)
+        return await self.mfa_recovery_codes.bulk_create(
+            [{"user_id": user_id, "code_hash": code_hash} for code_hash in code_hashes]
+        )
+
+    async def get_active_recovery_code(
+        self, user_id: uuid.UUID, code_hash: str
+    ) -> UserMfaRecoveryCode | None:
+        statement = select(UserMfaRecoveryCode).where(
+            UserMfaRecoveryCode.is_deleted.is_(False),
+            UserMfaRecoveryCode.user_id == user_id,
+            UserMfaRecoveryCode.code_hash == code_hash,
+            UserMfaRecoveryCode.used_at.is_(None),
+        )
+        result = await self.session.execute(statement)
+        return result.scalars().first()
+
+    async def mark_recovery_code_used(
+        self, recovery_code: UserMfaRecoveryCode
+    ) -> UserMfaRecoveryCode:
+        return await self.mfa_recovery_codes.update(
+            recovery_code, {"used_at": datetime.now(UTC)}
+        )

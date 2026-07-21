@@ -113,6 +113,7 @@ this codebase already returns.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import logging
@@ -123,6 +124,7 @@ from typing import Protocol
 
 from redis.asyncio import Redis
 
+from app.core.config import Settings
 from app.domains.rbac.enums import AuditAction
 
 from .constants import OTP_REQUEST_RATE_LIMIT_KEY_TEMPLATE, OtpChannel, OtpPurpose
@@ -203,6 +205,198 @@ class LoggingEmailProvider:
             "otp_email_would_send",
             extra={"email": email, "subject": subject, "body_length": len(body)},
         )
+
+
+# ============================================================================
+# Real providers (app.domains.notification's own driving reason to exist:
+# every caller of EmailProviderProtocol/SmsProviderProtocol -- this
+# service, app.domains.monitoring's NotificationService,
+# app.domains.notification itself -- previously had only the Logging
+# providers above to fall back to). Composition, not a second provider
+# abstraction: every class below still just implements the exact
+# Protocols already defined in this module.
+# ============================================================================
+
+
+class EmailProviderNotConfiguredError(Exception):
+    """Raised when ``Settings.email_delivery_provider`` explicitly selects
+    a real provider ('smtp'/'ses') whose required credentials are empty --
+    mirrors ``app.domains.billing.payment_gateways
+    .PaymentGatewayNotConfiguredError``'s identical "explicit selection
+    without configuration is a real error, not a silent fallback"
+    precedent."""
+
+
+class SmsProviderNotConfiguredError(Exception):
+    """Same as :class:`EmailProviderNotConfiguredError`, for
+    ``Settings.sms_delivery_provider``."""
+
+
+class SmtpEmailProvider:
+    """Real ``EmailProviderProtocol`` implementation: sends via any
+    standard SMTP server (SendGrid, Mailgun, Postmark, AWS SES's own SMTP
+    interface, or a plain relay) using stdlib ``smtplib``/``email`` --
+    zero new dependencies. ``smtplib`` is synchronous; ``send`` bridges it
+    through ``asyncio.to_thread``, the same sync-in-async bridge
+    ``app.core.storage.S3ObjectStorage`` uses for boto3."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        use_tls: bool,
+        from_address: str,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.use_tls = use_tls
+        self.from_address = from_address
+
+    def _send_sync(self, email: str, subject: str, body: str) -> None:
+        import smtplib
+        from email.message import EmailMessage
+
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = self.from_address
+        message["To"] = email
+        message.set_content(body)
+
+        smtp_class = smtplib.SMTP_SSL if self.port == 465 else smtplib.SMTP
+        with smtp_class(self.host, self.port, timeout=10) as smtp:
+            if self.use_tls and self.port != 465:
+                smtp.starttls()
+            if self.username:
+                smtp.login(self.username, self.password)
+            smtp.send_message(message)
+
+    async def send(self, email: str, subject: str, body: str) -> None:
+        await asyncio.to_thread(self._send_sync, email, subject, body)
+
+
+class SesEmailProvider:
+    """Real ``EmailProviderProtocol`` implementation via AWS SES
+    (``boto3``'s ``ses`` client -- already a dependency for
+    ``app.core.storage.S3ObjectStorage``). Synchronous client, bridged
+    through ``asyncio.to_thread`` like :class:`SmtpEmailProvider` above."""
+
+    def __init__(
+        self,
+        *,
+        access_key_id: str,
+        secret_access_key: str,
+        region_name: str,
+        from_address: str,
+    ) -> None:
+        import boto3
+
+        self.from_address = from_address
+        self._client = boto3.client(
+            "ses",
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            region_name=region_name,
+        )
+
+    def _send_sync(self, email: str, subject: str, body: str) -> None:
+        self._client.send_email(
+            Source=self.from_address,
+            Destination={"ToAddresses": [email]},
+            Message={"Subject": {"Data": subject}, "Body": {"Text": {"Data": body}}},
+        )
+
+    async def send(self, email: str, subject: str, body: str) -> None:
+        await asyncio.to_thread(self._send_sync, email, subject, body)
+
+
+class TwilioSmsProvider:
+    """Real ``SmsProviderProtocol`` implementation: a plain
+    ``httpx.AsyncClient`` POST to Twilio's documented REST API
+    (https://www.twilio.com/docs/sms/api) -- the same "real, well-
+    documented third-party API, no fabricated payload shape" bar
+    ``app.domains.monitoring.service``'s Slack/Teams/Discord notifiers
+    already set."""
+
+    _API_URL_TEMPLATE = (
+        "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+    )
+    _TIMEOUT_SECONDS = 10.0
+
+    def __init__(self, *, account_sid: str, auth_token: str, from_number: str) -> None:
+        self.account_sid = account_sid
+        self.auth_token = auth_token
+        self.from_number = from_number
+
+    async def send(self, phone_number: str, message: str) -> None:
+        import httpx
+
+        url = self._API_URL_TEMPLATE.format(sid=self.account_sid)
+        async with httpx.AsyncClient(timeout=self._TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                url,
+                auth=(self.account_sid, self.auth_token),
+                data={"From": self.from_number, "To": phone_number, "Body": message},
+            )
+            response.raise_for_status()
+
+
+def get_configured_email_provider(settings: Settings) -> EmailProviderProtocol:
+    """Selects the real ``EmailProviderProtocol`` implementation
+    ``Settings.email_delivery_provider`` names, or :class:`LoggingEmailProvider`
+    if unset/``"logging"``. Shared by this domain's own ``dependencies.py``,
+    ``app.domains.monitoring``'s ``NotificationService`` wiring, and
+    ``app.domains.notification`` -- one place to add a new provider, not
+    three copies of the same selection logic."""
+    provider = settings.email_delivery_provider.lower()
+    if provider == "smtp":
+        if not settings.smtp_host:
+            raise EmailProviderNotConfiguredError(
+                "email_delivery_provider='smtp' but smtp_host is empty."
+            )
+        return SmtpEmailProvider(
+            host=settings.smtp_host,
+            port=settings.smtp_port,
+            username=settings.smtp_username,
+            password=settings.smtp_password,
+            use_tls=settings.smtp_use_tls,
+            from_address=settings.smtp_from_address,
+        )
+    if provider == "ses":
+        if not settings.ses_access_key_id or not settings.ses_from_address:
+            raise EmailProviderNotConfiguredError(
+                "email_delivery_provider='ses' but ses_access_key_id/"
+                "ses_from_address is empty."
+            )
+        return SesEmailProvider(
+            access_key_id=settings.ses_access_key_id,
+            secret_access_key=settings.ses_secret_access_key,
+            region_name=settings.ses_region,
+            from_address=settings.ses_from_address,
+        )
+    return LoggingEmailProvider()
+
+
+def get_configured_sms_provider(settings: Settings) -> SmsProviderProtocol:
+    """Same selection contract as :func:`get_configured_email_provider`,
+    for ``Settings.sms_delivery_provider``."""
+    provider = settings.sms_delivery_provider.lower()
+    if provider == "twilio":
+        if not settings.twilio_account_sid or not settings.twilio_from_number:
+            raise SmsProviderNotConfiguredError(
+                "sms_delivery_provider='twilio' but twilio_account_sid/"
+                "twilio_from_number is empty."
+            )
+        return TwilioSmsProvider(
+            account_sid=settings.twilio_account_sid,
+            auth_token=settings.twilio_auth_token,
+            from_number=settings.twilio_from_number,
+        )
+    return LoggingSmsProvider()
 
 
 class AuditLogWriter(Protocol):
@@ -468,6 +662,13 @@ __all__ = [
     "EmailProviderProtocol",
     "LoggingSmsProvider",
     "LoggingEmailProvider",
+    "SmtpEmailProvider",
+    "SesEmailProvider",
+    "TwilioSmsProvider",
+    "EmailProviderNotConfiguredError",
+    "SmsProviderNotConfiguredError",
+    "get_configured_email_provider",
+    "get_configured_sms_provider",
     "AuditLogWriter",
     "OtpRateLimiter",
     "generate_numeric_code",

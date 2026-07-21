@@ -20,11 +20,24 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+import pyotp
 import pytest
+from fastapi import HTTPException
+from starlette.requests import Request
 
 from app.database.utils.pagination import PageParams, PaginationMeta
+from app.domains.api_keys.exceptions import ApiKeyAuthenticationError
+from app.domains.auth import mfa as mfa_module
+from app.domains.auth.dependencies import get_current_user
 from app.domains.auth.jwt import InvalidTokenError, JWTManager, TokenExpiredError
-from app.domains.auth.models import LoginAttempt, PasswordHistory, Session, User
+from app.domains.auth.models import (
+    LoginAttempt,
+    PasswordHistory,
+    Session,
+    User,
+    UserMfaCredential,
+    UserMfaRecoveryCode,
+)
 from app.domains.auth.password import PasswordManager, PasswordStrengthError
 from app.domains.auth.security import AccountLockedError, AuthSecurity
 from app.domains.auth.service import (
@@ -33,6 +46,11 @@ from app.domains.auth.service import (
     EmailAlreadyExistsError,
     EmailNotVerifiedError,
     InvalidCredentialsError,
+    InvalidMfaCodeError,
+    MfaAlreadyEnabledError,
+    MfaNotEnabledError,
+    MfaNotEnrolledError,
+    MfaRequiredError,
     UsernameAlreadyExistsError,
 )
 
@@ -83,6 +101,12 @@ class FakeAuthRepository:
     sessions_by_jti: dict[str, Session] = field(default_factory=dict)
     password_history: dict[uuid.UUID, list[str]] = field(default_factory=dict)
     login_attempts: list[LoginAttempt] = field(default_factory=list)
+    mfa_credentials_by_user: dict[uuid.UUID, UserMfaCredential] = field(
+        default_factory=dict
+    )
+    recovery_codes_by_user: dict[uuid.UUID, list[UserMfaRecoveryCode]] = field(
+        default_factory=dict
+    )
 
     async def get_user_by_email(self, email: str) -> User | None:
         return next(
@@ -113,6 +137,7 @@ class FakeAuthRepository:
             "timezone": "UTC",
             "language": "en",
             "must_change_password": False,
+            "mfa_enabled": False,
         }
         user = User(
             id=uuid.uuid4(),
@@ -259,11 +284,91 @@ class FakeAuthRepository:
         paged = values[params.offset : params.offset + params.page_size]
         return paged, PaginationMeta.from_total(params, len(values))
 
+    # -- MFA -------------------------------------------------------------
+
+    async def get_mfa_credential(
+        self, user_id: uuid.UUID
+    ) -> UserMfaCredential | None:
+        return self.mfa_credentials_by_user.get(user_id)
+
+    async def create_mfa_credential(self, **fields: object) -> UserMfaCredential:
+        credential = UserMfaCredential(
+            id=uuid.uuid4(), created_at=datetime.now(UTC), updated_at=datetime.now(UTC),
+            **fields,
+        )
+        self.mfa_credentials_by_user[credential.user_id] = credential
+        return credential
+
+    async def update_mfa_credential(
+        self, credential: UserMfaCredential, data: dict[str, object]
+    ) -> UserMfaCredential:
+        for key, value in data.items():
+            setattr(credential, key, value)
+        return credential
+
+    async def delete_mfa_credential(self, credential: UserMfaCredential) -> None:
+        self.mfa_credentials_by_user.pop(credential.user_id, None)
+
+    async def replace_recovery_codes(
+        self, user_id: uuid.UUID, code_hashes: list[str]
+    ) -> list[UserMfaRecoveryCode]:
+        codes = [
+            UserMfaRecoveryCode(
+                id=uuid.uuid4(),
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+                user_id=user_id,
+                code_hash=code_hash,
+                used_at=None,
+            )
+            for code_hash in code_hashes
+        ]
+        self.recovery_codes_by_user[user_id] = codes
+        return codes
+
+    async def get_active_recovery_code(
+        self, user_id: uuid.UUID, code_hash: str
+    ) -> UserMfaRecoveryCode | None:
+        for code in self.recovery_codes_by_user.get(user_id, []):
+            if code.code_hash == code_hash and code.used_at is None:
+                return code
+        return None
+
+    async def mark_recovery_code_used(
+        self, recovery_code: UserMfaRecoveryCode
+    ) -> UserMfaRecoveryCode:
+        recovery_code.used_at = datetime.now(UTC)
+        return recovery_code
+
 
 def make_service() -> tuple[AuthService, FakeAuthRepository, FakeRedis]:
     repository = FakeAuthRepository()
     redis = FakeRedis()
     return AuthService(repository, redis), repository, redis
+
+
+@dataclass
+class FakeNotificationSender:
+    """In-memory stand-in for ``AuthService``'s own
+    ``NotificationSenderProtocol`` -- mirrors ``FakeAuthRepository``'s
+    identical "fake the narrow Protocol boundary" precedent."""
+
+    enqueued: list[dict[str, object]] = field(default_factory=list)
+
+    async def enqueue(self, **kwargs: object) -> None:
+        self.enqueued.append(kwargs)
+
+
+def make_service_with_notification_sender() -> (
+    tuple[AuthService, FakeAuthRepository, FakeRedis, FakeNotificationSender]
+):
+    repository = FakeAuthRepository()
+    redis = FakeRedis()
+    notification_sender = FakeNotificationSender()
+    service = AuthService(
+        repository, redis, notification_service=notification_sender
+    )
+    return service, repository, redis, notification_sender
 
 
 def make_device_info() -> DeviceInfo:
@@ -462,6 +567,74 @@ class TestAuthServiceRegister:
             )
 
 
+class TestAuthServiceNotificationWiring:
+    """``register``/``initiate_password_reset``/``resend_verification``
+    previously only logged a token and never delivered it anywhere (see
+    ``app.domains.notification``'s own module docstring for the write-up
+    of this exact gap). These assert the real enqueue call now happens."""
+
+    async def test_register_enqueues_verification_email(self) -> None:
+        service, _repository, _redis, sender = make_service_with_notification_sender()
+
+        user, verification_token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="test@example.com",
+            username="testuser",
+            password=STRONG_PASSWORD,
+        )
+
+        assert len(sender.enqueued) == 1
+        call = sender.enqueued[0]
+        assert call["recipient"] == user.email
+        assert verification_token in call["body"]
+
+    async def test_initiate_password_reset_enqueues_email_for_known_user(
+        self,
+    ) -> None:
+        service, _repository, _redis, sender = make_service_with_notification_sender()
+        await service.register(
+            first_name="Test",
+            last_name="User",
+            email="test@example.com",
+            username="testuser",
+            password=STRONG_PASSWORD,
+        )
+        sender.enqueued.clear()
+
+        await service.initiate_password_reset("test@example.com")
+
+        assert len(sender.enqueued) == 1
+        assert sender.enqueued[0]["recipient"] == "test@example.com"
+
+    async def test_initiate_password_reset_does_not_enqueue_for_unknown_email(
+        self,
+    ) -> None:
+        service, _repository, _redis, sender = make_service_with_notification_sender()
+
+        await service.initiate_password_reset("nobody@example.com")
+
+        assert sender.enqueued == []
+
+    async def test_resend_verification_enqueues_email_for_unverified_user(
+        self,
+    ) -> None:
+        service, _repository, _redis, sender = make_service_with_notification_sender()
+        await service.register(
+            first_name="Test",
+            last_name="User",
+            email="test@example.com",
+            username="testuser",
+            password=STRONG_PASSWORD,
+        )
+        sender.enqueued.clear()
+
+        await service.resend_verification("test@example.com")
+
+        assert len(sender.enqueued) == 1
+        assert sender.enqueued[0]["recipient"] == "test@example.com"
+
+
 class TestAuthServiceLogin:
     async def test_login_rejects_unknown_email(self) -> None:
         service, _repository, _redis = make_service()
@@ -618,3 +791,374 @@ class TestListLoginAttempts:
         )
         assert meta.total_items == 1
         assert attempts[0].success is False
+
+
+# ============================================================================
+# get_current_user: X-API-Key as an alternative to a JWT
+# ============================================================================
+
+
+def _make_request(*, headers: dict[str, str] | None = None) -> Request:
+    raw_headers = [
+        (k.lower().encode(), v.encode()) for k, v in (headers or {}).items()
+    ]
+    return Request(
+        {"type": "http", "method": "GET", "path": "/", "headers": raw_headers}
+    )
+
+
+@dataclass
+class _ResolvedApiKey:
+    organization_id: uuid.UUID
+    user_id: uuid.UUID
+
+
+@dataclass
+class FakeApiKeyService:
+    resolved: _ResolvedApiKey | None = None
+    should_fail: bool = False
+
+    async def resolve_active_key(self, plaintext_key: str) -> _ResolvedApiKey:
+        if self.should_fail or self.resolved is None:
+            raise ApiKeyAuthenticationError()
+        return self.resolved
+
+
+class TestGetCurrentUserApiKey:
+    async def test_resolves_user_via_x_api_key_header(self) -> None:
+        repository = FakeAuthRepository()
+        user = await repository.create_user(
+            first_name="Api",
+            last_name="Caller",
+            email="apicaller@example.com",
+            username="apicaller",
+            password_hash="hashed",
+            is_active=True,
+            is_verified=True,
+        )
+        org_id = uuid.uuid4()
+        api_key_service = FakeApiKeyService(
+            resolved=_ResolvedApiKey(organization_id=org_id, user_id=user.id)
+        )
+        request = _make_request(headers={"X-API-Key": "cgst_whatever"})
+
+        auth_user = await get_current_user(
+            request=request,
+            credentials=None,
+            repository=repository,
+            api_key_service=api_key_service,
+        )
+
+        assert auth_user.id == str(user.id)
+
+    async def test_rejects_invalid_api_key(self) -> None:
+        repository = FakeAuthRepository()
+        api_key_service = FakeApiKeyService(should_fail=True)
+        request = _make_request(headers={"X-API-Key": "cgst_bad"})
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(
+                request=request,
+                credentials=None,
+                repository=repository,
+                api_key_service=api_key_service,
+            )
+
+        assert exc_info.value.status_code == 401
+
+    async def test_rejects_organization_header_mismatch(self) -> None:
+        repository = FakeAuthRepository()
+        user = await repository.create_user(
+            first_name="Api",
+            last_name="Caller",
+            email="apicaller2@example.com",
+            username="apicaller2",
+            password_hash="hashed",
+            is_active=True,
+            is_verified=True,
+        )
+        key_org_id = uuid.uuid4()
+        other_org_id = uuid.uuid4()
+        api_key_service = FakeApiKeyService(
+            resolved=_ResolvedApiKey(organization_id=key_org_id, user_id=user.id)
+        )
+        request = _make_request(
+            headers={
+                "X-API-Key": "cgst_whatever",
+                "X-Organization-Id": str(other_org_id),
+            }
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(
+                request=request,
+                credentials=None,
+                repository=repository,
+                api_key_service=api_key_service,
+            )
+
+        assert exc_info.value.status_code == 403
+
+    async def test_missing_credentials_raises_401(self) -> None:
+        repository = FakeAuthRepository()
+        request = _make_request()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(
+                request=request,
+                credentials=None,
+                repository=repository,
+                api_key_service=FakeApiKeyService(),
+            )
+
+        assert exc_info.value.status_code == 401
+
+
+# ============================================================================
+# MFA/TOTP: enroll, verify+enable, login gating, disable, recovery codes
+# ============================================================================
+
+
+class TestMfa:
+    async def test_enroll_returns_secret_and_provisioning_uri(self) -> None:
+        service, _repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+
+        secret, uri = await service.enroll_mfa(user.id)
+
+        assert len(secret) >= 16
+        assert "otpauth://totp/" in uri
+        assert user.mfa_enabled is False
+
+    async def test_enroll_rejects_already_enabled(self) -> None:
+        service, _repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+        secret, _uri = await service.enroll_mfa(user.id)
+        await service.verify_and_enable_mfa(user.id, pyotp.TOTP(secret).now())
+
+        with pytest.raises(MfaAlreadyEnabledError):
+            await service.enroll_mfa(user.id)
+
+    async def test_verify_and_enable_requires_prior_enrollment(self) -> None:
+        service, _repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+
+        with pytest.raises(MfaNotEnrolledError):
+            await service.verify_and_enable_mfa(user.id, "123456")
+
+    async def test_verify_and_enable_rejects_wrong_code(self) -> None:
+        service, _repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+        await service.enroll_mfa(user.id)
+
+        with pytest.raises(InvalidMfaCodeError):
+            await service.verify_and_enable_mfa(user.id, "000000")
+
+    async def test_verify_and_enable_flips_flag_and_returns_recovery_codes(
+        self,
+    ) -> None:
+        service, _repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+        secret, _uri = await service.enroll_mfa(user.id)
+        recovery_codes = await service.verify_and_enable_mfa(
+            user.id, pyotp.TOTP(secret).now()
+        )
+
+        assert user.mfa_enabled is True
+        assert len(recovery_codes) == 10  # Settings.mfa_recovery_code_count default
+
+    async def test_login_requires_mfa_code_when_enabled(self) -> None:
+        service, _repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+        await _enable_mfa(service, user.id)
+        await _verify_email(service, user)
+
+        with pytest.raises(MfaRequiredError):
+            await service.login(
+                "mfa@example.com", STRONG_PASSWORD, make_device_info()
+            )
+
+    async def test_login_succeeds_with_correct_totp_code(self) -> None:
+        service, _repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+        secret = await _enable_mfa(service, user.id)
+        await _verify_email(service, user)
+        _user, tokens, _session_id = await service.login(
+            "mfa@example.com",
+            STRONG_PASSWORD,
+            make_device_info(),
+            mfa_code=pyotp.TOTP(secret).now(),
+        )
+
+        assert tokens.access_token
+
+    async def test_login_succeeds_with_recovery_code_and_consumes_it(self) -> None:
+        service, repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+        _secret = await _enable_mfa(service, user.id)
+        await _verify_email(service, user)
+        recovery_code = repository.recovery_codes_by_user[user.id][0]
+        # We only have the hash in the fake repo's stored row; regenerate a
+        # known plaintext/hash pair directly via the mfa module instead.
+
+        plaintext = "ABCDE-12345"
+        recovery_code.code_hash = mfa_module.hash_recovery_code(plaintext)
+
+        await service.login(
+            "mfa@example.com",
+            STRONG_PASSWORD,
+            make_device_info(),
+            mfa_code=plaintext,
+        )
+
+        assert recovery_code.used_at is not None
+
+    async def test_login_rejects_wrong_mfa_code(self) -> None:
+        service, _repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+        await _enable_mfa(service, user.id)
+        await _verify_email(service, user)
+
+        with pytest.raises(InvalidMfaCodeError):
+            await service.login(
+                "mfa@example.com",
+                STRONG_PASSWORD,
+                make_device_info(),
+                mfa_code="000000",
+            )
+
+    async def test_disable_requires_correct_password_and_code(self) -> None:
+        service, _repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+        secret = await _enable_mfa(service, user.id)
+        with pytest.raises(InvalidCredentialsError):
+            await service.disable_mfa(
+                user.id, password="wrong-password", code=pyotp.TOTP(secret).now()
+            )
+
+    async def test_disable_clears_mfa_state(self) -> None:
+        service, repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+        secret = await _enable_mfa(service, user.id)
+        await service.disable_mfa(
+            user.id, password=STRONG_PASSWORD, code=pyotp.TOTP(secret).now()
+        )
+
+        assert user.mfa_enabled is False
+        assert repository.mfa_credentials_by_user.get(user.id) is None
+
+    async def test_disable_rejects_when_not_enabled(self) -> None:
+        service, _repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+
+        with pytest.raises(MfaNotEnabledError):
+            await service.disable_mfa(user.id, password=STRONG_PASSWORD, code="123456")
+
+    async def test_regenerate_recovery_codes_replaces_old_ones(self) -> None:
+        service, repository, _redis = make_service()
+        user, _token = await service.register(
+            first_name="Test",
+            last_name="User",
+            email="mfa@example.com",
+            username="mfauser",
+            password=STRONG_PASSWORD,
+        )
+        secret = await _enable_mfa(service, user.id)
+        old_codes = list(repository.recovery_codes_by_user[user.id])
+        new_codes = await service.regenerate_recovery_codes(
+            user.id, code=pyotp.TOTP(secret).now()
+        )
+
+        assert len(new_codes) == 10
+        new_hashes = {c.code_hash for c in repository.recovery_codes_by_user[user.id]}
+        old_hashes = {c.code_hash for c in old_codes}
+        assert new_hashes.isdisjoint(old_hashes)
+
+
+async def _enable_mfa(service: AuthService, user_id: uuid.UUID) -> str:
+    """Enrolls and verifies MFA for ``user_id``, returning the raw TOTP
+    secret so a test can generate further valid codes."""
+    import pyotp
+
+    secret, _uri = await service.enroll_mfa(user_id)
+    await service.verify_and_enable_mfa(user_id, pyotp.TOTP(secret).now())
+    return secret
+
+
+async def _verify_email(service: AuthService, user: User) -> None:
+    """Marks ``user`` verified directly through the repository -- MFA
+    login tests need a verified account but don't exercise the
+    verification flow itself."""
+    await service.repository.update_user(user, is_verified=True)

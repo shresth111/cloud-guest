@@ -29,11 +29,14 @@ from fastapi import Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.storage import ObjectStorageProtocol, get_object_storage
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.location.dependencies import get_location_service
 from app.domains.location.service import LocationService
+from app.domains.notification.dependencies import get_notification_service
+from app.domains.notification.service import NotificationService
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.authorization import AccessValidator
@@ -64,6 +67,8 @@ def get_voucher_service(
     organization_service: OrganizationService = Depends(get_organization_service),
     location_service: LocationService = Depends(get_location_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    object_storage: ObjectStorageProtocol = Depends(get_object_storage),
+    notification_service: NotificationService = Depends(get_notification_service),
 ) -> VoucherService:
     return VoucherService(
         repository,
@@ -71,6 +76,8 @@ def get_voucher_service(
         organization_service,
         location_service,
         audit_writer=audit_repository,
+        object_storage=object_storage,
+        notification_service=notification_service,
     )
 
 

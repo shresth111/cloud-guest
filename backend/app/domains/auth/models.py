@@ -117,6 +117,14 @@ class User(BaseModel):
         Boolean, default=True, nullable=False
     )
 
+    # MFA/TOTP addition (see app.domains.auth.mfa's own module docstring).
+    # A denormalized flag directly on User -- mirrors data_masking_enabled's
+    # own identical "fast, join-free check on the hot auth path" precedent
+    # -- rather than requiring a join to UserMfaCredential on every login.
+    # False by default: every pre-existing account, and every newly
+    # registered account, has MFA off until the user explicitly enrolls.
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     sessions: Mapped[list[Session]] = relationship(
         "Session", back_populates="user", cascade="all, delete-orphan"
     )
@@ -242,6 +250,59 @@ class LoginAttempt(BaseModel):
         )
 
 
+class UserMfaCredential(BaseModel):
+    """One TOTP secret per user (1:1, enforced by ``user_id``'s own
+    ``unique=True``). ``secret_encrypted`` is opaque ciphertext -- see
+    ``app.domains.auth.mfa``'s own module docstring for the encryption
+    scheme. A row exists from the moment a user starts enrollment
+    (``User.mfa_enabled`` still ``False`` until the first successful
+    verify); disabling MFA deletes the row entirely rather than leaving a
+    stale, unusable secret around."""
+
+    __tablename__ = "user_mfa_credentials"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    enrolled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (Index("ix_user_mfa_credentials_user_id", "user_id", unique=True),)
+
+    def __repr__(self) -> str:
+        return f"<UserMfaCredential(user_id={self.user_id})>"
+
+
+class UserMfaRecoveryCode(BaseModel):
+    """One single-use recovery code. Only ``code_hash`` (SHA-256) is ever
+    stored -- see ``app.domains.auth.mfa``'s own module docstring for why.
+    ``used_at`` is set the moment a code is consumed; a used code is never
+    accepted again."""
+
+    __tablename__ = "user_mfa_recovery_codes"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    code_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_user_mfa_recovery_codes_user_id", "user_id"),
+        Index("ix_user_mfa_recovery_codes_used_at", "used_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<UserMfaRecoveryCode(user_id={self.user_id})>"
+
+
 @dataclass
 class AuthUser:
     """Lightweight, non-persisted representation of an authenticated user.
@@ -257,6 +318,7 @@ class AuthUser:
     is_superuser: bool = False
     is_verified: bool = False
     data_masking_enabled: bool = True
+    mfa_enabled: bool = False
 
     @classmethod
     def from_model(cls, user: User) -> AuthUser:
@@ -268,6 +330,7 @@ class AuthUser:
             is_superuser=False,
             is_verified=user.is_verified,
             data_masking_enabled=user.data_masking_enabled,
+            mfa_enabled=user.mfa_enabled,
         )
 
 

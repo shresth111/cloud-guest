@@ -135,6 +135,7 @@ from app.domains.isp.constants import (
     ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
 )
+from app.domains.notification.constants import TASK_RUN_NOTIFICATION_DISPATCH_SWEEP
 from app.domains.provisioning_engine.constants import (
     PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
     TASK_DRAIN_PROVISION_QUEUE,
@@ -174,6 +175,7 @@ celery_app = Celery(
         "app.domains.connected_devices.tasks",
         "app.domains.guest.tasks",
         "app.domains.isp.tasks",
+        "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
     ],
@@ -354,6 +356,16 @@ celery_app.conf.update(
         "campaigns-sweep-status-transitions": {
             "task": TASK_SWEEP_CAMPAIGN_STATUS_TRANSITIONS,
             "schedule": CAMPAIGN_STATUS_SWEEP_INTERVAL_SECONDS,
+        },
+        # Notification domain: drains due PENDING/RETRYING
+        # NotificationDelivery rows -- see
+        # app.domains.notification.service's own module docstring for the
+        # full outbox/dispatch design and
+        # Settings.notification_dispatch_sweep_interval_seconds's own
+        # docstring for the cadence reasoning.
+        "notification-dispatch-sweep": {
+            "task": TASK_RUN_NOTIFICATION_DISPATCH_SWEEP,
+            "schedule": _settings.notification_dispatch_sweep_interval_seconds,
         },
     },
 )

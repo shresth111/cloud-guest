@@ -67,7 +67,9 @@ from .dependencies import (
 )
 from .models import Voucher, VoucherBatch, VoucherPlan, VoucherSeries
 from .schemas import (
+    MessageResponse,
     VoucherBatchCreate,
+    VoucherBatchEmailRequest,
     VoucherBatchListResponse,
     VoucherBatchResponse,
     VoucherBatchRevokeRequest,
@@ -600,6 +602,38 @@ async def download_voucher_batch_pdf(
                 f'attachment; filename="voucher_batch_{batch_id}.pdf"'
             )
         },
+    )
+
+
+@router.post(
+    "/voucher-batches/{batch_id}/email",
+    response_model=ApiResponse[MessageResponse],
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(RequirePermission("voucher.export"))],
+)
+async def email_voucher_batch_pdf(
+    request: Request,
+    batch_id: uuid.UUID,
+    payload: VoucherBatchEmailRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: VoucherService = Depends(get_voucher_service),
+):
+    """Operator-facing convenience: emails the same PDF export
+    ``GET .../download`` serves for direct download, as a real attachment
+    -- see ``VoucherService.email_batch_pdf``'s own docstring for why this
+    is deliberately not guest-facing auto-delivery."""
+    await service.email_batch_pdf(
+        batch_id=batch_id,
+        requesting_organization_id=requesting_organization_id,
+        recipient_email=payload.recipient_email,
+    )
+    return build_response(
+        success=True,
+        message="Voucher batch export queued for delivery",
+        data=MessageResponse(
+            message="Voucher batch export queued for delivery"
+        ).model_dump(),
+        request_id=str(getattr(request.state, "request_id", "")),
     )
 
 

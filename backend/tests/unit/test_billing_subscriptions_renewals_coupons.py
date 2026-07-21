@@ -393,12 +393,15 @@ class FakePaymentGateway:
         return PaymentResult(success=True)
 
 
-class FakeEmailProvider:
-    def __init__(self) -> None:
-        self.sent: list[tuple[str, str, str]] = []
+class FakeNotificationSender:
+    """In-memory stand-in for ``RenewalService``'s own
+    ``NotificationSenderProtocol``."""
 
-    async def send(self, email: str, subject: str, body: str) -> None:
-        self.sent.append((email, subject, body))
+    def __init__(self) -> None:
+        self.enqueued: list[dict[str, object]] = []
+
+    async def enqueue(self, **kwargs: object) -> None:
+        self.enqueued.append(kwargs)
 
 
 # ============================================================================
@@ -470,7 +473,7 @@ class RenewalFixture:
     plan_repository: FakePlanRepository
     license_fixture: LicenseFixture
     payment_gateway: FakePaymentGateway
-    email_provider: FakeEmailProvider
+    notification_service: FakeNotificationSender
     organization_composer: FakeOrganizationComposer
     service: RenewalService
 
@@ -489,7 +492,7 @@ def make_renewal_service(
     license_fixture = license_fixture or make_license_service()
     plan_repository = plan_repository or license_fixture.plan_repository
     payment_gateway = payment_gateway or FakePaymentGateway()
-    email_provider = FakeEmailProvider()
+    notification_service = FakeNotificationSender()
     organization_composer = license_fixture.organization_composer
     service = RenewalService(
         subscription_repository,
@@ -497,7 +500,7 @@ def make_renewal_service(
         license_service=license_fixture.service,
         organization_lookup=organization_composer,
         payment_gateway=payment_gateway,
-        email_provider=email_provider,
+        notification_service=notification_service,
         grace_period_days=grace_period_days,
         renewal_reminder_days_before=renewal_reminder_days_before,
         expiry_reminder_days_before=expiry_reminder_days_before,
@@ -507,7 +510,7 @@ def make_renewal_service(
         plan_repository,
         license_fixture,
         payment_gateway,
-        email_provider,
+        notification_service,
         organization_composer,
         service,
     )
@@ -1315,9 +1318,8 @@ class TestReminders:
 
         sent_count = await fx.service.send_renewal_reminders()
         assert sent_count == 1
-        assert len(fx.email_provider.sent) == 1
-        recipient, _subject, _body = fx.email_provider.sent[0]
-        assert recipient == "org@example.com"
+        assert len(fx.notification_service.enqueued) == 1
+        assert fx.notification_service.enqueued[0]["recipient"] == "org@example.com"
 
         updated = await fx.subscription_repository.get_by_id(subscription.id)
         assert updated.last_renewal_reminder_sent_at is not None
@@ -1325,7 +1327,7 @@ class TestReminders:
         # A second sweep within the same billing period must not re-send.
         sent_again = await fx.service.send_renewal_reminders()
         assert sent_again == 0
-        assert len(fx.email_provider.sent) == 1
+        assert len(fx.notification_service.enqueued) == 1
 
     async def test_renewal_reminder_not_sent_outside_window(self) -> None:
         fx = make_renewal_service(renewal_reminder_days_before=3)
@@ -1378,7 +1380,7 @@ class TestReminders:
 
         sent_count = await fx.service.send_expiry_reminders()
         assert sent_count == 1
-        assert len(fx.email_provider.sent) == 1
+        assert len(fx.notification_service.enqueued) == 1
 
         updated = await fx.subscription_repository.get_by_id(subscription.id)
         assert updated.last_expiry_reminder_sent_at is not None

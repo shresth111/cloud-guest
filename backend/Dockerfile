@@ -16,6 +16,8 @@ RUN pip install --upgrade pip \
 
 COPY app ./app
 COPY scripts ./scripts
+COPY alembic ./alembic
+COPY alembic.ini .
 
 RUN chmod +x /app/scripts/run_api.sh \
     && mkdir -p /var/log/cloudguest

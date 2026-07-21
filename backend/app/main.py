@@ -12,6 +12,8 @@ from app.core.logging import configure_logging, get_logger
 from app.core.metrics import PrometheusMiddleware
 from app.core.metrics import router as metrics_router
 from app.core.tracing import configure_tracing
+from app.database.redis import redis_client
+from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_context import RequestContextMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 
@@ -50,6 +52,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RequestContextMiddleware)
+    # Global, Redis-backed rate limit on auth/public/guest-facing routes
+    # only -- see app.middleware.rate_limit's own module docstring for
+    # exactly which paths and why.
+    app.add_middleware(
+        RateLimitMiddleware,
+        redis=redis_client,
+        max_requests=app_settings.rate_limit_max_requests,
+        window_seconds=app_settings.rate_limit_window_seconds,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[str(origin) for origin in app_settings.allowed_origins],

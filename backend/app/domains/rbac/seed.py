@@ -217,7 +217,19 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     PermissionModule.REPORTS: (_A.READ, _A.EXPORT, _A.VIEW, _A.MANAGE),
     PermissionModule.MONITORING: (_A.READ, _A.VIEW, _A.MANAGE),
     PermissionModule.ALERTS: (_A.READ, _A.UPDATE, _A.DELETE, _A.VIEW, _A.MANAGE),
-    PermissionModule.NOTIFICATIONS: (_A.READ, _A.UPDATE, _A.DELETE, _A.MANAGE),
+    # Extended for app.domains.notification's own NotificationTemplate CRUD
+    # (CREATE was previously missing -- this module was seeded ahead of any
+    # real domain, like PermissionModule.BANDWIDTH/DHCP were). Additive
+    # only: no existing role's own grants change shape, since
+    # expand_grant_level filters by action name, not position -- see
+    # PermissionModule.BANDWIDTH's own identical precedent comment above.
+    PermissionModule.NOTIFICATIONS: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.MANAGE,
+    ),
     PermissionModule.BILLING: (_A.READ, _A.UPDATE, _A.EXPORT, _A.MANAGE),
     PermissionModule.INVOICES: (
         _A.CREATE,

@@ -16,12 +16,13 @@ import uuid
 from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
+from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 
 from .enums import ScopeType
 from .models import (
@@ -181,6 +182,19 @@ class RBACRepositoryProtocol(Protocol):
     async def list_audit_log_entries(
         self, *, entity_type: str | None = None, entity_id: uuid.UUID | None = None
     ) -> list[AuditLogEntry]: ...
+
+    async def search_audit_log_entries(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        actor_user_id: uuid.UUID | None = None,
+        action: str | None = None,
+        entity_type: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[AuditLogEntry], PaginationMeta]: ...
 
 
 class RBACRepository:
@@ -527,3 +541,53 @@ class RBACRepository:
         return await self.audit_log_entries.get_all(
             filters=filters or None, sort_by="created_at", sort_order=SortOrder.DESC
         )
+
+    async def search_audit_log_entries(
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        actor_user_id: uuid.UUID | None = None,
+        action: str | None = None,
+        entity_type: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[AuditLogEntry], PaginationMeta]:
+        """Extension of :meth:`list_audit_log_entries` for
+        ``app.domains.audit``'s query/export surface -- hand-written SQL,
+        not ``GenericRepository.paginate``'s equality/IN-only filters,
+        since a ``start``/``end`` date range needs a real ``>=``/``<=``
+        comparison (same precedent as
+        ``app.domains.billing.repository.BillingRepository
+        .list_issued_past_due``). No schema change -- reads the exact same
+        ``audit_log_entries`` table ``create_audit_log_entry`` already
+        writes."""
+        conditions = [AuditLogEntry.is_deleted.is_(False)]
+        if organization_id is not None:
+            conditions.append(AuditLogEntry.organization_id == organization_id)
+        if actor_user_id is not None:
+            conditions.append(AuditLogEntry.actor_user_id == actor_user_id)
+        if action is not None:
+            conditions.append(AuditLogEntry.action == action)
+        if entity_type is not None:
+            conditions.append(AuditLogEntry.entity_type == entity_type)
+        if start is not None:
+            conditions.append(AuditLogEntry.created_at >= start)
+        if end is not None:
+            conditions.append(AuditLogEntry.created_at <= end)
+
+        params = PageParams(page=page, page_size=page_size)
+        count_statement = (
+            select(func.count()).select_from(AuditLogEntry).where(*conditions)
+        )
+        total_items = (await self.session.execute(count_statement)).scalar_one()
+
+        statement = (
+            select(AuditLogEntry)
+            .where(*conditions)
+            .order_by(AuditLogEntry.created_at.desc())
+        )
+        result = await self.session.execute(paginate(statement, params))
+        rows = list(result.scalars().all())
+        return rows, PaginationMeta.from_total(params, total_items)

@@ -51,6 +51,7 @@ from app.domains.voucher.exceptions import (
     VoucherBatchNotActiveError,
     VoucherBatchNotFoundError,
     VoucherBatchQuantityExceededError,
+    VoucherEmailDeliveryNotConfiguredError,
     VoucherExhaustedError,
     VoucherExpiredError,
     VoucherNotFoundError,
@@ -384,6 +385,33 @@ class FakeRedis:
 
 
 @dataclass
+class FakeObjectStorage:
+    """In-memory stand-in for ``app.core.storage.ObjectStorageProtocol``."""
+
+    uploaded: dict[str, bytes] = field(default_factory=dict)
+
+    async def upload(self, *, key: str, content: bytes, content_type: str) -> str:
+        self.uploaded[key] = content
+        return key
+
+    async def generate_presigned_url(
+        self, *, key: str, expires_in_seconds: int = 3600
+    ) -> str:
+        return f"https://example.com/{key}"
+
+
+@dataclass
+class FakeNotificationSender:
+    """In-memory stand-in for
+    ``VoucherService``'s own ``VoucherNotificationSenderProtocol``."""
+
+    enqueued: list[dict[str, object]] = field(default_factory=list)
+
+    async def enqueue(self, **kwargs: object) -> None:
+        self.enqueued.append(kwargs)
+
+
+@dataclass
 class Fixture:
     repository: FakeVoucherRepository
     redis: FakeRedis
@@ -392,10 +420,15 @@ class Fixture:
     location_lookup: FakeLocationLookup
     service: VoucherService
     organization: Organization
+    object_storage: FakeObjectStorage | None = None
+    notification_service: FakeNotificationSender | None = None
 
 
 def make_service(
-    *, redemption_max_attempts_per_window: int = 30, redemption_window_minutes: int = 1
+    *,
+    redemption_max_attempts_per_window: int = 30,
+    redemption_window_minutes: int = 1,
+    with_email_delivery: bool = False,
 ) -> Fixture:
     repository = FakeVoucherRepository()
     redis = FakeRedis()
@@ -403,12 +436,16 @@ def make_service(
     organization_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup()
     organization = organization_lookup.add()
+    object_storage = FakeObjectStorage() if with_email_delivery else None
+    notification_service = FakeNotificationSender() if with_email_delivery else None
     service = VoucherService(
         repository,
         redis,
         organization_lookup,
         location_lookup,
         audit_writer=audit_writer,
+        object_storage=object_storage,
+        notification_service=notification_service,
         redemption_max_attempts_per_window=redemption_max_attempts_per_window,
         redemption_window_minutes=redemption_window_minutes,
     )
@@ -420,6 +457,8 @@ def make_service(
         location_lookup=location_lookup,
         service=service,
         organization=organization,
+        object_storage=object_storage,
+        notification_service=notification_service,
     )
 
 
@@ -1252,6 +1291,41 @@ class TestExportPdf:
         with pytest.raises(VoucherBatchNotFoundError):
             await fx.service.export_batch_pdf(
                 batch_id=uuid.uuid4(), requesting_organization_id=fx.organization.id
+            )
+
+
+class TestEmailBatchPdf:
+    """``VoucherService.email_batch_pdf`` -- operator-facing convenience,
+    not guest-facing auto-delivery (see that method's own docstring)."""
+
+    async def test_email_batch_pdf_uploads_and_enqueues(self) -> None:
+        fx = make_service(with_email_delivery=True)
+        batch = await _create_batch(fx, quantity=2, has_manage_permission=True)
+
+        await fx.service.email_batch_pdf(
+            batch_id=batch.id,
+            requesting_organization_id=fx.organization.id,
+            recipient_email="ops@example.com",
+        )
+
+        assert len(fx.object_storage.uploaded) == 1
+        stored_key, stored_bytes = next(iter(fx.object_storage.uploaded.items()))
+        assert stored_bytes[:4] == b"%PDF"
+        assert len(fx.notification_service.enqueued) == 1
+        call = fx.notification_service.enqueued[0]
+        assert call["recipient"] == "ops@example.com"
+        assert call["attachment_storage_key"] == stored_key
+        assert call["organization_id"] == fx.organization.id
+
+    async def test_email_batch_pdf_raises_when_not_configured(self) -> None:
+        fx = make_service()
+        batch = await _create_batch(fx, quantity=1, has_manage_permission=True)
+
+        with pytest.raises(VoucherEmailDeliveryNotConfiguredError):
+            await fx.service.email_batch_pdf(
+                batch_id=batch.id,
+                requesting_organization_id=fx.organization.id,
+                recipient_email="ops@example.com",
             )
 
 

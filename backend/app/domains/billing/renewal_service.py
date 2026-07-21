@@ -16,10 +16,13 @@ of forward-looking seam this codebase has built before:
   .RouterProvisioningService.complete_provisioning_job`` as an explicit,
   documented, not-yet-called seam for BE-010's ``router_agent`` to call
   later -- and BE-010 then genuinely called it, unmodified.
-* ``app.domains.otp.service.EmailProviderProtocol`` /
-  ``LoggingEmailProvider`` is the identical shape one level removed: a
-  narrow ``Protocol`` plus an honest interim default, reused here verbatim
-  (see below) rather than rebuilt.
+* Renewal/expiry reminders are enqueued through
+  ``app.domains.notification.service.NotificationService`` (a durable
+  outbox with real retry -- see that module's own docstring), not sent
+  directly via ``app.domains.otp.service.EmailProviderProtocol`` as in an
+  earlier pass of this file. ``NotificationSenderProtocol`` below is the
+  narrow, structural seam -- reused composition, not a rebuilt
+  abstraction.
 
 ``process_renewal`` does **everything real it can do today**: it determines
 whether a renewal is genuinely due, computes the real charge amount (the
@@ -75,7 +78,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
-from app.domains.otp.service import EmailProviderProtocol, LoggingEmailProvider
+from app.domains.notification.constants import (
+    NotificationChannelType,
+    NotificationEventType,
+)
 from app.domains.rbac.enums import AuditAction
 
 from .constants import RENEWABLE_SUBSCRIPTION_STATUSES, SubscriptionStatus
@@ -188,6 +194,48 @@ class OrganizationContactLookupProtocol(Protocol):
     ) -> object: ...
 
 
+class NotificationSenderProtocol(Protocol):
+    """The minimal surface ``RenewalService`` needs to enqueue a reminder
+    email -- satisfied structurally by
+    ``app.domains.notification.service.NotificationService`` (see that
+    module's own docstring). A narrow ``Protocol``, not a hard import of
+    the concrete class -- mirrors ``OrganizationContactLookupProtocol``'s
+    identical per-domain composition pattern."""
+
+    async def enqueue(
+        self,
+        *,
+        event_type: NotificationEventType,
+        channel: NotificationChannelType,
+        recipient: str,
+        body: str,
+        organization_id: uuid.UUID | None,
+        subject: str | None = None,
+    ) -> object: ...
+
+
+class _NoopNotificationSender:
+    """Honest fallback when no real ``NotificationSenderProtocol`` is
+    wired in -- logs instead of silently discarding the reminder,
+    mirroring ``app.domains.auth.service._NoopNotificationSender``'s
+    identical precedent."""
+
+    async def enqueue(
+        self,
+        *,
+        event_type: NotificationEventType,
+        channel: NotificationChannelType,
+        recipient: str,
+        body: str,
+        organization_id: uuid.UUID | None,
+        subject: str | None = None,
+    ) -> None:
+        logger.info(
+            "billing_notification_would_send",
+            extra={"event_type": event_type.value, "recipient": recipient},
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class RenewalSweepResult:
     subscriptions_checked: int
@@ -221,7 +269,7 @@ class RenewalService:
         license_service: LicenseLifecycleProtocol,
         organization_lookup: OrganizationContactLookupProtocol,
         payment_gateway: PaymentGatewayProtocol | None = None,
-        email_provider: EmailProviderProtocol | None = None,
+        notification_service: NotificationSenderProtocol | None = None,
         audit_writer: AuditLogWriter | None = None,
         grace_period_days: int = 7,
         renewal_reminder_days_before: int = 3,
@@ -234,8 +282,8 @@ class RenewalService:
         self.payment_gateway: PaymentGatewayProtocol = (
             payment_gateway or UnconfiguredPaymentGateway()
         )
-        self.email_provider: EmailProviderProtocol = (
-            email_provider or LoggingEmailProvider()
+        self.notification_service: NotificationSenderProtocol = (
+            notification_service or _NoopNotificationSender()
         )
         self.audit_writer = audit_writer
         self.grace_period_days = grace_period_days
@@ -544,6 +592,7 @@ class RenewalService:
                 continue
             await self._send_reminder_email(
                 subscription,
+                event_type=NotificationEventType.SUBSCRIPTION_RENEWAL_REMINDER,
                 subject="Your CloudGuest subscription renews soon",
                 body=(
                     f"Your subscription is scheduled to renew on "
@@ -590,6 +639,7 @@ class RenewalService:
                 continue
             await self._send_reminder_email(
                 subscription,
+                event_type=NotificationEventType.SUBSCRIPTION_EXPIRY_REMINDER,
                 subject="Action needed: your CloudGuest license will expire soon",
                 body=(
                     "Your most recent renewal attempt failed. Unless resolved, "
@@ -608,12 +658,24 @@ class RenewalService:
         return sent
 
     async def _send_reminder_email(
-        self, subscription: Subscription, *, subject: str, body: str
+        self,
+        subscription: Subscription,
+        *,
+        event_type: NotificationEventType,
+        subject: str,
+        body: str,
     ) -> None:
         organization = await self.organization_lookup.get_organization(
             subscription.organization_id
         )
-        await self.email_provider.send(organization.contact_email, subject, body)
+        await self.notification_service.enqueue(
+            event_type=event_type,
+            channel=NotificationChannelType.EMAIL,
+            recipient=organization.contact_email,
+            subject=subject,
+            body=body,
+            organization_id=subscription.organization_id,
+        )
 
     # ========================================================================
     # The single Beat-scheduled entrypoint (tasks.run_subscription_renewal_sweep)

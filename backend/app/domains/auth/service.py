@@ -13,6 +13,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 from uuid import uuid4
 
 from fastapi import status
@@ -21,7 +22,12 @@ from redis.asyncio import Redis
 from app.common.exceptions import CloudGuestError
 from app.core.config import get_settings
 from app.database.redis import redis_client as _default_redis_client
+from app.domains.notification.constants import (
+    NotificationChannelType,
+    NotificationEventType,
+)
 
+from . import mfa
 from .jwt import InvalidTokenError as JWTInvalidTokenError
 from .jwt import JWTManager
 from .jwt import TokenExpiredError as JWTTokenExpiredError
@@ -106,6 +112,52 @@ class InvalidTokenError(AuthServiceError):
         super().__init__(message, status_code=status.HTTP_401_UNAUTHORIZED)
 
 
+class MfaAlreadyEnabledError(AuthServiceError):
+    def __init__(self) -> None:
+        super().__init__(
+            "MFA is already enabled for this account",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class MfaNotEnrolledError(AuthServiceError):
+    def __init__(self) -> None:
+        super().__init__(
+            "MFA enrollment has not been started for this account",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class MfaNotEnabledError(AuthServiceError):
+    def __init__(self) -> None:
+        super().__init__(
+            "MFA is not enabled for this account",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class MfaRequiredError(AuthServiceError):
+    """Raised by ``login`` instead of issuing tokens when the account has
+    MFA enabled and no ``mfa_code`` was supplied -- mirrors
+    ``PasswordChangeRequiredError``'s identical "credentials correct but a
+    special state blocks a normal login" precedent. The caller retries the
+    same ``login`` call with ``mfa_code`` included."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "MFA code required to complete login",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+
+class InvalidMfaCodeError(AuthServiceError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Invalid MFA code or recovery code",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+
 @dataclass
 class DeviceInfo:
     """Client device/network context captured at login, for session tracking."""
@@ -127,6 +179,49 @@ _VERIFICATION_TOKEN_KEY = "auth:email_verification:{token}"
 _RESET_TOKEN_KEY = "auth:password_reset:{token}"
 
 
+class NotificationSenderProtocol(Protocol):
+    """The minimal surface ``AuthService`` needs to actually deliver an
+    email -- satisfied structurally by
+    ``app.domains.notification.service.NotificationService`` (see
+    ``app.domains.notification``'s own module docstring for the full
+    outbox/dispatch design). A narrow ``Protocol``, not a hard import of
+    that concrete class -- the same cross-domain composition pattern every
+    other domain's service already uses."""
+
+    async def enqueue(
+        self,
+        *,
+        event_type: NotificationEventType,
+        channel: NotificationChannelType,
+        recipient: str,
+        body: str,
+        organization_id: uuid.UUID | None,
+        subject: str | None = None,
+    ) -> object: ...
+
+
+class _NoopNotificationSender:
+    """Honest fallback when no real ``NotificationSenderProtocol`` is
+    wired in -- logs instead of silently discarding the token, mirroring
+    ``app.domains.otp.service.LoggingEmailProvider``'s identical "logged,
+    not faked, not silently dropped" precedent."""
+
+    async def enqueue(
+        self,
+        *,
+        event_type: NotificationEventType,
+        channel: NotificationChannelType,
+        recipient: str,
+        body: str,
+        organization_id: uuid.UUID | None,
+        subject: str | None = None,
+    ) -> None:
+        logger.info(
+            "auth_notification_would_send",
+            extra={"event_type": event_type.value, "recipient": recipient},
+        )
+
+
 class AuthService:
     """Core authentication business logic."""
 
@@ -134,9 +229,14 @@ class AuthService:
         self,
         repository: AuthRepositoryProtocol,
         redis: Redis | None = None,
+        *,
+        notification_service: NotificationSenderProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.redis = redis or _default_redis_client
+        self.notification_service: NotificationSenderProtocol = (
+            notification_service or _NoopNotificationSender()
+        )
 
     # -- registration -----------------------------------------------------
 
@@ -183,6 +283,17 @@ class AuthService:
         verification_token = await self._issue_cache_token(
             _VERIFICATION_TOKEN_KEY, user.id, ttl=timedelta(hours=24)
         )
+        await self.notification_service.enqueue(
+            event_type=NotificationEventType.EMAIL_VERIFICATION,
+            channel=NotificationChannelType.EMAIL,
+            recipient=user.email,
+            subject="Verify your CloudGuest account",
+            body=(
+                f"Welcome to CloudGuest, {user.first_name}. Use this code to "
+                f"verify your account: {verification_token}"
+            ),
+            organization_id=None,
+        )
 
         logger.info("user_registered", extra={"email": user.email})
         return user, verification_token
@@ -190,11 +301,24 @@ class AuthService:
     # -- login / tokens -----------------------------------------------------
 
     async def login(
-        self, email: str, password: str, device_info: DeviceInfo
+        self,
+        email: str,
+        password: str,
+        device_info: DeviceInfo,
+        *,
+        mfa_code: str | None = None,
     ) -> tuple[User, TokenPair, uuid.UUID]:
         """Authenticate a user and start a session.
 
         Returns ``(user, tokens, session_id)``.
+
+        If the account has MFA enabled (``User.mfa_enabled``) and
+        ``mfa_code`` is omitted, raises ``MfaRequiredError`` instead of
+        issuing tokens -- the caller retries the same call with
+        ``mfa_code`` set (a 6-digit TOTP code, or a recovery code). See
+        module docstring's ``PasswordChangeRequiredError`` precedent for
+        why this is a single-endpoint retry rather than a separate
+        challenge-token flow.
         """
         await AuthSecurity.check_rate_limit(self.redis, email, device_info.ip_address)
 
@@ -235,6 +359,26 @@ class AuthService:
                 reason="password_change_required",
             )
             raise PasswordChangeRequiredError()
+
+        if user.mfa_enabled:
+            if not mfa_code:
+                await self._record_attempt(
+                    user.id,
+                    email,
+                    device_info,
+                    success=False,
+                    reason="mfa_code_required",
+                )
+                raise MfaRequiredError()
+            if not await self._verify_mfa_or_recovery_code(user.id, mfa_code):
+                await self._record_attempt(
+                    user.id,
+                    email,
+                    device_info,
+                    success=False,
+                    reason="invalid_mfa_code",
+                )
+                raise InvalidMfaCodeError()
 
         await self.repository.update_user(
             user,
@@ -339,8 +483,19 @@ class AuthService:
         """Issue a reset token if the email exists. Never reveals whether it does."""
         user = await self.repository.get_user_by_email(email)
         if user:
-            await self._issue_cache_token(
+            reset_token = await self._issue_cache_token(
                 _RESET_TOKEN_KEY, user.id, ttl=timedelta(hours=1)
+            )
+            await self.notification_service.enqueue(
+                event_type=NotificationEventType.PASSWORD_RESET,
+                channel=NotificationChannelType.EMAIL,
+                recipient=user.email,
+                subject="Reset your CloudGuest password",
+                body=(
+                    "Use this code to reset your password: "
+                    f"{reset_token} (expires in 1 hour)."
+                ),
+                organization_id=None,
             )
             logger.info("password_reset_initiated", extra={"user_id": str(user.id)})
         else:
@@ -391,9 +546,151 @@ class AuthService:
     async def resend_verification(self, email: str) -> None:
         user = await self.repository.get_user_by_email(email)
         if user and not user.is_verified:
-            await self._issue_cache_token(
+            verification_token = await self._issue_cache_token(
                 _VERIFICATION_TOKEN_KEY, user.id, ttl=timedelta(hours=24)
             )
+            await self.notification_service.enqueue(
+                event_type=NotificationEventType.EMAIL_VERIFICATION,
+                channel=NotificationChannelType.EMAIL,
+                recipient=user.email,
+                subject="Verify your CloudGuest account",
+                body=(
+                    "Use this code to verify your account: "
+                    f"{verification_token}"
+                ),
+                organization_id=None,
+            )
+
+    # -- MFA ------------------------------------------------------------------
+
+    async def _verify_mfa_or_recovery_code(self, user_id: uuid.UUID, code: str) -> bool:
+        """Tries a real TOTP code first, then falls back to a single-use
+        recovery code -- either satisfies ``login``'s own ``mfa_code``
+        check."""
+        credential = await self.repository.get_mfa_credential(user_id)
+        if credential is not None:
+            secret = mfa.decrypt_secret(credential.secret_encrypted)
+            if mfa.verify_code(secret, code):
+                await self.repository.update_mfa_credential(
+                    credential, {"last_verified_at": datetime.now(UTC)}
+                )
+                return True
+
+        recovery_code = await self.repository.get_active_recovery_code(
+            user_id, mfa.hash_recovery_code(code)
+        )
+        if recovery_code is not None:
+            await self.repository.mark_recovery_code_used(recovery_code)
+            return True
+
+        return False
+
+    async def enroll_mfa(self, user_id: uuid.UUID) -> tuple[str, str]:
+        """Starts (or restarts, if not yet verified) MFA enrollment.
+        Returns ``(secret, provisioning_uri)`` -- the secret is shown once
+        here so a user without an authenticator app handy can type it in
+        manually; ``provisioning_uri`` is what a QR code would encode.
+        ``User.mfa_enabled`` stays ``False`` until :meth:`verify_and_enable_mfa`
+        succeeds."""
+        user = await self.repository.get_user_by_id(user_id)
+        if not user:
+            raise UserNotFoundError()
+        if user.mfa_enabled:
+            raise MfaAlreadyEnabledError()
+
+        secret = mfa.generate_secret()
+        encrypted = mfa.encrypt_secret(secret)
+        existing = await self.repository.get_mfa_credential(user_id)
+        if existing is not None:
+            await self.repository.update_mfa_credential(
+                existing, {"secret_encrypted": encrypted, "enrolled_at": None}
+            )
+        else:
+            await self.repository.create_mfa_credential(
+                user_id=user_id,
+                secret_encrypted=encrypted,
+                enrolled_at=None,
+                last_verified_at=None,
+            )
+        uri = mfa.get_provisioning_uri(secret, account_name=user.email)
+        logger.info("mfa_enrollment_started", extra={"user_id": str(user_id)})
+        return secret, uri
+
+    async def verify_and_enable_mfa(self, user_id: uuid.UUID, code: str) -> list[str]:
+        """Completes enrollment: verifies ``code`` against the pending
+        secret, flips ``User.mfa_enabled``, and returns a fresh set of
+        recovery codes (plaintext, shown exactly once)."""
+        user = await self.repository.get_user_by_id(user_id)
+        if not user:
+            raise UserNotFoundError()
+
+        credential = await self.repository.get_mfa_credential(user_id)
+        if credential is None:
+            raise MfaNotEnrolledError()
+
+        secret = mfa.decrypt_secret(credential.secret_encrypted)
+        if not mfa.verify_code(secret, code):
+            raise InvalidMfaCodeError()
+
+        now = datetime.now(UTC)
+        await self.repository.update_mfa_credential(
+            credential,
+            {"enrolled_at": credential.enrolled_at or now, "last_verified_at": now},
+        )
+        await self.repository.update_user(user, mfa_enabled=True)
+
+        recovery_codes = mfa.generate_recovery_codes(
+            get_settings().mfa_recovery_code_count
+        )
+        await self.repository.replace_recovery_codes(
+            user_id, [mfa.hash_recovery_code(c) for c in recovery_codes]
+        )
+        logger.info("mfa_enabled", extra={"user_id": str(user_id)})
+        return recovery_codes
+
+    async def disable_mfa(
+        self, user_id: uuid.UUID, *, password: str, code: str
+    ) -> None:
+        """Disables MFA -- requires both the current password (proves this
+        is the account owner, not a hijacked session) and a valid MFA/
+        recovery code (proves the second factor itself, not just the
+        first, is under the caller's control)."""
+        user = await self.repository.get_user_by_id(user_id)
+        if not user:
+            raise UserNotFoundError()
+        if not user.mfa_enabled:
+            raise MfaNotEnabledError()
+        if not PasswordManager.verify(password, user.password_hash):
+            raise InvalidCredentialsError()
+        if not await self._verify_mfa_or_recovery_code(user_id, code):
+            raise InvalidMfaCodeError()
+
+        credential = await self.repository.get_mfa_credential(user_id)
+        await self.repository.update_user(user, mfa_enabled=False)
+        if credential is not None:
+            await self.repository.delete_mfa_credential(credential)
+        await self.repository.replace_recovery_codes(user_id, [])
+        logger.info("mfa_disabled", extra={"user_id": str(user_id)})
+
+    async def regenerate_recovery_codes(
+        self, user_id: uuid.UUID, *, code: str
+    ) -> list[str]:
+        """Invalidates every existing recovery code and issues a fresh
+        set -- requires a valid MFA/recovery code first."""
+        user = await self.repository.get_user_by_id(user_id)
+        if not user or not user.mfa_enabled:
+            raise MfaNotEnabledError()
+        if not await self._verify_mfa_or_recovery_code(user_id, code):
+            raise InvalidMfaCodeError()
+
+        recovery_codes = mfa.generate_recovery_codes(
+            get_settings().mfa_recovery_code_count
+        )
+        await self.repository.replace_recovery_codes(
+            user_id, [mfa.hash_recovery_code(c) for c in recovery_codes]
+        )
+        logger.info("mfa_recovery_codes_regenerated", extra={"user_id": str(user_id)})
+        return recovery_codes
 
     # -- sessions -------------------------------------------------------------
 

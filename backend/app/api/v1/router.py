@@ -2,6 +2,8 @@ from fastapi import APIRouter
 
 from app.api.v1.health.routes import router as health_router
 from app.domains.analytics.router import router as analytics_router
+from app.domains.api_keys.router import router as api_keys_router
+from app.domains.audit.router import router as audit_router
 from app.domains.auth.router import router as auth_router
 from app.domains.billing.router import router as billing_router
 from app.domains.campaigns.router import guest_router as campaigns_guest_router
@@ -28,6 +30,7 @@ from app.domains.mac_authorization.router import router as mac_authorization_rou
 from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
 from app.domains.network_diagnostics.router import router as network_diagnostics_router
+from app.domains.notification.router import router as notification_router
 from app.domains.organization.router import router as organization_router
 from app.domains.otp.router import router as otp_router
 from app.domains.policy.router import router as policy_router
@@ -88,3 +91,6 @@ api_v1_router.include_router(qos_router)
 api_v1_router.include_router(network_diagnostics_router)
 api_v1_router.include_router(campaigns_guest_router)
 api_v1_router.include_router(campaigns_router)
+api_v1_router.include_router(notification_router)
+api_v1_router.include_router(api_keys_router)
+api_v1_router.include_router(audit_router)

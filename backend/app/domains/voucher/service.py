@@ -125,8 +125,13 @@ from typing import Protocol
 
 from redis.asyncio import Redis
 
+from app.core.storage import ObjectStorageProtocol
 from app.database.constants import MAX_BULK_CREATE_SIZE
 from app.domains.location.models import Location
+from app.domains.notification.constants import (
+    NotificationChannelType,
+    NotificationEventType,
+)
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 
@@ -158,6 +163,7 @@ from .exceptions import (
     VoucherBatchNotFoundError,
     VoucherBatchQuantityExceededError,
     VoucherCodeGenerationExhaustedError,
+    VoucherEmailDeliveryNotConfiguredError,
     VoucherExhaustedError,
     VoucherExpiredError,
     VoucherNotFoundError,
@@ -211,6 +217,28 @@ class AuditLogWriter(Protocol):
     shape every other domain's service already defines for itself."""
 
     async def create_audit_log_entry(self, **fields: object) -> object: ...
+
+
+class VoucherNotificationSenderProtocol(Protocol):
+    """The minimal surface ``VoucherService.email_batch_pdf`` needs --
+    satisfied structurally by
+    ``app.domains.notification.service.NotificationService`` (see that
+    module's own docstring). A narrow ``Protocol``, not a hard import of
+    the concrete class -- mirrors ``AuditLogWriter``'s identical
+    per-domain composition pattern."""
+
+    async def enqueue(
+        self,
+        *,
+        event_type: NotificationEventType,
+        channel: NotificationChannelType,
+        recipient: str,
+        body: str,
+        organization_id: uuid.UUID | None,
+        subject: str | None = None,
+        attachment_storage_key: str | None = None,
+        attachment_filename: str | None = None,
+    ) -> object: ...
 
 
 # ============================================================================
@@ -291,6 +319,8 @@ class VoucherService:
         location_lookup: LocationLookupProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        object_storage: ObjectStorageProtocol | None = None,
+        notification_service: VoucherNotificationSenderProtocol | None = None,
         redemption_max_attempts_per_window: int = (
             DEFAULT_REDEMPTION_MAX_ATTEMPTS_PER_WINDOW
         ),
@@ -301,6 +331,8 @@ class VoucherService:
         self.organization_lookup = organization_lookup
         self.location_lookup = location_lookup
         self.audit_writer = audit_writer
+        self.object_storage = object_storage
+        self.notification_service = notification_service
         self.redemption_max_attempts_per_window = redemption_max_attempts_per_window
         self.redemption_window_minutes = redemption_window_minutes
 
@@ -1037,6 +1069,52 @@ class VoucherService:
         )
         return render_voucher_batch_pdf(
             batch, vouchers, organization_name=organization.name
+        )
+
+    async def email_batch_pdf(
+        self,
+        *,
+        batch_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        recipient_email: str,
+    ) -> object:
+        """Operator-facing convenience: emails ``batch_id``'s existing PDF
+        export (:meth:`export_batch_pdf`, reused as-is -- no duplicate PDF
+        logic) to ``recipient_email`` as a real attachment, via
+        ``app.core.storage`` + ``app.domains.notification``.
+
+        Deliberately **not** guest-facing auto-delivery -- vouchers remain
+        a physically/verbally-communicated artifact by design (see this
+        module's own docstring); this only lets a staff member email
+        themselves/a distribution address the same export
+        ``GET .../export/pdf`` already serves for direct download.
+
+        Raises ``VoucherEmailDeliveryNotConfiguredError`` if this service
+        instance was constructed without ``object_storage``/
+        ``notification_service`` -- never silently drops the export.
+        """
+        if self.object_storage is None or self.notification_service is None:
+            raise VoucherEmailDeliveryNotConfiguredError()
+
+        pdf_bytes = await self.export_batch_pdf(
+            batch_id=batch_id, requesting_organization_id=requesting_organization_id
+        )
+        storage_key = f"voucher-batches/{batch_id}/{uuid.uuid4()}.pdf"
+        await self.object_storage.upload(
+            key=storage_key, content=pdf_bytes, content_type="application/pdf"
+        )
+        return await self.notification_service.enqueue(
+            event_type=NotificationEventType.VOUCHER_BATCH_EXPORT,
+            channel=NotificationChannelType.EMAIL,
+            recipient=recipient_email,
+            subject="Your CloudGuest voucher batch export",
+            body=(
+                "The voucher batch export you requested is attached to "
+                "this email."
+            ),
+            organization_id=requesting_organization_id,
+            attachment_storage_key=storage_key,
+            attachment_filename=f"voucher_batch_{batch_id}.pdf",
         )
 
     async def import_vouchers(

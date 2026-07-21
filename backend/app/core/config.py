@@ -671,6 +671,152 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ========================================================================
+    # Notification domain: real email/SMS providers + object storage +
+    # outbox dispatch
+    #
+    # Mirrors the Stripe/Razorpay section's own "empty/'logging' = honest
+    # unconfigured default" pattern: every real-provider setting below is
+    # inert until explicitly selected via `email_delivery_provider`/
+    # `sms_delivery_provider`, so a fresh local checkout keeps today's
+    # log-only behavior with zero configuration. See
+    # app.domains.otp.service's `SmtpEmailProvider`/`SesEmailProvider`/
+    # `TwilioSmsProvider` and app.domains.notification for the full
+    # write-up.
+    # ========================================================================
+
+    email_delivery_provider: str = Field(
+        default="logging",
+        description=(
+            "Which concrete EmailProviderProtocol implementation "
+            "app.domains.otp.service.get_configured_email_provider selects: "
+            "'logging' (default, no real send), 'smtp', or 'ses'."
+        ),
+    )
+    smtp_host: str = Field(default="", description="SMTP server hostname.")
+    smtp_port: int = Field(default=587, ge=1, le=65_535)
+    smtp_username: str = Field(default="")
+    smtp_password: str = Field(default="")
+    smtp_use_tls: bool = Field(default=True)
+    smtp_from_address: str = Field(default="noreply@cloudguest.local")
+
+    ses_access_key_id: str = Field(default="")
+    ses_secret_access_key: str = Field(default="")
+    ses_region: str = Field(default="us-east-1")
+    ses_from_address: str = Field(default="")
+
+    sms_delivery_provider: str = Field(
+        default="logging",
+        description=(
+            "Which concrete SmsProviderProtocol implementation "
+            "app.domains.otp.service.get_configured_sms_provider selects: "
+            "'logging' (default, no real send) or 'twilio'."
+        ),
+    )
+    twilio_account_sid: str = Field(default="")
+    twilio_auth_token: str = Field(default="")
+    twilio_from_number: str = Field(default="")
+
+    s3_endpoint_url: str = Field(
+        default="http://minio:9000",
+        description=(
+            "S3-compatible endpoint app.core.storage.S3ObjectStorage "
+            "connects to -- points at the local docker-compose MinIO "
+            "service by default. Override with a real AWS S3 endpoint (or "
+            "leave the AWS default) in any non-local deployment."
+        ),
+    )
+    s3_bucket_name: str = Field(default="cloudguest")
+    s3_access_key_id: str = Field(default="cloudguest")
+    s3_secret_access_key: str = Field(default="cloudguest12345")
+    s3_region: str = Field(default="us-east-1")
+
+    notification_dispatch_sweep_interval_seconds: float = Field(
+        default=60.0,
+        ge=5.0,
+        le=3600.0,
+        description=(
+            "Beat interval for app.domains.notification.tasks"
+            ".run_notification_dispatch_sweep, which drains every PENDING/"
+            "RETRYING NotificationDelivery row whose next_attempt_at has "
+            "passed."
+        ),
+    )
+    notification_max_delivery_attempts: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description=(
+            "How many real send attempts a NotificationDelivery gets "
+            "before app.domains.notification.service.NotificationService"
+            ".dispatch_pending gives up and leaves it FAILED."
+        ),
+    )
+    notification_retry_backoff_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=86_400,
+        description=(
+            "Flat backoff before a RETRYING NotificationDelivery's next "
+            "send attempt. A flat (not exponential) backoff is the "
+            "deliberately simplest defensible choice for this first pass "
+            "-- see app.domains.notification.service's own docstring."
+        ),
+    )
+
+    # ========================================================================
+    # Security surface: API keys, MFA/TOTP, rate limiting
+    # ========================================================================
+
+    mfa_encryption_key: str = Field(
+        default="aW5zZWN1cmUtbG9jYWwtZGV2LWZlcm5ldC1rZXkzMiE=",
+        min_length=32,
+        description=(
+            "App-level symmetric key (Fernet, urlsafe-base64) used by "
+            "app.domains.auth.mfa to encrypt/decrypt a user's TOTP secret "
+            "at rest. Deliberately a separate key from "
+            "router_encryption_key -- an unrelated secret class gets its "
+            "own key, never a shared one. Same interim-design posture as "
+            "router_encryption_key (see that field's own docstring): must "
+            "be overridden with a real Fernet key "
+            "(Fernet.generate_key()) in every non-local environment."
+        ),
+    )
+    mfa_recovery_code_count: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description=(
+            "How many single-use recovery codes "
+            "app.domains.auth.mfa.generate_recovery_codes issues on MFA "
+            "enrollment/regeneration."
+        ),
+    )
+
+    rate_limit_max_requests: int = Field(
+        default=60,
+        ge=1,
+        le=10_000,
+        description=(
+            "Requests a single (client IP, path) pair may make within "
+            "rate_limit_window_seconds before "
+            "app.middleware.rate_limit.RateLimitMiddleware responds "
+            "429 -- applied only to the curated auth/public/guest-facing "
+            "path prefixes that module's own constants.py lists, not "
+            "every route."
+        ),
+    )
+    rate_limit_window_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=3600,
+        description=(
+            "Rolling window (seconds) rate_limit_max_requests is measured "
+            "over -- mirrors app.domains.otp.service.OtpRateLimiter's "
+            "identical INCR+EXPIRE+TTL Redis pattern."
+        ),
+    )
+
     @property
     def log_path(self) -> Path:
         return self.log_dir / self.log_file

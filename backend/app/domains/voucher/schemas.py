@@ -18,9 +18,13 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+from app.domains.auth.schemas import MessageResponse
 
 __all__ = [
+    "MessageResponse",
+    "VoucherBatchEmailRequest",
     "VoucherPlanCreateRequest",
     "VoucherPlanResponse",
     "VoucherPlanListResponse",
@@ -337,3 +341,13 @@ class VoucherRedeemResponse(BaseModel):
     expires_at: datetime | None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class VoucherBatchEmailRequest(BaseModel):
+    """``POST /voucher-batches/{batch_id}/email`` -- an operator-facing
+    convenience emailing the same PDF export ``GET .../download`` already
+    serves for direct download. See ``VoucherService.email_batch_pdf``'s
+    own docstring for why this is deliberately not guest-facing
+    auto-delivery."""
+
+    recipient_email: EmailStr

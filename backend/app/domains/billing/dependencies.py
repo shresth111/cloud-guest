@@ -29,6 +29,8 @@ from app.domains.analytics.dependencies import get_analytics_repository
 from app.domains.analytics.repository import AnalyticsRepositoryProtocol
 from app.domains.guest.dependencies import get_guest_analytics_service
 from app.domains.guest.service import GuestAnalyticsService
+from app.domains.notification.dependencies import get_notification_service
+from app.domains.notification.service import NotificationService
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import get_rbac_repository
@@ -307,6 +309,7 @@ def get_renewal_service(
     organization_service: OrganizationService = Depends(get_organization_service),
     payment_gateway: PaymentGatewayProtocol = Depends(get_payment_gateway),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    notification_service: NotificationService = Depends(get_notification_service),
     settings: Settings = Depends(get_settings),
 ) -> RenewalService:
     return RenewalService(
@@ -315,6 +318,7 @@ def get_renewal_service(
         license_service=license_service,
         organization_lookup=organization_service,
         payment_gateway=payment_gateway,
+        notification_service=notification_service,
         audit_writer=audit_repository,
         grace_period_days=settings.subscription_renewal_grace_period_days,
         renewal_reminder_days_before=settings.subscription_renewal_reminder_days_before,

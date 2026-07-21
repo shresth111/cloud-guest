@@ -4,8 +4,8 @@ composing existing analytics services (verified via spies -- proving
 composition, never recomputation), every export format (JSON/CSV/Excel/PDF)
 producing real, valid, parseable output, the scheduled-report Celery task's
 due-report detection + per-schedule failure isolation +
-``next_run_at`` computation, email dispatch via the reused
-``EmailProviderProtocol``, tenant isolation, and unconditional
+``next_run_at`` computation, email dispatch (with a real attachment) via
+``app.domains.notification``, tenant isolation, and unconditional
 (never-throttled) audit-every-generation.
 
 Follows this project's plain-``assert``/native-``async def`` style (see
@@ -67,7 +67,6 @@ from app.domains.analytics.report_types import (
     extract_tabular_blocks,
     flatten_scalar_fields,
 )
-from app.domains.otp.service import EmailProviderProtocol
 from app.domains.rbac.enums import ScopeType
 
 # ============================================================================
@@ -1059,12 +1058,26 @@ class _FakeGenerationService:
         )
 
 
-class _FakeEmailProvider(EmailProviderProtocol):
+class _FakeObjectStorage:
     def __init__(self) -> None:
-        self.sent: list[tuple[str, str, str]] = []
+        self.uploaded: dict[str, bytes] = {}
 
-    async def send(self, email: str, subject: str, body: str) -> None:
-        self.sent.append((email, subject, body))
+    async def upload(self, *, key: str, content: bytes, content_type: str) -> str:
+        self.uploaded[key] = content
+        return key
+
+    async def generate_presigned_url(
+        self, *, key: str, expires_in_seconds: int = 3600
+    ) -> str:
+        return f"https://example.com/{key}"
+
+
+class _FakeNotificationSender:
+    def __init__(self) -> None:
+        self.enqueued: list[dict[str, object]] = []
+
+    async def enqueue(self, **kwargs: object) -> None:
+        self.enqueued.append(kwargs)
 
 
 def _make_template(*, created_by_user_id=None, config=None) -> ReportTemplate:
@@ -1117,20 +1130,32 @@ async def test_run_one_scheduled_report_sends_email_to_every_recipient():
     schedule = _make_schedule(template_id=template.id)
     repository = _FakeReportRepositoryForTasks({template.id: template})
     generation_service = _FakeGenerationService()
-    email_provider = _FakeEmailProvider()
+    object_storage = _FakeObjectStorage()
+    notification_service = _FakeNotificationSender()
 
     await _run_one_scheduled_report(
-        repository, generation_service, email_provider, schedule, now=datetime.now(UTC)
+        repository,
+        generation_service,
+        object_storage,
+        notification_service,
+        schedule,
+        now=datetime.now(UTC),
     )
 
     assert generation_service.calls == [schedule.template_id]
-    assert [email for email, _, _ in email_provider.sent] == schedule.recipient_emails
-    for _, subject, body in email_provider.sent:
-        assert "Scheduled Report" in subject
-        # Honest attachment limitation -- see report_tasks.py's own module
-        # docstring: the body describes the report, it does not (cannot,
-        # via this shared protocol) attach its bytes.
-        assert "json" in body.lower() or "bytes" in body.lower()
+    assert [
+        call["recipient"] for call in notification_service.enqueued
+    ] == schedule.recipient_emails
+    # The rendered report's real bytes are persisted and attached -- not
+    # just described -- closing report_tasks.py's own previously-documented
+    # attachment gap.
+    assert len(object_storage.uploaded) == 1
+    stored_key, stored_bytes = next(iter(object_storage.uploaded.items()))
+    assert len(stored_bytes) > 0
+    for call in notification_service.enqueued:
+        assert "Scheduled Report" in call["subject"]
+        assert call["attachment_storage_key"] == stored_key
+        assert call["attachment_filename"]
 
 
 async def test_run_one_scheduled_report_raises_when_template_missing():
@@ -1140,7 +1165,8 @@ async def test_run_one_scheduled_report_raises_when_template_missing():
         await _run_one_scheduled_report(
             repository,
             _FakeGenerationService(),
-            _FakeEmailProvider(),
+            _FakeObjectStorage(),
+            _FakeNotificationSender(),
             schedule,
             now=datetime.now(UTC),
         )
@@ -1154,7 +1180,8 @@ async def test_run_one_scheduled_report_raises_when_no_attributable_actor():
         await _run_one_scheduled_report(
             repository,
             _FakeGenerationService(),
-            _FakeEmailProvider(),
+            _FakeObjectStorage(),
+            _FakeNotificationSender(),
             schedule,
             now=datetime.now(UTC),
         )
@@ -1171,13 +1198,15 @@ async def test_scheduled_report_batch_isolates_one_failure_and_reports_it():
         {good_template.id: good_template, bad_template.id: bad_template}
     )
     generation_service = _FakeGenerationService(fail_for={bad_template.id})
-    email_provider = _FakeEmailProvider()
+    object_storage = _FakeObjectStorage()
+    notification_service = _FakeNotificationSender()
     now = datetime.now(UTC)
 
     result = await run_scheduled_report_batch(
         repository,
         generation_service,
-        email_provider,
+        object_storage,
+        notification_service,
         [good_schedule, bad_schedule],
         now=now,
     )
@@ -1203,14 +1232,15 @@ async def test_scheduled_report_batch_isolates_one_failure_and_reports_it():
         assert fields["next_run_at"] > now
 
     # Only the good schedule's recipients actually received a "send".
-    assert len(email_provider.sent) == len(good_schedule.recipient_emails)
+    assert len(notification_service.enqueued) == len(good_schedule.recipient_emails)
 
 
 async def test_scheduled_report_batch_empty_due_list_is_a_no_op():
     result = await run_scheduled_report_batch(
         _FakeReportRepositoryForTasks({}),
         _FakeGenerationService(),
-        _FakeEmailProvider(),
+        _FakeObjectStorage(),
+        _FakeNotificationSender(),
         [],
         now=datetime.now(UTC),
     )
