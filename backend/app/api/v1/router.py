@@ -18,6 +18,7 @@ from app.domains.guest_teams.router import guest_router as guest_teams_guest_rou
 from app.domains.isp.router import router as isp_router
 from app.domains.isp_routing.router import router as isp_routing_router
 from app.domains.location.router import router as location_router
+from app.domains.mac_authorization.router import router as mac_authorization_router
 from app.domains.monitoring.router import router as monitoring_router
 from app.domains.organization.router import router as organization_router
 from app.domains.otp.router import router as otp_router
@@ -68,3 +69,4 @@ api_v1_router.include_router(isp_routing_router)
 api_v1_router.include_router(vlan_router)
 api_v1_router.include_router(dhcp_router)
 api_v1_router.include_router(port_forwarding_router)
+api_v1_router.include_router(mac_authorization_router)

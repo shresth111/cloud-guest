@@ -107,6 +107,7 @@ class PermissionModule(StrEnum):
     ISP = "isp"
     ISP_ROUTING = "isp_routing"
     VLAN = "vlan"
+    MAC_AUTHORIZATION = "mac_authorization"
 
 
 class OverrideEffect(StrEnum):
@@ -656,3 +657,12 @@ class AuditAction(StrEnum):
     PORT_FORWARDING_RULE_CREATED = "port_forwarding_rule_created"
     PORT_FORWARDING_RULE_UPDATED = "port_forwarding_rule_updated"
     PORT_FORWARDING_RULE_DELETED = "port_forwarding_rule_deleted"
+
+    # MAC Authorization domain events -- written through this same table
+    # by
+    # ``app.domains.mac_authorization.service.MacAuthorizationService``
+    # via the same narrow ``AuditLogWriter`` protocol shape every other
+    # domain's service uses.
+    MAC_AUTHORIZATION_ENTRY_CREATED = "mac_authorization_entry_created"
+    MAC_AUTHORIZATION_ENTRY_UPDATED = "mac_authorization_entry_updated"
+    MAC_AUTHORIZATION_ENTRY_DELETED = "mac_authorization_entry_deleted"

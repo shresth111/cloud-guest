@@ -292,6 +292,19 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # was for queue_management) -- this build reuses it as-is for
     # app.domains.dhcp rather than minting a second key, and its shape
     # already matches (CREATE/READ/UPDATE/DELETE/MANAGE, no EXECUTE).
+    # MAC Authorization: CRUD plus IMPORT/EXPORT for its own bulk
+    # operations -- mirrors PermissionModule.VOUCHER's own inclusion of
+    # both actions for the identical "bulk-load/download a whitelist"
+    # shape.
+    PermissionModule.MAC_AUTHORIZATION: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.IMPORT,
+        _A.EXPORT,
+        _A.MANAGE,
+    ),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -338,6 +351,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.ISP: "ISP Management",
     PermissionModule.ISP_ROUTING: "ISP Routing",
     PermissionModule.VLAN: "VLAN Management",
+    PermissionModule.MAC_AUTHORIZATION: "MAC Authorization",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -400,6 +414,12 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # above (seeded ahead of any real domain) and already matches this
     # domain's own scoping (a DHCP pool is scoped to one router's own
     # interfaces) -- reused as-is, no change needed.
+    # MAC Authorization has no router concept at all (organization/
+    # location scoped only) -- ScopeType.LOCATION mirrors
+    # PermissionModule.GUEST_ACCESS's own identical scope for the
+    # closest analogous domain (also a MAC-address-keyed, org/location-
+    # scoped concept).
+    PermissionModule.MAC_AUTHORIZATION: ScopeType.LOCATION,
 }
 
 
@@ -512,6 +532,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.GUEST_USERS: _L.OPERATE,
             _M.GUEST_SESSIONS: _L.OPERATE,
             _M.GUEST_ACCESS: _L.OPERATE,
+            _M.MAC_AUTHORIZATION: _L.OPERATE,
             _M.GUEST_TEAMS: _L.OPERATE,
             _M.ALERTS: _L.OPERATE,
             _M.NOTIFICATIONS: _L.OPERATE,
@@ -650,6 +671,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.GUEST_USERS: _L.OPERATE,
             _M.GUEST_SESSIONS: _L.OPERATE,
             _M.GUEST_ACCESS: _L.OPERATE,
+            _M.MAC_AUTHORIZATION: _L.OPERATE,
             _M.GUEST_TEAMS: _L.OPERATE,
             _M.CAPTIVE_PORTAL: _L.OPERATE,
             _M.VOUCHER: _L.OPERATE,
@@ -675,6 +697,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.GUEST_USERS: _L.OPERATE,
             _M.GUEST_SESSIONS: _L.OPERATE,
             _M.GUEST_ACCESS: _L.OPERATE,
+            _M.MAC_AUTHORIZATION: _L.OPERATE,
             _M.GUEST_TEAMS: _L.OPERATE,
             _M.VOUCHER: _L.OPERATE,
             _M.OTP: _L.OPERATE,
@@ -691,6 +714,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.GUEST_USERS: _L.READ,
             _M.GUEST_SESSIONS: _L.OPERATE,
             _M.GUEST_ACCESS: _L.READ,
+            _M.MAC_AUTHORIZATION: _L.READ,
             _M.GUEST_TEAMS: _L.READ,
             _M.POLICY: _L.READ,
             _M.ALERTS: _L.READ,
@@ -732,6 +756,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.GUEST_USERS: _L.OPERATE,
             _M.GUEST_SESSIONS: _L.OPERATE,
             _M.GUEST_ACCESS: _L.OPERATE,
+            _M.MAC_AUTHORIZATION: _L.OPERATE,
             _M.GUEST_TEAMS: _L.OPERATE,
             _M.OTP: _L.OPERATE,
             _M.VOUCHER: _L.OPERATE,
