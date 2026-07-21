@@ -22,6 +22,7 @@ from app.domains.monitoring.router import router as monitoring_router
 from app.domains.organization.router import router as organization_router
 from app.domains.otp.router import router as otp_router
 from app.domains.policy.router import router as policy_router
+from app.domains.port_forwarding.router import router as port_forwarding_router
 from app.domains.provisioning_engine.router import router as provisioning_engine_router
 from app.domains.queue_management.router import router as queue_management_router
 from app.domains.rbac.router import router as rbac_router
@@ -66,3 +67,4 @@ api_v1_router.include_router(isp_router)
 api_v1_router.include_router(isp_routing_router)
 api_v1_router.include_router(vlan_router)
 api_v1_router.include_router(dhcp_router)
+api_v1_router.include_router(port_forwarding_router)
