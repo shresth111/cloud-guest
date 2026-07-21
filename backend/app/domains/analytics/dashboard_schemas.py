@@ -23,6 +23,8 @@ __all__ = [
     "DeviceBreakdownResponse",
     "AuthMethodBreakdownItem",
     "SuperAdminDashboardResponse",
+    "PlatformHealthSummaryResponse",
+    "UnifiedSuperAdminDashboardResponse",
     "HealthScoreResponse",
     "OrganizationSummaryItem",
     "OrganizationDashboardResponse",
@@ -168,6 +170,42 @@ class SuperAdminDashboardResponse(BaseModel):
         "are unavailable."
     )
     revenue: RevenueMetricsResponse
+
+
+class PlatformHealthSummaryResponse(BaseModel):
+    """A compact slice of ``app.domains.monitoring.service
+    .PlatformDashboardService.get_dashboard_statistics``'s own, richer
+    ``PlatformDashboardResult`` -- just the fields the composed
+    ``UnifiedSuperAdminDashboardResponse`` needs. The full monitoring
+    dashboard (device/ZTP lifecycle breakdowns, etc.) remains available,
+    unmodified, at ``GET /monitoring/dashboard``."""
+
+    overall_health_status: str
+    alert_counts_by_severity: dict[str, int]
+    alert_counts_by_status: dict[str, int]
+    device_counts_by_status: dict[str, int]
+    average_response_time_ms: float | None
+    availability_percentage: float | None
+
+
+class UnifiedSuperAdminDashboardResponse(BaseModel):
+    """Composes three already-existing, separately-callable dashboards --
+    this domain's own ``SuperAdminDashboardResponse``,
+    ``app.domains.monitoring``'s platform health statistics, and
+    ``app.domains.billing``'s Revenue/License figures -- into one payload,
+    plus the one genuinely new figure none of them expose: a real
+    ``License.status`` breakdown across every organization on the
+    platform. None of the three source dashboards are modified, removed,
+    or replaced by this -- each remains independently callable exactly as
+    before."""
+
+    platform: SuperAdminDashboardResponse
+    operations: PlatformHealthSummaryResponse
+    license_status_breakdown: dict[str, int]
+    total_revenue: float | None
+    mrr: float | None
+    arr: float | None
+    revenue_note: str
 
 
 # ============================================================================

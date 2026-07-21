@@ -31,14 +31,23 @@ from app.domains.location.models import Location
 from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
-from app.domains.policy.constants import PLATFORM_DEFAULT_RULES, PolicyType
+from app.domains.policy.constants import (
+    PLATFORM_DEFAULT_RULES,
+    PolicyAssignmentTargetType,
+    PolicyType,
+)
 from app.domains.policy.exceptions import (
     CrossOrganizationPolicyAccessError,
     InvalidPolicyAssignmentScopeTypeError,
+    InvalidPolicyAssignmentTargetTypeError,
     InvalidPolicyVersionStatusTransitionError,
     PolicyAssignmentRequiresPublishedVersionError,
     PolicyAssignmentScopeIdNotAllowedError,
     PolicyAssignmentScopeIdRequiredError,
+    PolicyAssignmentTargetIdNotAllowedError,
+    PolicyAssignmentTargetIdRequiredError,
+    PolicyAssignmentTargetRoleNotFoundError,
+    PolicyAssignmentTargetUserNotFoundError,
     PolicyRollbackTargetMismatchError,
     PolicyRollbackTargetNotPublishedError,
     PolicyRulesValidationError,
@@ -267,6 +276,8 @@ class FakePolicyRepository:
         policy_type: str,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        user_id: uuid.UUID | None = None,
+        role_ids: list[uuid.UUID] | None = None,
     ) -> list[PolicyAssignment]:
         candidates = []
         for assignment in self.assignments.values():
@@ -288,7 +299,26 @@ class FakePolicyRepository:
                 and location_id is not None
                 and assignment.scope_id == location_id
             )
-            if is_global_match or is_org_match or is_location_match:
+            if not (is_global_match or is_org_match or is_location_match):
+                continue
+
+            # Unflushed test fixtures that construct a PolicyAssignment
+            # directly (bypassing PolicyService.create_assignment) never
+            # get the column's "none" default applied -- normalize None
+            # the same way a real flush/DB read would.
+            target_type = getattr(assignment, "target_type", None) or "none"
+            is_untargeted = target_type == "none"
+            is_user_match = (
+                target_type == "user"
+                and user_id is not None
+                and assignment.target_id == user_id
+            )
+            is_role_match = (
+                target_type == "role"
+                and role_ids
+                and assignment.target_id in role_ids
+            )
+            if is_untargeted or is_user_match or is_role_match:
                 candidates.append(assignment)
         return candidates
 
@@ -306,6 +336,48 @@ def _build_service() -> (
         repo, org_lookup, location_lookup, audit_writer=audit_writer
     )
     return service, repo, org_lookup, audit_writer
+
+
+@dataclass
+class FakeUserLookup:
+    """In-memory stand-in for ``PolicyService.UserLookupProtocol``."""
+
+    known_user_ids: set[uuid.UUID] = field(default_factory=set)
+
+    async def get_user_by_id(self, user_id: uuid.UUID) -> object | None:
+        return object() if user_id in self.known_user_ids else None
+
+
+@dataclass
+class FakeRoleLookup:
+    """In-memory stand-in for ``PolicyService.RoleLookupProtocol``."""
+
+    known_role_ids: set[uuid.UUID] = field(default_factory=set)
+
+    async def get_role_by_id(
+        self, role_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> object | None:
+        return object() if role_id in self.known_role_ids else None
+
+
+def _build_service_with_targeting() -> tuple[
+    PolicyService, FakePolicyRepository, FakeUserLookup, FakeRoleLookup
+]:
+    repo = FakePolicyRepository()
+    org_lookup = FakeOrganizationLookup()
+    location_lookup = FakeLocationLookup()
+    audit_writer = FakeAuditLogWriter()
+    user_lookup = FakeUserLookup()
+    role_lookup = FakeRoleLookup()
+    service = PolicyService(
+        repo,
+        org_lookup,
+        location_lookup,
+        audit_writer=audit_writer,
+        user_lookup=user_lookup,
+        role_lookup=role_lookup,
+    )
+    return service, repo, user_lookup, role_lookup
 
 
 async def _create_published_session_policy(
@@ -1121,6 +1193,268 @@ class TestResolution:
             organization_id=org.id,
             location_id=None,
         )
+        assert resolved.source == "platform_default"
+
+
+# ============================================================================
+# WHO-targeting (Enterprise SaaS Phase F: per-user / per-role assignments)
+# ============================================================================
+
+
+class TestPolicyAssignmentTargeting:
+    async def test_create_assignment_rejects_invalid_target_type(self) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+
+        with pytest.raises(InvalidPolicyAssignmentTargetTypeError):
+            await service.create_assignment(
+                policy_id=policy.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                scope_type=ScopeType.GLOBAL.value,
+                scope_id=None,
+                priority=0,
+                target_type="department",
+                target_id=uuid.uuid4(),
+            )
+
+    async def test_create_assignment_rejects_target_id_for_none_target_type(
+        self,
+    ) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+
+        with pytest.raises(PolicyAssignmentTargetIdNotAllowedError):
+            await service.create_assignment(
+                policy_id=policy.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                scope_type=ScopeType.GLOBAL.value,
+                scope_id=None,
+                priority=0,
+                target_type=PolicyAssignmentTargetType.NONE.value,
+                target_id=uuid.uuid4(),
+            )
+
+    async def test_create_assignment_requires_target_id_for_user_target_type(
+        self,
+    ) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+
+        with pytest.raises(PolicyAssignmentTargetIdRequiredError):
+            await service.create_assignment(
+                policy_id=policy.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                scope_type=ScopeType.GLOBAL.value,
+                scope_id=None,
+                priority=0,
+                target_type=PolicyAssignmentTargetType.USER.value,
+                target_id=None,
+            )
+
+    async def test_create_assignment_rejects_unknown_user_target(self) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+
+        with pytest.raises(PolicyAssignmentTargetUserNotFoundError):
+            await service.create_assignment(
+                policy_id=policy.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                scope_type=ScopeType.GLOBAL.value,
+                scope_id=None,
+                priority=0,
+                target_type=PolicyAssignmentTargetType.USER.value,
+                target_id=uuid.uuid4(),
+            )
+
+    async def test_create_assignment_rejects_unknown_role_target(self) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+
+        with pytest.raises(PolicyAssignmentTargetRoleNotFoundError):
+            await service.create_assignment(
+                policy_id=policy.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                scope_type=ScopeType.GLOBAL.value,
+                scope_id=None,
+                priority=0,
+                target_type=PolicyAssignmentTargetType.ROLE.value,
+                target_id=uuid.uuid4(),
+            )
+
+    async def test_create_assignment_accepts_known_user_target(self) -> None:
+        service, _repo, user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+        user_id = uuid.uuid4()
+        user_lookup.known_user_ids.add(user_id)
+
+        assignment = await service.create_assignment(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.USER.value,
+            target_id=user_id,
+        )
+        assert assignment.target_type == PolicyAssignmentTargetType.USER.value
+        assert assignment.target_id == user_id
+
+    async def test_user_targeted_assignment_wins_over_untargeted(self) -> None:
+        service, _repo, user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+        # Untargeted, organization-scoped assignment -- applies to everyone.
+        await service.create_assignment(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.ORGANIZATION.value,
+            scope_id=org.id,
+            priority=0,
+        )
+        # A second published policy with a personalized override.
+        personalized_policy = await _create_published_session_policy(
+            service, organization_id=org.id
+        )
+        await service.create_version(
+            policy_id=personalized_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={
+                "session_timeout_minutes": 9999,
+                "max_concurrent_sessions_per_guest": 99,
+                "termination_reconnect_cooldown_minutes": 99,
+                "reconnect_grace_minutes": 99,
+            },
+        )
+        user_id = uuid.uuid4()
+        user_lookup.known_user_ids.add(user_id)
+        await service.create_assignment(
+            policy_id=personalized_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.USER.value,
+            target_id=user_id,
+        )
+
+        resolved = await service.resolve_effective_policy(
+            policy_type=PolicyType.SESSION,
+            organization_id=org.id,
+            location_id=None,
+            user_id=user_id,
+        )
+
+        assert resolved.source == f"user:{user_id}"
+        assert resolved.user_id == user_id
+
+    async def test_role_targeted_assignment_wins_over_untargeted_but_not_user(
+        self,
+    ) -> None:
+        service, _repo, user_lookup, role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        base_policy = await _create_published_session_policy(
+            service, organization_id=org.id
+        )
+        await service.create_assignment(
+            policy_id=base_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.ORGANIZATION.value,
+            scope_id=org.id,
+            priority=0,
+        )
+
+        role_policy = await _create_published_session_policy(
+            service, organization_id=org.id
+        )
+        role_id = uuid.uuid4()
+        role_lookup.known_role_ids.add(role_id)
+        await service.create_assignment(
+            policy_id=role_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.ROLE.value,
+            target_id=role_id,
+        )
+
+        user_id = uuid.uuid4()
+        user_lookup.known_user_ids.add(user_id)
+        resolved = await service.resolve_effective_policy(
+            policy_type=PolicyType.SESSION,
+            organization_id=org.id,
+            location_id=None,
+            user_id=user_id,
+            role_ids=[role_id],
+        )
+        assert resolved.source == f"role:{role_id}"
+
+        # A user-targeted assignment on yet a third policy must still beat
+        # the role-targeted one.
+        user_policy = await _create_published_session_policy(
+            service, organization_id=org.id
+        )
+        await service.create_assignment(
+            policy_id=user_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.USER.value,
+            target_id=user_id,
+        )
+        resolved_again = await service.resolve_effective_policy(
+            policy_type=PolicyType.SESSION,
+            organization_id=org.id,
+            location_id=None,
+            user_id=user_id,
+            role_ids=[role_id],
+        )
+        assert resolved_again.source == f"user:{user_id}"
+
+    async def test_role_assignment_not_a_candidate_for_a_different_role(self) -> None:
+        service, _repo, _user_lookup, role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+        role_id = uuid.uuid4()
+        role_lookup.known_role_ids.add(role_id)
+        await service.create_assignment(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.ROLE.value,
+            target_id=role_id,
+        )
+
+        resolved = await service.resolve_effective_policy(
+            policy_type=PolicyType.SESSION,
+            organization_id=org.id,
+            location_id=None,
+            user_id=uuid.uuid4(),
+            role_ids=[uuid.uuid4()],
+        )
+
         assert resolved.source == "platform_default"
 
 

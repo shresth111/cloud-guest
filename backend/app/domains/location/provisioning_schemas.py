@@ -29,6 +29,7 @@ __all__ = [
     "NewOrganizationInputSchema",
     "ProvisionLocationRequest",
     "ProvisionLocationResponse",
+    "ProvisionLocationPreviewResponse",
     "ResendWelcomeEmailResponse",
 ]
 
@@ -215,6 +216,38 @@ class ProvisionLocationResponse(BaseModel):
     )
     login_url: str
     provisioned_at: str
+
+
+class ProvisionLocationPreviewResponse(BaseModel):
+    """The Organization Provisioning Wizard's "review summary before
+    final provisioning" screen -- a read-only preview, never persisted.
+    See ``provisioning_service.ProvisionLocationPreview``'s own
+    docstring for exactly what each generated-ID field maps to and the
+    honest boundary on what this preview does and does not guarantee."""
+
+    organization_id: str | None = Field(
+        default=None,
+        description=(
+            "Null when previewing a new organization -- it does not exist "
+            "yet, so it has no id yet."
+        ),
+    )
+    organization_name: str
+    customer_id: str = Field(
+        ..., description="The organization's slug -- this platform's Customer ID."
+    )
+    site_id: str = Field(..., description="Previewed Location.location_code.")
+    nas_id: str = Field(..., description="Previewed RADIUS NAS code.")
+    controller_id: str = Field(
+        ..., description="The router's own serial_number -- the 'Controller ID'."
+    )
+    plan_id: str
+    plan_name: str
+    feature_summary: dict[str, Any] = Field(default_factory=dict)
+    owner_name: str
+    owner_email: str
+    owner_username_preview: str
+    router_name: str
 
 
 class ResendWelcomeEmailResponse(BaseModel):

@@ -178,6 +178,7 @@ class FakeBillingDashboardRepository:
     active_subscription_plans: list[tuple[Plan, str]] = field(default_factory=list)
     status_counts: list[tuple[str, int]] = field(default_factory=list)
     plan_type_counts: list[tuple[str, int]] = field(default_factory=list)
+    license_status_counts: list[tuple[str, int]] = field(default_factory=list)
     active_before_count: int = 0
     cancelled_between_count: int = 0
     customer_rows: list[tuple[Subscription, object, Plan]] = field(default_factory=list)
@@ -207,6 +208,9 @@ class FakeBillingDashboardRepository:
 
     async def count_subscriptions_active_before(self, cutoff: datetime) -> int:
         return self.active_before_count
+
+    async def count_licenses_by_status(self) -> list[tuple[str, int]]:
+        return self.license_status_counts
 
     async def count_subscriptions_cancelled_between(
         self, start: datetime, end: datetime
@@ -387,6 +391,39 @@ class FakeSubscriptionRepository:
             setattr(subscription, key, value)
         subscription.version += 1
         return subscription
+
+
+# ============================================================================
+# License status breakdown (Enterprise SaaS Phase B)
+# ============================================================================
+
+
+class TestLicenseStatusBreakdown:
+    async def test_maps_repository_rows_to_a_dict(self) -> None:
+        repository = FakeBillingDashboardRepository(
+            license_status_counts=[("active", 42), ("suspended", 3), ("expired", 1)]
+        )
+        payment_service = FakeFailedPaymentsPaymentService()
+        invoice_service = FakeInvoiceServiceForDashboard()
+        service = SuperAdminBillingDashboardService(
+            repository, payment_service, invoice_service
+        )
+
+        breakdown = await service.get_license_status_breakdown()
+
+        assert breakdown == {"active": 42, "suspended": 3, "expired": 1}
+
+    async def test_empty_when_no_licenses_exist(self) -> None:
+        repository = FakeBillingDashboardRepository(license_status_counts=[])
+        payment_service = FakeFailedPaymentsPaymentService()
+        invoice_service = FakeInvoiceServiceForDashboard()
+        service = SuperAdminBillingDashboardService(
+            repository, payment_service, invoice_service
+        )
+
+        breakdown = await service.get_license_status_breakdown()
+
+        assert breakdown == {}
 
 
 # ============================================================================

@@ -150,3 +150,17 @@ class LocationCodeCounterRepository:
         result = await self.session.execute(statement)
         await self.session.flush()
         return int(result.scalar_one())
+
+    async def peek_next(self, counter_key: str) -> int:
+        """Read-only: the sequence ``increment_and_get_next`` would return
+        *if* called right now, without actually consuming it -- backs
+        ``number_generator.peek_next_location_code``'s dry-run preview (see
+        that function's own docstring for why a genuine "preview without
+        side effects" needs a distinct read-only code path from the
+        atomic-UPSERT-always-writes ``increment_and_get_next``)."""
+        statement = select(LocationCodeCounter.last_value).where(
+            LocationCodeCounter.counter_key == counter_key
+        )
+        result = await self.session.execute(statement)
+        last_value = result.scalar_one_or_none()
+        return (last_value or 0) + 1

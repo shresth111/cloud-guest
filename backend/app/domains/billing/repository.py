@@ -1118,6 +1118,8 @@ class BillingDashboardRepositoryProtocol(Protocol):
 
     async def count_subscriptions_by_plan_type(self) -> list[tuple[str, int]]: ...
 
+    async def count_licenses_by_status(self) -> list[tuple[str, int]]: ...
+
     async def count_subscriptions_active_before(self, cutoff: datetime) -> int: ...
 
     async def count_subscriptions_cancelled_between(
@@ -1241,6 +1243,19 @@ class BillingDashboardRepository:
             .join(Plan, Subscription.plan_id == Plan.id)
             .where(Subscription.is_deleted.is_(False), Plan.is_deleted.is_(False))
             .group_by(Plan.plan_type)
+        )
+        result = await self.session.execute(statement)
+        return [(row[0], int(row[1])) for row in result.all()]
+
+    async def count_licenses_by_status(self) -> list[tuple[str, int]]:
+        """The real ``License.status`` breakdown backing the Super Admin
+        dashboard's license-status summary -- mirrors
+        ``count_subscriptions_by_status``'s identical group-by shape,
+        applied to ``License`` instead of ``Subscription``."""
+        statement = (
+            select(License.status, func.count())
+            .where(License.is_deleted.is_(False))
+            .group_by(License.status)
         )
         result = await self.session.execute(statement)
         return [(row[0], int(row[1])) for row in result.all()]

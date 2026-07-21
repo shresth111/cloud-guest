@@ -547,6 +547,7 @@ class AuditLogEntry(BaseModel):
         Index("ix_audit_log_entries_entity_type", "entity_type"),
         Index("ix_audit_log_entries_entity_id", "entity_id"),
         Index("ix_audit_log_entries_organization_id", "organization_id"),
+        Index("ix_audit_log_entries_location_id", "location_id"),
     )
 
     def __repr__(self) -> str:

@@ -99,6 +99,32 @@ class PolicyType(StrEnum):
     DEVICE = "device"
 
 
+class PolicyAssignmentTargetType(StrEnum):
+    """The WHO axis a :class:`~.models.PolicyAssignment` additionally
+    targets, orthogonal to its existing WHERE axis
+    (``scope_type``/``scope_id``, reusing ``app.domains.rbac.enums
+    .ScopeType`` -- see that column's own docstring). Deliberately a new,
+    ``policy``-local enum rather than adding ``USER``/``ROLE`` members to
+    ``ScopeType`` itself: that enum is RBAC's own load-bearing tenant-
+    hierarchy ordering (``SCOPE_HIERARCHY_ORDER``, consulted by
+    ``rbac.authorization``'s real permission-containment logic and baked
+    into ``Role``/``RoleScope``/``PermissionScope`` across the whole
+    codebase) -- a "which specific user/role" target is not a level of
+    that broad-to-narrow tenant hierarchy, and folding it in would force
+    every one of ``ScopeType``'s many unrelated consumers to reason about
+    what "USER contains LOCATION" would even mean.
+
+    ``NONE`` (the default -- every ``PolicyAssignment`` row created before
+    this axis existed reads as ``NONE``/``target_id=NULL``, identical to
+    its pre-Phase-F behavior) means "applies to everyone within the
+    WHERE scope". ``USER``/``ROLE`` narrow that further to one specific
+    user or one specific role's holders."""
+
+    NONE = "none"
+    USER = "user"
+    ROLE = "role"
+
+
 class PolicyVersionStatus(StrEnum):
     """Lifecycle of a :class:`~.models.PolicyVersion`.
 
@@ -171,6 +197,7 @@ PLATFORM_DEFAULT_RULES: dict[PolicyType, dict[str, Any]] = {
 
 __all__ = [
     "PolicyType",
+    "PolicyAssignmentTargetType",
     "PolicyVersionStatus",
     "POLICY_VERSION_STATUS_TRANSITIONS",
     "PLATFORM_DEFAULT_RULES",

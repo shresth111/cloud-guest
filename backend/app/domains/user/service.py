@@ -26,6 +26,8 @@ use.
 from __future__ import annotations
 
 import logging
+import secrets
+import string
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +38,10 @@ from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import User
 from app.domains.auth.password import PasswordManager
 from app.domains.auth.service import EmailAlreadyExistsError, UsernameAlreadyExistsError
+from app.domains.notification.constants import (
+    NotificationChannelType,
+    NotificationEventType,
+)
 from app.domains.organization.enums import MembershipStatus
 from app.domains.organization.models import Organization, OrganizationMember
 from app.domains.rbac.context import ScopeContext
@@ -189,6 +195,75 @@ class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
 
+class NotificationSenderProtocol(Protocol):
+    """The minimal surface ``invite_user`` needs to actually deliver an
+    invite email -- satisfied structurally by
+    ``app.domains.notification.service.NotificationService``, the exact
+    same narrow-``Protocol`` composition pattern
+    ``app.domains.auth.service.AuthService``'s own
+    ``NotificationSenderProtocol`` already establishes."""
+
+    async def enqueue(
+        self,
+        *,
+        event_type: NotificationEventType,
+        channel: NotificationChannelType,
+        recipient: str,
+        body: str,
+        organization_id: uuid.UUID | None,
+        subject: str | None = None,
+    ) -> object: ...
+
+
+class _NoopNotificationSender:
+    """Honest fallback when no real ``NotificationSenderProtocol`` is
+    wired in -- logs instead of silently discarding the invite, mirroring
+    ``app.domains.auth.service._NoopNotificationSender``'s identical
+    "logged, not faked, not silently dropped" precedent."""
+
+    async def enqueue(
+        self,
+        *,
+        event_type: NotificationEventType,
+        channel: NotificationChannelType,
+        recipient: str,
+        body: str,
+        organization_id: uuid.UUID | None,
+        subject: str | None = None,
+    ) -> None:
+        logger.info(
+            "user_invite_notification_would_send",
+            extra={"event_type": event_type.value, "recipient": recipient},
+        )
+
+
+_TEMPORARY_PASSWORD_LENGTH = 16
+_TEMPORARY_PASSWORD_SPECIALS = "!@#$%^&*()-_=+"
+
+
+def _generate_temporary_password(length: int = _TEMPORARY_PASSWORD_LENGTH) -> str:
+    """A real, cryptographically secure (``secrets``, never ``random``)
+    temporary password, guaranteed to contain at least one uppercase,
+    lowercase, digit, and special character. A small, deliberate,
+    self-contained duplication of
+    ``app.domains.location.provisioning_service._generate_temporary_password``
+    -- the same "trivial, self-contained utility, not a business rule"
+    precedent ``app.domains.router_provisioning.validators``'s own MAC
+    validator already establishes for why this is not cross-domain
+    imported."""
+    categories = [
+        string.ascii_uppercase,
+        string.ascii_lowercase,
+        string.digits,
+        _TEMPORARY_PASSWORD_SPECIALS,
+    ]
+    chars = [secrets.choice(category) for category in categories]
+    all_chars = "".join(categories)
+    chars.extend(secrets.choice(all_chars) for _ in range(length - len(categories)))
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
+
+
 @dataclass(frozen=True, slots=True)
 class OrganizationMembershipView:
     """An ``OrganizationMember`` row paired with its organization's display
@@ -197,6 +272,18 @@ class OrganizationMembershipView:
 
     membership: OrganizationMember
     organization_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class InviteUserResult:
+    """Result of :meth:`UserService.invite_user` -- pairs the created
+    ``User`` with the generated temporary password, shown exactly once,
+    the same "shown once, in this response only" convention
+    ``app.domains.location.provisioning_service.ProvisionLocationResult
+    .owner_temporary_password`` already establishes."""
+
+    user: User
+    temporary_password: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,12 +309,16 @@ class UserService:
         role_resolver: RoleResolverProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        notification_service: NotificationSenderProtocol | None = None,
     ) -> None:
         self.identity_repository = identity_repository
         self.organization_lookup = organization_lookup
         self.role_assigner = role_assigner
         self.role_resolver = role_resolver
         self.audit_writer = audit_writer
+        self.notification_service: NotificationSenderProtocol = (
+            notification_service or _NoopNotificationSender()
+        )
 
     # -- reads -----------------------------------------------------------------
 
@@ -371,6 +462,70 @@ class UserService:
             organization_id=organization_id,
         )
         return user
+
+    async def invite_user(
+        self,
+        *,
+        actor_user_id: uuid.UUID,
+        first_name: str,
+        last_name: str,
+        email: str,
+        username: str,
+        requesting_organization_id: uuid.UUID | None,
+        phone: str | None = None,
+        designation: str | None = None,
+        department: str | None = None,
+        employee_id: str | None = None,
+        timezone: str = "UTC",
+        language: str = "en",
+        organization_id: uuid.UUID | None = None,
+        initial_role_id: uuid.UUID | None = None,
+    ) -> InviteUserResult:
+        """A real invitation workflow: unlike ``create_user`` (which
+        requires the caller to type a plaintext ``temporary_password``),
+        this generates a cryptographically secure one, forces a password
+        change on first login (``must_change_password``), and emails the
+        invitee a real, notification-domain-delivered invite -- closing
+        the gap ``create_user``'s own docstring comment used to
+        acknowledge ("no verification-email-delivery infrastructure...
+        for admin flow" -- no longer true, ``app.domains.notification``
+        now exists). Delegates every existing validation/creation/
+        membership/role-assignment step to ``create_user`` unchanged --
+        this is a thin wrapper, not a second implementation of it."""
+        temporary_password = _generate_temporary_password()
+        user = await self.create_user(
+            actor_user_id=actor_user_id,
+            first_name=first_name,
+            last_name=last_name,
+            email=email,
+            username=username,
+            temporary_password=temporary_password,
+            requesting_organization_id=requesting_organization_id,
+            phone=phone,
+            designation=designation,
+            department=department,
+            employee_id=employee_id,
+            timezone=timezone,
+            language=language,
+            organization_id=organization_id,
+            initial_role_id=initial_role_id,
+        )
+        user = await self.identity_repository.update_user(
+            user, must_change_password=True
+        )
+        await self.notification_service.enqueue(
+            event_type=NotificationEventType.USER_INVITED,
+            channel=NotificationChannelType.EMAIL,
+            recipient=user.email,
+            subject="You've been invited to CloudGuest",
+            body=(
+                f"Hi {user.first_name}, an account has been created for you. "
+                f"Username: {username}. Temporary password: {temporary_password}. "
+                "You will be asked to set a new password when you first sign in."
+            ),
+            organization_id=organization_id,
+        )
+        return InviteUserResult(user=user, temporary_password=temporary_password)
 
     async def update_user(
         self,

@@ -40,6 +40,7 @@ class VlanRepositoryProtocol(Protocol):
         *,
         requesting_organization_id: uuid.UUID | None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
         sort_by: str = DEFAULT_SORT_FIELD,
@@ -84,6 +85,7 @@ class VlanRepository:
         *,
         requesting_organization_id: uuid.UUID | None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
         sort_by: str = DEFAULT_SORT_FIELD,
@@ -94,6 +96,8 @@ class VlanRepository:
             filters["organization_id"] = requesting_organization_id
         if router_id is not None:
             filters["router_id"] = router_id
+        if location_id is not None:
+            filters["location_id"] = location_id
         return await self.vlans.paginate(
             page=page,
             page_size=page_size,

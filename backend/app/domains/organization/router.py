@@ -28,6 +28,8 @@ from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
+from app.domains.billing.constants import PlanFeatureKey
+from app.domains.billing.dependencies import RequireFeature
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -39,6 +41,8 @@ from .enums import MembershipStatus, OrganizationStatus, OrganizationType
 from .models import Organization, OrganizationMember
 from .schemas import (
     MessageResponse,
+    OrganizationBrandingRequest,
+    OrganizationBrandingResponse,
     OrganizationCreateRequest,
     OrganizationListResponse,
     OrganizationMemberInviteRequest,
@@ -218,6 +222,64 @@ async def update_organization(
         success=True,
         message="Organization updated",
         data=_organization_response(organization).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/organizations/{organization_id}/branding",
+    response_model=ApiResponse[OrganizationBrandingResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("organizations.read")),
+        Depends(RequireFeature(PlanFeatureKey.WHITE_LABEL)),
+    ],
+)
+async def get_organization_branding(
+    request: Request,
+    organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    organization_service: OrganizationService = Depends(get_organization_service),
+):
+    branding = await organization_service.get_branding(
+        organization_id, requesting_organization_id=requesting_organization_id
+    )
+    return build_response(
+        success=True,
+        message="Organization branding retrieved",
+        data=OrganizationBrandingResponse(**branding).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/organizations/{organization_id}/branding",
+    response_model=ApiResponse[OrganizationBrandingResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("organizations.update")),
+        Depends(RequireFeature(PlanFeatureKey.WHITE_LABEL)),
+    ],
+)
+async def update_organization_branding(
+    request: Request,
+    organization_id: uuid.UUID,
+    payload: OrganizationBrandingRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    organization_service: OrganizationService = Depends(get_organization_service),
+):
+    data = payload.model_dump(exclude_unset=True)
+    branding = await organization_service.update_branding(
+        organization_id,
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+        data=data,
+    )
+    return build_response(
+        success=True,
+        message="Organization branding updated",
+        data=OrganizationBrandingResponse(**branding).model_dump(),
         request_id=_request_id(request),
     )
 

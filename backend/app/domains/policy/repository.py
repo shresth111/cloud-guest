@@ -24,6 +24,7 @@ from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
 from app.domains.rbac.enums import ScopeType
 
+from .constants import PolicyAssignmentTargetType
 from .models import Policy, PolicyAssignment, PolicyVersion
 
 
@@ -87,6 +88,8 @@ class PolicyRepositoryProtocol(Protocol):
         policy_type: str,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        user_id: uuid.UUID | None = None,
+        role_ids: list[uuid.UUID] | None = None,
     ) -> list[PolicyAssignment]: ...
 
 
@@ -191,13 +194,17 @@ class PolicyRepository:
         policy_type: str,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        user_id: uuid.UUID | None = None,
+        role_ids: list[uuid.UUID] | None = None,
     ) -> list[PolicyAssignment]:
         """Every currently-active ``PolicyAssignment`` whose policy is
-        active/of the requested ``policy_type`` and whose scope matches
-        global, this organization, or this location -- the join
-        ``PolicyResolver.resolve`` needs, which
+        active/of the requested ``policy_type``, whose WHERE scope matches
+        global/this organization/this location, AND whose WHO target
+        (Enterprise SaaS Phase F) matches untargeted/this user/one of this
+        user's roles -- the join ``PolicyResolver.resolve`` needs, which
         ``GenericRepository``'s plain per-table equality/IN filters cannot
-        express (it spans two tables and an OR across three scope shapes)."""
+        express (it spans two tables and an OR across scope AND target
+        shapes)."""
         scope_conditions = [PolicyAssignment.scope_type == ScopeType.GLOBAL.value]
         if organization_id is not None:
             scope_conditions.append(
@@ -208,6 +215,19 @@ class PolicyRepository:
             scope_conditions.append(
                 (PolicyAssignment.scope_type == ScopeType.LOCATION.value)
                 & (PolicyAssignment.scope_id == location_id)
+            )
+        target_conditions = [
+            PolicyAssignment.target_type == PolicyAssignmentTargetType.NONE.value
+        ]
+        if user_id is not None:
+            target_conditions.append(
+                (PolicyAssignment.target_type == PolicyAssignmentTargetType.USER.value)
+                & (PolicyAssignment.target_id == user_id)
+            )
+        if role_ids:
+            target_conditions.append(
+                (PolicyAssignment.target_type == PolicyAssignmentTargetType.ROLE.value)
+                & (PolicyAssignment.target_id.in_(role_ids))
             )
         stmt = (
             select(PolicyAssignment)
@@ -220,6 +240,7 @@ class PolicyRepository:
                 Policy.policy_type == policy_type,
                 Policy.current_version_id.is_not(None),
                 or_(*scope_conditions),
+                or_(*target_conditions),
             )
         )
         result = await self.session.execute(stmt)

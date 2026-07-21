@@ -28,3 +28,5 @@ class NetworkConfigPreviewResponse(BaseModel):
     port_forwarding_rule_count: int
     hotspot_profile_count: int
     qos_traffic_rule_count: int
+    dns_record_count: int
+    firewall_rule_count: int

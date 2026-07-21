@@ -144,6 +144,49 @@ class InvalidPolicyAssignmentScopeTypeError(PolicyError):
         )
 
 
+class PolicyAssignmentTargetIdRequiredError(PolicyError):
+    def __init__(self, target_type: str) -> None:
+        super().__init__(
+            f"target_id is required for target_type '{target_type}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class PolicyAssignmentTargetIdNotAllowedError(PolicyError):
+    def __init__(self) -> None:
+        super().__init__(
+            "target_id must not be set for target_type 'none'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidPolicyAssignmentTargetTypeError(PolicyError):
+    """``target_type`` is not one of
+    ``constants.PolicyAssignmentTargetType``'s values."""
+
+    def __init__(self, target_type: str) -> None:
+        super().__init__(
+            f"Invalid target_type: '{target_type}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class PolicyAssignmentTargetUserNotFoundError(PolicyError):
+    def __init__(self, user_id: object) -> None:
+        super().__init__(
+            f"Cannot target a policy assignment at unknown user: {user_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class PolicyAssignmentTargetRoleNotFoundError(PolicyError):
+    def __init__(self, role_id: object) -> None:
+        super().__init__(
+            f"Cannot target a policy assignment at unknown role: {role_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
 class PolicyRollbackTargetNotPublishedError(PolicyError):
     """``rollback`` may only re-point ``Policy.current_version_id`` at a
     version that has itself already been published -- rolling back to a

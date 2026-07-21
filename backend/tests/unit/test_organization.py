@@ -32,6 +32,7 @@ from app.domains.organization.exceptions import (
     CrossOrganizationAccessError,
     DuplicateMembershipError,
     DuplicateSlugError,
+    InvalidBrandingFieldError,
     InvalidMembershipStatusTransitionError,
     LastActiveMemberError,
     MembershipSuspendedError,
@@ -314,6 +315,105 @@ async def make_active_member(
         joined_at=_now(),
         is_primary_contact=is_primary_contact,
     )
+
+
+# ============================================================================
+# Org-wide product branding (Enterprise SaaS Phase B, White Label)
+# ============================================================================
+
+
+class TestOrganizationBranding:
+    async def test_get_branding_defaults_to_empty(self) -> None:
+        service, repo, _ = make_service()
+        org = await make_organization(repo, "Acme")
+
+        branding = await service.get_branding(org.id)
+
+        assert branding == {}
+
+    async def test_update_branding_persists_under_settings(self) -> None:
+        service, repo, audit_writer = make_service()
+        org = await make_organization(repo, "Acme")
+
+        branding = await service.update_branding(
+            org.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=None,
+            data={"app_name": "Acme Guest WiFi", "support_email": "Help@Acme.com"},
+        )
+
+        assert branding["app_name"] == "Acme Guest WiFi"
+        assert branding["support_email"] == "help@acme.com"
+        assert org.settings["branding"]["app_name"] == "Acme Guest WiFi"
+        assert len(audit_writer.entries) == 1
+
+    async def test_update_branding_merges_rather_than_replaces(self) -> None:
+        service, repo, _ = make_service()
+        org = await make_organization(repo, "Acme")
+        await service.update_branding(
+            org.id,
+            actor_user_id=None,
+            requesting_organization_id=None,
+            data={"app_name": "Acme Guest WiFi"},
+        )
+
+        branding = await service.update_branding(
+            org.id,
+            actor_user_id=None,
+            requesting_organization_id=None,
+            data={"support_email": "help@acme.com"},
+        )
+
+        assert branding["app_name"] == "Acme Guest WiFi"
+        assert branding["support_email"] == "help@acme.com"
+
+    async def test_update_branding_rejects_invalid_custom_domain(self) -> None:
+        service, repo, _ = make_service()
+        org = await make_organization(repo, "Acme")
+
+        with pytest.raises(InvalidBrandingFieldError):
+            await service.update_branding(
+                org.id,
+                actor_user_id=None,
+                requesting_organization_id=None,
+                data={"custom_domain": "not a domain"},
+            )
+
+    async def test_update_branding_accepts_valid_custom_domain(self) -> None:
+        service, repo, _ = make_service()
+        org = await make_organization(repo, "Acme")
+
+        branding = await service.update_branding(
+            org.id,
+            actor_user_id=None,
+            requesting_organization_id=None,
+            data={"custom_domain": "Guest.Acme.example.COM"},
+        )
+
+        assert branding["custom_domain"] == "guest.acme.example.com"
+
+    async def test_update_branding_rejects_archived_organization(self) -> None:
+        service, repo, _ = make_service()
+        org = await make_organization(
+            repo, "Acme", status=OrganizationStatus.ARCHIVED
+        )
+
+        with pytest.raises(OrganizationArchivedError):
+            await service.update_branding(
+                org.id,
+                actor_user_id=None,
+                requesting_organization_id=None,
+                data={"app_name": "New Name"},
+            )
+
+    async def test_branding_enforces_cross_organization_access(self) -> None:
+        service, repo, _ = make_service()
+        org = await make_organization(repo, "Acme")
+
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.get_branding(
+                org.id, requesting_organization_id=uuid.uuid4()
+            )
 
 
 # ============================================================================

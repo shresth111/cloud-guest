@@ -57,6 +57,26 @@ which would need an interface/address-pool this table has no data for.
 substituting ``0`` (RouterOS's own "unlimited" value) for whichever half
 of the pair is unset.
 
+## DNS: type inferred from the record itself, never a separate column
+
+``DnsRecord.record_type`` already carries A/AAAA/CNAME -- ``/ip dns
+static`` renders ``address=`` for A/AAAA records and ``cname=`` for CNAME,
+matching RouterOS's own real, distinct parameter names for each shape
+(there is no single parameter that means both).
+
+## Firewall: rendered in ascending ``priority`` order
+
+Mirrors ``app.domains.firewall.models.FirewallRule``'s own module
+docstring: rule order is semantically significant in a real RouterOS
+firewall filter, so ``service.py``'s own
+``FirewallRepository.list_rules_for_router`` already returns rows sorted
+by ``priority`` ascending -- this renderer trusts that ordering rather
+than re-sorting, the same "sorting is the repository's job, rendering is
+this function's job" split every other renderer here already follows.
+``FirewallProtocol.ALL`` omits ``protocol=`` entirely, the identical
+"omit the parameter, don't fabricate a value RouterOS wouldn't recognize"
+convention ``PortForwardingProtocol.BOTH`` already establishes.
+
 ## QoS: marks traffic, never creates the paired queue
 
 Mirrors ``app.domains.qos.models.QosTrafficRule``'s own module
@@ -75,6 +95,10 @@ from __future__ import annotations
 import ipaddress
 
 from app.domains.dhcp.models import DhcpPool
+from app.domains.dns.constants import DnsRecordType
+from app.domains.dns.models import DnsRecord
+from app.domains.firewall.constants import FirewallProtocol
+from app.domains.firewall.models import FirewallRule
 from app.domains.hotspot.models import HotspotProfile
 from app.domains.port_forwarding.constants import PortForwardingProtocol
 from app.domains.port_forwarding.models import PortForwardingRule
@@ -83,6 +107,8 @@ from app.domains.vlan.models import Vlan
 
 from .constants import (
     DHCP_SECTION_HEADER,
+    DNS_SECTION_HEADER,
+    FIREWALL_SECTION_HEADER,
     HOTSPOT_SECTION_HEADER,
     PORT_FORWARDING_SECTION_HEADER,
     QOS_SECTION_HEADER,
@@ -258,6 +284,42 @@ def render_qos_traffic_rule(rule: QosTrafficRule) -> list[str]:
     return [" ".join(parts)]
 
 
+def render_dns_record(record: DnsRecord) -> list[str]:
+    """Renders one enabled ``DnsRecord`` row -- see module docstring for
+    why the RouterOS parameter name depends on ``record_type``."""
+    parts = [f"/ip dns static add name={record.name} ttl={record.ttl_seconds}s"]
+    if record.record_type == DnsRecordType.CNAME.value:
+        parts.append(f"cname={record.address} type=CNAME")
+    else:
+        parts.append(f"address={record.address}")
+    if record.comment:
+        parts.append(f'comment="{record.comment}"')
+    return [" ".join(parts)]
+
+
+def render_firewall_rule(rule: FirewallRule) -> list[str]:
+    """Renders one enabled ``FirewallRule`` row -- see module docstring
+    for why ``ALL`` omits ``protocol=`` and why callers must already have
+    sorted ``rule`` by ``priority`` ascending before calling this."""
+    parts = [f"/ip firewall filter add chain={rule.chain}"]
+    if rule.protocol != FirewallProtocol.ALL.value:
+        parts.append(f"protocol={rule.protocol}")
+    if rule.source_address:
+        parts.append(f"src-address={rule.source_address}")
+    if rule.destination_address:
+        parts.append(f"dst-address={rule.destination_address}")
+    if rule.source_port is not None:
+        parts.append(f"src-port={rule.source_port}")
+    if rule.destination_port is not None:
+        parts.append(f"dst-port={rule.destination_port}")
+    if rule.in_interface:
+        parts.append(f"in-interface={rule.in_interface}")
+    parts.append(f"action={rule.action}")
+    comment = rule.comment or rule.name
+    parts.append(f'comment="{comment} (priority={rule.priority})"')
+    return [" ".join(parts)]
+
+
 def render_network_config(
     *,
     dhcp_pools: list[DhcpPool],
@@ -265,6 +327,8 @@ def render_network_config(
     port_forwarding_rules: list[PortForwardingRule],
     hotspot_profiles: list[HotspotProfile] | None = None,
     qos_traffic_rules: list[QosTrafficRule] | None = None,
+    dns_records: list[DnsRecord] | None = None,
+    firewall_rules: list[FirewallRule] | None = None,
 ) -> str:
     """Combines every enabled row across all five categories into one
     router-wide RouterOS script -- a full desired-state snapshot, mirroring
@@ -294,6 +358,14 @@ def render_network_config(
         sections.append(QOS_SECTION_HEADER)
         for rule in qos_traffic_rules:
             sections.extend(render_qos_traffic_rule(rule))
+    if dns_records:
+        sections.append(DNS_SECTION_HEADER)
+        for record in dns_records:
+            sections.extend(render_dns_record(record))
+    if firewall_rules:
+        sections.append(FIREWALL_SECTION_HEADER)
+        for rule in firewall_rules:
+            sections.extend(render_firewall_rule(rule))
     return "\n".join(sections)
 
 
@@ -303,5 +375,7 @@ __all__ = [
     "render_port_forwarding_rule",
     "render_hotspot_profile",
     "render_qos_traffic_rule",
+    "render_dns_record",
+    "render_firewall_rule",
     "render_network_config",
 ]

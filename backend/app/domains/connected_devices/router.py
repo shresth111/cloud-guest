@@ -97,6 +97,7 @@ def _device_response(device: ConnectedDevice) -> ConnectedDeviceResponse:
 async def list_connected_devices(
     request: Request,
     router_id: uuid.UUID | None = Query(default=None),
+    location_id: uuid.UUID | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
@@ -106,6 +107,7 @@ async def list_connected_devices(
     devices, meta = await service.list_devices(
         requesting_organization_id=requesting_organization_id,
         router_id=router_id,
+        location_id=location_id,
         is_active=is_active,
         page=page,
         page_size=page_size,

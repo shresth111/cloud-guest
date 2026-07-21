@@ -159,12 +159,14 @@ class VlanService:
         *,
         requesting_organization_id: uuid.UUID | None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[Vlan], object]:
         return await self.repository.list_vlans(
             requesting_organization_id=requesting_organization_id,
             router_id=router_id,
+            location_id=location_id,
             page=page,
             page_size=page_size,
         )

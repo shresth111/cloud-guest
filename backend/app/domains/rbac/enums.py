@@ -113,6 +113,7 @@ class PermissionModule(StrEnum):
     NETWORK_CONFIG = "network_config"
     QOS = "qos"
     NETWORK_DIAGNOSTICS = "network_diagnostics"
+    NETWORK_DEVICE = "network_device"
 
 
 class OverrideEffect(StrEnum):
@@ -145,6 +146,7 @@ class AuditAction(StrEnum):
     # domains could plausibly reuse it" design (see ``AuditLogEntry``).
     ORGANIZATION_CREATED = "organization_created"
     ORGANIZATION_UPDATED = "organization_updated"
+    ORGANIZATION_BRANDING_UPDATED = "organization_branding_updated"
     ORGANIZATION_ARCHIVED = "organization_archived"
     ORGANIZATION_SUSPENDED = "organization_suspended"
     ORGANIZATION_ACTIVATED = "organization_activated"
@@ -747,3 +749,38 @@ class AuditAction(StrEnum):
     CAMPAIGN_STATUS_CHANGED = "campaign_status_changed"
     CAMPAIGN_DELETED = "campaign_deleted"
     CAMPAIGN_CLONED = "campaign_cloned"
+
+    # DNS Management domain events -- written through this same table by
+    # ``app.domains.dns.service.DnsService`` via the same narrow
+    # ``AuditLogWriter`` protocol shape every other domain's service
+    # uses. A pure rules/inventory domain (no live device push in this
+    # pass -- see that module's own docstring), so create/update/delete
+    # are its only lifecycle events.
+    DNS_RECORD_CREATED = "dns_record_created"
+    DNS_RECORD_UPDATED = "dns_record_updated"
+    DNS_RECORD_DELETED = "dns_record_deleted"
+
+    # Firewall Rule Management domain events -- written through this
+    # same table by ``app.domains.firewall.service.FirewallService`` via
+    # the same narrow ``AuditLogWriter`` protocol shape every other
+    # domain's service uses. A pure rules/inventory domain (no live
+    # device push in this pass -- see that module's own docstring), so
+    # create/update/delete are its only lifecycle events.
+    FIREWALL_RULE_CREATED = "firewall_rule_created"
+    FIREWALL_RULE_UPDATED = "firewall_rule_updated"
+    FIREWALL_RULE_DELETED = "firewall_rule_deleted"
+
+    # Network Device (NAC) domain events -- written through this same
+    # table by ``app.domains.network_device.service.NetworkDeviceService``
+    # via the same narrow ``AuditLogWriter`` protocol shape every other
+    # domain's service uses. Compliance-status changes get their own
+    # action distinct from a plain field update since they are the
+    # operationally significant moment (feeds guest_access as an input
+    # signal) -- mirrors app.domains.campaigns's own status-change-vs-
+    # plain-update split.
+    NETWORK_DEVICE_CREATED = "network_device_created"
+    NETWORK_DEVICE_UPDATED = "network_device_updated"
+    NETWORK_DEVICE_COMPLIANCE_STATUS_CHANGED = (
+        "network_device_compliance_status_changed"
+    )
+    NETWORK_DEVICE_DELETED = "network_device_deleted"

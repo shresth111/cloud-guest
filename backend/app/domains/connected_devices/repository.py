@@ -53,6 +53,7 @@ class ConnectedDeviceRepositoryProtocol(Protocol):
         *,
         requesting_organization_id: uuid.UUID | None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         is_active: bool | None = None,
         page: int,
         page_size: int,
@@ -106,6 +107,7 @@ class ConnectedDeviceRepository:
         *,
         requesting_organization_id: uuid.UUID | None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         is_active: bool | None = None,
         page: int,
         page_size: int,
@@ -117,6 +119,8 @@ class ConnectedDeviceRepository:
             filters["organization_id"] = requesting_organization_id
         if router_id is not None:
             filters["router_id"] = router_id
+        if location_id is not None:
+            filters["location_id"] = location_id
         if is_active is not None:
             filters["is_active"] = is_active
         return await self.devices.paginate(

@@ -33,6 +33,8 @@ __all__ = [
     "RoleSummary",
     "UserDetailResponse",
     "UserCreateRequest",
+    "InviteUserRequest",
+    "InviteUserResponse",
     "UserUpdateRequest",
     "MeUpdateRequest",
 ]
@@ -187,6 +189,76 @@ class UserCreateRequest(BaseModel):
                 "language": "en",
             }
         }
+    )
+
+
+class InviteUserRequest(BaseModel):
+    """Real invitation workflow: unlike ``UserCreateRequest``, the caller
+    never supplies a password -- a secure one is generated and emailed to
+    the invitee (see ``app.domains.user.service.UserService.invite_user``).
+    Every other field mirrors ``UserCreateRequest``."""
+
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    email: EmailStr = Field(..., description="Email address")
+    username: str = Field(
+        ..., min_length=3, max_length=100, description="Unique username"
+    )
+    phone: str | None = Field(default=None, max_length=20)
+    designation: str | None = Field(default=None, max_length=100)
+    department: str | None = Field(default=None, max_length=100)
+    employee_id: str | None = Field(default=None, max_length=50)
+    timezone: str = Field(default="UTC", max_length=50)
+    language: str = Field(default="en", max_length=10)
+    organization_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "If set, the invited user is added as an active member of this "
+            "organization in the same call."
+        ),
+    )
+    initial_role_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Optional convenience: assign this role (at ORGANIZATION scope, "
+            "against organization_id) to the invited user in the same call. "
+            "Requires organization_id to also be set."
+        ),
+    )
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        return _validate_username(value)
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "first_name": "Jamie",
+                "last_name": "Rivera",
+                "email": "jamie.rivera@example.com",
+                "username": "jamie_rivera",
+                "timezone": "America/Chicago",
+                "language": "en",
+            }
+        }
+    )
+
+
+class InviteUserResponse(BaseModel):
+    """Pairs the created user with the generated temporary password --
+    shown exactly once, in this response only (also emailed to the
+    invitee) -- never logged, never persisted in plaintext, and never
+    retrievable again afterward."""
+
+    user: UserResponse
+    temporary_password: str = Field(
+        ...,
+        description=(
+            "Shown exactly once, in this response only -- also emailed to "
+            "the invitee. Never logged, never persisted in plaintext, and "
+            "never retrievable again afterward."
+        ),
     )
 
 

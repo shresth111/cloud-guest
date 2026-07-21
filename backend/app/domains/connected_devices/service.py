@@ -202,6 +202,7 @@ class ConnectedDeviceService:
         *,
         requesting_organization_id: uuid.UUID | None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         is_active: bool | None = None,
         page: int = 1,
         page_size: int = 25,
@@ -209,6 +210,7 @@ class ConnectedDeviceService:
         return await self.repository.list_devices(
             requesting_organization_id=requesting_organization_id,
             router_id=router_id,
+            location_id=location_id,
             is_active=is_active,
             page=page,
             page_size=page_size,

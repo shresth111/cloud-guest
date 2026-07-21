@@ -118,6 +118,7 @@ async def create_vlan(
 async def list_vlans(
     request: Request,
     router_id: uuid.UUID | None = Query(default=None),
+    location_id: uuid.UUID | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
@@ -126,6 +127,7 @@ async def list_vlans(
     vlans, meta = await service.list_vlans(
         requesting_organization_id=requesting_organization_id,
         router_id=router_id,
+        location_id=location_id,
         page=page,
         page_size=page_size,
     )

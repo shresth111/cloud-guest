@@ -109,8 +109,27 @@ def generate_shared_secret(length: int) -> str:
     return secrets.token_urlsafe(length)
 
 
+def preview_first_nas_code(location_code: str) -> str:
+    """The "NAS ID" preview field for the Organization Provisioning
+    Wizard (``app.domains.location.provisioning_service
+    .LocationProvisioningService.preview_provision_location``) -- a pure,
+    no-DB computation, deliberately valid **only** for a location that
+    does not exist yet (which is always true at provisioning-preview
+    time: ``provision_location`` unconditionally creates a brand-new
+    ``Location``, never reuses one). Since the real ``nas:<location_id>``
+    counter (see module docstring) is keyed by a location id that has
+    never existed, it has certainly never been incremented, so the first
+    real ``generate_nas_code`` call for that location is guaranteed to be
+    sequence 1 -- no counter read/peek is needed, unlike
+    ``app.domains.location.number_generator.peek_next_location_code``
+    (whose per-year counter key *is* shared with other, already-existing
+    locations)."""
+    return _format_code(location_code, 1)
+
+
 __all__ = [
     "NasCodeCounterRepositoryProtocol",
     "generate_nas_code",
     "generate_shared_secret",
+    "preview_first_nas_code",
 ]

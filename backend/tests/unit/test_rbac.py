@@ -1330,3 +1330,11 @@ class TestSeedDataConsistency:
         matrix = generate_permission_matrix_markdown()
         for role_def in SYSTEM_ROLES:
             assert role_def.name in matrix
+
+    def test_network_engineer_and_office_admin_are_seeded(self) -> None:
+        """Enterprise SaaS Phase D: the two suggested-role gaps identified
+        against the objective's "Network Engineer, Office Admin, Reception,
+        Helpdesk, Read Only" list (the other three already existed)."""
+        slugs = {role_def.slug for role_def in SYSTEM_ROLES}
+        assert "network-engineer" in slugs
+        assert "office-admin" in slugs

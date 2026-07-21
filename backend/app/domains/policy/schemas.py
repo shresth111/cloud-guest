@@ -252,6 +252,18 @@ class PolicyAssignmentCreateRequest(BaseModel):
         default=None, description="Required unless scope_type is 'global'."
     )
     priority: int = Field(default=0)
+    target_type: str = Field(
+        default="none",
+        description=(
+            "One of app.domains.policy.constants.PolicyAssignmentTargetType's "
+            "values -- an orthogonal WHO axis alongside scope_type's WHERE "
+            "axis. 'none' (the default) applies to everyone within the "
+            "scope; 'user'/'role' narrow it to one specific user or role."
+        ),
+    )
+    target_id: uuid.UUID | None = Field(
+        default=None, description="Required unless target_type is 'none'."
+    )
 
 
 # ============================================================================
@@ -292,6 +304,8 @@ class PolicyAssignmentResponse(BaseModel):
     scope_type: str
     scope_id: str | None
     priority: int
+    target_type: str
+    target_id: str | None
     is_active: bool
     created_at: datetime
 
@@ -321,7 +335,16 @@ class ResolvedPolicyResponse(BaseModel):
     source: str = Field(
         ...,
         description="Which resolution tier produced these rules: the id of "
-        "the winning PolicyAssignment's scope ('location:<id>', "
+        "the winning PolicyAssignment's target ('user:<id>', 'role:<id>') "
+        "if it was targeted, else its scope ('location:<id>', "
         "'organization:<id>', 'global:<policy_id>'), or the literal string "
         "'platform_default' when no assignment matched at all.",
+    )
+    user_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "The user this policy was resolved for, if any -- echoes the "
+            "request's user_id so a caller can tell a per-user override was "
+            "considered even when it didn't win."
+        ),
     )

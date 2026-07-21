@@ -30,6 +30,7 @@ Design notes worth calling out (see
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from enum import Enum
@@ -45,6 +46,7 @@ from .exceptions import (
     CrossOrganizationAccessError,
     DuplicateMembershipError,
     DuplicateSlugError,
+    InvalidBrandingFieldError,
     InvalidMembershipStatusTransitionError,
     LastActiveMemberError,
     MembershipSuspendedError,
@@ -76,6 +78,26 @@ def _normalize_slug(slug: str) -> str:
 
 def _enum_value(value: object) -> object:
     return value.value if isinstance(value, Enum) else value
+
+
+# The key branding fields are nested under inside ``Organization.settings``
+# (a JSONB "extension point" -- see ``models.py``'s own docstring) rather
+# than a new table/columns -- org-wide product branding (app name/favicon/
+# support email/custom domain) is a simple per-org config blob, not
+# something that needs its own indexed columns, the same reasoning that
+# docstring already gives for feature flags/notification defaults.
+BRANDING_SETTINGS_KEY = "branding"
+
+_CUSTOM_DOMAIN_PATTERN = re.compile(
+    r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
+)
+
+
+def _normalize_custom_domain(value: str) -> str:
+    normalized = value.strip().lower()
+    if not _CUSTOM_DOMAIN_PATTERN.match(normalized):
+        raise InvalidBrandingFieldError(f"Invalid custom domain: '{value}'")
+    return normalized
 
 
 class OrganizationService:
@@ -394,6 +416,65 @@ class OrganizationService:
         if organization.parent_organization_id == requesting_organization_id:
             return
         raise CrossOrganizationAccessError()
+
+    # -- org-wide product branding (White Label) ----------------------------------
+    #
+    # Distinct from ``app.domains.captive_portal.models.CaptivePortalConfig``,
+    # which is per-portal, guest-facing branding (logo/theme/colors shown to
+    # a connecting guest). This is the platform admin-panel's own product
+    # rebrand -- app name, favicon, support contact, custom domain -- gated
+    # by ``app.domains.billing.dependencies.RequireFeature(WHITE_LABEL)`` at
+    # the router layer, not anything checked here.
+
+    async def get_branding(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
+        organization = await self.get_organization(organization_id)
+        self._enforce_tenant_access(organization, requesting_organization_id)
+        return dict(organization.settings.get(BRANDING_SETTINGS_KEY, {}))
+
+    async def update_branding(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        data: dict[str, object],
+    ) -> dict[str, Any]:
+        organization = await self.get_organization(organization_id)
+        self._enforce_tenant_access(organization, requesting_organization_id)
+        if organization.status == OrganizationStatus.ARCHIVED.value:
+            raise OrganizationArchivedError(organization_id)
+
+        update_data = {k: v for k, v in data.items() if v is not None}
+        if "custom_domain" in update_data:
+            update_data["custom_domain"] = _normalize_custom_domain(
+                str(update_data["custom_domain"])
+            )
+        if "support_email" in update_data:
+            update_data["support_email"] = str(update_data["support_email"]).lower()
+
+        current_branding = dict(organization.settings.get(BRANDING_SETTINGS_KEY, {}))
+        current_branding.update(update_data)
+        merged_settings = {
+            **organization.settings,
+            BRANDING_SETTINGS_KEY: current_branding,
+        }
+
+        await self.repository.update_organization(
+            organization, {"settings": merged_settings, "updated_by": actor_user_id}
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.ORGANIZATION_BRANDING_UPDATED,
+            entity_id=organization.id,
+            description=f"Organization '{organization.name}' branding updated",
+            organization_id=organization.id,
+        )
+        return current_branding
 
     # -- membership --------------------------------------------------------------
 

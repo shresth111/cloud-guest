@@ -18,6 +18,9 @@ other than ``OrganizationService``'s own new, additive
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Awaitable, Callable
+
 from fastapi import Depends
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,10 +36,12 @@ from app.domains.notification.dependencies import get_notification_service
 from app.domains.notification.service import NotificationService
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
-from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.dependencies import CurrentOrganization, get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
-from .constants import PaymentProvider
+from .cache import EntitlementCache
+from .constants import PaymentProvider, PlanFeatureKey
+from .exceptions import FeatureNotEntitledError, LicenseNotActiveError
 from .payment_gateways import RazorpayPaymentGateway, StripePaymentGateway
 from .renewal_service import PaymentGatewayProtocol, RenewalService
 from .repository import (
@@ -70,6 +75,7 @@ from .service import (
     BillingProfileService,
     CouponService,
     CustomerBillingDashboardService,
+    EntitlementChecker,
     InvoiceService,
     LicenseService,
     PaymentMethodService,
@@ -130,12 +136,17 @@ def get_usage_service(
     )
 
 
+def get_entitlement_cache(redis: Redis = Depends(get_redis_client)) -> EntitlementCache:
+    return EntitlementCache(redis)
+
+
 def get_license_service(
     repository: LicenseRepositoryProtocol = Depends(get_license_repository),
     plan_repository: PlanRepositoryProtocol = Depends(get_plan_repository),
     organization_service: OrganizationService = Depends(get_organization_service),
     usage_service: UsageService = Depends(get_usage_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    entitlement_cache: EntitlementCache = Depends(get_entitlement_cache),
 ) -> LicenseService:
     return LicenseService(
         repository,
@@ -143,7 +154,76 @@ def get_license_service(
         organization_sync=organization_service,
         usage_validator=usage_service,
         audit_writer=audit_repository,
+        entitlement_cache=entitlement_cache,
     )
+
+
+def get_entitlement_checker(
+    license_service: LicenseService = Depends(get_license_service),
+    cache: EntitlementCache = Depends(get_entitlement_cache),
+) -> EntitlementChecker:
+    return EntitlementChecker(license_service, cache)
+
+
+# ============================================================================
+# Request-time license/feature enforcement dependencies
+# ============================================================================
+#
+# Mirror ``app.domains.rbac.dependencies.RequirePermission``'s dependency-
+# factory shape exactly. A ``None`` organization context (no
+# ``X-Organization-Id`` header -- a GLOBAL-scoped platform caller, e.g. Super
+# Admin managing the plan/license catalog itself) passes through unchecked,
+# the same convention ``CurrentOrganization`` itself already establishes:
+# there is nothing to license-check when a request isn't acting within any
+# organization. Billing's own license-lifecycle endpoints
+# (activate/suspend/cancel/upgrade/downgrade in ``router.py``) deliberately
+# never use either dependency -- gating license *management* behind "the
+# license must already be active" would make a suspended organization's
+# license permanently unrecoverable via the API.
+
+
+def RequireActiveLicense() -> Callable[..., Awaitable[uuid.UUID | None]]:
+    """402s (``LicenseNotActiveError``) unless the current organization's
+    license is ``ACTIVE`` and unexpired. A request with no organization
+    context passes through unchecked."""
+
+    async def _dependency(
+        organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+        checker: EntitlementChecker = Depends(get_entitlement_checker),
+    ) -> uuid.UUID | None:
+        if organization_id is None:
+            return None
+        snapshot = await checker.get_snapshot(organization_id)
+        if not snapshot.is_active:
+            raise LicenseNotActiveError(
+                organization_id, f"status is '{snapshot.license_status}'"
+            )
+        return organization_id
+
+    return _dependency
+
+
+def RequireFeature(
+    feature_key: PlanFeatureKey,
+) -> Callable[..., Awaitable[uuid.UUID | None]]:
+    """402s (``FeatureNotEntitledError``) unless the current organization's
+    license is active *and* its plan has ``feature_key`` enabled. Implies
+    ``RequireActiveLicense`` -- a feature check is meaningless against an
+    inactive license. A request with no organization context passes through
+    unchecked (see module-level note above)."""
+
+    async def _dependency(
+        organization_id: uuid.UUID | None = Depends(RequireActiveLicense()),
+        checker: EntitlementChecker = Depends(get_entitlement_checker),
+    ) -> uuid.UUID | None:
+        if organization_id is None:
+            return None
+        snapshot = await checker.get_snapshot(organization_id)
+        if not snapshot.has_feature(feature_key):
+            raise FeatureNotEntitledError(organization_id, feature_key.value)
+        return organization_id
+
+    return _dependency
 
 
 def get_subscription_repository(

@@ -28,6 +28,8 @@ from app.domains.api_keys.exceptions import ApiKeyAuthenticationError
 from app.domains.api_keys.service import ApiKeyService
 from app.domains.notification.dependencies import get_notification_service
 from app.domains.notification.service import NotificationService
+from app.domains.rbac.authorization import RoleResolver
+from app.domains.rbac.repository import RBACRepository
 from app.middleware.request_context import get_masking_context
 
 from .jwt import InvalidTokenError, JWTManager, TokenExpiredError
@@ -52,6 +54,15 @@ def get_auth_service(
     notification_service: NotificationService = Depends(get_notification_service),
 ) -> AuthService:
     return AuthService(repository, redis, notification_service=notification_service)
+
+
+def get_role_resolver(db: AsyncSession = Depends(get_db_session)) -> RoleResolver:
+    """Builds directly against ``rbac.repository``/``rbac.authorization``
+    -- deliberately NOT ``app.domains.rbac.dependencies.get_rbac_repository``,
+    which itself imports ``get_current_user`` from *this* module and would
+    create a circular import. Used only by ``login``'s role-aware response
+    (Enterprise SaaS Phase E)."""
+    return RoleResolver(RBACRepository(db))
 
 
 async def get_current_user(

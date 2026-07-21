@@ -146,7 +146,16 @@ class PolicyVersion(BaseModel):
 class PolicyAssignment(BaseModel):
     """Attaches a :class:`Policy` to a scope -- see module docstring for why
     this reuses ``app.domains.rbac.enums.ScopeType`` rather than a parallel
-    enum, and why ``scope_id`` is nullable."""
+    enum, and why ``scope_id`` is nullable.
+
+    ``target_type``/``target_id`` (Enterprise SaaS Phase F) are a second,
+    orthogonal WHO axis layered on top of the existing WHERE axis above --
+    see ``constants.PolicyAssignmentTargetType``'s own docstring for why
+    this is a new, ``policy``-local enum rather than added to
+    ``ScopeType`` itself. ``target_type`` defaults to ``NONE`` so every
+    pre-Phase-F row (and every new row that doesn't set it) behaves
+    identically to before this axis existed: "applies to everyone within
+    the WHERE scope"."""
 
     __tablename__ = "policy_assignments"
 
@@ -168,6 +177,19 @@ class PolicyAssignment(BaseModel):
     scope_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
+    # WHO this assignment additionally targets -- one of
+    # constants.PolicyAssignmentTargetType's values. NULL-equivalent default
+    # is "none" (untargeted), not a nullable column, so every row always has
+    # an explicit, queryable WHO-tier.
+    target_type: Mapped[str] = mapped_column(
+        String(20), default="none", server_default="none", nullable=False
+    )
+    # NULL iff target_type == "none". Points at a users.id or roles.id row
+    # depending on target_type -- deliberately not a real FK, the same
+    # polymorphic-column reasoning scope_id's own docstring above gives.
+    target_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     # Tie-breaker when more than one active assignment matches the same
     # resolved scope (see service.PolicyResolver.resolve) -- higher wins.
     priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -181,12 +203,15 @@ class PolicyAssignment(BaseModel):
         Index("ix_policy_assignments_scope_type", "scope_type"),
         Index("ix_policy_assignments_scope_id", "scope_id"),
         Index("ix_policy_assignments_is_active", "is_active"),
+        Index("ix_policy_assignments_target_type", "target_type"),
+        Index("ix_policy_assignments_target_id", "target_id"),
     )
 
     def __repr__(self) -> str:
         return (
             f"<PolicyAssignment(id={self.id}, policy_id={self.policy_id}, "
-            f"scope_type={self.scope_type}, scope_id={self.scope_id})>"
+            f"scope_type={self.scope_type}, scope_id={self.scope_id}, "
+            f"target_type={self.target_type})>"
         )
 
 

@@ -55,6 +55,10 @@ from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
+from app.domains.billing.dependencies import get_super_admin_billing_dashboard_service
+from app.domains.billing.service import SuperAdminBillingDashboardService
+from app.domains.monitoring.dependencies import get_platform_dashboard_service
+from app.domains.monitoring.service import PlatformDashboardService
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -75,7 +79,9 @@ from .constants import (
 from .dashboard_schemas import (
     LocationDashboardResponse,
     OrganizationDashboardResponse,
+    PlatformHealthSummaryResponse,
     SuperAdminDashboardResponse,
+    UnifiedSuperAdminDashboardResponse,
 )
 from .dashboard_service import DashboardService
 from .dependencies import (
@@ -240,6 +246,70 @@ async def get_super_admin_dashboard(
     return build_response(
         success=True,
         message="Super Admin dashboard retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/dashboard/super-admin/unified",
+    response_model=ApiResponse[UnifiedSuperAdminDashboardResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.GLOBAL)),
+        Depends(RequirePermission("monitoring.read", scope=ScopeType.GLOBAL)),
+        Depends(RequirePermission("billing.read", scope=ScopeType.GLOBAL)),
+    ],
+)
+async def get_unified_super_admin_dashboard(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    dashboard_service: DashboardService = Depends(get_dashboard_service),
+    platform_dashboard_service: PlatformDashboardService = Depends(
+        get_platform_dashboard_service
+    ),
+    billing_dashboard_service: SuperAdminBillingDashboardService = Depends(
+        get_super_admin_billing_dashboard_service
+    ),
+):
+    """Composes three already-existing, independently-callable dashboards
+    (this one's own ``get_super_admin_dashboard``, monitoring's platform
+    health statistics, billing's revenue figures) plus one genuinely new
+    figure -- a real ``License.status`` breakdown -- into a single
+    payload. None of the three source dashboards are modified or replaced;
+    each remains callable on its own exactly as before."""
+    user_id = uuid.UUID(user.id)
+    platform = await dashboard_service.get_super_admin_dashboard(user_id)
+
+    now = datetime.now(UTC)
+    operations = await platform_dashboard_service.get_dashboard_statistics(
+        organization_id=None, start=now - timedelta(hours=24), end=now
+    )
+
+    license_status_breakdown = (
+        await billing_dashboard_service.get_license_status_breakdown()
+    )
+    revenue = await billing_dashboard_service.get_revenue_dashboard(user_id=user_id)
+
+    payload = UnifiedSuperAdminDashboardResponse(
+        platform=platform,
+        operations=PlatformHealthSummaryResponse(
+            overall_health_status=operations.overall_health_status,
+            alert_counts_by_severity=operations.alert_counts_by_severity,
+            alert_counts_by_status=operations.alert_counts_by_status,
+            device_counts_by_status=operations.device_counts_by_status,
+            average_response_time_ms=operations.average_response_time_ms,
+            availability_percentage=operations.availability_percentage,
+        ),
+        license_status_breakdown=license_status_breakdown,
+        total_revenue=float(revenue.total_revenue),
+        mrr=float(revenue.mrr),
+        arr=float(revenue.arr),
+        revenue_note=revenue.currency_note,
+    )
+    return build_response(
+        success=True,
+        message="Unified Super Admin dashboard retrieved",
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )

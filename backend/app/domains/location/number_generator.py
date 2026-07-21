@@ -36,12 +36,14 @@ _SEQUENCE_DIGITS = 6
 
 
 class LocationCodeCounterRepositoryProtocol(Protocol):
-    """The single method this module needs -- satisfied by
-    ``repository.LocationCodeCounterRepository`` (a real, atomic Postgres
-    UPSERT) for production use, and by a small in-memory fake in this
-    domain's own tests."""
+    """Satisfied by ``repository.LocationCodeCounterRepository`` (a real,
+    atomic Postgres UPSERT for ``increment_and_get_next``, and a plain
+    read-only ``SELECT`` for ``peek_next``) for production use, and by a
+    small in-memory fake in this domain's own tests."""
 
     async def increment_and_get_next(self, counter_key: str) -> int: ...
+
+    async def peek_next(self, counter_key: str) -> int: ...
 
 
 def _counter_key(year: int) -> str:
@@ -62,7 +64,27 @@ async def generate_location_code(
     return _format_code(year, sequence)
 
 
+async def peek_next_location_code(
+    repository: LocationCodeCounterRepositoryProtocol, *, at: datetime
+) -> str:
+    """The ``location_code`` ``generate_location_code`` would produce *if*
+    called right now -- a genuine dry-run read, never incrementing the
+    real counter (see ``repository.LocationCodeCounterRepository
+    .peek_next``'s own docstring). Backs
+    ``app.domains.location.service.LocationService
+    .preview_next_location_code``, the Organization Provisioning Wizard's
+    "Site ID" preview field. Not guaranteed to match the value a
+    subsequent real ``generate_location_code`` call produces if another
+    location is created for the same year in between -- the same
+    inherent preview/commit race every other preview in this codebase
+    (e.g. ``app.domains.network_config``'s) already documents."""
+    year = at.year
+    sequence = await repository.peek_next(_counter_key(year))
+    return _format_code(year, sequence)
+
+
 __all__ = [
     "LocationCodeCounterRepositoryProtocol",
     "generate_location_code",
+    "peek_next_location_code",
 ]

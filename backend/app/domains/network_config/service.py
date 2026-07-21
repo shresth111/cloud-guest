@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from app.domains.dhcp.models import DhcpPool
+from app.domains.dns.models import DnsRecord
+from app.domains.firewall.models import FirewallRule
 from app.domains.hotspot.models import HotspotProfile
 from app.domains.port_forwarding.models import PortForwardingRule
 from app.domains.qos.models import QosTrafficRule
@@ -43,6 +45,12 @@ class VlanLookupProtocol(Protocol):
     ) -> list[Vlan]: ...
 
 
+class DnsLookupProtocol(Protocol):
+    async def list_records_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[DnsRecord]: ...
+
+
 class PortForwardingLookupProtocol(Protocol):
     async def list_rules_for_router(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
@@ -53,6 +61,12 @@ class HotspotLookupProtocol(Protocol):
     async def list_profiles_for_router(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> list[HotspotProfile]: ...
+
+
+class FirewallLookupProtocol(Protocol):
+    async def list_rules_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[FirewallRule]: ...
 
 
 class QosLookupProtocol(Protocol):
@@ -128,6 +142,8 @@ class NetworkConfigPreview:
     port_forwarding_rule_count: int
     hotspot_profile_count: int
     qos_traffic_rule_count: int
+    dns_record_count: int
+    firewall_rule_count: int
 
 
 class NetworkConfigService:
@@ -142,6 +158,9 @@ class NetworkConfigService:
         hotspot_lookup: HotspotLookupProtocol,
         qos_lookup: QosLookupProtocol,
         router_provisioning_lookup: RouterProvisioningLookupProtocol,
+        *,
+        dns_lookup: DnsLookupProtocol,
+        firewall_lookup: FirewallLookupProtocol,
     ) -> None:
         self.dhcp_lookup = dhcp_lookup
         self.vlan_lookup = vlan_lookup
@@ -149,6 +168,8 @@ class NetworkConfigService:
         self.hotspot_lookup = hotspot_lookup
         self.qos_lookup = qos_lookup
         self.router_provisioning_lookup = router_provisioning_lookup
+        self.dns_lookup = dns_lookup
+        self.firewall_lookup = firewall_lookup
 
     async def _gather_enabled_rows(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
@@ -158,6 +179,8 @@ class NetworkConfigService:
         list[PortForwardingRule],
         list[HotspotProfile],
         list[QosTrafficRule],
+        list[DnsRecord],
+        list[FirewallRule],
     ]:
         pools = await self.dhcp_lookup.list_pools_for_router(
             router_id, requesting_organization_id=requesting_organization_id
@@ -174,12 +197,20 @@ class NetworkConfigService:
         qos_traffic_rules = await self.qos_lookup.list_rules_for_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        dns_records = await self.dns_lookup.list_records_for_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        firewall_rules = await self.firewall_lookup.list_rules_for_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
         return (
             [p for p in pools if p.is_enabled],
             [v for v in vlans if v.is_enabled],
             [r for r in rules if r.is_enabled],
             [h for h in hotspot_profiles if h.is_enabled],
             [q for q in qos_traffic_rules if q.is_enabled],
+            [d for d in dns_records if d.is_enabled],
+            [f for f in firewall_rules if f.is_enabled],
         )
 
     async def preview_config(
@@ -191,6 +222,8 @@ class NetworkConfigService:
             rules,
             hotspot_profiles,
             qos_traffic_rules,
+            dns_records,
+            firewall_rules,
         ) = await self._gather_enabled_rows(
             router_id, requesting_organization_id=requesting_organization_id
         )
@@ -200,6 +233,8 @@ class NetworkConfigService:
             port_forwarding_rules=rules,
             hotspot_profiles=hotspot_profiles,
             qos_traffic_rules=qos_traffic_rules,
+            dns_records=dns_records,
+            firewall_rules=firewall_rules,
         )
         return NetworkConfigPreview(
             router_id=router_id,
@@ -209,6 +244,8 @@ class NetworkConfigService:
             port_forwarding_rule_count=len(rules),
             hotspot_profile_count=len(hotspot_profiles),
             qos_traffic_rule_count=len(qos_traffic_rules),
+            dns_record_count=len(dns_records),
+            firewall_rule_count=len(firewall_rules),
         )
 
     async def push_config(
@@ -224,6 +261,8 @@ class NetworkConfigService:
             rules,
             hotspot_profiles,
             qos_traffic_rules,
+            dns_records,
+            firewall_rules,
         ) = await self._gather_enabled_rows(
             router_id, requesting_organization_id=requesting_organization_id
         )
@@ -233,6 +272,8 @@ class NetworkConfigService:
             port_forwarding_rules=rules,
             hotspot_profiles=hotspot_profiles,
             qos_traffic_rules=qos_traffic_rules,
+            dns_records=dns_records,
+            firewall_rules=firewall_rules,
         )
         if not rendered:
             raise EmptyNetworkConfigError(router_id)
@@ -321,6 +362,8 @@ __all__ = [
     "PortForwardingLookupProtocol",
     "HotspotLookupProtocol",
     "QosLookupProtocol",
+    "DnsLookupProtocol",
+    "FirewallLookupProtocol",
     "RouterProvisioningLookupProtocol",
     "NetworkConfigPreview",
     "NetworkConfigService",

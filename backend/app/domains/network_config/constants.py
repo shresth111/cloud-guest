@@ -11,6 +11,8 @@ VLAN_SECTION_HEADER = "# --- VLANs (CloudGuest-managed) ---"
 PORT_FORWARDING_SECTION_HEADER = "# --- Port Forwarding (CloudGuest-managed) ---"
 HOTSPOT_SECTION_HEADER = "# --- Hotspot Profiles (CloudGuest-managed) ---"
 QOS_SECTION_HEADER = "# --- QoS Traffic Rules (CloudGuest-managed) ---"
+DNS_SECTION_HEADER = "# --- DNS Records (CloudGuest-managed) ---"
+FIREWALL_SECTION_HEADER = "# --- Firewall Rules (CloudGuest-managed) ---"
 
 __all__ = [
     "DHCP_SECTION_HEADER",
@@ -18,4 +20,6 @@ __all__ = [
     "PORT_FORWARDING_SECTION_HEADER",
     "HOTSPOT_SECTION_HEADER",
     "QOS_SECTION_HEADER",
+    "DNS_SECTION_HEADER",
+    "FIREWALL_SECTION_HEADER",
 ]

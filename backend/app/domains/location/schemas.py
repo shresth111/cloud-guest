@@ -23,6 +23,7 @@ __all__ = [
     "MessageResponse",
     "LocationResponse",
     "LocationListResponse",
+    "LocationOverviewResponse",
     "LocationCreateRequest",
     "LocationUpdateRequest",
 ]
@@ -88,6 +89,24 @@ class LocationListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class LocationOverviewResponse(BaseModel):
+    """The "Location Workspace" overview -- composes counts already
+    exposed by their own domains' list endpoints (routers, connected
+    devices, VLANs, campaigns, audit log entries) into one call, the
+    same composition-not-duplication shape
+    ``app.domains.analytics.dashboard_service.DashboardService`` already
+    establishes. Guest sessions/reports are intentionally left to their
+    own existing, richer dashboard endpoints rather than re-summarized
+    here a second way."""
+
+    location: LocationResponse
+    router_count: int
+    connected_device_count: int
+    vlan_count: int
+    campaign_count: int
+    audit_log_count: int
 
 
 # ============================================================================

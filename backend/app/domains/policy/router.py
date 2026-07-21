@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
+from app.domains.rbac.authorization import RoleResolver
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -28,7 +29,7 @@ from app.domains.rbac.dependencies import (
 )
 
 from .constants import PolicyType
-from .dependencies import get_policy_service
+from .dependencies import get_policy_service, get_role_resolver
 from .models import Policy, PolicyAssignment, PolicyVersion
 from .schemas import (
     PolicyAssignmentCreateRequest,
@@ -88,6 +89,8 @@ def _assignment_response(assignment: PolicyAssignment) -> PolicyAssignmentRespon
         scope_type=assignment.scope_type,
         scope_id=str(assignment.scope_id) if assignment.scope_id else None,
         priority=assignment.priority,
+        target_type=assignment.target_type,
+        target_id=str(assignment.target_id) if assignment.target_id else None,
         is_active=assignment.is_active,
         created_at=assignment.created_at,
     )
@@ -109,12 +112,28 @@ async def resolve_effective_policy(
     policy_type: PolicyType = Query(...),
     organization_id: uuid.UUID | None = Query(default=None),
     location_id: uuid.UUID | None = Query(default=None),
+    user_id: uuid.UUID | None = Query(
+        default=None,
+        description=(
+            "Enterprise SaaS Phase F: also consider any per-user or "
+            "per-role assignment targeting this user (roles resolved "
+            "server-side from RBAC's own active role assignments)."
+        ),
+    ),
     service: PolicyService = Depends(get_policy_service),
+    role_resolver: RoleResolver = Depends(get_role_resolver),
 ):
+    role_ids: list[uuid.UUID] | None = None
+    if user_id is not None:
+        roles = await role_resolver.get_active_roles(user_id)
+        role_ids = [role.id for role in roles]
+
     resolved = await service.resolve_effective_policy(
         policy_type=policy_type,
         organization_id=organization_id,
         location_id=location_id,
+        user_id=user_id,
+        role_ids=role_ids,
     )
     return build_response(
         success=True,
@@ -125,6 +144,7 @@ async def resolve_effective_policy(
             location_id=resolved.location_id,
             rules=resolved.rules,
             source=resolved.source,
+            user_id=resolved.user_id,
         ).model_dump(),
         request_id=_request_id(request),
     )
@@ -374,6 +394,8 @@ async def create_policy_assignment(
         scope_type=payload.scope_type,
         scope_id=payload.scope_id,
         priority=payload.priority,
+        target_type=payload.target_type,
+        target_id=payload.target_id,
     )
     return build_response(
         success=True,

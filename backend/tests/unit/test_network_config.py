@@ -18,9 +18,19 @@ from datetime import UTC, datetime
 import pytest
 
 from app.domains.dhcp.models import DhcpPool
+from app.domains.dns.constants import DnsRecordType
+from app.domains.dns.models import DnsRecord
+from app.domains.firewall.constants import (
+    FirewallAction,
+    FirewallChain,
+    FirewallProtocol,
+)
+from app.domains.firewall.models import FirewallRule
 from app.domains.hotspot.models import HotspotProfile
 from app.domains.network_config.constants import (
     DHCP_SECTION_HEADER,
+    DNS_SECTION_HEADER,
+    FIREWALL_SECTION_HEADER,
     HOTSPOT_SECTION_HEADER,
     PORT_FORWARDING_SECTION_HEADER,
     QOS_SECTION_HEADER,
@@ -29,6 +39,8 @@ from app.domains.network_config.constants import (
 from app.domains.network_config.exceptions import EmptyNetworkConfigError
 from app.domains.network_config.renderers import (
     render_dhcp_pool,
+    render_dns_record,
+    render_firewall_rule,
     render_hotspot_profile,
     render_network_config,
     render_port_forwarding_rule,
@@ -151,6 +163,44 @@ def _make_qos_rule(**overrides: object) -> QosTrafficRule:
     }
     fields.update(overrides)
     return QosTrafficRule(**_base_fields(**fields))
+
+
+def _make_dns_record(**overrides: object) -> DnsRecord:
+    fields = {
+        "router_id": uuid.uuid4(),
+        "organization_id": uuid.uuid4(),
+        "location_id": uuid.uuid4(),
+        "name": "printer.local",
+        "record_type": DnsRecordType.A.value,
+        "address": "192.168.1.50",
+        "ttl_seconds": 3600,
+        "comment": None,
+        "is_enabled": True,
+    }
+    fields.update(overrides)
+    return DnsRecord(**_base_fields(**fields))
+
+
+def _make_firewall_rule(**overrides: object) -> FirewallRule:
+    fields = {
+        "router_id": uuid.uuid4(),
+        "organization_id": uuid.uuid4(),
+        "location_id": uuid.uuid4(),
+        "name": "Block Telnet",
+        "chain": FirewallChain.INPUT.value,
+        "action": FirewallAction.DROP.value,
+        "protocol": FirewallProtocol.TCP.value,
+        "source_address": None,
+        "destination_address": None,
+        "source_port": None,
+        "destination_port": 23,
+        "in_interface": None,
+        "priority": 10,
+        "comment": None,
+        "is_enabled": True,
+    }
+    fields.update(overrides)
+    return FirewallRule(**_base_fields(**fields))
 
 
 # ============================================================================
@@ -298,20 +348,79 @@ class TestRenderQosTrafficRule:
         assert line_a != line_b
 
 
+class TestRenderDnsRecord:
+    def test_renders_an_a_record(self) -> None:
+        (line,) = render_dns_record(_make_dns_record())
+        assert "/ip dns static add name=printer.local" in line
+        assert "address=192.168.1.50" in line
+        assert "ttl=3600s" in line
+        assert "cname=" not in line
+
+    def test_renders_a_cname_record(self) -> None:
+        (line,) = render_dns_record(
+            _make_dns_record(
+                record_type=DnsRecordType.CNAME.value, address="host.local"
+            )
+        )
+        assert "cname=host.local" in line
+        assert "type=CNAME" in line
+        assert "address=" not in line
+
+    def test_includes_comment_when_present(self) -> None:
+        (line,) = render_dns_record(_make_dns_record(comment="office printer"))
+        assert 'comment="office printer"' in line
+
+
+class TestRenderFirewallRule:
+    def test_renders_a_drop_rule(self) -> None:
+        (line,) = render_firewall_rule(_make_firewall_rule())
+        assert "/ip firewall filter add chain=input" in line
+        assert "protocol=tcp" in line
+        assert "dst-port=23" in line
+        assert "action=drop" in line
+        assert 'comment="Block Telnet (priority=10)"' in line
+
+    def test_all_protocol_omits_protocol_parameter(self) -> None:
+        (line,) = render_firewall_rule(
+            _make_firewall_rule(protocol=FirewallProtocol.ALL.value)
+        )
+        assert "protocol=" not in line
+
+    def test_addresses_and_interface_included_when_present(self) -> None:
+        (line,) = render_firewall_rule(
+            _make_firewall_rule(
+                source_address="10.0.0.0/24",
+                destination_address="192.168.1.1",
+                in_interface="ether1",
+            )
+        )
+        assert "src-address=10.0.0.0/24" in line
+        assert "dst-address=192.168.1.1" in line
+        assert "in-interface=ether1" in line
+
+    def test_own_comment_overrides_name_default(self) -> None:
+        (line,) = render_firewall_rule(_make_firewall_rule(comment="custom note"))
+        assert 'comment="custom note (priority=10)"' in line
+
+
 class TestRenderNetworkConfig:
-    def test_combines_all_five_categories_with_section_headers(self) -> None:
+    def test_combines_all_seven_categories_with_section_headers(self) -> None:
         rendered = render_network_config(
             dhcp_pools=[_make_pool()],
             vlans=[_make_vlan()],
             port_forwarding_rules=[_make_rule()],
             hotspot_profiles=[_make_hotspot_profile()],
             qos_traffic_rules=[_make_qos_rule()],
+            dns_records=[_make_dns_record()],
+            firewall_rules=[_make_firewall_rule()],
         )
         assert DHCP_SECTION_HEADER in rendered
         assert VLAN_SECTION_HEADER in rendered
         assert PORT_FORWARDING_SECTION_HEADER in rendered
         assert HOTSPOT_SECTION_HEADER in rendered
         assert QOS_SECTION_HEADER in rendered
+        assert DNS_SECTION_HEADER in rendered
+        assert FIREWALL_SECTION_HEADER in rendered
 
     def test_returns_empty_string_for_no_input(self) -> None:
         assert (
@@ -321,6 +430,8 @@ class TestRenderNetworkConfig:
                 port_forwarding_rules=[],
                 hotspot_profiles=[],
                 qos_traffic_rules=[],
+                dns_records=[],
+                firewall_rules=[],
             )
             == ""
         )
@@ -332,12 +443,16 @@ class TestRenderNetworkConfig:
             port_forwarding_rules=[],
             hotspot_profiles=[],
             qos_traffic_rules=[],
+            dns_records=[],
+            firewall_rules=[],
         )
         assert DHCP_SECTION_HEADER in rendered
         assert VLAN_SECTION_HEADER not in rendered
         assert PORT_FORWARDING_SECTION_HEADER not in rendered
         assert HOTSPOT_SECTION_HEADER not in rendered
         assert QOS_SECTION_HEADER not in rendered
+        assert DNS_SECTION_HEADER not in rendered
+        assert FIREWALL_SECTION_HEADER not in rendered
 
 
 # ============================================================================
@@ -399,6 +514,26 @@ class FakeQosLookup:
     async def list_rules_for_router(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> list[QosTrafficRule]:
+        return [r for r in self.rules if r.router_id == router_id]
+
+
+@dataclass
+class FakeDnsLookup:
+    records: list[DnsRecord] = field(default_factory=list)
+
+    async def list_records_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[DnsRecord]:
+        return [r for r in self.records if r.router_id == router_id]
+
+
+@dataclass
+class FakeFirewallLookup:
+    rules: list[FirewallRule] = field(default_factory=list)
+
+    async def list_rules_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[FirewallRule]:
         return [r for r in self.rules if r.router_id == router_id]
 
 
@@ -537,6 +672,8 @@ def _make_service(
     rules: list[PortForwardingRule] | None = None,
     hotspot_profiles: list[HotspotProfile] | None = None,
     qos_traffic_rules: list[QosTrafficRule] | None = None,
+    dns_records: list[DnsRecord] | None = None,
+    firewall_rules: list[FirewallRule] | None = None,
 ) -> tuple[NetworkConfigService, FakeRouterProvisioningLookup]:
     provisioning_lookup = FakeRouterProvisioningLookup()
     service = NetworkConfigService(
@@ -546,6 +683,8 @@ def _make_service(
         FakeHotspotLookup(hotspot_profiles or []),
         FakeQosLookup(qos_traffic_rules or []),
         provisioning_lookup,
+        dns_lookup=FakeDnsLookup(dns_records or []),
+        firewall_lookup=FakeFirewallLookup(firewall_rules or []),
     )
     return service, provisioning_lookup
 
@@ -564,6 +703,8 @@ class TestPreviewConfig:
             rules=[_make_rule(router_id=router_id)],
             hotspot_profiles=[_make_hotspot_profile(router_id=router_id)],
             qos_traffic_rules=[_make_qos_rule(router_id=router_id)],
+            dns_records=[_make_dns_record(router_id=router_id)],
+            firewall_rules=[_make_firewall_rule(router_id=router_id)],
         )
         preview = await service.preview_config(
             router_id, requesting_organization_id=uuid.uuid4()
@@ -573,9 +714,13 @@ class TestPreviewConfig:
         assert preview.port_forwarding_rule_count == 1
         assert preview.hotspot_profile_count == 1
         assert preview.qos_traffic_rule_count == 1
+        assert preview.dns_record_count == 1
+        assert preview.firewall_rule_count == 1
         assert DHCP_SECTION_HEADER in preview.rendered_content
         assert HOTSPOT_SECTION_HEADER in preview.rendered_content
         assert QOS_SECTION_HEADER in preview.rendered_content
+        assert DNS_SECTION_HEADER in preview.rendered_content
+        assert FIREWALL_SECTION_HEADER in preview.rendered_content
 
     async def test_excludes_disabled_rows(self) -> None:
         router_id = uuid.uuid4()

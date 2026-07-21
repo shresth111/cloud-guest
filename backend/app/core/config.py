@@ -28,6 +28,29 @@ class Settings(BaseSettings):
     database_max_overflow: int = Field(default=20, ge=0, le=100)
     database_pool_timeout: int = Field(default=30, ge=1, le=120)
 
+    pagination_default_page_size: int = Field(
+        default=25,
+        ge=1,
+        le=1000,
+        description=(
+            "Default page_size for app.database.utils.pagination.PageParams "
+            "when a caller doesn't specify one. Enterprise SaaS Phase G: "
+            "was previously a hardcoded app.database.constants.DEFAULT_PAGE_SIZE "
+            "module constant -- moved to Settings per this codebase's own "
+            "'every tunable is a documented Settings field' convention."
+        ),
+    )
+    pagination_max_page_size: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description=(
+            "Hard ceiling PageParams clamps page_size to, regardless of what "
+            "a caller requests. Was previously app.database.constants"
+            ".MAX_PAGE_SIZE -- see pagination_default_page_size's own note."
+        ),
+    )
+
     redis_url: RedisDsn = Field(default="redis://localhost:6379/0")
     redis_health_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
 
@@ -63,6 +86,19 @@ class Settings(BaseSettings):
             "(app.domains.rbac.cache.PermissionCache). Real invalidation "
             "happens on every role/permission/override mutation; this TTL "
             "is only a backstop against a missed invalidation."
+        ),
+    )
+    billing_entitlement_cache_ttl_seconds: int = Field(
+        default=120,
+        ge=1,
+        le=86_400,
+        description=(
+            "TTL for the Redis-backed entitlement-snapshot cache "
+            "(app.domains.billing.cache.EntitlementCache). Real invalidation "
+            "happens on every License mutation (assign/activate/suspend/"
+            "cancel/expire/upgrade/downgrade); this TTL is only a backstop "
+            "against a missed invalidation and against a Plan/PlanFeature "
+            "catalog edit (which does not fan out to affected organizations)."
         ),
     )
     rbac_max_parent_role_depth: int = Field(

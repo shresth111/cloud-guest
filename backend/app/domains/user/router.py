@@ -34,6 +34,8 @@ from app.domains.rbac.dependencies import (
 
 from .dependencies import get_user_service
 from .schemas import (
+    InviteUserRequest,
+    InviteUserResponse,
     MeUpdateRequest,
     OrganizationMembershipSummary,
     RoleSummary,
@@ -183,6 +185,49 @@ async def create_user(
         success=True,
         message="User created",
         data=_user_response(created).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/users/invite",
+    response_model=ApiResponse[InviteUserResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("users.create"))],
+)
+async def invite_user(
+    request: Request,
+    payload: InviteUserRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    user_service: UserService = Depends(get_user_service),
+):
+    """Real invitation workflow -- unlike ``POST /users``, the caller never
+    supplies a password: one is generated and emailed to the invitee (see
+    ``UserService.invite_user``)."""
+    result = await user_service.invite_user(
+        actor_user_id=uuid.UUID(user.id),
+        first_name=payload.first_name,
+        last_name=payload.last_name,
+        email=payload.email,
+        username=payload.username,
+        requesting_organization_id=requesting_organization_id,
+        phone=payload.phone,
+        designation=payload.designation,
+        department=payload.department,
+        employee_id=payload.employee_id,
+        timezone=payload.timezone,
+        language=payload.language,
+        organization_id=payload.organization_id,
+        initial_role_id=payload.initial_role_id,
+    )
+    return build_response(
+        success=True,
+        message="User invited",
+        data=InviteUserResponse(
+            user=_user_response(result.user),
+            temporary_password=result.temporary_password,
+        ).model_dump(),
         request_id=_request_id(request),
     )
 

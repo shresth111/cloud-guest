@@ -21,6 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
 from app.domains.auth.repository import AuthRepository, AuthRepositoryProtocol
+from app.domains.notification.dependencies import get_notification_service
+from app.domains.notification.service import NotificationService
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.authorization import RoleResolver
@@ -49,6 +51,7 @@ def get_user_service(
     rbac_service: RBACService = Depends(get_rbac_service),
     role_resolver: RoleResolver = Depends(get_role_resolver),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    notification_service: NotificationService = Depends(get_notification_service),
 ) -> UserService:
     return UserService(
         identity_repository,
@@ -56,4 +59,5 @@ def get_user_service(
         rbac_service,
         role_resolver,
         audit_writer=audit_repository,
+        notification_service=notification_service,
     )

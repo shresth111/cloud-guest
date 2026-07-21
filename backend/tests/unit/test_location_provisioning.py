@@ -49,6 +49,7 @@ from app.domains.location.provisioning_service import (
     NewOrganizationInput,
     OwnerInput,
     OwnerNotProvisionedError,
+    OwnerRoleNotSeededError,
     ProvisionLocationInput,
     RouterInput,
     _generate_temporary_password,
@@ -56,6 +57,11 @@ from app.domains.location.provisioning_service import (
 )
 from app.domains.location.service import LocationService
 from app.domains.organization.enums import OrganizationStatus, OrganizationType
+from app.domains.organization.exceptions import (
+    DuplicateSlugError,
+    OrganizationArchivedError,
+    OrganizationNotFoundError,
+)
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.seed import SYSTEM_ROLES
@@ -201,6 +207,9 @@ class FakeLocationCodeCounterRepository:
         self.session.flush("location_code_counter.increment")
         return next_value
 
+    async def peek_next(self, counter_key: str) -> int:
+        return self.counters.get(counter_key, 0) + 1
+
 
 @dataclass
 class FakeOrganizationLookupForLocation:
@@ -325,6 +334,13 @@ class ProvisioningFakes:
     async def get_organization(self, organization_id, *, include_deleted=False):
         self._maybe_fail("organization.get")
         return self.organizations[organization_id]
+
+    async def get_by_slug(self, slug: str):
+        self._maybe_fail("organization.get_by_slug")
+        for organization in self.organizations.values():
+            if organization.slug == slug:
+                return organization
+        raise OrganizationNotFoundError(slug)
 
     async def create_organization(self, *, actor_user_id, name, slug, **kwargs):
         self._maybe_fail("organization.create")
@@ -676,6 +692,164 @@ def _new_org() -> NewOrganizationInput:
         slug=f"grand-plaza-{uuid.uuid4().hex[:6]}",
         contact_email="ops@grandplaza.example.com",
     )
+
+
+# ============================================================================
+# Preview (Enterprise SaaS Phase C: read-only dry run)
+# ============================================================================
+
+
+class TestPreviewProvisionLocation:
+    async def test_preview_never_creates_anything(self) -> None:
+        service, fakes, base_plan_id = make_service()
+
+        preview = await service.preview_provision_location(
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id)
+        )
+
+        assert preview.organization_id is None
+        assert fakes.organizations == {}
+        assert fakes.users_by_id == {}
+        # Only real, read-only lookups happen (e.g. resolving the default
+        # config template) -- never a create/assign/update call.
+        assert not any(
+            call.split(".", 1)[1].startswith(("create", "assign", "update"))
+            for call in fakes.calls
+        )
+
+    async def test_preview_new_organization_previews_customer_and_site_ids(
+        self,
+    ) -> None:
+        service, _fakes, base_plan_id = make_service()
+        new_org = _new_org()
+
+        preview = await service.preview_provision_location(
+            data=_input(new_organization=new_org, plan_id=base_plan_id)
+        )
+
+        assert preview.customer_id == new_org.slug
+        assert preview.site_id.startswith("LOC-")
+        assert preview.nas_id == f"NAS-{preview.site_id}-0001"
+        assert preview.controller_id == "SN-00001"
+        assert preview.plan_name == "Professional"
+
+    async def test_preview_does_not_consume_the_real_location_code_counter(
+        self,
+    ) -> None:
+        service, fakes, base_plan_id = make_service()
+        data = _input(new_organization=_new_org(), plan_id=base_plan_id)
+
+        first_preview = await service.preview_provision_location(data=data)
+        second_preview = await service.preview_provision_location(data=data)
+
+        assert first_preview.site_id == second_preview.site_id
+        assert fakes.session.flushed == []
+
+    async def test_preview_existing_organization_uses_its_real_slug(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        organization = Organization(
+            **_base_fields(
+                name="Existing Co",
+                slug="existing-co",
+                legal_name=None,
+                org_type=OrganizationType.STANDARD.value,
+                status=OrganizationStatus.ACTIVE.value,
+                parent_organization_id=None,
+                contact_email="ops@existing.example.com",
+                contact_phone=None,
+                timezone="UTC",
+                default_locale="en",
+                settings={},
+                subscription_tier=None,
+            )
+        )
+        fakes.organizations[organization.id] = organization
+
+        preview = await service.preview_provision_location(
+            data=_input(
+                existing_organization_id=organization.id, plan_id=base_plan_id
+            )
+        )
+
+        assert preview.organization_id == organization.id
+        assert preview.customer_id == "existing-co"
+
+    async def test_preview_rejects_archived_organization(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        organization = Organization(
+            **_base_fields(
+                name="Archived Co",
+                slug="archived-co",
+                legal_name=None,
+                org_type=OrganizationType.STANDARD.value,
+                status=OrganizationStatus.ARCHIVED.value,
+                parent_organization_id=None,
+                contact_email="ops@archived.example.com",
+                contact_phone=None,
+                timezone="UTC",
+                default_locale="en",
+                settings={},
+                subscription_tier=None,
+            )
+        )
+        fakes.organizations[organization.id] = organization
+
+        with pytest.raises(OrganizationArchivedError):
+            await service.preview_provision_location(
+                data=_input(
+                    existing_organization_id=organization.id, plan_id=base_plan_id
+                )
+            )
+
+    async def test_preview_rejects_duplicate_new_organization_slug(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        taken_slug = "taken-slug"
+        organization = Organization(
+            **_base_fields(
+                name="Taken Co",
+                slug=taken_slug,
+                legal_name=None,
+                org_type=OrganizationType.STANDARD.value,
+                status=OrganizationStatus.ACTIVE.value,
+                parent_organization_id=None,
+                contact_email="ops@taken.example.com",
+                contact_phone=None,
+                timezone="UTC",
+                default_locale="en",
+                settings={},
+                subscription_tier=None,
+            )
+        )
+        fakes.organizations[organization.id] = organization
+
+        with pytest.raises(DuplicateSlugError):
+            await service.preview_provision_location(
+                data=_input(
+                    new_organization=NewOrganizationInput(
+                        name="Duplicate Co",
+                        slug=taken_slug,
+                        contact_email="ops@duplicate.example.com",
+                    ),
+                    plan_id=base_plan_id,
+                )
+            )
+
+    async def test_preview_raises_when_owner_role_not_seeded(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        fakes.roles_by_slug.clear()
+
+        with pytest.raises(OwnerRoleNotSeededError):
+            await service.preview_provision_location(
+                data=_input(new_organization=_new_org(), plan_id=base_plan_id)
+            )
+
+    async def test_preview_raises_when_plan_not_found(self) -> None:
+        service, _fakes, _base_plan_id = make_service()
+
+        with pytest.raises(KeyError):
+            await service.preview_provision_location(
+                data=_input(new_organization=_new_org(), plan_id=uuid.uuid4())
+            )
 
 
 # ============================================================================

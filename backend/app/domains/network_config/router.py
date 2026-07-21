@@ -125,6 +125,8 @@ async def preview_network_config(
         port_forwarding_rule_count=preview.port_forwarding_rule_count,
         hotspot_profile_count=preview.hotspot_profile_count,
         qos_traffic_rule_count=preview.qos_traffic_rule_count,
+        dns_record_count=preview.dns_record_count,
+        firewall_rule_count=preview.firewall_rule_count,
     )
     return build_response(
         success=True,

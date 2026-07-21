@@ -138,6 +138,15 @@ class LastActiveMemberError(OrganizationError):
         )
 
 
+class InvalidBrandingFieldError(OrganizationError):
+    """A field in an org-wide branding update (see
+    ``OrganizationService.update_branding``) failed validation --
+    e.g. a malformed custom domain."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
+
+
 class OrganizationMembershipRequiredError(OrganizationError):
     """Raised by ``RequireOrganizationMembership``-style checks (see
     ``app.domains.rbac.dependencies.CurrentOrganization``) when the caller

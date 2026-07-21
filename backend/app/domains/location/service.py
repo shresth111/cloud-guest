@@ -60,6 +60,7 @@ from .models import Location
 from .number_generator import (
     LocationCodeCounterRepositoryProtocol,
     generate_location_code,
+    peek_next_location_code,
 )
 from .repository import LocationRepositoryProtocol
 
@@ -148,6 +149,17 @@ class LocationService:
             page_size=page_size,
             search=search,
             status=status.value if status else None,
+        )
+
+    async def preview_next_location_code(self) -> str:
+        """The ``location_code`` a subsequent ``create_location`` call
+        would generate right now -- a genuine dry-run read, never
+        consuming the real counter. Backs the Organization Provisioning
+        Wizard's "Site ID" preview field (see
+        ``app.domains.location.provisioning_service
+        .LocationProvisioningService.preview_provision_location``)."""
+        return await peek_next_location_code(
+            self.location_code_counter, at=datetime.now(UTC)
         )
 
     # -- writes ------------------------------------------------------------------

@@ -90,7 +90,9 @@ async def ready(request: Request) -> JSONResponse:
         status_code=response_status,
         content=build_response(
             success=is_ready,
-            message="Service is ready" if is_ready else "Service dependencies unavailable",
+            message=(
+                "Service is ready" if is_ready else "Service dependencies unavailable"
+            ),
             data=ReadinessData(
                 service=settings.service_name,
                 database=database,

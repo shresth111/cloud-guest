@@ -481,6 +481,157 @@ class TestUserCreation:
 
 
 # ============================================================================
+# Real invitation workflow (Enterprise SaaS Phase D)
+# ============================================================================
+
+
+@dataclass
+class FakeNotificationSender:
+    """In-memory stand-in for ``UserService.NotificationSenderProtocol``."""
+
+    sent: list[dict[str, object]] = field(default_factory=list)
+
+    async def enqueue(
+        self,
+        *,
+        event_type,
+        channel,
+        recipient,
+        body,
+        organization_id,
+        subject=None,
+    ) -> dict[str, object]:
+        record = {
+            "event_type": event_type,
+            "channel": channel,
+            "recipient": recipient,
+            "body": body,
+            "organization_id": organization_id,
+            "subject": subject,
+        }
+        self.sent.append(record)
+        return record
+
+
+def make_service_with_notifications() -> tuple[
+    UserService,
+    FakeIdentityRepository,
+    FakeOrganizationLookup,
+    FakeRoleAssigner,
+    FakeRoleResolver,
+    FakeAuditLogWriter,
+    FakeNotificationSender,
+]:
+    identity_repository = FakeIdentityRepository()
+    organization_lookup = FakeOrganizationLookup()
+    role_assigner = FakeRoleAssigner()
+    role_resolver = FakeRoleResolver()
+    audit_writer = FakeAuditLogWriter()
+    notification_sender = FakeNotificationSender()
+    service = UserService(
+        identity_repository,
+        organization_lookup,
+        role_assigner,
+        role_resolver,
+        audit_writer=audit_writer,
+        notification_service=notification_sender,
+    )
+    return (
+        service,
+        identity_repository,
+        organization_lookup,
+        role_assigner,
+        role_resolver,
+        audit_writer,
+        notification_sender,
+    )
+
+
+def _invite_kwargs(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "actor_user_id": uuid.uuid4(),
+        "first_name": "Jamie",
+        "last_name": "Rivera",
+        "email": "jamie@example.com",
+        "username": "jamie",
+        "requesting_organization_id": None,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestUserInvitation:
+    async def test_invite_generates_a_real_random_password(self) -> None:
+        service, *_rest = make_service_with_notifications()
+
+        result = await service.invite_user(**_invite_kwargs())
+
+        assert len(result.temporary_password) >= 12
+        assert result.temporary_password != STRONG_PASSWORD
+        assert any(c.isupper() for c in result.temporary_password)
+        assert any(c.islower() for c in result.temporary_password)
+        assert any(c.isdigit() for c in result.temporary_password)
+
+    async def test_invite_forces_password_change_on_first_login(self) -> None:
+        service, *_rest = make_service_with_notifications()
+
+        result = await service.invite_user(**_invite_kwargs())
+
+        assert result.user.must_change_password is True
+
+    async def test_invite_sends_a_real_email_with_credentials(self) -> None:
+        service, *_rest, notification_sender = make_service_with_notifications()
+
+        result = await service.invite_user(**_invite_kwargs())
+
+        assert len(notification_sender.sent) == 1
+        sent = notification_sender.sent[0]
+        assert sent["recipient"] == "jamie@example.com"
+        assert result.temporary_password in sent["body"]
+        assert "jamie" in sent["body"]
+
+    async def test_invite_two_different_users_get_different_passwords(self) -> None:
+        service, *_rest = make_service_with_notifications()
+
+        first = await service.invite_user(**_invite_kwargs())
+        second = await service.invite_user(
+            **_invite_kwargs(email="other@example.com", username="other")
+        )
+
+        assert first.temporary_password != second.temporary_password
+
+    async def test_invite_rejects_duplicate_email(self) -> None:
+        service, *_rest = make_service_with_notifications()
+        await service.invite_user(**_invite_kwargs())
+
+        with pytest.raises(EmailAlreadyExistsError):
+            await service.invite_user(**_invite_kwargs(username="someoneelse"))
+
+    async def test_invite_with_organization_creates_active_membership(self) -> None:
+        service, _identity, org_lookup, *_rest = make_service_with_notifications()
+        organization = org_lookup.add_organization()
+
+        result = await service.invite_user(
+            **_invite_kwargs(organization_id=organization.id)
+        )
+
+        memberships = [
+            m for m in org_lookup.member_rows if m.organization_id == organization.id
+        ]
+        assert any(m.user_id == result.user.id for m in memberships)
+
+    async def test_no_real_notification_sender_falls_back_to_noop(self) -> None:
+        """Mirrors ``AuthService``'s own ``_NoopNotificationSender``
+        precedent -- an unwired invite still succeeds (logged, not
+        faked, not silently dropped, and never raises)."""
+        service, *_rest = make_service()
+
+        result = await service.invite_user(**_invite_kwargs())
+
+        assert result.user.email == "jamie@example.com"
+
+
+# ============================================================================
 # Tenant-scoped listing / search
 # ============================================================================
 

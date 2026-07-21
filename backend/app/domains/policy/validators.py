@@ -15,14 +15,18 @@ from app.domains.rbac.enums import ScopeType
 
 from .constants import (
     POLICY_VERSION_STATUS_TRANSITIONS,
+    PolicyAssignmentTargetType,
     PolicyType,
     PolicyVersionStatus,
 )
 from .exceptions import (
     InvalidPolicyAssignmentScopeTypeError,
+    InvalidPolicyAssignmentTargetTypeError,
     InvalidPolicyVersionStatusTransitionError,
     PolicyAssignmentScopeIdNotAllowedError,
     PolicyAssignmentScopeIdRequiredError,
+    PolicyAssignmentTargetIdNotAllowedError,
+    PolicyAssignmentTargetIdRequiredError,
     PolicyRulesValidationError,
 )
 from .schemas import POLICY_RULE_SCHEMAS
@@ -73,8 +77,27 @@ def validate_assignment_scope(*, scope_type: str, scope_id: object | None) -> No
         raise PolicyAssignmentScopeIdRequiredError(scope_type)
 
 
+def validate_assignment_target(*, target_type: str, target_id: object | None) -> None:
+    """``target_type`` must be one of
+    ``constants.PolicyAssignmentTargetType``'s values. A ``none`` target
+    must have no ``target_id``; ``user``/``role`` requires one -- the
+    identical shape ``validate_assignment_scope`` already establishes for
+    the WHERE axis, applied to the new, orthogonal WHO axis (Enterprise
+    SaaS Phase F)."""
+    try:
+        resolved_target_type = PolicyAssignmentTargetType(target_type)
+    except ValueError as exc:
+        raise InvalidPolicyAssignmentTargetTypeError(target_type) from exc
+    if resolved_target_type == PolicyAssignmentTargetType.NONE:
+        if target_id is not None:
+            raise PolicyAssignmentTargetIdNotAllowedError()
+    elif target_id is None:
+        raise PolicyAssignmentTargetIdRequiredError(target_type)
+
+
 __all__ = [
     "validate_rules",
     "validate_version_status_transition",
     "validate_assignment_scope",
+    "validate_assignment_target",
 ]

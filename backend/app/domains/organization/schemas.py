@@ -27,6 +27,8 @@ __all__ = [
     "OrganizationUpdateRequest",
     "OrganizationMemberResponse",
     "OrganizationMemberInviteRequest",
+    "OrganizationBrandingRequest",
+    "OrganizationBrandingResponse",
 ]
 
 _SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -157,3 +159,27 @@ class OrganizationUpdateRequest(BaseModel):
 class OrganizationMemberInviteRequest(BaseModel):
     user_id: uuid.UUID = Field(..., description="User to invite into the organization")
     is_primary_contact: bool = Field(default=False)
+
+
+# ============================================================================
+# Org-wide product branding (White Label) -- gated by
+# ``PlanFeatureKey.WHITE_LABEL``, distinct from per-portal
+# ``app.domains.captive_portal`` branding (see ``service.py``'s own
+# ``get_branding``/``update_branding`` docstring).
+# ============================================================================
+
+
+class OrganizationBrandingRequest(BaseModel):
+    app_name: str | None = Field(default=None, max_length=100)
+    favicon_url: str | None = Field(default=None, max_length=500)
+    support_email: EmailStr | None = None
+    custom_domain: str | None = Field(default=None, max_length=255)
+    primary_color: str | None = Field(default=None, max_length=20)
+
+
+class OrganizationBrandingResponse(BaseModel):
+    app_name: str | None = None
+    favicon_url: str | None = None
+    support_email: str | None = None
+    custom_domain: str | None = None
+    primary_color: str | None = None

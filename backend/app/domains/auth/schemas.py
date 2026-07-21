@@ -163,10 +163,39 @@ class TokenResponse(BaseModel):
     refresh_expires_in: int = Field(..., description="Refresh token expiry in seconds")
 
 
+class RoleAssignmentSummary(BaseModel):
+    """One active role assignment, with the scope it was granted at --
+    Enterprise SaaS Phase E: lets the frontend render the right
+    dashboard/menu per role without a second round trip."""
+
+    role_id: str
+    role_name: str
+    role_slug: str
+    scope_type: str
+    organization_id: str | None = None
+    location_id: str | None = None
+    router_id: str | None = None
+
+
+class OrganizationMembershipSummary(BaseModel):
+    """One organization the caller is an active member of, plus that
+    organization's currently enabled plan features (empty if it has no
+    license yet) -- Enterprise SaaS Phase E's "dynamic dashboards based
+    on licensed features" data source."""
+
+    organization_id: str
+    organization_name: str
+    organization_slug: str
+    is_primary_contact: bool
+    enabled_features: list[str] = Field(default_factory=list)
+
+
 class LoginResponse(BaseModel):
     user: UserResponse
     tokens: TokenResponse
     session_id: str
+    roles: list[RoleAssignmentSummary] = Field(default_factory=list)
+    organizations: list[OrganizationMembershipSummary] = Field(default_factory=list)
 
 
 class RegisterResponse(BaseModel):

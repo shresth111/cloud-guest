@@ -221,7 +221,9 @@ class GenericRepository(Generic[ModelT]):
             await self.session.flush()
         except IntegrityError as exc:
             await self.session.rollback()
-            raise DuplicateRecordError(self.model.__name__, "unique constraint") from exc
+            raise DuplicateRecordError(
+                self.model.__name__, "unique constraint"
+            ) from exc
         except SQLAlchemyError as exc:
             await self.session.rollback()
             raise DatabaseError(str(exc)) from exc

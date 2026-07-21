@@ -13,6 +13,8 @@ from app.domains.connected_devices.router import router as connected_devices_rou
 from app.domains.controller_logs.router import router as controller_logs_router
 from app.domains.device_sync.router import router as device_sync_router
 from app.domains.dhcp.router import router as dhcp_router
+from app.domains.dns.router import router as dns_router
+from app.domains.firewall.router import router as firewall_router
 from app.domains.guest.router import admin_router as guest_admin_router
 from app.domains.guest.router import analytics_router as guest_analytics_router
 from app.domains.guest.router import guest_router
@@ -29,6 +31,7 @@ from app.domains.location.router import router as location_router
 from app.domains.mac_authorization.router import router as mac_authorization_router
 from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
+from app.domains.network_device.router import router as network_device_router
 from app.domains.network_diagnostics.router import router as network_diagnostics_router
 from app.domains.notification.router import router as notification_router
 from app.domains.organization.router import router as organization_router
@@ -80,6 +83,8 @@ api_v1_router.include_router(isp_router)
 api_v1_router.include_router(isp_routing_router)
 api_v1_router.include_router(vlan_router)
 api_v1_router.include_router(dhcp_router)
+api_v1_router.include_router(dns_router)
+api_v1_router.include_router(firewall_router)
 api_v1_router.include_router(port_forwarding_router)
 api_v1_router.include_router(mac_authorization_router)
 api_v1_router.include_router(connected_devices_router)
@@ -89,6 +94,7 @@ api_v1_router.include_router(network_config_router)
 api_v1_router.include_router(hotspot_router)
 api_v1_router.include_router(qos_router)
 api_v1_router.include_router(network_diagnostics_router)
+api_v1_router.include_router(network_device_router)
 api_v1_router.include_router(campaigns_guest_router)
 api_v1_router.include_router(campaigns_router)
 api_v1_router.include_router(notification_router)

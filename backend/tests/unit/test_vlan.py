@@ -137,6 +137,7 @@ class FakeVlanRepository:
         *,
         requesting_organization_id: uuid.UUID | None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
         **_kw: object,
@@ -148,6 +149,8 @@ class FakeVlanRepository:
             ]
         if router_id is not None:
             values = [v for v in values if v.router_id == router_id]
+        if location_id is not None:
+            values = [v for v in values if v.location_id == location_id]
         values.sort(key=lambda v: v.created_at, reverse=True)
         params = PageParams(page=page, page_size=page_size)
         paged = values[params.offset : params.offset + params.page_size]
@@ -326,6 +329,20 @@ class TestVlanCrud:
         )
         assert meta.total_items == 1
         assert vlans[0].router_id == router_a.id
+
+    async def test_list_vlans_filters_by_location_id(self) -> None:
+        h = make_harness()
+        router_a = h.router_lookup.add(_make_router())
+        router_b = h.router_lookup.add(_make_router())
+        await _create_vlan(h, router_a, vlan_id=100)
+        await _create_vlan(h, router_b, vlan_id=200)
+
+        vlans, meta = await h.service.list_vlans(
+            requesting_organization_id=None, location_id=router_a.location_id
+        )
+
+        assert meta.total_items == 1
+        assert vlans[0].location_id == router_a.location_id
 
     async def test_update_name_only(self) -> None:
         h = make_harness()

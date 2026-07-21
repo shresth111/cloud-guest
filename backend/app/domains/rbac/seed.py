@@ -353,6 +353,22 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # itself, mirroring DEVICE_SYNC's identical "no CRUD resource of its
     # own" shape.
     PermissionModule.NETWORK_DIAGNOSTICS: (_A.READ, _A.EXECUTE, _A.MANAGE),
+    # Network Device (NAC): plain CRUD registration plus MANAGE (used by
+    # the compliance-status-assessment endpoint -- a real, admin-driven
+    # action distinct from a plain field edit, mirroring
+    # PermissionModule.CAMPAIGNS's own APPROVE-style "significant action
+    # gets a stronger action tier" precedent, here reusing the existing
+    # MANAGE tier rather than adding a new action). No EXECUTE -- this
+    # domain has no device-facing action of its own (see
+    # app.domains.network_device's own module docstring: no live
+    # detection, admin-assessed only).
+    PermissionModule.NETWORK_DEVICE: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.MANAGE,
+    ),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -405,6 +421,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.NETWORK_CONFIG: "Network Configuration Management",
     PermissionModule.QOS: "QoS & VOIP Priority",
     PermissionModule.NETWORK_DIAGNOSTICS: "Network Diagnostics",
+    PermissionModule.NETWORK_DEVICE: "Network Device (NAC)",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -488,6 +505,13 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # A diagnostic run targets one router at a time -- identical
     # ScopeType.ROUTER reasoning as PermissionModule.DEVICE_SYNC above.
     PermissionModule.NETWORK_DIAGNOSTICS: ScopeType.ROUTER,
+    # A network device's own router_id is nullable (a device can be
+    # pre-registered before ever being seen on one specific router, or
+    # roam across routers at one location) -- ScopeType.LOCATION, the
+    # identical "no mandatory router" reasoning
+    # PermissionModule.MAC_AUTHORIZATION's own entry above already
+    # documents.
+    PermissionModule.NETWORK_DEVICE: ScopeType.LOCATION,
 }
 
 
@@ -721,6 +745,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_CONFIG: _L.FULL,
             _M.QOS: _L.FULL,
             _M.NETWORK_DIAGNOSTICS: _L.FULL,
+            _M.NETWORK_DEVICE: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,
@@ -730,6 +755,56 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.TEMPLATES: _L.OPERATE,
             _M.CAPTIVE_PORTAL: _L.OPERATE,
             _M.LOCATIONS: _L.READ,
+        },
+    ),
+    SystemRoleDefinition(
+        name="Network Engineer",
+        slug="network-engineer",
+        description=(
+            "Day-to-day network operations at a single location -- narrower "
+            "than Network Administrator's full technical control (no "
+            "provisioning/deployment authority: ROUTER_PROVISIONING/"
+            "PROVISIONING_ENGINE stay OPERATOR-exclusive)."
+        ),
+        scope_type=ScopeType.LOCATION,
+        default_level=_L.NONE,
+        overrides={
+            _M.ROUTERS: _L.OPERATE,
+            _M.WIREGUARD: _L.OPERATE,
+            _M.FIREWALL: _L.OPERATE,
+            _M.DHCP: _L.OPERATE,
+            _M.DNS: _L.OPERATE,
+            _M.HOTSPOT: _L.OPERATE,
+            _M.VLAN: _L.OPERATE,
+            _M.CONNECTED_DEVICES: _L.OPERATE,
+            _M.NETWORK_CONFIG: _L.OPERATE,
+            _M.QOS: _L.OPERATE,
+            _M.NETWORK_DIAGNOSTICS: _L.OPERATE,
+            _M.NETWORK_DEVICE: _L.OPERATE,
+            _M.MONITORING: _L.READ,
+            _M.ALERTS: _L.READ,
+            _M.DASHBOARD: _L.READ,
+        },
+    ),
+    SystemRoleDefinition(
+        name="Office Admin",
+        slug="office-admin",
+        description=(
+            "Front-office administration at a single location -- location "
+            "settings, guest policy, and notifications, distinct from "
+            "Reception Staff's guest-onboarding-only scope and Network "
+            "Engineer's networking-only scope."
+        ),
+        scope_type=ScopeType.LOCATION,
+        default_level=_L.NONE,
+        overrides={
+            _M.LOCATIONS: _L.OPERATE,
+            _M.POLICY: _L.OPERATE,
+            _M.NOTIFICATIONS: _L.OPERATE,
+            _M.CAMPAIGNS: _L.READ,
+            _M.DASHBOARD: _L.READ,
+            _M.ANALYTICS: _L.READ,
+            _M.REPORTS: _L.READ,
         },
     ),
     SystemRoleDefinition(

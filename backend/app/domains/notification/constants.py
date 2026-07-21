@@ -21,6 +21,7 @@ class NotificationEventType(StrEnum):
     SUBSCRIPTION_RENEWAL_REMINDER = "subscription_renewal_reminder"
     SUBSCRIPTION_EXPIRY_REMINDER = "subscription_expiry_reminder"
     SCHEDULED_REPORT = "scheduled_report"
+    USER_INVITED = "user_invited"
 
 
 class NotificationChannelType(StrEnum):

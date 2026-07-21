@@ -143,6 +143,7 @@ class FakeConnectedDeviceRepository:
         *,
         requesting_organization_id: uuid.UUID | None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         is_active: bool | None = None,
         page: int,
         page_size: int,
@@ -155,6 +156,8 @@ class FakeConnectedDeviceRepository:
             ]
         if router_id is not None:
             values = [v for v in values if v.router_id == router_id]
+        if location_id is not None:
+            values = [v for v in values if v.location_id == location_id]
         if is_active is not None:
             values = [v for v in values if v.is_active == is_active]
         values.sort(key=lambda v: v.created_at, reverse=True)
@@ -640,6 +643,60 @@ class TestAdminActions:
         h = make_harness()
         with pytest.raises(ConnectedDeviceNotFoundError):
             await h.service.get_device(uuid.uuid4())
+
+
+# ============================================================================
+# location_id filter (Enterprise SaaS Phase E)
+# ============================================================================
+
+
+class TestListDevicesLocationFilter:
+    async def test_list_devices_filters_by_location_id(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        other_location_id = uuid.uuid4()
+        await h.repository.create_device(
+            router_id=router.id,
+            organization_id=router.organization_id,
+            location_id=router.location_id,
+            mac_address="AA:BB:CC:DD:EE:21",
+            ip_address=None,
+            hostname=None,
+            vendor=None,
+            connection_type=ConnectionType.UNKNOWN.value,
+            interface=None,
+            signal_strength_dbm=None,
+            is_active=True,
+            connected_at=_now(),
+            last_seen_at=_now(),
+            guest_id=None,
+            guest_session_id=None,
+        )
+        await h.repository.create_device(
+            router_id=router.id,
+            organization_id=router.organization_id,
+            location_id=other_location_id,
+            mac_address="AA:BB:CC:DD:EE:22",
+            ip_address=None,
+            hostname=None,
+            vendor=None,
+            connection_type=ConnectionType.UNKNOWN.value,
+            interface=None,
+            signal_strength_dbm=None,
+            is_active=True,
+            connected_at=_now(),
+            last_seen_at=_now(),
+            guest_id=None,
+            guest_session_id=None,
+        )
+
+        devices, meta = await h.service.list_devices(
+            requesting_organization_id=router.organization_id,
+            location_id=router.location_id,
+        )
+
+        assert meta.total_items == 1
+        assert devices[0].location_id == router.location_id
 
 
 # ============================================================================

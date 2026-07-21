@@ -10,6 +10,14 @@ endpoint is gated by RBAC's existing ``RequirePermission`` dependency
 against ``audit_logs.*`` (``PermissionModule.AUDIT_LOGS``, already seeded)
 and resolves ``CurrentOrganization``, passed through as
 ``requesting_organization_id``.
+
+**Entitlement pilot**: both endpoints additionally require
+``PlanFeatureKey.AUDIT_LOGS`` via ``app.domains.billing.dependencies
+.RequireFeature`` -- this is the first domain wired to the new
+request-time license/feature-entitlement gate (see that module's own
+docstring). A ``None`` organization context (no ``X-Organization-Id``
+header) still passes through unchecked, same as ``RequirePermission``'s
+own GLOBAL-scope behavior, so a platform-level caller is unaffected.
 """
 
 from __future__ import annotations
@@ -21,6 +29,8 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 
 from app.common.responses import ApiResponse, build_response
 from app.database.utils.pagination import PaginationMeta
+from app.domains.billing.constants import PlanFeatureKey
+from app.domains.billing.dependencies import RequireFeature
 from app.domains.rbac.dependencies import CurrentOrganization, RequirePermission
 from app.domains.rbac.models import AuditLogEntry
 
@@ -64,13 +74,17 @@ def _entry_response(entry: AuditLogEntry) -> AuditLogEntryResponse:
     "/entries",
     response_model=ApiResponse[AuditLogEntryListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("audit_logs.read"))],
+    dependencies=[
+        Depends(RequirePermission("audit_logs.read")),
+        Depends(RequireFeature(PlanFeatureKey.AUDIT_LOGS)),
+    ],
 )
 async def search_audit_log_entries(
     request: Request,
     actor_user_id: uuid.UUID | None = Query(default=None),
     action: str | None = Query(default=None),
     entity_type: str | None = Query(default=None),
+    location_id: uuid.UUID | None = Query(default=None),
     start: datetime | None = Query(default=None),
     end: datetime | None = Query(default=None),
     page: int = Query(default=1, ge=1),
@@ -83,6 +97,7 @@ async def search_audit_log_entries(
         actor_user_id=actor_user_id,
         action=action,
         entity_type=entity_type,
+        location_id=location_id,
         start=start,
         end=end,
         page=page,
@@ -103,12 +118,16 @@ async def search_audit_log_entries(
 @router.get(
     "/entries/export",
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("audit_logs.export"))],
+    dependencies=[
+        Depends(RequirePermission("audit_logs.export")),
+        Depends(RequireFeature(PlanFeatureKey.AUDIT_LOGS)),
+    ],
 )
 async def export_audit_log_entries(
     actor_user_id: uuid.UUID | None = Query(default=None),
     action: str | None = Query(default=None),
     entity_type: str | None = Query(default=None),
+    location_id: uuid.UUID | None = Query(default=None),
     start: datetime | None = Query(default=None),
     end: datetime | None = Query(default=None),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
@@ -119,6 +138,7 @@ async def export_audit_log_entries(
         actor_user_id=actor_user_id,
         action=action,
         entity_type=entity_type,
+        location_id=location_id,
         start=start,
         end=end,
     )

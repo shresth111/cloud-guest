@@ -15,8 +15,21 @@ import uuid
 from fastapi import APIRouter, Depends, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.domains.billing.dependencies import get_license_service
+from app.domains.billing.exceptions import LicenseNotFoundError
+from app.domains.billing.service import LicenseService
+from app.domains.organization.dependencies import get_organization_service
+from app.domains.organization.enums import MembershipStatus
+from app.domains.organization.models import OrganizationMember
+from app.domains.organization.service import OrganizationService
+from app.domains.rbac.authorization import ActiveRoleAssignment, RoleResolver
 
-from .dependencies import get_auth_service, get_current_user, get_device_info
+from .dependencies import (
+    get_auth_service,
+    get_current_user,
+    get_device_info,
+    get_role_resolver,
+)
 from .jwt import InvalidTokenError, JWTManager, TokenExpiredError
 from .models import AuthUser, Session, User
 from .schemas import (
@@ -31,11 +44,13 @@ from .schemas import (
     MfaRecoveryCodesResponse,
     MfaRegenerateRecoveryCodesRequest,
     MfaVerifyRequest,
+    OrganizationMembershipSummary,
     RefreshTokenRequest,
     RegisterRequest,
     RegisterResponse,
     ResendVerificationRequest,
     ResetPasswordRequest,
+    RoleAssignmentSummary,
     SessionListResponse,
     SessionResponse,
     TokenResponse,
@@ -112,12 +127,20 @@ async def login(
     payload: LoginRequest,
     device_info: DeviceInfo = Depends(get_device_info),
     auth_service: AuthService = Depends(get_auth_service),
+    role_resolver: RoleResolver = Depends(get_role_resolver),
+    organization_service: OrganizationService = Depends(get_organization_service),
+    license_service: LicenseService = Depends(get_license_service),
 ):
     if payload.device_name:
         device_info.device_name = payload.device_name
 
     user, tokens, session_id = await auth_service.login(
         payload.email, payload.password, device_info, mfa_code=payload.mfa_code
+    )
+
+    roles = await _role_assignment_summaries(role_resolver, user.id)
+    organizations = await _organization_membership_summaries(
+        organization_service, license_service, user.id
     )
 
     return build_response(
@@ -127,8 +150,82 @@ async def login(
             user=_user_response(user),
             tokens=_token_response(tokens),
             session_id=str(session_id),
+            roles=roles,
+            organizations=organizations,
         ).model_dump(),
         request_id=_request_id(request),
+    )
+
+
+async def _role_assignment_summaries(
+    role_resolver: RoleResolver, user_id: uuid.UUID
+) -> list[RoleAssignmentSummary]:
+    """Every active role the caller holds, at whatever scope it was
+    granted -- Enterprise SaaS Phase E's "dynamic dashboards based on
+    role permissions" data source. Uses ``get_active_assignments`` (not
+    ``get_active_roles``) so each summary keeps its own
+    organization/location/router scope rather than a deduplicated,
+    scope-less role list."""
+    assignments = await role_resolver.get_active_assignments(user_id)
+    return [_role_summary(item) for item in assignments]
+
+
+def _role_summary(item: ActiveRoleAssignment) -> RoleAssignmentSummary:
+    assignment = item.assignment
+    return RoleAssignmentSummary(
+        role_id=str(item.role.id),
+        role_name=item.role.name,
+        role_slug=item.role.slug,
+        scope_type=assignment.scope_type,
+        organization_id=(
+            str(assignment.organization_id) if assignment.organization_id else None
+        ),
+        location_id=(
+            str(assignment.location_id) if assignment.location_id else None
+        ),
+        router_id=str(assignment.router_id) if assignment.router_id else None,
+    )
+
+
+async def _organization_membership_summaries(
+    organization_service: OrganizationService,
+    license_service: LicenseService,
+    user_id: uuid.UUID,
+) -> list[OrganizationMembershipSummary]:
+    """Every organization the caller is an *active* member of, each
+    paired with that organization's currently enabled plan features
+    (empty if it has no license yet -- never fabricated). Reuses Phase
+    A's ``LicenseService.get_entitlement_snapshot`` directly rather than
+    a second entitlement computation."""
+    memberships = await organization_service.list_user_organizations(
+        user_id, status=MembershipStatus.ACTIVE
+    )
+    return [
+        await _membership_summary(organization_service, license_service, membership)
+        for membership in memberships
+    ]
+
+
+async def _membership_summary(
+    organization_service: OrganizationService,
+    license_service: LicenseService,
+    membership: OrganizationMember,
+) -> OrganizationMembershipSummary:
+    organization = await organization_service.get_organization(
+        membership.organization_id
+    )
+    enabled_features: list[str] = []
+    try:
+        snapshot = await license_service.get_entitlement_snapshot(organization.id)
+        enabled_features = sorted(snapshot.enabled_features)
+    except LicenseNotFoundError:
+        pass
+    return OrganizationMembershipSummary(
+        organization_id=str(organization.id),
+        organization_name=organization.name,
+        organization_slug=organization.slug,
+        is_primary_contact=membership.is_primary_contact,
+        enabled_features=enabled_features,
     )
 
 

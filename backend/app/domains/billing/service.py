@@ -79,6 +79,7 @@ from .constants import (
     LicenseStatus,
     NoteType,
     PaymentStatus,
+    PlanFeatureKey,
     PlanFeatureType,
     PlanType,
     SubscriptionStatus,
@@ -549,6 +550,126 @@ class LicenseLifecycleProtocol(Protocol):
     async def expire_license(self, *, license_id: uuid.UUID) -> License: ...
 
 
+# ============================================================================
+# Entitlement snapshot -- request-time license/feature enforcement
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class EntitlementSnapshot:
+    """What one organization is currently entitled to, composed from its
+    ``License`` + that license's ``Plan``'s ``PlanFeature`` rows -- the read
+    model ``dependencies.RequireActiveLicense``/``RequireFeature`` gate
+    requests against. Never fabricated: every field is read straight off
+    real ``License``/``PlanFeature`` rows (see
+    ``LicenseService.get_entitlement_snapshot``), the same "no synthetic
+    data" rule the rest of this codebase follows.
+
+    Serialized to/from a plain ``dict`` for ``cache.EntitlementCache``
+    (mirrors ``app.domains.rbac.cache.PermissionCache``'s identical
+    serialize-for-Redis shape)."""
+
+    organization_id: uuid.UUID
+    plan_id: uuid.UUID
+    license_status: str
+    expires_at: datetime | None
+    enabled_features: frozenset[str]
+    limits: dict[str, Decimal]
+    tiers: dict[str, str]
+
+    @property
+    def is_active(self) -> bool:
+        if self.license_status != LicenseStatus.ACTIVE.value:
+            return False
+        return self.expires_at is None or self.expires_at > datetime.now(UTC)
+
+    def has_feature(self, feature_key: PlanFeatureKey) -> bool:
+        return feature_key.value in self.enabled_features
+
+    def to_cache_payload(self) -> dict[str, object]:
+        return {
+            "organization_id": str(self.organization_id),
+            "plan_id": str(self.plan_id),
+            "license_status": self.license_status,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "enabled_features": sorted(self.enabled_features),
+            "limits": {key: str(value) for key, value in self.limits.items()},
+            "tiers": dict(self.tiers),
+        }
+
+    @classmethod
+    def from_cache_payload(cls, payload: dict[str, object]) -> EntitlementSnapshot:
+        expires_at_raw = payload.get("expires_at")
+        return cls(
+            organization_id=uuid.UUID(str(payload["organization_id"])),
+            plan_id=uuid.UUID(str(payload["plan_id"])),
+            license_status=str(payload["license_status"]),
+            expires_at=(
+                datetime.fromisoformat(str(expires_at_raw))
+                if expires_at_raw
+                else None
+            ),
+            enabled_features=frozenset(payload.get("enabled_features", [])),
+            limits={
+                key: Decimal(str(value))
+                for key, value in dict(payload.get("limits", {})).items()
+            },
+            tiers=dict(payload.get("tiers", {})),
+        )
+
+
+class EntitlementCacheProtocol(Protocol):
+    """The minimal surface ``EntitlementChecker`` needs from
+    ``cache.EntitlementCache`` -- kept structural so ``service.py`` never
+    imports the concrete Redis-backed class (mirrors this module's own
+    ``AuditLogWriter``/``OrganizationSyncProtocol`` narrow-Protocol
+    convention)."""
+
+    async def get(self, organization_id: uuid.UUID) -> dict[str, object] | None: ...
+
+    async def set(
+        self, organization_id: uuid.UUID, payload: dict[str, object]
+    ) -> None: ...
+
+    async def invalidate(self, organization_id: uuid.UUID) -> None: ...
+
+
+class EntitlementSnapshotSource(Protocol):
+    """Satisfied by ``LicenseService`` directly."""
+
+    async def get_entitlement_snapshot(
+        self, organization_id: uuid.UUID
+    ) -> EntitlementSnapshot: ...
+
+
+class EntitlementChecker:
+    """Cache-or-fetch resolver of an organization's current
+    :class:`EntitlementSnapshot` -- mirrors
+    ``app.domains.rbac.authorization.AccessValidator``'s identical
+    cache-or-fetch shape. This is the single object
+    ``dependencies.RequireActiveLicense``/``dependencies.RequireFeature``
+    depend on; neither dependency touches ``LicenseService`` or Redis
+    directly."""
+
+    def __init__(
+        self,
+        snapshot_source: EntitlementSnapshotSource,
+        cache: EntitlementCacheProtocol,
+    ) -> None:
+        self._snapshot_source = snapshot_source
+        self._cache = cache
+
+    async def get_snapshot(self, organization_id: uuid.UUID) -> EntitlementSnapshot:
+        cached = await self._cache.get(organization_id)
+        if cached is not None:
+            return EntitlementSnapshot.from_cache_payload(cached)
+        snapshot = await self._snapshot_source.get_entitlement_snapshot(
+            organization_id
+        )
+        await self._cache.set(organization_id, snapshot.to_cache_payload())
+        return snapshot
+
+
 class LicenseService:
     """License lifecycle: assign, activate, suspend, upgrade/downgrade
     (with real ``LicenseChangeLog`` history), expire, cancel, and
@@ -562,12 +683,14 @@ class LicenseService:
         organization_sync: OrganizationSyncProtocol | None = None,
         usage_validator: UsageValidatorProtocol | None = None,
         audit_writer: AuditLogWriter | None = None,
+        entitlement_cache: EntitlementCacheProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.plan_repository = plan_repository
         self.organization_sync = organization_sync
         self.usage_validator = usage_validator
         self.audit_writer = audit_writer
+        self.entitlement_cache = entitlement_cache
 
     async def get_license(self, license_id: uuid.UUID) -> License:
         license_ = await self.repository.get_by_id(license_id)
@@ -580,6 +703,46 @@ class LicenseService:
         if license_ is None:
             raise LicenseNotFoundError(organization_id)
         return license_
+
+    async def get_entitlement_snapshot(
+        self, organization_id: uuid.UUID
+    ) -> EntitlementSnapshot:
+        """The read model ``EntitlementChecker`` composes into a cache --
+        see that class's own docstring. Always a fresh read off the real
+        ``License``/``PlanFeature`` rows; never fabricated."""
+        license_ = await self.get_license_for_organization(organization_id)
+        features = await self.plan_repository.list_plan_features(license_.plan_id)
+        enabled_features = frozenset(
+            feature.feature_key
+            for feature in features
+            if feature.feature_type == PlanFeatureType.BOOLEAN.value
+            and feature.is_enabled
+        )
+        limits = {
+            feature.feature_key: feature.limit_value
+            for feature in features
+            if feature.feature_type == PlanFeatureType.LIMIT.value
+            and feature.limit_value is not None
+        }
+        tiers = {
+            feature.feature_key: feature.tier_value
+            for feature in features
+            if feature.feature_type == PlanFeatureType.TIER.value
+            and feature.tier_value is not None
+        }
+        return EntitlementSnapshot(
+            organization_id=organization_id,
+            plan_id=license_.plan_id,
+            license_status=license_.status,
+            expires_at=license_.expires_at,
+            enabled_features=enabled_features,
+            limits=limits,
+            tiers=tiers,
+        )
+
+    async def _invalidate_entitlement_cache(self, organization_id: uuid.UUID) -> None:
+        if self.entitlement_cache is not None:
+            await self.entitlement_cache.invalidate(organization_id)
 
     async def list_change_history(
         self, license_id: uuid.UUID
@@ -617,6 +780,7 @@ class LicenseService:
             reason=None,
         )
         await self._sync_subscription_tier(organization_id, plan.slug)
+        await self._invalidate_entitlement_cache(organization_id)
         event = LicenseAssigned(
             license_id=license_.id, organization_id=organization_id, plan_id=plan.id
         )
@@ -645,6 +809,7 @@ class LicenseService:
             data["suspended_at"] = None
             data["suspended_reason"] = None
         updated = await self.repository.update_license(license_, data)
+        await self._invalidate_entitlement_cache(updated.organization_id)
         event = LicenseActivated(
             license_id=updated.id, organization_id=updated.organization_id
         )
@@ -671,6 +836,7 @@ class LicenseService:
                 "updated_by": actor_user_id,
             },
         )
+        await self._invalidate_entitlement_cache(updated.organization_id)
         event = LicenseSuspended(
             license_id=updated.id,
             organization_id=updated.organization_id,
@@ -698,6 +864,7 @@ class LicenseService:
                 "updated_by": actor_user_id,
             },
         )
+        await self._invalidate_entitlement_cache(updated.organization_id)
         event = LicenseCancelled(
             license_id=updated.id, organization_id=updated.organization_id
         )
@@ -718,6 +885,7 @@ class LicenseService:
         updated = await self.repository.update_license(
             license_, {"status": LicenseStatus.EXPIRED.value}
         )
+        await self._invalidate_entitlement_cache(updated.organization_id)
         event = LicenseExpired(
             license_id=updated.id, organization_id=updated.organization_id
         )
@@ -819,6 +987,7 @@ class LicenseService:
             reason=reason,
         )
         await self._sync_subscription_tier(updated.organization_id, new_plan.slug)
+        await self._invalidate_entitlement_cache(updated.organization_id)
 
         if change_type == LicenseChangeType.UPGRADED:
             event: object = LicenseUpgraded(
@@ -3115,6 +3284,15 @@ class SuperAdminBillingDashboardService:
         self.invoice_service = invoice_service
         self.redis = redis
         self.audit_writer = audit_writer
+
+    async def get_license_status_breakdown(self) -> dict[str, int]:
+        """Real ``License.status`` counts across every organization on the
+        platform -- e.g. ``{"active": 42, "suspended": 3, "expired": 1}``.
+        Every key is a real ``constants.LicenseStatus`` value; a status
+        with zero licenses simply does not appear (never a fabricated
+        zero)."""
+        rows = await self.repository.count_licenses_by_status()
+        return {status: count for status, count in rows}
 
     async def get_revenue_dashboard(
         self, *, user_id: uuid.UUID, months: int = 12

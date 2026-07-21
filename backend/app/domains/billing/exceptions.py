@@ -110,6 +110,19 @@ class LicenseNotActiveError(BillingError):
         )
 
 
+class FeatureNotEntitledError(BillingError):
+    """Raised by ``RequireFeature``-gated routes (see
+    ``dependencies.py``) -- the organization's license is active, but its
+    current plan does not have ``feature_key`` enabled."""
+
+    def __init__(self, organization_id: uuid.UUID, feature_key: str) -> None:
+        super().__init__(
+            f"Organization {organization_id}'s plan does not include "
+            f"the '{feature_key}' feature",
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        )
+
+
 class SamePlanError(BillingError):
     """An upgrade/downgrade was requested to the license's current plan."""
 

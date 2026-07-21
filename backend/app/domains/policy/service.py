@@ -65,7 +65,12 @@ from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction, ScopeType
 
-from .constants import PLATFORM_DEFAULT_RULES, PolicyType, PolicyVersionStatus
+from .constants import (
+    PLATFORM_DEFAULT_RULES,
+    PolicyAssignmentTargetType,
+    PolicyType,
+    PolicyVersionStatus,
+)
 from .events import (
     PolicyAssignmentCreated,
     PolicyAssignmentDeactivated,
@@ -78,6 +83,8 @@ from .exceptions import (
     CrossOrganizationPolicyAccessError,
     PolicyAssignmentNotFoundError,
     PolicyAssignmentRequiresPublishedVersionError,
+    PolicyAssignmentTargetRoleNotFoundError,
+    PolicyAssignmentTargetUserNotFoundError,
     PolicyNotFoundError,
     PolicyRollbackTargetMismatchError,
     PolicyRollbackTargetNotPublishedError,
@@ -87,6 +94,7 @@ from .models import Policy, PolicyAssignment, PolicyVersion
 from .repository import PolicyRepositoryProtocol
 from .validators import (
     validate_assignment_scope,
+    validate_assignment_target,
     validate_rules,
     validate_version_status_transition,
 )
@@ -97,6 +105,16 @@ _SCOPE_SPECIFICITY: dict[str, int] = {
     ScopeType.GLOBAL.value: 0,
     ScopeType.ORGANIZATION.value: 1,
     ScopeType.LOCATION.value: 2,
+}
+
+# WHO-specificity (Enterprise SaaS Phase F) -- a user-targeted assignment
+# always outranks a role-targeted one, which always outranks an untargeted
+# one, regardless of which WHERE tier either was defined at (see
+# PolicyResolver.resolve's own docstring for the combined ordering).
+_TARGET_SPECIFICITY: dict[str, int] = {
+    PolicyAssignmentTargetType.NONE.value: 0,
+    PolicyAssignmentTargetType.ROLE.value: 1,
+    PolicyAssignmentTargetType.USER.value: 2,
 }
 
 
@@ -134,6 +152,27 @@ class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
 
+class UserLookupProtocol(Protocol):
+    """The single method this module needs to validate a ``user``-targeted
+    :class:`~.models.PolicyAssignment` actually names a real user --
+    satisfied structurally by ``app.domains.auth.repository
+    .AuthRepository`` (composition, not a new identity store)."""
+
+    async def get_user_by_id(self, user_id: uuid.UUID) -> object | None: ...
+
+
+class RoleLookupProtocol(Protocol):
+    """The single method this module needs to validate a ``role``-targeted
+    :class:`~.models.PolicyAssignment` actually names a real role --
+    satisfied structurally by ``app.domains.rbac.repository
+    .RBACRepository`` (the same object already composed as this
+    service's ``AuditLogWriter``)."""
+
+    async def get_role_by_id(
+        self, role_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> object | None: ...
+
+
 # ============================================================================
 # Pure resolution
 # ============================================================================
@@ -141,14 +180,27 @@ class AuditLogWriter(Protocol):
 
 class PolicyResolver:
     """Pure precedence resolution over already-fetched candidate
-    assignments -- see module docstring."""
+    assignments -- see module docstring.
+
+    Enterprise SaaS Phase F: the WHO axis (``target_type``) is resolved
+    *first* -- a user-targeted assignment always wins over a role-targeted
+    or untargeted one, regardless of which WHERE tier (``scope_type``)
+    either was defined at, since a personalized override is meant to be
+    the most specific possible match. The existing WHERE-tier/``priority``
+    ordering remains the tiebreaker within the same WHO tier."""
 
     def resolve(self, *, candidates: list[PolicyAssignment]) -> PolicyAssignment | None:
         if not candidates:
             return None
         return max(
             candidates,
-            key=lambda a: (_SCOPE_SPECIFICITY.get(a.scope_type, -1), a.priority),
+            key=lambda a: (
+                _TARGET_SPECIFICITY.get(
+                    a.target_type or PolicyAssignmentTargetType.NONE.value, -1
+                ),
+                _SCOPE_SPECIFICITY.get(a.scope_type, -1),
+                a.priority,
+            ),
         )
 
 
@@ -164,6 +216,7 @@ class ResolvedPolicy:
     location_id: uuid.UUID | None
     rules: dict[str, Any]
     source: str
+    user_id: uuid.UUID | None = None
 
 
 # ============================================================================
@@ -182,11 +235,15 @@ class PolicyService:
         location_lookup: LocationLookupProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        user_lookup: UserLookupProtocol | None = None,
+        role_lookup: RoleLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.organization_lookup = organization_lookup
         self.location_lookup = location_lookup
         self.audit_writer = audit_writer
+        self.user_lookup = user_lookup
+        self.role_lookup = role_lookup
         self.resolver = PolicyResolver()
 
     # ========================================================================
@@ -430,6 +487,8 @@ class PolicyService:
         scope_type: str,
         scope_id: uuid.UUID | None,
         priority: int,
+        target_type: str = PolicyAssignmentTargetType.NONE.value,
+        target_id: uuid.UUID | None = None,
     ) -> PolicyAssignment:
         policy = await self.get_policy(
             policy_id, requesting_organization_id=requesting_organization_id
@@ -445,11 +504,31 @@ class PolicyService:
                 scope_id, requesting_organization_id=requesting_organization_id
             )
 
+        validate_assignment_target(target_type=target_type, target_id=target_id)
+        if (
+            target_type == PolicyAssignmentTargetType.USER.value
+            and target_id is not None
+            and self.user_lookup is not None
+        ):
+            user = await self.user_lookup.get_user_by_id(target_id)
+            if user is None:
+                raise PolicyAssignmentTargetUserNotFoundError(target_id)
+        elif (
+            target_type == PolicyAssignmentTargetType.ROLE.value
+            and target_id is not None
+            and self.role_lookup is not None
+        ):
+            role = await self.role_lookup.get_role_by_id(target_id)
+            if role is None:
+                raise PolicyAssignmentTargetRoleNotFoundError(target_id)
+
         assignment = await self.repository.create_assignment(
             policy_id=policy.id,
             scope_type=scope_type,
             scope_id=scope_id,
             priority=priority,
+            target_type=target_type,
+            target_id=target_id,
             is_active=True,
             created_by_user_id=actor_user_id,
             created_by=actor_user_id,
@@ -525,14 +604,23 @@ class PolicyService:
         policy_type: PolicyType,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        user_id: uuid.UUID | None = None,
+        role_ids: list[uuid.UUID] | None = None,
     ) -> ResolvedPolicy:
         """See module docstring's "Resolution" write-up. Falls back to
         ``constants.PLATFORM_DEFAULT_RULES`` when no assignment matches at
-        all -- always returns a real, usable rule set, never ``None``."""
+        all -- always returns a real, usable rule set, never ``None``.
+
+        ``user_id``/``role_ids`` (Enterprise SaaS Phase F) additionally
+        surface any per-user or per-role assignment as a resolution
+        candidate -- see ``PolicyResolver.resolve``'s own docstring for
+        why a matching one always wins over an untargeted match."""
         candidates = await self.repository.list_candidate_assignments(
             policy_type=policy_type.value,
             organization_id=organization_id,
             location_id=location_id,
+            user_id=user_id,
+            role_ids=role_ids,
         )
         winner = self.resolver.resolve(candidates=candidates)
         if winner is None:
@@ -542,6 +630,7 @@ class PolicyService:
                 location_id=location_id,
                 rules=dict(PLATFORM_DEFAULT_RULES.get(policy_type, {})),
                 source="platform_default",
+                user_id=user_id,
             )
 
         policy = await self.repository.get_policy_by_id(winner.policy_id)
@@ -555,20 +644,24 @@ class PolicyService:
                 location_id=location_id,
                 rules=dict(PLATFORM_DEFAULT_RULES.get(policy_type, {})),
                 source="platform_default",
+                user_id=user_id,
             )
         version = await self.repository.get_version_by_id(policy.current_version_id)
         rules = dict(version.rules) if version is not None else {}
-        source = (
-            f"{winner.scope_type}:{winner.scope_id}"
-            if winner.scope_id is not None
-            else f"{winner.scope_type}:{policy.id}"
-        )
+        winner_target_type = winner.target_type or PolicyAssignmentTargetType.NONE.value
+        if winner_target_type != PolicyAssignmentTargetType.NONE.value:
+            source = f"{winner_target_type}:{winner.target_id}"
+        elif winner.scope_id is not None:
+            source = f"{winner.scope_type}:{winner.scope_id}"
+        else:
+            source = f"{winner.scope_type}:{policy.id}"
         return ResolvedPolicy(
             policy_type=policy_type,
             organization_id=organization_id,
             location_id=location_id,
             rules=rules,
             source=source,
+            user_id=user_id,
         )
 
     # ========================================================================

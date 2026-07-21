@@ -14,6 +14,10 @@ from fastapi import Depends
 
 from app.domains.dhcp.dependencies import get_dhcp_service
 from app.domains.dhcp.service import DhcpService
+from app.domains.dns.dependencies import get_dns_service
+from app.domains.dns.service import DnsService
+from app.domains.firewall.dependencies import get_firewall_service
+from app.domains.firewall.service import FirewallService
 from app.domains.hotspot.dependencies import get_hotspot_service
 from app.domains.hotspot.service import HotspotService
 from app.domains.port_forwarding.dependencies import get_port_forwarding_service
@@ -39,6 +43,8 @@ def get_network_config_service(
     router_provisioning_service: RouterProvisioningService = Depends(
         get_router_provisioning_service
     ),
+    dns_service: DnsService = Depends(get_dns_service),
+    firewall_service: FirewallService = Depends(get_firewall_service),
 ) -> NetworkConfigService:
     return NetworkConfigService(
         dhcp_service,
@@ -47,6 +53,8 @@ def get_network_config_service(
         hotspot_service,
         qos_service,
         router_provisioning_service,
+        dns_lookup=dns_service,
+        firewall_lookup=firewall_service,
     )
 
 

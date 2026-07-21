@@ -190,6 +190,7 @@ class RBACRepositoryProtocol(Protocol):
         actor_user_id: uuid.UUID | None = None,
         action: str | None = None,
         entity_type: str | None = None,
+        location_id: uuid.UUID | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
         page: int,
@@ -549,6 +550,7 @@ class RBACRepository:
         actor_user_id: uuid.UUID | None = None,
         action: str | None = None,
         entity_type: str | None = None,
+        location_id: uuid.UUID | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
         page: int,
@@ -572,6 +574,8 @@ class RBACRepository:
             conditions.append(AuditLogEntry.action == action)
         if entity_type is not None:
             conditions.append(AuditLogEntry.entity_type == entity_type)
+        if location_id is not None:
+            conditions.append(AuditLogEntry.location_id == location_id)
         if start is not None:
             conditions.append(AuditLogEntry.created_at >= start)
         if end is not None:

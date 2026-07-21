@@ -27,13 +27,23 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.domains.audit.dependencies import get_audit_service
+from app.domains.audit.service import AuditService
 from app.domains.auth.models import AuthUser
+from app.domains.campaigns.dependencies import get_campaigns_service
+from app.domains.campaigns.service import CampaignsService
+from app.domains.connected_devices.dependencies import get_connected_device_service
+from app.domains.connected_devices.service import ConnectedDeviceService
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
     RequirePermission,
 )
 from app.domains.rbac.enums import ScopeType
+from app.domains.router.dependencies import get_router_service
+from app.domains.router.service import RouterService
+from app.domains.vlan.dependencies import get_vlan_service
+from app.domains.vlan.service import VlanService
 
 from .dependencies import get_location_service
 from .enums import LocationStatus, PropertyType
@@ -41,6 +51,7 @@ from .models import Location
 from .provisioning_dependencies import get_location_provisioning_service
 from .provisioning_schemas import (
     FeatureOverrideInputSchema,
+    ProvisionLocationPreviewResponse,
     ProvisionLocationRequest,
     ProvisionLocationResponse,
     ResendWelcomeEmailResponse,
@@ -57,6 +68,7 @@ from .provisioning_service import (
 from .schemas import (
     LocationCreateRequest,
     LocationListResponse,
+    LocationOverviewResponse,
     LocationResponse,
     LocationUpdateRequest,
     MessageResponse,
@@ -213,6 +225,78 @@ async def get_location(
         success=True,
         message="Location retrieved",
         data=_location_response(location).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/locations/{location_id}/overview",
+    response_model=ApiResponse[LocationOverviewResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("locations.read"))],
+)
+async def get_location_overview(
+    request: Request,
+    location_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    location_service: LocationService = Depends(get_location_service),
+    router_service: RouterService = Depends(get_router_service),
+    connected_device_service: ConnectedDeviceService = Depends(
+        get_connected_device_service
+    ),
+    vlan_service: VlanService = Depends(get_vlan_service),
+    campaigns_service: CampaignsService = Depends(get_campaigns_service),
+    audit_service: AuditService = Depends(get_audit_service),
+):
+    """The "Location Workspace" overview -- composes counts already
+    exposed by their own domains' list endpoints into one call. See
+    ``LocationOverviewResponse``'s own docstring for exactly what is (and
+    is deliberately not) included."""
+    location = await location_service.get_location(
+        location_id, requesting_organization_id=requesting_organization_id
+    )
+    _, router_meta = await router_service.list_routers(
+        location_id=location_id,
+        requesting_organization_id=requesting_organization_id,
+        page=1,
+        page_size=1,
+    )
+    _, device_meta = await connected_device_service.list_devices(
+        requesting_organization_id=requesting_organization_id,
+        location_id=location_id,
+        page=1,
+        page_size=1,
+    )
+    _, vlan_meta = await vlan_service.list_vlans(
+        requesting_organization_id=requesting_organization_id,
+        location_id=location_id,
+        page=1,
+        page_size=1,
+    )
+    _, campaign_meta = await campaigns_service.list_campaigns(
+        requesting_organization_id=requesting_organization_id,
+        location_id=location_id,
+        page=1,
+        page_size=1,
+    )
+    _, audit_meta = await audit_service.search(
+        requesting_organization_id=requesting_organization_id,
+        location_id=location_id,
+        page=1,
+        page_size=1,
+    )
+    payload = LocationOverviewResponse(
+        location=_location_response(location),
+        router_count=router_meta.total_items,
+        connected_device_count=device_meta.total_items,
+        vlan_count=vlan_meta.total_items,
+        campaign_count=campaign_meta.total_items,
+        audit_log_count=audit_meta.total_items,
+    )
+    return build_response(
+        success=True,
+        message="Location overview retrieved",
+        data=payload.model_dump(),
         request_id=_request_id(request),
     )
 
@@ -422,6 +506,53 @@ def _provision_input(payload: ProvisionLocationRequest) -> ProvisionLocationInpu
             else None
         ),
         coupon_code=payload.coupon_code,
+    )
+
+
+@router.post(
+    "/locations/provision/preview",
+    response_model=ApiResponse[ProvisionLocationPreviewResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("locations.manage", scope=ScopeType.GLOBAL))
+    ],
+)
+async def preview_provision_location(
+    request: Request,
+    payload: ProvisionLocationRequest,
+    provisioning_service: LocationProvisioningService = Depends(
+        get_location_provisioning_service
+    ),
+):
+    """The Organization Provisioning Wizard's "review summary before final
+    provisioning" step -- read-only, never creates anything. Takes the
+    exact same request body ``POST /locations/provision`` does (so a
+    client can preview, then re-submit the identical payload to commit)."""
+    preview = await provisioning_service.preview_provision_location(
+        data=_provision_input(payload)
+    )
+    response = ProvisionLocationPreviewResponse(
+        organization_id=(
+            str(preview.organization_id) if preview.organization_id else None
+        ),
+        organization_name=preview.organization_name,
+        customer_id=preview.customer_id,
+        site_id=preview.site_id,
+        nas_id=preview.nas_id,
+        controller_id=preview.controller_id,
+        plan_id=str(preview.plan_id),
+        plan_name=preview.plan_name,
+        feature_summary=preview.feature_summary,
+        owner_name=preview.owner_name,
+        owner_email=preview.owner_email,
+        owner_username_preview=preview.owner_username_preview,
+        router_name=preview.router_name,
+    )
+    return build_response(
+        success=True,
+        message="Provisioning preview generated",
+        data=response.model_dump(),
+        request_id=_request_id(request),
     )
 
 

@@ -181,8 +181,13 @@ from app.domains.billing.constants import (
 )
 from app.domains.billing.models import Plan, PlanFeature, Subscription
 from app.domains.captive_portal.models import CaptivePortalConfig
+from app.domains.guest.nas_number_generator import preview_first_nas_code
 from app.domains.organization.enums import OrganizationStatus, OrganizationType
-from app.domains.organization.exceptions import OrganizationArchivedError
+from app.domains.organization.exceptions import (
+    DuplicateSlugError,
+    OrganizationArchivedError,
+    OrganizationNotFoundError,
+)
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.models import Role
@@ -248,6 +253,8 @@ class OrganizationProvisioningProtocol(Protocol):
     async def get_organization(
         self, organization_id: uuid.UUID, *, include_deleted: bool = False
     ) -> Organization: ...
+
+    async def get_by_slug(self, slug: str) -> Organization: ...
 
     async def create_organization(
         self,
@@ -531,6 +538,57 @@ class ProvisionLocationResult:
     provisioned_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ProvisionLocationPreview:
+    """Read model for
+    ``LocationProvisioningService.preview_provision_location`` -- a dry
+    run that never creates any record. Mirrors
+    ``app.domains.network_config.service.NetworkConfigPreview``'s own
+    "same read/validate logic as the real write path, stop before any
+    write" shape.
+
+    ``organization_id`` is ``None`` when previewing a *new* organization
+    (it does not exist yet, so it has no id to preview -- unlike
+    ``ProvisionLocationResult.organization_id``, which is always real
+    since that runs after creation). ``site_id``/``nas_id`` are the
+    real "Site ID"/"NAS ID" the wizard would generate, previewed via
+    ``LocationService.preview_next_location_code``/
+    ``app.domains.guest.nas_number_generator.preview_first_nas_code``
+    without consuming either real counter. ``customer_id`` is the
+    organization's own ``slug`` (existing or, for a new organization,
+    the one supplied in the request) -- this codebase's already-unique,
+    already-human-readable per-customer identifier, reused here rather
+    than inventing a second, parallel "Customer ID" concept.
+    ``controller_id`` is the router's own ``serial_number`` as supplied
+    in the request -- the MikroTik device *is* "the controller" in this
+    architecture (see this dataclass's own docstring section in
+    ``preview_provision_location``), not a separately generated value.
+
+    This preview validates everything checkable without writing (Plan
+    exists, Organization archived-state or new-slug availability, the
+    "organization-owner" role is seeded, a default config template
+    resolves) but is not an exhaustive guarantee: a few failure modes
+    only the real write path can catch (e.g. a router serial/MAC
+    uniqueness race, WireGuard IP pool exhaustion) can still make
+    ``provision_location`` fail after a clean preview -- the same
+    honest boundary every preview/commit split in this codebase
+    documents (see ``app.domains.network_config``'s own)."""
+
+    organization_id: uuid.UUID | None
+    organization_name: str
+    customer_id: str
+    site_id: str
+    nas_id: str
+    controller_id: str
+    plan_id: uuid.UUID
+    plan_name: str
+    feature_summary: dict[str, object]
+    owner_name: str
+    owner_email: str
+    owner_username_preview: str
+    router_name: str
+
+
 # ============================================================================
 # Generation helpers -- see module docstring's "Username / temporary-
 # password generation" section.
@@ -655,6 +713,74 @@ class LocationProvisioningService:
         self.email_provider = email_provider
         self.sms_provider = sms_provider
         self.login_url_base = login_url_base
+
+    # -- preview (read-only dry run) ----------------------------------------
+
+    async def preview_provision_location(
+        self, *, data: ProvisionLocationInput
+    ) -> ProvisionLocationPreview:
+        """Read-only dry run of ``provision_location`` -- see
+        ``ProvisionLocationPreview``'s own docstring for exactly what is
+        and is not validated, and the honest boundary on what it does not
+        guarantee. Never calls a single ``create_*``/``update_*`` method
+        on any composed service."""
+        organization_id: uuid.UUID | None
+        if data.existing_organization_id is not None:
+            organization = await self.organization_service.get_organization(
+                data.existing_organization_id
+            )
+            if organization.status == OrganizationStatus.ARCHIVED.value:
+                raise OrganizationArchivedError(organization.id)
+            organization_id = organization.id
+            organization_name = organization.name
+            customer_id = organization.slug
+        else:
+            if data.new_organization is None:
+                raise NewOrganizationRequiredError()
+            try:
+                await self.organization_service.get_by_slug(
+                    data.new_organization.slug
+                )
+            except OrganizationNotFoundError:
+                pass
+            else:
+                raise DuplicateSlugError(data.new_organization.slug)
+            organization_id = None
+            organization_name = data.new_organization.name
+            customer_id = data.new_organization.slug
+
+        owner_role = await self.rbac_support.get_role_by_slug(_OWNER_ROLE_SLUG, None)
+        if owner_role is None:
+            raise OwnerRoleNotSeededError()
+
+        if data.router_config_template_id is None:
+            await self._resolve_default_template_id()
+
+        base_plan = await self.plan_service.get_plan(data.plan_id)
+        feature_rows = await self.plan_service.list_features(base_plan.id)
+        feature_summary = _summarize_features(feature_rows)
+
+        site_id = await self.location_service.preview_next_location_code()
+        nas_id = preview_first_nas_code(site_id)
+        owner_username_preview = data.owner.username or _generate_username(
+            data.owner.email
+        )
+
+        return ProvisionLocationPreview(
+            organization_id=organization_id,
+            organization_name=organization_name,
+            customer_id=customer_id,
+            site_id=site_id,
+            nas_id=nas_id,
+            controller_id=data.router.serial_number,
+            plan_id=base_plan.id,
+            plan_name=base_plan.name,
+            feature_summary=feature_summary,
+            owner_name=f"{data.owner.first_name} {data.owner.last_name}".strip(),
+            owner_email=data.owner.email,
+            owner_username_preview=owner_username_preview,
+            router_name=data.router.name,
+        )
 
     # -- main orchestration ------------------------------------------------
 

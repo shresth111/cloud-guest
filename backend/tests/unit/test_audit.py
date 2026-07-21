@@ -66,6 +66,7 @@ class FakeAuditRepository:
         actor_user_id: uuid.UUID | None = None,
         action: str | None = None,
         entity_type: str | None = None,
+        location_id: uuid.UUID | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
         page: int,
@@ -80,6 +81,8 @@ class FakeAuditRepository:
             values = [v for v in values if v.action == action]
         if entity_type is not None:
             values = [v for v in values if v.entity_type == entity_type]
+        if location_id is not None:
+            values = [v for v in values if v.location_id == location_id]
         if start is not None:
             values = [v for v in values if v.created_at >= start]
         if end is not None:
@@ -111,6 +114,21 @@ async def test_search_scopes_to_organization() -> None:
 
     assert meta.total_items == 1
     assert entries[0].organization_id == org_a
+
+
+async def test_search_filters_by_location_id() -> None:
+    service, repository = make_service()
+    location_a = uuid.uuid4()
+    location_b = uuid.uuid4()
+    repository.entries.append(_make_entry(location_id=location_a))
+    repository.entries.append(_make_entry(location_id=location_b))
+
+    entries, meta = await service.search(
+        requesting_organization_id=None, location_id=location_a
+    )
+
+    assert meta.total_items == 1
+    assert entries[0].location_id == location_a
 
 
 async def test_search_filters_by_action_and_entity_type() -> None:
