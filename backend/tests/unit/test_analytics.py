@@ -777,6 +777,11 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # wireless registration-table sync sweep -- see
     # app.domains.connected_devices.service.run_device_sync_sweep's own
     # module docstring.
+    # Campaigns domain adds a thirteenth Beat entry
+    # ("campaigns-sweep-status-transitions") that keeps the stored
+    # Campaign.status reasonably fresh for admin dashboards -- see
+    # app.domains.campaigns.service.CampaignsService
+    # .sweep_status_transitions's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -790,6 +795,7 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "guest-quota-reset-sweep",
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
+        "campaigns-sweep-status-transitions",
     }
 
 

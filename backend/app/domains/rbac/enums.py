@@ -733,3 +733,17 @@ class AuditAction(StrEnum):
     # ``name``/``mac``) -- never one row per field, to avoid a
     # multi-hundred-row explosion on a single guest-list page view.
     PII_VIEWED_UNMASKED = "pii_viewed_unmasked"
+
+    # Campaigns domain events -- written through this same table by
+    # ``app.domains.campaigns.service.CampaignsService`` via the same
+    # narrow ``AuditLogWriter`` protocol shape every other domain's
+    # service uses. Status transitions get their own action distinct
+    # from a plain field update since they are the operationally
+    # significant moment (a campaign going live/ending), mirroring
+    # ``app.domains.router_provisioning``'s own config-version-status
+    # audit split.
+    CAMPAIGN_CREATED = "campaign_created"
+    CAMPAIGN_UPDATED = "campaign_updated"
+    CAMPAIGN_STATUS_CHANGED = "campaign_status_changed"
+    CAMPAIGN_DELETED = "campaign_deleted"
+    CAMPAIGN_CLONED = "campaign_cloned"

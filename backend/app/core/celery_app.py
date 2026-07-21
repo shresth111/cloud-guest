@@ -115,6 +115,10 @@ from app.domains.billing.constants import (
     TASK_RUN_INVOICE_OVERDUE_SWEEP,
     TASK_RUN_SUBSCRIPTION_RENEWAL_SWEEP,
 )
+from app.domains.campaigns.constants import (
+    CAMPAIGN_STATUS_SWEEP_INTERVAL_SECONDS,
+    TASK_SWEEP_CAMPAIGN_STATUS_TRANSITIONS,
+)
 from app.domains.connected_devices.constants import (
     CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
@@ -166,6 +170,7 @@ celery_app = Celery(
         "app.domains.analytics.tasks",
         "app.domains.analytics.report_tasks",
         "app.domains.billing.tasks",
+        "app.domains.campaigns.tasks",
         "app.domains.connected_devices.tasks",
         "app.domains.guest.tasks",
         "app.domains.isp.tasks",
@@ -334,6 +339,21 @@ celery_app.conf.update(
         "connected-device-sync-sweep": {
             "task": TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
             "schedule": CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
+        },
+        # Campaigns domain: keeps the stored Campaign.status reasonably
+        # fresh for admin dashboards (SCHEDULED -> ACTIVE -> ENDED) --
+        # every 5 minutes, the same cadence as the guest-session-timeout/
+        # FUP-accrual sweeps above, since a campaign's own starts_at/
+        # ends_at window is exactly as operationally visible as a guest
+        # session. The guest-facing serving path never trusts this stored
+        # value alone regardless of this sweep's cadence -- see
+        # app.domains.campaigns.validators.compute_effective_status's own
+        # docstring and app.domains.campaigns's module docstring for the
+        # full "cron keeps the dashboard fresh, the read path re-derives
+        # truth live" reasoning.
+        "campaigns-sweep-status-transitions": {
+            "task": TASK_SWEEP_CAMPAIGN_STATUS_TRANSITIONS,
+            "schedule": CAMPAIGN_STATUS_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

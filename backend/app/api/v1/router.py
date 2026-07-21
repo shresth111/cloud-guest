@@ -4,6 +4,8 @@ from app.api.v1.health.routes import router as health_router
 from app.domains.analytics.router import router as analytics_router
 from app.domains.auth.router import router as auth_router
 from app.domains.billing.router import router as billing_router
+from app.domains.campaigns.router import guest_router as campaigns_guest_router
+from app.domains.campaigns.router import router as campaigns_router
 from app.domains.captive_portal.router import router as captive_portal_router
 from app.domains.connected_devices.router import router as connected_devices_router
 from app.domains.controller_logs.router import router as controller_logs_router
@@ -84,3 +86,5 @@ api_v1_router.include_router(network_config_router)
 api_v1_router.include_router(hotspot_router)
 api_v1_router.include_router(qos_router)
 api_v1_router.include_router(network_diagnostics_router)
+api_v1_router.include_router(campaigns_guest_router)
+api_v1_router.include_router(campaigns_router)
