@@ -28,6 +28,7 @@ from app.domains.router.router import router as router_router
 from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.user.router import router as user_router
+from app.domains.vlan.router import router as vlan_router
 from app.domains.voucher.router import router as voucher_router
 from app.domains.wireguard.router import router as wireguard_router
 
@@ -62,3 +63,4 @@ api_v1_router.include_router(provisioning_engine_router)
 api_v1_router.include_router(queue_management_router)
 api_v1_router.include_router(isp_router)
 api_v1_router.include_router(isp_routing_router)
+api_v1_router.include_router(vlan_router)

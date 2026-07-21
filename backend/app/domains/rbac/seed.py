@@ -277,6 +277,16 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.DELETE,
         _A.MANAGE,
     ),
+    # VLAN Management: same CRUD+MANAGE shape as PermissionModule
+    # .ISP_ROUTING -- a pure rules/inventory domain, no EXECUTE action in
+    # this pass (see app.domains.vlan.service's own module docstring).
+    PermissionModule.VLAN: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.MANAGE,
+    ),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -322,6 +332,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.PROVISIONING_ENGINE: "Provisioning Engine",
     PermissionModule.ISP: "ISP Management",
     PermissionModule.ISP_ROUTING: "ISP Routing",
+    PermissionModule.VLAN: "VLAN Management",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -377,6 +388,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # A routing rule is scoped to one router's own uplinks -- same
     # reasoning as PermissionModule.ISP's own ScopeType.ROUTER entry above.
     PermissionModule.ISP_ROUTING: ScopeType.ROUTER,
+    # A VLAN is a router's own interface-level construct -- same
+    # ScopeType.ROUTER reasoning as PermissionModule.ISP/ISP_ROUTING above.
+    PermissionModule.VLAN: ScopeType.ROUTER,
 }
 
 
@@ -603,6 +617,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.BANDWIDTH: _L.FULL,
             _M.ISP: _L.FULL,
             _M.ISP_ROUTING: _L.FULL,
+            _M.VLAN: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,

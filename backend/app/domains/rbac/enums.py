@@ -106,6 +106,7 @@ class PermissionModule(StrEnum):
     PROVISIONING_ENGINE = "provisioning_engine"
     ISP = "isp"
     ISP_ROUTING = "isp_routing"
+    VLAN = "vlan"
 
 
 class OverrideEffect(StrEnum):
@@ -624,3 +625,13 @@ class AuditAction(StrEnum):
     ISP_ROUTING_RULE_CREATED = "isp_routing_rule_created"
     ISP_ROUTING_RULE_UPDATED = "isp_routing_rule_updated"
     ISP_ROUTING_RULE_DELETED = "isp_routing_rule_deleted"
+
+    # VLAN Management domain events -- written through this same table by
+    # ``app.domains.vlan.service.VlanService`` via the same narrow
+    # ``AuditLogWriter`` protocol shape every other domain's service uses.
+    # A pure rules/inventory domain (no live device push in this pass --
+    # see that module's own docstring), so create/update/delete are its
+    # only lifecycle events.
+    VLAN_CREATED = "vlan_created"
+    VLAN_UPDATED = "vlan_updated"
+    VLAN_DELETED = "vlan_deleted"
