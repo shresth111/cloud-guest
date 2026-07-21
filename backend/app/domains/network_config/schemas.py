@@ -27,3 +27,4 @@ class NetworkConfigPreviewResponse(BaseModel):
     vlan_count: int
     port_forwarding_rule_count: int
     hotspot_profile_count: int
+    qos_traffic_rule_count: int

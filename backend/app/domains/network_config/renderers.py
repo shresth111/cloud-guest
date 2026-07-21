@@ -56,6 +56,18 @@ which would need an interface/address-pool this table has no data for.
 .format_mikrotik_rate_limit``'s own rx=upload/tx=download convention,
 substituting ``0`` (RouterOS's own "unlimited" value) for whichever half
 of the pair is unset.
+
+## QoS: marks traffic, never creates the paired queue
+
+Mirrors ``app.domains.qos.models.QosTrafficRule``'s own module
+docstring: only RouterOS's ``/ip firewall mangle`` packet-marking half of
+real QoS is rendered here -- a real ``new-packet-mark`` derived from the
+rule's own identifier, matched either by protocol/port range or by DSCP
+value (never both, enforced at that domain's own service layer).
+Pairing this mark with an actual ``/queue tree`` entry (the half that
+would make the mark do anything) is real, separate device-side work,
+deliberately left undone and documented rather than fabricated -- see
+``docs/qos/FLOW.md`` §2.
 """
 
 from __future__ import annotations
@@ -66,12 +78,14 @@ from app.domains.dhcp.models import DhcpPool
 from app.domains.hotspot.models import HotspotProfile
 from app.domains.port_forwarding.constants import PortForwardingProtocol
 from app.domains.port_forwarding.models import PortForwardingRule
+from app.domains.qos.models import QosTrafficRule
 from app.domains.vlan.models import Vlan
 
 from .constants import (
     DHCP_SECTION_HEADER,
     HOTSPOT_SECTION_HEADER,
     PORT_FORWARDING_SECTION_HEADER,
+    QOS_SECTION_HEADER,
     VLAN_SECTION_HEADER,
 )
 
@@ -98,6 +112,12 @@ def _hotspot_identifier(profile: HotspotProfile) -> str:
     """``HotspotProfile.name`` carries no uniqueness constraint -- same
     reasoning as :func:`_dhcp_identifier`."""
     return f"{_sanitize_identifier(profile.name)}-{str(profile.id)[:8]}"
+
+
+def _qos_identifier(rule: QosTrafficRule) -> str:
+    """``QosTrafficRule.name`` carries no uniqueness constraint -- same
+    reasoning as :func:`_dhcp_identifier`."""
+    return f"{_sanitize_identifier(rule.name)}-{str(rule.id)[:8]}"
 
 
 def _smallest_enclosing_network(
@@ -218,14 +238,35 @@ def render_hotspot_profile(profile: HotspotProfile) -> list[str]:
     return lines
 
 
+def render_qos_traffic_rule(rule: QosTrafficRule) -> list[str]:
+    """Renders one enabled ``QosTrafficRule`` row -- see module docstring
+    for why only the mangle mark half of real QoS is modeled. Matches by
+    port range when both bounds are present, otherwise by ``dscp_value``
+    (the two are mutually exclusive, enforced at
+    ``app.domains.qos.validators.validate_traffic_match``)."""
+    identifier = _qos_identifier(rule)
+    parts = ["/ip firewall mangle add chain=prerouting"]
+    if rule.port_range_start is not None and rule.port_range_end is not None:
+        parts.append(f"protocol={rule.protocol}")
+        parts.append(f"dst-port={rule.port_range_start}-{rule.port_range_end}")
+    else:
+        parts.append(f"dscp={rule.dscp_value}")
+    parts.append("action=mark-packet")
+    parts.append(f"new-packet-mark={identifier}")
+    parts.append("passthrough=no")
+    parts.append(f'comment="{rule.name} (priority={rule.priority})"')
+    return [" ".join(parts)]
+
+
 def render_network_config(
     *,
     dhcp_pools: list[DhcpPool],
     vlans: list[Vlan],
     port_forwarding_rules: list[PortForwardingRule],
     hotspot_profiles: list[HotspotProfile] | None = None,
+    qos_traffic_rules: list[QosTrafficRule] | None = None,
 ) -> str:
-    """Combines every enabled row across all four categories into one
+    """Combines every enabled row across all five categories into one
     router-wide RouterOS script -- a full desired-state snapshot, mirroring
     how ``app.domains.router_provisioning.models.ConfigVersion`` already
     represents a router's *whole* config rather than an incremental diff.
@@ -249,6 +290,10 @@ def render_network_config(
         sections.append(HOTSPOT_SECTION_HEADER)
         for profile in hotspot_profiles:
             sections.extend(render_hotspot_profile(profile))
+    if qos_traffic_rules:
+        sections.append(QOS_SECTION_HEADER)
+        for rule in qos_traffic_rules:
+            sections.extend(render_qos_traffic_rule(rule))
     return "\n".join(sections)
 
 
@@ -257,5 +302,6 @@ __all__ = [
     "render_vlan",
     "render_port_forwarding_rule",
     "render_hotspot_profile",
+    "render_qos_traffic_rule",
     "render_network_config",
 ]

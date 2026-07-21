@@ -329,6 +329,12 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # app.domains.router_provisioning's own ConfigVersion, mirroring
     # DEVICE_SYNC's identical "no CRUD resource of its own" shape.
     PermissionModule.NETWORK_CONFIG: (_A.READ, _A.EXECUTE, _A.MANAGE),
+    # QoS & VOIP Priority: a plain CRUD rules/inventory domain -- no
+    # EXECUTE, since this domain has no device-facing action of its own
+    # (real device push is composed via app.domains.network_config's own
+    # EXECUTE-gated push endpoint instead), mirroring DHCP/VLAN's
+    # identical shape.
+    PermissionModule.QOS: (_A.CREATE, _A.READ, _A.UPDATE, _A.DELETE, _A.MANAGE),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -379,6 +385,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.CONNECTED_DEVICES: "Connected Devices",
     PermissionModule.DEVICE_SYNC: "Device Synchronization",
     PermissionModule.NETWORK_CONFIG: "Network Configuration Management",
+    PermissionModule.QOS: "QoS & VOIP Priority",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -456,6 +463,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # A pushed/rolled-back network config targets one router at a time --
     # identical ScopeType.ROUTER reasoning.
     PermissionModule.NETWORK_CONFIG: ScopeType.ROUTER,
+    # A QoS traffic rule is scoped to one router -- identical ScopeType
+    # .ROUTER reasoning as PermissionModule.DHCP/VLAN above.
+    PermissionModule.QOS: ScopeType.ROUTER,
 }
 
 
@@ -687,6 +697,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.CONNECTED_DEVICES: _L.FULL,
             _M.DEVICE_SYNC: _L.FULL,
             _M.NETWORK_CONFIG: _L.FULL,
+            _M.QOS: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,

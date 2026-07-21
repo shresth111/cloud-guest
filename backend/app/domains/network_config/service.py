@@ -1,10 +1,10 @@
 """Network Configuration Management business logic: render a router's own
-enabled DHCP/VLAN/Port Forwarding/Hotspot rows into RouterOS script text,
-and push it through ``app.domains.router_provisioning``'s already-real
-config-version/apply/rollback pipeline. See ``__init__.py``'s own module
-docstring for the full design rationale.
+enabled DHCP/VLAN/Port Forwarding/Hotspot/QoS rows into RouterOS script
+text, and push it through ``app.domains.router_provisioning``'s
+already-real config-version/apply/rollback pipeline. See ``__init__.py``'s
+own module docstring for the full design rationale.
 
-## Composition, not duplication, with five other domains
+## Composition, not duplication, with six other domains
 
 Every read here composes a narrow, duck-typed Protocol satisfied
 structurally by a real, already-existing service -- the identical
@@ -23,6 +23,7 @@ from typing import Protocol
 from app.domains.dhcp.models import DhcpPool
 from app.domains.hotspot.models import HotspotProfile
 from app.domains.port_forwarding.models import PortForwardingRule
+from app.domains.qos.models import QosTrafficRule
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
 from app.domains.vlan.models import Vlan
 
@@ -52,6 +53,12 @@ class HotspotLookupProtocol(Protocol):
     async def list_profiles_for_router(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> list[HotspotProfile]: ...
+
+
+class QosLookupProtocol(Protocol):
+    async def list_rules_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[QosTrafficRule]: ...
 
 
 class RouterProvisioningLookupProtocol(Protocol):
@@ -120,6 +127,7 @@ class NetworkConfigPreview:
     vlan_count: int
     port_forwarding_rule_count: int
     hotspot_profile_count: int
+    qos_traffic_rule_count: int
 
 
 class NetworkConfigService:
@@ -132,18 +140,24 @@ class NetworkConfigService:
         vlan_lookup: VlanLookupProtocol,
         port_forwarding_lookup: PortForwardingLookupProtocol,
         hotspot_lookup: HotspotLookupProtocol,
+        qos_lookup: QosLookupProtocol,
         router_provisioning_lookup: RouterProvisioningLookupProtocol,
     ) -> None:
         self.dhcp_lookup = dhcp_lookup
         self.vlan_lookup = vlan_lookup
         self.port_forwarding_lookup = port_forwarding_lookup
         self.hotspot_lookup = hotspot_lookup
+        self.qos_lookup = qos_lookup
         self.router_provisioning_lookup = router_provisioning_lookup
 
     async def _gather_enabled_rows(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> tuple[
-        list[DhcpPool], list[Vlan], list[PortForwardingRule], list[HotspotProfile]
+        list[DhcpPool],
+        list[Vlan],
+        list[PortForwardingRule],
+        list[HotspotProfile],
+        list[QosTrafficRule],
     ]:
         pools = await self.dhcp_lookup.list_pools_for_router(
             router_id, requesting_organization_id=requesting_organization_id
@@ -157,17 +171,27 @@ class NetworkConfigService:
         hotspot_profiles = await self.hotspot_lookup.list_profiles_for_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        qos_traffic_rules = await self.qos_lookup.list_rules_for_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
         return (
             [p for p in pools if p.is_enabled],
             [v for v in vlans if v.is_enabled],
             [r for r in rules if r.is_enabled],
             [h for h in hotspot_profiles if h.is_enabled],
+            [q for q in qos_traffic_rules if q.is_enabled],
         )
 
     async def preview_config(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> NetworkConfigPreview:
-        pools, vlans, rules, hotspot_profiles = await self._gather_enabled_rows(
+        (
+            pools,
+            vlans,
+            rules,
+            hotspot_profiles,
+            qos_traffic_rules,
+        ) = await self._gather_enabled_rows(
             router_id, requesting_organization_id=requesting_organization_id
         )
         rendered = render_network_config(
@@ -175,6 +199,7 @@ class NetworkConfigService:
             vlans=vlans,
             port_forwarding_rules=rules,
             hotspot_profiles=hotspot_profiles,
+            qos_traffic_rules=qos_traffic_rules,
         )
         return NetworkConfigPreview(
             router_id=router_id,
@@ -183,6 +208,7 @@ class NetworkConfigService:
             vlan_count=len(vlans),
             port_forwarding_rule_count=len(rules),
             hotspot_profile_count=len(hotspot_profiles),
+            qos_traffic_rule_count=len(qos_traffic_rules),
         )
 
     async def push_config(
@@ -192,7 +218,13 @@ class NetworkConfigService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> tuple[ConfigVersion, ProvisioningJob]:
-        pools, vlans, rules, hotspot_profiles = await self._gather_enabled_rows(
+        (
+            pools,
+            vlans,
+            rules,
+            hotspot_profiles,
+            qos_traffic_rules,
+        ) = await self._gather_enabled_rows(
             router_id, requesting_organization_id=requesting_organization_id
         )
         rendered = render_network_config(
@@ -200,6 +232,7 @@ class NetworkConfigService:
             vlans=vlans,
             port_forwarding_rules=rules,
             hotspot_profiles=hotspot_profiles,
+            qos_traffic_rules=qos_traffic_rules,
         )
         if not rendered:
             raise EmptyNetworkConfigError(router_id)
@@ -287,6 +320,7 @@ __all__ = [
     "VlanLookupProtocol",
     "PortForwardingLookupProtocol",
     "HotspotLookupProtocol",
+    "QosLookupProtocol",
     "RouterProvisioningLookupProtocol",
     "NetworkConfigPreview",
     "NetworkConfigService",

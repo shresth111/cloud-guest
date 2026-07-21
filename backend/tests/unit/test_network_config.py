@@ -1,10 +1,11 @@
 """Unit tests for the Network Configuration Management domain: RouterOS
-renderers (DHCP pool / VLAN / Port Forwarding / Hotspot -> real script
-text) and ``NetworkConfigService``'s composition of ``app.domains.dhcp``/
-``app.domains.vlan``/``app.domains.port_forwarding``/``app.domains
-.hotspot``/``app.domains.router_provisioning`` via small, hand-rolled
-in-memory fakes -- mirrors ``test_device_sync.py``'s own identical "fake
-the narrow Protocol boundary" precedent. A structural RBAC check confirms
+renderers (DHCP pool / VLAN / Port Forwarding / Hotspot / QoS -> real
+script text) and ``NetworkConfigService``'s composition of
+``app.domains.dhcp``/``app.domains.vlan``/``app.domains
+.port_forwarding``/``app.domains.hotspot``/``app.domains.qos``/
+``app.domains.router_provisioning`` via small, hand-rolled in-memory
+fakes -- mirrors ``test_device_sync.py``'s own identical "fake the
+narrow Protocol boundary" precedent. A structural RBAC check confirms
 every route carries a permission dependency.
 """
 
@@ -22,6 +23,7 @@ from app.domains.network_config.constants import (
     DHCP_SECTION_HEADER,
     HOTSPOT_SECTION_HEADER,
     PORT_FORWARDING_SECTION_HEADER,
+    QOS_SECTION_HEADER,
     VLAN_SECTION_HEADER,
 )
 from app.domains.network_config.exceptions import EmptyNetworkConfigError
@@ -30,12 +32,14 @@ from app.domains.network_config.renderers import (
     render_hotspot_profile,
     render_network_config,
     render_port_forwarding_rule,
+    render_qos_traffic_rule,
     render_vlan,
 )
 from app.domains.network_config.router import router as network_config_router
 from app.domains.network_config.service import NetworkConfigService
 from app.domains.port_forwarding.constants import PortForwardingProtocol
 from app.domains.port_forwarding.models import PortForwardingRule
+from app.domains.qos.models import QosTrafficRule
 from app.domains.router_provisioning.constants import ConfigVersionStatus
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
 from app.domains.vlan.models import Vlan
@@ -130,6 +134,23 @@ def _make_hotspot_profile(**overrides: object) -> HotspotProfile:
     }
     fields.update(overrides)
     return HotspotProfile(**_base_fields(**fields))
+
+
+def _make_qos_rule(**overrides: object) -> QosTrafficRule:
+    fields = {
+        "router_id": uuid.uuid4(),
+        "organization_id": uuid.uuid4(),
+        "location_id": uuid.uuid4(),
+        "name": "SIP Signaling",
+        "protocol": "udp",
+        "port_range_start": 5060,
+        "port_range_end": 5061,
+        "dscp_value": None,
+        "priority": 1,
+        "is_enabled": True,
+    }
+    fields.update(overrides)
+    return QosTrafficRule(**_base_fields(**fields))
 
 
 # ============================================================================
@@ -249,18 +270,48 @@ class TestRenderHotspotProfile:
         assert line_a != line_b
 
 
+class TestRenderQosTrafficRule:
+    def test_renders_a_port_range_match(self) -> None:
+        (line,) = render_qos_traffic_rule(_make_qos_rule())
+        assert "/ip firewall mangle add chain=prerouting" in line
+        assert "protocol=udp" in line
+        assert "dst-port=5060-5061" in line
+        assert "action=mark-packet" in line
+        assert "passthrough=no" in line
+        assert 'comment="SIP Signaling (priority=1)"' in line
+
+    def test_renders_a_dscp_match(self) -> None:
+        (line,) = render_qos_traffic_rule(
+            _make_qos_rule(
+                protocol=None, port_range_start=None, port_range_end=None, dscp_value=46
+            )
+        )
+        assert "dscp=46" in line
+        assert "dst-port=" not in line
+        assert "protocol=" not in line
+
+    def test_two_rules_with_the_same_name_get_distinct_identifiers(self) -> None:
+        rule_a = _make_qos_rule(name="SIP Signaling")
+        rule_b = _make_qos_rule(name="SIP Signaling")
+        line_a = render_qos_traffic_rule(rule_a)[0]
+        line_b = render_qos_traffic_rule(rule_b)[0]
+        assert line_a != line_b
+
+
 class TestRenderNetworkConfig:
-    def test_combines_all_four_categories_with_section_headers(self) -> None:
+    def test_combines_all_five_categories_with_section_headers(self) -> None:
         rendered = render_network_config(
             dhcp_pools=[_make_pool()],
             vlans=[_make_vlan()],
             port_forwarding_rules=[_make_rule()],
             hotspot_profiles=[_make_hotspot_profile()],
+            qos_traffic_rules=[_make_qos_rule()],
         )
         assert DHCP_SECTION_HEADER in rendered
         assert VLAN_SECTION_HEADER in rendered
         assert PORT_FORWARDING_SECTION_HEADER in rendered
         assert HOTSPOT_SECTION_HEADER in rendered
+        assert QOS_SECTION_HEADER in rendered
 
     def test_returns_empty_string_for_no_input(self) -> None:
         assert (
@@ -269,6 +320,7 @@ class TestRenderNetworkConfig:
                 vlans=[],
                 port_forwarding_rules=[],
                 hotspot_profiles=[],
+                qos_traffic_rules=[],
             )
             == ""
         )
@@ -279,11 +331,13 @@ class TestRenderNetworkConfig:
             vlans=[],
             port_forwarding_rules=[],
             hotspot_profiles=[],
+            qos_traffic_rules=[],
         )
         assert DHCP_SECTION_HEADER in rendered
         assert VLAN_SECTION_HEADER not in rendered
         assert PORT_FORWARDING_SECTION_HEADER not in rendered
         assert HOTSPOT_SECTION_HEADER not in rendered
+        assert QOS_SECTION_HEADER not in rendered
 
 
 # ============================================================================
@@ -336,6 +390,16 @@ class FakeHotspotLookup:
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> list[HotspotProfile]:
         return [p for p in self.profiles if p.router_id == router_id]
+
+
+@dataclass
+class FakeQosLookup:
+    rules: list[QosTrafficRule] = field(default_factory=list)
+
+    async def list_rules_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[QosTrafficRule]:
+        return [r for r in self.rules if r.router_id == router_id]
 
 
 @dataclass
@@ -472,6 +536,7 @@ def _make_service(
     vlans: list[Vlan] | None = None,
     rules: list[PortForwardingRule] | None = None,
     hotspot_profiles: list[HotspotProfile] | None = None,
+    qos_traffic_rules: list[QosTrafficRule] | None = None,
 ) -> tuple[NetworkConfigService, FakeRouterProvisioningLookup]:
     provisioning_lookup = FakeRouterProvisioningLookup()
     service = NetworkConfigService(
@@ -479,6 +544,7 @@ def _make_service(
         FakeVlanLookup(vlans or []),
         FakePortForwardingLookup(rules or []),
         FakeHotspotLookup(hotspot_profiles or []),
+        FakeQosLookup(qos_traffic_rules or []),
         provisioning_lookup,
     )
     return service, provisioning_lookup
@@ -497,6 +563,7 @@ class TestPreviewConfig:
             vlans=[_make_vlan(router_id=router_id)],
             rules=[_make_rule(router_id=router_id)],
             hotspot_profiles=[_make_hotspot_profile(router_id=router_id)],
+            qos_traffic_rules=[_make_qos_rule(router_id=router_id)],
         )
         preview = await service.preview_config(
             router_id, requesting_organization_id=uuid.uuid4()
@@ -505,8 +572,10 @@ class TestPreviewConfig:
         assert preview.vlan_count == 1
         assert preview.port_forwarding_rule_count == 1
         assert preview.hotspot_profile_count == 1
+        assert preview.qos_traffic_rule_count == 1
         assert DHCP_SECTION_HEADER in preview.rendered_content
         assert HOTSPOT_SECTION_HEADER in preview.rendered_content
+        assert QOS_SECTION_HEADER in preview.rendered_content
 
     async def test_excludes_disabled_rows(self) -> None:
         router_id = uuid.uuid4()

@@ -111,6 +111,7 @@ class PermissionModule(StrEnum):
     CONNECTED_DEVICES = "connected_devices"
     DEVICE_SYNC = "device_sync"
     NETWORK_CONFIG = "network_config"
+    QOS = "qos"
 
 
 class OverrideEffect(StrEnum):
@@ -702,3 +703,13 @@ class AuditAction(StrEnum):
     HOTSPOT_PROFILE_CREATED = "hotspot_profile_created"
     HOTSPOT_PROFILE_UPDATED = "hotspot_profile_updated"
     HOTSPOT_PROFILE_DELETED = "hotspot_profile_deleted"
+
+    # QoS & VOIP Priority domain events -- written through this same
+    # table by ``app.domains.qos.service.QosService`` via the same narrow
+    # ``AuditLogWriter`` protocol shape every other domain's service uses.
+    # A pure rules/inventory domain (no live device push in this pass --
+    # see that module's own docstring), so create/update/delete are its
+    # only lifecycle events.
+    QOS_TRAFFIC_RULE_CREATED = "qos_traffic_rule_created"
+    QOS_TRAFFIC_RULE_UPDATED = "qos_traffic_rule_updated"
+    QOS_TRAFFIC_RULE_DELETED = "qos_traffic_rule_deleted"

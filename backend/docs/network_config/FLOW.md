@@ -139,3 +139,20 @@ DHCP subnet-mask gap's identical "document the real limit, don't
 fabricate a binding this table has no data for" posture). `rate-limit`
 mirrors `app.domains.queue_management.service
 .format_mikrotik_rate_limit`'s own rx=upload/tx=download convention.
+
+## 7. QoS: a fifth category, marking only, no paired queue created
+
+`QosLookupProtocol` (`list_rules_for_router`) is the fifth composed
+read. `render_qos_traffic_rule` renders a single RouterOS
+`/ip firewall mangle` entry per rule -- `action=mark-packet` matched
+either by `protocol`/`dst-port` (a port range) or by `dscp` (mutually
+exclusive, enforced at `app.domains.qos.validators
+.validate_traffic_match`). This only marks traffic; it never creates the
+paired `/queue tree` entry that would make the mark do anything --
+see `docs/qos/FLOW.md` §2 for why that pairing is real, separate,
+currently-manual device-side work, deliberately left undone and
+documented rather than fabricated as automatic. The rule's own
+`priority` is embedded in the mangle rule's `comment` field only
+(informational -- `app.domains.queue_management` remains the sole real
+consumer of an actual priority value, via whatever `/queue tree` entry
+an admin later pairs with this mark).

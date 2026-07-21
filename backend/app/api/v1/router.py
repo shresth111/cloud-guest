@@ -30,6 +30,7 @@ from app.domains.otp.router import router as otp_router
 from app.domains.policy.router import router as policy_router
 from app.domains.port_forwarding.router import router as port_forwarding_router
 from app.domains.provisioning_engine.router import router as provisioning_engine_router
+from app.domains.qos.router import router as qos_router
 from app.domains.queue_management.router import router as queue_management_router
 from app.domains.rbac.router import router as rbac_router
 from app.domains.router.router import router as router_router
@@ -80,3 +81,4 @@ api_v1_router.include_router(device_sync_router)
 api_v1_router.include_router(controller_logs_router)
 api_v1_router.include_router(network_config_router)
 api_v1_router.include_router(hotspot_router)
+api_v1_router.include_router(qos_router)

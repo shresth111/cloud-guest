@@ -4,8 +4,8 @@ Network Configuration Management (NCM) is the "provisioning-integration
 mechanism" that `app.domains.dhcp`/`app.domains.vlan`/`app.domains
 .port_forwarding`'s own `FLOW.md` files all explicitly deferred real
 device provisioning to. It renders a router's real, currently-enabled
-DHCP pools/VLANs/port-forwarding rules/hotspot profiles into RouterOS
-script text and pushes that text through `app.domains
+DHCP pools/VLANs/port-forwarding rules/hotspot profiles/QoS traffic
+rules into RouterOS script text and pushes that text through `app.domains
 .router_provisioning`'s own already-real config-version/apply/rollback
 pipeline.
 
@@ -27,10 +27,11 @@ read aggregation).
 ## What "push" means here
 
 A push renders **one combined RouterOS script** covering every enabled
-`DhcpPool`/`Vlan`/`PortForwardingRule`/`HotspotProfile` row currently on
-the target router -- a full desired-state snapshot, mirroring how
-`ConfigVersion` already represents a router's whole config, never an
-incremental diff. That script is queued through the same real,
+`DhcpPool`/`Vlan`/`PortForwardingRule`/`HotspotProfile`/`QosTrafficRule`
+row currently on the target router -- a full desired-state snapshot,
+mirroring how `ConfigVersion` already represents a router's whole
+config, never an incremental diff. That script is queued through the
+same real,
 already-established pull-model provisioning queue every other config
 version already flows through: a real router-side agent
 (`app.domains.router_agent`) polls for and completes these jobs. This
@@ -62,15 +63,15 @@ backend/
 No `models.py`, `events.py`, `repository.py`, or `alembic/versions/*.py`
 exist for this domain.
 
-## Composition, not duplication, with five other domains
+## Composition, not duplication, with six other domains
 
 * `app.domains.dhcp` / `app.domains.vlan` / `app.domains.port_forwarding` /
-  `app.domains.hotspot` each has an unpaginated `list_*_for_router` method
-  (real, small, well-tested additions -- see `FLOW.md` §1) that this
-  domain composes to read every enabled row for a target router.
-  `app.domains.hotspot` was built with this method from day one (a
-  lesson learned from the other three, which needed it added
-  retroactively).
+  `app.domains.hotspot` / `app.domains.qos` each has an unpaginated
+  `list_*_for_router` method (real, small, well-tested additions -- see
+  `FLOW.md` §1) that this domain composes to read every enabled row for
+  a target router. `app.domains.hotspot`/`app.domains.qos` were both
+  built with this method from day one (a lesson learned from the first
+  three, which needed it added retroactively).
 * `app.domains.router_provisioning` gained `create_version_from_content`
   (see `FLOW.md` §2) -- everything else (`apply_version`, `get_version`,
   `list_versions`, `diff_versions`, `rollback_to_version`) is composed
