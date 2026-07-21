@@ -723,3 +723,13 @@ class AuditAction(StrEnum):
     # ``DEVICE_SYNC_RUN_COMPLETED``'s identical "an admin-triggered,
     # operationally significant action" posture.
     NETWORK_DIAGNOSTIC_RUN_COMPLETED = "network_diagnostic_run_completed"
+
+    # PII masking bypass -- written by ``app.middleware.request_context
+    # .RequestContextMiddleware`` itself (not a domain service), once per
+    # request, only when a caller with ``User.data_masking_enabled=False``
+    # actually caused a ``Masked*`` field to serialize unmasked (see
+    # ``app.common.masking``'s own module docstring). One row per request
+    # summarizing every distinct PII kind unmasked (``mobile``/``email``/
+    # ``name``/``mac``) -- never one row per field, to avoid a
+    # multi-hundred-row explosion on a single guest-list page view.
+    PII_VIEWED_UNMASKED = "pii_viewed_unmasked"

@@ -71,6 +71,7 @@ from app.domains.organization.exceptions import (
     OrganizationNotFoundError,
 )
 from app.domains.organization.models import Organization, OrganizationMember
+from app.middleware.request_context import get_masking_context
 
 from .authorization import AccessValidator, RoleResolver
 from .cache import PermissionCache
@@ -168,6 +169,12 @@ async def CurrentOrganization(
     if not active_memberships:
         raise OrganizationMembershipRequiredError(organization_id)
 
+    # See app.common.masking's own module docstring: best-effort
+    # organization context for the PII-unmasking audit row, if this
+    # request's masking context ends up needing one. Not access-control-
+    # critical (only descriptive metadata on an audit row), so this is
+    # populated opportunistically rather than guaranteed for every route.
+    get_masking_context().organization_id = str(organization_id)
     return organization_id
 
 

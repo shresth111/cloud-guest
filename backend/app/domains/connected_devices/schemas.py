@@ -18,6 +18,7 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from app.common.masking import MaskedMac
 from app.domains.auth.schemas import MessageResponse
 
 __all__ = [
@@ -35,7 +36,7 @@ class ConnectedDeviceResponse(BaseModel):
     router_id: str
     organization_id: str
     location_id: str
-    mac_address: str
+    mac_address: MaskedMac
     ip_address: str | None
     hostname: str | None
     vendor: str | None

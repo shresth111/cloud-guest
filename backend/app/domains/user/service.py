@@ -72,6 +72,7 @@ ADMIN_EDITABLE_FIELDS: frozenset[str] = frozenset(
         "timezone",
         "language",
         "is_verified",
+        "data_masking_enabled",
     }
 )
 

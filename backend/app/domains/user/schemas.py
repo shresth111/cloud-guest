@@ -74,6 +74,7 @@ class UserResponse(BaseModel):
     status: str
     is_active: bool
     is_verified: bool
+    data_masking_enabled: bool
     last_login_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
@@ -208,6 +209,16 @@ class UserUpdateRequest(BaseModel):
     is_verified: bool | None = Field(
         default=None,
         description="Administrators may manually mark an account as verified.",
+    )
+    data_masking_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Whether app.common.masking's Masked* fields (guest mobile/"
+            "email/name, device MAC addresses) render masked for this "
+            "user. True (masked) is the default for every account -- "
+            "administrators explicitly flip this to False for privileged "
+            "users, never the other way around via self-service."
+        ),
     )
 
 

@@ -172,6 +172,7 @@ class FakeUser:
     username: str | None = "user"
     is_active: bool = True
     is_verified: bool = True
+    data_masking_enabled: bool = True
 
 
 @dataclass

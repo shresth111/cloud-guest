@@ -18,6 +18,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.common.masking import MaskedMac
 from app.domains.auth.schemas import MessageResponse
 
 __all__ = [
@@ -55,7 +56,7 @@ class MacAuthorizationEntryResponse(BaseModel):
     id: str
     organization_id: str
     location_id: str | None
-    mac_address: str
+    mac_address: MaskedMac
     authorization_type: str
     expires_at: datetime | None
     comment: str | None

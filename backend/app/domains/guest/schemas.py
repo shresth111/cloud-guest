@@ -20,6 +20,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.common.masking import MaskedIdentifier, MaskedMac, MaskedName
+
 from .constants import GuestAuthMethod, GuestSessionStatus
 
 __all__ = [
@@ -154,7 +156,7 @@ class SessionReconnectRequest(BaseModel):
 class GuestDeviceResponse(BaseModel):
     id: str
     guest_id: str
-    mac_address: str
+    mac_address: MaskedMac
     device_name: str | None
     first_seen_at: datetime
     last_seen_at: datetime
@@ -197,6 +199,16 @@ class GuestSessionListResponse(BaseModel):
 
 
 class GuestLoginResponse(BaseModel):
+    """Returned to the guest themselves, right after they submit this
+    same identifier to log in -- deliberately **not** masked (unlike
+    ``GuestResponse``'s admin-facing identical field): showing a guest
+    their own, just-typed phone/email back to them masked would be a
+    confusing regression, not a privacy improvement, and this endpoint
+    never goes through ``CurrentUser``/JWT auth at all (guests
+    authenticate via OTP/voucher, not a platform ``User`` account), so
+    ``MaskingContext`` would otherwise sit at its fail-closed default and
+    mask it for every guest, not just privileged ones."""
+
     guest_id: str
     identifier: str
     is_new_guest: bool
@@ -205,11 +217,15 @@ class GuestLoginResponse(BaseModel):
 
 
 class GuestResponse(BaseModel):
+    """Admin-/dashboard-facing -- unlike ``GuestLoginResponse``, this is
+    exactly the "reception staff sees the dashboard, not raw numbers"
+    view ``app.common.masking`` exists for."""
+
     id: str
     organization_id: str
     location_id: str | None
-    identifier: str
-    display_name: str | None
+    identifier: MaskedIdentifier
+    display_name: MaskedName
     first_seen_at: datetime
     last_seen_at: datetime
     total_visit_count: int

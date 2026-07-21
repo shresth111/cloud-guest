@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
+from app.middleware.request_context import get_masking_context
 
 from .jwt import InvalidTokenError, JWTManager, TokenExpiredError
 from .models import AuthUser
@@ -62,7 +63,16 @@ async def get_current_user(
             detail="User is not active",
         )
 
-    return AuthUser.from_model(user)
+    auth_user = AuthUser.from_model(user)
+    # See app.common.masking's own module docstring / MaskingContext's
+    # docstring: this is the one place a real, authenticated user's
+    # data_masking_enabled flag becomes visible to the rest of the
+    # request (Masked* field serializers, and the audit flush at the end
+    # of RequestContextMiddleware.dispatch).
+    masking_ctx = get_masking_context()
+    masking_ctx.masking_enabled = auth_user.data_masking_enabled
+    masking_ctx.user_id = auth_user.id
+    return auth_user
 
 
 def get_device_info(request: Request) -> DeviceInfo:

@@ -102,6 +102,21 @@ class User(BaseModel):
         Boolean, default=False, nullable=False
     )
 
+    # PII masking addition (``app.common.masking``) -- see that module's
+    # own docstring and ``docs/masking/FLOW.md`` for the full write-up.
+    # ``True`` (masked) is the fail-closed default for every account,
+    # pre-existing and new alike: reception-style users see
+    # ``Masked*``-annotated fields (guest mobile/email/name, device MAC
+    # addresses) rendered as e.g. ``"XXXXXXX98647"``; a privileged user
+    # must have this explicitly flipped to ``False`` (via the existing
+    # admin ``PUT /api/v1/users/{id}`` endpoint -- see
+    # ``app.domains.user.service.ADMIN_EDITABLE_FIELDS``) before they see
+    # raw values, and every such view is audited (``AuditAction
+    # .PII_VIEWED_UNMASKED``).
+    data_masking_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False
+    )
+
     sessions: Mapped[list[Session]] = relationship(
         "Session", back_populates="user", cascade="all, delete-orphan"
     )
@@ -241,6 +256,7 @@ class AuthUser:
     is_active: bool = True
     is_superuser: bool = False
     is_verified: bool = False
+    data_masking_enabled: bool = True
 
     @classmethod
     def from_model(cls, user: User) -> AuthUser:
@@ -251,6 +267,7 @@ class AuthUser:
             is_active=user.is_active,
             is_superuser=False,
             is_verified=user.is_verified,
+            data_masking_enabled=user.data_masking_enabled,
         )
 
 

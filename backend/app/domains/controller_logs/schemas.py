@@ -17,6 +17,8 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from app.common.masking import MaskedIdentifier
+
 __all__ = [
     "ProvisionLogEntryResponse",
     "ProvisionLogListResponse",
@@ -117,7 +119,7 @@ class GuestLoginHistoryLogResponse(BaseModel):
     guest_id: str | None
     organization_id: str | None
     location_id: str | None
-    identifier: str
+    identifier: MaskedIdentifier
     auth_method: str
     success: bool
     failure_reason: str | None
