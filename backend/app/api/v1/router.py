@@ -25,6 +25,7 @@ from app.domains.location.router import router as location_router
 from app.domains.mac_authorization.router import router as mac_authorization_router
 from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
+from app.domains.network_diagnostics.router import router as network_diagnostics_router
 from app.domains.organization.router import router as organization_router
 from app.domains.otp.router import router as otp_router
 from app.domains.policy.router import router as policy_router
@@ -82,3 +83,4 @@ api_v1_router.include_router(controller_logs_router)
 api_v1_router.include_router(network_config_router)
 api_v1_router.include_router(hotspot_router)
 api_v1_router.include_router(qos_router)
+api_v1_router.include_router(network_diagnostics_router)

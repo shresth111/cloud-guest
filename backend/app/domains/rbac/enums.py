@@ -112,6 +112,7 @@ class PermissionModule(StrEnum):
     DEVICE_SYNC = "device_sync"
     NETWORK_CONFIG = "network_config"
     QOS = "qos"
+    NETWORK_DIAGNOSTICS = "network_diagnostics"
 
 
 class OverrideEffect(StrEnum):
@@ -713,3 +714,12 @@ class AuditAction(StrEnum):
     QOS_TRAFFIC_RULE_CREATED = "qos_traffic_rule_created"
     QOS_TRAFFIC_RULE_UPDATED = "qos_traffic_rule_updated"
     QOS_TRAFFIC_RULE_DELETED = "qos_traffic_rule_deleted"
+
+    # Network Diagnostics domain events -- written through this same
+    # table by ``app.domains.network_diagnostics.service
+    # .NetworkDiagnosticsService`` via the same narrow ``AuditLogWriter``
+    # protocol shape every other domain's service uses. Always audited,
+    # even when the diagnostic itself fails -- mirrors
+    # ``DEVICE_SYNC_RUN_COMPLETED``'s identical "an admin-triggered,
+    # operationally significant action" posture.
+    NETWORK_DIAGNOSTIC_RUN_COMPLETED = "network_diagnostic_run_completed"

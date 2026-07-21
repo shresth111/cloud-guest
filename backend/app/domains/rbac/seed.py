@@ -335,6 +335,12 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # EXECUTE-gated push endpoint instead), mirroring DHCP/VLAN's
     # identical shape.
     PermissionModule.QOS: (_A.CREATE, _A.READ, _A.UPDATE, _A.DELETE, _A.MANAGE),
+    # Network Diagnostics: read-only history plus EXECUTE (run a real
+    # ping/traceroute) -- no CREATE/UPDATE/DELETE, since DiagnosticRun
+    # rows are immutable and only ever created by running a diagnostic
+    # itself, mirroring DEVICE_SYNC's identical "no CRUD resource of its
+    # own" shape.
+    PermissionModule.NETWORK_DIAGNOSTICS: (_A.READ, _A.EXECUTE, _A.MANAGE),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -386,6 +392,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.DEVICE_SYNC: "Device Synchronization",
     PermissionModule.NETWORK_CONFIG: "Network Configuration Management",
     PermissionModule.QOS: "QoS & VOIP Priority",
+    PermissionModule.NETWORK_DIAGNOSTICS: "Network Diagnostics",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -466,6 +473,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # A QoS traffic rule is scoped to one router -- identical ScopeType
     # .ROUTER reasoning as PermissionModule.DHCP/VLAN above.
     PermissionModule.QOS: ScopeType.ROUTER,
+    # A diagnostic run targets one router at a time -- identical
+    # ScopeType.ROUTER reasoning as PermissionModule.DEVICE_SYNC above.
+    PermissionModule.NETWORK_DIAGNOSTICS: ScopeType.ROUTER,
 }
 
 
@@ -698,6 +708,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DEVICE_SYNC: _L.FULL,
             _M.NETWORK_CONFIG: _L.FULL,
             _M.QOS: _L.FULL,
+            _M.NETWORK_DIAGNOSTICS: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,
