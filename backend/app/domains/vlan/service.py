@@ -169,6 +169,22 @@ class VlanService:
             page_size=page_size,
         )
 
+    async def list_vlans_for_router(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> list[Vlan]:
+        """Every non-deleted VLAN for this router, unpaginated -- the real
+        read source ``app.domains.network_config`` composes to render a
+        router's full VLAN config, mirroring
+        ``app.domains.dhcp.DhcpService.list_pools_for_router``'s identical
+        shape."""
+        await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        return await self.repository.list_vlans_for_router(router_id)
+
     async def update_vlan(
         self,
         vlan_pk: uuid.UUID,

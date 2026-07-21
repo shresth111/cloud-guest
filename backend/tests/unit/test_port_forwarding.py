@@ -438,6 +438,44 @@ class TestPortForwardingConflict:
 
 
 # ============================================================================
+# list_rules_for_router -- the real read source Network Configuration
+# Management composes to render a router's full port-forwarding config
+# ============================================================================
+
+
+class TestListRulesForRouter:
+    async def test_returns_every_non_deleted_rule_for_the_router(self) -> None:
+        h = make_harness()
+        router = _make_router()
+        h.router_lookup.add(router)
+        rule_a = await _create_rule(h, router, destination_port=8080)
+        rule_b = await _create_rule(h, router, destination_port=9090)
+        await h.service.delete_rule(
+            rule_b.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        rules = await h.service.list_rules_for_router(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert [r.id for r in rules] == [rule_a.id]
+
+    async def test_raises_for_a_router_outside_the_requesting_organization(
+        self,
+    ) -> None:
+        h = make_harness()
+        router = _make_router()
+        h.router_lookup.add(router)
+
+        with pytest.raises(RouterNotFoundError):
+            await h.service.list_rules_for_router(
+                router.id, requesting_organization_id=uuid.uuid4()
+            )
+
+
+# ============================================================================
 # RBAC -- every route requires a permission dependency
 # ============================================================================
 

@@ -1456,6 +1456,160 @@ class TestConfigProfileAndVersions:
 
 
 # ============================================================================
+# create_version_from_content -- the direct-content version-creation path
+# app.domains.network_config composes, bypassing ConfigTemplate/ConfigProfile
+# ============================================================================
+
+
+class TestCreateVersionFromContent:
+    async def test_creates_a_draft_version_without_a_profile(self) -> None:
+        (
+            service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(router_service, location_lookup, organization)
+
+        version = await service.create_version_from_content(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            rendered_content="/ip pool add name=guest-pool ranges=10.0.0.10-10.0.0.100",
+            requesting_organization_id=None,
+        )
+
+        assert version.version_number == 1
+        assert version.status == ConfigVersionStatus.DRAFT.value
+        assert version.profile_id is None
+        assert version.rendered_content.startswith("/ip pool add")
+
+    async def test_does_not_disturb_an_existing_profile_assignment(self) -> None:
+        (
+            service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(router_service, location_lookup, organization)
+        template = await service.create_template(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=None,
+            name="Basic",
+            template_content="no placeholders",
+        )
+        profile, _template_version = await service.assign_profile(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            template_id=template.id,
+            requesting_organization_id=None,
+        )
+
+        version = await service.create_version_from_content(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            rendered_content="/interface vlan add name=vlan100 vlan-id=100",
+            requesting_organization_id=None,
+        )
+
+        assert version.profile_id is None
+        refreshed_profile = await _repo.get_profile_for_router(router_device.id)
+        assert refreshed_profile.id == profile.id
+        assert refreshed_profile.template_id == template.id
+
+    async def test_sequential_version_numbers_share_the_same_router_sequence(
+        self,
+    ) -> None:
+        (
+            service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(router_service, location_lookup, organization)
+
+        first = await service.create_version_from_content(
+            actor_user_id=None,
+            router_id=router_device.id,
+            rendered_content="first",
+            requesting_organization_id=None,
+        )
+        second = await service.create_version_from_content(
+            actor_user_id=None,
+            router_id=router_device.id,
+            rendered_content="second",
+            requesting_organization_id=None,
+        )
+        assert second.version_number == first.version_number + 1
+
+    async def test_on_decommissioned_router_raises(self) -> None:
+        (
+            service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(
+            router_service,
+            location_lookup,
+            organization,
+            status=RouterStatus.DECOMMISSIONED,
+        )
+        with pytest.raises(RouterNotEligibleForConfigError):
+            await service.create_version_from_content(
+                actor_user_id=None,
+                router_id=router_device.id,
+                rendered_content="anything",
+                requesting_organization_id=None,
+            )
+
+    async def test_can_be_applied_through_the_existing_apply_version_pipeline(
+        self,
+    ) -> None:
+        (
+            service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(router_service, location_lookup, organization)
+
+        version = await service.create_version_from_content(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            rendered_content="/ip firewall nat add chain=dstnat",
+            requesting_organization_id=None,
+        )
+        applied_version, job = await service.apply_version(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            version_id=version.id,
+            requesting_organization_id=None,
+        )
+        assert applied_version.status == ConfigVersionStatus.PENDING_APPLY.value
+        assert job.payload["config_version_id"] == str(version.id)
+
+
+# ============================================================================
 # Backup / restore
 # ============================================================================
 

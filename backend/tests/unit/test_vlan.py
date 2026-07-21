@@ -153,6 +153,13 @@ class FakeVlanRepository:
         paged = values[params.offset : params.offset + params.page_size]
         return paged, PaginationMeta.from_total(params, len(values))
 
+    async def list_vlans_for_router(self, router_id: uuid.UUID) -> list[Vlan]:
+        return [
+            v
+            for v in self.vlans.values()
+            if v.router_id == router_id and not v.is_deleted
+        ]
+
 
 @dataclass
 class FakeAuditLogWriter:
@@ -381,6 +388,44 @@ class TestVlanCrud:
         recreated = await _create_vlan(h, router, vlan_id=100)
         assert recreated.vlan_id == 100
         assert recreated.id != vlan.id
+
+
+# ============================================================================
+# list_vlans_for_router -- the real read source Network Configuration
+# Management composes to render a router's full VLAN config
+# ============================================================================
+
+
+class TestListVlansForRouter:
+    async def test_returns_every_non_deleted_vlan_for_the_router(self) -> None:
+        h = make_harness()
+        router = _make_router()
+        h.router_lookup.add(router)
+        vlan_a = await _create_vlan(h, router, vlan_id=100)
+        vlan_b = await _create_vlan(h, router, vlan_id=200)
+        await h.service.delete_vlan(
+            vlan_b.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        vlans = await h.service.list_vlans_for_router(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert [v.id for v in vlans] == [vlan_a.id]
+
+    async def test_raises_for_a_router_outside_the_requesting_organization(
+        self,
+    ) -> None:
+        h = make_harness()
+        router = _make_router()
+        h.router_lookup.add(router)
+
+        with pytest.raises(RouterNotFoundError):
+            await h.service.list_vlans_for_router(
+                router.id, requesting_organization_id=uuid.uuid4()
+            )
 
 
 # ============================================================================

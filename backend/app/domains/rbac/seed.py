@@ -322,6 +322,13 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # immutable and only ever created by the sync action itself (see
     # app.domains.device_sync.models's own module docstring).
     PermissionModule.DEVICE_SYNC: (_A.READ, _A.EXECUTE, _A.MANAGE),
+    # Network Configuration Management: read (preview/list/get/diff
+    # versions) plus EXECUTE (push/rollback -- the actions that actually
+    # queue a real device push) -- no CREATE/UPDATE/DELETE, since this
+    # domain owns no table of its own; every version it creates lives in
+    # app.domains.router_provisioning's own ConfigVersion, mirroring
+    # DEVICE_SYNC's identical "no CRUD resource of its own" shape.
+    PermissionModule.NETWORK_CONFIG: (_A.READ, _A.EXECUTE, _A.MANAGE),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -371,6 +378,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.MAC_AUTHORIZATION: "MAC Authorization",
     PermissionModule.CONNECTED_DEVICES: "Connected Devices",
     PermissionModule.DEVICE_SYNC: "Device Synchronization",
+    PermissionModule.NETWORK_CONFIG: "Network Configuration Management",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -445,6 +453,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # A device sync run is scoped to one router -- same ScopeType.ROUTER
     # reasoning as PermissionModule.CONNECTED_DEVICES above.
     PermissionModule.DEVICE_SYNC: ScopeType.ROUTER,
+    # A pushed/rolled-back network config targets one router at a time --
+    # identical ScopeType.ROUTER reasoning.
+    PermissionModule.NETWORK_CONFIG: ScopeType.ROUTER,
 }
 
 
@@ -675,6 +686,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.VLAN: _L.FULL,
             _M.CONNECTED_DEVICES: _L.FULL,
             _M.DEVICE_SYNC: _L.FULL,
+            _M.NETWORK_CONFIG: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,

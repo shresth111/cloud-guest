@@ -178,6 +178,22 @@ class DhcpService:
             page_size=page_size,
         )
 
+    async def list_pools_for_router(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> list[DhcpPool]:
+        """Every non-deleted pool for this router, unpaginated -- the real
+        read source ``app.domains.network_config`` composes to render a
+        router's full DHCP config, mirroring ``get_pool``'s own tenant
+        validation via ``router_lookup`` rather than a per-row organization
+        comparison (there is no single row here to compare against)."""
+        await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        return await self.repository.list_pools_for_router(router_id)
+
     async def update_pool(
         self,
         pool_id: uuid.UUID,

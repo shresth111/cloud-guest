@@ -110,6 +110,7 @@ class PermissionModule(StrEnum):
     MAC_AUTHORIZATION = "mac_authorization"
     CONNECTED_DEVICES = "connected_devices"
     DEVICE_SYNC = "device_sync"
+    NETWORK_CONFIG = "network_config"
 
 
 class OverrideEffect(StrEnum):

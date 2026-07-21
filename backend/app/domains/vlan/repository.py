@@ -46,6 +46,8 @@ class VlanRepositoryProtocol(Protocol):
         sort_order: SortOrder = SortOrder.DESC,
     ) -> tuple[list[Vlan], PaginationMeta]: ...
 
+    async def list_vlans_for_router(self, router_id: uuid.UUID) -> list[Vlan]: ...
+
 
 class VlanRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -99,6 +101,12 @@ class VlanRepository:
             sort_by=sort_by,
             sort_order=sort_order,
         )
+
+    async def list_vlans_for_router(self, router_id: uuid.UUID) -> list[Vlan]:
+        """Every non-deleted VLAN for this router, unpaginated -- mirrors
+        ``app.domains.dhcp.repository.DhcpRepository
+        .list_pools_for_router``'s identical shape."""
+        return await self.vlans.get_all(filters={"router_id": router_id})
 
 
 __all__ = ["VlanRepositoryProtocol", "VlanRepository"]

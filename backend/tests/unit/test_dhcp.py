@@ -400,6 +400,44 @@ class TestDhcpPoolRangeConflict:
 
 
 # ============================================================================
+# list_pools_for_router -- the real read source Network Configuration
+# Management composes to render a router's full DHCP config
+# ============================================================================
+
+
+class TestListPoolsForRouter:
+    async def test_returns_every_non_deleted_pool_for_the_router(self) -> None:
+        h = make_harness()
+        router = _make_router()
+        h.router_lookup.add(router)
+        pool_a = await _create_pool(h, router, interface="ether2")
+        pool_b = await _create_pool(h, router, start="10.0.0.10", end="10.0.0.50")
+        await h.service.delete_pool(
+            pool_b.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        pools = await h.service.list_pools_for_router(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert [p.id for p in pools] == [pool_a.id]
+
+    async def test_raises_for_a_router_outside_the_requesting_organization(
+        self,
+    ) -> None:
+        h = make_harness()
+        router = _make_router()
+        h.router_lookup.add(router)
+
+        with pytest.raises(RouterNotFoundError):
+            await h.service.list_pools_for_router(
+                router.id, requesting_organization_id=uuid.uuid4()
+            )
+
+
+# ============================================================================
 # RBAC -- every route requires a permission dependency
 # ============================================================================
 

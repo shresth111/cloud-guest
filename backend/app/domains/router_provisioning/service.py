@@ -621,6 +621,60 @@ class RouterProvisioningService:
         )
         return profile, version
 
+    async def create_version_from_content(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        rendered_content: str,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> ConfigVersion:
+        """Creates a ``DRAFT`` :class:`~.models.ConfigVersion` directly from
+        already-final config text, bypassing :meth:`assign_profile`'s
+        ``ConfigTemplate``/``ConfigProfile``/``resolve_variables`` machinery
+        entirely (``profile_id`` is left ``NULL``).
+
+        For a caller that has already rendered a router's full desired
+        config itself (``app.domains.network_config``, composing its own
+        DHCP/VLAN/Port Forwarding rows into RouterOS script text) --
+        assigning a one-off ``ConfigTemplate`` per push just to satisfy
+        ``assign_profile``'s template/variable-resolution machinery would
+        both proliferate throw-away template rows and silently overwrite
+        whatever real, admin-assigned ``ConfigProfile`` the router already
+        has (a profile is unique per router). This method reuses every
+        other real, tested mechanism ``assign_profile`` itself uses --
+        sequential version numbering, the ``DRAFT`` starting status, the
+        ``CONFIG_VERSION_DRAFTED`` event -- without touching the
+        profile/template tables at all."""
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        validate_router_can_receive_config(router)
+
+        version_number = await self.repository.get_next_version_number(router.id)
+        version = await self.repository.create_version(
+            router_id=router.id,
+            profile_id=None,
+            version_number=version_number,
+            rendered_content=rendered_content,
+            status=ConfigVersionStatus.DRAFT.value,
+            created_by_user_id=actor_user_id,
+            applied_at=None,
+            rollback_of_version_id=None,
+            is_backup=False,
+            created_by=actor_user_id,
+        )
+        await self._record_event(
+            router,
+            RouterEventType.CONFIG_VERSION_DRAFTED,
+            message=(
+                f"Draft config version {version.version_number} created "
+                "from rendered content"
+            ),
+            metadata={"version_id": str(version.id)},
+        )
+        return version
+
     # ========================================================================
     # Config versions: read / diff / rollback / apply
     # ========================================================================
