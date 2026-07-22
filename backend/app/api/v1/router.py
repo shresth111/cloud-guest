@@ -56,6 +56,7 @@ from app.domains.user.router import router as user_router
 from app.domains.vlan.router import router as vlan_router
 from app.domains.voucher.router import router as voucher_router
 from app.domains.wireguard.router import router as wireguard_router
+from app.domains.branding.router import router as branding_router
 
 api_v1_router = APIRouter()
 api_v1_router.include_router(health_router, prefix="/health", tags=["Health"])
@@ -114,3 +115,4 @@ api_v1_router.include_router(agent_permissions_router)
 api_v1_router.include_router(live_sessions_router)
 api_v1_router.include_router(customer_provisioning_router)
 api_v1_router.include_router(system_router)
+api_v1_router.include_router(branding_router)
