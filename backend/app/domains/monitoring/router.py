@@ -174,6 +174,7 @@ from .models import (
     SlaTarget,
 )
 from .schemas import (
+    AlertEvaluationResponse,
     AlertListResponse,
     AlertResponse,
     AlertRuleCreateRequest,
@@ -186,6 +187,7 @@ from .schemas import (
     HealthCheckRunResponse,
     HealthHistoryResponse,
     IncidentAlertAttachRequest,
+    IncidentAlertsResponse,
     IncidentCreateRequest,
     IncidentListResponse,
     IncidentResponse,
@@ -719,6 +721,29 @@ async def resolve_alert(
     )
 
 
+@router.post(
+    "/alerts/evaluate",
+    response_model=ApiResponse[AlertEvaluationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("alerts.manage"))],
+)
+async def evaluate_alert_rules(
+    request: Request,
+    service: AlertService = Depends(get_alert_service),
+):
+    result = await service.evaluate_alert_rules()
+    payload = AlertEvaluationResponse(
+        triggered=[_alert_response(a) for a in result.triggered],
+        resolved=[_alert_response(a) for a in result.resolved],
+    )
+    return build_response(
+        success=True,
+        message="Alert rules evaluated",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
 # ============================================================================
 # Notification Engine endpoints
 #
@@ -1034,6 +1059,27 @@ async def attach_alert_to_incident(
         success=True,
         message="Alert attached to incident",
         data=_incident_response(incident).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/incidents/{incident_id}/alerts",
+    response_model=ApiResponse[IncidentAlertsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("alerts.read"))],
+)
+async def list_incident_alerts(
+    request: Request,
+    incident_id: uuid.UUID,
+    service: IncidentService = Depends(get_incident_service),
+):
+    alerts = await service.list_alerts_for_incident(incident_id)
+    payload = IncidentAlertsResponse(items=[_alert_response(a) for a in alerts])
+    return build_response(
+        success=True,
+        message="Incident alerts retrieved",
+        data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )
 

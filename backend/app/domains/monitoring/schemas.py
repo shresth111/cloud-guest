@@ -34,6 +34,7 @@ __all__ = [
     "AlertRuleListResponse",
     "AlertResponse",
     "AlertListResponse",
+    "AlertEvaluationResponse",
     "NotificationChannelCreateRequest",
     "NotificationChannelUpdateRequest",
     "NotificationChannelResponse",
@@ -45,6 +46,7 @@ __all__ = [
     "IncidentResponse",
     "IncidentListResponse",
     "IncidentAlertAttachRequest",
+    "IncidentAlertsResponse",
     "SlaTargetCreateRequest",
     "SlaTargetResponse",
     "SlaTargetWithLatestReportResponse",
@@ -212,6 +214,11 @@ class AlertListResponse(BaseModel):
     has_previous: bool
 
 
+class AlertEvaluationResponse(BaseModel):
+    triggered: list[AlertResponse]
+    resolved: list[AlertResponse]
+
+
 # ============================================================================
 # Notification Engine
 # ============================================================================
@@ -330,6 +337,10 @@ class IncidentListResponse(BaseModel):
 
 class IncidentAlertAttachRequest(BaseModel):
     alert_id: uuid.UUID
+
+
+class IncidentAlertsResponse(BaseModel):
+    items: list[AlertResponse]
 
 
 # ============================================================================
