@@ -11,6 +11,26 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _jsonable_validation_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``RequestValidationError.errors()`` embeds the raw exception instance
+    in ``ctx["error"]`` whenever a Pydantic ``field_validator`` raises
+    ``ValueError`` (rather than returning a plain error string) -- that raw
+    exception object is not JSON-serializable, which crashes this handler
+    into an unrelated 500 instead of the intended 422. Stringify anything
+    inside ``ctx`` that isn't already JSON-safe."""
+    sanitized: list[dict[str, Any]] = []
+    for error in errors:
+        clean = dict(error)
+        ctx = clean.get("ctx")
+        if isinstance(ctx, dict):
+            clean["ctx"] = {
+                key: str(value) if isinstance(value, BaseException) else value
+                for key, value in ctx.items()
+            }
+        sanitized.append(clean)
+    return sanitized
+
+
 class CloudGuestError(Exception):
     def __init__(
         self,
@@ -76,7 +96,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             content=build_response(
                 success=False,
                 message="Request validation failed",
-                data={"errors": exc.errors()},
+                data={"errors": _jsonable_validation_errors(exc.errors())},
                 request_id=_request_id(request),
             ),
         )

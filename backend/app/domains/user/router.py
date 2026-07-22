@@ -72,6 +72,7 @@ def _user_response(user: User) -> UserResponse:
         status=user.status,
         is_active=user.is_active,
         is_verified=user.is_verified,
+        data_masking_enabled=user.data_masking_enabled,
         last_login_at=user.last_login_at,
         created_at=user.created_at,
         updated_at=user.updated_at,

@@ -140,6 +140,7 @@ def _login_attempt_response(attempt: LoginAttempt) -> LoginAttemptLogResponse:
         user_id=str(attempt.user_id) if attempt.user_id else None,
         email=attempt.email,
         ip_address=attempt.ip_address,
+        user_agent=attempt.user_agent,
         success=attempt.success,
         failure_reason=attempt.failure_reason,
         created_at=attempt.created_at,

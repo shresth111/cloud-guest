@@ -30,10 +30,12 @@ from .schemas import (
     PermissionResponse,
     RoleCloneRequest,
     RoleCreateRequest,
+    RolePermissionAttachRequest,
     RoleResponse,
     RoleUpdateRequest,
     UserPermissionsResponse,
     UserRoleAssignRequest,
+    UserRoleListResponse,
     UserRoleResponse,
 )
 from .service import RBACService
@@ -45,7 +47,7 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
 
 
-def _role_response(role: Role) -> RoleResponse:
+def _role_response(role: Role, permissions: list[str]) -> RoleResponse:
     return RoleResponse(
         id=str(role.id),
         name=role.name,
@@ -57,9 +59,17 @@ def _role_response(role: Role) -> RoleResponse:
         scope_type=ScopeType(role.scope_type),
         organization_id=str(role.organization_id) if role.organization_id else None,
         parent_role_id=str(role.parent_role_id) if role.parent_role_id else None,
+        permissions=permissions,
         created_at=role.created_at,
         updated_at=role.updated_at,
     )
+
+
+async def _role_permission_keys(
+    rbac_service: RBACService, role_id: uuid.UUID
+) -> list[str]:
+    rows = await rbac_service.repository.get_role_permissions(role_id)
+    return [row.permission.key for row in rows]
 
 
 def _permission_response(permission: Permission) -> PermissionResponse:
@@ -119,10 +129,14 @@ async def list_roles(
     rbac_service: RBACService = Depends(get_rbac_service),
 ):
     roles = await rbac_service.list_roles(requesting_organization_id=organization_id)
+    payloads = [
+        _role_response(role, await _role_permission_keys(rbac_service, role.id))
+        for role in roles
+    ]
     return build_response(
         success=True,
         message="Roles retrieved",
-        data=[_role_response(role).model_dump() for role in roles],
+        data=[payload.model_dump() for payload in payloads],
         request_id=_request_id(request),
     )
 
@@ -156,7 +170,9 @@ async def create_role(
     return build_response(
         success=True,
         message="Role created",
-        data=_role_response(role).model_dump(),
+        data=_role_response(
+            role, await _role_permission_keys(rbac_service, role.id)
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -185,7 +201,9 @@ async def update_role(
     return build_response(
         success=True,
         message="Role updated",
-        data=_role_response(role).model_dump(),
+        data=_role_response(
+            role, await _role_permission_keys(rbac_service, role.id)
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -241,7 +259,9 @@ async def clone_role(
     return build_response(
         success=True,
         message="Role cloned",
-        data=_role_response(clone).model_dump(),
+        data=_role_response(
+            clone, await _role_permission_keys(rbac_service, clone.id)
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -268,7 +288,9 @@ async def activate_role(
     return build_response(
         success=True,
         message="Role activated",
-        data=_role_response(role).model_dump(),
+        data=_role_response(
+            role, await _role_permission_keys(rbac_service, role.id)
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -295,7 +317,75 @@ async def deactivate_role(
     return build_response(
         success=True,
         message="Role deactivated",
-        data=_role_response(role).model_dump(),
+        data=_role_response(
+            role, await _role_permission_keys(rbac_service, role.id)
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/roles/{role_id}/permissions",
+    response_model=ApiResponse[RoleResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("roles.manage"))],
+)
+async def attach_role_permission(
+    request: Request,
+    role_id: uuid.UUID,
+    payload: RolePermissionAttachRequest,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    rbac_service: RBACService = Depends(get_rbac_service),
+):
+    await rbac_service.assign_permission_to_role(
+        actor_user_id=uuid.UUID(user.id),
+        role_id=role_id,
+        permission_key=payload.permission_key,
+        requesting_organization_id=organization_id,
+    )
+    role = await rbac_service.get_role(
+        role_id, requesting_organization_id=organization_id
+    )
+    return build_response(
+        success=True,
+        message="Permission attached to role",
+        data=_role_response(
+            role, await _role_permission_keys(rbac_service, role.id)
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.delete(
+    "/roles/{role_id}/permissions/{permission_key}",
+    response_model=ApiResponse[RoleResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("roles.manage"))],
+)
+async def detach_role_permission(
+    request: Request,
+    role_id: uuid.UUID,
+    permission_key: str,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    rbac_service: RBACService = Depends(get_rbac_service),
+):
+    await rbac_service.remove_permission_from_role(
+        actor_user_id=uuid.UUID(user.id),
+        role_id=role_id,
+        permission_key=permission_key,
+        requesting_organization_id=organization_id,
+    )
+    role = await rbac_service.get_role(
+        role_id, requesting_organization_id=organization_id
+    )
+    return build_response(
+        success=True,
+        message="Permission removed from role",
+        data=_role_response(
+            role, await _role_permission_keys(rbac_service, role.id)
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -351,6 +441,29 @@ async def list_permission_groups(
 # ============================================================================
 # User role assignment
 # ============================================================================
+
+
+@router.get(
+    "/users/{user_id}/roles",
+    response_model=ApiResponse[UserRoleListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("users.read"))],
+)
+async def list_user_role_assignments(
+    request: Request,
+    user_id: uuid.UUID,
+    rbac_service: RBACService = Depends(get_rbac_service),
+):
+    assignments = await rbac_service.repository.get_active_user_roles(user_id)
+    payload = UserRoleListResponse(
+        items=[_user_role_response(a) for a in assignments]
+    )
+    return build_response(
+        success=True,
+        message="User role assignments retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
 
 
 @router.post(

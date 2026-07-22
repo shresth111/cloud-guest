@@ -25,8 +25,10 @@ __all__ = [
     "RoleCreateRequest",
     "RoleUpdateRequest",
     "RoleCloneRequest",
+    "RolePermissionAttachRequest",
     "UserRoleAssignRequest",
     "UserRoleResponse",
+    "UserRoleListResponse",
     "UserPermissionsResponse",
     "PermissionOverrideRequest",
     "PermissionOverrideResponse",
@@ -71,6 +73,7 @@ class RoleResponse(BaseModel):
     scope_type: ScopeType
     organization_id: str | None = None
     parent_role_id: str | None = None
+    permissions: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -91,6 +94,10 @@ class UserRoleResponse(BaseModel):
     is_active: bool
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class UserRoleListResponse(BaseModel):
+    items: list[UserRoleResponse] = Field(default_factory=list)
 
 
 class UserPermissionsResponse(BaseModel):
@@ -174,6 +181,10 @@ class UserRoleAssignRequest(BaseModel):
     location_id: uuid.UUID | None = None
     router_id: uuid.UUID | None = None
     expires_at: datetime | None = None
+
+
+class RolePermissionAttachRequest(BaseModel):
+    permission_key: str = Field(..., min_length=1, max_length=150)
 
 
 class PermissionOverrideRequest(BaseModel):

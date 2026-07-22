@@ -354,7 +354,7 @@ class AuthRepository:
         success: bool,
         failure_reason: str | None = None,
     ) -> LoginAttempt:
-        return await self.login_attempts.create(
+        attempt = await self.login_attempts.create(
             {
                 "user_id": user_id,
                 "email": email.lower(),
@@ -364,6 +364,15 @@ class AuthRepository:
                 "failure_reason": failure_reason,
             }
         )
+        # Every failed-login call site records this attempt and then raises
+        # (e.g. InvalidCredentialsError) in the same request -- the shared
+        # get_db_session() dependency rolls back the whole session on any
+        # exception, which was silently discarding every failure row (audit
+        # trail + account-lockout counting both depend on these persisting).
+        # Commit immediately so this audit record survives the caller's
+        # subsequent rollback regardless of outcome.
+        await self.session.commit()
+        return attempt
 
     async def get_recent_failed_attempts(
         self, email: str, ip_address: str, *, minutes: int = 15

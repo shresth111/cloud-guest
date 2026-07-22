@@ -99,6 +99,7 @@ class LoginAttemptLogResponse(BaseModel):
     user_id: str | None
     email: str
     ip_address: str
+    user_agent: str | None
     success: bool
     failure_reason: str | None
     created_at: datetime
