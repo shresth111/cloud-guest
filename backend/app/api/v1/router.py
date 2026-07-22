@@ -4,6 +4,13 @@ from app.api.v1.health.routes import router as health_router
 from app.domains.analytics.router import router as analytics_router
 from app.domains.api_keys.router import router as api_keys_router
 from app.domains.audit.router import router as audit_router
+from app.domains.dashboard.router import router as dashboard_router
+from app.domains.workspace.router import router as workspace_router
+from app.domains.feature_entitlement.router import router as feature_entitlement_router
+from app.domains.agent_permissions.router import router as agent_permissions_router
+from app.domains.live_sessions.router import router as live_sessions_router
+from app.domains.customer_provisioning.router import router as customer_provisioning_router
+from app.domains.system.router import router as system_router
 from app.domains.auth.router import router as auth_router
 from app.domains.billing.router import router as billing_router
 from app.domains.campaigns.router import guest_router as campaigns_guest_router
@@ -100,3 +107,10 @@ api_v1_router.include_router(campaigns_router)
 api_v1_router.include_router(notification_router)
 api_v1_router.include_router(api_keys_router)
 api_v1_router.include_router(audit_router)
+api_v1_router.include_router(dashboard_router)
+api_v1_router.include_router(workspace_router)
+api_v1_router.include_router(feature_entitlement_router)
+api_v1_router.include_router(agent_permissions_router)
+api_v1_router.include_router(live_sessions_router)
+api_v1_router.include_router(customer_provisioning_router)
+api_v1_router.include_router(system_router)
