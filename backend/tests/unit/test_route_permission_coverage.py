@@ -56,6 +56,23 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     # -- Health/readiness: no identity of any kind exists yet -----------
     ("GET", "/api/v1/health/live"): "Liveness probe -- no identity exists yet.",
     ("GET", "/api/v1/health/ready"): "Readiness probe -- no identity exists yet.",
+    ("GET", "/api/v1/system/health"): (
+        "Richer health info than /health/live -- same pre-identity "
+        "monitoring/status-page use case; /system/status (the "
+        "privileged view) is separately RequirePermission-gated."
+    ),
+    ("GET", "/api/v1/system/version"): "Platform version -- no identity exists yet.",
+    # -- Public catalog/branding: shown before any org identity exists,
+    # e.g. on the login page or a marketing/pricing page. No customer-
+    # specific data. -----------------------------------------------------
+    ("GET", "/api/v1/branding/default"): (
+        "Platform default branding shown pre-login -- no organization "
+        "identity exists yet."
+    ),
+    ("GET", "/api/v1/features"): (
+        "Static platform feature catalog, not customer-specific -- same "
+        "public-catalog category as GET /branding/default."
+    ),
     # -- Auth: pre-identity flows by definition --------------------------
     ("POST", "/api/v1/auth/register"): "Self-registration -- no account exists yet.",
     ("POST", "/api/v1/auth/login"): "Login -- no session exists yet.",
@@ -89,6 +106,17 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ("PUT", "/api/v1/me"): "Self-service -- own profile.",
     ("GET", "/api/v1/me/organizations"): "Self-service -- own memberships.",
     ("GET", "/api/v1/me/permissions"): "Self-service -- own effective permissions.",
+    # -- Workspace: self-service among orgs the caller already belongs
+    # to -- CurrentUser establishes identity, WorkspaceService itself
+    # filters/validates membership; there is no meaningful org-scoped
+    # RBAC permission to check before you have picked a workspace. Same
+    # category as GET /me/organizations above. ------------------------
+    ("GET", "/api/v1/workspaces"): "Self-service -- own memberships only.",
+    ("GET", "/api/v1/workspaces/current"): "Self-service -- own current workspace only.",
+    ("POST", "/api/v1/workspaces/switch"): (
+        "Self-service -- switching among orgs the caller is already a "
+        "member of; WorkspaceService enforces membership."
+    ),
     (
         "POST",
         "/api/v1/organizations/{organization_id}/members/{member_id}/accept",

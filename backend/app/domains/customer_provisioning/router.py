@@ -36,6 +36,7 @@ def _request_id(request: Request) -> str:
     "/customers/onboard",
     response_model=ApiResponse[OnboardResponse],
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("organizations.create"))],
 )
 async def onboard_customer(
     request: Request,
