@@ -7,6 +7,7 @@ celery[redis]==5.5.3
 cryptography==44.0.0
 email-validator==2.2.0
 fastapi==0.115.6
+greenlet==3.5.3
 httpx==0.28.1
 librouteros==3.2.1
 opentelemetry-exporter-otlp-proto-http==1.44.0
