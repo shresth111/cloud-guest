@@ -118,6 +118,26 @@ class PlanFeatureKey(StrEnum):
     MULTI_ROUTER = "multi_router"
     MULTI_LOCATION = "multi_location"
 
+    # -- Feature Entitlement additions: capabilities the frontend customer
+    # dashboard actually exposes as their own nav items/pages
+    # (``customerFeatureCatalog.ts``'s Campaigns/VLANs/DHCP Pool, the 2FA
+    # settings dialog, per-report PDF/print export, and ISP Details' load
+    # balancing/failover config) but that BE-013 Part 1 and Smart Location
+    # Provisioning's additions above had no reason to name yet. Deliberately
+    # narrower than the frontend-less superset ``feature_entitlement``'s
+    # first draft assumed (SSO/RADIUS/VLAN/DHCP/... wholesale) -- see that
+    # module's own note on why entries with no real frontend surface (SSO,
+    # WEBHOOKS, QOS, FIREWALL, DNS, ...) were left out rather than added
+    # here, and why VOUCHER/RADIUS/BRANDING were pointed at the
+    # already-existing VOUCHER_LOGIN/FREERADIUS/WHITE_LABEL instead of
+    # duplicating them under a new name.
+    CAMPAIGNS = "campaigns"
+    VLAN = "vlan"
+    DHCP = "dhcp"
+    MFA = "mfa"
+    EXPORTS = "exports"
+    ISP_FAILOVER = "isp_failover"
+
 
 class PlanFeatureType(StrEnum):
     """The value-shape a :class:`~.models.PlanFeature` row carries -- see
@@ -182,6 +202,12 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.AUDIT_LOGS,
         PlanFeatureKey.MULTI_ROUTER,
         PlanFeatureKey.MULTI_LOCATION,
+        PlanFeatureKey.CAMPAIGNS,
+        PlanFeatureKey.VLAN,
+        PlanFeatureKey.DHCP,
+        PlanFeatureKey.MFA,
+        PlanFeatureKey.EXPORTS,
+        PlanFeatureKey.ISP_FAILOVER,
     }
 )
 TIER_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset({PlanFeatureKey.SUPPORT_LEVEL})
