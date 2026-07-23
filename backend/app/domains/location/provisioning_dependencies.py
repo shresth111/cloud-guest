@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from fastapi import Depends
 
+from app.core.config import Settings, get_settings
 from app.domains.auth.repository import AuthRepositoryProtocol
 from app.domains.billing.dependencies import get_plan_service, get_subscription_service
 from app.domains.billing.service import PlanService, SubscriptionService
@@ -77,6 +78,7 @@ def get_location_provisioning_service(
     plan_service: PlanService = Depends(get_plan_service),
     subscription_service: SubscriptionService = Depends(get_subscription_service),
     captive_portal_service: CaptivePortalService = Depends(get_captive_portal_service),
+    settings: Settings = Depends(get_settings),
 ) -> LocationProvisioningService:
     return LocationProvisioningService(
         location_service,
@@ -92,6 +94,7 @@ def get_location_provisioning_service(
         captive_portal_service,
         LoggingEmailProvider(),
         LoggingSmsProvider(),
+        login_url_base=settings.frontend_base_url,
     )
 
 

@@ -627,6 +627,16 @@ class Settings(BaseSettings):
     # docs/billing/FLOW.md for the full write-up.
     # ========================================================================
 
+    frontend_base_url: str = Field(
+        default="https://app.cloudguest.example",
+        description=(
+            "The deployed frontend's public origin, used to build the "
+            "login_url a newly-provisioned location owner's welcome email "
+            "points at (see app.domains.location.provisioning_service). "
+            "Override via CLOUDGUEST_FRONTEND_BASE_URL in any real "
+            "deployment -- the default is a placeholder, not a real host."
+        ),
+    )
     platform_gst_state: str = Field(
         default="Maharashtra",
         description=(
