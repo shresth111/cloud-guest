@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1.health.routes import router as health_router
 from app.domains.analytics.router import router as analytics_router
 from app.domains.api_keys.router import router as api_keys_router
+from app.domains.assistant.router import router as assistant_router
 from app.domains.audit.router import router as audit_router
 from app.domains.dashboard.router import router as dashboard_router
 from app.domains.workspace.router import router as workspace_router
@@ -118,3 +119,4 @@ api_v1_router.include_router(customer_provisioning_router)
 api_v1_router.include_router(system_router)
 api_v1_router.include_router(branding_router)
 api_v1_router.include_router(support_tickets_router)
+api_v1_router.include_router(assistant_router)

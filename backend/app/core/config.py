@@ -600,6 +600,27 @@ class Settings(BaseSettings):
             "right model for this part."
         ),
     )
+
+    # ========================================================================
+    # Assistant domain: AI customer-support chatbot
+    # ========================================================================
+
+    anthropic_api_key: str = Field(
+        default="",
+        description=(
+            "Anthropic API key (sk-ant-...) used by "
+            "app.domains.assistant.service.AnthropicAssistantProvider. "
+            "Empty = unconfigured -- app.domains.assistant.dependencies"
+            ".build_assistant_provider falls back to "
+            "LoggingAssistantProvider (keyword-matched canned replies, no "
+            "network call) rather than making a network call, mirroring "
+            "the identical 'empty key = honest logging default' posture "
+            "stripe_secret_key/razorpay_key_id already establish for "
+            "payments. Override via CLOUDGUEST_ANTHROPIC_API_KEY in any "
+            "real deployment -- the default is a placeholder, not a real "
+            "key."
+        ),
+    )
     payment_webhook_event_dedup_ttl_seconds: int = Field(
         default=604_800,
         ge=60,
