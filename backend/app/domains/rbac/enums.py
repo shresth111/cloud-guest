@@ -114,6 +114,7 @@ class PermissionModule(StrEnum):
     QOS = "qos"
     NETWORK_DIAGNOSTICS = "network_diagnostics"
     NETWORK_DEVICE = "network_device"
+    SUPPORT_TICKETS = "support_tickets"
 
 
 class OverrideEffect(StrEnum):
@@ -784,3 +785,22 @@ class AuditAction(StrEnum):
         "network_device_compliance_status_changed"
     )
     NETWORK_DEVICE_DELETED = "network_device_deleted"
+
+    # Support Tickets domain events -- written through this same table by
+    # ``app.domains.support_tickets.service.TicketService`` via the same
+    # narrow ``AuditLogWriter`` protocol shape every other domain's service
+    # uses. Support Tickets is a brand-new, additive domain (customers raise
+    # tickets from their own org dashboard; platform admins triage/resolve
+    # across every organization on the Master dashboard) -- the same "add
+    # its own additive block directly here" precedent every prior brand-new
+    # domain in this codebase's history has followed at its own first Part.
+    # Both create and any admin update (status/priority/assignment/
+    # resolution) are audited -- a support ticket's whole lifecycle is
+    # low-volume and always human-attributable, the same profile every
+    # other domain's own lifecycle events already meet; there is no
+    # separate "resolved"/"assigned" action distinct from a plain update
+    # since, unlike e.g. ``app.domains.campaigns``'s own status-vs-update
+    # split, a ticket's status/assignment/resolution are all just fields on
+    # the same ``PATCH`` a caller may set together in one call.
+    SUPPORT_TICKET_CREATED = "support_ticket_created"
+    SUPPORT_TICKET_UPDATED = "support_ticket_updated"

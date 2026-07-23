@@ -9,23 +9,25 @@ python -c "from app.domains.rbac.seed import generate_permission_matrix_markdown
 
 Cell values are the *default grant level* for that role x module pair: `-` (none), `R` (read-only), `O` (operate: applicable actions minus Manage/Delete), or `F` (full: every applicable action for that module). See `RBAC_ARCHITECTURE.md` for what each level expands to.
 
-| Role | Scope | Dashboard | Users | Roles | Permissions | Organizations | Locations | Routers | Router Provisioning | Templates | Captive Portal | Guest WiFi | Guest Users | Guest Sessions | Guest Access Control | Guest Teams | OTP | Voucher | Campaigns | Radius | WireGuard | Firewall | DHCP | DNS | Hotspot | Bandwidth | Analytics | Reports | Monitoring | Alerts | Notifications | Billing | Invoices | Subscriptions | White Label | API Keys | Audit Logs | System Settings | AI Assistant | Policy | Provisioning Engine |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Super Admin | global | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F |
-| Platform Admin | global | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | O | F | F | O | F | F | F |
-| Platform Support | global | R | O | R | R | R | R | R | R | R | R | R | O | O | O | O | R | R | R | R | R | R | R | R | R | R | R | R | O | O | O | R | R | R | R | R | R | R | R | R | R |
-| Billing Manager | global | R | - | - | - | R | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | R | - | - | - | F | F | F | - | - | - | - | - | - | - |
-| MSP Owner | organization | O | F | F | O | F | F | F | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | - | O | - | O | O | O |
-| MSP Admin | organization | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | R | O | O | O | - | O | - | O | O | O |
-| Organization Owner | organization | F | F | O | R | R | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | O | O | R | O | O | F | - | F | F | F |
-| Organization Admin | organization | O | O | R | R | R | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | R | R | R | R | - | O | - | O | O | O |
-| Network Administrator | location | R | - | - | - | - | R | F | F | O | O | - | - | - | - | - | - | - | - | F | F | F | F | F | F | F | R | R | F | O | - | - | - | - | - | - | - | - | - | O | F |
-| Location Manager | location | R | - | - | - | - | O | - | - | - | O | O | O | O | O | O | O | O | O | - | - | - | - | - | R | - | R | R | R | R | O | - | - | - | - | - | - | - | - | O | - |
-| Reception Staff | location | R | - | - | - | - | - | - | - | - | - | - | O | O | O | O | O | O | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - |
-| Helpdesk | location | R | - | - | - | - | - | - | - | - | - | - | R | O | R | R | - | R | - | - | - | - | - | - | - | - | - | - | R | R | R | - | - | - | - | - | - | - | - | R | - |
-| Read Only | organization | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | - | R | R | R |
-| Auditor | organization | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | F | - | R | R | R |
-| Guest Operator | location | R | - | - | - | - | - | - | - | - | - | O | O | O | O | O | O | O | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - |
+| Role | Scope | Dashboard | Users | Roles | Permissions | Organizations | Locations | Routers | Router Provisioning | Templates | Captive Portal | Guest WiFi | Guest Users | Guest Sessions | Guest Access Control | Guest Teams | OTP | Voucher | Campaigns | Radius | WireGuard | Firewall | DHCP Pool Management | DNS | Hotspot Settings | Bandwidth | Analytics | Reports | Monitoring | Alerts | Notifications | Billing | Invoices | Subscriptions | White Label | API Keys | Audit Logs | System Settings | AI Assistant | Policy | Provisioning Engine | ISP Management | ISP Routing | VLAN Management | MAC Authorization | Connected Devices | Device Synchronization | Network Configuration Management | QoS & VOIP Priority | Network Diagnostics | Network Device (NAC) | Support Tickets |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Super Admin | global | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F |
+| Platform Admin | global | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | O | F | F | O | F | F | F | F | F | F | F | F | F | F | F | F | F | F |
+| Platform Support | global | R | O | R | R | R | R | R | R | R | R | R | O | O | O | O | R | R | R | R | R | R | R | R | R | R | R | R | O | O | O | R | R | R | R | R | R | R | R | R | R | R | R | R | O | R | R | R | R | R | R | F |
+| Billing Manager | global | R | - | - | - | R | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | R | - | - | - | F | F | F | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | O |
+| MSP Owner | organization | O | F | F | O | F | F | F | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | - | O | - | O | O | O | O | O | O | O | O | O | O | O | O | O | F |
+| MSP Admin | organization | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | R | O | O | O | - | O | - | O | O | O | O | O | O | O | O | O | O | O | O | O | F |
+| Organization Owner | organization | F | F | O | R | R | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | F | O | O | R | O | O | F | - | F | F | F | F | F | F | F | F | F | F | F | F | F | F |
+| Organization Admin | organization | O | O | R | R | R | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | O | R | R | R | R | - | O | - | O | O | O | O | O | O | O | O | O | O | O | O | O | F |
+| Network Administrator | location | R | - | - | - | - | R | F | F | O | O | - | - | - | - | - | - | - | - | F | F | F | F | F | F | F | R | R | F | O | - | - | - | - | - | - | - | - | - | O | F | F | F | F | - | F | F | F | F | F | F | O |
+| Network Engineer | location | R | - | - | - | - | - | O | - | - | - | - | - | - | - | - | - | - | - | - | O | O | O | O | O | - | - | - | R | R | - | - | - | - | - | - | - | - | - | - | - | - | - | O | - | O | - | O | O | O | O | O |
+| Office Admin | location | R | - | - | - | - | O | - | - | - | - | - | - | - | - | - | - | - | R | - | - | - | - | - | - | - | R | R | - | - | O | - | - | - | - | - | - | - | - | O | - | - | - | - | - | - | - | - | - | - | - | O |
+| Location Manager | location | R | - | - | - | - | O | - | - | - | O | O | O | O | O | O | O | O | O | - | - | - | - | - | R | - | R | R | R | R | O | - | - | - | - | - | - | - | - | O | - | - | - | - | O | - | - | - | - | - | - | O |
+| Reception Staff | location | R | - | - | - | - | - | - | - | - | - | - | O | O | O | O | O | O | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | O | - | - | - | - | - | - | O |
+| Helpdesk | location | R | - | - | - | - | - | - | - | - | - | - | R | O | R | R | - | R | - | - | - | - | - | - | - | - | - | - | R | R | R | - | - | - | - | - | - | - | - | R | - | - | - | - | R | - | - | - | - | - | - | O |
+| Read Only | organization | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | - | R | R | R | R | R | R | R | R | R | R | R | R | R | R |
+| Auditor | organization | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | R | F | - | R | R | R | R | R | R | R | R | R | R | R | R | R | R |
+| Guest Operator | location | R | - | - | - | - | - | - | - | - | - | O | O | O | O | O | O | O | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | O | - | - | - | - | - | - | O |
 
 ## Module -> Applicable Actions
 
@@ -52,15 +54,15 @@ Cell values are the *default grant level* for that role x module pair: `-` (none
 | Radius | create, read, update, delete, execute, manage |
 | WireGuard | create, read, update, delete, execute, manage |
 | Firewall | create, read, update, delete, execute, manage |
-| DHCP | create, read, update, delete, manage |
+| DHCP Pool Management | create, read, update, delete, manage |
 | DNS | create, read, update, delete, manage |
-| Hotspot | create, read, update, delete, manage, execute |
+| Hotspot Settings | create, read, update, delete, manage, execute |
 | Bandwidth | create, read, update, delete, execute, manage |
 | Analytics | read, export, view |
 | Reports | read, export, view, manage |
 | Monitoring | read, view, manage |
 | Alerts | read, update, delete, view, manage |
-| Notifications | read, update, delete, manage |
+| Notifications | create, read, update, delete, manage |
 | Billing | read, update, export, manage |
 | Invoices | create, read, update, delete, export, approve, manage |
 | Subscriptions | create, read, update, delete, manage |
@@ -71,4 +73,15 @@ Cell values are the *default grant level* for that role x module pair: `-` (none
 | AI Assistant | read, execute, view, manage |
 | Policy | create, read, update, delete, execute, manage |
 | Provisioning Engine | create, read, execute, manage |
+| ISP Management | create, read, update, delete, execute, manage |
+| ISP Routing | create, read, update, delete, manage |
+| VLAN Management | create, read, update, delete, manage |
+| MAC Authorization | create, read, update, delete, import, export, manage |
+| Connected Devices | read, update, delete, execute, manage |
+| Device Synchronization | read, execute, manage |
+| Network Configuration Management | read, execute, manage |
+| QoS & VOIP Priority | create, read, update, delete, manage |
+| Network Diagnostics | read, execute, manage |
+| Network Device (NAC) | create, read, update, delete, manage |
+| Support Tickets | create, read, manage |
 

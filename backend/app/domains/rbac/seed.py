@@ -369,6 +369,16 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.DELETE,
         _A.MANAGE,
     ),
+    # Support Tickets: deliberately no UPDATE/DELETE -- there is no
+    # dedicated "edit ticket text" action (a ticket's own subject/
+    # description are immutable after creation) and tickets are closed, not
+    # deleted (see app.domains.support_tickets.router's own module
+    # docstring). This narrow, 3-action tuple is exactly what makes
+    # GrantLevel.OPERATE (every applicable action except MANAGE/DELETE)
+    # resolve to precisely (CREATE, READ) for self-service "raise a ticket"
+    # roles, and GrantLevel.FULL resolve to (CREATE, READ, MANAGE) for
+    # admin roles that triage/resolve tickets -- see expand_grant_level.
+    PermissionModule.SUPPORT_TICKETS: (_A.CREATE, _A.READ, _A.MANAGE),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -422,6 +432,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.QOS: "QoS & VOIP Priority",
     PermissionModule.NETWORK_DIAGNOSTICS: "Network Diagnostics",
     PermissionModule.NETWORK_DEVICE: "Network Device (NAC)",
+    PermissionModule.SUPPORT_TICKETS: "Support Tickets",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -512,6 +523,12 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # PermissionModule.MAC_AUTHORIZATION's own entry above already
     # documents.
     PermissionModule.NETWORK_DEVICE: ScopeType.LOCATION,
+    # A support ticket may be org-wide or scoped to one location (see
+    # app.domains.support_tickets.models's own module docstring) --
+    # ScopeType.LOCATION, the identical "no mandatory location" reasoning
+    # PermissionModule.GUEST_ACCESS's own entry already established (also
+    # an org/location-scoped, non-router, non-device domain).
+    PermissionModule.SUPPORT_TICKETS: ScopeType.LOCATION,
 }
 
 
@@ -629,6 +646,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.ALERTS: _L.OPERATE,
             _M.NOTIFICATIONS: _L.OPERATE,
             _M.MONITORING: _L.OPERATE,
+            # Platform Support literally triages/resolves support tickets
+            # for this job -- FULL, not just OPERATE like this role's other
+            # overrides above.
+            _M.SUPPORT_TICKETS: _L.FULL,
         },
     ),
     SystemRoleDefinition(
@@ -644,6 +665,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DASHBOARD: _L.READ,
             _M.REPORTS: _L.READ,
             _M.ORGANIZATIONS: _L.READ,
+            # Can raise a billing-category ticket -- OPERATE (create+read),
+            # not FULL: resolving/assigning tickets isn't this role's job.
+            _M.SUPPORT_TICKETS: _L.OPERATE,
         },
     ),
     SystemRoleDefinition(
@@ -664,6 +688,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.BILLING: _L.OPERATE,
             _M.SYSTEM_SETTINGS: _L.NONE,
             _M.API_KEYS: _L.NONE,
+            # Full control over its own portfolio's tickets (assign/
+            # resolve) -- mirrors this role's own FULL overrides above for
+            # ORGANIZATIONS/LOCATIONS/ROUTERS/USERS/ROLES.
+            _M.SUPPORT_TICKETS: _L.FULL,
         },
     ),
     SystemRoleDefinition(
@@ -680,6 +708,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.BILLING: _L.READ,
             _M.SYSTEM_SETTINGS: _L.NONE,
             _M.API_KEYS: _L.NONE,
+            # Day-to-day ticket triage/resolution for the MSP's own
+            # organizations -- FULL, the same "manage tickets for our own
+            # org" posture MSP Owner's own override above establishes.
+            _M.SUPPORT_TICKETS: _L.FULL,
         },
     ),
     SystemRoleDefinition(
@@ -718,6 +750,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.INVOICES: _L.READ,
             _M.API_KEYS: _L.NONE,
             _M.WHITE_LABEL: _L.READ,
+            # Day-to-day ticket triage/resolution for this organization --
+            # FULL, since this role's default_level (OPERATE) alone would
+            # only cover create+read, not assign/resolve.
+            _M.SUPPORT_TICKETS: _L.FULL,
         },
     ),
     SystemRoleDefinition(
@@ -755,6 +791,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.TEMPLATES: _L.OPERATE,
             _M.CAPTIVE_PORTAL: _L.OPERATE,
             _M.LOCATIONS: _L.READ,
+            # Can raise a ticket about this location's own networking
+            # issue -- OPERATE (create+read); resolving/assigning stays an
+            # admin/support job, not this role's.
+            _M.SUPPORT_TICKETS: _L.OPERATE,
         },
     ),
     SystemRoleDefinition(
@@ -784,6 +824,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.MONITORING: _L.READ,
             _M.ALERTS: _L.READ,
             _M.DASHBOARD: _L.READ,
+            # Same "raise a ticket about my location" posture as Network
+            # Administrator's own override above.
+            _M.SUPPORT_TICKETS: _L.OPERATE,
         },
     ),
     SystemRoleDefinition(
@@ -805,6 +848,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DASHBOARD: _L.READ,
             _M.ANALYTICS: _L.READ,
             _M.REPORTS: _L.READ,
+            # Front-office staff plausibly raise a ticket about a location
+            # issue -- OPERATE (create+read), the same posture Network
+            # Administrator/Network Engineer's own overrides establish.
+            _M.SUPPORT_TICKETS: _L.OPERATE,
         },
     ),
     SystemRoleDefinition(
@@ -833,6 +880,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.ALERTS: _L.READ,
             _M.NOTIFICATIONS: _L.OPERATE,
             _M.HOTSPOT: _L.READ,
+            # Raises tickets about guest-facing/location issues at this
+            # location -- OPERATE (create+read), the same posture every
+            # other location-level role above already gets.
+            _M.SUPPORT_TICKETS: _L.OPERATE,
         },
     ),
     SystemRoleDefinition(
@@ -850,6 +901,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.VOUCHER: _L.OPERATE,
             _M.OTP: _L.OPERATE,
             _M.DASHBOARD: _L.READ,
+            # Front-desk staff raise tickets about their own location --
+            # OPERATE (create+read), same posture as this role's siblings.
+            _M.SUPPORT_TICKETS: _L.OPERATE,
         },
     ),
     SystemRoleDefinition(
@@ -870,6 +924,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.MONITORING: _L.READ,
             _M.DASHBOARD: _L.READ,
             _M.VOUCHER: _L.READ,
+            # First-line guest support raises tickets (and escalates guest
+            # issues) at this location -- OPERATE (create+read), the same
+            # posture every other location-level role above already gets.
+            _M.SUPPORT_TICKETS: _L.OPERATE,
         },
     ),
     SystemRoleDefinition(
@@ -909,6 +967,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.OTP: _L.OPERATE,
             _M.VOUCHER: _L.OPERATE,
             _M.DASHBOARD: _L.READ,
+            # Narrow, guest-facing operational role -- can still raise a
+            # ticket about a guest-facing issue at this location, the same
+            # OPERATE posture every other location-level role above gets.
+            _M.SUPPORT_TICKETS: _L.OPERATE,
         },
     ),
 )
