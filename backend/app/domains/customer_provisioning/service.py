@@ -22,6 +22,7 @@ from app.domains.wireguard.service import WireGuardService
 from app.domains.guest.service import RadiusService
 from app.domains.rbac.service import RBACService
 from app.domains.rbac.enums import ScopeType
+from app.domains.rbac.exceptions import RoleNotFoundError
 from app.domains.organization.enums import OrganizationType
 
 from .schemas import (
@@ -63,17 +64,40 @@ class CustomerProvisioningService:
             org_type=OrganizationType.STANDARD,
         )
 
+        org_admin_role = await self.rbac_service.repository.get_role_by_slug(
+            "organization-admin", None
+        )
+        if org_admin_role is None:
+            raise RoleNotFoundError("organization-admin")
+
         await self.rbac_service.assign_role_to_user(
             actor_user_id=actor_user_id,
             target_user_id=actor_user_id,
-            role_id=uuid.UUID(int=2),  # Organization Admin
+            role_id=org_admin_role.id,
             scope_type=ScopeType.ORGANIZATION,
             requesting_organization_id=None,
             organization_id=org.id,
         )
 
+        location_id: uuid.UUID | None = None
+        if request.location_name:
+            location = await self.location_service.create_location(
+                actor_user_id=actor_user_id,
+                organization_id=org.id,
+                requesting_organization_id=None,
+                name=request.location_name,
+                slug=request.organization_slug,
+                address_line1=request.location_address or "Not specified",
+                city="Not specified",
+                state_province="Not specified",
+                postal_code="000000",
+                country="IN",
+            )
+            location_id = location.id
+
         return OnboardResponse(
             organization_id=str(org.id),
+            location_id=str(location_id) if location_id else None,
             admin_user_id=str(actor_user_id),
             message=f"Organization '{org.name}' onboarded",
         )
