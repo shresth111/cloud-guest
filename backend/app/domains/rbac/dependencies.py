@@ -141,13 +141,33 @@ async def CurrentOrganization(
     request: Request,
     user: AuthUser = Depends(CurrentUser),
     db: AsyncSession = Depends(get_db_session),
+    repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ) -> uuid.UUID | None:
     """The organization context for this request, if any (``X-Organization-Id``).
 
-    When the header is present, validates the organization exists and that
-    the current user is an *active* member of it (see module docstring for
-    why this is no longer a trust-the-header parse). Returns ``None`` (no
-    DB lookup performed) when the header is absent."""
+    When the header is present, validates the organization exists and, for
+    everyone except a GLOBAL-scoped caller, that the current user is an
+    *active* member of it (see module docstring for why this is no longer a
+    trust-the-header parse). Returns ``None`` (no DB lookup performed) when
+    the header is absent.
+
+    ## GLOBAL-scope bypass
+
+    A platform-level admin (any active role with ``Role.scope_type ==
+    ScopeType.GLOBAL``, e.g. Super Admin/Platform Admin) is never an
+    ``OrganizationMember`` row of any individual organization -- their
+    authority comes from holding a global role, not from tenant membership,
+    the same distinction ``app.domains.rbac.seed``'s own module docstring
+    draws ("a GLOBAL-scoped role can always exercise a location-level
+    permission"). Before this bypass, every org-scoped read/write endpoint
+    that resolves ``X-Organization-Id`` (which is most of them) was
+    unreachable for such a caller on any organization they hadn't also been
+    separately, manually added to as a member -- a real gap surfaced by the
+    Master (super-admin) dashboard's cross-tenant pages 403ing on every
+    organization except the one an operator had happened to add a
+    membership row for by hand. The membership check below still applies in
+    full to every non-GLOBAL caller -- this narrows, not removes, the
+    original guard."""
     organization_id = _parse_uuid_header(request, _ORG_HEADER)
     if organization_id is None:
         return None
@@ -157,17 +177,25 @@ async def CurrentOrganization(
     if organization is None:
         raise OrganizationNotFoundError(organization_id)
 
-    member_repo = GenericRepository(OrganizationMember, db)
-    active_memberships = await member_repo.get_all(
-        filters={
-            "organization_id": organization_id,
-            "user_id": uuid.UUID(user.id),
-            "status": MembershipStatus.ACTIVE.value,
-        },
-        limit=1,
+    resolver = RoleResolver(repository)
+    active_assignments = await resolver.get_active_assignments(uuid.UUID(user.id))
+    holds_global_role = any(
+        assignment.role.scope_type == ScopeType.GLOBAL.value
+        for assignment in active_assignments
     )
-    if not active_memberships:
-        raise OrganizationMembershipRequiredError(organization_id)
+
+    if not holds_global_role:
+        member_repo = GenericRepository(OrganizationMember, db)
+        active_memberships = await member_repo.get_all(
+            filters={
+                "organization_id": organization_id,
+                "user_id": uuid.UUID(user.id),
+                "status": MembershipStatus.ACTIVE.value,
+            },
+            limit=1,
+        )
+        if not active_memberships:
+            raise OrganizationMembershipRequiredError(organization_id)
 
     # See app.common.masking's own module docstring: best-effort
     # organization context for the PII-unmasking audit row, if this
