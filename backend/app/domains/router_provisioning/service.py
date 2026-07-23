@@ -487,11 +487,25 @@ class RouterProvisioningService:
     async def resolve_variables(self, router: Router) -> dict[str, str]:
         """Resolves every variable visible to ``router``, merging
         **router-level > location-level > organization-level > global
-        defaults** (most-specific wins). Implemented as four ordered
+        defaults** (most-specific wins). Implemented as five ordered
         passes, lowest-precedence first, each overwriting any same-``key``
         entry from the pass before it -- so the last (router-level) pass
-        always wins for any key present at more than one tier."""
-        resolved: dict[str, str] = {}
+        always wins for any key present at more than one tier.
+
+        The very first pass seeds a handful of intrinsic ``router_*``
+        keys (name/serial/model/mac) straight from the ``Router`` row
+        itself -- these are always known at render time and would
+        otherwise require an operator to manually create a
+        ``ConfigVariable`` duplicating data the platform already has,
+        for every single router. A DB-level ``ConfigVariable`` with the
+        same key (at any scope) still overrides these, same as any other
+        tier -- this is a default, not a reserved name."""
+        resolved: dict[str, str] = {
+            "router_name": router.name,
+            "router_serial_number": router.serial_number,
+            "router_mac_address": router.mac_address,
+            "router_model": router.model or "",
+        }
         for row in await self.repository.list_global_variables():
             resolved[row.key] = self._plain_value(row)
         for row in await self.repository.list_organization_variables(
