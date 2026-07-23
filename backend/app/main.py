@@ -66,7 +66,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_origins=[str(origin) for origin in app_settings.allowed_origins],
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-Organization-Id"],
     )
     # Prometheus HTTP-level metrics (app.core.metrics) -- must wrap every
     # request, so it is added like every other cross-cutting middleware
