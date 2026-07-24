@@ -26,8 +26,11 @@ from .constants import TicketPriority, TicketStatus
 __all__ = [
     "TicketCreateRequest",
     "TicketUpdateRequest",
+    "TicketReplyCreateRequest",
     "TicketResponse",
     "TicketListResponse",
+    "TicketReplyResponse",
+    "TicketReplyListResponse",
 ]
 
 _ALLOWED_PRIORITIES = {p.value for p in TicketPriority}
@@ -89,6 +92,16 @@ class TicketUpdateRequest(BaseModel):
         return value
 
 
+class TicketReplyCreateRequest(BaseModel):
+    """Either party (the ticket-owning organization's own member, or a
+    platform support agent from the Master console) posts a reply -- see
+    ``service.TicketService.add_reply`` for how ``is_staff_reply`` is
+    derived from the caller's organization context, not from this
+    request body."""
+
+    message: str = Field(..., min_length=1, max_length=10_000)
+
+
 # ============================================================================
 # Response schemas
 # ============================================================================
@@ -124,3 +137,20 @@ class TicketListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class TicketReplyResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    ticket_id: uuid.UUID
+    author_user_id: uuid.UUID
+    author_name: str
+    author_email: str
+    is_staff_reply: bool
+    message: str
+    created_at: datetime
+
+
+class TicketReplyListResponse(BaseModel):
+    items: list[TicketReplyResponse]

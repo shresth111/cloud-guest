@@ -16,17 +16,20 @@ for its own identical need), resolved concretely by
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+from redis.asyncio import Redis
+
 from app.database.utils.pagination import PaginationMeta
 from app.domains.location.exceptions import LocationNotFoundError
 from app.domains.rbac.enums import AuditAction
 
-from .constants import RESOLVED_STATUSES
+from .constants import RESOLVED_STATUSES, SUPPORT_TICKETS_LIVE_CHANNEL, TicketRealtimeMessageType
 from .exceptions import (
     CrossOrganizationTicketAccessError,
     InvalidTicketLocationError,
@@ -34,9 +37,71 @@ from .exceptions import (
     TicketNotFoundError,
 )
 from .models import SupportTicket
-from .repository import TicketRecord, TicketRepositoryProtocol
+from .repository import TicketRecord, TicketReplyRecord, TicketRepositoryProtocol
 
 logger = logging.getLogger(__name__)
+
+
+async def _publish_live_message(
+    redis_client: Redis | None,
+    message_type: TicketRealtimeMessageType,
+    payload: dict[str, object],
+) -> None:
+    """Best-effort ``PUBLISH`` to :data:`~.constants.SUPPORT_TICKETS_LIVE_CHANNEL`
+    -- mirrors ``app.domains.monitoring.service._publish_live_message``
+    exactly (same shape, same "never raises" resilience posture): called
+    *after* the real database write already succeeded, never instead of or
+    before it. A Redis publish failure only means connected WebSocket
+    clients miss that one live update -- the next ``GET`` against the same
+    ticket/reply-list still reflects reality, so nothing is lost from the
+    actual source of truth, only from the live stream."""
+    if redis_client is None:
+        return
+    try:
+        message = {
+            "type": message_type.value,
+            "payload": payload,
+            "occurred_at": datetime.now(UTC).isoformat(),
+        }
+        await redis_client.publish(
+            SUPPORT_TICKETS_LIVE_CHANNEL, json.dumps(message, default=str)
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "support_tickets_live_publish_failed",
+            extra={"message_type": message_type.value, "error": str(exc)},
+        )
+
+
+def _reply_live_payload(record: TicketReplyRecord, *, organization_id: uuid.UUID) -> dict[str, object]:
+    reply = record.reply
+    return {
+        "id": str(reply.id),
+        "ticket_id": str(reply.ticket_id),
+        "organization_id": str(organization_id),
+        "author_user_id": str(reply.author_user_id),
+        "author_name": record.author_name,
+        "author_email": record.author_email,
+        "is_staff_reply": reply.is_staff_reply,
+        "message": reply.message,
+        "created_at": reply.created_at.isoformat(),
+    }
+
+
+def _ticket_live_payload(ticket: SupportTicket) -> dict[str, object]:
+    return {
+        "id": str(ticket.id),
+        "ticket_id": str(ticket.id),
+        "organization_id": str(ticket.organization_id),
+        "status": ticket.status,
+        "priority": ticket.priority,
+        "assigned_to_user_id": (
+            str(ticket.assigned_to_user_id) if ticket.assigned_to_user_id else None
+        ),
+        "resolution_notes": ticket.resolution_notes,
+        "resolved_at": ticket.resolved_at.isoformat() if ticket.resolved_at else None,
+        "updated_at": ticket.updated_at.isoformat(),
+    }
 
 
 # ============================================================================
@@ -88,10 +153,19 @@ class TicketService:
         *,
         location_lookup: LocationLookupProtocol,
         audit_writer: AuditLogWriter | None = None,
+        redis_client: Redis | None = None,
     ) -> None:
         self.repository = repository
         self.location_lookup = location_lookup
         self.audit_writer = audit_writer
+        # None is the default (not a required constructor arg) so every
+        # existing unit test that builds a TicketService directly keeps
+        # working unchanged -- mirrors
+        # app.domains.monitoring.service.AlertService's identical
+        # "redis_client: Redis | None = None" posture. See
+        # _publish_live_message's own docstring for the "never raises"
+        # behavior this enables skipping safely in tests.
+        self.redis_client = redis_client
 
     # -- create --------------------------------------------------------------
 
@@ -240,7 +314,86 @@ class TicketService:
         )
         updated = await self.repository.get_record_by_id(ticket_id)
         assert updated is not None
+        # Publish *after* the DB write above already succeeded -- see
+        # _publish_live_message's own docstring. Cheap to include alongside
+        # the reply-created broadcast: a status/assignment/resolution
+        # change is exactly the other half of "what changed on this ticket
+        # while I was looking at it" a connected client cares about.
+        await _publish_live_message(
+            self.redis_client,
+            TicketRealtimeMessageType.TICKET_UPDATED,
+            _ticket_live_payload(updated.ticket),
+        )
         return updated
+
+    # -- replies -------------------------------------------------------------
+
+    async def list_replies(
+        self,
+        ticket_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[TicketReplyRecord]:
+        # Reuses get_ticket purely for its tenant-scope enforcement
+        # (CrossOrganizationTicketAccessError/TicketNotFoundError) -- the
+        # exact same "prove the caller may see this ticket at all before
+        # touching anything scoped under it" gate every other per-ticket
+        # method on this service already applies.
+        await self.get_ticket(
+            ticket_id, requesting_organization_id=requesting_organization_id
+        )
+        return await self.repository.list_reply_records(ticket_id)
+
+    async def add_reply(
+        self,
+        *,
+        ticket_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        message: str,
+        author_user_id: uuid.UUID,
+    ) -> TicketReplyRecord:
+        """Either party replies: the ticket-owning organization's own
+        member (``requesting_organization_id`` present, ``X-Organization-Id``
+        -- the customer dashboard) or a platform support agent (absent --
+        the Master console, mirrors ``list_tickets``'s identical
+        "organization_id is None" signal for the cross-tenant view). Never
+        trusts the request body for which side is replying -- see
+        ``schemas.TicketReplyCreateRequest``'s own docstring."""
+        record = await self.get_ticket(
+            ticket_id, requesting_organization_id=requesting_organization_id
+        )
+        ticket = record.ticket
+
+        reply = await self.repository.create_reply(
+            ticket_id=ticket.id,
+            author_user_id=author_user_id,
+            message=message,
+            is_staff_reply=requesting_organization_id is None,
+            created_by=author_user_id,
+            updated_by=author_user_id,
+        )
+        logger.info(
+            "support_ticket_reply_created",
+            extra={"ticket_id": str(ticket.id), "reply_id": str(reply.id)},
+        )
+        await self._audit(
+            author_user_id,
+            AuditAction.SUPPORT_TICKET_REPLY_ADDED,
+            entity_id=ticket.id,
+            description=f"Reply added to support ticket: '{ticket.subject}'",
+            organization_id=ticket.organization_id,
+            location_id=ticket.location_id,
+        )
+        reply_records = await self.repository.list_reply_records(ticket.id)
+        reply_record = next(r for r in reply_records if r.reply.id == reply.id)
+        # Publish *after* the DB write above already succeeded -- see
+        # _publish_live_message's own docstring.
+        await _publish_live_message(
+            self.redis_client,
+            TicketRealtimeMessageType.REPLY_CREATED,
+            _reply_live_payload(reply_record, organization_id=ticket.organization_id),
+        )
+        return reply_record
 
     # -- internal helpers ----------------------------------------------------
 

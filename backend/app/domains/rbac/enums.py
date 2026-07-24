@@ -804,3 +804,10 @@ class AuditAction(StrEnum):
     # the same ``PATCH`` a caller may set together in one call.
     SUPPORT_TICKET_CREATED = "support_ticket_created"
     SUPPORT_TICKET_UPDATED = "support_ticket_updated"
+    # Added alongside the real-time reply-thread pass: a reply is its own
+    # distinct, human-authored event on the ticket (not a field the
+    # existing PATCH-driven SUPPORT_TICKET_UPDATED already covers), from
+    # either side (the ticket-owning organization's own member or a
+    # platform support agent) -- see
+    # app.domains.support_tickets.service.TicketService.add_reply.
+    SUPPORT_TICKET_REPLY_ADDED = "support_ticket_reply_added"

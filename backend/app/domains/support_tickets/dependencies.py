@@ -9,8 +9,10 @@ cross-reference check) rather than duplicating either -- mirrors
 from __future__ import annotations
 
 from fastapi import Depends
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.location.dependencies import get_location_service
 from app.domains.location.service import LocationService
@@ -31,9 +33,13 @@ def get_ticket_service(
     repository: TicketRepositoryProtocol = Depends(get_ticket_repository),
     location_service: LocationService = Depends(get_location_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    redis_client: Redis = Depends(get_redis_client),
 ) -> TicketService:
     return TicketService(
-        repository, location_lookup=location_service, audit_writer=audit_repository
+        repository,
+        location_lookup=location_service,
+        audit_writer=audit_repository,
+        redis_client=redis_client,
     )
 
 

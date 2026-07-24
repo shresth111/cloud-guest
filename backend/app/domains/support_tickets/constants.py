@@ -38,4 +38,32 @@ RESOLVED_STATUSES: tuple[TicketStatus, ...] = (
     TicketStatus.CLOSED,
 )
 
-__all__ = ["TicketPriority", "TicketStatus", "RESOLVED_STATUSES"]
+# ============================================================================
+# Real-time (reply thread WebSocket + Redis pub/sub relay)
+#
+# Mirrors app.domains.monitoring.constants's own "one shared channel, every
+# real-time write path PUBLISHes a uniformly-shaped {"type", "payload",
+# "occurred_at"} message, each WebSocket endpoint filters by message type"
+# design -- see app.domains.support_tickets.router's module docstring for
+# the write-up of how this domain adapts it for per-organization tenant
+# scoping (monitoring has no such scoping need).
+# ============================================================================
+
+SUPPORT_TICKETS_LIVE_CHANNEL = "support_tickets:live"
+
+
+class TicketRealtimeMessageType(StrEnum):
+    """The closed set of ``"type"`` values a message published to
+    :data:`SUPPORT_TICKETS_LIVE_CHANNEL` carries."""
+
+    REPLY_CREATED = "reply_created"
+    TICKET_UPDATED = "ticket_updated"
+
+
+__all__ = [
+    "TicketPriority",
+    "TicketStatus",
+    "RESOLVED_STATUSES",
+    "SUPPORT_TICKETS_LIVE_CHANNEL",
+    "TicketRealtimeMessageType",
+]

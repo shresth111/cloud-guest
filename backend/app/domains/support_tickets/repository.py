@@ -26,11 +26,22 @@ from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 from app.domains.auth.models import User
 
-from .models import SupportTicket
+from .models import SupportTicket, SupportTicketReply
 
 
 def _display_name(user: User) -> str:
     return f"{user.first_name} {user.last_name}".strip()
+
+
+@dataclass(frozen=True, slots=True)
+class TicketReplyRecord:
+    """A ``SupportTicketReply`` row plus the author's display name/email
+    joined in from ``users`` -- mirrors ``TicketRecord``'s identical
+    "resolve the join here, not a second round trip on the caller" shape."""
+
+    reply: SupportTicketReply
+    author_name: str
+    author_email: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +79,12 @@ class TicketRepositoryProtocol(Protocol):
         search: str | None = None,
     ) -> tuple[list[TicketRecord], PaginationMeta]: ...
 
+    async def create_reply(self, **fields: object) -> SupportTicketReply: ...
+
+    async def list_reply_records(
+        self, ticket_id: uuid.UUID
+    ) -> list[TicketReplyRecord]: ...
+
 
 class TicketRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -76,6 +93,7 @@ class TicketRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.tickets = GenericRepository(SupportTicket, session)
+        self.replies = GenericRepository(SupportTicketReply, session)
 
     async def create(self, **fields: object) -> SupportTicket:
         return await self.tickets.create(fields)
@@ -181,5 +199,37 @@ class TicketRepository:
         records = [self._to_record(t, c, a) for t, c, a in result.all()]
         return records, PaginationMeta.from_total(params, total_items)
 
+    # -- replies --------------------------------------------------------
 
-__all__ = ["TicketRepositoryProtocol", "TicketRepository", "TicketRecord"]
+    async def create_reply(self, **fields: object) -> SupportTicketReply:
+        return await self.replies.create(fields)
+
+    async def list_reply_records(
+        self, ticket_id: uuid.UUID
+    ) -> list[TicketReplyRecord]:
+        statement = (
+            select(SupportTicketReply, User)
+            .join(User, User.id == SupportTicketReply.author_user_id)
+            .where(
+                SupportTicketReply.ticket_id == ticket_id,
+                SupportTicketReply.is_deleted.is_(False),
+            )
+            .order_by(SupportTicketReply.created_at.asc())
+        )
+        result = await self.session.execute(statement)
+        return [
+            TicketReplyRecord(
+                reply=reply,
+                author_name=_display_name(author),
+                author_email=author.email,
+            )
+            for reply, author in result.all()
+        ]
+
+
+__all__ = [
+    "TicketRepositoryProtocol",
+    "TicketRepository",
+    "TicketRecord",
+    "TicketReplyRecord",
+]
