@@ -38,6 +38,8 @@ from app.domains.network_config.constants import (
 )
 from app.domains.network_config.exceptions import EmptyNetworkConfigError
 from app.domains.network_config.renderers import (
+    render_agent_heartbeat_scheduler,
+    render_bootstrap_script,
     render_dhcp_pool,
     render_dns_record,
     render_firewall_rule,
@@ -46,15 +48,20 @@ from app.domains.network_config.renderers import (
     render_port_forwarding_rule,
     render_qos_traffic_rule,
     render_vlan,
+    render_wireguard_peer,
 )
 from app.domains.network_config.router import router as network_config_router
 from app.domains.network_config.service import NetworkConfigService
 from app.domains.port_forwarding.constants import PortForwardingProtocol
 from app.domains.port_forwarding.models import PortForwardingRule
 from app.domains.qos.models import QosTrafficRule
+from app.domains.router.crypto import encrypt_secret
 from app.domains.router_provisioning.constants import ConfigVersionStatus
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
 from app.domains.vlan.models import Vlan
+from app.domains.wireguard.constants import PeerStatus
+from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
+from app.domains.wireguard.service import EXTERNALLY_MANAGED_KEY_SENTINEL
 
 
 def _now() -> datetime:
@@ -201,6 +208,36 @@ def _make_firewall_rule(**overrides: object) -> FirewallRule:
     }
     fields.update(overrides)
     return FirewallRule(**_base_fields(**fields))
+
+
+def _make_wireguard_server(**overrides: object) -> WireGuardServer:
+    fields = {
+        "name": "Primary Hub",
+        "endpoint_host": "hub.cloudguest.example",
+        "endpoint_port": 51820,
+        "public_key": "hub-public-key-base64==",
+        "private_key_encrypted": encrypt_secret("hub-private-key"),
+        "tunnel_network_cidr": "10.100.0.0/16",
+        "is_active": True,
+    }
+    fields.update(overrides)
+    return WireGuardServer(**_base_fields(**fields))
+
+
+def _make_wireguard_peer(**overrides: object) -> WireGuardPeer:
+    fields = {
+        "router_id": uuid.uuid4(),
+        "server_id": uuid.uuid4(),
+        "tunnel_ip_address": "10.100.0.5",
+        "public_key": "peer-public-key-base64==",
+        "private_key_encrypted": encrypt_secret("peer-private-key"),
+        "status": PeerStatus.ACTIVE.value,
+        "rotation_count": 0,
+        "last_handshake_at": None,
+        "revoked_at": None,
+    }
+    fields.update(overrides)
+    return WireGuardPeer(**_base_fields(**fields))
 
 
 # ============================================================================
@@ -401,6 +438,117 @@ class TestRenderFirewallRule:
     def test_own_comment_overrides_name_default(self) -> None:
         (line,) = render_firewall_rule(_make_firewall_rule(comment="custom note"))
         assert 'comment="custom note (priority=10)"' in line
+
+
+class TestRenderWireGuardPeerExternallyManagedKeyGuard:
+    """Module 009 Part 3 addition: ``render_wireguard_peer`` must skip the
+    ``private-key=`` line for a peer whose key material is device-managed
+    -- see that function's own docstring."""
+
+    def test_platform_generated_peer_renders_private_key_line(self) -> None:
+        server = _make_wireguard_server()
+        peer = _make_wireguard_peer(server_id=server.id)
+        lines = render_wireguard_peer(peer, server)
+        assert any(line.startswith("/interface wireguard add") for line in lines)
+        assert len(lines) == 3
+
+    def test_externally_managed_peer_omits_private_key_line(self) -> None:
+        server = _make_wireguard_server()
+        peer = _make_wireguard_peer(
+            server_id=server.id,
+            private_key_encrypted=encrypt_secret(EXTERNALLY_MANAGED_KEY_SENTINEL),
+        )
+        lines = render_wireguard_peer(peer, server)
+        assert not any(line.startswith("/interface wireguard add") for line in lines)
+        assert not any("private-key=" in line for line in lines)
+        # The address + hub peer entry still render -- no secret material
+        # in either.
+        assert len(lines) == 2
+        assert any(line.startswith("/ip address add") for line in lines)
+        assert any(line.startswith("/interface wireguard peers add") for line in lines)
+
+
+class TestRenderBootstrapScript:
+    def test_rejects_non_https_base_url(self) -> None:
+        with pytest.raises(ValueError, match="https://"):
+            render_bootstrap_script(
+                location_code="HQ-001",
+                provisioning_token="tok",
+                api_base_url="http://api.cloudguest.example",
+            )
+
+    def test_renders_identity_keypair_enrollment_and_config_pull(self) -> None:
+        lines = render_bootstrap_script(
+            location_code="HQ-001",
+            provisioning_token="one-time-token-abc",
+            api_base_url="https://api.cloudguest.example",
+        )
+        script = "\n".join(lines)
+
+        # Roughly 15 lines, not a full config dump -- see module docstring.
+        assert len(lines) <= 15
+
+        assert '/system identity set name="HQ-001"' in lines
+        assert any(
+            line.startswith("/interface wireguard add name=wg-cloudguard")
+            for line in lines
+        )
+        # The device's own public key is read locally, never a
+        # platform-generated one.
+        assert ":local pub [/interface wireguard get" in script
+        # The provisioning token is embedded, the private key never is.
+        assert "one-time-token-abc" in script
+        assert "private-key" not in script
+        # Enrollment POST hits the real check-in endpoint over HTTPS.
+        assert (
+            "https://api.cloudguest.example/api/v1/routers/provisioning/check-in"
+            in script
+        )
+        assert "http-method=post" in script
+        # Idempotent remove-then-add, comment-tagged.
+        assert '/ip address remove [find comment="CGBOOT"]' in lines
+        assert '/interface wireguard peers remove [find comment="CGBOOT"]' in lines
+        assert script.count('comment="CGBOOT"') >= 2
+        # Full config pull over HTTPS + import -- the real config-pull
+        # endpoint, not an invented one.
+        assert "https://api.cloudguest.example/api/v1/agent/config" in script
+        assert "/import file-name=cloudguest.rsc" in lines
+
+    def test_default_wireguard_port_used_unless_overridden(self) -> None:
+        lines = render_bootstrap_script(
+            location_code="HQ-001",
+            provisioning_token="tok",
+            api_base_url="https://api.cloudguest.example",
+        )
+        assert any("listen-port=51820" in line for line in lines)
+
+        lines = render_bootstrap_script(
+            location_code="HQ-001",
+            provisioning_token="tok",
+            api_base_url="https://api.cloudguest.example",
+            wireguard_listen_port=13231,
+        )
+        assert any("listen-port=13231" in line for line in lines)
+
+
+class TestRenderAgentHeartbeatScheduler:
+    def test_rejects_non_https_base_url(self) -> None:
+        with pytest.raises(ValueError, match="https://"):
+            render_agent_heartbeat_scheduler("cred123", "http://api.cloudguest.example")
+
+    def test_renders_idempotent_scheduler_calling_real_heartbeat_endpoint(
+        self,
+    ) -> None:
+        lines = render_agent_heartbeat_scheduler(
+            "cred123", "https://api.cloudguest.example", interval="5m"
+        )
+        script = "\n".join(lines)
+        assert '/system scheduler remove [find comment="CGBOOT-hb"]' in lines
+        assert any(line.startswith("/system scheduler add") for line in lines)
+        assert "interval=5m" in script
+        assert "https://api.cloudguest.example/api/v1/agent/heartbeat" in script
+        assert "X-Agent-Credential: cred123" in script
+        assert 'comment="CGBOOT-hb"' in script
 
 
 class TestRenderNetworkConfig:

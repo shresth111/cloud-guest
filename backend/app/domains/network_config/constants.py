@@ -13,6 +13,8 @@ HOTSPOT_SECTION_HEADER = "# --- Hotspot Profiles (CloudGuest-managed) ---"
 QOS_SECTION_HEADER = "# --- QoS Traffic Rules (CloudGuest-managed) ---"
 DNS_SECTION_HEADER = "# --- DNS Records (CloudGuest-managed) ---"
 FIREWALL_SECTION_HEADER = "# --- Firewall Rules (CloudGuest-managed) ---"
+WIREGUARD_SECTION_HEADER = "# --- WireGuard Peer (CloudGuest-managed) ---"
+RADIUS_SECTION_HEADER = "# --- RADIUS Client (CloudGuest-managed) ---"
 
 __all__ = [
     "DHCP_SECTION_HEADER",
@@ -22,4 +24,6 @@ __all__ = [
     "QOS_SECTION_HEADER",
     "DNS_SECTION_HEADER",
     "FIREWALL_SECTION_HEADER",
+    "WIREGUARD_SECTION_HEADER",
+    "RADIUS_SECTION_HEADER",
 ]

@@ -38,7 +38,7 @@ from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
 from app.domains.router.crypto import decrypt_secret
-from app.domains.router.enums import RouterStatus
+from app.domains.router.enums import RouterHealthStatus, RouterStatus
 from app.domains.router.exceptions import (
     CrossOrganizationRouterAccessError,
     RouterDecommissionedError,
@@ -2487,3 +2487,68 @@ class TestVendorCapabilitiesIntrospection:
         assert len(capabilities) == 1
         assert capabilities[0]["vendor"] == "mikrotik"
         assert "supported_job_types" in capabilities[0]
+
+
+class TestRecordFailedHealthCheck:
+    """``record_failed_health_check`` is the honest counterpart to
+    ``record_health_snapshot`` for a router-health-poll sweep reading that
+    could not reach the device at all (see
+    ``app.domains.provisioning_engine.service.run_router_health_poll_sweep``,
+    which calls this on an unhealthy ``DeviceHealthResult``). The single
+    thing worth directly asserting here: it must never call
+    ``RouterService.heartbeat`` -- that would fabricate a false ``ONLINE``/
+    ``"healthy"`` signal for a device that just failed to answer."""
+
+    async def test_persists_unhealthy_snapshot_without_touching_router_status(
+        self,
+    ) -> None:
+        (
+            service,
+            _repo,
+            router_service,
+            _router_repo,
+            location_lookup,
+            org_lookup,
+            *_,
+        ) = make_services()
+        organization = org_lookup.add()
+        router_device = await make_router(
+            router_service,
+            location_lookup,
+            organization,
+            status=RouterStatus.ONLINE,
+        )
+        before_status = router_device.status
+        before_health_status = router_device.health_status
+        before_last_health_check_at = router_device.last_health_check_at
+
+        snapshot = await service.record_failed_health_check(
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            detail="connection refused",
+        )
+
+        assert isinstance(snapshot, RouterHealthSnapshot)
+        assert snapshot.router_id == router_device.id
+        assert snapshot.health_status == RouterHealthStatus.UNHEALTHY.value
+        assert snapshot.cpu_usage_percent is None
+        assert snapshot.memory_usage_percent is None
+        assert snapshot.uptime_seconds is None
+        assert snapshot.connected_clients_count is None
+
+        # Router.status/health_status/last_health_check_at are completely
+        # untouched -- unlike record_health_snapshot, this method never
+        # calls RouterService.heartbeat.
+        refreshed = await router_service.get_router(
+            router_device.id, requesting_organization_id=None
+        )
+        assert refreshed.status == before_status
+        assert refreshed.health_status == before_health_status
+        assert refreshed.last_health_check_at == before_last_health_check_at
+
+    async def test_raises_for_unknown_router(self) -> None:
+        (service, *_rest) = make_services()
+        with pytest.raises(Exception):  # noqa: B017 -- RouterNotFoundError
+            await service.record_failed_health_check(
+                router_id=uuid.uuid4(), requesting_organization_id=None
+            )

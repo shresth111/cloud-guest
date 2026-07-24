@@ -93,13 +93,15 @@ from .constants import (
     PROVISION_ENGINE_QUEUE_REDIS_KEY,
     PROVISION_QUEUE_DRAIN_BATCH_SIZE,
     TASK_DRAIN_PROVISION_QUEUE,
+    TASK_RUN_ROUTER_HEALTH_POLL_SWEEP,
 )
 from .exceptions import ProvisioningEngineError
 from .repository import (
     ProvisioningEngineRepository,
     RedisProvisionEngineQueueDispatcher,
 )
-from .service import ProvisioningEngineService
+from .service import HealthPollSweepSummary, ProvisioningEngineService
+from .service import run_router_health_poll_sweep as _run_router_health_poll_sweep
 
 logger = get_logger(__name__)
 
@@ -228,4 +230,73 @@ def drain_provision_queue() -> dict[str, int]:
     return result
 
 
-__all__ = ["drain_provision_queue"]
+async def _run_router_health_poll_sweep_async() -> HealthPollSweepSummary:
+    """A fresh session per task run, never shared across separate task
+    invocations/worker ticks -- mirrors every other sweep task's identical
+    per-run session discipline. Only the three narrow pieces
+    ``run_router_health_poll_sweep`` actually needs are built (this
+    domain's own repository, a real ``RouterService`` for credential
+    decryption/heartbeat, and a real ``RouterProvisioningService`` for
+    ``RouterHealthSnapshot`` persistence) -- not the full
+    ``ProvisioningEngineService`` graph ``_build_provisioning_engine_service``
+    builds for job orchestration, which this sweep never touches."""
+    async with SessionLocal() as session:
+        try:
+            audit_repository = RBACRepository(session)
+            organization_service = OrganizationService(
+                OrganizationRepository(session), audit_writer=audit_repository
+            )
+            location_service = LocationService(
+                LocationRepository(session),
+                organization_service,
+                location_code_counter=LocationCodeCounterRepository(session),
+                audit_writer=audit_repository,
+            )
+            router_service = RouterService(
+                RouterRepository(session),
+                location_service,
+                organization_service,
+                audit_writer=audit_repository,
+            )
+            router_provisioning_service = RouterProvisioningService(
+                RouterProvisioningRepository(session),
+                router_service,
+                location_service,
+                queue_dispatcher=RedisProvisioningQueueDispatcher(redis_client),
+                audit_writer=audit_repository,
+            )
+            summary = await _run_router_health_poll_sweep(
+                ProvisioningEngineRepository(session),
+                router_service,
+                router_provisioning_service,
+            )
+            await session.commit()
+            return summary
+        except Exception:
+            await session.rollback()
+            raise
+
+
+@celery_app.task(name=TASK_RUN_ROUTER_HEALTH_POLL_SWEEP)
+def run_router_health_poll_sweep() -> dict[str, int]:
+    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
+    ``beat_schedule`` -- runs every
+    ``constants.ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS``). Bridges to the
+    real async implementation of the same name in ``service.py`` (imported
+    here as ``_run_router_health_poll_sweep`` purely to avoid shadowing this
+    task function's own name within this module)."""
+    summary = asyncio.run(_run_router_health_poll_sweep_async())
+    result = {
+        "checked": summary.checked,
+        "unreachable": summary.unreachable,
+        "skipped": summary.skipped,
+        "errors": summary.errors,
+    }
+    logger.info(
+        "provisioning_engine_task_run_router_health_poll_sweep_completed",
+        extra=result,
+    )
+    return result
+
+
+__all__ = ["drain_provision_queue", "run_router_health_poll_sweep"]

@@ -274,6 +274,30 @@ PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS = 15.0
 # seconds later -- never dropped.
 PROVISION_QUEUE_DRAIN_BATCH_SIZE = 50
 
+# ============================================================================
+# Router device health poll sweep -- pull-based, real device I/O (see
+# device_adapters.MikroTikProvisionAdapter.health_check), distinct from
+# app.domains.router_agent's push-based heartbeat (a device-initiated
+# liveness signal with its own arrival-triggered recording, not something a
+# sweep drives). See service.run_router_health_poll_sweep's own docstring.
+# ============================================================================
+
+TASK_RUN_ROUTER_HEALTH_POLL_SWEEP = (
+    "app.domains.provisioning_engine.tasks.run_router_health_poll_sweep"
+)
+
+# Every 5 minutes -- the same "operationally visible, dashboard-facing, not
+# safety-critical" tier app.domains.guest.constants
+# .SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS's/app.domains.connected_devices
+# .constants.CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS's own docstrings
+# establish -- a router's CPU/memory/uptime history is admin-dashboard
+# telemetry, not a live guest-facing failover trigger the way
+# app.domains.isp.constants.ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS's own
+# 60-second WAN-uplink cadence is (nothing in this codebase reacts to a
+# RouterHealthSnapshot reading in real time the way ISP failover does to a
+# ping result), so the tighter 60-second cadence is not warranted here.
+ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS = 300.0
+
 __all__ = [
     "ProvisionJobStatus",
     "PROVISION_JOB_STATUS_TRANSITIONS",
@@ -292,4 +316,6 @@ __all__ = [
     "TASK_DRAIN_PROVISION_QUEUE",
     "PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS",
     "PROVISION_QUEUE_DRAIN_BATCH_SIZE",
+    "TASK_RUN_ROUTER_HEALTH_POLL_SWEEP",
+    "ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS",
 ]

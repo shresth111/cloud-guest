@@ -244,6 +244,14 @@ class RouterProvisioningLookupProtocol(Protocol):
         management_ip_address: str | None = None,
     ) -> tuple[Router, object]: ...
 
+    async def record_failed_health_check(
+        self,
+        *,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        detail: str | None = None,
+    ) -> object: ...
+
 
 class PolicyLookupProtocol(Protocol):
     async def resolve_effective_policy(
@@ -300,6 +308,19 @@ class TimelineEntry:
 class ConfigurationPreview:
     rendered_content: str
     variables_used: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class HealthPollSweepSummary:
+    """Returned by ``run_router_health_poll_sweep`` below -- mirrors
+    ``app.domains.isp.service.HealthCheckSweepSummary``'s/
+    ``app.domains.connected_devices.service.DeviceSyncSweepSummary``'s
+    identical "plain counts, no per-router detail" shape."""
+
+    checked: int
+    unreachable: int
+    skipped: int
+    errors: int
 
 
 # ============================================================================
@@ -1207,6 +1228,116 @@ class ProvisioningEngineService:
         )
 
 
+async def run_router_health_poll_sweep(
+    repository: ProvisioningEngineRepositoryProtocol,
+    router_lookup: RouterLookupProtocol,
+    router_provisioning: RouterProvisioningLookupProtocol,
+    *,
+    device_adapter_resolver=get_device_adapter,
+) -> HealthPollSweepSummary:
+    """The platform-wide router device-health poll sweep
+    ``tasks.run_router_health_poll_sweep`` (Celery Beat) drives -- pulled
+    out to module scope for the identical "Celery task + test suite share
+    one real implementation, no live Postgres needed for the latter" reason
+    ``app.domains.isp.service.run_health_check_sweep``/
+    ``app.domains.connected_devices.service.run_device_sync_sweep`` were.
+
+    ## Pull, not push -- and why this is the right choice
+
+    ``app.domains.router_provisioning.models.RouterHealthSnapshot``/
+    ``RouterProvisioningService.record_health_snapshot`` have existed since
+    that domain's own first pass, but nothing has ever called them on a
+    schedule. Two real, already-existing mechanisms could plausibly drive
+    that call, and they are genuinely different architectures for the same
+    concept:
+
+    * **Pull** (this sweep): ``device_adapters.MikroTikProvisionAdapter
+      .health_check`` -- the server actively reaches out to each router's
+      real RouterOS API (``/system/resource/print``) on its own schedule.
+    * **Push**: ``app.domains.router_agent``'s heartbeat
+      (``POST /agent/heartbeat``) -- the *device* initiates contact, and
+      that arrival is already its own trigger for recording a liveness
+      signal (see ``RouterAgentService.heartbeat``); it needs no separate
+      sweep to drive it, and building one that tried to would just be a
+      sweep silently doing nothing between real device check-ins.
+
+    A server-side *sweep* only makes sense for the pull architecture --
+    hence this task calls ``health_check``, never touches the heartbeat
+    path.
+
+    ## Per-router failure isolation, and the two outcomes recorded
+    differently
+
+    Every router is polled independently; one router's own connection
+    failure/timeout/missing-credentials never aborts the sweep for the
+    rest (mirrors ``run_health_check_sweep``'s/``run_device_sync_sweep``'s
+    identical per-item isolation contract). A device that does not answer
+    at all is an expected, honest, non-fatal outcome per
+    ``device_adapters``'s own "real client code, never fabricates success"
+    module docstring -- ``health_check`` itself already returns
+    ``DeviceHealthResult(healthy=False, ...)`` rather than raising for a
+    connection failure, but this sweep additionally guards the whole
+    per-router iteration with a broad ``except Exception`` for anything
+    else that goes wrong (an unexpected adapter bug, a
+    ``ProvisionDeviceOperationError`` from a post-connection RouterOS
+    command failure, ...). A router with no ``management_ip_address``/
+    ``api_username``/decrypted secret on file yet is skipped outright
+    (``skipped``, not ``errors``) -- there is nothing to even attempt.
+
+    On a successful read (``healthy=True``), records a full
+    ``RouterHealthSnapshot`` via ``record_health_snapshot`` (which also
+    calls ``RouterService.heartbeat`` -- the device really did just answer,
+    so that liveness signal is honest). On an unreachable read
+    (``healthy=False``), records the failed reading via
+    ``record_failed_health_check`` instead -- see that method's own
+    docstring for why it deliberately never calls ``heartbeat``."""
+    routers = await repository.list_routers_for_health_poll()
+    checked = 0
+    unreachable = 0
+    skipped = 0
+    errors = 0
+    for router in routers:
+        try:
+            host = router.management_ip_address or router.public_ip_address
+            secret = router_lookup.get_decrypted_api_secret(router)
+            if not host or not router.api_username or not secret:
+                skipped += 1
+                continue
+            credentials = DeviceCredentials(
+                host=host, username=router.api_username, password=secret
+            )
+            adapter = device_adapter_resolver(router.vendor)
+            result: DeviceHealthResult = await adapter.health_check(credentials)
+            if result.healthy:
+                await router_provisioning.record_health_snapshot(
+                    router_id=router.id,
+                    requesting_organization_id=router.organization_id,
+                    cpu_usage_percent=result.cpu_load_percent,
+                    uptime_seconds=result.uptime_seconds,
+                )
+                checked += 1
+            else:
+                await router_provisioning.record_failed_health_check(
+                    router_id=router.id,
+                    requesting_organization_id=router.organization_id,
+                    detail=result.detail,
+                )
+                unreachable += 1
+                logger.warning(
+                    "router_health_poll_sweep_router_unreachable",
+                    extra={"router_id": str(router.id), "detail": result.detail},
+                )
+        except Exception as exc:  # noqa: BLE001 -- per-router isolation, see docstring
+            errors += 1
+            logger.warning(
+                "router_health_poll_sweep_router_failed",
+                extra={"router_id": str(router.id), "error": str(exc)},
+            )
+    return HealthPollSweepSummary(
+        checked=checked, unreachable=unreachable, skipped=skipped, errors=errors
+    )
+
+
 def _validate_job_transition(
     *, current: ProvisionJobStatus, target: ProvisionJobStatus
 ) -> None:
@@ -1241,4 +1372,6 @@ __all__ = [
     "AuditLogWriter",
     "TimelineEntry",
     "ConfigurationPreview",
+    "HealthPollSweepSummary",
+    "run_router_health_poll_sweep",
 ]

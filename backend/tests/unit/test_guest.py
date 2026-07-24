@@ -22,6 +22,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -747,6 +748,15 @@ class FakeGuestRepository:
             s
             for s in self.sessions.values()
             if s.guest_id == guest_id and s.status == GuestSessionStatus.ACTIVE.value
+        ]
+
+    async def list_active_sessions_for_router(
+        self, router_id: uuid.UUID
+    ) -> list[GuestSession]:
+        return [
+            s
+            for s in self.sessions.values()
+            if s.router_id == router_id and s.status == GuestSessionStatus.ACTIVE.value
         ]
 
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]:
@@ -3428,6 +3438,148 @@ class TestRadius:
             await fx.radius_service.accounting_start(
                 nas_client=nas_client, session_id=uuid.uuid4()
             )
+
+
+# ============================================================================
+# RADIUS Accounting-On/Accounting-Off (RFC 2866 §5.13): NAS reboot/shutdown
+# closes every ACTIVE GuestSession tied to that NAS's router.
+# ============================================================================
+
+
+class TestRadiusAccountingOnOff:
+    async def _register_nas(self, fx: Fixture, secret: str = "supersecret123") -> None:
+        await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=fx.router.id,
+            nas_identifier="nas-1",
+            shared_secret=secret,
+        )
+
+    async def _login(self, fx: Fixture, identifier: str) -> GuestSession:
+        login = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        return login.session
+
+    async def test_accounting_on_closes_every_active_session_for_that_router(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        await self._register_nas(fx)
+        session_a = await self._login(fx, "+15550001111")
+        session_b = await self._login(fx, "+15550002222")
+        nas_client = await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-1", shared_secret="supersecret123"
+        )
+
+        closed = await fx.radius_service.accounting_on(nas_client=nas_client)
+
+        assert {s.id for s in closed} == {session_a.id, session_b.id}
+        for session in closed:
+            assert session.status == GuestSessionStatus.DISCONNECTED.value
+            assert session.disconnect_reason == "radius_accounting_on"
+            assert session.ended_at is not None
+
+    async def test_accounting_off_closes_every_active_session_for_that_router(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        await self._register_nas(fx)
+        session_a = await self._login(fx, "+15550003333")
+        nas_client = await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-1", shared_secret="supersecret123"
+        )
+
+        closed = await fx.radius_service.accounting_off(nas_client=nas_client)
+
+        assert [s.id for s in closed] == [session_a.id]
+        assert closed[0].status == GuestSessionStatus.DISCONNECTED.value
+        assert closed[0].disconnect_reason == "radius_accounting_off"
+
+    async def test_accounting_on_never_touches_other_routers_sessions(self) -> None:
+        fx = make_fixture()
+        await self._register_nas(fx)
+        other_router = fx.router_service.add(organization_id=fx.organization_id)
+        other_session = await fx.guest_service.login_via_otp(
+            identifier="+15550004444",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=other_router.id,
+        )
+        nas_client = await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-1", shared_secret="supersecret123"
+        )
+
+        closed = await fx.radius_service.accounting_on(nas_client=nas_client)
+
+        assert closed == []
+        untouched = await fx.repository.get_session_by_id(other_session.session.id)
+        assert untouched.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_accounting_on_is_a_noop_when_nothing_active(self) -> None:
+        fx = make_fixture()
+        await self._register_nas(fx)
+        nas_client = await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-1", shared_secret="supersecret123"
+        )
+
+        closed = await fx.radius_service.accounting_on(nas_client=nas_client)
+
+        assert closed == []
+
+    async def test_accounting_on_never_sends_a_live_coa_disconnect(self) -> None:
+        """Unlike enforce_session_timeouts/run_fup_time_accrual, closing a
+        session on Accounting-On must never attempt a live RADIUS
+        CoA-Disconnect back to the NAS that just told us it is
+        restarting."""
+        fx = make_fixture()
+        await self._register_nas(fx)
+        await self._login(fx, "+15550005555")
+        nas_client = await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-1", shared_secret="supersecret123"
+        )
+
+        with patch(
+            "app.domains.guest.service.send_packet",
+            new_callable=AsyncMock,
+        ) as mock_send_packet:
+            await fx.radius_service.accounting_on(nas_client=nas_client)
+
+        mock_send_packet.assert_not_called()
+
+
+class TestRadiusAccountingRequestSchema:
+    """``RadiusAccountingRequest.session_id`` became optional (to allow
+    accounting-on/accounting-off, which carry none) -- this covers the
+    ``model_validator`` that keeps it effectively required for the three
+    genuinely session-scoped status types."""
+
+    def test_session_id_required_for_start(self) -> None:
+        from pydantic import ValidationError
+
+        from app.domains.guest.schemas import RadiusAccountingRequest
+
+        with pytest.raises(ValidationError):
+            RadiusAccountingRequest(status_type="start", session_id=None)
+
+    def test_session_id_optional_for_accounting_on(self) -> None:
+        from app.domains.guest.schemas import RadiusAccountingRequest
+
+        payload = RadiusAccountingRequest(status_type="accounting-on", session_id=None)
+        assert payload.session_id is None
+
+    def test_session_id_optional_for_accounting_off(self) -> None:
+        from app.domains.guest.schemas import RadiusAccountingRequest
+
+        payload = RadiusAccountingRequest(status_type="accounting-off", session_id=None)
+        assert payload.session_id is None
 
 
 # ============================================================================

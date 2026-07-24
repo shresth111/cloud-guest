@@ -67,7 +67,11 @@ from app.domains.provisioning_engine.repository import (
     RedisProvisionEngineQueueDispatcher,
 )
 from app.domains.provisioning_engine.router import router as provisioning_engine_router
-from app.domains.provisioning_engine.service import ProvisioningEngineService
+from app.domains.provisioning_engine.service import (
+    HealthPollSweepSummary,
+    ProvisioningEngineService,
+    run_router_health_poll_sweep,
+)
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 from app.domains.router_provisioning.exceptions import DuplicateConfigVariableError
@@ -167,6 +171,7 @@ class FakeProvisioningEngineRepository:
     steps: dict[uuid.UUID, ProvisionStep] = field(default_factory=dict)
     logs: dict[uuid.UUID, ProvisionLog] = field(default_factory=dict)
     templates: dict[uuid.UUID, ProvisionTemplate] = field(default_factory=dict)
+    routers_for_health_poll: list[Router] = field(default_factory=list)
 
     async def create_job(self, **fields: object) -> ProvisionJob:
         job = ProvisionJob(**_base_fields(**fields))
@@ -264,6 +269,9 @@ class FakeProvisioningEngineRepository:
         paged = values[params.offset : params.offset + params.page_size]
         return paged, PaginationMeta.from_total(params, len(values))
 
+    async def list_routers_for_health_poll(self) -> list[Router]:
+        return list(self.routers_for_health_poll)
+
 
 @dataclass
 class FakeQueueDispatcher:
@@ -341,6 +349,7 @@ class FakeRouterProvisioningLookup:
         default_factory=list
     )
     health_snapshots_recorded: list[dict[str, object]] = field(default_factory=list)
+    failed_health_checks_recorded: list[dict[str, object]] = field(default_factory=list)
 
     def add_template(self, template: ConfigTemplate) -> ConfigTemplate:
         self.templates[template.id] = template
@@ -419,6 +428,15 @@ class FakeRouterProvisioningLookup:
             id: uuid.UUID = field(default_factory=uuid.uuid4)
 
         return object(), _FakeSnapshot()
+
+    async def record_failed_health_check(self, *, router_id: uuid.UUID, **kwargs):
+        self.failed_health_checks_recorded.append({"router_id": router_id, **kwargs})
+
+        @dataclass
+        class _FakeSnapshot:
+            id: uuid.UUID = field(default_factory=uuid.uuid4)
+
+        return _FakeSnapshot()
 
 
 @dataclass
@@ -1224,6 +1242,132 @@ class TestRedisProvisionEngineQueueDispatcher:
         job_id = uuid.uuid4()
         await dispatcher.enqueue(job_id)
         assert redis.calls == [("cloudguest:provisioning_engine:queue", str(job_id))]
+
+
+# ============================================================================
+# Router device health poll sweep: per-router failure isolation
+# ============================================================================
+
+
+class _HealthPollAdapter:
+    """A small, host-keyed fake adapter -- different real MikroTik hosts
+    would return different results, so this fake keys its canned
+    ``DeviceHealthResult``/exception per ``credentials.host``, mirroring
+    ``test_isp.py``'s ``FakeIspHealthAdapter``'s identical "controllable per
+    call" shape."""
+
+    vendor = "mikrotik"
+
+    def __init__(
+        self,
+        *,
+        healthy_hosts: dict[str, DeviceHealthResult] | None = None,
+        unhealthy_hosts: dict[str, DeviceHealthResult] | None = None,
+        raising_hosts: dict[str, Exception] | None = None,
+    ) -> None:
+        self.healthy_hosts = healthy_hosts or {}
+        self.unhealthy_hosts = unhealthy_hosts or {}
+        self.raising_hosts = raising_hosts or {}
+
+    async def health_check(self, credentials: DeviceCredentials) -> DeviceHealthResult:
+        if credentials.host in self.raising_hosts:
+            raise self.raising_hosts[credentials.host]
+        if credentials.host in self.unhealthy_hosts:
+            return self.unhealthy_hosts[credentials.host]
+        return self.healthy_hosts[credentials.host]
+
+
+class TestRouterHealthPollSweep:
+    async def test_sweep_records_healthy_unreachable_skipped_and_isolates_errors(
+        self,
+    ) -> None:
+        repository = FakeProvisioningEngineRepository()
+        router_lookup = FakeRouterLookup()
+        router_provisioning = FakeRouterProvisioningLookup()
+
+        healthy_router = router_lookup.add(_make_router(), secret="secret-1")
+        healthy_router.management_ip_address = "10.0.0.1"
+        unreachable_router = router_lookup.add(_make_router(), secret="secret-2")
+        unreachable_router.management_ip_address = "10.0.0.2"
+        broken_router = router_lookup.add(_make_router(), secret="secret-3")
+        broken_router.management_ip_address = "10.0.0.3"
+        no_creds_router = router_lookup.add(_make_router(), secret=None)
+        no_creds_router.management_ip_address = "10.0.0.4"
+
+        repository.routers_for_health_poll = [
+            healthy_router,
+            unreachable_router,
+            broken_router,
+            no_creds_router,
+        ]
+
+        adapter = _HealthPollAdapter(
+            healthy_hosts={
+                "10.0.0.1": DeviceHealthResult(
+                    healthy=True,
+                    cpu_load_percent=12.5,
+                    free_memory_bytes=1000,
+                    uptime_seconds=3600,
+                )
+            },
+            unhealthy_hosts={
+                "10.0.0.2": DeviceHealthResult(
+                    healthy=False,
+                    cpu_load_percent=None,
+                    free_memory_bytes=None,
+                    uptime_seconds=None,
+                    detail="connection refused",
+                )
+            },
+            raising_hosts={"10.0.0.3": RuntimeError("unexpected adapter failure")},
+        )
+
+        summary = await run_router_health_poll_sweep(
+            repository,
+            router_lookup,
+            router_provisioning,
+            device_adapter_resolver=lambda vendor: adapter,
+        )
+
+        assert isinstance(summary, HealthPollSweepSummary)
+        assert summary.checked == 1
+        assert summary.unreachable == 1
+        assert summary.skipped == 1
+        assert summary.errors == 1
+
+        assert len(router_provisioning.health_snapshots_recorded) == 1
+        recorded = router_provisioning.health_snapshots_recorded[0]
+        assert recorded["router_id"] == healthy_router.id
+        assert recorded["cpu_usage_percent"] == 12.5
+        assert recorded["uptime_seconds"] == 3600
+
+        assert len(router_provisioning.failed_health_checks_recorded) == 1
+        failed = router_provisioning.failed_health_checks_recorded[0]
+        assert failed["router_id"] == unreachable_router.id
+        assert failed["detail"] == "connection refused"
+
+        # The broken/no-creds routers never reach either recording call.
+        recorded_ids = {
+            r["router_id"] for r in router_provisioning.health_snapshots_recorded
+        }
+        failed_ids = {
+            r["router_id"] for r in router_provisioning.failed_health_checks_recorded
+        }
+        assert broken_router.id not in recorded_ids | failed_ids
+        assert no_creds_router.id not in recorded_ids | failed_ids
+
+    async def test_sweep_returns_all_zero_summary_when_no_routers(self) -> None:
+        repository = FakeProvisioningEngineRepository()
+        router_lookup = FakeRouterLookup()
+        router_provisioning = FakeRouterProvisioningLookup()
+
+        summary = await run_router_health_poll_sweep(
+            repository, router_lookup, router_provisioning
+        )
+
+        assert summary == HealthPollSweepSummary(
+            checked=0, unreachable=0, skipped=0, errors=0
+        )
 
 
 class TestProvisioningEngineRepositoryConstruction:

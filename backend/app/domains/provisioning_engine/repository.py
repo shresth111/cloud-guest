@@ -18,11 +18,14 @@ import uuid
 from typing import Protocol
 
 from redis.asyncio import Redis
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
+from app.domains.router.enums import RouterStatus
+from app.domains.router.models import Router
 
 from .constants import PROVISION_ENGINE_QUEUE_REDIS_KEY
 from .models import ProvisionJob, ProvisionLog, ProvisionStep, ProvisionTemplate
@@ -119,6 +122,9 @@ class ProvisioningEngineRepositoryProtocol(Protocol):
         page_size: int,
         filters: dict[str, object] | None = None,
     ) -> tuple[list[ProvisionTemplate], PaginationMeta]: ...
+
+    # -- routers (cross-domain, read-only) -----------------------------------
+    async def list_routers_for_health_poll(self) -> list[Router]: ...
 
 
 class ProvisioningEngineRepository:
@@ -219,6 +225,32 @@ class ProvisioningEngineRepository:
         return await self.templates.paginate(
             page=page, page_size=page_size, filters=filters
         )
+
+    # -- routers (cross-domain, read-only) -----------------------------------
+
+    async def list_routers_for_health_poll(self) -> list[Router]:
+        """Every non-deleted, already-provisioned router (``ONLINE`` or
+        ``OFFLINE`` -- excludes ``PENDING_PROVISIONING``/``PROVISIONING``,
+        which never have working device credentials yet, and
+        ``SUSPENDED``/``DECOMMISSIONED``, which are administratively out of
+        service) -- platform-wide, for ``service.run_router_health_poll_sweep``.
+        Mirrors ``app.domains.connected_devices.repository
+        .ConnectedDeviceRepository.list_routers_for_sync``'s/
+        ``app.domains.monitoring.repository.MonitoringRepository
+        .list_routers``'s identical "a domain owning its own read-only
+        cross-domain router query, not delegating to ``app.domains.router``
+        itself" precedent -- there is no platform-wide "list every router"
+        method on ``RouterRepository`` itself to delegate to. ``OFFLINE`` is
+        deliberately included (not just ``ONLINE``): a router the platform
+        currently believes is offline is exactly the one this poll needs to
+        keep trying, so it can flip back to a real, honest ``ONLINE`` the
+        moment it actually answers again."""
+        statement = select(Router).where(
+            Router.is_deleted.is_(False),
+            Router.status.in_([RouterStatus.ONLINE.value, RouterStatus.OFFLINE.value]),
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
 
 __all__ = [

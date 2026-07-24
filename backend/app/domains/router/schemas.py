@@ -113,7 +113,28 @@ class ProvisioningCheckInResponse(BaseModel):
     "activate" call the device could instead present it to. Both fields are
     optional/default ``None`` so this remains a purely additive schema
     change. See ``app.domains.router_agent.service``'s module docstring for
-    the full reasoning."""
+    the full reasoning.
+
+    ``tunnel_ip_address``/``wireguard_server_public_key``/
+    ``wireguard_endpoint_host``/``wireguard_endpoint_port``/
+    ``wireguard_hub_tunnel_address`` are a second, identically-shaped
+    additive extension (Module 009 Part 3, zero-touch enrollment): present
+    only when the request carried ``wireguard_public_key`` -- see that
+    field's own docstring on ``ProvisioningCheckInRequest`` for why the
+    device, not the platform, generates this keypair. Everything a thin
+    bootstrap script needs to finish bringing up its own WireGuard
+    interface (the tunnel address the platform just allocated it, and the
+    hub's own public key/reachable endpoint/own tunnel address) is
+    returned right here, in the same one round-trip as the agent
+    credential above -- for the identical "this is the device's last
+    authenticated moment before the one-time token is burned" reason, not a
+    second, later call. ``wireguard_hub_tunnel_address`` specifically
+    exists so the device's own ``allowed-address=`` can be the hub's real
+    tunnel address (a ``/32``), not a fabricated or over-broad range -- see
+    ``app.domains.network_config.renderers``'s WireGuard section for why
+    that parameter is correctness-critical, not cosmetic, and
+    ``_hub_tunnel_address`` there for the identical derivation this
+    field's value mirrors."""
 
     router_id: str
     status: RouterStatus
@@ -125,6 +146,30 @@ class ProvisioningCheckInResponse(BaseModel):
         ),
     )
     agent_credential_expires_at: datetime | None = Field(default=None)
+    tunnel_ip_address: str | None = Field(
+        default=None,
+        description=(
+            "This router's newly-allocated WireGuard tunnel address -- "
+            "present only when the request carried wireguard_public_key."
+        ),
+    )
+    wireguard_server_public_key: str | None = Field(
+        default=None,
+        description="The hub's own public key, for the device's peer entry.",
+    )
+    wireguard_endpoint_host: str | None = Field(
+        default=None,
+        description="The hub's reachable endpoint host, e.g. its public IP.",
+    )
+    wireguard_endpoint_port: int | None = Field(default=None)
+    wireguard_hub_tunnel_address: str | None = Field(
+        default=None,
+        description=(
+            "The hub's own tunnel-network address -- the correct, "
+            "narrowest legal allowed-address=</32> for this peer's hub "
+            "entry (see this class's own docstring)."
+        ),
+    )
 
 
 # ============================================================================
@@ -201,9 +246,27 @@ class RouterUpdateRequest(BaseModel):
 
 class ProvisioningCheckInRequest(BaseModel):
     """Presented by the physical device itself, not an authenticated
-    platform user -- see ``docs/router/ROUTER_ARCHITECTURE.md`` §5."""
+    platform user -- see ``docs/router/ROUTER_ARCHITECTURE.md`` §5.
+
+    ``wireguard_public_key`` is an additive, optional extension (Module 009
+    Part 3, zero-touch enrollment): the device's own WireGuard *public* key,
+    generated on-device (RouterOS's ``/interface wireguard add`` does this
+    automatically) by the thin bootstrap script this check-in call is
+    typically presented from. The private half deliberately never appears
+    anywhere in this request, or transits this API at all -- unlike this
+    platform's existing cloud-managed model (``app.domains.wireguard``,
+    where the platform generates *both* keys of a peer's pair because a
+    NAT'd router cannot always be reached to self-enroll), the bootstrap
+    script itself is a pasted-once, site-technician-handled artifact
+    (WinBox/SSH), and a real private key embedded in it would turn that
+    routinely-shared blob (commonly forwarded over WhatsApp/email between
+    site techs, in practice) into a bearer credential for the tunnel
+    itself. ``None`` (the default) preserves today's behavior exactly: no
+    ``WireGuardPeer`` is created at check-in, the same as before this field
+    existed."""
 
     token: str = Field(..., min_length=1)
+    wireguard_public_key: str | None = Field(default=None)
 
 
 class HeartbeatRequest(BaseModel):

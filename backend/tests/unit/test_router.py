@@ -300,6 +300,22 @@ class FakeRouterRepository:
         token.used_at = used_at
         return token
 
+    async def list_expired_unused_provisioning_tokens(
+        self, *, now: object
+    ) -> list[RouterProvisioningToken]:
+        return [
+            t
+            for t in self.tokens.values()
+            if not t.is_deleted and t.used_at is None and t.expires_at < now
+        ]
+
+    async def soft_delete_provisioning_token(
+        self, token: RouterProvisioningToken
+    ) -> RouterProvisioningToken:
+        token.is_deleted = True
+        token.deleted_at = _now()
+        return token
+
 
 def make_service(
     repo: FakeRouterRepository | None = None,
@@ -337,6 +353,11 @@ def _create_kwargs(**overrides: object) -> dict[str, object]:
     }
     base.update(overrides)
     return base
+
+
+def _unique_mac() -> str:
+    hex_digits = uuid.uuid4().hex[:12]
+    return ":".join(hex_digits[i : i + 2] for i in range(0, 12, 2)).upper()
 
 
 async def make_router(
@@ -869,6 +890,101 @@ class TestRouterProvisioning:
                 router_id=router_device.id,
                 requesting_organization_id=None,
             )
+
+
+# ============================================================================
+# Enrollment token expiry cleanup sweep
+# ============================================================================
+
+
+class TestProvisioningTokenCleanupSweep:
+    async def test_soft_deletes_only_expired_unused_tokens(self) -> None:
+        service, repo, location_lookup, org_lookup, _audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+
+        async def _new_token() -> RouterProvisioningToken:
+            router_device = await service.create_router(
+                actor_user_id=uuid.uuid4(),
+                location_id=location.id,
+                requesting_organization_id=None,
+                **_create_kwargs(
+                    serial_number=f"SN-{uuid.uuid4()}",
+                    mac_address=_unique_mac(),
+                ),
+            )
+            token, _plaintext = await service.generate_provisioning_token(
+                actor_user_id=uuid.uuid4(),
+                router_id=router_device.id,
+                requesting_organization_id=None,
+            )
+            return token
+
+        expired_unused = await _new_token()
+        expired_unused.expires_at = _now() - timedelta(hours=1)
+
+        expired_but_used = await _new_token()
+        expired_but_used.expires_at = _now() - timedelta(hours=1)
+        expired_but_used.used_at = _now()
+
+        still_valid = await _new_token()
+
+        cleaned = await service.sweep_expired_provisioning_tokens()
+
+        assert cleaned == 1
+        assert repo.tokens[expired_unused.id].is_deleted is True
+        assert repo.tokens[expired_but_used.id].is_deleted is False
+        assert repo.tokens[still_valid.id].is_deleted is False
+
+    async def test_returns_zero_when_nothing_expired(self) -> None:
+        service, _repo, _location_lookup, _org_lookup, _audit = make_service()
+
+        cleaned = await service.sweep_expired_provisioning_tokens()
+
+        assert cleaned == 0
+
+    async def test_one_token_failing_to_soft_delete_never_aborts_the_sweep(
+        self,
+    ) -> None:
+        service, repo, location_lookup, org_lookup, _audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+
+        async def _new_expired_token() -> RouterProvisioningToken:
+            router_device = await service.create_router(
+                actor_user_id=uuid.uuid4(),
+                location_id=location.id,
+                requesting_organization_id=None,
+                **_create_kwargs(
+                    serial_number=f"SN-{uuid.uuid4()}",
+                    mac_address=_unique_mac(),
+                ),
+            )
+            token, _plaintext = await service.generate_provisioning_token(
+                actor_user_id=uuid.uuid4(),
+                router_id=router_device.id,
+                requesting_organization_id=None,
+            )
+            token.expires_at = _now() - timedelta(hours=1)
+            return token
+
+        bad_token = await _new_expired_token()
+        good_token = await _new_expired_token()
+
+        original_soft_delete = repo.soft_delete_provisioning_token
+
+        async def flaky_soft_delete(token: RouterProvisioningToken):
+            if token.id == bad_token.id:
+                raise RuntimeError("transient db error")
+            return await original_soft_delete(token)
+
+        repo.soft_delete_provisioning_token = flaky_soft_delete  # type: ignore[method-assign]
+
+        cleaned = await service.sweep_expired_provisioning_tokens()
+
+        assert cleaned == 1
+        assert repo.tokens[good_token.id].is_deleted is True
+        assert repo.tokens[bad_token.id].is_deleted is False
 
 
 # ============================================================================

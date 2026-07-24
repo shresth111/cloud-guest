@@ -57,7 +57,7 @@ from typing import Protocol
 from app.domains.location.models import Location
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
-from app.domains.router.enums import RouterStatus
+from app.domains.router.enums import RouterHealthStatus, RouterStatus
 from app.domains.router.exceptions import RouterDecommissionedError, RouterNotFoundError
 from app.domains.router.models import Router
 
@@ -1504,6 +1504,47 @@ class RouterProvisioningService:
             "router_health_snapshot_recorded", extra={"router_id": str(router.id)}
         )
         return router, snapshot
+
+    async def record_failed_health_check(
+        self,
+        *,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        detail: str | None = None,
+    ) -> RouterHealthSnapshot:
+        """The honest counterpart to ``record_health_snapshot`` above, for a
+        poll that could not reach the device at all -- used by
+        ``app.domains.provisioning_engine.service
+        .run_router_health_poll_sweep`` when ``DeviceHealthResult.healthy``
+        is ``False``. Deliberately **never** calls ``RouterService
+        .heartbeat`` (unlike ``record_health_snapshot``): that method
+        unconditionally sets ``Router.status`` to ``ONLINE`` and
+        ``health_status`` to ``"healthy"`` -- calling it here would fabricate
+        a false liveness signal for a device that just failed to answer,
+        exactly what ``device_adapters.MikroTikProvisionAdapter``'s own
+        "honest, never fabricated success" stance forbids. ``Router.status``/
+        ``health_status`` are therefore left untouched by this method; only
+        the point-in-time history row is written, with
+        ``health_status=RouterHealthStatus.UNHEALTHY`` and every metric field
+        ``None`` (nothing was actually read from the device)."""
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        now = datetime.now(UTC)
+        snapshot = await self.repository.create_health_snapshot(
+            router_id=router.id,
+            recorded_at=now,
+            health_status=RouterHealthStatus.UNHEALTHY.value,
+            cpu_usage_percent=None,
+            memory_usage_percent=None,
+            uptime_seconds=None,
+            connected_clients_count=None,
+        )
+        logger.info(
+            "router_health_snapshot_recorded_failed_check",
+            extra={"router_id": str(router.id), "detail": detail},
+        )
+        return snapshot
 
     async def list_health_history(
         self,

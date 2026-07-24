@@ -126,6 +126,30 @@ logger = logging.getLogger(__name__)
 # giving up and surfacing a clear, retryable error to the caller).
 _MAX_ALLOCATION_ATTEMPTS = 3
 
+# Stored in ``WireGuardPeer.private_key_encrypted`` (``NOT NULL``, models.py)
+# for a peer created with an externally (device-)supplied public key --
+# see ``create_tunnel``'s ``external_public_key`` parameter, added for
+# Module 009 Part 3 zero-touch enrollment. This module never possesses a
+# real private key for such a peer (that is the entire point -- see
+# ``app.domains.router.schemas.ProvisioningCheckInRequest
+# .wireguard_public_key``'s own docstring), so the column cannot hold one;
+# an unmistakable, never-a-real-base64-X25519-key marker is stored instead
+# of e.g. an empty string, so any future reader (including
+# ``render_wireguard_peer``) can tell at a glance "this row's private key
+# is not recoverable, do not attempt to deliver or re-render it" rather
+# than silently mis-decrypting/mis-delivering a nonsense value as if it
+# were real key material.
+#
+# KNOWN GAP (documented, not fixed here -- would need a schema change
+# outside this addition's footprint): nothing on ``WireGuardPeer`` itself
+# records *that* a row is externally-managed versus platform-generated
+# other than this sentinel's exact value. ``render_wireguard_peer`` checks
+# for it (see that function's own docstring) so a full-config re-fetch
+# does not push this sentinel to a device as a literal ``private-key=``,
+# but a dedicated column (e.g. ``key_source``) would be the more durable
+# fix if this pattern grows a second use.
+EXTERNALLY_MANAGED_KEY_SENTINEL = "external:device-managed-key"
+
 
 def generate_wireguard_keypair() -> tuple[str, str]:
     """Generates a fresh, platform-side WireGuard (X25519/Curve25519)
@@ -306,6 +330,7 @@ class WireGuardService:
         actor_user_id: uuid.UUID | None,
         router_id: uuid.UUID,
         requesting_organization_id: uuid.UUID | None,
+        external_public_key: str | None = None,
     ) -> TunnelDeliveryInfo:
         """Generates a fresh keypair, allocates a tunnel IP, and creates (or
         re-creates, if the router's only existing peer is ``revoked``) its
@@ -321,7 +346,18 @@ class WireGuardService:
         ``include_deleted=True`` a decommissioned router would surface a
         misleading ``RouterNotFoundError`` instead of the more informative
         ``WireGuardRouterNotEligibleError`` that
-        ``validate_router_eligible_for_wireguard`` below is meant to raise."""
+        ``validate_router_eligible_for_wireguard`` below is meant to raise.
+
+        ``external_public_key`` is an additive, optional parameter (Module
+        009 Part 3, zero-touch enrollment): when supplied, allocation still
+        runs through the exact same IP-allocation path below, but the
+        peer's public key is *this* value, generated on-device, rather than
+        a freshly platform-generated one -- see
+        ``app.domains.router.schemas.ProvisioningCheckInRequest
+        .wireguard_public_key``'s own docstring for why the platform must
+        never generate (and therefore never hold a real private key for) a
+        peer enrolled this way, and ``EXTERNALLY_MANAGED_KEY_SENTINEL``'s
+        own comment for what is stored in ``private_key_encrypted`` instead."""
         router = await self.router_lookup.get_router(
             router_id,
             requesting_organization_id=requesting_organization_id,
@@ -335,7 +371,10 @@ class WireGuardService:
             raise WireGuardPeerAlreadyExistsError(router.id)
 
         peer, private_key = await self._allocate_and_persist(
-            server=server, existing=existing, router_id=router.id
+            server=server,
+            existing=existing,
+            router_id=router.id,
+            external_public_key=external_public_key,
         )
 
         await self._record_event_and_audit(
@@ -361,6 +400,7 @@ class WireGuardService:
         server: WireGuardServer,
         existing: WireGuardPeer | None,
         router_id: uuid.UUID,
+        external_public_key: str | None = None,
     ) -> tuple[WireGuardPeer, str]:
         exclude_id = existing.id if existing is not None else None
         for attempt in range(_MAX_ALLOCATION_ATTEMPTS):
@@ -368,7 +408,16 @@ class WireGuardService:
                 server.id, exclude_peer_id=exclude_id
             )
             tunnel_ip = allocate_tunnel_ip(server.tunnel_network_cidr, occupied)
-            private_key, public_key = generate_wireguard_keypair()
+            if external_public_key is not None:
+                # Device-generated keypair (see create_tunnel's own
+                # docstring) -- the platform only ever learns the public
+                # half, so private_key here is the documented sentinel, not
+                # a real secret, and must never be delivered to any caller
+                # as though it were one.
+                public_key = external_public_key
+                private_key = EXTERNALLY_MANAGED_KEY_SENTINEL
+            else:
+                private_key, public_key = generate_wireguard_keypair()
             try:
                 if existing is not None:
                     peer = await self.repository.update_peer(

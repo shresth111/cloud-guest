@@ -138,11 +138,17 @@ from app.domains.isp.constants import (
 from app.domains.notification.constants import TASK_RUN_NOTIFICATION_DISPATCH_SWEEP
 from app.domains.provisioning_engine.constants import (
     PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
+    ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS,
     TASK_DRAIN_PROVISION_QUEUE,
+    TASK_RUN_ROUTER_HEALTH_POLL_SWEEP,
 )
 from app.domains.queue_management.constants import (
     SCHEDULE_SWEEP_INTERVAL_SECONDS,
     TASK_SWEEP_SCHEDULE_TRANSITIONS,
+)
+from app.domains.router.constants import (
+    PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP,
 )
 
 _settings = get_settings()
@@ -178,6 +184,7 @@ celery_app = Celery(
         "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
+        "app.domains.router.tasks",
     ],
 )
 
@@ -305,6 +312,31 @@ celery_app.conf.update(
             "task": TASK_DRAIN_PROVISION_QUEUE,
             "schedule": PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
         },
+        # Provisioning Engine: the real, pull-based router device-health
+        # poll sweep -- every 5 minutes, the same "operationally visible,
+        # dashboard-facing, not safety-critical" tier
+        # guest-session-timeout-sweep/connected-device-sync-sweep below
+        # already establish, not ISP's tighter 60-second WAN-failover
+        # cadence (nothing in this codebase reacts to a
+        # ``RouterHealthSnapshot`` reading in real time the way ISP
+        # failover does to a ping result). Calls
+        # ``device_adapters.MikroTikProvisionAdapter.health_check`` (a real
+        # RouterOS API round-trip) against every already-provisioned
+        # router, recording into ``router_provisioning.models
+        # .RouterHealthSnapshot`` -- the sweep
+        # ``router_provisioning.service.record_health_snapshot`` has always
+        # needed but never had. Deliberately distinct from
+        # ``app.domains.router_agent``'s own device-pushed heartbeat (an
+        # arrival-triggered signal with its own recording, not something a
+        # sweep drives) -- see
+        # ``app.domains.provisioning_engine.service
+        # .run_router_health_poll_sweep``'s own docstring for the full
+        # pull-vs-push write-up and its per-router failure-isolation
+        # contract.
+        "provisioning-engine-router-health-poll-sweep": {
+            "task": TASK_RUN_ROUTER_HEALTH_POLL_SWEEP,
+            "schedule": ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS,
+        },
         # Queue Management Engine: re-evaluates every ACTIVE/SUSPENDED
         # QueueAssignment scoped to a QueueSchedule and flips its device
         # state the moment a time window opens or closes -- the real
@@ -366,6 +398,24 @@ celery_app.conf.update(
         "notification-dispatch-sweep": {
             "task": TASK_RUN_NOTIFICATION_DISPATCH_SWEEP,
             "schedule": _settings.notification_dispatch_sweep_interval_seconds,
+        },
+        # Router domain: enrollment (zero-touch provisioning) token expiry
+        # cleanup -- hourly, not every 5 minutes like the guest-session-
+        # timeout/FUP-accrual sweeps above. An expired
+        # RouterProvisioningToken is already fully inert the instant it
+        # expires (RouterService.check_in already honestly rejects it via
+        # ProvisioningTokenExpiredError, sweep or no sweep) -- soft-deleting
+        # it is pure housekeeping with no operationally-visible urgency, the
+        # same "day/week/month rollover boundary never needs finer-than-
+        # hourly latency" reasoning guest-quota-reset-sweep's own entry
+        # above documents for an analogous low-urgency proactive cleanup.
+        # See app.domains.router.service.RouterService
+        # .sweep_expired_provisioning_tokens's own docstring for the
+        # per-token failure-isolation contract, mirroring every other sweep
+        # in this schedule.
+        "router-provisioning-token-cleanup-sweep": {
+            "task": TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP,
+            "schedule": PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

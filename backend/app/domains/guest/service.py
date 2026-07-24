@@ -396,6 +396,50 @@ async def enforce_session_timeouts(
     return expired
 
 
+async def close_sessions_for_nas_restart(
+    repository: GuestRepositoryProtocol,
+    *,
+    router_id: uuid.UUID,
+    reason: str,
+    now: datetime | None = None,
+) -> list[GuestSession]:
+    """RADIUS Accounting-On/Accounting-Off (RFC 2866 §5.13): a NAS sends
+    Accounting-On once, right after it boots, and Accounting-Off once,
+    right before a controlled shutdown -- in both cases, the NAS's own
+    local accounting state (which sessions it believes are actually live)
+    was just reset/lost, so every ``GuestSession`` this platform still has
+    ``ACTIVE`` against that router is now stale on *our* side too. Pulled
+    to module scope for the identical "RadiusService method + test suite
+    share one real implementation" reason ``enforce_session_timeouts``/
+    ``run_fup_time_accrual`` were.
+
+    Deliberately **never** calls ``issue_live_disconnect`` (unlike
+    ``enforce_session_timeouts``'s/``run_fup_time_accrual``'s own calls
+    for an *unexpected* stale session): sending a RADIUS CoA-Disconnect
+    back to a NAS that just told us it is rebooting/shutting down is
+    pointless -- it has no live session left to disconnect, and may not
+    even be ready to process a CoA packet yet (Accounting-On) or may
+    already be gone (Accounting-Off). Only this platform's own
+    bookkeeping needs correcting here; closing the row is enough. Returns
+    every session just flipped to ``DISCONNECTED``."""
+    now = now or datetime.now(UTC)
+    sessions = await repository.list_active_sessions_for_router(router_id)
+    closed: list[GuestSession] = []
+    for session in sessions:
+        updated = await repository.update_session(
+            session,
+            {
+                "status": GuestSessionStatus.DISCONNECTED.value,
+                "ended_at": now,
+                "disconnect_reason": reason,
+            },
+        )
+        event = GuestSessionDisconnected(session_id=updated.id, reason=reason)
+        logger.info("guest_session_closed_nas_restart", extra=_event_extra(event))
+        closed.append(updated)
+    return closed
+
+
 async def get_or_reset_quota_usage(
     repository: GuestRepositoryProtocol,
     *,
@@ -3056,6 +3100,34 @@ class RadiusService:
         return await self.guest_service.disconnect_session(
             session_id=session.id,
             reason=disconnect_reason or "radius_accounting_stop",
+        )
+
+    async def accounting_on(self, *, nas_client: RadiusNasClient) -> list[GuestSession]:
+        """RADIUS Accounting-On (RFC 2866 §5.13): the NAS sends this once,
+        right after it boots -- a NAS-level event, carrying no
+        Acct-Session-Id at all (unlike Start/Interim-Update/Stop above).
+        Closes every ``GuestSession`` this platform still has ``ACTIVE``
+        against ``nas_client.router_id``; see
+        ``close_sessions_for_nas_restart``'s own docstring for why no live
+        CoA-Disconnect is sent."""
+        return await close_sessions_for_nas_restart(
+            self.repository,
+            router_id=nas_client.router_id,
+            reason="radius_accounting_on",
+        )
+
+    async def accounting_off(
+        self, *, nas_client: RadiusNasClient
+    ) -> list[GuestSession]:
+        """RADIUS Accounting-Off (RFC 2866 §5.13): the NAS sends this once,
+        right before a controlled shutdown -- the same "NAS-level event,
+        no Acct-Session-Id" shape as ``accounting_on`` above, and the
+        identical close-not-disconnect handling; see
+        ``close_sessions_for_nas_restart``'s own docstring."""
+        return await close_sessions_for_nas_restart(
+            self.repository,
+            router_id=nas_client.router_id,
+            reason="radius_accounting_off",
         )
 
     async def _get_session_for_nas(

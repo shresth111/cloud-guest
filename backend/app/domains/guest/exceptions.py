@@ -247,6 +247,23 @@ class InvalidAnalyticsDateRangeError(GuestError):
         )
 
 
+class RadiusAccountingUnsupportedStatusTypeError(GuestError):
+    """Raised by ``POST /radius/accounting`` for an
+    ``Acct-Status-Type`` this module does not (yet) handle -- e.g. RFC
+    2866's ``modem-start``/``modem-stop``/``cyclic-guest-oth``. Deliberately
+    explicit rather than silently falling through to the ``stop`` handling
+    path (the previous shape of this endpoint's status-type dispatch, before
+    ``accounting-on``/``accounting-off`` were added) -- an unrecognized
+    status type is not the same event as a real Accounting-Stop, and must
+    never be treated as one."""
+
+    def __init__(self, status_type: str) -> None:
+        super().__init__(
+            f"Unsupported RADIUS Acct-Status-Type '{status_type}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 class ConcurrentSessionLimitExceededError(GuestError):
     """The guest already holds
     ``constants.DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` (or more)

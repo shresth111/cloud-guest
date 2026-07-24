@@ -283,6 +283,16 @@ RADIUS_SHARED_SECRET_HEADER = "X-RADIUS-Shared-Secret"
 RADIUS_ACCT_STATUS_START = "start"
 RADIUS_ACCT_STATUS_INTERIM_UPDATE = "interim-update"
 RADIUS_ACCT_STATUS_STOP = "stop"
+# RFC 2866 §5.13: a NAS sends Accounting-On once, right after it boots, and
+# Accounting-Off once, right before a controlled shutdown -- both are
+# NAS-level events (no Acct-Session-Id at all; RadiusAccountingRequest
+# .session_id is therefore optional and ignored for these two status
+# types), signalling that every session this platform still has ``ACTIVE``
+# against that NAS is now stale (the NAS's own local accounting state was
+# just lost/reset). See ``service.close_sessions_for_nas_restart``'s own
+# docstring.
+RADIUS_ACCT_STATUS_ACCOUNTING_ON = "accounting-on"
+RADIUS_ACCT_STATUS_ACCOUNTING_OFF = "accounting-off"
 
 # ============================================================================
 # NAS lifecycle -- extends RadiusNasClient (originally a bare
@@ -400,6 +410,8 @@ __all__ = [
     "RADIUS_ACCT_STATUS_START",
     "RADIUS_ACCT_STATUS_INTERIM_UPDATE",
     "RADIUS_ACCT_STATUS_STOP",
+    "RADIUS_ACCT_STATUS_ACCOUNTING_ON",
+    "RADIUS_ACCT_STATUS_ACCOUNTING_OFF",
     "NasStatus",
     "NAS_STATUS_TRANSITIONS",
     "NAS_CODE_PREFIX",

@@ -52,7 +52,7 @@ from app.domains.router_agent.exceptions import (
     AgentCredentialMissingError,
 )
 from app.domains.router_agent.models import RouterAgentCredential
-from app.domains.router_agent.service import hash_credential
+from app.domains.router_agent.service import RouterAgentService, hash_credential
 from app.domains.wireguard.constants import HealthStatus, PeerStatus
 from app.domains.wireguard.exceptions import (
     InvalidPeerStatusTransitionError,
@@ -806,6 +806,165 @@ class TestCreateTunnel:
             requesting_organization_id=None,
         )
         assert first_info.peer.tunnel_ip_address != second_info.peer.tunnel_ip_address
+
+
+class TestCreateTunnelExternalPublicKey:
+    """Module 009 Part 3 (zero-touch enrollment): ``create_tunnel``'s
+    additive ``external_public_key`` parameter -- see that method's own
+    docstring."""
+
+    async def test_uses_device_supplied_public_key_not_a_generated_one(self) -> None:
+        fx = make_services()
+        await make_hub(fx)
+        organization = fx.org_lookup.add()
+        router_device = await make_router(fx, organization)
+        device_public_key = "ZGV2aWNlLWdlbmVyYXRlZC1wdWJsaWMta2V5LTMyYnl0ZXM="
+
+        info = await fx.wireguard_service.create_tunnel(
+            actor_user_id=None,
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            external_public_key=device_public_key,
+        )
+
+        assert info.peer.public_key == device_public_key
+        assert info.peer.tunnel_ip_address == "10.100.0.2"
+
+    async def test_private_key_encrypted_holds_sentinel_not_a_real_key(self) -> None:
+        from app.domains.wireguard.service import EXTERNALLY_MANAGED_KEY_SENTINEL
+
+        fx = make_services()
+        await make_hub(fx)
+        organization = fx.org_lookup.add()
+        router_device = await make_router(fx, organization)
+
+        info = await fx.wireguard_service.create_tunnel(
+            actor_user_id=None,
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            external_public_key="ZGV2aWNlLXB1YmxpYy1rZXk=",
+        )
+
+        # The platform never possesses this peer's real private key -- the
+        # "private key" this call returns is the documented sentinel, and
+        # it round-trips through encryption exactly like any other stored
+        # value (proving the NOT NULL column constraint is satisfied),
+        # never a fabricated/random secret.
+        assert info.peer_private_key == EXTERNALLY_MANAGED_KEY_SENTINEL
+        assert decrypt_secret(info.peer.private_key_encrypted) == (
+            EXTERNALLY_MANAGED_KEY_SENTINEL
+        )
+
+    async def test_omitting_external_public_key_still_generates_one(self) -> None:
+        """Unchanged, pre-existing behavior: no ``external_public_key``
+        means the platform still generates both keys itself, exactly as
+        before this addition."""
+        fx = make_services()
+        await make_hub(fx)
+        organization = fx.org_lookup.add()
+        router_device = await make_router(fx, organization)
+
+        info = await fx.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+        )
+
+        assert info.peer_private_key != "EXTERNALLY_MANAGED_KEY_SENTINEL"
+        assert decrypt_secret(info.peer.private_key_encrypted) == info.peer_private_key
+
+
+class TestProvisioningCheckInWireGuardComposition:
+    """Exercises the exact composition
+    ``app.domains.router.router.provisioning_check_in`` performs when the
+    device-presented request carries ``wireguard_public_key`` -- mirrors
+    ``test_router_agent.py``'s own
+    ``test_check_in_then_issue_credential_full_flow``'s "re-implement the
+    endpoint's own composition inline against real services" convention,
+    extended one step further (check-in -> issue agent credential ->
+    create tunnel with the device's public key)."""
+
+    async def test_check_in_with_public_key_allocates_tunnel(self) -> None:
+        fx = make_services()
+        await make_hub(fx)
+        organization = fx.org_lookup.add()
+        location = fx.location_lookup.add(organization_id=organization.id)
+        router_device = await fx.router_service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            name="Bootstrap AP",
+            serial_number=f"SN-{uuid.uuid4()}",
+            mac_address=_unique_mac(),
+            model="hAP ac2",
+        )
+        _token, plaintext_token = await fx.router_service.generate_provisioning_token(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+        )
+
+        # -- the same composition provisioning_check_in performs --
+        checked_in = await fx.router_service.check_in(plaintext_token=plaintext_token)
+        assert checked_in.status == RouterStatus.PROVISIONING.value
+
+        agent_service = RouterAgentService(
+            fx.agent_repo,
+            fx.router_service,
+            None,  # config_version_lookup: unused by issue_credential_for_router
+            None,  # job_queue_lookup: unused by issue_credential_for_router
+            None,  # job_lifecycle: unused by issue_credential_for_router
+        )
+        credential, agent_plaintext = await agent_service.issue_credential_for_router(
+            checked_in
+        )
+        assert agent_plaintext
+
+        device_public_key = "ZGV2aWNlLWdlbmVyYXRlZC1wdWJsaWMta2V5LTMyYnl0ZXM="
+        delivery = await fx.wireguard_service.create_tunnel(
+            actor_user_id=None,
+            router_id=checked_in.id,
+            requesting_organization_id=None,
+            external_public_key=device_public_key,
+        )
+
+        # Everything app.domains.router.router.provisioning_check_in's
+        # response would carry, all real, non-None values.
+        assert delivery.peer.public_key == device_public_key
+        assert delivery.peer.tunnel_ip_address == "10.100.0.2"
+        assert delivery.server.public_key
+        assert delivery.server.endpoint_host == "hub.cloudguest.example"
+        assert delivery.server.endpoint_port == 51820
+        assert credential.expires_at is not None
+
+    async def test_check_in_without_public_key_creates_no_peer(self) -> None:
+        """A device presenting only ``token`` (no ``wireguard_public_key``)
+        gets exactly today's pre-existing behavior -- no ``WireGuardPeer``
+        is created at check-in."""
+        fx = make_services()
+        await make_hub(fx)
+        organization = fx.org_lookup.add()
+        location = fx.location_lookup.add(organization_id=organization.id)
+        router_device = await fx.router_service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            name="No-WG AP",
+            serial_number=f"SN-{uuid.uuid4()}",
+            mac_address=_unique_mac(),
+            model="hAP ac2",
+        )
+        _token, plaintext_token = await fx.router_service.generate_provisioning_token(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+        )
+        checked_in = await fx.router_service.check_in(plaintext_token=plaintext_token)
+
+        # No create_tunnel call at all -- mirrors provisioning_check_in's
+        # own ``if payload.wireguard_public_key:`` gate.
+        peer = await fx.wireguard_repo.get_peer_by_router_id(checked_in.id)
+        assert peer is None
 
 
 class TestAllocationConflictRetry:

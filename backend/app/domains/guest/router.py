@@ -49,14 +49,25 @@ from app.domains.rbac.dependencies import (
     RequirePermission,
 )
 
-from .constants import GuestSessionStatus, NasStatus
+from .constants import (
+    RADIUS_ACCT_STATUS_ACCOUNTING_OFF,
+    RADIUS_ACCT_STATUS_ACCOUNTING_ON,
+    RADIUS_ACCT_STATUS_INTERIM_UPDATE,
+    RADIUS_ACCT_STATUS_START,
+    RADIUS_ACCT_STATUS_STOP,
+    GuestSessionStatus,
+    NasStatus,
+)
 from .dependencies import (
     CurrentNas,
     get_guest_analytics_service,
     get_guest_service,
     get_radius_service,
 )
-from .exceptions import RadiusNasNotFoundError
+from .exceptions import (
+    RadiusAccountingUnsupportedStatusTypeError,
+    RadiusNasNotFoundError,
+)
 from .models import Guest, GuestDevice, GuestSession, RadiusNasClient
 from .schemas import (
     GuestAnalyticsSummaryResponse,
@@ -1021,18 +1032,39 @@ async def radius_accounting(
     nas_client=Depends(CurrentNas),
     service: RadiusService = Depends(get_radius_service),
 ) -> RadiusAccountingResponse:
-    if payload.status_type == "start":
+    # Accounting-On/Accounting-Off (RFC 2866 §5.13) are NAS-level events --
+    # no single session to report on, handled entirely separately from the
+    # three session-scoped status types below. See
+    # RadiusService.accounting_on/accounting_off's own docstrings.
+    if payload.status_type == RADIUS_ACCT_STATUS_ACCOUNTING_ON:
+        closed = await service.accounting_on(nas_client=nas_client)
+        return RadiusAccountingResponse(
+            session_id=None,
+            status=payload.status_type,
+            closed_session_count=len(closed),
+        )
+    if payload.status_type == RADIUS_ACCT_STATUS_ACCOUNTING_OFF:
+        closed = await service.accounting_off(nas_client=nas_client)
+        return RadiusAccountingResponse(
+            session_id=None,
+            status=payload.status_type,
+            closed_session_count=len(closed),
+        )
+
+    # payload's own model_validator already guarantees session_id is set
+    # for every status_type reachable below.
+    if payload.status_type == RADIUS_ACCT_STATUS_START:
         session = await service.accounting_start(
             nas_client=nas_client, session_id=payload.session_id
         )
-    elif payload.status_type == "interim-update":
+    elif payload.status_type == RADIUS_ACCT_STATUS_INTERIM_UPDATE:
         session = await service.accounting_interim_update(
             nas_client=nas_client,
             session_id=payload.session_id,
             bytes_uploaded_delta=payload.bytes_uploaded_delta,
             bytes_downloaded_delta=payload.bytes_downloaded_delta,
         )
-    else:
+    elif payload.status_type == RADIUS_ACCT_STATUS_STOP:
         session = await service.accounting_stop(
             nas_client=nas_client,
             session_id=payload.session_id,
@@ -1040,6 +1072,12 @@ async def radius_accounting(
             bytes_downloaded_total=payload.bytes_downloaded_total,
             disconnect_reason=payload.disconnect_reason,
         )
+    else:
+        # Previously: silently treated as "stop". Any status_type this
+        # module doesn't recognize (RFC 2866 defines several more, e.g.
+        # modem-start/modem-stop) must never be handled as if it were a
+        # real Accounting-Stop.
+        raise RadiusAccountingUnsupportedStatusTypeError(payload.status_type)
     return RadiusAccountingResponse(session_id=str(session.id), status=session.status)
 
 

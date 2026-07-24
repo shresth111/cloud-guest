@@ -18,11 +18,17 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.common.masking import MaskedIdentifier, MaskedMac, MaskedName
 
-from .constants import GuestAuthMethod, GuestSessionStatus
+from .constants import (
+    RADIUS_ACCT_STATUS_INTERIM_UPDATE,
+    RADIUS_ACCT_STATUS_START,
+    RADIUS_ACCT_STATUS_STOP,
+    GuestAuthMethod,
+    GuestSessionStatus,
+)
 
 __all__ = [
     "GuestOtpLoginRequest",
@@ -377,16 +383,31 @@ class RadiusAuthorizeResponse(BaseModel):
 
 
 class RadiusAccountingRequest(BaseModel):
-    """Covers all three Acct-Status-Type values
-    (``constants.RADIUS_ACCT_STATUS_START``/``_INTERIM_UPDATE``/``_STOP``)
-    in one schema -- fields not relevant to a given ``status_type`` are
-    simply left ``None``/default."""
+    """Covers all five Acct-Status-Type values
+    (``constants.RADIUS_ACCT_STATUS_START``/``_INTERIM_UPDATE``/``_STOP``/
+    ``_ACCOUNTING_ON``/``_ACCOUNTING_OFF``) in one schema -- fields not
+    relevant to a given ``status_type`` are simply left ``None``/default.
 
-    status_type: str = Field(..., description="One of: start, interim-update, stop.")
-    session_id: uuid.UUID = Field(
+    ``session_id`` is optional (unlike the original three-status-type
+    shape) because Accounting-On/Accounting-Off (RFC 2866 §5.13) are
+    NAS-level events, not session-level ones -- the real RADIUS protocol
+    carries no Acct-Session-Id on either packet at all, since the NAS is
+    signalling its own boot/shutdown, not reporting on one specific
+    session."""
+
+    status_type: str = Field(
         ...,
+        description=(
+            "One of: start, interim-update, stop, accounting-on, " "accounting-off."
+        ),
+    )
+    session_id: uuid.UUID | None = Field(
+        default=None,
         description="The GuestSession id -- echoed back by the NAS as "
-        "Acct-Session-Id, originated by this module's own login endpoints.",
+        "Acct-Session-Id, originated by this module's own login endpoints. "
+        "Required for start/interim-update/stop; omitted (ignored if sent) "
+        "for accounting-on/accounting-off, which are NAS-level, not "
+        "session-level, events.",
     )
     bytes_uploaded_delta: int = Field(default=0, ge=0)
     bytes_downloaded_delta: int = Field(default=0, ge=0)
@@ -394,10 +415,41 @@ class RadiusAccountingRequest(BaseModel):
     bytes_downloaded_total: int | None = Field(default=None, ge=0)
     disconnect_reason: str | None = Field(default=None, max_length=255)
 
+    @model_validator(mode="after")
+    def _require_session_id_for_session_scoped_status_types(
+        self,
+    ) -> RadiusAccountingRequest:
+        """``accounting-on``/``accounting-off`` are NAS-level events with no
+        Acct-Session-Id at all -- deliberately not enforced here (their
+        ``session_id`` stays ``None``/is ignored). Every other, genuinely
+        session-scoped status type still requires one; this catches a
+        malformed request at the schema boundary rather than letting a
+        ``None`` reach the service layer's ``uuid.UUID``-typed
+        ``session_id`` parameter."""
+        session_scoped = {
+            RADIUS_ACCT_STATUS_START,
+            RADIUS_ACCT_STATUS_INTERIM_UPDATE,
+            RADIUS_ACCT_STATUS_STOP,
+        }
+        if self.status_type in session_scoped and self.session_id is None:
+            raise ValueError(
+                f"session_id is required for status_type '{self.status_type}'"
+            )
+        return self
+
 
 class RadiusAccountingResponse(BaseModel):
-    session_id: str
+    session_id: str | None = Field(
+        default=None,
+        description="None for accounting-on/accounting-off (NAS-level "
+        "events with no single session to report on).",
+    )
     status: str
+    closed_session_count: int | None = Field(
+        default=None,
+        description="Set only for accounting-on/accounting-off: how many "
+        "previously-ACTIVE sessions against this NAS were closed as stale.",
+    )
 
 
 # ============================================================================

@@ -786,6 +786,16 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # ("notification-dispatch-sweep") that drains due PENDING/RETRYING
     # NotificationDelivery rows -- see
     # app.domains.notification.service's own module docstring.
+    # Provisioning Engine adds a fifteenth Beat entry
+    # ("provisioning-engine-router-health-poll-sweep") for the real,
+    # pull-based router device-health poll sweep -- see
+    # app.domains.provisioning_engine.service
+    # .run_router_health_poll_sweep's own module docstring.
+    # Router domain adds a sixteenth Beat entry
+    # ("router-provisioning-token-cleanup-sweep") for the enrollment
+    # (zero-touch provisioning) token expiry cleanup sweep -- see
+    # app.domains.router.service.RouterService
+    # .sweep_expired_provisioning_tokens's own docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -800,6 +810,8 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
         "campaigns-sweep-status-transitions",
+        "provisioning-engine-router-health-poll-sweep",
+        "router-provisioning-token-cleanup-sweep",
         "notification-dispatch-sweep",
     }
 

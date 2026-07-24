@@ -46,10 +46,22 @@ response -- see ``ProvisioningCheckInResponse``'s own docstring and
 ``app.domains.router_agent.service``'s module docstring for why this was
 chosen over a separate, later "activate" endpoint. Nothing else in this
 file changed for that module's sake.
+
+**Additive dependency on Module 009 Part 3
+(``app.domains.wireguard``).** ``provisioning_check_in`` also, optionally,
+composes with ``WireGuardService.create_tunnel`` (its additive
+``external_public_key`` parameter) when the device-presented request
+carries ``wireguard_public_key`` -- the zero-touch bootstrap-script path
+described in ``app.domains.network_config.renderers.render_bootstrap_script``'s
+own docstring. This reuses ``WireGuardService``'s real tunnel-IP allocator
+rather than a second, parallel one; see that method's own docstring for
+why the device's public key is accepted as-is instead of a platform-
+generated one.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 
 from fastapi import APIRouter, Depends, Query, Request, status
@@ -63,6 +75,8 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.router_agent.dependencies import get_router_agent_service
 from app.domains.router_agent.service import RouterAgentService
+from app.domains.wireguard.dependencies import get_wireguard_service
+from app.domains.wireguard.service import WireGuardService
 
 from .dependencies import get_router_service
 from .enums import RouterStatus
@@ -404,6 +418,7 @@ async def provisioning_check_in(
     payload: ProvisioningCheckInRequest,
     router_service: RouterService = Depends(get_router_service),
     agent_service: RouterAgentService = Depends(get_router_agent_service),
+    wireguard_service: WireGuardService = Depends(get_wireguard_service),
 ) -> ProvisioningCheckInResponse:
     """Presented by the physical device, not an authenticated platform user
     -- see module docstring and ``docs/router/ROUTER_ARCHITECTURE.md`` §5.
@@ -414,16 +429,66 @@ async def provisioning_check_in(
     ``app.domains.router_agent.service``'s module docstring for why here,
     not a separate later endpoint): this call is the device's last chance to
     authenticate itself with a credential (the one-time provisioning token)
-    this platform already trusts before that token is consumed."""
+    this platform already trusts before that token is consumed.
+
+    **Module 009 Part 3 (zero-touch enrollment) additive extension:** when
+    ``payload.wireguard_public_key`` is present, this call also composes
+    with ``WireGuardService.create_tunnel`` (via its additive
+    ``external_public_key`` parameter -- see that method's own docstring)
+    to allocate this router's tunnel IP and create its ``WireGuardPeer``
+    row right here, using the *same* allocation logic every other tunnel
+    on this platform goes through -- not a second, parallel allocator. This
+    is deliberately optional: a device presenting only ``token`` (no public
+    key yet, or a non-WireGuard enrollment path) gets exactly today's
+    behavior, unchanged. When absent, no ``WireGuardPeer`` is created and
+    the four WireGuard-shaped response fields stay ``None`` -- a device can
+    always create its tunnel later through the ordinary, authenticated
+    ``app.domains.wireguard`` admin surface instead."""
     updated = await router_service.check_in(plaintext_token=payload.token)
     credential, agent_credential = await agent_service.issue_credential_for_router(
         updated
     )
+
+    tunnel_ip_address: str | None = None
+    wireguard_server_public_key: str | None = None
+    wireguard_endpoint_host: str | None = None
+    wireguard_endpoint_port: int | None = None
+    wireguard_hub_tunnel_address: str | None = None
+    if payload.wireguard_public_key:
+        delivery = await wireguard_service.create_tunnel(
+            actor_user_id=None,
+            router_id=updated.id,
+            requesting_organization_id=None,
+            external_public_key=payload.wireguard_public_key,
+        )
+        tunnel_ip_address = delivery.peer.tunnel_ip_address
+        wireguard_server_public_key = delivery.server.public_key
+        wireguard_endpoint_host = delivery.server.endpoint_host
+        wireguard_endpoint_port = delivery.server.endpoint_port
+        # The hub's own conventional tunnel address (first usable host of
+        # its tunnel_network_cidr) -- mirrors
+        # app.domains.network_config.renderers._hub_tunnel_address's
+        # identical derivation exactly, computed here rather than imported
+        # since that helper is that module's own private implementation
+        # detail, not a shared cross-domain surface. See
+        # ProvisioningCheckInResponse.wireguard_hub_tunnel_address's own
+        # docstring for why the device needs this real value, not a
+        # fabricated one, for its own allowed-address=.
+        hub_network = ipaddress.ip_network(
+            delivery.server.tunnel_network_cidr, strict=False
+        )
+        wireguard_hub_tunnel_address = str(next(hub_network.hosts()))
+
     return ProvisioningCheckInResponse(
         router_id=str(updated.id),
         status=RouterStatus(updated.status),
         agent_credential=agent_credential,
         agent_credential_expires_at=credential.expires_at,
+        tunnel_ip_address=tunnel_ip_address,
+        wireguard_server_public_key=wireguard_server_public_key,
+        wireguard_endpoint_host=wireguard_endpoint_host,
+        wireguard_endpoint_port=wireguard_endpoint_port,
+        wireguard_hub_tunnel_address=wireguard_hub_tunnel_address,
     )
 
 

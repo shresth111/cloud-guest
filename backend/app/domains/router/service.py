@@ -522,6 +522,50 @@ class RouterService:
         )
         return updated
 
+    async def sweep_expired_provisioning_tokens(self) -> int:
+        """Beat-scheduled sweep support (see
+        ``app.domains.router.tasks.run_provisioning_token_cleanup_sweep``):
+        finds every ``RouterProvisioningToken`` whose ``expires_at`` has
+        already passed and that was never consumed (``used_at IS NULL``),
+        and soft-deletes each one via
+        ``repository.soft_delete_provisioning_token`` -- the same
+        ``BaseModel``-provided ``is_deleted``/``deleted_at`` soft-delete
+        convention every other domain in this codebase already uses (e.g.
+        ``app.domains.guest.repository.GuestRepository
+        .soft_delete_nas_client``), never a hand-rolled raw-SQL delete. A
+        soft-deleted token can never again be presented at ``check_in``
+        (``get_provisioning_token_by_hash`` only ever looks up
+        non-deleted rows through ``GenericRepository``), which is the
+        actual goal here: a stale, expired token sitting around forever is
+        both dead weight and a lingering (if already-unusable) credential
+        this sweep now proactively retires.
+
+        A single token's own soft-delete failing (e.g. a transient DB
+        error) is logged and skipped, never aborting the sweep for every
+        other expired token -- mirrors every other Beat-scheduled sweep in
+        this codebase's identical per-item failure-isolation contract
+        (e.g. ``app.domains.isp.service.run_health_check_sweep``'s own
+        per-link isolation). Returns the number of tokens actually
+        soft-deleted. Deliberately not audited (mirrors ``heartbeat``'s own
+        "system-driven housekeeping, not an admin action" posture) -- an
+        expired, never-used token silently aging out is routine, not an
+        event an admin needs an audit-log entry for."""
+        now = datetime.now(UTC)
+        expired_tokens = await self.repository.list_expired_unused_provisioning_tokens(
+            now=now
+        )
+        cleaned = 0
+        for token in expired_tokens:
+            try:
+                await self.repository.soft_delete_provisioning_token(token)
+                cleaned += 1
+            except Exception as exc:  # noqa: BLE001 -- per-token isolation, see docstring
+                logger.warning(
+                    "router_provisioning_token_cleanup_sweep_token_failed",
+                    extra={"token_id": str(token.id), "error": str(exc)},
+                )
+        return cleaned
+
     # -- credential access ---------------------------------------------------------
 
     def get_decrypted_api_secret(self, router: Router) -> str | None:

@@ -19,6 +19,7 @@ living alongside ``roles`` in one repository.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy import func, or_, select
@@ -67,6 +68,14 @@ class RouterRepositoryProtocol(Protocol):
 
     async def mark_provisioning_token_used(
         self, token: RouterProvisioningToken, *, used_at: object
+    ) -> RouterProvisioningToken: ...
+
+    async def list_expired_unused_provisioning_tokens(
+        self, *, now: datetime
+    ) -> list[RouterProvisioningToken]: ...
+
+    async def soft_delete_provisioning_token(
+        self, token: RouterProvisioningToken
     ) -> RouterProvisioningToken: ...
 
 
@@ -161,3 +170,30 @@ class RouterRepository:
         self, token: RouterProvisioningToken, *, used_at: object
     ) -> RouterProvisioningToken:
         return await self.provisioning_tokens.update(token, {"used_at": used_at})
+
+    async def list_expired_unused_provisioning_tokens(
+        self, *, now: datetime
+    ) -> list[RouterProvisioningToken]:
+        """Every not-yet-soft-deleted, never-used token whose ``expires_at``
+        has already passed, platform-wide -- for
+        ``service.sweep_expired_provisioning_tokens``. Hand-written (not
+        ``GenericRepository.get_all``'s equality-only filters) for the same
+        reason ``list_routers`` above is: a ``<`` comparison on
+        ``expires_at``, not an equality match."""
+        statement = select(RouterProvisioningToken).where(
+            RouterProvisioningToken.is_deleted.is_(False),
+            RouterProvisioningToken.used_at.is_(None),
+            RouterProvisioningToken.expires_at < now,
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def soft_delete_provisioning_token(
+        self, token: RouterProvisioningToken
+    ) -> RouterProvisioningToken:
+        """``GenericRepository.update()`` deliberately refuses to set
+        ``is_deleted``/``deleted_at`` -- only this dedicated
+        ``soft_delete()`` path actually flips them, mirroring
+        ``app.domains.guest.repository.GuestRepository
+        .soft_delete_nas_client``'s identical convention."""
+        return await self.provisioning_tokens.soft_delete(token)

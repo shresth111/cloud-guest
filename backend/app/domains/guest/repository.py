@@ -177,6 +177,10 @@ class GuestRepositoryProtocol(Protocol):
         self, guest_id: uuid.UUID
     ) -> list[GuestSession]: ...
 
+    async def list_active_sessions_for_router(
+        self, router_id: uuid.UUID
+    ) -> list[GuestSession]: ...
+
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]: ...
 
     # -- FUP quota usage ---------------------------------------------------------
@@ -509,6 +513,19 @@ class GuestRepository:
         crossed a configured FUP limit."""
         return await self.sessions.get_all(
             filters={"guest_id": guest_id, "status": GuestSessionStatus.ACTIVE.value}
+        )
+
+    async def list_active_sessions_for_router(
+        self, router_id: uuid.UUID
+    ) -> list[GuestSession]:
+        """Every currently ``ACTIVE`` session tied to ``router_id`` -- backs
+        ``service.close_sessions_for_nas_restart``'s "close every session
+        this platform still thinks is live against a NAS that just told us
+        it rebooted" step (RADIUS Accounting-On, RFC 2866 §5.13). Mirrors
+        ``list_active_sessions_for_guest``'s identical equality-filter
+        shape, just scoped by router instead of guest."""
+        return await self.sessions.get_all(
+            filters={"router_id": router_id, "status": GuestSessionStatus.ACTIVE.value}
         )
 
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]:
