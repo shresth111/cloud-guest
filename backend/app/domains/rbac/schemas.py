@@ -163,6 +163,16 @@ class RoleUpdateRequest(BaseModel):
     description: str | None = Field(default=None, max_length=2000)
     is_template: bool | None = None
     parent_role_id: uuid.UUID | None = None
+    # Optional full replacement of this role's permission-key set, gated by
+    # the same `roles.update` this whole endpoint already requires -- a
+    # customer/org-owner session that can rename a role can also repoint
+    # what it grants, without needing the separate `roles.manage` permission
+    # the dedicated attach/detach-one-permission endpoints require (which an
+    # Organization Owner does not hold by default; see seed.py's ROLES
+    # module grant -- OPERATE excludes MANAGE). Omit the field entirely to
+    # leave permissions untouched -- `None` (unset) vs. `[]` (explicitly
+    # clear every permission) are distinguished via `exclude_unset`.
+    permission_keys: list[str] | None = None
 
 
 class RoleCloneRequest(BaseModel):

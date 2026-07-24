@@ -212,6 +212,17 @@ class RBACService:
         if role.is_system_role and ({"name", "slug", "scope_type"} & data.keys()):
             raise SystemRoleImmutableError(role.name, "renamed or rescoped")
 
+        # `permission_keys`, when present, isn't a Role column -- pop it
+        # before handing the rest of `data` to the generic column update
+        # below, and reconcile it separately (see RoleUpdateRequest's
+        # docstring for why this rides on `roles.update` rather than the
+        # dedicated attach/detach endpoints' `roles.manage`).
+        permission_keys = data.pop("permission_keys", None)
+        if permission_keys is not None and role.is_system_role:
+            raise SystemRoleImmutableError(
+                role.name, "modified directly (clone it instead)"
+            )
+
         new_parent_id = data.get("parent_role_id")
         if new_parent_id is not None:
             await self._assert_no_cycle(role.id, new_parent_id)  # type: ignore[arg-type]
@@ -219,6 +230,12 @@ class RBACService:
         updated = await self.repository.update_role(
             role, {**data, "updated_by": actor_user_id}
         )
+
+        if permission_keys is not None:
+            await self._reconcile_role_permissions(
+                updated, permission_keys, granted_by=actor_user_id
+            )
+
         await self._invalidate_role_holders(role.id)
         await self._audit(
             actor_user_id,
@@ -229,6 +246,30 @@ class RBACService:
             organization_id=role.organization_id,
         )
         return updated
+
+    async def _reconcile_role_permissions(
+        self,
+        role: Role,
+        permission_keys: list[str],
+        *,
+        granted_by: uuid.UUID | None,
+    ) -> None:
+        """Full-replacement diff: attach whatever's newly present in
+        ``permission_keys``, detach whatever's no longer there. Reuses
+        ``_attach_permission`` so the same per-permission scope-applicability
+        check (``InvalidScopeAssignmentError``) applies here as it does for
+        the single-permission attach endpoint and role creation."""
+        current_rows = await self.repository.get_role_permissions(role.id)
+        current_keys = {
+            row.permission.key for row in current_rows if row.permission is not None
+        }
+        target_keys = set(permission_keys)
+        for key in target_keys - current_keys:
+            await self._attach_permission(role, key, granted_by=granted_by)
+        for key in current_keys - target_keys:
+            permission = await self.repository.get_permission_by_key(key)
+            if permission is not None:
+                await self.repository.remove_role_permission(role.id, permission.id)
 
     async def delete_role(
         self,
