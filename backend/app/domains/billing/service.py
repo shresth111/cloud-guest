@@ -3599,6 +3599,7 @@ class CustomerBillingDashboardResult:
 
     license: License
     plan: Plan
+    plan_features: list[PlanFeature]
     subscription: Subscription
     usage: UsageValidationResult
     recent_invoices: list[Invoice]
@@ -3659,6 +3660,7 @@ class CustomerBillingDashboardService:
             organization_id
         )
         plan = await self.plan_service.get_plan(license_.plan_id)
+        plan_features = await self.plan_service.list_features(plan.id)
         subscription = (
             await self.subscription_service.get_subscription_for_organization(
                 organization_id
@@ -3702,6 +3704,7 @@ class CustomerBillingDashboardService:
         return CustomerBillingDashboardResult(
             license=license_,
             plan=plan,
+            plan_features=plan_features,
             subscription=subscription,
             usage=usage,
             recent_invoices=invoices,

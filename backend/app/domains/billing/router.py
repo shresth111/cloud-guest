@@ -2262,7 +2262,7 @@ def _customer_billing_dashboard_response(
 ) -> CustomerBillingDashboardResponse:
     return CustomerBillingDashboardResponse(
         license=_license_response(result.license),
-        plan=_plan_response(result.plan, []),
+        plan=_plan_response(result.plan, result.plan_features),
         subscription=_subscription_response(result.subscription),
         usage=_usage_summary_response(result.usage.organization_id, result.usage),
         recent_invoices=[

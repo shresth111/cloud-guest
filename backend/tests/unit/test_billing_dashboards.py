@@ -44,6 +44,7 @@ from app.domains.billing.models import (
     Payment,
     PaymentMethod,
     Plan,
+    PlanFeature,
     Subscription,
 )
 from app.domains.billing.router import _require_subscription_self_service_permission
@@ -305,6 +306,7 @@ class CallRecordingCustomerDashboardDeps:
     subscription: Subscription
     usage_result: UsageValidationResult
     payment_methods: list[PaymentMethod]
+    plan_features: list[PlanFeature] = field(default_factory=list)
     calls: list[str] = field(default_factory=list)
 
     async def get_license_for_organization(self, organization_id: uuid.UUID) -> License:
@@ -316,6 +318,10 @@ class CallRecordingCustomerDashboardDeps:
     ) -> Plan:
         self.calls.append(f"plan:{plan_id}")
         return self.plan
+
+    async def list_features(self, plan_id: uuid.UUID) -> list[PlanFeature]:
+        self.calls.append(f"plan_features:{plan_id}")
+        return self.plan_features
 
     async def get_subscription_for_organization(
         self, organization_id: uuid.UUID
@@ -783,6 +789,7 @@ class TestCustomerBillingDashboardComposition:
 
         assert result.license is license_
         assert result.plan is plan
+        assert result.plan_features is deps.plan_features
         assert result.subscription is subscription
         assert result.usage is usage_result
         # Every composed dependency was called exactly once -- proves this
@@ -790,6 +797,7 @@ class TestCustomerBillingDashboardComposition:
         assert deps.calls == [
             f"license:{organization_id}",
             f"plan:{plan.id}",
+            f"plan_features:{plan.id}",
             f"subscription:{organization_id}",
             f"usage:{organization_id}",
             f"payment_methods:{organization_id}",
