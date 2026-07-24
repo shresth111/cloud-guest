@@ -855,6 +855,14 @@ class FakeGuestRepository:
         nas_client.version += 1
         return nas_client
 
+    async def soft_delete_nas_client(
+        self, nas_client: RadiusNasClient
+    ) -> RadiusNasClient:
+        nas_client.is_deleted = True
+        nas_client.deleted_at = datetime.now(UTC)
+        nas_client.version += 1
+        return nas_client
+
     async def list_nas_clients(
         self,
         *,

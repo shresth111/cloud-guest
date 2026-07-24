@@ -221,6 +221,10 @@ class GuestRepositoryProtocol(Protocol):
         self, nas_client: RadiusNasClient, data: dict[str, object]
     ) -> RadiusNasClient: ...
 
+    async def soft_delete_nas_client(
+        self, nas_client: RadiusNasClient
+    ) -> RadiusNasClient: ...
+
     async def list_nas_clients(
         self,
         *,
@@ -618,6 +622,14 @@ class GuestRepository:
         self, nas_client: RadiusNasClient, data: dict[str, object]
     ) -> RadiusNasClient:
         return await self.nas_clients.update(nas_client, data)
+
+    async def soft_delete_nas_client(
+        self, nas_client: RadiusNasClient
+    ) -> RadiusNasClient:
+        """GenericRepository.update() deliberately refuses to set
+        is_deleted/deleted_at (see its `protected` fields) -- only this
+        dedicated soft_delete() path actually flips them."""
+        return await self.nas_clients.soft_delete(nas_client)
 
     async def list_nas_clients(
         self,

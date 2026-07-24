@@ -2882,17 +2882,20 @@ class RadiusService:
         )
         current = NasStatus(nas_client.status)
         validate_nas_status_transition(current=current, target=NasStatus.DELETED)
-        now = datetime.now(UTC)
-        updated = await self.repository.update_nas_client(
+        await self.repository.update_nas_client(
             nas_client,
             {
                 "status": NasStatus.DELETED.value,
                 "is_active": False,
-                "is_deleted": True,
-                "deleted_at": now,
                 "updated_by": actor_user_id,
             },
         )
+        # update_nas_client() -> GenericRepository.update() deliberately
+        # refuses to set is_deleted/deleted_at (protected fields) -- without
+        # this, the row's status became DELETED but it never actually left
+        # get_nas_client_by_router()'s (correctly is_deleted-scoped) lookup,
+        # permanently blocking the router from ever registering a new NAS.
+        updated = await self.repository.soft_delete_nas_client(nas_client)
         event = RadiusNasDeleted(nas_client_id=updated.id)
         logger.info("radius_nas_deleted", extra=_event_extra(event))
         await self._audit_nas(
