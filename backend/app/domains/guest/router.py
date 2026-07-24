@@ -143,6 +143,7 @@ def _session_response(session: GuestSession) -> GuestSessionResponse:
         data_limit_mb=session.data_limit_mb,
         session_timeout_minutes=session.session_timeout_minutes,
         disconnect_reason=session.disconnect_reason,
+        user_agent=session.user_agent,
         created_at=session.created_at,
     )
 

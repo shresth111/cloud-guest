@@ -183,6 +183,7 @@ class GuestSessionResponse(BaseModel):
     data_limit_mb: int | None
     session_timeout_minutes: int | None
     disconnect_reason: str | None
+    user_agent: str | None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
