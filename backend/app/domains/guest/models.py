@@ -591,7 +591,12 @@ class RadiusNasClient(BaseModel):
     vendor: Mapped[str] = mapped_column(String(50), default="MikroTik", nullable=False)
 
     __table_args__ = (
-        Index("ix_radius_nas_clients_router_id", "router_id", unique=True),
+        Index(
+            "ix_radius_nas_clients_router_id",
+            "router_id",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
         Index("ix_radius_nas_clients_organization_id", "organization_id"),
         Index("ix_radius_nas_clients_location_id", "location_id"),
         Index(
@@ -600,7 +605,12 @@ class RadiusNasClient(BaseModel):
             unique=True,
             postgresql_where=text("nas_code IS NOT NULL"),
         ),
-        Index("ix_radius_nas_clients_nas_identifier", "nas_identifier", unique=True),
+        Index(
+            "ix_radius_nas_clients_nas_identifier",
+            "nas_identifier",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
         Index("ix_radius_nas_clients_status", "status"),
         Index("ix_radius_nas_clients_is_active", "is_active"),
     )
