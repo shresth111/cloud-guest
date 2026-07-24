@@ -90,6 +90,7 @@ from .device_adapters import (
     DeviceCredentials,
     DeviceDiscoveryResult,
     DeviceHealthResult,
+    RawCommandResult,
     get_device_adapter,
 )
 from .events import (
@@ -106,6 +107,7 @@ from .exceptions import (
     InvalidProvisionJobStatusTransitionError,
     ProvisionDeviceConnectionError,
     ProvisionDeviceOperationError,
+    ProvisioningEngineError,
     ProvisionJobHasNoAppliedVersionError,
     ProvisionJobNotFoundError,
     ProvisionJobNotRetryableError,
@@ -749,6 +751,47 @@ class ProvisioningEngineService:
         )
         return result
 
+    async def execute_console_command(
+        self,
+        *,
+        router_id: uuid.UUID,
+        command: str,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> RawCommandResult:
+        """The Winbox-terminal-equivalent raw command path -- gated by its
+        own dedicated ``DEVICE_CONSOLE`` permission at the router.py route
+        layer (see that permission's own ``rbac.seed`` comment for why it is
+        never folded into this domain's own ``EXECUTE`` action). Every
+        invocation is audited unconditionally, including a failed
+        connection attempt -- there is no bounded command shape here to
+        reconstruct after the fact from anything else, unlike this
+        service's other, structured actions."""
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter = self._get_device_adapter(router.vendor)
+        try:
+            result = await adapter.execute_raw_command(credentials, command=command)
+        except ProvisioningEngineError as exc:
+            await self._audit_console_command(
+                actor_user_id,
+                router=router,
+                command=command,
+                description=f"Device console command failed to run: {exc}",
+            )
+            raise
+        await self._audit_console_command(
+            actor_user_id,
+            router=router,
+            command=command,
+            description=(
+                f"Ran device console command (exit status {result.exit_status})"
+            ),
+        )
+        return result
+
     async def validate_device(
         self,
         *,
@@ -1225,6 +1268,31 @@ class ProvisioningEngineService:
             description=description,
             organization_id=job.organization_id,
             location_id=job.location_id,
+        )
+
+    async def _audit_console_command(
+        self,
+        actor_user_id: uuid.UUID | None,
+        *,
+        router: Router,
+        command: str,
+        description: str,
+    ) -> None:
+        """Unlike ``_audit`` above, unconditionally called for both success
+        and failure (see ``execute_console_command``'s own docstring) --
+        ``command`` is included in ``description`` deliberately, not just
+        ``result``, so the audit trail is reconstructible even for a
+        connection failure that never produced a ``RawCommandResult``."""
+        if self.audit_writer is None:
+            return
+        await self.audit_writer.create_audit_log_entry(
+            actor_user_id=actor_user_id,
+            action=AuditAction.DEVICE_CONSOLE_COMMAND_EXECUTED.value,
+            entity_type="router",
+            entity_id=router.id,
+            description=f"{description} -- command: {command}",
+            organization_id=router.organization_id,
+            location_id=router.location_id,
         )
 
 

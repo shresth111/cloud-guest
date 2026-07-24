@@ -42,6 +42,7 @@ from app.domains.provisioning_engine.device_adapters import (
     DeviceCredentials,
     DeviceDiscoveryResult,
     DeviceHealthResult,
+    RawCommandResult,
 )
 from app.domains.provisioning_engine.exceptions import (
     InvalidProvisionJobStatusTransitionError,
@@ -477,6 +478,9 @@ class FakeDeviceAdapter:
     verify_result: bool = True
     health_result: DeviceHealthResult | None = None
     push_calls: list[str] = field(default_factory=list)
+    raw_command_result: RawCommandResult | None = None
+    raw_command_exception: Exception | None = None
+    raw_commands_run: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.discover_result is None:
@@ -530,6 +534,16 @@ class FakeDeviceAdapter:
 
     async def upload_file(self, credentials, *, filename: str, content: bytes) -> None:
         return None
+
+    async def execute_raw_command(
+        self, credentials: DeviceCredentials, *, command: str
+    ) -> RawCommandResult:
+        self.raw_commands_run.append(command)
+        if self.raw_command_exception:
+            raise self.raw_command_exception
+        if self.raw_command_result is not None:
+            return self.raw_command_result
+        return RawCommandResult(command=command, stdout="ok", stderr="", exit_status=0)
 
 
 # ============================================================================
@@ -996,6 +1010,88 @@ class TestValidateDevice:
             )
 
 
+class TestExecuteConsoleCommand:
+    async def test_runs_command_and_audits_success(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        actor_id = uuid.uuid4()
+
+        result = await h.service.execute_console_command(
+            router_id=router.id,
+            command="/interface print",
+            actor_user_id=actor_id,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert result.command == "/interface print"
+        assert result.exit_status == 0
+        assert h.device_adapter.raw_commands_run == ["/interface print"]
+        assert len(h.audit_writer.entries) == 1
+        entry = h.audit_writer.entries[0]
+        assert entry["actor_user_id"] == actor_id
+        assert entry["entity_type"] == "router"
+        assert entry["entity_id"] == router.id
+        assert "/interface print" in entry["description"]
+
+    async def test_non_zero_exit_status_does_not_raise(self) -> None:
+        h = make_harness(
+            device_adapter=FakeDeviceAdapter(
+                raw_command_result=RawCommandResult(
+                    command="/bad command",
+                    stdout="",
+                    stderr="no such command",
+                    exit_status=1,
+                )
+            )
+        )
+        router = h.router_lookup.add(_make_router())
+
+        result = await h.service.execute_console_command(
+            router_id=router.id,
+            command="/bad command",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert result.exit_status == 1
+        assert result.stderr == "no such command"
+        # A non-zero exit status is still a completed run -- audited as one,
+        # not treated as a connection/operation failure.
+        assert len(h.audit_writer.entries) == 1
+
+    async def test_connection_failure_still_audits_and_reraises(self) -> None:
+        h = make_harness(
+            device_adapter=FakeDeviceAdapter(
+                raw_command_exception=ProvisionDeviceConnectionError(
+                    "10.20.0.5", "timed out"
+                )
+            )
+        )
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(ProvisionDeviceConnectionError):
+            await h.service.execute_console_command(
+                router_id=router.id,
+                command="/system reboot",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert len(h.audit_writer.entries) == 1
+        assert "failed" in h.audit_writer.entries[0]["description"].lower()
+
+    async def test_missing_credentials_raises(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router(), secret=None)
+        with pytest.raises(ProvisionMissingCredentialsError):
+            await h.service.execute_console_command(
+                router_id=router.id,
+                command="/interface print",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=None,
+            )
+
+
 class TestGenerateConfiguration:
     async def test_seeds_variables_registers_nas_and_renders(self) -> None:
         h = make_harness()
@@ -1216,7 +1312,7 @@ class TestRunProvisionJob:
 
 class TestEveryRouteRequiresPermission:
     def test_every_provisioning_engine_route_has_a_permission_dependency(self) -> None:
-        assert len(provisioning_engine_router.routes) == 12
+        assert len(provisioning_engine_router.routes) == 13
         for route in provisioning_engine_router.routes:
             assert (
                 route.dependencies != []

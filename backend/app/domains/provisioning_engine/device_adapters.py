@@ -133,6 +133,24 @@ class DeviceHealthResult:
     detail: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RawCommandResult:
+    """The real, unfiltered outcome of one console command -- unlike every
+    other adapter method here, a non-zero ``exit_status`` is not raised as
+    an exception. A raw console is explicitly for commands whose shape and
+    outcome the platform has no prior knowledge of (that is the entire
+    point of it existing alongside the structured, always-succeeds-or-
+    raises methods above) -- ``/interface print`` on a typo'd interface
+    name, for instance, is a normal, expected non-zero outcome a console
+    user needs to actually see, not an exception unwound into a generic
+    502."""
+
+    command: str
+    stdout: str
+    stderr: str
+    exit_status: int
+
+
 class BaseProvisionAdapter(Protocol):
     """What a vendor implements to plug real device I/O into the
     Provisioning Engine. See module docstring for the "real code, untested
@@ -181,6 +199,16 @@ class BaseProvisionAdapter(Protocol):
     ) -> None:
         """A generic file upload -- the primitive ``push_config``/
         ``restore`` are themselves built on."""
+        ...
+
+    async def execute_raw_command(
+        self, credentials: DeviceCredentials, *, command: str
+    ) -> RawCommandResult:
+        """Runs exactly ``command`` over the device's real SSH console
+        connection and returns its real stdout/stderr/exit status, with no
+        interpretation, whitelisting, or retry -- the Winbox-terminal
+        equivalent this Protocol's other methods deliberately are not (see
+        ``RawCommandResult``'s own docstring)."""
         ...
 
 
@@ -300,6 +328,21 @@ class MikroTikProvisionAdapter:
         except (OSError, asyncssh.Error) as exc:
             raise ProvisionDeviceConnectionError(credentials.host, str(exc)) from exc
 
+    async def execute_raw_command(
+        self, credentials: DeviceCredentials, *, command: str
+    ) -> RawCommandResult:
+        try:
+            async with self._ssh_connect(credentials) as conn:
+                result = await conn.run(command, check=False)
+        except (OSError, asyncssh.Error) as exc:
+            raise ProvisionDeviceConnectionError(credentials.host, str(exc)) from exc
+        return RawCommandResult(
+            command=command,
+            stdout=str(result.stdout or ""),
+            stderr=str(result.stderr or ""),
+            exit_status=result.exit_status if result.exit_status is not None else -1,
+        )
+
     # ========================================================================
     # Internal transport helpers
     # ========================================================================
@@ -418,6 +461,7 @@ __all__ = [
     "DeviceCredentials",
     "DeviceDiscoveryResult",
     "DeviceHealthResult",
+    "RawCommandResult",
     "BaseProvisionAdapter",
     "MikroTikProvisionAdapter",
     "get_device_adapter",

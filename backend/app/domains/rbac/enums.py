@@ -115,6 +115,7 @@ class PermissionModule(StrEnum):
     NETWORK_DIAGNOSTICS = "network_diagnostics"
     NETWORK_DEVICE = "network_device"
     SUPPORT_TICKETS = "support_tickets"
+    DEVICE_CONSOLE = "device_console"
 
 
 class OverrideEffect(StrEnum):
@@ -577,6 +578,17 @@ class AuditAction(StrEnum):
     PROVISION_JOB_ROLLED_BACK = "provision_job_rolled_back"
     PROVISION_JOB_SUCCEEDED = "provision_job_succeeded"
     PROVISION_JOB_FAILED = "provision_job_failed"
+
+    # Device Console -- a raw RouterOS command run directly against a
+    # device's real SSH connection (the Winbox-terminal-equivalent
+    # capability), gated behind its own dedicated DEVICE_CONSOLE permission
+    # module rather than reusing PROVISIONING_ENGINE's EXECUTE (see
+    # ``seed.py``'s own comment on why: unlike every other PROVISIONING_ENGINE
+    # action, this one has no bounded command shape -- always audited, every
+    # single invocation, unlike this table's usual "only lifecycle events"
+    # posture, precisely because there is no narrower per-command structure
+    # to fall back on for after-the-fact reconstruction otherwise.
+    DEVICE_CONSOLE_COMMAND_EXECUTED = "device_console_command_executed"
 
     # Queue Management Engine domain events -- written through this same
     # table by

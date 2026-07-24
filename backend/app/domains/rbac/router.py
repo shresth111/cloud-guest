@@ -455,9 +455,7 @@ async def list_user_role_assignments(
     rbac_service: RBACService = Depends(get_rbac_service),
 ):
     assignments = await rbac_service.repository.get_active_user_roles(user_id)
-    payload = UserRoleListResponse(
-        items=[_user_role_response(a) for a in assignments]
-    )
+    payload = UserRoleListResponse(items=[_user_role_response(a) for a in assignments])
     return build_response(
         success=True,
         message="User role assignments retrieved",

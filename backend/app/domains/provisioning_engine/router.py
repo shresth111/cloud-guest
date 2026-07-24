@@ -40,6 +40,8 @@ from .constants import ProvisionJobStatus
 from .dependencies import get_provisioning_engine_service
 from .models import ProvisionJob
 from .schemas import (
+    ConsoleCommandRequest,
+    ConsoleCommandResponse,
     DeviceDiscoveryResultResponse,
     MessageResponse,
     ProvisionCancelRequest,
@@ -307,6 +309,47 @@ async def generate_configuration_preview(
     return build_response(
         success=True,
         message="Configuration generated",
+        data=data.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# Raw device console (the Winbox-terminal-equivalent capability) -- gated by
+# its own dedicated ``device_console.execute`` permission, never
+# ``provisioning_engine.execute`` (see ``rbac.seed``'s DEVICE_CONSOLE
+# MODULE_ACTIONS comment for why).
+# ============================================================================
+
+
+@router.post(
+    "/console",
+    response_model=ApiResponse[ConsoleCommandResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("device_console.execute"))],
+)
+async def execute_console_command(
+    request: Request,
+    payload: ConsoleCommandRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: ProvisioningEngineService = Depends(get_provisioning_engine_service),
+):
+    result = await service.execute_console_command(
+        router_id=uuid.UUID(payload.router_id),
+        command=payload.command,
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    data = ConsoleCommandResponse(
+        command=result.command,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        exit_status=result.exit_status,
+    )
+    return build_response(
+        success=True,
+        message="Console command executed",
         data=data.model_dump(),
         request_id=_request_id(request),
     )

@@ -30,6 +30,8 @@ __all__ = [
     "ProvisionValidateRequest",
     "ProvisionConfigurationRequest",
     "ProvisionConfigurationResponse",
+    "ConsoleCommandRequest",
+    "ConsoleCommandResponse",
 ]
 
 
@@ -133,3 +135,20 @@ class ProvisionConfigurationRequest(BaseModel):
 class ProvisionConfigurationResponse(BaseModel):
     rendered_content: str
     variables_used: dict[str, Any] = Field(default_factory=dict)
+
+
+# ============================================================================
+# Raw device console (the Winbox-terminal-equivalent capability)
+# ============================================================================
+
+
+class ConsoleCommandRequest(BaseModel):
+    router_id: str
+    command: str = Field(min_length=1, max_length=4000)
+
+
+class ConsoleCommandResponse(BaseModel):
+    command: str
+    stdout: str
+    stderr: str
+    exit_status: int

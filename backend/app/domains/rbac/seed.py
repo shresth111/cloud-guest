@@ -265,6 +265,15 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # never directly updated/deleted by a user -- there is no
     # UPDATE/DELETE/APPROVE action for a ProvisionJob.
     PermissionModule.PROVISIONING_ENGINE: (_A.CREATE, _A.READ, _A.EXECUTE, _A.MANAGE),
+    # Deliberately its own module, not folded into PROVISIONING_ENGINE's
+    # own EXECUTE: every other PROVISIONING_ENGINE action (discover,
+    # validate, push a rendered config) has a bounded, platform-authored
+    # command shape -- a raw console command has none, so a role that can
+    # already push arbitrary rendered config to a router does not
+    # automatically get this. No UPDATE/DELETE/CREATE -- READ (view a
+    # device's console command history) and EXECUTE (run a command) are the
+    # only two actions this module has.
+    PermissionModule.DEVICE_CONSOLE: (_A.READ, _A.EXECUTE),
     # ISP Management: full CRUD on isp_links plus EXECUTE for the manual
     # health-check/failover/failback triggers -- mirrors
     # PermissionModule.BANDWIDTH's own identical CRUD+EXECUTE+MANAGE shape
@@ -422,6 +431,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.AI_ASSISTANT: "AI Assistant",
     PermissionModule.POLICY: "Policy",
     PermissionModule.PROVISIONING_ENGINE: "Provisioning Engine",
+    PermissionModule.DEVICE_CONSOLE: "Device Console",
     PermissionModule.ISP: "ISP Management",
     PermissionModule.ISP_ROUTING: "ISP Routing",
     PermissionModule.VLAN: "VLAN Management",
@@ -482,6 +492,9 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # ROUTER_PROVISIONING/RADIUS/WIREGUARD/FIREWALL/DHCP/DNS/HOTSPOT/
     # MONITORING already share.
     PermissionModule.PROVISIONING_ENGINE: ScopeType.ROUTER,
+    # A console command runs against one specific router's own connection --
+    # same ScopeType.ROUTER reasoning as PROVISIONING_ENGINE's entry above.
+    PermissionModule.DEVICE_CONSOLE: ScopeType.ROUTER,
     # An ISP link is physically terminated at one router -- same reasoning
     # as PermissionModule.BANDWIDTH's own ScopeType.ROUTER entry above.
     PermissionModule.ISP: ScopeType.ROUTER,
@@ -626,7 +639,15 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         ),
         scope_type=ScopeType.GLOBAL,
         default_level=_L.FULL,
-        overrides={_M.SYSTEM_SETTINGS: _L.OPERATE, _M.WHITE_LABEL: _L.OPERATE},
+        overrides={
+            _M.SYSTEM_SETTINGS: _L.OPERATE,
+            _M.WHITE_LABEL: _L.OPERATE,
+            # Raw device console access is Super Admin-exclusive by design
+            # (see DEVICE_CONSOLE's own MODULE_ACTIONS comment) -- excluded
+            # here the same way SYSTEM_SETTINGS/WHITE_LABEL above are
+            # deliberately lowered off this role's own FULL default.
+            _M.DEVICE_CONSOLE: _L.NONE,
+        },
     ),
     SystemRoleDefinition(
         name="Platform Support",
@@ -692,6 +713,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # resolve) -- mirrors this role's own FULL overrides above for
             # ORGANIZATIONS/LOCATIONS/ROUTERS/USERS/ROLES.
             _M.SUPPORT_TICKETS: _L.FULL,
+            # Not granted even to a portfolio owner -- see DEVICE_CONSOLE's
+            # own MODULE_ACTIONS comment for why it stays off every
+            # OPERATE/FULL-default role by default.
+            _M.DEVICE_CONSOLE: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -712,6 +737,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # organizations -- FULL, the same "manage tickets for our own
             # org" posture MSP Owner's own override above establishes.
             _M.SUPPORT_TICKETS: _L.FULL,
+            _M.DEVICE_CONSOLE: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -732,6 +758,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.INVOICES: _L.OPERATE,
             _M.WHITE_LABEL: _L.OPERATE,
             _M.API_KEYS: _L.OPERATE,
+            # "Full control" over an org's own config/operations still stops
+            # short of raw command execution on its routers -- see
+            # DEVICE_CONSOLE's own MODULE_ACTIONS comment.
+            _M.DEVICE_CONSOLE: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -754,6 +784,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # FULL, since this role's default_level (OPERATE) alone would
             # only cover create+read, not assign/resolve.
             _M.SUPPORT_TICKETS: _L.FULL,
+            _M.DEVICE_CONSOLE: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -766,6 +797,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.ROUTERS: _L.FULL,
             _M.ROUTER_PROVISIONING: _L.FULL,
             _M.PROVISIONING_ENGINE: _L.FULL,
+            # The one role below Super Admin trusted with raw device
+            # console access, on the strength of already holding full
+            # technical control (ROUTERS/PROVISIONING_ENGINE FULL) over
+            # this location's own devices -- see DEVICE_CONSOLE's own
+            # MODULE_ACTIONS comment for why every other role stays NONE.
+            _M.DEVICE_CONSOLE: _L.FULL,
             _M.RADIUS: _L.FULL,
             _M.WIREGUARD: _L.FULL,
             _M.FIREWALL: _L.FULL,
