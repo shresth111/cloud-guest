@@ -20,8 +20,7 @@ result.
 
 from __future__ import annotations
 
-import asyncio
-
+from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.core.logging import get_logger
 from app.database.session import SessionLocal
@@ -84,7 +83,7 @@ def sweep_campaign_status_transitions() -> dict[str, int]:
     """Beat-scheduled periodic task (see ``app.core.celery_app``'s
     ``beat_schedule`` -- runs every
     ``constants.CAMPAIGN_STATUS_SWEEP_INTERVAL_SECONDS``)."""
-    result = asyncio.run(_sweep_campaign_status_transitions_async())
+    result = run_celery_task(_sweep_campaign_status_transitions_async())
     logger.info("campaigns_task_sweep_status_transitions_completed", extra=result)
     return result
 

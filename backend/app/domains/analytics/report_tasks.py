@@ -57,12 +57,12 @@ here.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
+from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -418,7 +418,7 @@ def run_scheduled_reports(now_iso: str | None = None) -> dict[str, object]:
     triggers can pin "now" deterministically -- the Beat schedule itself
     never passes it, always taking the real current time.
     """
-    result = asyncio.run(_run_scheduled_reports_async(now_iso=now_iso))
+    result = run_celery_task(_run_scheduled_reports_async(now_iso=now_iso))
     logger.info(
         "analytics_task_run_scheduled_reports_completed",
         extra={

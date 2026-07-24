@@ -31,8 +31,7 @@ plain Python code such as this task body.
 
 from __future__ import annotations
 
-import asyncio
-
+from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -132,7 +131,7 @@ def run_subscription_renewal_sweep() -> dict[str, object]:
     per-subscription failure isolation (see that method's own docstring);
     this task simply reports the aggregate result, it never re-raises a
     single subscription's or phase's failure."""
-    report = asyncio.run(_run_renewal_sweep_async())
+    report = run_celery_task(_run_renewal_sweep_async())
     logger.info(
         "billing_task_run_subscription_renewal_sweep_completed",
         extra={
@@ -227,7 +226,7 @@ def run_invoice_overdue_sweep() -> dict[str, object]:
     failure isolation (``InvoiceService.mark_overdue_invoices``'s own
     docstring). See the module-level note above for why this is not yet
     registered in ``app.core.celery_app``'s ``beat_schedule``."""
-    overdue_ids = asyncio.run(_run_invoice_overdue_sweep_async())
+    overdue_ids = run_celery_task(_run_invoice_overdue_sweep_async())
     logger.info(
         "billing_task_run_invoice_overdue_sweep_completed",
         extra={"overdue_count": len(overdue_ids)},

@@ -27,9 +27,9 @@ FastAPI's DI machinery cannot run outside a request.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
+from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.database.session import SessionLocal
 from app.domains.location.repository import (
@@ -80,7 +80,7 @@ def run_provisioning_token_cleanup_sweep() -> dict[str, int]:
     """Beat-scheduled periodic task (see ``app.core.celery_app``'s
     ``beat_schedule`` -- runs every
     ``constants.PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS``)."""
-    cleaned = asyncio.run(_run_provisioning_token_cleanup_sweep_async())
+    cleaned = run_celery_task(_run_provisioning_token_cleanup_sweep_async())
     result = {"cleaned": cleaned}
     logger.info(
         "router_task_run_provisioning_token_cleanup_sweep_completed", extra=result

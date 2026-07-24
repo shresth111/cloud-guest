@@ -55,11 +55,11 @@ per-subscription isolation).
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 
 from redis.asyncio import Redis
 
+from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -256,7 +256,7 @@ def drain_provision_queue() -> dict[str, int]:
     """Beat-scheduled periodic task (see ``app.core.celery_app``'s
     ``beat_schedule`` -- runs every
     ``constants.PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS``)."""
-    result = asyncio.run(_drain_provision_queue_async())
+    result = run_celery_task(_drain_provision_queue_async())
     logger.info(
         "provisioning_engine_task_drain_provision_queue_completed", extra=result
     )
@@ -330,7 +330,7 @@ def run_router_health_poll_sweep() -> dict[str, int]:
     real async implementation of the same name in ``service.py`` (imported
     here as ``_run_router_health_poll_sweep`` purely to avoid shadowing this
     task function's own name within this module)."""
-    summary = asyncio.run(_run_router_health_poll_sweep_async())
+    summary = run_celery_task(_run_router_health_poll_sweep_async())
     result = {
         "checked": summary.checked,
         "unreachable": summary.unreachable,

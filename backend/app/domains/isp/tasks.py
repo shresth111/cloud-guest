@@ -22,9 +22,9 @@ a multi-dependency service by hand inside a Celery task.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
+from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.database.session import SessionLocal
 from app.domains.location.repository import (
@@ -82,7 +82,7 @@ async def _run_isp_health_check_sweep_async() -> HealthCheckSweepSummary:
 
 @celery_app.task(name=TASK_RUN_ISP_HEALTH_CHECK_SWEEP)
 def run_isp_health_check_sweep() -> dict[str, int]:
-    summary = asyncio.run(_run_isp_health_check_sweep_async())
+    summary = run_celery_task(_run_isp_health_check_sweep_async())
     result = {
         "checked": summary.checked,
         "failovers": summary.failovers,

@@ -42,9 +42,9 @@ this part's test suite requires.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 
+from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.core.logging import get_logger
 from app.database.session import SessionLocal
@@ -118,7 +118,7 @@ def run_daily_aggregation_for_all_organizations(
     task simply reports the batch result, it never re-raises a single
     organization's failure.
     """
-    result = asyncio.run(
+    result = run_celery_task(
         _run_all_organizations_async(target_date_iso=target_date_iso, days_ago=days_ago)
     )
     logger.info(
@@ -149,7 +149,7 @@ def run_daily_aggregation_for_organization(
     per ``app.core.celery_app``'s JSON-only serialization) parsed into a
     ``uuid.UUID`` here."""
     org_id = uuid.UUID(organization_id)
-    snapshot_count = asyncio.run(
+    snapshot_count = run_celery_task(
         _run_single_organization_async(
             org_id, target_date_iso=target_date_iso, days_ago=days_ago
         )

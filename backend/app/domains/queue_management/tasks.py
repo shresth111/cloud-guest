@@ -23,8 +23,7 @@ full guest/OTP/voucher/captive-portal graph that domain's own
 
 from __future__ import annotations
 
-import asyncio
-
+from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -95,7 +94,7 @@ def sweep_schedule_transitions() -> dict[str, int]:
     """Beat-scheduled periodic task (see ``app.core.celery_app``'s
     ``beat_schedule`` -- runs every
     ``constants.SCHEDULE_SWEEP_INTERVAL_SECONDS``)."""
-    result = asyncio.run(_sweep_schedule_transitions_async())
+    result = run_celery_task(_sweep_schedule_transitions_async())
     logger.info(
         "queue_management_task_sweep_schedule_transitions_completed", extra=result
     )

@@ -44,11 +44,11 @@ bridge, call the plain task function directly" contract
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.core.logging import get_logger
 from app.database.session import SessionLocal
@@ -124,7 +124,7 @@ def run_session_timeout_sweep() -> dict[str, object]:
     what makes that computation actually run on a schedule instead of only
     ever being reachable by an explicit caller (e.g. a test, or a future
     manual admin trigger)."""
-    expired_count = asyncio.run(_run_session_timeout_sweep_async())
+    expired_count = run_celery_task(_run_session_timeout_sweep_async())
     logger.info(
         "guest_task_run_session_timeout_sweep_completed",
         extra={"expired_count": expired_count},
@@ -163,7 +163,7 @@ def run_fup_time_accrual_sweep() -> dict[str, object]:
     expires any session whose guest has just crossed one -- see
     ``service.py``'s "FUP quota tracking" module docstring section for the
     full design write-up."""
-    result = asyncio.run(_run_fup_time_accrual_sweep_async())
+    result = run_celery_task(_run_fup_time_accrual_sweep_async())
     logger.info("guest_task_run_fup_time_accrual_sweep_completed", extra=result)
     return result
 
@@ -193,7 +193,7 @@ def run_quota_reset_sweep() -> dict[str, object]:
     every ``GuestQuotaUsage`` row over to a fresh, zeroed period the moment
     its own organization's local calendar day/week/month boundary passes --
     see ``service.py``'s "FUP quota tracking" module docstring section."""
-    result = asyncio.run(_run_quota_reset_sweep_async())
+    result = run_celery_task(_run_quota_reset_sweep_async())
     logger.info("guest_task_run_quota_reset_sweep_completed", extra=result)
     return result
 

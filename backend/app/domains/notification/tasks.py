@@ -17,9 +17,9 @@ and returns a plain, JSON-serializable result.
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 
+from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -62,7 +62,7 @@ def run_notification_dispatch_sweep() -> dict[str, int]:
     """Beat-scheduled periodic task (see ``app.core.celery_app``'s
     ``beat_schedule`` -- runs every
     ``Settings.notification_dispatch_sweep_interval_seconds``)."""
-    result = asyncio.run(_run_notification_dispatch_sweep_async())
+    result = run_celery_task(_run_notification_dispatch_sweep_async())
     logger.info("notification_task_dispatch_sweep_completed", extra=result)
     return result
 
