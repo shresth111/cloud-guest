@@ -9,6 +9,7 @@ try/except translation.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from dataclasses import dataclass
@@ -37,6 +38,14 @@ from .repository import AuthRepositoryProtocol
 from .security import AuthSecurity
 
 logger = logging.getLogger(__name__)
+
+
+def _hash_token(plaintext_token: str) -> str:
+    """SHA-256 of a high-entropy, randomly-generated token -- same choice
+    and same rationale as ``app.domains.api_keys.service._hash_key``: a
+    fast digest is fine (and preferable) here, unlike a user-chosen
+    password, because the input already has UUID4-grade entropy."""
+    return hashlib.sha256(plaintext_token.encode("utf-8")).hexdigest()
 
 
 class AuthServiceError(CloudGuestError):
@@ -486,14 +495,28 @@ class AuthService:
             reset_token = await self._issue_cache_token(
                 _RESET_TOKEN_KEY, user.id, ttl=timedelta(hours=1)
             )
+            # Same "public frontend origin + path" construction
+            # app.domains.location.provisioning_service._login_url uses for
+            # the welcome email's login_url -- the frontend's
+            # /reset-password route (src/routes/reset-password.tsx) reads
+            # this exact `token` query param and never a raw pasted code.
+            reset_url = (
+                f"{get_settings().frontend_base_url.rstrip('/')}"
+                f"/reset-password?token={reset_token}"
+            )
             await self.notification_service.enqueue(
                 event_type=NotificationEventType.PASSWORD_RESET,
                 channel=NotificationChannelType.EMAIL,
                 recipient=user.email,
                 subject="Reset your CloudGuest password",
                 body=(
-                    "Use this code to reset your password: "
-                    f"{reset_token} (expires in 1 hour)."
+                    f"Hello {user.first_name},\n\n"
+                    "We received a request to reset your CloudGuest password. "
+                    "Click the link below to choose a new one:\n\n"
+                    f"{reset_url}\n\n"
+                    "This link expires in 1 hour and can only be used once. "
+                    "If you didn't request this, you can safely ignore this "
+                    "email -- your password will not be changed."
                 ),
                 organization_id=None,
             )
@@ -554,10 +577,7 @@ class AuthService:
                 channel=NotificationChannelType.EMAIL,
                 recipient=user.email,
                 subject="Verify your CloudGuest account",
-                body=(
-                    "Use this code to verify your account: "
-                    f"{verification_token}"
-                ),
+                body=("Use this code to verify your account: " f"{verification_token}"),
                 organization_id=None,
             )
 
@@ -769,16 +789,25 @@ class AuthService:
     async def _issue_cache_token(
         self, key_template: str, user_id: uuid.UUID, *, ttl: timedelta
     ) -> str:
+        """Issues a high-entropy, single-use token (emailed/returned to the
+        caller) but keys the Redis entry off its SHA-256 hash, never the
+        plaintext -- the same "plaintext is handed out once, only its hash
+        is ever persisted" rule ``app.domains.api_keys.service._hash_key``
+        applies to API keys. Redis key names (unlike values) show up in
+        ``MONITOR``, slow logs, and RDB/AOF dumps, so this is a real
+        exposure surface worth closing, not just theatre."""
         token = str(uuid4())
         await self.redis.set(
-            key_template.format(token=token), str(user_id), ex=int(ttl.total_seconds())
+            key_template.format(token=_hash_token(token)),
+            str(user_id),
+            ex=int(ttl.total_seconds()),
         )
         return token
 
     async def _consume_cache_token(
         self, key_template: str, token: str
     ) -> uuid.UUID | None:
-        key = key_template.format(token=token)
+        key = key_template.format(token=_hash_token(token))
         raw_user_id = await self.redis.get(key)
         if not raw_user_id:
             return None

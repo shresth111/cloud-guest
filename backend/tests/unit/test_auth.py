@@ -53,6 +53,7 @@ from app.domains.auth.service import (
     MfaRequiredError,
     UsernameAlreadyExistsError,
 )
+from app.domains.auth.service import InvalidTokenError as ResetTokenInvalidError
 
 STRONG_PASSWORD = "SecurePass123!@#"
 
@@ -286,14 +287,14 @@ class FakeAuthRepository:
 
     # -- MFA -------------------------------------------------------------
 
-    async def get_mfa_credential(
-        self, user_id: uuid.UUID
-    ) -> UserMfaCredential | None:
+    async def get_mfa_credential(self, user_id: uuid.UUID) -> UserMfaCredential | None:
         return self.mfa_credentials_by_user.get(user_id)
 
     async def create_mfa_credential(self, **fields: object) -> UserMfaCredential:
         credential = UserMfaCredential(
-            id=uuid.uuid4(), created_at=datetime.now(UTC), updated_at=datetime.now(UTC),
+            id=uuid.uuid4(),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
             **fields,
         )
         self.mfa_credentials_by_user[credential.user_id] = credential
@@ -365,9 +366,7 @@ def make_service_with_notification_sender() -> (
     repository = FakeAuthRepository()
     redis = FakeRedis()
     notification_sender = FakeNotificationSender()
-    service = AuthService(
-        repository, redis, notification_service=notification_sender
-    )
+    service = AuthService(repository, redis, notification_service=notification_sender)
     return service, repository, redis, notification_sender
 
 
@@ -635,6 +634,103 @@ class TestAuthServiceNotificationWiring:
         assert sender.enqueued[0]["recipient"] == "test@example.com"
 
 
+class TestAuthServicePasswordResetRoundTrip:
+    """``initiate_password_reset`` (issues the token, emails the link) and
+    ``reset_password`` (consumes it) previously had no test exercising the
+    real, full flow a self-service "forgot password" click-through
+    actually performs -- only the notification-enqueue side was covered
+    above. These close that gap."""
+
+    @staticmethod
+    def _extract_token(body: object) -> str:
+        text = str(body)
+        assert "/reset-password?token=" in text
+        return text.split("token=", 1)[1].split()[0].strip()
+
+    async def test_reset_link_points_at_configured_frontend_base_url(self) -> None:
+        from app.core.config import get_settings
+
+        service, _repository, _redis, sender = make_service_with_notification_sender()
+        await service.register(
+            first_name="Test",
+            last_name="User",
+            email="test@example.com",
+            username="testuser",
+            password=STRONG_PASSWORD,
+        )
+        sender.enqueued.clear()
+
+        await service.initiate_password_reset("test@example.com")
+
+        body = str(sender.enqueued[0]["body"])
+        settings = get_settings()
+        assert f"{settings.frontend_base_url.rstrip('/')}/reset-password?token=" in body
+
+    async def test_full_round_trip_updates_password(self) -> None:
+        service, repository, _redis, sender = make_service_with_notification_sender()
+        await service.register(
+            first_name="Test",
+            last_name="User",
+            email="test@example.com",
+            username="testuser",
+            password=STRONG_PASSWORD,
+        )
+        sender.enqueued.clear()
+
+        await service.initiate_password_reset("test@example.com")
+        token = self._extract_token(sender.enqueued[0]["body"])
+
+        new_password = "AnotherSecurePass456!@#"
+        await service.reset_password(token, new_password)
+
+        user = await repository.get_user_by_email("test@example.com")
+        assert user is not None
+        assert PasswordManager.verify(new_password, user.password_hash) is True
+        assert PasswordManager.verify(STRONG_PASSWORD, user.password_hash) is False
+
+    async def test_reset_token_is_single_use(self) -> None:
+        service, _repository, _redis, sender = make_service_with_notification_sender()
+        await service.register(
+            first_name="Test",
+            last_name="User",
+            email="test@example.com",
+            username="testuser",
+            password=STRONG_PASSWORD,
+        )
+        sender.enqueued.clear()
+        await service.initiate_password_reset("test@example.com")
+        token = self._extract_token(sender.enqueued[0]["body"])
+
+        await service.reset_password(token, "AnotherSecurePass456!@#")
+
+        with pytest.raises(ResetTokenInvalidError):
+            await service.reset_password(token, "YetAnotherPass789!@#")
+
+    async def test_reset_password_rejects_unknown_token(self) -> None:
+        service, _repository, _redis, _sender = make_service_with_notification_sender()
+
+        with pytest.raises(ResetTokenInvalidError):
+            await service.reset_password("not-a-real-token", "AnotherSecurePass456!@#")
+
+    async def test_reset_token_not_stored_as_plaintext_in_redis(self) -> None:
+        """The Redis key must be a hash of the token, not the token
+        itself -- mirrors ``app.domains.api_keys`` never persisting a
+        plaintext API key. See ``AuthService._hash_token``."""
+        service, _repository, redis, sender = make_service_with_notification_sender()
+        await service.register(
+            first_name="Test",
+            last_name="User",
+            email="test@example.com",
+            username="testuser",
+            password=STRONG_PASSWORD,
+        )
+        sender.enqueued.clear()
+        await service.initiate_password_reset("test@example.com")
+        token = self._extract_token(sender.enqueued[0]["body"])
+
+        assert f"auth:password_reset:{token}" not in redis._store
+
+
 class TestAuthServiceLogin:
     async def test_login_rejects_unknown_email(self) -> None:
         service, _repository, _redis = make_service()
@@ -799,9 +895,7 @@ class TestListLoginAttempts:
 
 
 def _make_request(*, headers: dict[str, str] | None = None) -> Request:
-    raw_headers = [
-        (k.lower().encode(), v.encode()) for k, v in (headers or {}).items()
-    ]
+    raw_headers = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     return Request(
         {"type": "http", "method": "GET", "path": "/", "headers": raw_headers}
     )
@@ -1010,9 +1104,7 @@ class TestMfa:
         await _verify_email(service, user)
 
         with pytest.raises(MfaRequiredError):
-            await service.login(
-                "mfa@example.com", STRONG_PASSWORD, make_device_info()
-            )
+            await service.login("mfa@example.com", STRONG_PASSWORD, make_device_info())
 
     async def test_login_succeeds_with_correct_totp_code(self) -> None:
         service, _repository, _redis = make_service()
