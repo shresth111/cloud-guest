@@ -401,6 +401,24 @@ class WireGuardService:
                 # Lost a race for this tunnel_ip (or, vanishingly unlikely,
                 # a public_key collision) -- retry with a fresh occupancy
                 # read. See validators.allocate_tunnel_ip's module docstring.
+                #
+                # CAVEAT (not exercised by this loop's own unit tests, which
+                # use an in-memory fake repository): against the real
+                # ``GenericRepository``, ``_flush_or_raise`` converts the
+                # underlying ``IntegrityError`` into this exception via a
+                # full ``session.rollback()`` -- for a caller sharing one
+                # session/transaction across many already-flushed steps
+                # (``LocationProvisioningService.provision_location``), that
+                # can expire ORM state from earlier in the same request and
+                # make a *second* collision here surface as a confusing
+                # ``sqlalchemy.exc.MissingGreenlet`` instead of a clean
+                # domain error, rather than cleanly retrying. In practice
+                # this loop's realistic trigger (a revoked peer's tunnel IP
+                # never actually being freed at the DB level) is fixed at
+                # the source in ``revoke_tunnel`` below, which is expected
+                # to make hitting this branch at all rare going forward. See
+                # request_id ef092a85-0ff0-49b8-801f-327b733288f5 for a live
+                # repro of the pre-fix crash.
                 logger.warning(
                     "wireguard_tunnel_ip_allocation_conflict",
                     extra={"attempt": attempt + 1, "tunnel_ip": tunnel_ip},
@@ -428,15 +446,38 @@ class WireGuardService:
         validate_peer_transition(peer.status, PeerStatus.REVOKED)
 
         now = datetime.now(UTC)
+        # Release the tunnel IP back to the pool -- ``(server_id,
+        # tunnel_ip_address)`` carries an unconditional DB unique
+        # constraint (models.py), so leaving a revoked peer's real address
+        # in place would permanently block any *other* router from ever
+        # being allocated that same address again: ``_allocate_and_persist``
+        # already treats a revoked peer's IP as free (``list_occupied_tunnel_ips``
+        # excludes non-active statuses), but that promise was never actually
+        # honored at the database level -- the stale row's address would
+        # deterministically collide on every future allocation attempt that
+        # reached it (``allocate_tunnel_ip`` walks candidates in address
+        # order, so a low, once-used address is retried indefinitely). A
+        # deterministic, per-peer-unique placeholder both satisfies the
+        # ``nullable=False`` column and can never again collide with a real
+        # allocated address.
+        released_tunnel_ip = peer.tunnel_ip_address
         updated = await self.repository.update_peer(
-            peer, {"status": PeerStatus.REVOKED.value, "revoked_at": now}
+            peer,
+            {
+                "status": PeerStatus.REVOKED.value,
+                "revoked_at": now,
+                "tunnel_ip_address": f"revoked:{peer.id}",
+            },
         )
         await self._record_event_and_audit(
             actor_user_id,
             AuditAction.WIREGUARD_TUNNEL_REVOKED,
             router=router,
             peer=updated,
-            description=f"WireGuard tunnel revoked for router '{router.name}'",
+            description=(
+                f"WireGuard tunnel revoked for router '{router.name}' "
+                f"(released {released_tunnel_ip})"
+            ),
         )
         event = TunnelRevoked(router_id=router.id, peer_id=updated.id)
         logger.info("wireguard_tunnel_revoked", extra=_event_extra(event))
