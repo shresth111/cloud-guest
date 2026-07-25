@@ -9,9 +9,9 @@ envelope by ``router.py``.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .constants import AccessRuleType
 
@@ -25,6 +25,22 @@ __all__ = [
     "DeviceAccessRuleListResponse",
     "AccessCheckResponse",
 ]
+
+
+def _assume_utc_if_naive(v: datetime | None) -> datetime | None:
+    """HTML's ``<input type="datetime-local">`` -- what the customer
+    dashboard's Whitelist "End Date" field (``WhiteList.tsx``) submits --
+    produces a value with no UTC offset, e.g. ``"2026-08-01T06:49"``.
+    Pydantic parses that into a *naive* ``datetime``. ``validate_rule_expiry``/
+    ``is_rule_expired`` then compare it against ``datetime.now(UTC)`` (aware),
+    which raises ``TypeError: can't compare offset-naive and offset-aware
+    datetimes`` -- an unhandled 500 that (since it escapes CORSMiddleware)
+    the browser reports as a CORS failure, masking the real error. Treat a
+    naive value as already-UTC, the same interpretation every other stored
+    ``expires_at`` in this table uses, rather than crashing the request."""
+    if v is not None and v.tzinfo is None:
+        return v.replace(tzinfo=UTC)
+    return v
 
 
 # ============================================================================
@@ -49,6 +65,8 @@ class GuestAccessRuleCreate(BaseModel):
         ),
     )
 
+    _normalize_expires_at = field_validator("expires_at")(_assume_utc_if_naive)
+
 
 class DeviceAccessRuleCreate(BaseModel):
     organization_id: uuid.UUID
@@ -57,6 +75,8 @@ class DeviceAccessRuleCreate(BaseModel):
     rule_type: AccessRuleType
     reason: str | None = Field(default=None, max_length=2000)
     expires_at: datetime | None = Field(default=None)
+
+    _normalize_expires_at = field_validator("expires_at")(_assume_utc_if_naive)
 
 
 class AccessCheckRequest(BaseModel):
