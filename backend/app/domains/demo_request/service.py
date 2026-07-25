@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from typing import Protocol
 
 from app.database.utils.pagination import PaginationMeta
 
@@ -19,6 +20,17 @@ from .repository import DemoRequestRepositoryProtocol
 logger = logging.getLogger(__name__)
 
 
+class NotificationEnqueuer(Protocol):
+    """The narrow subset of ``app.domains.notification.service
+    .NotificationService`` this module needs -- composition, not
+    duplication, mirrors ``app.domains.support_tickets.service``'s own
+    ``AuditLogWriter``/``LocationLookupProtocol`` narrow-protocol pattern
+    for the identical reason (depend on the one method actually used, not
+    the concrete class)."""
+
+    async def enqueue(self, **fields: object) -> object: ...
+
+
 @dataclass
 class DemoRequestListResult:
     items: list[DemoRequest]
@@ -26,8 +38,21 @@ class DemoRequestListResult:
 
 
 class DemoRequestService:
-    def __init__(self, repository: DemoRequestRepositoryProtocol) -> None:
+    def __init__(
+        self,
+        repository: DemoRequestRepositoryProtocol,
+        *,
+        notification_service: NotificationEnqueuer | None = None,
+        notify_email: str = "",
+    ) -> None:
         self.repository = repository
+        # Both default to inert (None/"") so every existing unit test that
+        # builds a DemoRequestService directly keeps working unchanged --
+        # mirrors app.domains.support_tickets.service.TicketService's own
+        # "redis_client: Redis | None = None" posture for the identical
+        # reason.
+        self.notification_service = notification_service
+        self.notify_email = notify_email
 
     # -- create (public) ---------------------------------------------------
 
@@ -55,7 +80,45 @@ class DemoRequestService:
             "demo_request_submitted",
             extra={"demo_request_id": str(demo_request.id)},
         )
+        await self._notify_team(demo_request)
         return demo_request
+
+    async def _notify_team(self, demo_request: DemoRequest) -> None:
+        """Best-effort internal-team email on every new submission --
+        never raises out of ``submit_demo_request`` (a notification
+        failure must never fail the prospect's own form submission, the
+        same resilience posture ``app.domains.support_tickets.service
+        ._publish_live_message`` documents for its own identical "never
+        block/break the real write that already succeeded" reasoning). A
+        genuine no-op, not a soft failure, when either dependency is unset
+        -- see ``Settings.demo_request_notify_email``'s own docstring."""
+        if self.notification_service is None or not self.notify_email:
+            return
+        try:
+            from app.domains.notification.constants import (
+                NotificationChannelType,
+                NotificationEventType,
+            )
+
+            await self.notification_service.enqueue(
+                event_type=NotificationEventType.DEMO_REQUEST_RECEIVED,
+                channel=NotificationChannelType.EMAIL,
+                recipient=self.notify_email,
+                subject=f"New demo request: {demo_request.company_name}",
+                body=(
+                    f"{demo_request.full_name} ({demo_request.email}) from "
+                    f"{demo_request.company_name} requested a demo.\n\n"
+                    f"Phone: {demo_request.phone or '—'}\n"
+                    f"Message: {demo_request.message or '—'}\n\n"
+                    "View it on the Master console under Demo Requests."
+                ),
+                organization_id=None,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "demo_request_notify_failed",
+                extra={"demo_request_id": str(demo_request.id), "error": str(exc)},
+            )
 
     # -- read (Master console) ----------------------------------------------
 
@@ -98,4 +161,4 @@ class DemoRequestService:
         return updated
 
 
-__all__ = ["DemoRequestService", "DemoRequestListResult"]
+__all__ = ["DemoRequestService", "DemoRequestListResult", "NotificationEnqueuer"]

@@ -772,6 +772,20 @@ class Settings(BaseSettings):
     ses_region: str = Field(default="us-east-1")
     ses_from_address: str = Field(default="")
 
+    demo_request_notify_email: str = Field(
+        default="",
+        description=(
+            "Internal-team inbox app.domains.demo_request.service"
+            ".DemoRequestService notifies (via app.domains.notification) on "
+            "every new public 'Book a Demo' submission. Empty (the "
+            "default) is a deliberate no-op -- same 'unconfigured means "
+            "silently skip, not fabricate a recipient' posture as "
+            "email_delivery_provider='logging' above -- so a fresh "
+            "checkout with no team inbox configured yet never fails/spams "
+            "an arbitrary address."
+        ),
+    )
+
     sms_delivery_provider: str = Field(
         default="logging",
         description=(
