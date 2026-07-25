@@ -112,7 +112,10 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     # RBAC permission to check before you have picked a workspace. Same
     # category as GET /me/organizations above. ------------------------
     ("GET", "/api/v1/workspaces"): "Self-service -- own memberships only.",
-    ("GET", "/api/v1/workspaces/current"): "Self-service -- own current workspace only.",
+    (
+        "GET",
+        "/api/v1/workspaces/current",
+    ): "Self-service -- own current workspace only.",
     ("POST", "/api/v1/workspaces/switch"): (
         "Self-service -- switching among orgs the caller is already a "
         "member of; WorkspaceService enforces membership."
@@ -158,6 +161,12 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "Gated by a one-time provisioning token in the request body "
         "(hash-compared/expiry/single-use checked in RouterService"
         ".check_in), not RBAC."
+    ),
+    ("POST", "/api/v1/demo-requests"): (
+        "Public 'Book a Demo' lead-capture form -- a prospective customer "
+        "has no platform-user identity yet; protected by "
+        "RateLimitMiddleware, not RBAC (see "
+        "app.domains.demo_request.router's module docstring)."
     ),
     ("POST", "/api/v1/webhooks/stripe"): (
         "Payment gateway webhook -- verified by Stripe request signature."

@@ -274,6 +274,13 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # device's console command history) and EXECUTE (run a command) are the
     # only two actions this module has.
     PermissionModule.DEVICE_CONSOLE: (_A.READ, _A.EXECUTE),
+    # Demo Requests: no CREATE action -- the only way a row is created is
+    # the public, unauthenticated "Book a Demo" form (see
+    # app.domains.demo_request.router's own module docstring), which is
+    # deliberately never RBAC-gated. The Master console only ever READs
+    # the submitted queue and MANAGEs (updates status/internal notes on)
+    # an existing row -- no UPDATE/DELETE/CREATE beyond that.
+    PermissionModule.DEMO_REQUESTS: (_A.READ, _A.MANAGE),
     # ISP Management: full CRUD on isp_links plus EXECUTE for the manual
     # health-check/failover/failback triggers -- mirrors
     # PermissionModule.BANDWIDTH's own identical CRUD+EXECUTE+MANAGE shape
@@ -443,6 +450,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.NETWORK_DIAGNOSTICS: "Network Diagnostics",
     PermissionModule.NETWORK_DEVICE: "Network Device (NAC)",
     PermissionModule.SUPPORT_TICKETS: "Support Tickets",
+    PermissionModule.DEMO_REQUESTS: "Demo Requests",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -542,6 +550,12 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # PermissionModule.GUEST_ACCESS's own entry already established (also
     # an org/location-scoped, non-router, non-device domain).
     PermissionModule.SUPPORT_TICKETS: ScopeType.LOCATION,
+    # A demo request belongs to no organization/location/router at all --
+    # it is submitted before any of those exist for the prospect (see
+    # models.py's own module docstring) -- same ScopeType.GLOBAL reasoning
+    # as PermissionModule.SYSTEM_SETTINGS's own entry above: it is
+    # meaningful only at the platform (Master console) level.
+    PermissionModule.DEMO_REQUESTS: ScopeType.GLOBAL,
 }
 
 
@@ -717,6 +731,11 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # own MODULE_ACTIONS comment for why it stays off every
             # OPERATE/FULL-default role by default.
             _M.DEVICE_CONSOLE: _L.NONE,
+            # DEMO_REQUESTS is GLOBAL-only (see MODULE_NARROWEST_SCOPE) --
+            # an ORGANIZATION-scoped role can never hold any of its
+            # permissions, same reasoning as this role's own
+            # SYSTEM_SETTINGS: NONE override above.
+            _M.DEMO_REQUESTS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -738,6 +757,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # org" posture MSP Owner's own override above establishes.
             _M.SUPPORT_TICKETS: _L.FULL,
             _M.DEVICE_CONSOLE: _L.NONE,
+            # DEMO_REQUESTS is GLOBAL-only -- see MSP Owner's own identical
+            # override above.
+            _M.DEMO_REQUESTS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -762,6 +784,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # short of raw command execution on its routers -- see
             # DEVICE_CONSOLE's own MODULE_ACTIONS comment.
             _M.DEVICE_CONSOLE: _L.NONE,
+            # DEMO_REQUESTS is GLOBAL-only -- see MSP Owner's own identical
+            # override above.
+            _M.DEMO_REQUESTS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -785,6 +810,9 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # only cover create+read, not assign/resolve.
             _M.SUPPORT_TICKETS: _L.FULL,
             _M.DEVICE_CONSOLE: _L.NONE,
+            # DEMO_REQUESTS is GLOBAL-only -- see MSP Owner's own identical
+            # override above.
+            _M.DEMO_REQUESTS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -975,7 +1003,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         default_level=_L.READ,
         # SYSTEM_SETTINGS is GLOBAL-only (see MODULE_NARROWEST_SCOPE) -- an
         # ORGANIZATION-scoped role can never hold any of its permissions.
-        overrides={_M.SYSTEM_SETTINGS: _L.NONE},
+        # DEMO_REQUESTS is the identical case (also GLOBAL-only).
+        overrides={_M.SYSTEM_SETTINGS: _L.NONE, _M.DEMO_REQUESTS: _L.NONE},
     ),
     SystemRoleDefinition(
         name="Auditor",
@@ -986,7 +1015,13 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         ),
         scope_type=ScopeType.ORGANIZATION,
         default_level=_L.READ,
-        overrides={_M.AUDIT_LOGS: _L.FULL, _M.SYSTEM_SETTINGS: _L.NONE},
+        overrides={
+            _M.AUDIT_LOGS: _L.FULL,
+            _M.SYSTEM_SETTINGS: _L.NONE,
+            # DEMO_REQUESTS is GLOBAL-only -- see Read Only's own identical
+            # override above.
+            _M.DEMO_REQUESTS: _L.NONE,
+        },
     ),
     SystemRoleDefinition(
         name="Guest Operator",

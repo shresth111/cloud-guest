@@ -116,6 +116,7 @@ class PermissionModule(StrEnum):
     NETWORK_DEVICE = "network_device"
     SUPPORT_TICKETS = "support_tickets"
     DEVICE_CONSOLE = "device_console"
+    DEMO_REQUESTS = "demo_requests"
 
 
 class OverrideEffect(StrEnum):

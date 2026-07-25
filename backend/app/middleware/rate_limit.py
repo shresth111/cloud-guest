@@ -57,6 +57,13 @@ RATE_LIMITED_PATH_PREFIXES: tuple[str, ...] = (
     "/api/v1/vouchers/redeem",
     "/api/v1/captive-portal/resolve",
     "/api/v1/guest/",
+    # Public "Book a Demo" lead-capture form -- no auth, so nothing but this
+    # per-IP throttle stops it being trivially spammed. Only POST is
+    # unauthenticated (see app.domains.demo_request.router's own module
+    # docstring), but the prefix also covers the RBAC-gated GET/PATCH
+    # endpoints, matching every other prefix entry above's own
+    # "whole-domain prefix, not method-specific" grain.
+    "/api/v1/demo-requests",
 )
 
 _RATE_LIMIT_KEY_TEMPLATE = "rate_limit:{client_ip}:{path}"

@@ -6,11 +6,14 @@ from app.domains.api_keys.router import router as api_keys_router
 from app.domains.assistant.router import router as assistant_router
 from app.domains.audit.router import router as audit_router
 from app.domains.dashboard.router import router as dashboard_router
+from app.domains.demo_request.router import router as demo_request_router
 from app.domains.workspace.router import router as workspace_router
 from app.domains.feature_entitlement.router import router as feature_entitlement_router
 from app.domains.agent_permissions.router import router as agent_permissions_router
 from app.domains.live_sessions.router import router as live_sessions_router
-from app.domains.customer_provisioning.router import router as customer_provisioning_router
+from app.domains.customer_provisioning.router import (
+    router as customer_provisioning_router,
+)
 from app.domains.system.router import router as system_router
 from app.domains.auth.router import router as auth_router
 from app.domains.billing.router import router as billing_router
@@ -119,4 +122,5 @@ api_v1_router.include_router(customer_provisioning_router)
 api_v1_router.include_router(system_router)
 api_v1_router.include_router(branding_router)
 api_v1_router.include_router(support_tickets_router)
+api_v1_router.include_router(demo_request_router)
 api_v1_router.include_router(assistant_router)
