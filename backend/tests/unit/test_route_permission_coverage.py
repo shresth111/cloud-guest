@@ -69,6 +69,19 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "Platform default branding shown pre-login -- no organization "
         "identity exists yet."
     ),
+    ("GET", "/api/v1/branding/{organization_id}/logo/public"): (
+        "Public logo proxy for the guest-facing captive portal -- a real "
+        "guest has no platform identity RBAC could grant a permission "
+        "to, same class of exception as GET /captive-portal/resolve "
+        "itself, which is what points a guest's browser at this path in "
+        "the first place (see app.domains.branding.router's "
+        "get_logo_public docstring)."
+    ),
+    ("GET", "/api/v1/branding/{organization_id}/background-image/public"): (
+        "Public background-image proxy for the guest-facing captive "
+        "portal -- mirrors the logo/public entry immediately above "
+        "exactly, same reasoning."
+    ),
     ("GET", "/api/v1/features"): (
         "Static platform feature catalog, not customer-specific -- same "
         "public-catalog category as GET /branding/default."

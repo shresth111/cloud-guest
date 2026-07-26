@@ -36,6 +36,14 @@ class BrandingRepositoryProtocol(Protocol):
         actor_user_id: uuid.UUID | None = None,
     ) -> Branding: ...
 
+    async def set_logo_key(
+        self,
+        organization_id: uuid.UUID,
+        key: str | None,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> Branding: ...
+
 
 class BrandingRepository(BrandingRepositoryProtocol):
     def __init__(self, db: AsyncSession) -> None:
@@ -105,6 +113,33 @@ class BrandingRepository(BrandingRepositoryProtocol):
         branding = Branding(
             organization_id=organization_id,
             background_image_key=key,
+            created_by=actor_user_id,
+            updated_by=actor_user_id,
+        )
+        self.db.add(branding)
+        await self.db.flush()
+        return branding
+
+    async def set_logo_key(
+        self,
+        organization_id: uuid.UUID,
+        key: str | None,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> Branding:
+        """Sets (or, with ``key=None``, clears) the uploaded logo's object
+        key. Mirrors set_background_image_key exactly -- deliberately
+        separate from :meth:`upsert`, which skips ``None`` values."""
+        existing = await self.get_by_organization(organization_id)
+        if existing:
+            existing.logo_key = key
+            existing.updated_by = actor_user_id
+            await self.db.flush()
+            return existing
+
+        branding = Branding(
+            organization_id=organization_id,
+            logo_key=key,
             created_by=actor_user_id,
             updated_by=actor_user_id,
         )

@@ -26,6 +26,8 @@ from app.domains.branding.exceptions import (
     BackgroundImageNotFoundError,
     BrandingStorageNotConfiguredError,
     InvalidBackgroundImageError,
+    InvalidLogoError,
+    LogoNotFoundError,
 )
 from app.domains.branding.models import Branding
 from app.domains.branding.router import router as branding_router
@@ -34,6 +36,8 @@ from app.domains.branding.service import (
     BACKGROUND_IMAGE_MAX_BYTES,
     BACKGROUND_IMAGE_RAW_PATH,
     DEFAULT_BRANDING,
+    LOGO_MAX_BYTES,
+    LOGO_RAW_PATH,
     BrandingService,
 )
 
@@ -124,6 +128,30 @@ class FakeBrandingRepository:
             id=uuid.uuid4(),
             organization_id=organization_id,
             background_image_key=key,
+            created_by=actor_user_id,
+            updated_by=actor_user_id,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        self._by_org[organization_id] = branding
+        return branding
+
+    async def set_logo_key(
+        self,
+        organization_id: uuid.UUID,
+        key: str | None,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> Branding:
+        existing = self._by_org.get(organization_id)
+        if existing:
+            existing.logo_key = key
+            existing.updated_by = actor_user_id
+            return existing
+        branding = Branding(
+            id=uuid.uuid4(),
+            organization_id=organization_id,
+            logo_key=key,
             created_by=actor_user_id,
             updated_by=actor_user_id,
             created_at=datetime.now(UTC),
@@ -368,6 +396,170 @@ class TestGetBackgroundImageBytes:
 
 
 # ============================================================================
+# upload_logo / delete_logo / get_logo_bytes -- mirrors the
+# background-image test classes above exactly.
+# ============================================================================
+
+
+class TestUploadLogo:
+    async def test_upload_persists_key_and_returns_proxy_url(self) -> None:
+        service, repository, storage, audit_writer = make_service()
+        org_id = uuid.uuid4()
+
+        result = await service.upload_logo(
+            org_id,
+            filename="logo.png",
+            content_type="image/png",
+            content=PNG_BYTES,
+            actor_user_id=uuid.uuid4(),
+        )
+
+        assert result.logo_url == LOGO_RAW_PATH
+        assert result.logo_is_uploaded is True
+        stored = repository._by_org[org_id]
+        assert stored.logo_key is not None
+        assert stored.logo_key.startswith(f"branding/{org_id}/logo/")
+        assert stored.logo_key.endswith(".png")
+        assert storage.uploaded[stored.logo_key] == PNG_BYTES
+        assert any(
+            e["action"] == "branding_logo_updated" for e in audit_writer.entries
+        )
+
+    async def test_upload_wins_over_plain_text_logo_url(self) -> None:
+        service, repository, _storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        repository._by_org[org_id] = Branding(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            logo_url="https://example.com/manually-typed-logo.png",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+
+        result = await service.upload_logo(
+            org_id, filename="logo.png", content_type="image/png", content=PNG_BYTES
+        )
+
+        assert result.logo_url == LOGO_RAW_PATH
+        assert result.logo_is_uploaded is True
+
+    async def test_rejects_unsupported_content_type(self) -> None:
+        service, _repository, _storage, _audit = make_service()
+        with pytest.raises(InvalidLogoError):
+            await service.upload_logo(
+                uuid.uuid4(),
+                filename="script.svg",
+                content_type="image/svg+xml",
+                content=b"<svg></svg>",
+            )
+
+    async def test_rejects_empty_file(self) -> None:
+        service, _repository, _storage, _audit = make_service()
+        with pytest.raises(InvalidLogoError):
+            await service.upload_logo(
+                uuid.uuid4(),
+                filename="empty.png",
+                content_type="image/png",
+                content=b"",
+            )
+
+    async def test_rejects_oversized_file(self) -> None:
+        service, _repository, _storage, _audit = make_service()
+        oversized = b"0" * (LOGO_MAX_BYTES + 1)
+        with pytest.raises(InvalidLogoError):
+            await service.upload_logo(
+                uuid.uuid4(),
+                filename="huge.png",
+                content_type="image/png",
+                content=oversized,
+            )
+
+    async def test_raises_when_storage_not_configured(self) -> None:
+        service, _repository, _storage, _audit = make_service(with_storage=False)
+        with pytest.raises(BrandingStorageNotConfiguredError):
+            await service.upload_logo(
+                uuid.uuid4(),
+                filename="logo.png",
+                content_type="image/png",
+                content=PNG_BYTES,
+            )
+
+
+class TestDeleteLogo:
+    async def test_delete_clears_key_and_falls_back_to_plain_url(self) -> None:
+        service, repository, _storage, audit_writer = make_service()
+        org_id = uuid.uuid4()
+        repository._by_org[org_id] = Branding(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            logo_url="https://example.com/fallback-logo.png",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        await service.upload_logo(
+            org_id, filename="logo.png", content_type="image/png", content=PNG_BYTES
+        )
+        assert repository._by_org[org_id].logo_key is not None
+
+        result = await service.delete_logo(org_id)
+
+        assert repository._by_org[org_id].logo_key is None
+        # Deleting the *uploaded* logo reveals the plain-text URL again,
+        # exactly the same "clear only this layer" semantics
+        # set_background_image_key/set_logo_key both implement.
+        assert result.logo_url == "https://example.com/fallback-logo.png"
+        assert result.logo_is_uploaded is False
+        assert any(
+            e["action"] == "branding_logo_removed" for e in audit_writer.entries
+        )
+
+    async def test_raises_when_storage_not_configured(self) -> None:
+        service, _repository, _storage, _audit = make_service(with_storage=False)
+        with pytest.raises(BrandingStorageNotConfiguredError):
+            await service.delete_logo(uuid.uuid4())
+
+
+class TestGetLogoBytes:
+    async def test_returns_bytes_and_content_type_for_uploaded_logo(self) -> None:
+        service, _repository, _storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        await service.upload_logo(
+            org_id, filename="logo.jpg", content_type="image/jpeg", content=PNG_BYTES
+        )
+
+        content, content_type = await service.get_logo_bytes(org_id)
+
+        assert content == PNG_BYTES
+        assert content_type == "image/jpeg"
+
+    async def test_raises_not_found_when_no_logo_uploaded(self) -> None:
+        service, _repository, _storage, _audit = make_service()
+        with pytest.raises(LogoNotFoundError):
+            await service.get_logo_bytes(uuid.uuid4())
+
+    async def test_raises_not_found_when_only_plain_text_url_set(self) -> None:
+        # A manually-typed logo_url with no upload doesn't count -- that's
+        # rendered by hotlinking the URL directly, never through this
+        # authenticated proxy.
+        service, repository, _storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        repository._by_org[org_id] = Branding(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            logo_url="https://example.com/logo.png",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        with pytest.raises(LogoNotFoundError):
+            await service.get_logo_bytes(org_id)
+
+    async def test_raises_when_storage_not_configured(self) -> None:
+        service, _repository, _storage, _audit = make_service(with_storage=False)
+        with pytest.raises(BrandingStorageNotConfiguredError):
+            await service.get_logo_bytes(uuid.uuid4())
+
+
+# ============================================================================
 # GET /branding response_model regression: this endpoint can genuinely
 # return either shape (see router.py's own comment on this), so the
 # declared response_model must accept both -- this is exactly the
@@ -406,16 +598,22 @@ class TestGetBrandingResponseModelAcceptsBothShapes:
 # ============================================================================
 
 
+_PUBLIC_BRANDING_ROUTES = {
+    "/branding/default",
+    "/branding/{organization_id}/logo/public",
+    "/branding/{organization_id}/background-image/public",
+}
+
+
 class TestEveryRouteRequiresPermission:
-    def test_every_branding_route_has_a_permission_dependency_or_is_the_public_default(
+    def test_every_branding_route_has_a_permission_dependency_or_is_public(
         self,
     ) -> None:
-        # GET /branding/default is the one deliberate exception -- platform
-        # default branding shown pre-login, no organization/identity exists
-        # yet (see tests/unit/test_route_permission_coverage.py's own
-        # allowlist entry for this exact route).
+        # See tests/unit/test_route_permission_coverage.py's own allowlist
+        # entries for these exact three routes -- each documents its own
+        # "no platform identity exists at this point" reason there.
         for route in branding_router.routes:
-            if getattr(route, "path", "") == "/branding/default":
+            if getattr(route, "path", "") in _PUBLIC_BRANDING_ROUTES:
                 continue
             assert (
                 route.dependencies != []

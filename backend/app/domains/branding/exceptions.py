@@ -33,15 +33,28 @@ class InvalidBackgroundImageError(CloudGuestError):
         )
 
 
-class BrandingStorageNotConfiguredError(CloudGuestError):
-    """Raised if BrandingService.upload/delete_background_image is called
-    on a service instance built without an object_storage backend --
-    mirrors app.domains.voucher.exceptions.
-    VoucherEmailDeliveryNotConfiguredError's identical defensive shape."""
+class InvalidLogoError(CloudGuestError):
+    """Raised when an uploaded logo fails content-type or size validation
+    in ``BrandingService.upload_logo`` -- mirrors
+    InvalidBackgroundImageError exactly."""
 
-    def __init__(self) -> None:
+    def __init__(self, reason: str) -> None:
         super().__init__(
-            message="Background image storage is not configured",
+            message=f"Invalid logo: {reason}",
+            status_code=400,
+        )
+
+
+class BrandingStorageNotConfiguredError(CloudGuestError):
+    """Raised if BrandingService.upload/delete_background_image or
+    upload/delete_logo is called on a service instance built without an
+    object_storage backend -- mirrors
+    app.domains.voucher.exceptions.VoucherEmailDeliveryNotConfiguredError's
+    identical defensive shape."""
+
+    def __init__(self, asset: str = "Background image") -> None:
+        super().__init__(
+            message=f"{asset} storage is not configured",
             status_code=503,
         )
 
@@ -55,5 +68,16 @@ class BackgroundImageNotFoundError(CloudGuestError):
     def __init__(self, organization_id: object) -> None:
         super().__init__(
             message=f"No background image set for organization {organization_id}",
+            status_code=404,
+        )
+
+
+class LogoNotFoundError(CloudGuestError):
+    """Raised by BrandingService.get_logo_bytes when the organization has
+    no uploaded logo -- mirrors BackgroundImageNotFoundError exactly."""
+
+    def __init__(self, organization_id: object) -> None:
+        super().__init__(
+            message=f"No logo set for organization {organization_id}",
             status_code=404,
         )

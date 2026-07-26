@@ -11,7 +11,14 @@ class BrandingResponse(BaseModel):
     id: str
     organization_id: str
     company_name: str | None = None
+    # Either the stable GET /branding/logo/raw proxy path (an uploaded
+    # logo exists -- see BrandingService._resolve_logo_url) or the plain
+    # text URL column (no upload, an admin typed an already-hosted URL
+    # instead). `logo_is_uploaded` tells the caller which one this is --
+    # the proxy path needs an authenticated blob fetch, a plain URL can
+    # be hotlinked directly.
     logo_url: str | None = None
+    logo_is_uploaded: bool = False
     favicon_url: str | None = None
     primary_color: str | None = None
     secondary_color: str | None = None
@@ -38,6 +45,7 @@ class BrandingUpdateRequest(BaseModel):
 class DefaultBrandingResponse(BaseModel):
     company_name: str = "CloudGuest"
     logo_url: str = "https://cloudguest.io/logo.svg"
+    logo_is_uploaded: bool = False
     favicon_url: str = "https://cloudguest.io/favicon.ico"
     primary_color: str = "#4361EE"
     secondary_color: str = "#3F37C9"

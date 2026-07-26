@@ -34,10 +34,17 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, Query, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.responses import ApiResponse, build_response
+from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
+from app.domains.branding.repository import BrandingRepository
+from app.domains.branding.service import (
+    PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE,
+    PUBLIC_LOGO_PATH_TEMPLATE,
+)
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -336,12 +343,54 @@ async def resolve_captive_portal_config(
     organization_id: uuid.UUID | None = Query(default=None),
     location_id: uuid.UUID | None = Query(default=None),
     service: CaptivePortalService = Depends(get_captive_portal_service),
+    db: AsyncSession = Depends(get_db_session),
 ):
     resolved = await service.resolve_portal_config(
         organization_id=organization_id, location_id=location_id
     )
+    config_payload = _config_response(resolved.config).model_dump()
+
+    # Fall back to the organization's own branding (app.domains.branding)
+    # for whichever of logo_url/background_image_url this specific
+    # captive_portal_configs row left unset -- a config controls login-
+    # method toggles/legal text/theme colors, but plenty of real
+    # organizations only ever uploaded a logo/background image through
+    # the separate Branding admin page, never typed a URL into this
+    # config's own fields. Guest-facing resolve only: every admin CRUD
+    # endpoint above (list/get/create/update) returns the config exactly
+    # as stored, unmerged, so an operator editing it sees real data, not
+    # a synthesized value. Points at the *public* (unauthenticated)
+    # branding proxy paths (see app.domains.branding.router's
+    # get_logo_public/get_background_image_public) -- the real, private
+    # /branding/logo/raw path this same organization's admins use
+    # requires a JWT this anonymous guest's device will never have.
+    needs_logo = config_payload["logo_url"] is None
+    needs_background = config_payload["background_image_url"] is None
+    if needs_logo or needs_background:
+        branding = await BrandingRepository(db).get_by_organization(
+            resolved.config.organization_id
+        )
+        if branding is not None:
+            org_id = str(resolved.config.organization_id)
+            if config_payload["logo_url"] is None:
+                if branding.logo_key:
+                    # An uploaded logo needs the public proxy -- the
+                    # object storage key isn't a URL a browser can load.
+                    config_payload["logo_url"] = PUBLIC_LOGO_PATH_TEMPLATE.format(
+                        organization_id=org_id
+                    )
+                elif branding.logo_url:
+                    # A plain, already-hosted URL an admin typed in
+                    # instead of uploading a file -- directly
+                    # hotlinkable as-is, no proxy needed.
+                    config_payload["logo_url"] = branding.logo_url
+            if needs_background and branding.background_image_key:
+                config_payload["background_image_url"] = (
+                    PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE.format(organization_id=org_id)
+                )
+
     response_payload = ResolvedCaptivePortalConfigResponse(
-        **_config_response(resolved.config).model_dump(),
+        **config_payload,
         resolved_via_location_override=resolved.resolved_via_location_override,
     )
     return build_response(

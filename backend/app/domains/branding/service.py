@@ -13,6 +13,8 @@ from .exceptions import (
     BackgroundImageNotFoundError,
     BrandingStorageNotConfiguredError,
     InvalidBackgroundImageError,
+    InvalidLogoError,
+    LogoNotFoundError,
 )
 from .models import Branding
 from .repository import BrandingRepositoryProtocol
@@ -50,6 +52,31 @@ _EXTENSION_TO_CONTENT_TYPE = {
     ext: content_type
     for content_type, ext in BACKGROUND_IMAGE_ALLOWED_CONTENT_TYPES.items()
 }
+
+# Logo upload constraints -- same allowed types/size ceiling as the
+# background image (no image-processing pipeline exists here either), a
+# separate constant only so the two can diverge later without coupling.
+LOGO_ALLOWED_CONTENT_TYPES: dict[str, str] = dict(
+    BACKGROUND_IMAGE_ALLOWED_CONTENT_TYPES
+)
+LOGO_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB
+
+# See BACKGROUND_IMAGE_RAW_PATH's own comment -- same reasoning, same
+# same-API-proxy-not-direct-object-storage-link approach.
+LOGO_RAW_PATH = "/branding/logo/raw"
+
+# Unauthenticated counterparts (see GET /branding/{organization_id}/logo/public
+# and .../background-image/public's own docstrings) -- what
+# app.domains.captive_portal's guest-facing resolve endpoint points a
+# real guest's browser at when a location's own captive_portal_configs
+# row has no logo_url/background_image_url of its own set, falling back
+# to the organization's branding upload. `{organization_id}` is filled in
+# by the caller (there is no session to derive it from at that call site
+# either).
+PUBLIC_LOGO_PATH_TEMPLATE = "/branding/{organization_id}/logo/public"
+PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE = (
+    "/branding/{organization_id}/background-image/public"
+)
 
 
 class AuditLogWriter(Protocol):
@@ -176,6 +203,84 @@ class BrandingService:
         )
         return await self._to_response(branding)
 
+    async def upload_logo(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        filename: str,
+        content_type: str,
+        content: bytes,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> BrandingResponse:
+        """Uploads a new logo for ``organization_id``, replacing any
+        existing one, and persists the storage key. Mirrors
+        upload_background_image exactly -- same object storage, same
+        validation shape."""
+        if self.object_storage is None:
+            raise BrandingStorageNotConfiguredError("Logo")
+
+        extension = LOGO_ALLOWED_CONTENT_TYPES.get(content_type)
+        if extension is None:
+            raise InvalidLogoError(
+                f"unsupported content type '{content_type}' -- allowed: "
+                f"{', '.join(sorted(LOGO_ALLOWED_CONTENT_TYPES))}"
+            )
+        if not content:
+            raise InvalidLogoError("uploaded file is empty")
+        if len(content) > LOGO_MAX_BYTES:
+            max_mb = LOGO_MAX_BYTES // (1024 * 1024)
+            raise InvalidLogoError(f"file exceeds the {max_mb}MB limit")
+
+        key = f"branding/{organization_id}/logo/{uuid.uuid4()}.{extension}"
+        try:
+            await self.object_storage.upload(
+                key=key, content=content, content_type=content_type
+            )
+        except ObjectStorageError:
+            logger.exception(
+                "logo_upload_failed",
+                extra={"organization_id": str(organization_id)},
+            )
+            raise
+
+        branding = await self.repository.set_logo_key(
+            organization_id, key, actor_user_id=actor_user_id
+        )
+        await self._audit(
+            actor_user_id,
+            "branding_logo_updated",
+            entity_type="branding",
+            entity_id=branding.id,
+            description=(
+                f"Logo updated for organization {organization_id} "
+                f"(original filename: {filename})"
+            ),
+            organization_id=organization_id,
+        )
+        return await self._to_response(branding)
+
+    async def delete_logo(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> BrandingResponse:
+        if self.object_storage is None:
+            raise BrandingStorageNotConfiguredError("Logo")
+
+        branding = await self.repository.set_logo_key(
+            organization_id, None, actor_user_id=actor_user_id
+        )
+        await self._audit(
+            actor_user_id,
+            "branding_logo_removed",
+            entity_type="branding",
+            entity_id=branding.id,
+            description=f"Logo removed for organization {organization_id}",
+            organization_id=organization_id,
+        )
+        return await self._to_response(branding)
+
     async def get_default_branding(self) -> DefaultBrandingResponse:
         return DEFAULT_BRANDING
 
@@ -205,12 +310,36 @@ class BrandingService:
         )
         return content, content_type
 
+    async def get_logo_bytes(self, organization_id: uuid.UUID) -> tuple[bytes, str]:
+        """Streams the current uploaded logo's raw bytes + content type --
+        backs ``GET /branding/logo/raw``. Mirrors get_background_image_bytes
+        exactly. Raises ``LogoNotFoundError`` if the organization has no
+        *uploaded* logo (a plain-text ``logo_url`` with no ``logo_key``
+        doesn't count -- that's rendered by hotlinking the URL directly,
+        never through this proxy)."""
+        if self.object_storage is None:
+            raise BrandingStorageNotConfiguredError("Logo")
+
+        branding = await self.repository.get_by_organization(organization_id)
+        key = branding.logo_key if branding else None
+        if not key:
+            raise LogoNotFoundError(organization_id)
+
+        content = await self.object_storage.download(key=key)
+        extension = key.rsplit(".", 1)[-1].lower() if "." in key else ""
+        content_type = _EXTENSION_TO_CONTENT_TYPE.get(
+            extension, "application/octet-stream"
+        )
+        return content, content_type
+
     async def _to_response(self, branding: Branding) -> BrandingResponse:
+        logo_url, logo_is_uploaded = self._resolve_logo_url(branding)
         return BrandingResponse(
             id=str(branding.id),
             organization_id=str(branding.organization_id),
             company_name=branding.company_name,
-            logo_url=branding.logo_url,
+            logo_url=logo_url,
+            logo_is_uploaded=logo_is_uploaded,
             favicon_url=branding.favicon_url,
             primary_color=branding.primary_color,
             secondary_color=branding.secondary_color,
@@ -230,6 +359,16 @@ class BrandingService:
         if not branding.background_image_key:
             return None
         return BACKGROUND_IMAGE_RAW_PATH
+
+    def _resolve_logo_url(self, branding: Branding) -> tuple[str | None, bool]:
+        """An uploaded logo (``logo_key`` set) always wins over the plain
+        text ``logo_url`` column -- returns the stable proxy path and
+        ``True`` for that case, or the plain text URL as-is and ``False``
+        when there's no upload. See ``BrandingResponse.logo_is_uploaded``'s
+        own docstring for why the frontend needs to tell these apart."""
+        if branding.logo_key:
+            return LOGO_RAW_PATH, True
+        return branding.logo_url, False
 
     async def _audit(
         self,

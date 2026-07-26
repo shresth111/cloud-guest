@@ -193,6 +193,140 @@ async def delete_background_image(
     )
 
 
+@router.post(
+    "/branding/logo",
+    response_model=ApiResponse[BrandingResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("white_label.update")),
+        Depends(RequireFeature(PlanFeatureKey.WHITE_LABEL)),
+    ],
+)
+async def upload_logo(
+    request: Request,
+    file: UploadFile = File(...),
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: BrandingService = Depends(get_branding_service),
+):
+    """Uploads (replacing any existing) the logo for the current
+    organization. Stores the file via the platform's existing S3/MinIO-
+    compatible object storage and returns branding data with a fresh,
+    ready-to-render ``logo_url``. Mirrors ``POST /branding/background-image``
+    exactly.
+    """
+    content = await file.read()
+    payload = await service.upload_logo(
+        organization_id,
+        filename=file.filename or "logo",
+        content_type=file.content_type or "application/octet-stream",
+        content=content,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="Logo updated",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/branding/logo/raw",
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("white_label.read")),
+        Depends(RequireFeature(PlanFeatureKey.WHITE_LABEL)),
+    ],
+)
+async def get_logo_raw(
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: BrandingService = Depends(get_branding_service),
+):
+    """Streams the current organization's uploaded logo bytes. Mirrors
+    ``GET /branding/background-image/raw`` exactly -- see that endpoint's
+    own docstring for why this is an authenticated proxy, not a
+    directly-linkable public image URL.
+    """
+    content, content_type = await service.get_logo_bytes(organization_id)
+    return Response(content=content, media_type=content_type)
+
+
+@router.delete(
+    "/branding/logo",
+    response_model=ApiResponse[BrandingResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("white_label.update")),
+        Depends(RequireFeature(PlanFeatureKey.WHITE_LABEL)),
+    ],
+)
+async def delete_logo(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: BrandingService = Depends(get_branding_service),
+):
+    """Removes the current organization's uploaded logo (falls back to
+    the plain-text ``logo_url`` column, if any -- see
+    BrandingService._resolve_logo_url)."""
+    payload = await service.delete_logo(
+        organization_id,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="Logo removed",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/branding/{organization_id}/logo/public",
+    status_code=status.HTTP_200_OK,
+)
+async def get_logo_public(
+    organization_id: uuid.UUID,
+    service: BrandingService = Depends(get_branding_service),
+):
+    """Streams an organization's uploaded logo bytes with **no auth at
+    all** -- the guest-facing counterpart to ``GET /branding/logo/raw``.
+
+    A real captive-portal guest has no platform-user identity RBAC could
+    ever grant a permission to (same class of exception
+    ``GET /captive-portal/resolve`` and ``app.domains.otp``/
+    ``app.domains.voucher``'s own guest-facing endpoints already are --
+    see this module's own architecture note and each of those routers'
+    matching justification). Exposing this asset unauthenticated is not
+    a meaningfully bigger disclosure than the guest already has: it's
+    the exact same logo already rendered on their own screen the moment
+    the captive portal loads, before they've authenticated by any
+    method. ``organization_id`` is an explicit path param (not header-
+    derived) since there is no ``X-Organization-Id``/session to derive
+    it from pre-auth -- mirrors ``GET /captive-portal/resolve``'s own
+    query-param identity for the same reason.
+    """
+    content, content_type = await service.get_logo_bytes(organization_id)
+    return Response(content=content, media_type=content_type)
+
+
+@router.get(
+    "/branding/{organization_id}/background-image/public",
+    status_code=status.HTTP_200_OK,
+)
+async def get_background_image_public(
+    organization_id: uuid.UUID,
+    service: BrandingService = Depends(get_branding_service),
+):
+    """Streams an organization's login-screen background image bytes
+    with no auth -- mirrors ``get_logo_public`` exactly, see that
+    endpoint's own docstring for the full reasoning."""
+    content, content_type = await service.get_background_image_bytes(organization_id)
+    return Response(content=content, media_type=content_type)
+
+
 @router.get(
     "/branding/default",
     response_model=ApiResponse[DefaultBrandingResponse],
