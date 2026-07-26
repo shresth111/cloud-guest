@@ -134,6 +134,27 @@ class RoleInactiveError(RBACError):
         )
 
 
+class LastOrganizationOwnerError(RBACError):
+    """An organization must always retain at least one active
+    ``organization-owner`` role holder -- revoking (or, via the assign-then-
+    revoke pattern the customer dashboard's "Manage Agents" role editor
+    uses, downgrading) the sole remaining holder would leave the
+    organization with nobody able to administer it, up to and including the
+    holder itself losing every permission it needs to fix that (confirmed by
+    live reproduction: doing this to a real account locked it out of its own
+    ``users.read``/``roles.assign`` permissions immediately). A real
+    ownership transfer -- assigning ``organization-owner`` to someone else
+    first -- is required before this one can be revoked."""
+
+    def __init__(self, organization_id: uuid.UUID) -> None:
+        super().__init__(
+            "Cannot remove the organization's last Organization Owner -- "
+            "assign another Organization Owner first, then remove this one "
+            f"(organization {organization_id})",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class CrossTenantAccessError(RBACError):
     """An operation attempted to read or mutate another organization's RBAC data."""
 

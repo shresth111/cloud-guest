@@ -35,6 +35,7 @@ from .exceptions import (
     CrossTenantAccessError,
     DuplicateRoleError,
     InvalidScopeAssignmentError,
+    LastOrganizationOwnerError,
     OverrideEscalationError,
     PermissionGroupNotFoundError,
     PermissionNotFoundError,
@@ -61,6 +62,15 @@ logger = logging.getLogger(__name__)
 _ROLE_ASSIGN_PERMISSION = "roles.assign"
 _PERMISSION_OVERRIDE_ASSIGN_PERMISSION = "permissions.assign"
 _PERMISSION_MANAGE_BYPASS_PERMISSION = "permissions.manage"
+
+# The seeded system role an organization's founding/administering account
+# holds (see app.domains.location.provisioning_service's identically-named
+# ``_OWNER_ROLE_SLUG``, which assigns it during Smart Location Provisioning
+# -- duplicated here rather than imported to avoid a cross-domain import
+# from rbac into location). Used only by
+# ``_assert_not_last_organization_owner`` below to keep an organization from
+# ever ending up with zero active holders of it.
+_ORGANIZATION_OWNER_ROLE_SLUG = "organization-owner"
 
 
 class RBACService:
@@ -570,6 +580,7 @@ class RBACService:
             and assignment.organization_id != requesting_organization_id
         ):
             raise CrossTenantAccessError()
+        await self._assert_not_last_organization_owner(assignment)
 
         await self.repository.deactivate_user_role(assignment)
         await self._invalidate_users([assignment.user_id])
@@ -583,6 +594,34 @@ class RBACService:
             location_id=assignment.location_id,
             metadata={"target_user_id": str(assignment.user_id)},
         )
+
+    async def _assert_not_last_organization_owner(self, assignment: UserRole) -> None:
+        """An organization must always retain at least one active
+        ``organization-owner`` holder (see ``_ORGANIZATION_OWNER_ROLE_SLUG``'s
+        module-level comment) -- refuse to revoke this assignment if it's
+        the last one. This also blocks the "Manage Agents" role editor's
+        assign-then-revoke downgrade pattern (``AgentsPage.tsx``'s
+        ``updateAgent``): the revoke half of that flow lands here the same
+        as a direct revoke would, so downgrading an organization's sole
+        Owner to any other role fails at this same guard instead of
+        silently leaving the organization ownerless. Not scoped to
+        self-revocation only -- confirmed by direct reproduction that this
+        previously let the sole owner (or, with the right permission,
+        anyone else holding ``roles.assign``) revoke this and immediately
+        lose every permission needed to undo it, with no recovery path
+        short of direct DB access."""
+        if assignment.organization_id is None or not assignment.is_active:
+            return
+        role = await self.repository.get_role_by_id(assignment.role_id)
+        if role is None or role.slug != _ORGANIZATION_OWNER_ROLE_SLUG:
+            return
+        remaining = await self.repository.count_active_role_assignments_in_organization(
+            assignment.role_id,
+            assignment.organization_id,
+            exclude_assignment_id=assignment.id,
+        )
+        if remaining == 0:
+            raise LastOrganizationOwnerError(assignment.organization_id)
 
     async def _validate_scope_assignment(
         self,

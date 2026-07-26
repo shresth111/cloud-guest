@@ -31,6 +31,7 @@ from app.domains.rbac.exceptions import (
     CrossTenantAccessError,
     DuplicateRoleError,
     InvalidScopeAssignmentError,
+    LastOrganizationOwnerError,
     OverrideEscalationError,
     PermissionDeniedError,
     RoleEscalationError,
@@ -363,6 +364,23 @@ class FakeRBACRepository:
                 for row in self.user_role_rows
                 if row.role_id == role_id and row.is_active and not row.is_deleted
             }
+        )
+
+    async def count_active_role_assignments_in_organization(
+        self,
+        role_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        *,
+        exclude_assignment_id: uuid.UUID | None = None,
+    ) -> int:
+        return sum(
+            1
+            for row in self.user_role_rows
+            if row.role_id == role_id
+            and row.organization_id == organization_id
+            and row.is_active
+            and not row.is_deleted
+            and row.id != exclude_assignment_id
         )
 
     # -- permission overrides ------------------------------------------------
@@ -1101,6 +1119,101 @@ class TestRoleAssignment:
 
         assert assignment.is_active is False
         assert any(entry.action == "role_revoked" for entry in repo.audit_log_rows)
+
+    async def test_revoke_role_blocks_sole_organization_owner(self) -> None:
+        """"owner kbhi agent nahi hoga": revoking an organization's last
+        active 'organization-owner' assignment must fail loudly, not
+        silently leave the organization with nobody able to administer it
+        (confirmed against a real deployment: doing this locked the owner
+        out of their own 'users.read'/'roles.assign' permissions with no
+        recovery short of direct DB access -- see
+        ``RBACService._assert_not_last_organization_owner``)."""
+        service, repo, _cache = make_service()
+        org_id = uuid.uuid4()
+        owner_role = await make_role(
+            repo, "Organization Owner", scope_type=ScopeType.ORGANIZATION
+        )
+        assert owner_role.slug == "organization-owner"
+        owner_id = uuid.uuid4()
+        assignment = await assign_role(
+            repo,
+            user_id=owner_id,
+            role=owner_role,
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=org_id,
+        )
+
+        with pytest.raises(LastOrganizationOwnerError):
+            await service.revoke_role_from_user(
+                actor_user_id=uuid.uuid4(),
+                assignment_id=assignment.id,
+                requesting_organization_id=org_id,
+            )
+
+        assert assignment.is_active is True
+
+    async def test_revoke_role_allows_organization_owner_when_a_second_remains(
+        self,
+    ) -> None:
+        service, repo, _cache = make_service()
+        org_id = uuid.uuid4()
+        owner_role = await make_role(
+            repo, "Organization Owner", scope_type=ScopeType.ORGANIZATION
+        )
+        first = await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=owner_role,
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=org_id,
+        )
+        await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=owner_role,
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=org_id,
+        )
+
+        await service.revoke_role_from_user(
+            actor_user_id=uuid.uuid4(),
+            assignment_id=first.id,
+            requesting_organization_id=org_id,
+        )
+
+        assert first.is_active is False
+
+    async def test_revoke_role_ignores_other_organizations_owner_count(self) -> None:
+        """The "at least one owner" count is per-organization -- another
+        organization's Organization Owner assignment must not count as a
+        spare for this one."""
+        service, repo, _cache = make_service()
+        org_a = uuid.uuid4()
+        org_b = uuid.uuid4()
+        owner_role = await make_role(
+            repo, "Organization Owner", scope_type=ScopeType.ORGANIZATION
+        )
+        assignment_a = await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=owner_role,
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=org_a,
+        )
+        await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=owner_role,
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=org_b,
+        )
+
+        with pytest.raises(LastOrganizationOwnerError):
+            await service.revoke_role_from_user(
+                actor_user_id=uuid.uuid4(),
+                assignment_id=assignment_a.id,
+                requesting_organization_id=org_a,
+            )
 
 
 # ============================================================================
