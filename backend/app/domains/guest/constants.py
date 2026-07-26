@@ -21,21 +21,27 @@ from enum import StrEnum
 class GuestAuthMethod(StrEnum):
     """How a guest authenticated for a given login/session.
 
-    Deliberately mirrors ``app.domains.captive_portal.models
-    .CaptivePortalConfig``'s four enabled-method flags
-    (``otp_sms_enabled``/``otp_email_enabled``/``voucher_enabled``/
-    ``username_password_enabled``) one-for-one, so
+    ``OTP_SMS``/``OTP_EMAIL``/``VOUCHER``/``USERNAME_PASSWORD`` mirror
+    ``app.domains.captive_portal.models.CaptivePortalConfig``'s four
+    identically-named enabled-method flags one-for-one, so
     ``GuestService._require_method_enabled`` can check a resolved portal
-    config's boolean flag against exactly this enum without any translation
-    table. ``USERNAME_PASSWORD`` is carried here for schema completeness
-    (matching captive portal's own placeholder flag) but no login method in
-    this module implements it -- see ``service.py``'s module docstring.
+    config's boolean flag against exactly this enum without any
+    translation table. All four are real, working login methods today
+    (``GuestService.login_via_otp``/``login_via_voucher``/
+    ``login_via_password``).
+
+    ``MAC_WHITELIST`` is different: it has no corresponding
+    ``CaptivePortalConfig`` flag at all (see
+    ``GuestService.login_via_mac_whitelist``'s own docstring for why) --
+    an already-whitelisted MAC address (``app.domains.mac_authorization``)
+    is itself the enable signal, not a per-location toggle.
     """
 
     OTP_SMS = "otp_sms"
     OTP_EMAIL = "otp_email"
     VOUCHER = "voucher"
     USERNAME_PASSWORD = "username_password"
+    MAC_WHITELIST = "mac_whitelist"
 
 
 class GuestSessionStatus(StrEnum):

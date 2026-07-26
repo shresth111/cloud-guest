@@ -78,6 +78,7 @@ from .schemas import (
     GuestDisconnectRequest,
     GuestListResponse,
     GuestLoginResponse,
+    GuestMacLoginRequest,
     GuestOtpLoginRequest,
     GuestPasswordLoginRequest,
     GuestResponse,
@@ -309,6 +310,44 @@ async def guest_login_via_password(
         router_id=payload.router_id,
         device_mac=payload.device_mac,
         device_name=payload.device_name,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        accept_language=accept_language,
+    )
+    return build_response(
+        success=True,
+        message="Guest logged in",
+        data=_login_response(result).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/login/mac",
+    response_model=ApiResponse[GuestLoginResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_login_via_mac_whitelist(
+    request: Request,
+    payload: GuestMacLoginRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    """A pre-whitelisted device connecting without OTP/voucher/password --
+    see ``GuestService.login_via_mac_whitelist``'s own docstring for the
+    full write-up, including why there is deliberately no
+    ``CaptivePortalConfig`` flag gating this the way the other three
+    guest-facing login endpoints have. A ``MacAddressNotAuthorizedError``
+    (device not whitelisted, or no MAC Authorization integration wired at
+    all) is meant to be handled silently by the calling frontend -- fall
+    back to the normal sign-in card, not show a guest-facing error."""
+    ip_address = payload.ip_address or (request.client.host if request.client else None)
+    user_agent = request.headers.get("user-agent")
+    accept_language = request.headers.get("accept-language")
+    result = await service.login_via_mac_whitelist(
+        mac_address=payload.mac_address,
+        organization_id=payload.organization_id,
+        location_id=payload.location_id,
+        router_id=payload.router_id,
         ip_address=ip_address,
         user_agent=user_agent,
         accept_language=accept_language,

@@ -137,6 +137,25 @@ class GuestPasswordLoginRequest(BaseModel):
     ip_address: str | None = Field(default=None, max_length=45)
 
 
+class GuestMacLoginRequest(BaseModel):
+    """A pre-whitelisted device connecting without OTP/voucher/password --
+    see ``service.GuestService.login_via_mac_whitelist``'s docstring for
+    the full "how would a MAC address ever reach this endpoint" write-up.
+    ``mac_address`` is both the credential (checked against
+    ``app.domains.mac_authorization``) and the device identity recorded
+    on the resulting session -- there is deliberately no separate
+    ``device_mac`` field the way the other three login requests have,
+    since here they can only ever be the same value."""
+
+    mac_address: str = Field(..., min_length=1, max_length=64)
+    organization_id: uuid.UUID | None = Field(default=None)
+    location_id: uuid.UUID = Field(...)
+    router_id: uuid.UUID = Field(
+        ..., description="The NAS (router) this guest's session will be on."
+    )
+    ip_address: str | None = Field(default=None, max_length=45)
+
+
 class GuestSetPasswordRequest(BaseModel):
     """Lets a guest opt in to password login right after a real OTP
     verification -- ``session_id`` is the ``GuestSession.id`` that same OTP

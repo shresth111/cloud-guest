@@ -48,6 +48,7 @@ __all__ = [
     "GuestPasswordSetupNotAuthorizedError",
     "GuestPasswordTooWeakError",
     "GuestSelfDisconnectNotAuthorizedError",
+    "MacAddressNotAuthorizedError",
 ]
 
 
@@ -446,5 +447,26 @@ class GuestSelfDisconnectNotAuthorizedError(GuestError):
     def __init__(self) -> None:
         super().__init__(
             "This session isn't yours to disconnect.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class MacAddressNotAuthorizedError(GuestError):
+    """``GuestService.login_via_mac_whitelist`` rejects this device --
+    either no ``mac_authorization_hook`` is wired in at all (the feature
+    is simply not turned on for this deployment), or a real
+    ``MacAuthorizationService.is_mac_authorized`` lookup came back
+    ``False`` for this ``mac_address``/``organization_id`` pair (never
+    whitelisted, disabled, or expired -- see that method's own docstring;
+    it never distinguishes those reasons, and neither does this). Meant
+    to be handled silently by the guest-facing frontend: unlike a wrong
+    OTP/password, this isn't a guest-visible mistake to show an error for
+    -- it just means "fall back to the normal sign-in card", which every
+    real enabled method (OTP/voucher/password) stays available on
+    regardless."""
+
+    def __init__(self, mac_address: str) -> None:
+        super().__init__(
+            f"MAC address not authorized: {mac_address}",
             status_code=status.HTTP_403_FORBIDDEN,
         )

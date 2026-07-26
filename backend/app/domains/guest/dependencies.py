@@ -28,6 +28,8 @@ from app.domains.guest_access.dependencies import get_guest_access_service
 from app.domains.guest_access.service import GuestAccessService
 from app.domains.location.dependencies import get_location_service
 from app.domains.location.service import LocationService
+from app.domains.mac_authorization.dependencies import get_mac_authorization_service
+from app.domains.mac_authorization.service import MacAuthorizationService
 from app.domains.monitoring.dependencies import get_monitoring_service
 from app.domains.monitoring.service import MonitoringService
 from app.domains.otp.dependencies import get_otp_service
@@ -74,6 +76,9 @@ def get_guest_service(
         get_queue_management_service
     ),
     policy_service: PolicyService = Depends(get_policy_service),
+    mac_authorization_service: MacAuthorizationService = Depends(
+        get_mac_authorization_service
+    ),
 ) -> GuestService:
     """BE-011 Part 3 addition: wires ``MonitoringService`` in as
     ``GuestService``'s optional ``monitoring_hook`` (see that class's own
@@ -106,7 +111,13 @@ def get_guest_service(
     required for the real per-guest device limit
     (``PolicyType.DEVICE``) to actually resolve from a configured policy in
     the running application, rather than always falling back to
-    ``constants.DEFAULT_MAX_DEVICES_PER_GUEST``."""
+    ``constants.DEFAULT_MAX_DEVICES_PER_GUEST``.
+
+    MAC Whitelist bypass addition: wires ``MacAuthorizationService`` in as
+    ``GuestService``'s optional ``mac_authorization_hook`` -- the one
+    DI-wiring edit required for ``login_via_mac_whitelist`` to actually
+    check a device against a real, admin-created whitelist entry in the
+    running application, rather than always rejecting."""
     return GuestService(
         repository,
         otp_service,
@@ -118,6 +129,7 @@ def get_guest_service(
         access_control_hook=guest_access_service,
         queue_assignment_hook=queue_management_service,
         policy_lookup=policy_service,
+        mac_authorization_hook=mac_authorization_service,
     )
 
 

@@ -58,6 +58,7 @@ from app.domains.guest.exceptions import (
     InvalidExtensionMinutesError,
     InvalidNasStatusTransitionError,
     InvalidSessionStatusTransitionError,
+    MacAddressNotAuthorizedError,
     NoReconnectableSessionError,
     RadiusNasAuthenticationError,
     RadiusNasNotFoundError,
@@ -555,6 +556,25 @@ class FakeQueueAssignmentHook:
             id = assignment_id
 
         return _Assignment()
+
+
+@dataclass
+class FakeMacAuthorizationHook:
+    """Stand-in for ``MacAuthorizationLookupProtocol`` -- an in-memory set
+    of whitelisted (normalized, uppercase colon-separated) MAC addresses,
+    mirroring the real ``MacAuthorizationService.is_mac_authorized``'s own
+    "malformed input is never authorized, never raises" contract."""
+
+    whitelisted: set[str] = field(default_factory=set)
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def is_mac_authorized(
+        self, mac_address: str, *, organization_id: uuid.UUID
+    ) -> bool:
+        self.calls.append(
+            {"mac_address": mac_address, "organization_id": organization_id}
+        )
+        return mac_address in self.whitelisted
 
 
 @dataclass
@@ -1129,6 +1149,7 @@ def make_fixture(
     queue_lookup: object | None = None,
     policy_lookup: object | None = None,
     queue_assignment_hook: object | None = None,
+    mac_authorization_hook: object | None = None,
 ) -> Fixture:
     repository = FakeGuestRepository()
     otp_service = FakeOtpService()
@@ -1160,6 +1181,7 @@ def make_fixture(
         access_control_hook=access_control_hook,
         policy_lookup=policy_lookup,
         queue_assignment_hook=queue_assignment_hook,
+        mac_authorization_hook=mac_authorization_hook,
     )
     radius_service = RadiusService(
         repository,
@@ -1638,7 +1660,9 @@ class TestSetGuestPassword:
 
 
 class TestGuestSelfDisconnect:
-    async def _login(self, fx: Fixture, identifier: str = "+15559990000") -> GuestLoginResult:
+    async def _login(
+        self, fx: Fixture, identifier: str = "+15559990000"
+    ) -> GuestLoginResult:
         return await fx.guest_service.login_via_otp(
             identifier=identifier,
             code="GOOD",
@@ -1700,6 +1724,140 @@ class TestGuestSelfDisconnect:
             await fx.guest_service.disconnect_own_session(
                 guest_id=result.guest.id, session_id=result.session.id
             )
+
+
+class TestMacWhitelistLogin:
+    async def test_rejects_when_no_hook_is_wired(self) -> None:
+        fx = make_fixture()
+        with pytest.raises(MacAddressNotAuthorizedError):
+            await fx.guest_service.login_via_mac_whitelist(
+                mac_address="AA:BB:CC:DD:EE:FF",
+                organization_id=fx.organization_id,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_rejects_a_mac_not_on_the_whitelist(self) -> None:
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        with pytest.raises(MacAddressNotAuthorizedError):
+            await fx.guest_service.login_via_mac_whitelist(
+                mac_address="11:22:33:44:55:66",
+                organization_id=fx.organization_id,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_rejects_a_malformed_mac_address(self) -> None:
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        with pytest.raises(MacAddressNotAuthorizedError):
+            await fx.guest_service.login_via_mac_whitelist(
+                mac_address="not-a-mac-address",
+                organization_id=fx.organization_id,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        # Never even reached the real hook -- malformed input fails
+        # normalization first.
+        assert hook.calls == []
+
+    async def test_happy_path_creates_a_new_guest_and_session(self) -> None:
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        result = await fx.guest_service.login_via_mac_whitelist(
+            mac_address="AA:BB:CC:DD:EE:FF",
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.is_new_guest is True
+        assert result.guest.identifier == "mac:AA:BB:CC:DD:EE:FF"
+        assert result.session.auth_method == GuestAuthMethod.MAC_WHITELIST.value
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+        assert result.device is not None
+        assert result.device.mac_address == "AA:BB:CC:DD:EE:FF"
+
+    async def test_accepts_a_differently_formatted_but_equivalent_mac(self) -> None:
+        """The real whitelist check always runs against the canonical
+        normalized form -- a guest's device reporting
+        "aa-bb-cc-dd-ee-ff" still matches an entry stored/whitelisted as
+        "AA:BB:CC:DD:EE:FF"."""
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        result = await fx.guest_service.login_via_mac_whitelist(
+            mac_address="aa-bb-cc-dd-ee-ff",
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.guest.identifier == "mac:AA:BB:CC:DD:EE:FF"
+
+    async def test_same_device_reconnecting_reuses_the_same_guest(self) -> None:
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        first = await fx.guest_service.login_via_mac_whitelist(
+            mac_address="AA:BB:CC:DD:EE:FF",
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        second = await fx.guest_service.login_via_mac_whitelist(
+            mac_address="AA:BB:CC:DD:EE:FF",
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert second.guest.id == first.guest.id
+        assert second.is_new_guest is False
+        assert second.session.id != first.session.id
+
+    async def test_blocked_guest_rejected(self) -> None:
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        blocked = await fx.repository.create_guest(
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="mac:AA:BB:CC:DD:EE:FF",
+            display_name=None,
+            first_seen_at=_now(),
+            last_seen_at=_now(),
+            total_visit_count=0,
+            is_blocked=True,
+            blocked_reason="stolen device",
+        )
+        with pytest.raises(GuestBlockedError):
+            await fx.guest_service.login_via_mac_whitelist(
+                mac_address="AA:BB:CC:DD:EE:FF",
+                organization_id=fx.organization_id,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert blocked.is_blocked is True
+
+    async def test_username_password_and_otp_stay_available_regardless(self) -> None:
+        """The whole point: whitelisting one device never hides or
+        replaces the other real, independently-enabled login methods --
+        this location's own config keeps reporting exactly what it
+        always did."""
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(
+            mac_authorization_hook=hook,
+            otp_sms_enabled=True,
+            username_password_enabled=True,
+        )
+        await fx.guest_service.login_via_mac_whitelist(
+            mac_address="AA:BB:CC:DD:EE:FF",
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        resolved = await fx.captive_portal_service.resolve_portal_config(
+            organization_id=fx.organization_id, location_id=fx.location_id
+        )
+        assert resolved.config.otp_sms_enabled is True
+        assert resolved.config.username_password_enabled is True
 
 
 class TestSpeedLinkedVoucherQueueAssignment:

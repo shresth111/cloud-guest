@@ -239,6 +239,10 @@ from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.guest_access.exceptions import GuestAccessDeniedError
 from app.domains.guest_access.service import AccessDecision
 from app.domains.location.models import Location
+from app.domains.mac_authorization.exceptions import MacAuthorizationError
+from app.domains.mac_authorization.validators import (
+    normalize_mac_address as normalize_whitelist_mac_address,
+)
 from app.domains.monitoring.constants import RealtimeMessageType
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.models import OtpRequest
@@ -303,6 +307,7 @@ from .exceptions import (
     GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
     InvalidSessionStatusTransitionError,
+    MacAddressNotAuthorizedError,
     NoReconnectableSessionError,
     RadiusNasAlreadyRegisteredError,
     RadiusNasAuthenticationError,
@@ -618,6 +623,23 @@ class AccessDecisionProtocol(Protocol):
         identifier: str | None,
         mac_address: str | None,
     ) -> AccessDecision: ...
+
+
+class MacAuthorizationLookupProtocol(Protocol):
+    """The single method ``GuestService``'s optional
+    ``mac_authorization_hook`` needs from the real
+    ``app.domains.mac_authorization.service.MacAuthorizationService`` --
+    reused directly, never reimplemented, the identical composition
+    ``AccessDecisionProtocol``/``QueueAssignmentProtocol`` above already
+    establish for their own real collaborators. ``None``-by-default (see
+    ``GuestService.__init__``'s own docstring): a deployment with no MAC
+    Authorization integration wired simply has
+    ``login_via_mac_whitelist`` always reject, exactly like
+    ``policy_lookup``'s absent-hook fallback -- never a crash."""
+
+    async def is_mac_authorized(
+        self, mac_address: str, *, organization_id: uuid.UUID
+    ) -> bool: ...
 
 
 class QueueAssignmentProtocol(Protocol):
@@ -1037,6 +1059,17 @@ class GuestService:
     same way it always has, so only the *lookup* is optional (falling back
     to ``constants.DEFAULT_MAX_DEVICES_PER_GUEST`` when no hook is wired),
     never the enforcement itself.
+
+    ``mac_authorization_hook`` (real MAC-whitelist bypass) is a fifth,
+    independently optional, ``None``-by-default constructor parameter,
+    duck-typed against
+    ``app.domains.mac_authorization.service.MacAuthorizationService`` via
+    ``MacAuthorizationLookupProtocol``. Used only by
+    ``login_via_mac_whitelist`` -- **unlike** ``queue_assignment_hook``,
+    an absent hook doesn't just skip a nice-to-have side effect, it makes
+    that entire method always reject (see its own docstring): this hook
+    gates a whole login path, not an auxiliary effect of one of the other
+    three.
     """
 
     def __init__(
@@ -1052,6 +1085,7 @@ class GuestService:
         access_control_hook: AccessDecisionProtocol | None = None,
         queue_assignment_hook: QueueAssignmentProtocol | None = None,
         policy_lookup: PolicyLookupProtocol | None = None,
+        mac_authorization_hook: MacAuthorizationLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.otp_service = otp_service
@@ -1063,6 +1097,7 @@ class GuestService:
         self.access_control_hook = access_control_hook
         self.queue_assignment_hook = queue_assignment_hook
         self.policy_lookup = policy_lookup
+        self.mac_authorization_hook = mac_authorization_hook
 
     async def _broadcast_guest_session_started(
         self,
@@ -1623,6 +1658,160 @@ class GuestService:
         logger.info("guest_logged_in", extra=_event_extra(event))
         return GuestLoginResult(
             guest=guest, session=session, device=device, is_new_guest=False
+        )
+
+    async def login_via_mac_whitelist(
+        self,
+        *,
+        mac_address: str,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID,
+        router_id: uuid.UUID,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+        accept_language: str | None = None,
+    ) -> GuestLoginResult:
+        """Real MAC-whitelist bypass -- an admin-pre-authorized device
+        (``app.domains.mac_authorization``) connects without OTP,
+        voucher, or password at all, the same "skip verification for a
+        trusted device" feature that domain's own module docstring
+        already names as its one deliberately-deferred integration seam.
+
+        **How a MAC address legitimately reaches this method at all:**
+        a real captive-portal redirect from a NAS/router encodes the
+        connecting device's MAC as one of its query parameters (see
+        ``src/routes/portal.tsx``'s own docstring on the frontend side,
+        and this module's own ``radius_router``, which is the *other*,
+        NAS-authenticated way device identity reaches this domain) --
+        there is no live NAS in this environment to generate that
+        redirect for real, so the guest-facing frontend instead reads an
+        honest, optional ``mac`` search param when present and calls this
+        method with it. Absent that param, this method is simply never
+        called, and the sign-in card behaves exactly as it always did.
+
+        **No ``CaptivePortalConfig`` enabled-method flag gates this**
+        (unlike ``login_via_otp``/``login_via_voucher``/
+        ``login_via_password``, each checked against its own boolean via
+        ``_require_method_enabled``) -- see ``GuestAuthMethod
+        .MAC_WHITELIST``'s own docstring for why: a whitelist entry's
+        mere existence (real, admin-created, already gated by RBAC on
+        ``app.domains.mac_authorization``'s own endpoints) is itself the
+        per-device enable signal, and a second per-location toggle on top
+        of that would only add a way to disable an *already-explicit*
+        grant, not a meaningful new safeguard.
+
+        Requires a real ``mac_authorization_hook`` to be wired in (see
+        ``GuestService.__init__``'s docstring) -- with none wired (the
+        default), or a real lookup that comes back ``False``, or a
+        malformed ``mac_address``, this always raises
+        ``MacAddressNotAuthorizedError``. That failure is deliberately
+        **not** the trigger for any fallback OTP/voucher/password
+        attempt here -- the guest-facing frontend that called this is
+        the one responsible for silently falling back to its normal
+        sign-in card, exactly the same "every other real method stays
+        available" guarantee ``login_via_password`` already gives a
+        guest who hasn't set a password yet."""
+        try:
+            normalized_mac = normalize_whitelist_mac_address(mac_address)
+        except MacAuthorizationError as exc:
+            raise MacAddressNotAuthorizedError(mac_address) from exc
+
+        resolved = await self.captive_portal_service.resolve_portal_config(
+            organization_id=organization_id, location_id=location_id
+        )
+        resolved_org_id = resolved.config.organization_id
+
+        if self.mac_authorization_hook is None:
+            raise MacAddressNotAuthorizedError(normalized_mac)
+        authorized = await self.mac_authorization_hook.is_mac_authorized(
+            normalized_mac, organization_id=resolved_org_id
+        )
+        if not authorized:
+            raise MacAddressNotAuthorizedError(normalized_mac)
+
+        identifier = f"mac:{normalized_mac}"
+        existing_guest = await self.repository.get_guest_by_identifier(
+            resolved_org_id, identifier
+        )
+        self._reject_if_blocked(existing_guest)
+        await self._enforce_access_control(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=normalized_mac,
+        )
+        if existing_guest is not None:
+            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_device_limit(
+                guest_id=existing_guest.id,
+                mac_address=normalized_mac,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
+            await self._enforce_fup_quota(
+                guest_id=existing_guest.id, organization_id=resolved_org_id
+            )
+
+        router = await self._get_eligible_router(router_id)
+
+        guest, is_new = await self._get_or_create_guest(
+            existing_guest,
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            identifier=identifier,
+        )
+        device = await self._maybe_get_or_create_device(
+            guest_id=guest.id,
+            mac_address=normalized_mac,
+            device_name="Whitelisted device",
+        )
+        session = await self._create_session(
+            guest=guest,
+            device=device,
+            router=router,
+            location_id=location_id,
+            auth_method=GuestAuthMethod.MAC_WHITELIST,
+            voucher_id=None,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            accept_language=accept_language,
+            data_limit_mb=None,
+            session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
+        )
+        await self._broadcast_guest_session_started(
+            session=session,
+            guest=guest,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+            auth_method=GuestAuthMethod.MAC_WHITELIST.value,
+            is_new_guest=is_new,
+        )
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+        await self._bump_guest_visit(guest)
+        await self._record_login_success(
+            guest=guest,
+            identifier=identifier,
+            auth_method=GuestAuthMethod.MAC_WHITELIST,
+            location_id=location_id,
+            ip_address=ip_address,
+        )
+
+        event = GuestLoggedIn(
+            guest_id=guest.id,
+            identifier=identifier,
+            auth_method=GuestAuthMethod.MAC_WHITELIST.value,
+            session_id=session.id,
+            is_new_guest=is_new,
+        )
+        logger.info("guest_logged_in", extra=_event_extra(event))
+        return GuestLoginResult(
+            guest=guest, session=session, device=device, is_new_guest=is_new
         )
 
     async def set_guest_password(
