@@ -28,9 +28,15 @@ general-purpose RBAC dependency (``app.domains.rbac.dependencies``), not
 a new permission -- is what actually narrows this down to the real
 Organization Owner, without touching ``app.domains.rbac.seed`` at all.
 
-Also gated by the same ``PlanFeatureKey.AUDIT_LOGS`` entitlement
-``app.domains.audit`` uses, since this page is presented to customers as
-an extension of that same real feature.
+Deliberately *not* gated by ``app.domains.billing``'s
+``PlanFeatureKey.AUDIT_LOGS`` entitlement the way ``app.domains.audit``
+is -- that is a separate, plan/billing-driven concern (which
+organizations paid for the Audit Logs *feature*) orthogonal to this
+page's own access-control requirement (which *role* can see it). A real
+organization on a plan without that entitlement (confirmed in
+production against this feature's own launch org) would otherwise get a
+402 on a page this task's own requirement never asked to be
+plan-gated.
 """
 
 from __future__ import annotations
@@ -42,8 +48,6 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from app.common.responses import ApiResponse, build_response
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import LoginAttempt
-from app.domains.billing.constants import PlanFeatureKey
-from app.domains.billing.dependencies import RequireFeature
 from app.domains.rbac.dependencies import (
     RequireOrganization,
     RequirePermission,
@@ -63,12 +67,11 @@ from .service import AdminLogsService, RouterLogRow
 
 router = APIRouter(prefix="/admin-logs", tags=["Admin Logs"])
 
-# Shared by both routes below -- see module docstring for why all three
-# are required together.
+# Shared by both routes below -- see module docstring for why both are
+# required together (permission + role, not permission alone).
 _OWNER_ONLY_DEPENDENCIES = [
     Depends(RequirePermission("audit_logs.read")),
     Depends(RequireRole("organization-owner", scope=ScopeType.ORGANIZATION)),
-    Depends(RequireFeature(PlanFeatureKey.AUDIT_LOGS)),
 ]
 
 

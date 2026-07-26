@@ -341,13 +341,13 @@ class TestErrorEventTypes:
 
 
 class TestEveryRouteIsOwnerOnly:
-    def test_every_admin_logs_route_requires_all_three_owner_only_dependencies(
+    def test_every_admin_logs_route_requires_both_owner_only_dependencies(
         self,
     ) -> None:
         assert len(admin_logs_router.routes) == 2
         for route in admin_logs_router.routes:
             assert (
-                len(route.dependencies) == 3
+                len(route.dependencies) == 2
             ), f"{route.path} ({route.methods}) is missing an owner-only dependency"
 
 
