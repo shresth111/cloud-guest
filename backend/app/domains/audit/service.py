@@ -40,6 +40,7 @@ class AuditRepositoryProtocol(Protocol):
         location_id: uuid.UUID | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
+        exclude_view_events: bool = False,
         page: int,
         page_size: int,
     ): ...
@@ -61,6 +62,7 @@ class AuditService:
         location_id: uuid.UUID | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
+        exclude_view_events: bool = False,
         page: int = 1,
         page_size: int = 25,
     ):
@@ -72,6 +74,7 @@ class AuditService:
             location_id=location_id,
             start=start,
             end=end,
+            exclude_view_events=exclude_view_events,
             page=page,
             page_size=page_size,
         )

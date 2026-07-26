@@ -201,6 +201,7 @@ class RBACRepositoryProtocol(Protocol):
         location_id: uuid.UUID | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
+        exclude_view_events: bool = False,
         page: int,
         page_size: int,
     ) -> tuple[list[AuditLogEntry], PaginationMeta]: ...
@@ -588,6 +589,7 @@ class RBACRepository:
         location_id: uuid.UUID | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
+        exclude_view_events: bool = False,
         page: int,
         page_size: int,
     ) -> tuple[list[AuditLogEntry], PaginationMeta]:
@@ -599,7 +601,17 @@ class RBACRepository:
         ``app.domains.billing.repository.BillingRepository
         .list_issued_past_due``). No schema change -- reads the exact same
         ``audit_log_entries`` table ``create_audit_log_entry`` already
-        writes."""
+        writes.
+
+        ``exclude_view_events``: several domains (billing, analytics, ...)
+        write a ``*_viewed`` action into this same table every time a
+        read-only dashboard is loaded -- real access-logging, but not a
+        *change* a customer's Admin Logs page means by "account activity",
+        and frequent enough (every dashboard page load) to drown out the
+        real role/location/policy/etc. change events in any recent page.
+        Excluded via a suffix match at the DB layer (not a client-side
+        filter) so pagination/counts stay correct regardless of how noisy
+        the underlying table gets."""
         conditions = [AuditLogEntry.is_deleted.is_(False)]
         if organization_id is not None:
             conditions.append(AuditLogEntry.organization_id == organization_id)
@@ -615,6 +627,8 @@ class RBACRepository:
             conditions.append(AuditLogEntry.created_at >= start)
         if end is not None:
             conditions.append(AuditLogEntry.created_at <= end)
+        if exclude_view_events:
+            conditions.append(~AuditLogEntry.action.endswith("_viewed"))
 
         params = PageParams(page=page, page_size=page_size)
         count_statement = (

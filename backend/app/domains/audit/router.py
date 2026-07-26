@@ -148,6 +148,14 @@ async def search_audit_log_entries(
     location_id: uuid.UUID | None = Query(default=None),
     start: datetime | None = Query(default=None),
     end: datetime | None = Query(default=None),
+    exclude_view_events: bool = Query(
+        default=False,
+        description=(
+            "Drop read-only '*_viewed' access-logging entries (billing/"
+            "analytics dashboard loads, etc.) -- see repository"
+            ".search_audit_log_entries's own docstring."
+        ),
+    ),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
@@ -161,6 +169,7 @@ async def search_audit_log_entries(
         location_id=location_id,
         start=start,
         end=end,
+        exclude_view_events=exclude_view_events,
         page=page,
         page_size=page_size,
     )

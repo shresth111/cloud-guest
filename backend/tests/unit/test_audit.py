@@ -69,6 +69,7 @@ class FakeAuditRepository:
         location_id: uuid.UUID | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
+        exclude_view_events: bool = False,
         page: int,
         page_size: int,
     ) -> tuple[list[AuditLogEntry], PaginationMeta]:
@@ -87,6 +88,8 @@ class FakeAuditRepository:
             values = [v for v in values if v.created_at >= start]
         if end is not None:
             values = [v for v in values if v.created_at <= end]
+        if exclude_view_events:
+            values = [v for v in values if not v.action.endswith("_viewed")]
         values.sort(key=lambda v: v.created_at, reverse=True)
         params = PageParams(page=page, page_size=page_size)
         paged = values[params.offset : params.offset + params.page_size]
@@ -146,6 +149,29 @@ async def test_search_filters_by_action_and_entity_type() -> None:
 
     assert meta.total_items == 1
     assert entries[0].action == "role.assigned"
+
+
+async def test_search_excludes_view_events_when_requested() -> None:
+    service, repository = make_service()
+    repository.entries.append(_make_entry(action="role_assigned"))
+    repository.entries.append(_make_entry(action="billing_dashboard_customer_viewed"))
+
+    entries, meta = await service.search(
+        requesting_organization_id=None, exclude_view_events=True
+    )
+
+    assert meta.total_items == 1
+    assert entries[0].action == "role_assigned"
+
+
+async def test_search_includes_view_events_by_default() -> None:
+    service, repository = make_service()
+    repository.entries.append(_make_entry(action="role_assigned"))
+    repository.entries.append(_make_entry(action="billing_dashboard_customer_viewed"))
+
+    entries, meta = await service.search(requesting_organization_id=None)
+
+    assert meta.total_items == 2
 
 
 async def test_search_filters_by_date_range() -> None:
