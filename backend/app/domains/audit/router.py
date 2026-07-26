@@ -11,13 +11,21 @@ against ``audit_logs.*`` (``PermissionModule.AUDIT_LOGS``, already seeded)
 and resolves ``CurrentOrganization``, passed through as
 ``requesting_organization_id``.
 
-**Entitlement pilot**: both endpoints additionally require
-``PlanFeatureKey.AUDIT_LOGS`` via ``app.domains.billing.dependencies
-.RequireFeature`` -- this is the first domain wired to the new
-request-time license/feature-entitlement gate (see that module's own
-docstring). A ``None`` organization context (no ``X-Organization-Id``
-header) still passes through unchecked, same as ``RequirePermission``'s
-own GLOBAL-scope behavior, so a platform-level caller is unaffected.
+**No ``PlanFeatureKey.AUDIT_LOGS`` entitlement gate**: this domain's real
+data is now surfaced org-scoped only from inside the customer dashboard's
+Owner-only Admin Logs page (its "Account Activity" section) -- exactly
+``app.domains.admin_logs.router``'s own posture, which was deliberately
+never entitlement-gated for the identical reason its own docstring gives
+("a real organization on a plan without that entitlement would otherwise
+get a 402 on a page ... never asked to be plan-gated"). This endpoint
+briefly *was* the pilot for ``app.domains.billing.dependencies
+.RequireFeature`` / ``PlanFeatureKey.AUDIT_LOGS`` before the Audit Log tab
+was folded into Admin Logs -- confirmed live against this feature's own
+launch org ("xyz") that it does not hold that plan entitlement, which
+would have made the merged Account Activity section silently empty for
+the exact account this was built for. Dropped to match Admin Logs'
+existing precedent rather than leave the two halves of one page
+inconsistently gated.
 
 **Owner-only when organization-scoped**: both endpoints additionally
 require the real Organization Owner role *whenever called with an
@@ -54,8 +62,6 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from app.common.responses import ApiResponse, build_response
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import AuthUser
-from app.domains.billing.constants import PlanFeatureKey
-from app.domains.billing.dependencies import RequireFeature
 from app.domains.rbac.authorization import RoleResolver
 from app.domains.rbac.context import ScopeContext
 from app.domains.rbac.dependencies import (
@@ -131,7 +137,6 @@ def _entry_response(entry: AuditLogEntry) -> AuditLogEntryResponse:
     status_code=status.HTTP_200_OK,
     dependencies=[
         Depends(RequirePermission("audit_logs.read")),
-        Depends(RequireFeature(PlanFeatureKey.AUDIT_LOGS)),
         _OWNER_ONLY,
     ],
 )
@@ -176,7 +181,6 @@ async def search_audit_log_entries(
     status_code=status.HTTP_200_OK,
     dependencies=[
         Depends(RequirePermission("audit_logs.export")),
-        Depends(RequireFeature(PlanFeatureKey.AUDIT_LOGS)),
         _OWNER_ONLY,
     ],
 )
