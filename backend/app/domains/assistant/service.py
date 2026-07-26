@@ -29,18 +29,26 @@ decides real vs. logging" pattern) without this module changing at all.
 it is *not* ``otp.service.LoggingEmailProvider``'s "log and do nothing"
 shape verbatim, because a chat widget with a literally empty reply is a
 bad demo in a way a fire-and-forget OTP send is not (nobody is staring at
-the OTP provider waiting for visible output). Instead it does simple
-keyword matching against the customer's message and returns one of a
-small set of genuinely useful, topical canned replies (WiFi
-troubleshooting, billing help, voucher help, or a generic
-"a real ticket can be raised" fallback) -- the same *category* of honest,
-non-fake default this codebase already ships elsewhere for an unconfigured
-integration (``LoggingEmailProvider``/``LoggingSmsProvider`` here;
+the OTP provider waiting for visible output). Instead it does keyword
+matching against the customer's message and returns one of a set of
+genuinely useful, topical canned replies covering the product's real
+staff-facing actions -- voucher creation (distinct from guest-facing
+voucher redemption), router offline troubleshooting, blocking/disconnecting
+a guest or device, locations, team/roles, billing, WiFi connectivity
+troubleshooting, or a generic "a real ticket can be raised" fallback --
+the same *category* of honest, non-fake default this codebase already
+ships elsewhere for an unconfigured integration
+(``LoggingEmailProvider``/``LoggingSmsProvider`` here;
 ``UnconfiguredPaymentGateway`` in ``app.domains.billing``), just tuned so
 the demo experience is actually pleasant rather than obviously stubbed.
 This is not a placeholder to be embarrassed about -- it is a real,
 if limited, assistant that ships and works today with zero external
-dependencies.
+dependencies. The keyword groups are checked most-specific-intent-first
+(see the comment above ``_GUEST_MANAGEMENT_KEYWORDS``) precisely because
+live testing found two real collisions in the original single-bucket
+version: a generic WiFi keyword ("connect") is a Python substring of
+"disconnect", and a single "voucher" bucket conflated the staff-facing
+creation flow with the guest-facing redemption flow.
 
 ``AnthropicAssistantProvider`` is the real provider, using the official
 ``anthropic`` Python SDK -- present and correct, but unreachable until
@@ -91,15 +99,104 @@ class AssistantProviderProtocol(Protocol):
 
 
 # Keyword groups -> canned reply, checked in order against the lower-cased
-# customer message. Order matters: a message mentioning both "voucher" and
-# "wifi" ("my voucher won't get me on wifi") is classified as a voucher
-# question first, since that is the more specific stated intent -- WiFi
-# connectivity is scoped to a separate keyword group precisely so it
-# doesn't swallow voucher-redemption questions too.
-_WIFI_KEYWORDS = ("wifi", "wi-fi", "password", "connect", "internet", "network", "login")
-_BILLING_KEYWORDS = ("bill", "invoice", "payment", "charge", "subscription", "refund")
+# customer message. Order is intent-specificity, most specific first --
+# this matters more than the original single-bucket version because two
+# real collisions showed up in live testing (see PR notes):
+#
+# 1. "in" is a Python substring test, so a generic keyword can match
+#    inside an unrelated word -- e.g. "connect" (a _WIFI_KEYWORDS entry)
+#    is a substring of "disconnect", so "how do I disconnect a guest"
+#    used to match WiFi-troubleshooting before it could ever reach a
+#    guest-management bucket. Guest management is now checked first.
+# 2. A single "voucher" bucket collapsed two very different intents into
+#    one reply: an owner/staff caller asking how to *create* a voucher
+#    was getting told how a *guest redeems* one -- topically adjacent,
+#    but the wrong instructions for what was actually asked. Creation is
+#    now its own bucket, checked before redemption.
+_GUEST_MANAGEMENT_KEYWORDS = (
+    "block",
+    "unblock",
+    "ban",
+    "kick",
+    "disconnect",
+    "remove a guest",
+    "remove this guest",
+    "connected device",
+)
+_ROUTER_STATUS_KEYWORDS = (
+    "router offline",
+    "router is offline",
+    "router down",
+    "router disconnected",
+    "router unreachable",
+    "router not connecting",
+    "no signal",
+    "offline",
+)
+_VOUCHER_CREATE_KEYWORDS = (
+    "create a voucher",
+    "create voucher",
+    "generate voucher",
+    "generate a voucher",
+    "issue a voucher",
+    "issue voucher",
+    "new voucher",
+    "voucher plan",
+    "add a voucher",
+    "make a voucher",
+)
 _VOUCHER_KEYWORDS = ("voucher", "redeem", "redemption")
+_BILLING_KEYWORDS = ("bill", "invoice", "payment", "charge", "subscription", "refund")
+_LOCATION_KEYWORDS = (
+    "location",
+    "new property",
+    "another property",
+    "multiple properties",
+    "branch",
+)
+_TEAM_KEYWORDS = (
+    "team",
+    "staff",
+    "invite",
+    "teammate",
+    "role",
+    "permission",
+    "add a user",
+    "add a member",
+)
+_WIFI_KEYWORDS = (
+    "wifi",
+    "wi-fi",
+    "password",
+    "connect",
+    "internet",
+    "network",
+    "login",
+)
 
+_GUEST_MANAGEMENT_REPLY = (
+    "You can block a guest from either the Guests or Connected Devices "
+    "section of your dashboard -- open the guest or device entry and "
+    "choose Block (this prevents them from reconnecting until you "
+    "unblock them). If you just want to end their current session "
+    "without a permanent block, use Disconnect instead -- they can "
+    "reconnect normally afterward."
+)
+_ROUTER_STATUS_REPLY = (
+    "Router status on the Routers page is based on its last heartbeat, "
+    "shown as the last-seen time. If a router shows Offline, first check "
+    "it has power and an active internet uplink -- most routers "
+    "reconnect automatically within a few minutes once connectivity is "
+    "restored. Still showing Offline after confirming power and internet? "
+    "I've noted this conversation so our support team can take a closer "
+    "look, or you can raise a support ticket directly."
+)
+_VOUCHER_CREATE_REPLY = (
+    "To create vouchers: open the Vouchers section of your dashboard, "
+    "set up a Voucher Plan (validity period, data limit, uses per "
+    "voucher) under a Voucher Series, then generate vouchers from that "
+    "plan -- they're ready to hand out or print immediately."
+)
 _VOUCHER_REPLY = (
     "Vouchers are redeemed from the guest WiFi login page -- enter the "
     "code exactly as printed (it's case-sensitive) and tap Connect. If a "
@@ -114,6 +211,17 @@ _BILLING_REPLY = (
     "still looks wrong after checking there, I've noted this conversation "
     "so our support team can follow up directly, or you can raise a "
     "support ticket for a faster, tracked response."
+)
+_LOCATION_REPLY = (
+    "You can manage multiple properties from the Locations section of "
+    "your dashboard -- add a new location there, then assign routers and "
+    "vouchers to it. Use the location selector in the dashboard header "
+    "to switch between properties."
+)
+_TEAM_REPLY = (
+    "Invite teammates from the Team section of your dashboard and assign "
+    "a role -- Owner, Admin, or a custom role -- to control what they "
+    "can see and do, such as managing vouchers or viewing billing."
 )
 _WIFI_REPLY = (
     "For WiFi connection trouble: double-check the network name (SSID) "
@@ -145,10 +253,20 @@ class LoggingAssistantProvider:
             extra={"message_length": len(new_message)},
         )
         lowered = new_message.lower()
+        if any(keyword in lowered for keyword in _GUEST_MANAGEMENT_KEYWORDS):
+            return _GUEST_MANAGEMENT_REPLY
+        if any(keyword in lowered for keyword in _ROUTER_STATUS_KEYWORDS):
+            return _ROUTER_STATUS_REPLY
+        if any(keyword in lowered for keyword in _VOUCHER_CREATE_KEYWORDS):
+            return _VOUCHER_CREATE_REPLY
         if any(keyword in lowered for keyword in _VOUCHER_KEYWORDS):
             return _VOUCHER_REPLY
         if any(keyword in lowered for keyword in _BILLING_KEYWORDS):
             return _BILLING_REPLY
+        if any(keyword in lowered for keyword in _LOCATION_KEYWORDS):
+            return _LOCATION_REPLY
+        if any(keyword in lowered for keyword in _TEAM_KEYWORDS):
+            return _TEAM_REPLY
         if any(keyword in lowered for keyword in _WIFI_KEYWORDS):
             return _WIFI_REPLY
         return _DEFAULT_REPLY
@@ -187,11 +305,41 @@ class AnthropicAssistantProvider:
             output_config={"effort": "low"},
             system=(
                 "You are the customer support assistant for ZIP WiFi / "
-                "CloudGuest, a WiFi-hotspot management SaaS. Help "
-                "customers with WiFi connectivity, billing, and voucher "
-                "questions about their own account. Be concise and "
-                "practical. If you cannot resolve something, tell the "
-                "customer a real support ticket can be raised from their "
+                "CloudGuest, a WiFi-hotspot management SaaS for hotels, "
+                "cafes, and similar venues. The person chatting with you "
+                "is the venue owner/staff member managing the account, "
+                "not a guest using the WiFi -- answer accordingly.\n\n"
+                "Real product features you can accurately explain:\n"
+                "- Vouchers: staff create voucher plans/series in the "
+                "Vouchers section (validity period, data limit, uses per "
+                "voucher) and generate codes from a plan. Guests redeem "
+                "those codes on the WiFi login page; a redeemed code is "
+                "single-use and does not refresh -- staff must issue a "
+                "new one.\n"
+                "- Routers: each router's status (Online/Offline) on the "
+                "Routers page is based on its last heartbeat/last-seen "
+                "time. An offline router usually means a power or "
+                "internet-uplink problem at the router; it reconnects "
+                "automatically once connectivity returns.\n"
+                "- Guests & connected devices: staff can Block a guest or "
+                "device (prevents reconnecting until unblocked) or "
+                "Disconnect one (ends the current session only) from the "
+                "Guests or Connected Devices section.\n"
+                "- Locations: multi-property accounts manage each "
+                "property from the Locations section and switch between "
+                "them via the location selector in the dashboard header.\n"
+                "- Team & roles: staff are invited from the Team section "
+                "and assigned a role (Owner, Admin, or a custom role) "
+                "that controls what they can see and do.\n"
+                "- Billing: invoices, payment methods, and subscription "
+                "status live in the Billing section.\n\n"
+                "Be concise and practical, and answer the actual question "
+                "asked -- e.g. a question about *creating* a voucher is "
+                "about the staff-facing plan/generate flow, not the "
+                "guest-facing redemption flow. Never invent a feature, "
+                "menu location, or behavior you're not sure this product "
+                "has -- if you don't know, say so and tell the customer "
+                "a real support ticket can be raised from their "
                 "dashboard."
             ),
             messages=messages,
