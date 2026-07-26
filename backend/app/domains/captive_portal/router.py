@@ -37,6 +37,7 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.responses import ApiResponse, build_response
+from app.core.config import get_settings
 from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
@@ -364,6 +365,18 @@ async def resolve_captive_portal_config(
     # get_logo_public/get_background_image_public) -- the real, private
     # /branding/logo/raw path this same organization's admins use
     # requires a JWT this anonymous guest's device will never have.
+    #
+    # Built as a full absolute URL (scheme+host from this very request,
+    # not a bare path) -- unlike every *other* branding call in this
+    # codebase, which goes through the authenticated `api` axios client
+    # (whose own configured base URL supplies the host), the guest-facing
+    # frontend renders this value directly as an <img src>/CSS
+    # background-image, on its own separate origin (a different port in
+    # this platform's actual deployment) -- a bare "/branding/..." path
+    # would resolve against the *frontend's* origin, not the API's, and
+    # 404. `request.base_url` is this same request's own scheme+host
+    # (confirmed live against production: this API is reached directly,
+    # not behind a Host-header-rewriting reverse proxy).
     needs_logo = config_payload["logo_url"] is None
     needs_background = config_payload["background_image_url"] is None
     if needs_logo or needs_background:
@@ -372,22 +385,23 @@ async def resolve_captive_portal_config(
         )
         if branding is not None:
             org_id = str(resolved.config.organization_id)
+            api_base = str(request.base_url).rstrip("/") + get_settings().api_v1_prefix
             if config_payload["logo_url"] is None:
                 if branding.logo_key:
                     # An uploaded logo needs the public proxy -- the
                     # object storage key isn't a URL a browser can load.
-                    config_payload["logo_url"] = PUBLIC_LOGO_PATH_TEMPLATE.format(
-                        organization_id=org_id
-                    )
+                    logo_path = PUBLIC_LOGO_PATH_TEMPLATE.format(organization_id=org_id)
+                    config_payload["logo_url"] = api_base + logo_path
                 elif branding.logo_url:
                     # A plain, already-hosted URL an admin typed in
                     # instead of uploading a file -- directly
                     # hotlinkable as-is, no proxy needed.
                     config_payload["logo_url"] = branding.logo_url
             if needs_background and branding.background_image_key:
-                config_payload["background_image_url"] = (
-                    PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE.format(organization_id=org_id)
+                bg_path = PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE.format(
+                    organization_id=org_id
                 )
+                config_payload["background_image_url"] = api_base + bg_path
 
     response_payload = ResolvedCaptivePortalConfigResponse(
         **config_payload,
