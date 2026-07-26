@@ -727,11 +727,16 @@ class AuthService:
         *,
         email: str | None = None,
         success: bool | None = None,
+        user_ids: list[uuid.UUID] | None = None,
         page: int = 1,
         page_size: int = 25,
     ):
         return await self.repository.list_login_attempts(
-            email=email, success=success, page=page, page_size=page_size
+            email=email,
+            success=success,
+            user_ids=user_ids,
+            page=page,
+            page_size=page_size,
         )
 
     # -- internal helpers -------------------------------------------------------

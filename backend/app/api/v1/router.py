@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.health.routes import router as health_router
+from app.domains.admin_logs.router import router as admin_logs_router
 from app.domains.analytics.router import router as analytics_router
 from app.domains.api_keys.router import router as api_keys_router
 from app.domains.assistant.router import router as assistant_router
@@ -103,6 +104,7 @@ api_v1_router.include_router(mac_authorization_router)
 api_v1_router.include_router(connected_devices_router)
 api_v1_router.include_router(device_sync_router)
 api_v1_router.include_router(controller_logs_router)
+api_v1_router.include_router(admin_logs_router)
 api_v1_router.include_router(network_config_router)
 api_v1_router.include_router(hotspot_router)
 api_v1_router.include_router(qos_router)

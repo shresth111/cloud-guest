@@ -127,6 +127,7 @@ class AuthRepositoryProtocol(Protocol):
         *,
         email: str | None = None,
         success: bool | None = None,
+        user_ids: list[uuid.UUID] | None = None,
         page: int,
         page_size: int,
     ) -> tuple[list[LoginAttempt], PaginationMeta]: ...
@@ -392,6 +393,7 @@ class AuthRepository:
         *,
         email: str | None = None,
         success: bool | None = None,
+        user_ids: list[uuid.UUID] | None = None,
         page: int,
         page_size: int,
     ) -> tuple[list[LoginAttempt], PaginationMeta]:
@@ -401,13 +403,24 @@ class AuthRepository:
         has no ``organization_id`` column at all (confirmed by its own
         field list -- a login attempt is recorded by email/IP, not scoped
         to one organization), so this listing is genuinely platform-wide,
-        not tenant-filterable, unlike most other domains' own list
-        methods."""
+        not tenant-filterable by itself, unlike most other domains' own
+        list methods.
+
+        ``user_ids`` is the org-scoping seam ``app.domains.admin_logs``
+        composes: given the caller's own already-resolved list of an
+        organization's active member user ids, this filters down to just
+        their login rows (``IN`` clause, same as every other
+        ``GenericRepository.paginate`` list-valued filter -- see
+        ``app.database.utils.filters.apply_filters``). ``None`` (the
+        default) preserves this method's original platform-wide
+        behaviour for every existing caller."""
         filters: dict[str, object] = {}
         if email is not None:
             filters["email"] = email.lower()
         if success is not None:
             filters["success"] = success
+        if user_ids is not None:
+            filters["user_id"] = user_ids
         return await self.login_attempts.paginate(
             page=page,
             page_size=page_size,

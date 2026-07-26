@@ -273,6 +273,7 @@ class FakeAuthRepository:
         *,
         email: str | None = None,
         success: bool | None = None,
+        user_ids: list[uuid.UUID] | None = None,
         page: int,
         page_size: int,
     ) -> tuple[list[LoginAttempt], PaginationMeta]:
@@ -281,6 +282,8 @@ class FakeAuthRepository:
             values = [a for a in values if a.email == email.lower()]
         if success is not None:
             values = [a for a in values if a.success == success]
+        if user_ids is not None:
+            values = [a for a in values if a.user_id in user_ids]
         params = PageParams(page=page, page_size=page_size)
         paged = values[params.offset : params.offset + params.page_size]
         return paged, PaginationMeta.from_total(params, len(values))
