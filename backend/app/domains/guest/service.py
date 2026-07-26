@@ -50,15 +50,21 @@ docstring for the full reasoning (mirrors ``Router.api_credentials_encrypted
 ``RadiusService.accounting_start`` does **not** create a brand-new
 ``GuestSession`` from nothing. In this module's design, a ``GuestSession``
 is always originated by this module's own guest-facing login endpoints
-(``login_via_otp``/``login_via_voucher``) -- a NAS never authenticates a
-guest independently of CloudGuest's own OTP/voucher flow, unlike a generic
-enterprise RADIUS deployment where a NAS might originate sessions for
-usernames/passwords it has no other record of. The session id handed back
-to the guest's device (and, in a real deployment, echoed into the router's
-RADIUS accounting attributes as ``Acct-Session-Id``) is exactly the
-``GuestSession.id`` this module already created -- ``accounting_start``'s
-job is to confirm that id exists and belongs to a router this NAS is
-registered for, not to fabricate a session with no known auth method.
+(``login_via_otp``/``login_via_voucher``/``login_via_password``) or --
+the one deliberate exception, see ``RadiusService.authorize``'s own
+docstring -- by ``RadiusService.authorize`` itself, when a NAS-asserted
+``Calling-Station-Id`` matches a real MAC-whitelist entry. Either way, a
+``GuestSession`` is never originated from an unauthenticated claim: the
+former is a guest interactively proving an OTP/voucher/password over a
+rate-limited, purpose-built flow; the latter only ever runs behind
+``dependencies.CurrentNas``'s shared-secret authentication, i.e. the MAC
+value is the NAS's own assertion, not a browser's. The session id handed
+back to the guest's device (and, in a real deployment, echoed into the
+router's RADIUS accounting attributes as ``Acct-Session-Id``) is exactly
+the ``GuestSession.id`` one of those two paths already created --
+``accounting_start``'s job is to confirm that id exists and belongs to a
+router this NAS is registered for, not to fabricate a session with no
+known auth method.
 
 ## ``data_limit_mb``/``session_timeout_minutes``: copied, not referenced
 
@@ -3466,7 +3472,11 @@ class RadiusService:
         )
 
     async def authorize(
-        self, *, nas_client: RadiusNasClient, username: str
+        self,
+        *,
+        nas_client: RadiusNasClient,
+        username: str,
+        calling_station_id: str | None = None,
     ) -> RadiusAuthorizeResult:
         """Authorize phase: is ``username`` (the guest's identifier) a
         currently-``ACTIVE`` guest session on a router bound to this NAS?
@@ -3479,19 +3489,80 @@ class RadiusService:
         ``dependencies.CurrentNas`` -- this method (and every other
         RADIUS-facing method below) never re-authenticates the shared
         secret itself, that happens exactly once, at the FastAPI
-        dependency layer."""
+        dependency layer.
+
+        **MAC-whitelist auto-connect lives here, not a separate public
+        endpoint.** A previous pass added ``POST /guest/login/mac``, a
+        public, unauthenticated endpoint that issued a full guest session
+        from nothing more than a client-supplied ``mac_address`` string in
+        an HTTP body -- anyone who knew or guessed a whitelisted MAC could
+        impersonate that device from anywhere on the internet, with no
+        server-side verification the caller was ever near the real
+        network. That endpoint has been removed entirely. The genuinely
+        correct binding for "a pre-whitelisted device connects without
+        OTP/voucher/password" is exactly the one every real captive-portal
+        vendor (Cisco Meraki, Aruba, Ubiquiti) uses: bind the check to a
+        value the NAS/router itself asserts, never a browser's claim. RFC
+        2865 Section 5.31's ``Calling-Station-Id`` is that value -- it
+        only ever reaches this method as ``calling_station_id``, alongside
+        an already shared-secret-authenticated ``nas_client``, so it can
+        never be forged by an unauthenticated caller the way a JSON body
+        field could.
+
+        When ``username`` has no existing active session on this NAS's
+        router (the ordinary case for a device that has never been
+        through the captive portal at all -- exactly what a whitelisted
+        device skips), and a ``calling_station_id`` was supplied, this
+        next checks for an existing active session under that MAC's own
+        derived identity (``f"mac:{normalized_mac}"``, the same identity
+        ``login_via_mac_whitelist`` always creates/reuses) before ever
+        originating a new one -- a real NAS re-sends Authorize on every
+        periodic reauthentication for an already-connected device, and
+        without this check each one would call
+        ``GuestService.login_via_mac_whitelist`` again, piling up a new
+        concurrent ``GuestSession`` per reauth until
+        ``ConcurrentSessionLimitExceededError`` started rejecting the
+        device's *own* legitimate reauths. Only when neither lookup finds
+        a live session does this fall through to
+        ``GuestService.login_via_mac_whitelist`` -- composing with, not
+        reimplementing, the same whitelist check/session-origination logic
+        that method already owns -- to originate a real session right
+        here, at authorize time. Any ``CloudGuestError`` that comes back
+        (MAC not whitelisted, no MAC Authorization integration wired,
+        guest blocked, router not eligible, device/session limits
+        exceeded, FUP quota exhausted, malformed MAC, ...) is treated
+        exactly like every other authorize-phase rejection below: a plain
+        ``authorized=False``, never a raised exception -- RADIUS has no
+        notion of "why", only accept/reject."""
         router = await self.router_lookup.get_router(
             nas_client.router_id, include_deleted=True
         )
-        guest = await self.repository.get_guest_by_identifier(
-            router.organization_id, username
-        )
-        if guest is None or guest.is_blocked:
-            return RadiusAuthorizeResult(
-                authorized=False, session_timeout_seconds=None, data_limit_mb=None
-            )
-        session = await self.repository.get_latest_session_for_guest(guest.id)
-        if session is None or not session.is_active() or session.router_id != router.id:
+
+        session = await self._find_active_session_for_identifier(router, username)
+
+        if session is None and calling_station_id:
+            try:
+                normalized_mac = normalize_whitelist_mac_address(calling_station_id)
+            except MacAuthorizationError:
+                normalized_mac = None
+            if normalized_mac is not None:
+                session = await self._find_active_session_for_identifier(
+                    router, f"mac:{normalized_mac}"
+                )
+            if session is None:
+                try:
+                    result = await self.guest_service.login_via_mac_whitelist(
+                        mac_address=calling_station_id,
+                        organization_id=router.organization_id,
+                        location_id=router.location_id,
+                        router_id=router.id,
+                    )
+                except CloudGuestError:
+                    session = None
+                else:
+                    session = result.session
+
+        if session is None:
             return RadiusAuthorizeResult(
                 authorized=False, session_timeout_seconds=None, data_limit_mb=None
             )
@@ -3505,6 +3576,31 @@ class RadiusService:
             data_limit_mb=session.data_limit_mb,
             rate_limit=await self._resolve_rate_limit_reply(session.id),
         )
+
+    async def _find_active_session_for_identifier(
+        self, router: Router, identifier: str
+    ) -> GuestSession | None:
+        """Shared by ``authorize``'s two lookups (``username``, and --
+        MAC-whitelist bypass -- the MAC's own derived identity): is
+        ``identifier`` a currently-``ACTIVE`` guest session on
+        ``router``? Returns ``None`` for an unknown, blocked, or
+        session-less guest, or a session that exists but is inactive or
+        bound to a different router -- never raises, mirroring
+        ``authorize``'s own "no notion of why, only accept/reject"
+        contract."""
+        guest = await self.repository.get_guest_by_identifier(
+            router.organization_id, identifier
+        )
+        if guest is None or guest.is_blocked:
+            return None
+        candidate = await self.repository.get_latest_session_for_guest(guest.id)
+        if (
+            candidate is not None
+            and candidate.is_active()
+            and candidate.router_id == router.id
+        ):
+            return candidate
+        return None
 
     async def _resolve_rate_limit_reply(self, session_id: uuid.UUID) -> str | None:
         """Best-effort, additive ``Mikrotik-Rate-Limit`` resolution -- see

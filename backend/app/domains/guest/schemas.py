@@ -137,25 +137,6 @@ class GuestPasswordLoginRequest(BaseModel):
     ip_address: str | None = Field(default=None, max_length=45)
 
 
-class GuestMacLoginRequest(BaseModel):
-    """A pre-whitelisted device connecting without OTP/voucher/password --
-    see ``service.GuestService.login_via_mac_whitelist``'s docstring for
-    the full "how would a MAC address ever reach this endpoint" write-up.
-    ``mac_address`` is both the credential (checked against
-    ``app.domains.mac_authorization``) and the device identity recorded
-    on the resulting session -- there is deliberately no separate
-    ``device_mac`` field the way the other three login requests have,
-    since here they can only ever be the same value."""
-
-    mac_address: str = Field(..., min_length=1, max_length=64)
-    organization_id: uuid.UUID | None = Field(default=None)
-    location_id: uuid.UUID = Field(...)
-    router_id: uuid.UUID = Field(
-        ..., description="The NAS (router) this guest's session will be on."
-    )
-    ip_address: str | None = Field(default=None, max_length=45)
-
-
 class GuestSetPasswordRequest(BaseModel):
     """Lets a guest opt in to password login right after a real OTP
     verification -- ``session_id`` is the ``GuestSession.id`` that same OTP
@@ -436,9 +417,34 @@ class RadiusAuthorizeRequest(BaseModel):
     request headers (see ``constants.RADIUS_NAS_IDENTIFIER_HEADER``/
     ``RADIUS_SHARED_SECRET_HEADER``), not this body, mirroring
     ``app.domains.router_agent``'s device-credential-via-header
-    convention."""
+    convention.
+
+    ``calling_station_id`` is RFC 2865 Section 5.31's standard attribute
+    for the connecting device's MAC address, as asserted by the NAS
+    itself -- FreeRADIUS's ``rlm_rest`` always has this available (the
+    NAS puts it on every real Access-Request) and forwards it verbatim
+    into this call's body. This is the *only* place in this domain a MAC
+    address is trusted as a login credential: unlike a value a browser
+    could claim over an unauthenticated HTTP call, this one only ever
+    reaches ``RadiusService.authorize`` alongside a shared-secret-
+    authenticated ``nas_client`` (``dependencies.CurrentNas``), i.e. it is
+    asserted by the same network equipment whose secret already proved
+    it is the real NAS a device is physically connected to -- see
+    ``RadiusService.authorize``'s own docstring for how this replaces the
+    former public, unauthenticated ``POST /guest/login/mac`` endpoint."""
 
     username: str = Field(..., description="The guest's identifier (phone/email).")
+    calling_station_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "RADIUS Calling-Station-Id (RFC 2865 Section 5.31) -- the "
+            "connecting device's MAC address, as asserted by the NAS "
+            "itself. Used to grant a MAC-whitelist auto-connect directly "
+            "at authorize time when no session already exists for "
+            "``username`` -- see ``RadiusService.authorize``'s docstring."
+        ),
+    )
 
 
 class RadiusAuthorizeResponse(BaseModel):

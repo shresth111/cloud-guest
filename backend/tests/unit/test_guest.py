@@ -3956,6 +3956,199 @@ class TestRadius:
 
 
 # ============================================================================
+# RADIUS-authorize-time MAC-whitelist bypass (the real fix replacing the
+# removed, public, unauthenticated ``POST /guest/login/mac`` -- see
+# ``RadiusService.authorize``'s own docstring for the full write-up).
+# ============================================================================
+
+
+class TestRadiusAuthorizeMacWhitelistBypass:
+    async def _register_and_authenticate_nas(
+        self, fx: Fixture, secret: str = "supersecret123"
+    ) -> RadiusNasClient:
+        await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=fx.router.id,
+            nas_identifier="nas-1",
+            shared_secret=secret,
+        )
+        return await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-1", shared_secret=secret
+        )
+
+    async def test_nas_authenticated_authorize_with_whitelisted_calling_station_id_grants_access(  # noqa: E501
+        self,
+    ) -> None:
+        """The real, correct fix: a NAS that has already proved itself with
+        its own shared secret (``CurrentNas``, mirrored here by
+        ``authenticate_nas``) asserts ``Calling-Station-Id`` for a
+        whitelisted device that has never touched the captive portal at
+        all -- no prior OTP/voucher/password login, no pre-existing
+        guest. ``authorize`` must originate a real session for it and
+        grant access, entirely server-to-server."""
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        authz = await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="AA:BB:CC:DD:EE:FF",
+            calling_station_id="AA:BB:CC:DD:EE:FF",
+        )
+
+        assert authz.authorized is True
+        # Prove a real GuestSession was actually originated -- not merely
+        # a hollow "authorized=True" -- exactly the same session-of-record
+        # a captive-portal login would have created.
+        guest = await fx.repository.get_guest_by_identifier(
+            fx.organization_id, "mac:AA:BB:CC:DD:EE:FF"
+        )
+        assert guest is not None
+        session = await fx.repository.get_latest_session_for_guest(guest.id)
+        assert session is not None
+        assert session.status == GuestSessionStatus.ACTIVE.value
+        assert session.auth_method == GuestAuthMethod.MAC_WHITELIST.value
+        assert session.router_id == fx.router.id
+
+    async def test_repeated_nas_reauthorize_reuses_the_same_session(self) -> None:
+        """A real NAS re-sends Authorize on every periodic 802.1x
+        reauthentication for an already-connected device -- this must
+        never pile up a new concurrent session (and eventually start
+        rejecting the device's own legitimate reauths) each time."""
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        first = await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="AA:BB:CC:DD:EE:FF",
+            calling_station_id="AA:BB:CC:DD:EE:FF",
+        )
+        second = await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="AA:BB:CC:DD:EE:FF",
+            calling_station_id="AA:BB:CC:DD:EE:FF",
+        )
+
+        assert first.authorized is True
+        assert second.authorized is True
+        guest = await fx.repository.get_guest_by_identifier(
+            fx.organization_id, "mac:AA:BB:CC:DD:EE:FF"
+        )
+        active_sessions = [
+            s
+            for s in fx.repository.sessions.values()
+            if s.guest_id == guest.id and s.status == GuestSessionStatus.ACTIVE.value
+        ]
+        assert len(active_sessions) == 1
+
+    async def test_authorize_rejects_a_non_whitelisted_calling_station_id(self) -> None:
+        """A device the admin never whitelisted must never get access,
+        even with a genuinely NAS-authenticated ``Calling-Station-Id``."""
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        authz = await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="11:22:33:44:55:66",
+            calling_station_id="11:22:33:44:55:66",
+        )
+
+        assert authz.authorized is False
+        assert (
+            await fx.repository.get_guest_by_identifier(
+                fx.organization_id, "mac:11:22:33:44:55:66"
+            )
+            is None
+        )
+
+    async def test_authorize_with_no_hook_wired_rejects_calling_station_id(
+        self,
+    ) -> None:
+        """No ``MacAuthorizationService`` integration wired at all (the
+        default) -- the fallback must reject, not silently grant."""
+        fx = make_fixture()
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        authz = await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="AA:BB:CC:DD:EE:FF",
+            calling_station_id="AA:BB:CC:DD:EE:FF",
+        )
+
+        assert authz.authorized is False
+
+    async def test_authorize_without_calling_station_id_never_bypasses(self) -> None:
+        """A caller that only claims a username with no NAS-asserted MAC
+        at all -- the exact shape of the old, removed public endpoint's
+        claim -- must still be rejected: nothing here ever trusts a bare
+        claim with no NAS-verified Calling-Station-Id behind it."""
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        authz = await fx.radius_service.authorize(
+            nas_client=nas_client, username="mac:AA:BB:CC:DD:EE:FF"
+        )
+
+        assert authz.authorized is False
+
+    async def test_unauthenticated_nas_cannot_reach_authorize_at_all(self) -> None:
+        """The whole point: without the real NAS shared secret, a caller
+        can never even reach ``RadiusService.authorize`` to attempt a
+        Calling-Station-Id claim -- ``CurrentNas`` (the FastAPI dependency
+        the real router endpoint sits behind) raises before this service
+        method is ever invoked."""
+        fx = make_fixture()
+        await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=fx.router.id,
+            nas_identifier="nas-1",
+            shared_secret="supersecret123",
+        )
+        with pytest.raises(RadiusNasAuthenticationError):
+            await fx.radius_service.authenticate_nas(
+                nas_identifier="nas-1", shared_secret="wrong-secret"
+            )
+
+
+class TestPublicMacLoginEndpointRemoved:
+    """The engineering-lead review's finding: ``POST /guest/login/mac`` let
+    an unauthenticated browser claim any ``mac_address`` string and get a
+    full guest session for it. The fix is not a docstring caveat -- the
+    endpoint, its request schema, and the guest-facing frontend's ``?mac=``
+    trigger are all genuinely gone, not merely deprecated-but-still-
+    callable. This asserts that against the real, fully-wired app FastAPI
+    actually serves, the same way ``test_route_permission_coverage.py``
+    inspects real registered routes rather than a hand-maintained list."""
+
+    def test_login_mac_route_no_longer_exists_anywhere_in_the_app(self) -> None:
+        from app.main import create_app
+
+        app = create_app()
+        registered = {
+            (method, route.path)
+            for route in app.routes
+            if hasattr(route, "methods") and hasattr(route, "path")
+            for method in route.methods or ()
+        }
+        assert ("POST", "/api/v1/guest/login/mac") not in registered
+        # Confirm this isn't a false negative from a prefix mismatch --
+        # its sibling guest-facing login endpoints are still very much
+        # present and unaffected by the removal.
+        assert ("POST", "/api/v1/guest/login/otp") in registered
+        assert ("POST", "/api/v1/guest/login/voucher") in registered
+        assert ("POST", "/api/v1/guest/login/password") in registered
+        assert ("POST", "/api/v1/radius/authorize") in registered
+
+    def test_guest_mac_login_request_schema_no_longer_exists(self) -> None:
+        import app.domains.guest.schemas as guest_schemas
+
+        assert not hasattr(guest_schemas, "GuestMacLoginRequest")
+
+
+# ============================================================================
 # RADIUS Accounting-On/Accounting-Off (RFC 2866 §5.13): NAS reboot/shutdown
 # closes every ACTIVE GuestSession tied to that NAS's router.
 # ============================================================================
