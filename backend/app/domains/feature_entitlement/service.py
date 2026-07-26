@@ -8,21 +8,27 @@ rather than implementing its own feature store.
 
 from __future__ import annotations
 
-import uuid
 import logging
+import uuid
 from typing import Any
 
-from app.domains.billing.constants import PlanFeatureKey, BOOLEAN_FEATURE_KEYS, LIMIT_FEATURE_KEYS
+from app.domains.billing.constants import (
+    BOOLEAN_FEATURE_KEYS,
+    LIMIT_FEATURE_KEYS,
+    TIER_FEATURE_KEYS,
+    PlanFeatureKey,
+    SupportTier,
+)
 from app.domains.billing.service import SuperAdminBillingDashboardService
-from app.domains.organization.service import OrganizationService
 from app.domains.organization.repository import OrganizationRepositoryProtocol
+from app.domains.organization.service import OrganizationService
 
 from .schemas import (
-    FeatureInfo,
-    FeatureListResponse,
-    CustomerFeatureValue,
     CustomerFeaturesResponse,
     CustomerFeaturesUpdateResponse,
+    CustomerFeatureValue,
+    FeatureInfo,
+    FeatureListResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,17 +66,29 @@ class FeatureEntitlementService:
         for key in PlanFeatureKey:
             meta = FEATURE_META.get(key, (key.value, key.value.replace("_", " ").title(), "general"))
             is_limit = key in LIMIT_FEATURE_KEYS
+            # ``support_level`` is the one TIER-typed feature key this
+            # domain has today (``TIER_FEATURE_KEYS`` -- see that
+            # constant's own docstring) -- it must never be reported as
+            # ``"boolean"``: a plain on/off toggle has no legal
+            # ``tier_value`` to send, and ``validate_feature_value``
+            # correctly rejects a TIER-typed override with none (this is
+            # exactly the bug that let the Smart Location Provisioning
+            # wizard's "Features" step send a shapeless ``support_level``
+            # override).
+            is_tier = key in TIER_FEATURE_KEYS
             features.append(FeatureInfo(
                 key=key.value,
                 name=meta[0],
                 description=meta[1],
                 category=meta[2],
-                type="limit" if is_limit else "boolean",
+                type="limit" if is_limit else "tier" if is_tier else "boolean",
                 default_enabled=key in BOOLEAN_FEATURE_KEYS and key not in (
                     PlanFeatureKey.WHITE_LABEL,
                     PlanFeatureKey.AI_FEATURES,
                     PlanFeatureKey.ISP_FAILOVER,
                 ),
+                tier_options=[tier.value for tier in SupportTier] if is_tier else [],
+                default_tier_value=SupportTier.BASIC.value if is_tier else None,
             ))
         return FeatureListResponse(features=features)
 
