@@ -66,7 +66,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_origins=[str(origin) for origin in app_settings.allowed_origins],
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-Organization-Id"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-Request-ID",
+            "X-Organization-Id",
+            # RBAC's own CurrentLocation/CurrentRouter dependencies
+            # (app.domains.rbac.dependencies) resolve scope from these two
+            # headers exactly like X-Organization-Id above -- e.g. every
+            # LOCATION-scoped report (analytics report_router.py's
+            # POST /reports for report_type=location) needs X-Location-Id
+            # to reach the browser at all; without it here, the browser's
+            # preflight itself fails before the request is ever sent.
+            "X-Location-Id",
+            "X-Router-Id",
+        ],
     )
     # Prometheus HTTP-level metrics (app.core.metrics) -- must wrap every
     # request, so it is added like every other cross-cutting middleware
