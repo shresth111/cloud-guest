@@ -153,6 +153,23 @@ class Guest(BaseModel):
     total_visit_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Returning-guest password login: nullable, since every existing guest
+    # (and every brand-new one, until they opt in) has never set one --
+    # ``NULL`` here means "this guest can only log in via OTP/voucher today".
+    # Hashed with ``app.domains.auth.password.PasswordManager`` (Argon2id),
+    # the exact same convention platform ``AuthUser.password_hash`` accounts
+    # use -- reused, not reimplemented, so this column gets the same cost
+    # parameters/upgrade path for free. Only ever written by
+    # ``GuestService.set_guest_password`` (itself only reachable with proof
+    # of a just-completed, still-``ACTIVE`` OTP-authenticated
+    # ``GuestSession`` -- see that method's docstring), never by
+    # ``login_via_otp``/``login_via_voucher`` themselves. This is the real
+    # column ``app.domains.captive_portal.models.CaptivePortalConfig
+    # .username_password_enabled`` was always a placeholder readiness flag
+    # for (see that column's own docstring: "no ``Guest`` model exists yet
+    # to authenticate against") -- ``GuestService.login_via_password`` is
+    # what finally makes that flag do real work.
+    hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     __table_args__ = (
         Index("ix_guests_organization_id", "organization_id"),

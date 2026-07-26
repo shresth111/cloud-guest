@@ -33,6 +33,9 @@ from .constants import (
 __all__ = [
     "GuestOtpLoginRequest",
     "GuestVoucherLoginRequest",
+    "GuestPasswordLoginRequest",
+    "GuestSetPasswordRequest",
+    "GuestSetPasswordResponse",
     "GuestConsentRequest",
     "GuestBlockRequest",
     "SessionDisconnectRequest",
@@ -113,6 +116,44 @@ class GuestVoucherLoginRequest(BaseModel):
     device_mac: str | None = Field(default=None, max_length=17)
     device_name: str | None = Field(default=None, max_length=200)
     ip_address: str | None = Field(default=None, max_length=45)
+
+
+class GuestPasswordLoginRequest(BaseModel):
+    """Returning-guest phone/email + password login -- the ``username_password``
+    counterpart to ``GuestOtpLoginRequest``/``GuestVoucherLoginRequest``. Only
+    succeeds for a guest that has already called ``POST /guest/set-password``
+    once (itself only reachable after a real OTP login) -- see
+    ``service.GuestService.login_via_password``'s docstring."""
+
+    identifier: str = Field(..., min_length=3, max_length=255)
+    password: str = Field(..., min_length=1, max_length=128)
+    organization_id: uuid.UUID | None = Field(default=None)
+    location_id: uuid.UUID = Field(...)
+    router_id: uuid.UUID = Field(
+        ..., description="The NAS (router) this guest's session will be on."
+    )
+    device_mac: str | None = Field(default=None, max_length=17)
+    device_name: str | None = Field(default=None, max_length=200)
+    ip_address: str | None = Field(default=None, max_length=45)
+
+
+class GuestSetPasswordRequest(BaseModel):
+    """Lets a guest opt in to password login right after a real OTP
+    verification -- ``session_id`` is the ``GuestSession.id`` that same OTP
+    login just returned (see ``GuestLoginResponse.session.id``), and is the
+    *only* thing authenticating this call (there is no platform-user JWT a
+    guest could ever present) -- see
+    ``service.GuestService.set_guest_password``'s docstring for the full
+    proof-of-recent-OTP-login write-up."""
+
+    guest_id: uuid.UUID
+    session_id: uuid.UUID
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class GuestSetPasswordResponse(BaseModel):
+    guest_id: str
+    password_set: bool
 
 
 class GuestConsentRequest(BaseModel):
@@ -219,6 +260,13 @@ class GuestLoginResponse(BaseModel):
     guest_id: str
     identifier: str
     is_new_guest: bool
+    # Whether this guest already has a password set -- lets the
+    # guest-facing frontend decide whether to show the "set a password for
+    # next time?" prompt after an OTP login (skip it if already set, or if
+    # this login was itself via password -- see
+    # ``service.GuestService.login_via_password``, which only ever succeeds
+    # for a guest that already has one).
+    has_password: bool
     session: GuestSessionResponse
     device: GuestDeviceResponse | None
 

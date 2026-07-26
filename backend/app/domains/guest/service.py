@@ -230,6 +230,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from app.common.exceptions import CloudGuestError
+from app.domains.auth.password import (
+    PasswordManager,
+    PasswordStrengthError,
+    PasswordVerificationError,
+)
 from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.guest_access.exceptions import GuestAccessDeniedError
 from app.domains.guest_access.service import AccessDecision
@@ -256,6 +261,7 @@ from .constants import (
     DEFAULT_SESSION_TIMEOUT_MINUTES,
     NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
     RECONNECT_GRACE_MINUTES,
+    SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
     GuestAuthMethod,
     GuestSessionStatus,
@@ -291,6 +297,9 @@ from .exceptions import (
     GuestBlockedError,
     GuestDeviceLimitExceededError,
     GuestNotFoundError,
+    GuestPasswordLoginFailedError,
+    GuestPasswordSetupNotAuthorizedError,
+    GuestPasswordTooWeakError,
     GuestSessionNotFoundError,
     InvalidSessionStatusTransitionError,
     NoReconnectableSessionError,
@@ -342,6 +351,18 @@ from .validators import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A real Argon2id hash of a fixed, never-issued dummy password -- computed
+# once at import time and verified against whenever ``login_via_password``
+# has no real ``Guest.hashed_password`` to compare against (guest doesn't
+# exist, or exists but never called ``set_guest_password``). Without this,
+# a missing-guest/missing-password login would return in microseconds while
+# a real-guest-wrong-password login pays Argon2id's real verify cost,
+# letting a timing side-channel answer "does this phone number have a
+# password set?" even though ``GuestPasswordLoginFailedError``'s own
+# message is deliberately generic -- see ``GuestService
+# ._verify_guest_password``.
+_DUMMY_PASSWORD_HASH = PasswordManager.hash("Dummy-Guest-Password-000!")
 
 
 def _event_extra(event: object) -> dict[str, object]:
@@ -1460,6 +1481,220 @@ class GuestService:
         return GuestLoginResult(
             guest=guest, session=session, device=device, is_new_guest=is_new
         )
+
+    def _verify_guest_password(self, guest: Guest | None, password: str) -> bool:
+        """Constant-effort password check for ``login_via_password`` -- see
+        ``_DUMMY_PASSWORD_HASH``'s own module-level docstring for why a real
+        Argon2id ``verify`` always runs, even when ``guest`` is ``None`` or
+        has no password set, rather than short-circuiting straight to
+        ``False``."""
+        hashed = guest.hashed_password if guest and guest.hashed_password else None
+        try:
+            verified = PasswordManager.verify(password, hashed or _DUMMY_PASSWORD_HASH)
+        except PasswordVerificationError:
+            verified = False
+        return verified if hashed is not None else False
+
+    async def login_via_password(
+        self,
+        *,
+        identifier: str,
+        password: str,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID,
+        router_id: uuid.UUID,
+        device_mac: str | None = None,
+        device_name: str | None = None,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+        accept_language: str | None = None,
+    ) -> GuestLoginResult:
+        """Returning-guest phone/email + password login -- the
+        ``username_password`` auth method
+        ``app.domains.captive_portal.models.CaptivePortalConfig
+        .username_password_enabled`` was always a placeholder readiness flag
+        for (see that column's own docstring). Only ever succeeds for a
+        guest that has already called ``set_guest_password`` once (itself
+        only reachable right after a real OTP login) -- there is no way to
+        create a ``Guest`` row, or set its first password, through this
+        method. Mirrors ``login_via_otp``'s/``login_via_voucher``'s exact
+        blocked-guest/access-control/concurrent-session/device-limit/FUP-quota
+        gate ordering (reject before touching anything credential-shaped),
+        substituting a password comparison for OTP verification/voucher
+        redemption -- the one difference is that a missing/wrong-password
+        failure and a "no such guest at all" failure raise the exact same
+        ``GuestPasswordLoginFailedError`` (see that exception's own
+        docstring for why: distinguishing them here would let a caller
+        enumerate which identifiers are registered guests)."""
+        identifier = normalize_identifier(identifier)
+        resolved = await self._require_method_enabled(
+            organization_id=organization_id,
+            location_id=location_id,
+            auth_method=GuestAuthMethod.USERNAME_PASSWORD,
+        )
+        resolved_org_id = resolved.config.organization_id
+
+        existing_guest = await self.repository.get_guest_by_identifier(
+            resolved_org_id, identifier
+        )
+        self._reject_if_blocked(existing_guest)
+        await self._enforce_access_control(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=device_mac,
+        )
+        if existing_guest is not None:
+            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_device_limit(
+                guest_id=existing_guest.id,
+                mac_address=device_mac,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
+            await self._enforce_fup_quota(
+                guest_id=existing_guest.id, organization_id=resolved_org_id
+            )
+
+        router = await self._get_eligible_router(router_id)
+
+        if not self._verify_guest_password(existing_guest, password):
+            await self._record_login_failure(
+                guest=existing_guest,
+                identifier=identifier,
+                auth_method=GuestAuthMethod.USERNAME_PASSWORD,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+                reason="GuestPasswordLoginFailedError",
+                ip_address=ip_address,
+            )
+            raise GuestPasswordLoginFailedError()
+
+        guest = existing_guest
+        assert guest is not None  # narrowed by _verify_guest_password above
+        device = await self._maybe_get_or_create_device(
+            guest_id=guest.id, mac_address=device_mac, device_name=device_name
+        )
+        session = await self._create_session(
+            guest=guest,
+            device=device,
+            router=router,
+            location_id=location_id,
+            auth_method=GuestAuthMethod.USERNAME_PASSWORD,
+            voucher_id=None,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            accept_language=accept_language,
+            data_limit_mb=None,
+            session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
+        )
+        await self._broadcast_guest_session_started(
+            session=session,
+            guest=guest,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+            auth_method=GuestAuthMethod.USERNAME_PASSWORD.value,
+            is_new_guest=False,
+        )
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+        await self._bump_guest_visit(guest)
+        await self._record_login_success(
+            guest=guest,
+            identifier=identifier,
+            auth_method=GuestAuthMethod.USERNAME_PASSWORD,
+            location_id=location_id,
+            ip_address=ip_address,
+        )
+
+        event = GuestLoggedIn(
+            guest_id=guest.id,
+            identifier=identifier,
+            auth_method=GuestAuthMethod.USERNAME_PASSWORD.value,
+            session_id=session.id,
+            is_new_guest=False,
+        )
+        logger.info("guest_logged_in", extra=_event_extra(event))
+        return GuestLoginResult(
+            guest=guest, session=session, device=device, is_new_guest=False
+        )
+
+    async def set_guest_password(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        session_id: uuid.UUID,
+        password: str,
+    ) -> Guest:
+        """Lets a guest opt in to password login, right after a real OTP
+        verification -- the "set a password for next time?" prompt the
+        guest-facing frontend shows immediately after ``login_via_otp``
+        succeeds.
+
+        **Authenticated by the just-completed OTP session, not a separate
+        unauthenticated hole.** There is no platform-user JWT a guest could
+        ever present (the same reason ``guest_router`` carries no
+        ``RequirePermission``/``CurrentUser`` at all -- see ``router.py``'s
+        module docstring), so proof of "this really is the guest who just
+        verified an OTP code" has to come from something else: the
+        ``GuestSession.id`` that same OTP login just returned, in
+        ``GuestLoginResponse.session.id``. This method verifies every leg
+        of that proof itself (composing ``repository.get_session_by_id``,
+        never trusting the caller's say-so):
+
+        * the session exists and belongs to ``guest_id``;
+        * its ``auth_method`` is ``otp_sms``/``otp_email`` (not
+          ``voucher``/an earlier ``username_password`` login -- a guest
+          resetting their password with an *old* password is a genuinely
+          different, not-yet-built feature, and a voucher redemption proves
+          nothing about phone/email ownership the way an OTP does);
+        * it is still ``ACTIVE`` (a disconnected/expired/terminated session
+          is no longer live proof of anything);
+        * it started within ``constants.SET_PASSWORD_SESSION_WINDOW_MINUTES``
+          of now -- a deliberately short window (see that constant's own
+          docstring) so this can never become "any OTP login, ever, is a
+          standing license to set a password".
+
+        Any failed leg raises ``GuestPasswordSetupNotAuthorizedError``
+        (one generic message -- see that exception's own docstring for why).
+        ``password`` is hashed via ``PasswordManager.hash`` (Argon2id,
+        composed from ``app.domains.auth.password`` -- the exact same
+        convention/cost parameters platform ``AuthUser`` passwords use, not
+        reimplemented); a password failing
+        ``PasswordManager.validate_strength`` raises
+        ``GuestPasswordTooWeakError`` with that validator's own message,
+        surfaced to the guest so they know exactly what to fix."""
+        guest = await self._require_guest(guest_id)
+        session = await self.repository.get_session_by_id(session_id)
+        now = datetime.now(UTC)
+        window_start = now - timedelta(minutes=SET_PASSWORD_SESSION_WINDOW_MINUTES)
+        eligible = (
+            session is not None
+            and session.guest_id == guest.id
+            and session.auth_method
+            in (GuestAuthMethod.OTP_SMS.value, GuestAuthMethod.OTP_EMAIL.value)
+            and session.status == GuestSessionStatus.ACTIVE.value
+            and session.started_at >= window_start
+        )
+        if not eligible:
+            raise GuestPasswordSetupNotAuthorizedError()
+
+        try:
+            hashed = PasswordManager.hash(password)
+        except PasswordStrengthError as exc:
+            raise GuestPasswordTooWeakError(str(exc)) from exc
+
+        updated = await self.repository.update_guest(guest, {"hashed_password": hashed})
+        logger.info(
+            "guest_password_set",
+            extra={"event_guest_id": str(updated.id)},
+        )
+        return updated
 
     async def record_consent(
         self,

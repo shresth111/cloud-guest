@@ -44,6 +44,9 @@ __all__ = [
     "GuestDeviceLimitExceededError",
     "FairUsagePolicyExceededError",
     "InvalidExtensionMinutesError",
+    "GuestPasswordLoginFailedError",
+    "GuestPasswordSetupNotAuthorizedError",
+    "GuestPasswordTooWeakError",
 ]
 
 
@@ -372,3 +375,57 @@ class InvalidExtensionMinutesError(GuestError):
             f"additional_minutes must be positive, got {additional_minutes}",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+
+class GuestPasswordLoginFailedError(GuestError):
+    """Raised by ``GuestService.login_via_password`` for *every* way a
+    password login can fail: no ``Guest`` row exists for this identifier at
+    all, one exists but has never called ``set_guest_password``
+    (``hashed_password IS NULL``), or one exists with a password that
+    simply didn't match. All three collapse to this one, deliberately
+    generic message -- distinguishing them in the response would let an
+    attacker enumerate which phone numbers/emails are registered guests
+    (and, separately, which of those have a password set) purely from this
+    endpoint's error text, the same "don't leak identifier existence via a
+    login failure" posture ``app.domains.auth.router``'s own ``/auth/login``
+    already establishes for platform user accounts."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Invalid phone number/email or password. If you haven't set a "
+            "password yet, please sign in with a one-time code instead.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+
+class GuestPasswordSetupNotAuthorizedError(GuestError):
+    """``GuestService.set_guest_password`` requires proof of a
+    just-completed, still-``ACTIVE`` OTP-authenticated ``GuestSession``
+    (see that method's docstring) -- raised when the presented
+    ``session_id`` doesn't satisfy every leg of that proof: it doesn't
+    exist, belongs to a different guest, wasn't created via
+    ``otp_sms``/``otp_email``, is no longer ``ACTIVE``, or was started
+    further in the past than
+    ``constants.SET_PASSWORD_SESSION_WINDOW_MINUTES`` ago. Deliberately one
+    generic message across every one of those distinct reasons -- the
+    caller's only correct remedy is the same regardless of which leg
+    failed: log in again via OTP, then retry immediately."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This session isn't eligible to set a password -- please sign "
+            "in again with a one-time code and try again right after.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class GuestPasswordTooWeakError(GuestError):
+    """Wraps ``app.domains.auth.password.PasswordStrengthError`` from
+    ``PasswordManager.validate_strength`` (composed, not reimplemented --
+    the exact same strength policy platform ``AuthUser`` passwords are held
+    to) in this domain's own exception hierarchy, so
+    ``GuestService.set_guest_password`` callers only ever need to catch
+    ``GuestError`` subclasses, not reach into ``app.domains.auth`` too."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason, status_code=status.HTTP_400_BAD_REQUEST)

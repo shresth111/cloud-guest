@@ -78,9 +78,12 @@ from .schemas import (
     GuestListResponse,
     GuestLoginResponse,
     GuestOtpLoginRequest,
+    GuestPasswordLoginRequest,
     GuestResponse,
     GuestSessionListResponse,
     GuestSessionResponse,
+    GuestSetPasswordRequest,
+    GuestSetPasswordResponse,
     GuestVoucherLoginRequest,
     OtpSuccessRateResponse,
     RadiusAccountingRequest,
@@ -200,6 +203,7 @@ def _login_response(result: GuestLoginResult) -> GuestLoginResponse:
         guest_id=str(result.guest.id),
         identifier=result.guest.identifier,
         is_new_guest=result.is_new_guest,
+        has_password=bool(result.guest.hashed_password),
         session=_session_response(result.session),
         device=_device_response(result.device) if result.device else None,
     )
@@ -279,6 +283,64 @@ async def guest_login_via_voucher(
         success=True,
         message="Guest logged in",
         data=_login_response(result).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/login/password",
+    response_model=ApiResponse[GuestLoginResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_login_via_password(
+    request: Request,
+    payload: GuestPasswordLoginRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    ip_address = payload.ip_address or (request.client.host if request.client else None)
+    user_agent = request.headers.get("user-agent")
+    accept_language = request.headers.get("accept-language")
+    result = await service.login_via_password(
+        identifier=payload.identifier,
+        password=payload.password,
+        organization_id=payload.organization_id,
+        location_id=payload.location_id,
+        router_id=payload.router_id,
+        device_mac=payload.device_mac,
+        device_name=payload.device_name,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        accept_language=accept_language,
+    )
+    return build_response(
+        success=True,
+        message="Guest logged in",
+        data=_login_response(result).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/set-password",
+    response_model=ApiResponse[GuestSetPasswordResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_set_password(
+    request: Request,
+    payload: GuestSetPasswordRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    guest = await service.set_guest_password(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        password=payload.password,
+    )
+    return build_response(
+        success=True,
+        message="Password set",
+        data=GuestSetPasswordResponse(
+            guest_id=str(guest.id), password_set=True
+        ).model_dump(),
         request_id=_request_id(request),
     )
 

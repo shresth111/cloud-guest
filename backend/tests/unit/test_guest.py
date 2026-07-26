@@ -35,6 +35,7 @@ from app.domains.guest.constants import (
     DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
     RECONNECT_GRACE_MINUTES,
+    SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
     GuestAuthMethod,
     GuestSessionStatus,
@@ -49,6 +50,9 @@ from app.domains.guest.exceptions import (
     GuestAuthMethodNotEnabledError,
     GuestBlockedError,
     GuestDeviceLimitExceededError,
+    GuestPasswordLoginFailedError,
+    GuestPasswordSetupNotAuthorizedError,
+    GuestPasswordTooWeakError,
     GuestSessionNotFoundError,
     InvalidExtensionMinutesError,
     InvalidNasStatusTransitionError,
@@ -78,6 +82,7 @@ from app.domains.guest.repository import (
 )
 from app.domains.guest.service import (
     GuestAnalyticsService,
+    GuestLoginResult,
     GuestService,
     RadiusService,
     get_or_reset_quota_usage,
@@ -1117,6 +1122,7 @@ def make_fixture(
     *,
     otp_sms_enabled: bool = True,
     voucher_enabled: bool = True,
+    username_password_enabled: bool = True,
     router_status: str = RouterStatus.ONLINE.value,
     access_control_hook: object | None = None,
     queue_lookup: object | None = None,
@@ -1138,6 +1144,7 @@ def make_fixture(
         organization_id,
         otp_sms_enabled=otp_sms_enabled,
         voucher_enabled=voucher_enabled,
+        username_password_enabled=username_password_enabled,
     )
     captive_portal_service.add_location(location_id, organization_id)
     router = router_service.add(organization_id=organization_id, status=router_status)
@@ -1372,6 +1379,261 @@ class TestVoucherLogin:
                 router_id=fx.router.id,
             )
         assert fx.repository.login_history[0].success is False
+
+
+# ============================================================================
+# Password-based login (returning guest phone/email + password)
+# ============================================================================
+
+
+class TestPasswordLogin:
+    async def test_disabled_method_for_location_rejected(self) -> None:
+        fx = make_fixture(username_password_enabled=False)
+        with pytest.raises(GuestAuthMethodNotEnabledError):
+            await fx.guest_service.login_via_password(
+                identifier="+15551234567",
+                password="whatever",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_no_such_guest_fails_generically(self) -> None:
+        fx = make_fixture()
+        with pytest.raises(GuestPasswordLoginFailedError):
+            await fx.guest_service.login_via_password(
+                identifier="+15559999999",
+                password="whatever",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert len(fx.repository.login_history) == 1
+        assert fx.repository.login_history[0].success is False
+        assert fx.repository.login_history[0].guest_id is None
+
+    async def test_guest_with_no_password_set_fails_with_the_same_generic_error(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        # A real guest exists (via a prior OTP login) but never called
+        # set_guest_password -- must fail exactly like a nonexistent guest,
+        # not leak "this identifier exists but has no password".
+        otp_result = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        with pytest.raises(GuestPasswordLoginFailedError):
+            await fx.guest_service.login_via_password(
+                identifier="+15551234567",
+                password="whatever",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        failures = [h for h in fx.repository.login_history if h.success is False]
+        assert len(failures) == 1
+        assert failures[0].guest_id == otp_result.guest.id
+
+    async def test_wrong_password_fails_generically(self) -> None:
+        fx = make_fixture()
+        otp_result = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.set_guest_password(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            password="Correct-Horse-1!",
+        )
+        with pytest.raises(GuestPasswordLoginFailedError):
+            await fx.guest_service.login_via_password(
+                identifier="+15551234567",
+                password="Wrong-Horse-1!",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_happy_path_after_password_is_set(self) -> None:
+        fx = make_fixture()
+        otp_result = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.set_guest_password(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            password="Correct-Horse-1!",
+        )
+        result = await fx.guest_service.login_via_password(
+            identifier="+15551234567",
+            password="Correct-Horse-1!",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="aa:bb:cc:dd:ee:ff",
+        )
+        assert result.is_new_guest is False
+        assert result.guest.id == otp_result.guest.id
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+        assert result.session.auth_method == GuestAuthMethod.USERNAME_PASSWORD.value
+        assert result.guest.total_visit_count == 2
+        successes = [h for h in fx.repository.login_history if h.success is True]
+        assert len(successes) == 2  # the original OTP login + this one
+
+    async def test_blocked_guest_rejected_before_password_check(self) -> None:
+        fx = make_fixture()
+        otp_result = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        await fx.guest_service.set_guest_password(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            password="Correct-Horse-1!",
+        )
+        await fx.guest_service.block_guest(
+            actor_user_id=uuid.uuid4(),
+            guest_id=otp_result.guest.id,
+            requesting_organization_id=fx.organization_id,
+            reason="abuse",
+        )
+        with pytest.raises(GuestBlockedError):
+            await fx.guest_service.login_via_password(
+                identifier="+15551234567",
+                password="Correct-Horse-1!",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+
+class TestSetGuestPassword:
+    async def _otp_login(self, fx: Fixture) -> GuestLoginResult:
+        return await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+
+    async def test_happy_path_sets_a_verifiable_password(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        updated = await fx.guest_service.set_guest_password(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            password="Correct-Horse-1!",
+        )
+        assert updated.hashed_password is not None
+        # never stored in plaintext
+        assert updated.hashed_password != "Correct-Horse-1!"
+        login = await fx.guest_service.login_via_password(
+            identifier="+15551234567",
+            password="Correct-Horse-1!",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert login.guest.id == otp_result.guest.id
+
+    async def test_rejects_a_session_belonging_to_a_different_guest(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        other_guest = await fx.repository.create_guest(
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+15550000000",
+            display_name=None,
+            first_seen_at=_now(),
+            last_seen_at=_now(),
+            total_visit_count=0,
+            is_blocked=False,
+            blocked_reason=None,
+        )
+        with pytest.raises(GuestPasswordSetupNotAuthorizedError):
+            await fx.guest_service.set_guest_password(
+                guest_id=other_guest.id,
+                session_id=otp_result.session.id,
+                password="Correct-Horse-1!",
+            )
+
+    async def test_rejects_a_voucher_authenticated_session(self) -> None:
+        fx = make_fixture()
+        fx.voucher_service.register("VOUCHER1", data_limit_mb=500, validity_minutes=120)
+        voucher_result = await fx.guest_service.login_via_voucher(
+            code="VOUCHER1",
+            identifier="+15551234567",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        with pytest.raises(GuestPasswordSetupNotAuthorizedError):
+            await fx.guest_service.set_guest_password(
+                guest_id=voucher_result.guest.id,
+                session_id=voucher_result.session.id,
+                password="Correct-Horse-1!",
+            )
+
+    async def test_rejects_a_no_longer_active_session(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.disconnect_session(
+            session_id=otp_result.session.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+            reason="guest left",
+        )
+        with pytest.raises(GuestPasswordSetupNotAuthorizedError):
+            await fx.guest_service.set_guest_password(
+                guest_id=otp_result.guest.id,
+                session_id=otp_result.session.id,
+                password="Correct-Horse-1!",
+            )
+
+    async def test_rejects_a_session_outside_the_eligibility_window(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        stored_session = fx.repository.sessions[otp_result.session.id]
+        stored_session.started_at = _now() - timedelta(
+            minutes=SET_PASSWORD_SESSION_WINDOW_MINUTES + 1
+        )
+        with pytest.raises(GuestPasswordSetupNotAuthorizedError):
+            await fx.guest_service.set_guest_password(
+                guest_id=otp_result.guest.id,
+                session_id=otp_result.session.id,
+                password="Correct-Horse-1!",
+            )
+
+    async def test_weak_password_rejected_with_no_state_change(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        with pytest.raises(GuestPasswordTooWeakError):
+            await fx.guest_service.set_guest_password(
+                guest_id=otp_result.guest.id,
+                session_id=otp_result.session.id,
+                password="short",
+            )
+        assert fx.repository.guests[otp_result.guest.id].hashed_password is None
 
 
 class TestSpeedLinkedVoucherQueueAssignment:

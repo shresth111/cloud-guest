@@ -147,6 +147,19 @@ RECONNECT_GRACE_MINUTES = 30
 
 BYTES_PER_MB = 1024 * 1024
 
+# How long, after an OTP-authenticated ``GuestSession`` is created, its
+# ``session_id`` remains valid proof for ``GuestService.set_guest_password``
+# -- see that method's docstring for the full "authenticated by the
+# just-completed OTP login, not a separate unauthenticated hole" write-up.
+# Deliberately short: this is a one-time, immediately-after-login prompt
+# (see the guest-facing frontend's "set a password?" screen), not a general
+# "prove you logged in recently" grant -- a guest who navigated away and
+# comes back an hour later must complete a fresh OTP login to set a
+# password, the same way ``TERMINATION_RECONNECT_COOLDOWN_MINUTES``/
+# ``RECONNECT_GRACE_MINUTES`` above are each a narrow, single-purpose
+# window rather than a broad session lifetime.
+SET_PASSWORD_SESSION_WINDOW_MINUTES = 15
+
 # ============================================================================
 # Concurrent session limit -- Guest Session Engine (Phase 1).
 # ============================================================================
