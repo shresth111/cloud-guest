@@ -811,6 +811,19 @@ class Settings(BaseSettings):
     s3_access_key_id: str = Field(default="cloudguest")
     s3_secret_access_key: str = Field(default="cloudguest12345")
     s3_region: str = Field(default="us-east-1")
+    s3_public_endpoint_url: str = Field(
+        default="",
+        description=(
+            "Browser-facing S3/MinIO endpoint used only for signing "
+            "presigned GET URLs (e.g. branding background images) --  "
+            "distinct from ``s3_endpoint_url`` because that one is "
+            "frequently a docker-network-only host ('http://minio:9000') "
+            "this process can reach but a browser cannot. Empty (default) "
+            "falls back to ``s3_endpoint_url`` itself, correct when that "
+            "endpoint is already publicly reachable (real AWS S3, or a "
+            "single-host deployment with MinIO's port published)."
+        ),
+    )
 
     notification_dispatch_sweep_interval_seconds: float = Field(
         default=60.0,

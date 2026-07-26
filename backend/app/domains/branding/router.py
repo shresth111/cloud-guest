@@ -13,18 +13,17 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, File, Request, UploadFile, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
+from app.domains.billing.constants import PlanFeatureKey
+from app.domains.billing.dependencies import RequireFeature
 from app.domains.rbac.dependencies import (
-    CurrentOrganization,
     CurrentUser,
     RequireOrganization,
     RequirePermission,
 )
-from app.domains.billing.constants import PlanFeatureKey
-from app.domains.billing.dependencies import RequireFeature
 
 from .dependencies import get_branding_service
 from .schemas import BrandingResponse, BrandingUpdateRequest, DefaultBrandingResponse
@@ -91,6 +90,71 @@ async def update_branding(
     return build_response(
         success=True,
         message="Branding updated",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/branding/background-image",
+    response_model=ApiResponse[BrandingResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("white_label.update")),
+        Depends(RequireFeature(PlanFeatureKey.WHITE_LABEL)),
+    ],
+)
+async def upload_background_image(
+    request: Request,
+    file: UploadFile = File(...),
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: BrandingService = Depends(get_branding_service),
+):
+    """Uploads (replacing any existing) the login-screen background image
+    for the current organization. Stores the file via the platform's
+    existing S3/MinIO-compatible object storage and returns branding data
+    with a fresh, ready-to-render ``background_image_url``.
+    """
+    content = await file.read()
+    payload = await service.upload_background_image(
+        organization_id,
+        filename=file.filename or "background-image",
+        content_type=file.content_type or "application/octet-stream",
+        content=content,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="Background image updated",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.delete(
+    "/branding/background-image",
+    response_model=ApiResponse[BrandingResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("white_label.update")),
+        Depends(RequireFeature(PlanFeatureKey.WHITE_LABEL)),
+    ],
+)
+async def delete_background_image(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: BrandingService = Depends(get_branding_service),
+):
+    """Removes the current organization's login-screen background image."""
+    payload = await service.delete_background_image(
+        organization_id,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="Background image removed",
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )

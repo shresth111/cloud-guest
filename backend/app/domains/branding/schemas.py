@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class BrandingResponse(BaseModel):
@@ -18,6 +17,10 @@ class BrandingResponse(BaseModel):
     secondary_color: str | None = None
     accent_color: str | None = None
     theme: str = "light"
+    # Freshly-generated presigned URL for the stored background_image_key,
+    # not a persisted column itself -- see
+    # BrandingService._resolve_background_image_url.
+    background_image_url: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

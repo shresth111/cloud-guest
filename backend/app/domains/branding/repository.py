@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
 from typing import Protocol
 
 from sqlalchemy import select
@@ -29,15 +28,21 @@ class BrandingRepositoryProtocol(Protocol):
         actor_user_id: uuid.UUID | None = None,
     ) -> Branding: ...
 
+    async def set_background_image_key(
+        self,
+        organization_id: uuid.UUID,
+        key: str | None,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> Branding: ...
+
 
 class BrandingRepository(BrandingRepositoryProtocol):
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
         self.generic = GenericRepository[Branding](db, Branding)
 
-    async def get_by_organization(
-        self, organization_id: uuid.UUID
-    ) -> Branding | None:
+    async def get_by_organization(self, organization_id: uuid.UUID) -> Branding | None:
         stmt = select(Branding).where(
             Branding.organization_id == organization_id,
             Branding.is_deleted == False,
@@ -70,6 +75,36 @@ class BrandingRepository(BrandingRepositoryProtocol):
             secondary_color=data.get("secondary_color"),
             accent_color=data.get("accent_color"),
             theme=data.get("theme", "light"),
+            created_by=actor_user_id,
+            updated_by=actor_user_id,
+        )
+        self.db.add(branding)
+        await self.db.flush()
+        return branding
+
+    async def set_background_image_key(
+        self,
+        organization_id: uuid.UUID,
+        key: str | None,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> Branding:
+        """Sets (or, with ``key=None``, clears) the background image key.
+
+        Deliberately separate from :meth:`upsert`, which skips ``None``
+        values -- that logic is right for a partial ``PUT`` body, but
+        wrong here: clearing the background image *is* the operation.
+        """
+        existing = await self.get_by_organization(organization_id)
+        if existing:
+            existing.background_image_key = key
+            existing.updated_by = actor_user_id
+            await self.db.flush()
+            return existing
+
+        branding = Branding(
+            organization_id=organization_id,
+            background_image_key=key,
             created_by=actor_user_id,
             updated_by=actor_user_id,
         )

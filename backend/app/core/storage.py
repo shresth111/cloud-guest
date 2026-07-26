@@ -69,6 +69,7 @@ class S3ObjectStorage:
         access_key_id: str,
         secret_access_key: str,
         region_name: str,
+        public_endpoint_url: str | None = None,
     ) -> None:
         self.bucket_name = bucket_name
         self._client = boto3.client(
@@ -77,6 +78,26 @@ class S3ObjectStorage:
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
             region_name=region_name,
+        )
+        # Presigned URLs are consumed by a *browser*, not this process --
+        # ``endpoint_url`` above is frequently a docker-network-only host
+        # (e.g. "http://minio:9000") that resolves fine for this process's
+        # own upload/head calls but not for a client outside that network.
+        # generate_presigned_url() only signs a URL, it never opens a
+        # connection, so a second client pointed at a public-facing
+        # endpoint is safe to use purely for that signing step. Falls back
+        # to the same client when no public endpoint is configured (e.g.
+        # real AWS S3, where the one endpoint is already public).
+        self._url_client = (
+            boto3.client(
+                "s3",
+                endpoint_url=public_endpoint_url,
+                aws_access_key_id=access_key_id,
+                aws_secret_access_key=secret_access_key,
+                region_name=region_name,
+            )
+            if public_endpoint_url
+            else self._client
         )
         self._bucket_ensured = False
 
@@ -106,7 +127,7 @@ class S3ObjectStorage:
 
     def _generate_presigned_url_sync(self, *, key: str, expires_in_seconds: int) -> str:
         try:
-            return self._client.generate_presigned_url(
+            return self._url_client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": self.bucket_name, "Key": key},
                 ExpiresIn=expires_in_seconds,
@@ -142,6 +163,7 @@ def get_object_storage() -> ObjectStorageProtocol:
         access_key_id=settings.s3_access_key_id,
         secret_access_key=settings.s3_secret_access_key,
         region_name=settings.s3_region,
+        public_endpoint_url=settings.s3_public_endpoint_url or None,
     )
 
 

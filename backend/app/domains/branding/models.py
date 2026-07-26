@@ -13,9 +13,16 @@ Architecture notes:
   and updated frequently and independently of Organization settings.
 
 * **Future S3/CloudFront:** ``logo_url`` and ``favicon_url`` are stored as
-  plain text URL columns. When file upload is implemented in a future phase,
-  a pre-signed upload endpoint will write to S3 and store the CloudFront URL
-  here. No upload implementation is included in this module.
+  plain text URL columns -- still true for those two, no upload
+  implementation for them yet.
+
+* **Background image is the one exception:** ``background_image_key``
+  (the login-screen background) *is* a real upload, going through
+  ``app.core.storage`` (the same MinIO/S3-compatible object storage
+  ``app.domains.voucher``/``app.domains.analytics`` already write
+  through). It stores the object *key*, not a URL -- ``BrandingService``
+  resolves it to a fresh presigned URL on every read, since a stored
+  presigned URL would itself eventually expire.
 
 * **Default fallback:** every ``GET /api/branding`` endpoint returns
   non-null branding — either the organization's own row or the platform
@@ -24,10 +31,11 @@ Architecture notes:
 
 import uuid
 
-from app.database.base import BaseModel
-from sqlalchemy import String, ForeignKey, Index
+from sqlalchemy import ForeignKey, Index, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database.base import BaseModel
 
 
 class Branding(BaseModel):
@@ -46,6 +54,13 @@ class Branding(BaseModel):
     company_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     logo_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     favicon_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+
+    # Object storage key (not a URL) for the login-screen background image
+    # -- see this module's docstring. Resolved to a presigned URL at read
+    # time by BrandingService, never exposed to the frontend directly.
+    background_image_key: Mapped[str | None] = mapped_column(
+        String(1024), nullable=True
+    )
 
     primary_color: Mapped[str | None] = mapped_column(String(50), nullable=True)
     secondary_color: Mapped[str | None] = mapped_column(String(50), nullable=True)

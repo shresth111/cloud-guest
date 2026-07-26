@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.storage import ObjectStorageProtocol, get_object_storage
 from app.database.session import get_db_session
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
@@ -22,5 +23,8 @@ def get_branding_repository(
 def get_branding_service(
     repository: BrandingRepositoryProtocol = Depends(get_branding_repository),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    object_storage: ObjectStorageProtocol = Depends(get_object_storage),
 ) -> BrandingService:
-    return BrandingService(repository, audit_writer=audit_repository)
+    return BrandingService(
+        repository, audit_writer=audit_repository, object_storage=object_storage
+    )
