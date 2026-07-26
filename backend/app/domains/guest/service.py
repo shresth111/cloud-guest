@@ -683,6 +683,7 @@ class QueueAssignmentProtocol(Protocol):
         device_target: str,
         actor_user_id: uuid.UUID | None = None,
         auto_apply: bool = True,
+        guest_id: uuid.UUID | None = None,
     ) -> object: ...
 
     async def create_assignment(
@@ -730,6 +731,7 @@ class PolicyLookupProtocol(Protocol):
         policy_type: PolicyType,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
     ) -> ResolvedDevicePolicyProtocol: ...
 
 
@@ -771,6 +773,7 @@ async def run_fup_time_accrual(
             policy_type=PolicyType.FUP,
             organization_id=pair.organization_id,
             location_id=None,
+            guest_id=pair.guest_id,
         )
         time_limits = {
             QuotaPeriodType.DAILY: resolved.rules.get("daily_time_limit_minutes"),
@@ -1154,7 +1157,12 @@ class GuestService:
         one concrete IP address, and ``session.ip_address`` is the only
         one that is actually correct *right now*; a guest-level
         assignment would go stale the moment they reconnect with a new
-        DHCP lease."""
+        DHCP lease. ``session.guest_id`` is still passed through to the
+        Policy Engine's resolution (Group Policies "Map users") so a
+        GUEST-targeted bandwidth override for *this* guest outranks the
+        location's own default when picking which queue profile to apply
+        -- only the RouterOS-facing target stays session-scoped, the
+        policy that determines its rate is guest-scoped."""
         if self.queue_assignment_hook is None or not session.ip_address:
             return
         try:
@@ -1165,6 +1173,7 @@ class GuestService:
                 target_type=QueueTargetType.SESSION,
                 target_id=session.id,
                 device_target=session.ip_address,
+                guest_id=session.guest_id,
             )
         except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
             logger.warning(
@@ -2654,18 +2663,22 @@ class GuestService:
         *,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
     ) -> int:
         """Resolves the real per-guest device limit via
         ``PolicyType.DEVICE`` when a ``policy_lookup`` hook is wired,
         falling back to ``constants.DEFAULT_MAX_DEVICES_PER_GUEST``
         otherwise (or if the resolved rules omit the field, e.g. a
-        ``GenericPolicyRules``-shaped override)."""
+        ``GenericPolicyRules``-shaped override). ``guest_id``, when given,
+        additionally surfaces a Group Policies "Map users" override for
+        this exact guest ahead of the location/organization default."""
         if self.policy_lookup is None:
             return DEFAULT_MAX_DEVICES_PER_GUEST
         resolved = await self.policy_lookup.resolve_effective_policy(
             policy_type=PolicyType.DEVICE,
             organization_id=organization_id,
             location_id=location_id,
+            guest_id=guest_id,
         )
         return resolved.rules.get(
             "max_devices_per_guest", DEFAULT_MAX_DEVICES_PER_GUEST
@@ -2700,7 +2713,7 @@ class GuestService:
             return
         device_count = await self.repository.count_devices_for_guest(guest_id)
         limit = await self._resolve_device_limit(
-            organization_id=organization_id, location_id=location_id
+            organization_id=organization_id, location_id=location_id, guest_id=guest_id
         )
         if is_device_limit_reached(device_count=device_count, limit=limit):
             raise GuestDeviceLimitExceededError(guest_id=guest_id, limit=limit)
@@ -2727,6 +2740,7 @@ class GuestService:
             policy_type=PolicyType.FUP,
             organization_id=organization_id,
             location_id=None,
+            guest_id=guest_id,
         )
         rules = resolved.rules
         data_limits = {
@@ -2810,6 +2824,7 @@ class GuestService:
                 policy_type=PolicyType.FUP,
                 organization_id=organization_id,
                 location_id=None,
+                guest_id=guest_id,
             )
             data_limits = {
                 QuotaPeriodType.DAILY: resolved.rules.get("daily_data_limit_mb"),

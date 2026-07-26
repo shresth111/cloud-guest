@@ -120,6 +120,14 @@ async def resolve_effective_policy(
             "server-side from RBAC's own active role assignments)."
         ),
     ),
+    guest_id: uuid.UUID | None = Query(
+        default=None,
+        description=(
+            "Group Policies 'Map users': also consider any GUEST-targeted "
+            "assignment naming this guest (see "
+            "constants.PolicyAssignmentTargetType.GUEST's own docstring)."
+        ),
+    ),
     service: PolicyService = Depends(get_policy_service),
     role_resolver: RoleResolver = Depends(get_role_resolver),
 ):
@@ -134,6 +142,7 @@ async def resolve_effective_policy(
         location_id=location_id,
         user_id=user_id,
         role_ids=role_ids,
+        guest_id=guest_id,
     )
     return build_response(
         success=True,

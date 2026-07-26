@@ -278,6 +278,7 @@ class FakePolicyRepository:
         location_id: uuid.UUID | None,
         user_id: uuid.UUID | None = None,
         role_ids: list[uuid.UUID] | None = None,
+        guest_id: uuid.UUID | None = None,
     ) -> list[PolicyAssignment]:
         candidates = []
         for assignment in self.assignments.values():
@@ -318,7 +319,12 @@ class FakePolicyRepository:
                 and role_ids
                 and assignment.target_id in role_ids
             )
-            if is_untargeted or is_user_match or is_role_match:
+            is_guest_match = (
+                target_type == "guest"
+                and guest_id is not None
+                and assignment.target_id == guest_id
+            )
+            if is_untargeted or is_user_match or is_role_match or is_guest_match:
                 candidates.append(assignment)
         return candidates
 
@@ -1453,6 +1459,183 @@ class TestPolicyAssignmentTargeting:
             location_id=None,
             user_id=uuid.uuid4(),
             role_ids=[uuid.uuid4()],
+        )
+
+        assert resolved.source == "platform_default"
+
+
+class TestGuestTargetedAssignment:
+    """Group Policies "Map users" -- a GUEST-targeted PolicyAssignment
+    naming one specific guest. Unlike USER/ROLE, ``create_assignment``
+    performs no existence check against ``target_id`` here (there is no
+    ``guest_lookup`` composed into ``PolicyService`` -- see
+    ``constants.PolicyAssignmentTargetType.GUEST``'s own docstring for why
+    that's deliberate, not an oversight)."""
+
+    async def test_create_assignment_accepts_any_guest_target_with_no_lookup(
+        self,
+    ) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+        guest_id = uuid.uuid4()
+
+        assignment = await service.create_assignment(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+        assert assignment.target_type == PolicyAssignmentTargetType.GUEST.value
+        assert assignment.target_id == guest_id
+
+    async def test_create_assignment_requires_target_id_for_guest_target_type(
+        self,
+    ) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+
+        with pytest.raises(PolicyAssignmentTargetIdRequiredError):
+            await service.create_assignment(
+                policy_id=policy.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                scope_type=ScopeType.GLOBAL.value,
+                scope_id=None,
+                priority=0,
+                target_type=PolicyAssignmentTargetType.GUEST.value,
+                target_id=None,
+            )
+
+    async def test_guest_targeted_assignment_wins_over_user_role_and_untargeted(
+        self,
+    ) -> None:
+        service, _repo, user_lookup, role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+
+        # Untargeted, organization-scoped -- applies to everyone.
+        base_policy = await _create_published_session_policy(
+            service, organization_id=org.id
+        )
+        await service.create_assignment(
+            policy_id=base_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.ORGANIZATION.value,
+            scope_id=org.id,
+            priority=0,
+        )
+
+        guest_id = uuid.uuid4()
+
+        # A role-targeted assignment matching this guest's role.
+        role_policy = await _create_published_session_policy(
+            service, organization_id=org.id
+        )
+        role_id = uuid.uuid4()
+        role_lookup.known_role_ids.add(role_id)
+        await service.create_assignment(
+            policy_id=role_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.ROLE.value,
+            target_id=role_id,
+        )
+
+        # A user-targeted assignment, using the guest's id in the `user_id`
+        # resolution slot to prove GUEST still outranks it even at equal
+        # target_id -- a real caller would never pass the same id as both,
+        # this only isolates the specificity ordering itself.
+        user_policy = await _create_published_session_policy(
+            service, organization_id=org.id
+        )
+        user_lookup.known_user_ids.add(guest_id)
+        await service.create_assignment(
+            policy_id=user_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.USER.value,
+            target_id=guest_id,
+        )
+
+        # The GUEST-targeted assignment -- must win over all three above.
+        guest_policy = await _create_published_session_policy(
+            service, organization_id=org.id
+        )
+        guest_version = await service.create_version(
+            policy_id=guest_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={
+                "session_timeout_minutes": 7,
+                "max_concurrent_sessions_per_guest": 7,
+                "termination_reconnect_cooldown_minutes": 7,
+                "reconnect_grace_minutes": 7,
+            },
+        )
+        await service.publish_version(
+            policy_id=guest_policy.id,
+            version_id=guest_version.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+        )
+        await service.create_assignment(
+            policy_id=guest_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+
+        resolved = await service.resolve_effective_policy(
+            policy_type=PolicyType.SESSION,
+            organization_id=org.id,
+            location_id=None,
+            user_id=guest_id,
+            role_ids=[role_id],
+            guest_id=guest_id,
+        )
+
+        assert resolved.source == f"guest:{guest_id}"
+        assert resolved.rules["session_timeout_minutes"] == 7
+
+    async def test_guest_assignment_not_a_candidate_for_a_different_guest(
+        self,
+    ) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        policy = await _create_published_session_policy(service, organization_id=org.id)
+        guest_id = uuid.uuid4()
+        await service.create_assignment(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+
+        resolved = await service.resolve_effective_policy(
+            policy_type=PolicyType.SESSION,
+            organization_id=org.id,
+            location_id=None,
+            guest_id=uuid.uuid4(),
         )
 
         assert resolved.source == "platform_default"

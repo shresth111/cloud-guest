@@ -118,11 +118,27 @@ class PolicyAssignmentTargetType(StrEnum):
     this axis existed reads as ``NONE``/``target_id=NULL``, identical to
     its pre-Phase-F behavior) means "applies to everyone within the
     WHERE scope". ``USER``/``ROLE`` narrow that further to one specific
-    user or one specific role's holders."""
+    user or one specific role's holders.
+
+    ``GUEST`` (Group Policies "Map users" -- customer dashboard's Policies
+    > Group Policies flow: create a group, map it to a location, then map
+    specific guests into it) targets one specific
+    ``app.domains.guest.models.Guest`` row instead of a platform ``User``.
+    Deliberately unvalidated against a real guest existence check (no
+    ``guest_lookup`` composed into ``PolicyService``, unlike
+    ``user_lookup``/``role_lookup``): ``policy`` composes no *feature*
+    domain (see ``service.py``'s module docstring) and ``guest`` already
+    depends on ``policy`` the other way round via ``PolicyLookupProtocol``,
+    so validating this target here would be circular. ``target_id`` is
+    trusted the same way ``PolicyAssignment.scope_id``/
+    ``QueueAssignment.target_id`` already are -- the caller (the real
+    guest picker UI, fed from the same organization's own guest list) is
+    responsible for supplying a real id, not this column."""
 
     NONE = "none"
     USER = "user"
     ROLE = "role"
+    GUEST = "guest"
 
 
 class PolicyVersionStatus(StrEnum):

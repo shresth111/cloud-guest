@@ -107,14 +107,18 @@ _SCOPE_SPECIFICITY: dict[str, int] = {
     ScopeType.LOCATION.value: 2,
 }
 
-# WHO-specificity (Enterprise SaaS Phase F) -- a user-targeted assignment
-# always outranks a role-targeted one, which always outranks an untargeted
-# one, regardless of which WHERE tier either was defined at (see
-# PolicyResolver.resolve's own docstring for the combined ordering).
+# WHO-specificity (Enterprise SaaS Phase F, GUEST is Group Policies' "Map
+# users" step) -- a guest-targeted assignment outranks a user-targeted one,
+# which outranks a role-targeted one, which outranks an untargeted one,
+# regardless of which WHERE tier either was defined at (see
+# PolicyResolver.resolve's own docstring for the combined ordering). GUEST
+# is the most specific: it names one exact guest, never a broader group of
+# accounts the way ROLE does.
 _TARGET_SPECIFICITY: dict[str, int] = {
     PolicyAssignmentTargetType.NONE.value: 0,
     PolicyAssignmentTargetType.ROLE.value: 1,
     PolicyAssignmentTargetType.USER.value: 2,
+    PolicyAssignmentTargetType.GUEST.value: 3,
 }
 
 
@@ -217,6 +221,7 @@ class ResolvedPolicy:
     rules: dict[str, Any]
     source: str
     user_id: uuid.UUID | None = None
+    guest_id: uuid.UUID | None = None
 
 
 # ============================================================================
@@ -606,6 +611,7 @@ class PolicyService:
         location_id: uuid.UUID | None,
         user_id: uuid.UUID | None = None,
         role_ids: list[uuid.UUID] | None = None,
+        guest_id: uuid.UUID | None = None,
     ) -> ResolvedPolicy:
         """See module docstring's "Resolution" write-up. Falls back to
         ``constants.PLATFORM_DEFAULT_RULES`` when no assignment matches at
@@ -614,13 +620,18 @@ class PolicyService:
         ``user_id``/``role_ids`` (Enterprise SaaS Phase F) additionally
         surface any per-user or per-role assignment as a resolution
         candidate -- see ``PolicyResolver.resolve``'s own docstring for
-        why a matching one always wins over an untargeted match."""
+        why a matching one always wins over an untargeted match.
+        ``guest_id`` (Group Policies "Map users") does the same for a
+        ``GUEST``-targeted assignment, which outranks all of the above --
+        see ``constants.PolicyAssignmentTargetType.GUEST``'s own
+        docstring."""
         candidates = await self.repository.list_candidate_assignments(
             policy_type=policy_type.value,
             organization_id=organization_id,
             location_id=location_id,
             user_id=user_id,
             role_ids=role_ids,
+            guest_id=guest_id,
         )
         winner = self.resolver.resolve(candidates=candidates)
         if winner is None:
@@ -631,6 +642,7 @@ class PolicyService:
                 rules=dict(PLATFORM_DEFAULT_RULES.get(policy_type, {})),
                 source="platform_default",
                 user_id=user_id,
+                guest_id=guest_id,
             )
 
         policy = await self.repository.get_policy_by_id(winner.policy_id)
@@ -645,6 +657,7 @@ class PolicyService:
                 rules=dict(PLATFORM_DEFAULT_RULES.get(policy_type, {})),
                 source="platform_default",
                 user_id=user_id,
+                guest_id=guest_id,
             )
         version = await self.repository.get_version_by_id(policy.current_version_id)
         rules = dict(version.rules) if version is not None else {}
@@ -662,6 +675,7 @@ class PolicyService:
             rules=rules,
             source=source,
             user_id=user_id,
+            guest_id=guest_id,
         )
 
     # ========================================================================

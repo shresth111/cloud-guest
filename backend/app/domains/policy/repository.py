@@ -90,6 +90,7 @@ class PolicyRepositoryProtocol(Protocol):
         location_id: uuid.UUID | None,
         user_id: uuid.UUID | None = None,
         role_ids: list[uuid.UUID] | None = None,
+        guest_id: uuid.UUID | None = None,
     ) -> list[PolicyAssignment]: ...
 
 
@@ -196,12 +197,14 @@ class PolicyRepository:
         location_id: uuid.UUID | None,
         user_id: uuid.UUID | None = None,
         role_ids: list[uuid.UUID] | None = None,
+        guest_id: uuid.UUID | None = None,
     ) -> list[PolicyAssignment]:
         """Every currently-active ``PolicyAssignment`` whose policy is
         active/of the requested ``policy_type``, whose WHERE scope matches
         global/this organization/this location, AND whose WHO target
-        (Enterprise SaaS Phase F) matches untargeted/this user/one of this
-        user's roles -- the join ``PolicyResolver.resolve`` needs, which
+        (Enterprise SaaS Phase F, GUEST is Group Policies' "Map users")
+        matches untargeted/this user/one of this user's roles/this guest --
+        the join ``PolicyResolver.resolve`` needs, which
         ``GenericRepository``'s plain per-table equality/IN filters cannot
         express (it spans two tables and an OR across scope AND target
         shapes)."""
@@ -223,6 +226,11 @@ class PolicyRepository:
             target_conditions.append(
                 (PolicyAssignment.target_type == PolicyAssignmentTargetType.USER.value)
                 & (PolicyAssignment.target_id == user_id)
+            )
+        if guest_id is not None:
+            target_conditions.append(
+                (PolicyAssignment.target_type == PolicyAssignmentTargetType.GUEST.value)
+                & (PolicyAssignment.target_id == guest_id)
             )
         if role_ids:
             target_conditions.append(

@@ -325,10 +325,21 @@ class FakeRouterLookup:
 @dataclass
 class FakePolicyLookup:
     rules_by_scope: dict[tuple, dict[str, object]] = field(default_factory=dict)
+    rules_by_guest: dict[object, dict[str, object]] = field(default_factory=dict)
+    guest_ids_seen: list[object] = field(default_factory=list)
 
     async def resolve_effective_policy(
-        self, *, policy_type: PolicyType, organization_id, location_id
+        self, *, policy_type: PolicyType, organization_id, location_id, guest_id=None
     ) -> ResolvedPolicy:
+        self.guest_ids_seen.append(guest_id)
+        if guest_id is not None and guest_id in self.rules_by_guest:
+            return ResolvedPolicy(
+                policy_type=policy_type,
+                organization_id=organization_id,
+                location_id=location_id,
+                rules=self.rules_by_guest[guest_id],
+                source=f"guest:{guest_id}",
+            )
         rules = self.rules_by_scope.get((organization_id, location_id), {})
         return ResolvedPolicy(
             policy_type=policy_type,
@@ -1185,6 +1196,53 @@ class TestResolveAndAssignQueue:
         profile = await h.service.get_profile(assignment.queue_profile_id)
         assert profile.download_rate_kbps == 5000
         assert profile.upload_rate_kbps == 1000
+
+    async def test_guest_targeted_bandwidth_override_beats_the_location_default(
+        self,
+    ) -> None:
+        """Group Policies "Map users": the real Dynamic Queue Assignment
+        pipeline (``GuestService._assign_guest_queue`` -> here) has to pass
+        the connecting guest's own id through so a GUEST-targeted
+        bandwidth PolicyAssignment actually governs their queue instead of
+        the location's own default -- this is the physical enforcement
+        checkpoint, not just the Policy Engine's own resolution logic
+        (already covered in test_policy.py::TestGuestTargetedAssignment)."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        h.policy_lookup.rules_by_scope[(router.organization_id, router.location_id)] = {
+            "download_rate_kbps": 5000,
+            "upload_rate_kbps": 1000,
+            "burst_download_kbps": None,
+            "burst_upload_kbps": None,
+            "burst_threshold_kbps": None,
+            "burst_time_seconds": None,
+            "priority": None,
+        }
+        guest_id = uuid.uuid4()
+        h.policy_lookup.rules_by_guest[guest_id] = {
+            "download_rate_kbps": 512,
+            "upload_rate_kbps": 256,
+            "burst_download_kbps": None,
+            "burst_upload_kbps": None,
+            "burst_threshold_kbps": None,
+            "burst_time_seconds": None,
+            "priority": None,
+        }
+        target_id = uuid.uuid4()
+
+        assignment = await h.service.resolve_and_assign_queue(
+            requesting_organization_id=router.organization_id,
+            location_id=router.location_id,
+            router_id=router.id,
+            target_type=QueueTargetType.SESSION,
+            target_id=target_id,
+            device_target="10.0.0.5/32",
+            guest_id=guest_id,
+        )
+        assert h.policy_lookup.guest_ids_seen[-1] == guest_id
+        profile = await h.service.get_profile(assignment.queue_profile_id)
+        assert profile.download_rate_kbps == 512
+        assert profile.upload_rate_kbps == 256
 
     async def test_existing_assignment_with_same_profile_is_idempotent(self) -> None:
         h = make_harness()

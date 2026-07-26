@@ -469,6 +469,7 @@ class FakeDevicePolicyLookup:
     payload that simply omits the field."""
 
     max_devices_per_guest: int | None = None
+    guest_ids_seen: list[uuid.UUID | None] = field(default_factory=list)
 
     async def resolve_effective_policy(
         self,
@@ -476,7 +477,10 @@ class FakeDevicePolicyLookup:
         policy_type: object,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
     ):
+        self.guest_ids_seen.append(guest_id)
+
         class _Resolved:
             def __init__(self, rules: dict[str, object]) -> None:
                 self.rules = rules
@@ -507,6 +511,7 @@ class FakeFupPolicyLookup:
         policy_type: object,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
     ):
         class _Resolved:
             def __init__(self, rules: dict[str, object]) -> None:
@@ -1887,6 +1892,15 @@ class TestSpeedLinkedVoucherQueueAssignment:
         assert call["device_target"] == "10.0.0.5"
         assert len(hook.apply_queue_calls) == 1
         assert result.session.voucher_id == voucher.id
+        # Group Policies "Map users": _assign_guest_queue's own
+        # session-targeted resolve_and_assign_queue call (distinct from
+        # this test's voucher-targeted create_assignment/apply_queue
+        # composition above) must still carry the real guest_id through --
+        # see QueueManagementService.resolve_and_assign_queue's own test
+        # in test_queue_management.py for how that id then actually wins
+        # a GUEST-targeted bandwidth override.
+        assert len(hook.resolve_and_assign_queue_calls) == 1
+        assert hook.resolve_and_assign_queue_calls[0]["guest_id"] == result.guest.id
 
     async def test_no_op_when_voucher_has_no_plan(self) -> None:
         fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
@@ -2977,6 +2991,45 @@ class TestDeviceLimit:
                 device_mac="EE:FF:00:11:22:02",
             )
         assert exc_info.value.limit == 1
+
+    async def test_device_limit_resolution_passes_the_real_guest_id_through(
+        self,
+    ) -> None:
+        """Group Policies "Map users": a GUEST-targeted PolicyAssignment
+        can only ever be resolved for the returning guest if
+        ``_resolve_device_limit``/``_enforce_device_limit`` actually thread
+        the real ``guest_id`` down to ``policy_lookup
+        .resolve_effective_policy`` -- this pins that wiring directly
+        rather than only inferring it from the resolved rules' effect."""
+        policy_lookup = FakeDevicePolicyLookup(max_devices_per_guest=5)
+        fx = make_fixture(policy_lookup=policy_lookup)
+        identifier = "+15559990020"
+        # A brand-new guest's first login has no existing_guest yet, so
+        # _enforce_device_limit is skipped entirely (see
+        # test_new_guest_login_skips_the_check_entirely below) -- a second
+        # login for the same, now-known guest is what actually exercises
+        # the resolution call this test is pinning.
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:10",
+        )
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:11",
+        )
+        assert policy_lookup.guest_ids_seen
+        assert policy_lookup.guest_ids_seen[-1] == first.guest.id
 
     async def test_new_guest_login_skips_the_check_entirely(self) -> None:
         """Mirrors ``TestConcurrentSessionLimit``'s identical-named test: a

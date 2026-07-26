@@ -132,6 +132,7 @@ class PolicyLookupProtocol(Protocol):
         policy_type: PolicyType,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
     ) -> ResolvedPolicyProtocol: ...
 
 
@@ -1003,11 +1004,15 @@ class QueueManagementService:
         device_target: str,
         actor_user_id: uuid.UUID | None = None,
         auto_apply: bool = True,
+        guest_id: uuid.UUID | None = None,
     ) -> QueueAssignment:
         """The real "Dynamic Queue Assignment" pipeline the module brief's
         own flow diagram names. Resolves the effective
-        ``PolicyType.BANDWIDTH`` policy for this organization/location,
-        finds-or-creates a matching :class:`~.models.QueueProfile`
+        ``PolicyType.BANDWIDTH`` policy for this organization/location
+        (or, when ``guest_id`` is given and a Group Policies "Map users"
+        assignment targets this exact guest, that override instead --
+        see ``app.domains.policy.constants.PolicyAssignmentTargetType
+        .GUEST``), finds-or-creates a matching :class:`~.models.QueueProfile`
         (idempotent, never an ephemeral unpersisted rate), and either
         creates a fresh :class:`~.models.QueueAssignment` for this target
         or -- if one already exists with a *different* profile -- moves
@@ -1016,6 +1021,7 @@ class QueueManagementService:
             policy_type=PolicyType.BANDWIDTH,
             organization_id=requesting_organization_id,
             location_id=location_id,
+            guest_id=guest_id,
         )
         if resolved.rules:
             bandwidth_rules = BandwidthPolicyRules.model_validate(resolved.rules)
