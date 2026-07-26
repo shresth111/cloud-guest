@@ -18,6 +18,30 @@ request-time license/feature-entitlement gate (see that module's own
 docstring). A ``None`` organization context (no ``X-Organization-Id``
 header) still passes through unchecked, same as ``RequirePermission``'s
 own GLOBAL-scope behavior, so a platform-level caller is unaffected.
+
+**Owner-only when organization-scoped**: both endpoints additionally
+require the real Organization Owner role *whenever called with an
+organization context* (``X-Organization-Id``) -- ``audit_logs.read``/
+``audit_logs.export`` alone is not enough to keep the customer dashboard's
+use of this endpoint Owner-only, since Organization Admin (an
+"Agent"-invitable role) also holds those permissions at ORGANIZATION scope
+by default (see ``app.domains.admin_logs.router``'s own module docstring
+for the full seed-table reasoning -- identical here). The customer
+dashboard now surfaces this data only inside the Owner-only "Admin Logs"
+page (its "Account Activity" section), so this closes the gap where an
+Agent session could otherwise reach the same real change-audit trail
+directly, even with the separate customer-side "Audit Log" nav entry
+removed.
+
+Deliberately *not* a plain ``RequireRole("organization-owner",
+scope=ScopeType.ORGANIZATION)`` the way ``app.domains.admin_logs`` uses --
+unlike that domain, this one is also queried with **no** organization
+context at all (``requesting_organization_id=None`` means "search across
+every organization", see ``service.py``'s own docstring) for a genuine
+platform-level/cross-tenant caller. ``_require_owner_when_org_scoped``
+below only narrows to Organization Owner when an organization context is
+actually present -- an org-less call keeps relying on
+``RequirePermission``'s own GLOBAL-scope check, unchanged.
 """
 
 from __future__ import annotations
@@ -29,16 +53,47 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 
 from app.common.responses import ApiResponse, build_response
 from app.database.utils.pagination import PaginationMeta
+from app.domains.auth.models import AuthUser
 from app.domains.billing.constants import PlanFeatureKey
 from app.domains.billing.dependencies import RequireFeature
-from app.domains.rbac.dependencies import CurrentOrganization, RequirePermission
+from app.domains.rbac.authorization import RoleResolver
+from app.domains.rbac.context import ScopeContext
+from app.domains.rbac.dependencies import (
+    CurrentOrganization,
+    CurrentUser,
+    RequirePermission,
+    get_rbac_repository,
+)
+from app.domains.rbac.exceptions import RoleNotHeldError
 from app.domains.rbac.models import AuditLogEntry
+from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .dependencies import get_audit_service
 from .schemas import AuditLogEntryListResponse, AuditLogEntryResponse
 from .service import AuditService
 
 router = APIRouter(prefix="/audit", tags=["Audit"])
+
+
+async def _require_owner_when_org_scoped(
+    user: AuthUser = Depends(CurrentUser),
+    repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+) -> None:
+    """See module docstring's "Owner-only when organization-scoped"
+    section. A no-op (no DB lookup) when there is no organization context
+    to narrow to."""
+    if organization_id is None:
+        return
+    roles = await RoleResolver(repository).get_active_roles(
+        uuid.UUID(user.id), scope_context=ScopeContext(organization_id=organization_id)
+    )
+    if not any(role.slug == "organization-owner" for role in roles):
+        raise RoleNotHeldError("organization-owner")
+
+
+# Shared by both routes below.
+_OWNER_ONLY = Depends(_require_owner_when_org_scoped)
 
 
 def _request_id(request: Request) -> str:
@@ -77,6 +132,7 @@ def _entry_response(entry: AuditLogEntry) -> AuditLogEntryResponse:
     dependencies=[
         Depends(RequirePermission("audit_logs.read")),
         Depends(RequireFeature(PlanFeatureKey.AUDIT_LOGS)),
+        _OWNER_ONLY,
     ],
 )
 async def search_audit_log_entries(
@@ -121,6 +177,7 @@ async def search_audit_log_entries(
     dependencies=[
         Depends(RequirePermission("audit_logs.export")),
         Depends(RequireFeature(PlanFeatureKey.AUDIT_LOGS)),
+        _OWNER_ONLY,
     ],
 )
 async def export_audit_log_entries(
