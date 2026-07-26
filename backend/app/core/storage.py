@@ -57,6 +57,17 @@ class ObjectStorageProtocol(Protocol):
         self, *, key: str, expires_in_seconds: int = 3600
     ) -> str: ...
 
+    async def download(self, *, key: str) -> bytes:
+        """Fetches ``key``'s raw bytes back out. Added for
+        ``app.domains.branding``'s background-image proxy endpoint --
+        the bucket/``s3_endpoint_url`` here is a docker-network-only host
+        by default, not something an external browser can reach directly
+        (no ``generate_presigned_url`` link works from outside that
+        network without also opening the object storage port itself), so
+        the API streams bytes through its own already-public port instead
+        of handing back a direct storage URL."""
+        ...
+
 
 class S3ObjectStorage:
     """Real, boto3-backed :class:`ObjectStorageProtocol` implementation."""
@@ -69,7 +80,6 @@ class S3ObjectStorage:
         access_key_id: str,
         secret_access_key: str,
         region_name: str,
-        public_endpoint_url: str | None = None,
     ) -> None:
         self.bucket_name = bucket_name
         self._client = boto3.client(
@@ -78,26 +88,6 @@ class S3ObjectStorage:
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
             region_name=region_name,
-        )
-        # Presigned URLs are consumed by a *browser*, not this process --
-        # ``endpoint_url`` above is frequently a docker-network-only host
-        # (e.g. "http://minio:9000") that resolves fine for this process's
-        # own upload/head calls but not for a client outside that network.
-        # generate_presigned_url() only signs a URL, it never opens a
-        # connection, so a second client pointed at a public-facing
-        # endpoint is safe to use purely for that signing step. Falls back
-        # to the same client when no public endpoint is configured (e.g.
-        # real AWS S3, where the one endpoint is already public).
-        self._url_client = (
-            boto3.client(
-                "s3",
-                endpoint_url=public_endpoint_url,
-                aws_access_key_id=access_key_id,
-                aws_secret_access_key=secret_access_key,
-                region_name=region_name,
-            )
-            if public_endpoint_url
-            else self._client
         )
         self._bucket_ensured = False
 
@@ -127,7 +117,7 @@ class S3ObjectStorage:
 
     def _generate_presigned_url_sync(self, *, key: str, expires_in_seconds: int) -> str:
         try:
-            return self._url_client.generate_presigned_url(
+            return self._client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": self.bucket_name, "Key": key},
                 ExpiresIn=expires_in_seconds,
@@ -136,6 +126,13 @@ class S3ObjectStorage:
             raise ObjectStorageError(
                 f"Could not generate a presigned URL for '{key}': {exc}"
             ) from exc
+
+    def _download_sync(self, *, key: str) -> bytes:
+        try:
+            response = self._client.get_object(Bucket=self.bucket_name, Key=key)
+            return response["Body"].read()
+        except ClientError as exc:
+            raise ObjectStorageError(f"Download of '{key}' failed: {exc}") from exc
 
     async def upload(self, *, key: str, content: bytes, content_type: str) -> str:
         return await asyncio.to_thread(
@@ -151,6 +148,9 @@ class S3ObjectStorage:
             expires_in_seconds=expires_in_seconds,
         )
 
+    async def download(self, *, key: str) -> bytes:
+        return await asyncio.to_thread(self._download_sync, key=key)
+
 
 @lru_cache
 def get_object_storage() -> ObjectStorageProtocol:
@@ -163,7 +163,6 @@ def get_object_storage() -> ObjectStorageProtocol:
         access_key_id=settings.s3_access_key_id,
         secret_access_key=settings.s3_secret_access_key,
         region_name=settings.s3_region,
-        public_endpoint_url=settings.s3_public_endpoint_url or None,
     )
 
 

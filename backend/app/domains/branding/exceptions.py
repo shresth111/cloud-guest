@@ -44,3 +44,16 @@ class BrandingStorageNotConfiguredError(CloudGuestError):
             message="Background image storage is not configured",
             status_code=503,
         )
+
+
+class BackgroundImageNotFoundError(CloudGuestError):
+    """Raised by BrandingService.get_background_image_bytes when the
+    organization has no background image set -- the proxy endpoint
+    (GET /branding/background-image/raw) 404s rather than serving an
+    empty/placeholder image."""
+
+    def __init__(self, organization_id: object) -> None:
+        super().__init__(
+            message=f"No background image set for organization {organization_id}",
+            status_code=404,
+        )

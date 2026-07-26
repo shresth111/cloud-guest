@@ -20,9 +20,12 @@ Architecture notes:
   (the login-screen background) *is* a real upload, going through
   ``app.core.storage`` (the same MinIO/S3-compatible object storage
   ``app.domains.voucher``/``app.domains.analytics`` already write
-  through). It stores the object *key*, not a URL -- ``BrandingService``
-  resolves it to a fresh presigned URL on every read, since a stored
-  presigned URL would itself eventually expire.
+  through). It stores the object *key*, not a URL -- the frontend fetches
+  the actual bytes through ``GET /branding/background-image/raw``
+  (``BrandingService.get_background_image_bytes``), a proxy through this
+  API's own already-public port, rather than a direct object-storage
+  link the object storage's own docker-network-only endpoint can't serve
+  to a browser.
 
 * **Default fallback:** every ``GET /api/branding`` endpoint returns
   non-null branding — either the organization's own row or the platform

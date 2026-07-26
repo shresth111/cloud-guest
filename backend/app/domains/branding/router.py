@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Request, Response, UploadFile, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
@@ -138,6 +138,31 @@ async def upload_background_image(
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )
+
+
+@router.get(
+    "/branding/background-image/raw",
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("white_label.read")),
+        Depends(RequireFeature(PlanFeatureKey.WHITE_LABEL)),
+    ],
+)
+async def get_background_image_raw(
+    user: AuthUser = Depends(CurrentUser),
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: BrandingService = Depends(get_branding_service),
+):
+    """Streams the current organization's background image bytes.
+
+    ``background_image_url`` in ``GET/PUT /branding`` and the upload/
+    delete responses is this exact path -- an ``<img>`` tag can't send an
+    Authorization header, so the frontend fetches this authenticated
+    (same as every other branding call) and renders it via a local blob
+    URL, rather than this being a directly-linkable public image URL.
+    """
+    content, content_type = await service.get_background_image_bytes(organization_id)
+    return Response(content=content, media_type=content_type)
 
 
 @router.delete(

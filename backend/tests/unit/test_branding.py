@@ -1,14 +1,15 @@
-"""Unit tests for the Branding domain's background-image upload/delete
-flow -- ``BrandingService.upload_background_image``/
-``delete_background_image`` and their presigned-URL read path
-(``BrandingService._resolve_background_image_url``, exercised indirectly
-through ``get_branding``).
+"""Unit tests for the Branding domain's background-image upload/delete/
+read flow -- ``BrandingService.upload_background_image``/
+``delete_background_image``/``get_background_image_bytes``, and the proxy
+path (``BrandingService._resolve_background_image_url``) that
+``background_image_url`` resolves to, exercised indirectly through
+``get_branding``.
 
 Follows this project's plain-``assert``/native-``async def`` style (see
 ``tests/unit/test_dns.py``) and ``tests/unit/test_voucher.py``'s own
 ``FakeObjectStorage`` precedent for faking
-``app.core.storage.ObjectStorageProtocol`` -- reused here verbatim rather
-than re-invented.
+``app.core.storage.ObjectStorageProtocol`` -- reused here (extended with
+``download``) rather than re-invented.
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ from datetime import UTC, datetime
 import pytest
 
 from app.common.responses import ApiResponse
+from app.core.storage import ObjectStorageError
 from app.domains.branding.exceptions import (
+    BackgroundImageNotFoundError,
     BrandingStorageNotConfiguredError,
     InvalidBackgroundImageError,
 )
@@ -29,6 +32,7 @@ from app.domains.branding.router import router as branding_router
 from app.domains.branding.schemas import BrandingResponse, DefaultBrandingResponse
 from app.domains.branding.service import (
     BACKGROUND_IMAGE_MAX_BYTES,
+    BACKGROUND_IMAGE_RAW_PATH,
     DEFAULT_BRANDING,
     BrandingService,
 )
@@ -41,10 +45,11 @@ from app.domains.branding.service import (
 @dataclass
 class FakeObjectStorage:
     """In-memory stand-in for ``app.core.storage.ObjectStorageProtocol`` --
-    mirrors ``tests/unit/test_voucher.py``'s own ``FakeObjectStorage``."""
+    mirrors ``tests/unit/test_voucher.py``'s own ``FakeObjectStorage``,
+    extended with ``download`` for the background-image proxy read path."""
 
     uploaded: dict[str, bytes] = field(default_factory=dict)
-    fail_presign: bool = False
+    fail_download: bool = False
 
     async def upload(self, *, key: str, content: bytes, content_type: str) -> str:
         self.uploaded[key] = content
@@ -53,11 +58,12 @@ class FakeObjectStorage:
     async def generate_presigned_url(
         self, *, key: str, expires_in_seconds: int = 3600
     ) -> str:
-        if self.fail_presign:
-            from app.core.storage import ObjectStorageError
-
-            raise ObjectStorageError("presign failed")
         return f"https://minio.example.com/{key}?expires={expires_in_seconds}"
+
+    async def download(self, *, key: str) -> bytes:
+        if self.fail_download:
+            raise ObjectStorageError("download failed")
+        return self.uploaded[key]
 
 
 class FakeBrandingRepository:
@@ -162,7 +168,7 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"0" * 100
 
 
 class TestUploadBackgroundImage:
-    async def test_upload_persists_key_and_returns_presigned_url(self) -> None:
+    async def test_upload_persists_key_and_returns_proxy_url(self) -> None:
         service, repository, storage, audit_writer = make_service()
         org_id = uuid.uuid4()
 
@@ -174,10 +180,9 @@ class TestUploadBackgroundImage:
             actor_user_id=uuid.uuid4(),
         )
 
-        assert result.background_image_url is not None
-        assert result.background_image_url.startswith(
-            "https://minio.example.com/branding/"
-        )
+        # A stable proxy path, not a direct object-storage link -- see
+        # BACKGROUND_IMAGE_RAW_PATH's own docstring for why.
+        assert result.background_image_url == BACKGROUND_IMAGE_RAW_PATH
         stored = repository._by_org[org_id]
         assert stored.background_image_key is not None
         assert stored.background_image_key.startswith(f"branding/{org_id}/background/")
@@ -199,7 +204,9 @@ class TestUploadBackgroundImage:
             org_id, filename="b.jpg", content_type="image/jpeg", content=PNG_BYTES
         )
 
-        assert first.background_image_url != second.background_image_url
+        # Same stable proxy path both times -- the underlying key changed,
+        # not the URL callers see.
+        assert first.background_image_url == second.background_image_url
         assert repository._by_org[org_id].background_image_key.endswith(".jpg")
 
     async def test_rejects_unsupported_content_type(self) -> None:
@@ -282,12 +289,12 @@ class TestGetBrandingBackgroundImage:
     async def test_get_branding_with_no_row_returns_platform_default(self) -> None:
         # DefaultBrandingResponse (the platform fallback) has no
         # background_image_url field at all -- it's a fixed public
-        # default, not per-organization data with a presign step.
+        # default, not per-organization data.
         service, _repository, _storage, _audit = make_service()
         result = await service.get_branding(uuid.uuid4())
         assert result is DEFAULT_BRANDING
 
-    async def test_get_branding_resolves_fresh_presigned_url_each_call(self) -> None:
+    async def test_get_branding_returns_the_proxy_path_when_image_set(self) -> None:
         service, _repository, _storage, _audit = make_service()
         org_id = uuid.uuid4()
         await service.upload_background_image(
@@ -297,25 +304,67 @@ class TestGetBrandingBackgroundImage:
         first = await service.get_branding(org_id)
         second = await service.get_branding(org_id)
 
-        # Same underlying key, freshly resolved both times (not cached from
-        # the upload response) -- this is what makes a stored *key* durable
-        # even though the presigned URL itself would eventually expire.
-        assert first.background_image_url is not None
-        assert first.background_image_url == second.background_image_url
+        # Deterministic and stable across calls -- no expiring link to
+        # regenerate, so both reads return the exact same value.
+        assert first.background_image_url == BACKGROUND_IMAGE_RAW_PATH
+        assert second.background_image_url == BACKGROUND_IMAGE_RAW_PATH
 
-    async def test_get_branding_swallows_presign_failure(self) -> None:
-        service, repository, storage, _audit = make_service()
+    async def test_get_branding_returns_no_url_after_delete(self) -> None:
+        service, _repository, _storage, _audit = make_service()
         org_id = uuid.uuid4()
         await service.upload_background_image(
             org_id, filename="bg.png", content_type="image/png", content=PNG_BYTES
         )
-        storage.fail_presign = True
+        await service.delete_background_image(org_id)
 
         result = await service.get_branding(org_id)
 
         assert result.background_image_url is None
-        # The durable key itself is untouched by a transient presign failure.
-        assert repository._by_org[org_id].background_image_key is not None
+
+
+# ============================================================================
+# get_background_image_bytes (backs GET /branding/background-image/raw)
+# ============================================================================
+
+
+class TestGetBackgroundImageBytes:
+    async def test_returns_bytes_and_content_type_for_uploaded_image(self) -> None:
+        service, _repository, _storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        await service.upload_background_image(
+            org_id, filename="bg.jpg", content_type="image/jpeg", content=PNG_BYTES
+        )
+
+        content, content_type = await service.get_background_image_bytes(org_id)
+
+        assert content == PNG_BYTES
+        assert content_type == "image/jpeg"
+
+    async def test_raises_not_found_when_no_image_set(self) -> None:
+        service, _repository, _storage, _audit = make_service()
+        with pytest.raises(BackgroundImageNotFoundError):
+            await service.get_background_image_bytes(uuid.uuid4())
+
+    async def test_raises_not_found_when_no_branding_row_at_all(self) -> None:
+        service, _repository, _storage, _audit = make_service()
+        with pytest.raises(BackgroundImageNotFoundError):
+            await service.get_background_image_bytes(uuid.uuid4())
+
+    async def test_raises_when_storage_not_configured(self) -> None:
+        service, _repository, _storage, _audit = make_service(with_storage=False)
+        with pytest.raises(BrandingStorageNotConfiguredError):
+            await service.get_background_image_bytes(uuid.uuid4())
+
+    async def test_propagates_storage_download_failure(self) -> None:
+        service, _repository, storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        await service.upload_background_image(
+            org_id, filename="bg.png", content_type="image/png", content=PNG_BYTES
+        )
+        storage.fail_download = True
+
+        with pytest.raises(ObjectStorageError):
+            await service.get_background_image_bytes(org_id)
 
 
 # ============================================================================

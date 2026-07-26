@@ -10,6 +10,7 @@ from typing import Protocol
 from app.core.storage import ObjectStorageError, ObjectStorageProtocol
 
 from .exceptions import (
+    BackgroundImageNotFoundError,
     BrandingStorageNotConfiguredError,
     InvalidBackgroundImageError,
 )
@@ -32,7 +33,23 @@ BACKGROUND_IMAGE_ALLOWED_CONTENT_TYPES: dict[str, str] = {
     "image/gif": "gif",
 }
 BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB
-BACKGROUND_IMAGE_PRESIGNED_URL_TTL_SECONDS = 3600
+
+# The path BrandingResponse.background_image_url points browsers at --
+# proxied through this API (see get_background_image_bytes / the router's
+# GET /branding/background-image/raw) rather than a direct object-storage
+# link. A presigned MinIO/S3 URL would need that storage endpoint itself
+# reachable from the browser, which on this platform's actual single-VM
+# deployment it deliberately isn't (only the API's own port is opened) --
+# real AWS S3 in another deployment would make a direct link *possible*,
+# but routing every deployment through the already-authenticated,
+# already-public API is simpler than conditioning behavior on which one
+# this happens to be.
+BACKGROUND_IMAGE_RAW_PATH = "/branding/background-image/raw"
+
+_EXTENSION_TO_CONTENT_TYPE = {
+    ext: content_type
+    for content_type, ext in BACKGROUND_IMAGE_ALLOWED_CONTENT_TYPES.items()
+}
 
 
 class AuditLogWriter(Protocol):
@@ -162,6 +179,32 @@ class BrandingService:
     async def get_default_branding(self) -> DefaultBrandingResponse:
         return DEFAULT_BRANDING
 
+    async def get_background_image_bytes(
+        self, organization_id: uuid.UUID
+    ) -> tuple[bytes, str]:
+        """Streams the current background image's raw bytes + content
+        type -- backs ``GET /branding/background-image/raw``, the proxy
+        endpoint ``background_image_url`` actually points at.
+
+        Raises ``BackgroundImageNotFoundError`` if the organization has
+        no background image set, ``BrandingStorageNotConfiguredError`` if
+        this service instance has no object storage backend.
+        """
+        if self.object_storage is None:
+            raise BrandingStorageNotConfiguredError()
+
+        branding = await self.repository.get_by_organization(organization_id)
+        key = branding.background_image_key if branding else None
+        if not key:
+            raise BackgroundImageNotFoundError(organization_id)
+
+        content = await self.object_storage.download(key=key)
+        extension = key.rsplit(".", 1)[-1].lower() if "." in key else ""
+        content_type = _EXTENSION_TO_CONTENT_TYPE.get(
+            extension, "application/octet-stream"
+        )
+        return content, content_type
+
     async def _to_response(self, branding: Branding) -> BrandingResponse:
         return BrandingResponse(
             id=str(branding.id),
@@ -179,25 +222,14 @@ class BrandingService:
         )
 
     async def _resolve_background_image_url(self, branding: Branding) -> str | None:
-        """Turns the durable, persisted ``background_image_key`` into a
-        fresh, browser-usable presigned URL -- called on every read so the
-        URL's own expiry never matters to callers."""
-        key = branding.background_image_key
-        if not key:
+        """Turns the durable, persisted ``background_image_key`` into the
+        stable proxy path the frontend fetches (authenticated, same as
+        every other branding call) to render the actual image -- see
+        ``BACKGROUND_IMAGE_RAW_PATH``'s own docstring for why this is a
+        same-API proxy path rather than a direct object-storage link."""
+        if not branding.background_image_key:
             return None
-        if self.object_storage is None:
-            return None
-        try:
-            return await self.object_storage.generate_presigned_url(
-                key=key,
-                expires_in_seconds=BACKGROUND_IMAGE_PRESIGNED_URL_TTL_SECONDS,
-            )
-        except ObjectStorageError:
-            logger.exception(
-                "background_image_presign_failed",
-                extra={"organization_id": str(branding.organization_id)},
-            )
-            return None
+        return BACKGROUND_IMAGE_RAW_PATH
 
     async def _audit(
         self,
