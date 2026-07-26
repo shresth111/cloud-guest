@@ -19,12 +19,14 @@ from datetime import UTC, datetime
 
 import pytest
 
+from app.common.responses import ApiResponse
 from app.domains.branding.exceptions import (
     BrandingStorageNotConfiguredError,
     InvalidBackgroundImageError,
 )
 from app.domains.branding.models import Branding
 from app.domains.branding.router import router as branding_router
+from app.domains.branding.schemas import BrandingResponse, DefaultBrandingResponse
 from app.domains.branding.service import (
     BACKGROUND_IMAGE_MAX_BYTES,
     DEFAULT_BRANDING,
@@ -314,6 +316,40 @@ class TestGetBrandingBackgroundImage:
         assert result.background_image_url is None
         # The durable key itself is untouched by a transient presign failure.
         assert repository._by_org[org_id].background_image_key is not None
+
+
+# ============================================================================
+# GET /branding response_model regression: this endpoint can genuinely
+# return either shape (see router.py's own comment on this), so the
+# declared response_model must accept both -- this is exactly the
+# validation FastAPI itself runs on every response, exercised directly
+# here rather than through a full HTTP round trip.
+# ============================================================================
+
+
+class TestGetBrandingResponseModelAcceptsBothShapes:
+    def test_accepts_default_branding_with_no_organization_row(self) -> None:
+        envelope = ApiResponse[BrandingResponse | DefaultBrandingResponse](
+            success=True,
+            message="Branding retrieved",
+            data=DEFAULT_BRANDING.model_dump(mode="json"),
+            request_id="req-1",
+        )
+        assert isinstance(envelope.data, DefaultBrandingResponse)
+
+    async def test_accepts_real_organization_branding(self) -> None:
+        service, _repository, _storage, _audit = make_service()
+        result = await service.upload_background_image(
+            uuid.uuid4(), filename="bg.png", content_type="image/png", content=PNG_BYTES
+        )
+        envelope = ApiResponse[BrandingResponse | DefaultBrandingResponse](
+            success=True,
+            message="Branding retrieved",
+            data=result.model_dump(mode="json"),
+            request_id="req-2",
+        )
+        assert isinstance(envelope.data, BrandingResponse)
+        assert envelope.data.background_image_url == result.background_image_url
 
 
 # ============================================================================

@@ -38,7 +38,15 @@ def _request_id(request: Request) -> str:
 
 @router.get(
     "/branding",
-    response_model=ApiResponse[BrandingResponse],
+    # Union, not just BrandingResponse: an organization with no branding
+    # row yet gets DefaultBrandingResponse back (see get_branding's own
+    # docstring) -- that shape has no id/organization_id, so declaring
+    # this as BrandingResponse alone made FastAPI's own response
+    # validation 500 on every organization that had never configured
+    # branding (a pre-existing bug this endpoint had never actually been
+    # exercised against until BrandAssetPage.tsx started calling it for
+    # real).
+    response_model=ApiResponse[BrandingResponse | DefaultBrandingResponse],
     status_code=status.HTTP_200_OK,
     dependencies=[
         Depends(RequirePermission("white_label.read")),
