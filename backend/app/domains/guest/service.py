@@ -300,6 +300,7 @@ from .exceptions import (
     GuestPasswordLoginFailedError,
     GuestPasswordSetupNotAuthorizedError,
     GuestPasswordTooWeakError,
+    GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
     InvalidSessionStatusTransitionError,
     NoReconnectableSessionError,
@@ -1694,6 +1695,52 @@ class GuestService:
             "guest_password_set",
             extra={"event_guest_id": str(updated.id)},
         )
+        return updated
+
+    async def disconnect_own_session(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        session_id: uuid.UUID,
+        reason: str | None = None,
+    ) -> GuestSession:
+        """Lets a guest end their own connection from the captive portal's
+        success screen -- the guest-facing counterpart to the admin-only
+        ``disconnect_session`` (``POST /guest-sessions/{id}/disconnect``,
+        RBAC-gated). Authenticated the same way
+        ``set_guest_password`` is: there is no platform-user JWT a guest
+        could ever present, so ``guest_id``/``session_id`` (both already
+        known to whoever is holding the real, just-issued
+        ``GuestLoginResponse``) stand in for one, and this method verifies
+        the session actually belongs to that guest itself rather than
+        trusting the caller's say-so -- a mismatch raises
+        ``GuestSelfDisconnectNotAuthorizedError``.
+
+        Otherwise behaves exactly like a system-initiated
+        ``disconnect_session``: normal, non-punitive, never audited (no
+        ``actor_user_id`` -- there is no admin actor here), and still
+        issues a real RADIUS CoA-Disconnect via ``issue_live_disconnect``
+        so the guest's device is actually cut off the network, not just
+        marked disconnected in the database."""
+        session = await self.repository.get_session_by_id(session_id)
+        if session is None or session.guest_id != guest_id:
+            raise GuestSelfDisconnectNotAuthorizedError()
+        validate_session_status_transition(
+            current=GuestSessionStatus(session.status),
+            target=GuestSessionStatus.DISCONNECTED,
+        )
+        now = datetime.now(UTC)
+        updated = await self.repository.update_session(
+            session,
+            {
+                "status": GuestSessionStatus.DISCONNECTED.value,
+                "ended_at": now,
+                "disconnect_reason": reason or "guest_initiated",
+            },
+        )
+        event = GuestSessionDisconnected(session_id=updated.id, reason=reason)
+        logger.info("guest_session_disconnected", extra=_event_extra(event))
+        await issue_live_disconnect(self.repository, session=updated)
         return updated
 
     async def record_consent(

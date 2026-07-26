@@ -47,6 +47,7 @@ __all__ = [
     "GuestPasswordLoginFailedError",
     "GuestPasswordSetupNotAuthorizedError",
     "GuestPasswordTooWeakError",
+    "GuestSelfDisconnectNotAuthorizedError",
 ]
 
 
@@ -429,3 +430,21 @@ class GuestPasswordTooWeakError(GuestError):
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason, status_code=status.HTTP_400_BAD_REQUEST)
+
+
+class GuestSelfDisconnectNotAuthorizedError(GuestError):
+    """``GuestService.disconnect_own_session`` requires the presented
+    ``session_id`` to actually belong to the presented ``guest_id`` -- the
+    same "no platform-user JWT a guest could ever present" situation
+    ``GuestPasswordSetupNotAuthorizedError`` documents, applied to a guest
+    ending their own connection instead of setting a password. Raised when
+    the session doesn't exist or belongs to a different guest; a session
+    that exists but is already non-``ACTIVE`` instead surfaces the ordinary
+    ``InvalidSessionStatusTransitionError`` (a guest is allowed to learn
+    that -- it isn't proof of anything the way ownership is)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This session isn't yours to disconnect.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )

@@ -53,6 +53,7 @@ from app.domains.guest.exceptions import (
     GuestPasswordLoginFailedError,
     GuestPasswordSetupNotAuthorizedError,
     GuestPasswordTooWeakError,
+    GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
     InvalidExtensionMinutesError,
     InvalidNasStatusTransitionError,
@@ -1636,6 +1637,71 @@ class TestSetGuestPassword:
         assert fx.repository.guests[otp_result.guest.id].hashed_password is None
 
 
+class TestGuestSelfDisconnect:
+    async def _login(self, fx: Fixture, identifier: str = "+15559990000") -> GuestLoginResult:
+        return await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+
+    async def test_happy_path_disconnects_the_guests_own_session(self) -> None:
+        fx = make_fixture()
+        result = await self._login(fx)
+        updated = await fx.guest_service.disconnect_own_session(
+            guest_id=result.guest.id, session_id=result.session.id
+        )
+        assert updated.status == GuestSessionStatus.DISCONNECTED.value
+        assert updated.ended_at is not None
+        assert updated.disconnect_reason == "guest_initiated"
+        # Never audited -- there is no admin actor here.
+        assert fx.audit_writer.entries == []
+
+    async def test_custom_reason_is_recorded(self) -> None:
+        fx = make_fixture()
+        result = await self._login(fx)
+        updated = await fx.guest_service.disconnect_own_session(
+            guest_id=result.guest.id,
+            session_id=result.session.id,
+            reason="guest tapped disconnect",
+        )
+        assert updated.disconnect_reason == "guest tapped disconnect"
+
+    async def test_rejects_a_session_belonging_to_a_different_guest(self) -> None:
+        fx = make_fixture()
+        result = await self._login(fx)
+        other = await self._login(fx, identifier="+15559990001")
+        with pytest.raises(GuestSelfDisconnectNotAuthorizedError):
+            await fx.guest_service.disconnect_own_session(
+                guest_id=other.guest.id, session_id=result.session.id
+            )
+        # The mismatched-owner attempt never touched the real session.
+        untouched = await fx.repository.get_session_by_id(result.session.id)
+        assert untouched.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_rejects_an_unknown_session_id(self) -> None:
+        fx = make_fixture()
+        result = await self._login(fx)
+        with pytest.raises(GuestSelfDisconnectNotAuthorizedError):
+            await fx.guest_service.disconnect_own_session(
+                guest_id=result.guest.id, session_id=uuid.uuid4()
+            )
+
+    async def test_disconnect_twice_raises_invalid_transition(self) -> None:
+        fx = make_fixture()
+        result = await self._login(fx)
+        await fx.guest_service.disconnect_own_session(
+            guest_id=result.guest.id, session_id=result.session.id
+        )
+        with pytest.raises(InvalidSessionStatusTransitionError):
+            await fx.guest_service.disconnect_own_session(
+                guest_id=result.guest.id, session_id=result.session.id
+            )
+
+
 class TestSpeedLinkedVoucherQueueAssignment:
     async def test_creates_and_applies_a_voucher_targeted_assignment(self) -> None:
         fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
@@ -2247,6 +2313,35 @@ class TestLiveDisconnect:
         monkeypatch.setattr(service_module, "send_packet", _fake_send_packet)
 
         updated = await fx.guest_service.disconnect_session(session_id=session.id)
+        assert updated.status == GuestSessionStatus.DISCONNECTED.value
+        assert calls == ["203.0.113.10"]
+
+    async def test_guest_self_disconnect_attempts_a_live_disconnect(
+        self, monkeypatch
+    ) -> None:
+        """Same integration-level proof as
+        ``test_disconnect_session_attempts_a_live_disconnect``, for the
+        guest-initiated path (``disconnect_own_session``) -- a guest
+        tapping "Disconnect" on the captive portal's success screen must
+        actually cut their device off the network, not just flip a status
+        column."""
+        from app.domains.guest import service as service_module
+        from app.domains.guest.radius_coa import RADIUS_CODE_DISCONNECT_ACK
+
+        fx = make_fixture()
+        session = await self._login_with_registered_nas(fx)
+
+        calls: list[str] = []
+
+        def _fake_send_packet(packet: bytes, *, host: str, **kwargs: object):
+            calls.append(host)
+            return bytes([RADIUS_CODE_DISCONNECT_ACK])
+
+        monkeypatch.setattr(service_module, "send_packet", _fake_send_packet)
+
+        updated = await fx.guest_service.disconnect_own_session(
+            guest_id=session.guest_id, session_id=session.id
+        )
         assert updated.status == GuestSessionStatus.DISCONNECTED.value
         assert calls == ["203.0.113.10"]
 

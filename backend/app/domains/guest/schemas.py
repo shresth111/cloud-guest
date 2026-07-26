@@ -156,6 +156,18 @@ class GuestSetPasswordResponse(BaseModel):
     password_set: bool
 
 
+class GuestDisconnectRequest(BaseModel):
+    """A guest ending their own connection from the captive portal's
+    success screen -- ``guest_id``/``session_id`` mirror
+    ``GuestSetPasswordRequest``'s identical "prove it with the real
+    ``GuestLoginResponse`` you were just issued" shape (see
+    ``service.GuestService.disconnect_own_session``'s docstring)."""
+
+    guest_id: uuid.UUID
+    session_id: uuid.UUID
+    reason: str | None = Field(default=None, max_length=255)
+
+
 class GuestConsentRequest(BaseModel):
     guest_id: uuid.UUID
     captive_portal_config_id: uuid.UUID | None = Field(default=None)

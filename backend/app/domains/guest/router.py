@@ -75,6 +75,7 @@ from .schemas import (
     GuestConsentRequest,
     GuestConsentResponse,
     GuestDetailResponse,
+    GuestDisconnectRequest,
     GuestListResponse,
     GuestLoginResponse,
     GuestOtpLoginRequest,
@@ -341,6 +342,29 @@ async def guest_set_password(
         data=GuestSetPasswordResponse(
             guest_id=str(guest.id), password_set=True
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/session/disconnect",
+    response_model=ApiResponse[GuestSessionResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_disconnect_own_session(
+    request: Request,
+    payload: GuestDisconnectRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    session = await service.disconnect_own_session(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        reason=payload.reason,
+    )
+    return build_response(
+        success=True,
+        message="Disconnected",
+        data=_session_response(session).model_dump(),
         request_id=_request_id(request),
     )
 
