@@ -11,9 +11,9 @@ from enum import StrEnum
 class NotificationEventType(StrEnum):
     """What triggered a notification -- one value per real call site wired
     in this part (``app.domains.auth``, ``app.domains.voucher``,
-    ``app.domains.billing``, ``app.domains.analytics``). Not exhaustive of
-    every possible future event; extend additively as new callers adopt
-    this domain."""
+    ``app.domains.billing``, ``app.domains.analytics``,
+    ``app.domains.location``). Not exhaustive of every possible future
+    event; extend additively as new callers adopt this domain."""
 
     EMAIL_VERIFICATION = "email_verification"
     PASSWORD_RESET = "password_reset"
@@ -23,6 +23,7 @@ class NotificationEventType(StrEnum):
     SCHEDULED_REPORT = "scheduled_report"
     USER_INVITED = "user_invited"
     DEMO_REQUEST_RECEIVED = "demo_request_received"
+    LOCATION_WELCOME_EMAIL = "location_welcome_email"
 
 
 class NotificationChannelType(StrEnum):

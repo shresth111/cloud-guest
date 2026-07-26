@@ -56,6 +56,10 @@ from app.domains.location.provisioning_service import (
     _generate_username,
 )
 from app.domains.location.service import LocationService
+from app.domains.notification.constants import (
+    NotificationChannelType,
+    NotificationEventType,
+)
 from app.domains.organization.enums import OrganizationStatus, OrganizationType
 from app.domains.organization.exceptions import (
     DuplicateSlugError,
@@ -322,6 +326,7 @@ class ProvisioningFakes:
     audit_entries: list[dict[str, object]] = field(default_factory=list)
     emails_sent: list[tuple[str, str, str]] = field(default_factory=list)
     sms_sent: list[tuple[str, str]] = field(default_factory=list)
+    notifications_enqueued: list[dict[str, object]] = field(default_factory=list)
 
     fail_at: str | None = None
 
@@ -577,6 +582,39 @@ class _SmsProviderAdapter:
         await self._fakes.send_sms(phone_number, message)
 
 
+class _NotificationServiceAdapter:
+    """Fakes the real ``NotificationSenderProtocol.enqueue`` surface the
+    welcome-email step now goes through (the outbox, not a direct
+    ``EmailProviderProtocol.send`` call) -- routes into the same
+    ``fakes.emails_sent`` recorder every existing assertion already reads,
+    so this is a pure plumbing swap, not a new behavior to assert on."""
+
+    def __init__(self, fakes: ProvisioningFakes) -> None:
+        self._fakes = fakes
+
+    async def enqueue(
+        self,
+        *,
+        event_type,
+        channel,
+        recipient: str,
+        body: str,
+        organization_id,
+        subject: str | None = None,
+    ) -> None:
+        self._fakes.notifications_enqueued.append(
+            {
+                "event_type": event_type,
+                "channel": channel,
+                "recipient": recipient,
+                "organization_id": organization_id,
+                "subject": subject,
+                "body": body,
+            }
+        )
+        await self._fakes.send_email(recipient, subject or "", body)
+
+
 # ============================================================================
 # Test rig assembly
 # ============================================================================
@@ -646,6 +684,7 @@ def make_service(
         fakes,
         _EmailProviderAdapter(fakes),
         _SmsProviderAdapter(fakes),
+        notification_service=_NotificationServiceAdapter(fakes),
     )
     return service, fakes, base_plan_id
 
@@ -766,9 +805,7 @@ class TestPreviewProvisionLocation:
         fakes.organizations[organization.id] = organization
 
         preview = await service.preview_provision_location(
-            data=_input(
-                existing_organization_id=organization.id, plan_id=base_plan_id
-            )
+            data=_input(existing_organization_id=organization.id, plan_id=base_plan_id)
         )
 
         assert preview.organization_id == organization.id
@@ -947,6 +984,56 @@ class TestHappyPath:
         assert captured["voucher_enabled"] is False
         assert captured["is_default"] is False
         assert captured["location_id"] is not None
+
+
+# ============================================================================
+# Welcome-email routing: real regression coverage for the bug where
+# provisioning's welcome email was composed against ``EmailProviderProtocol``
+# directly (wired to ``LoggingEmailProvider``, a log-only stub -- see
+# ``provisioning_dependencies.py``'s history) instead of going through
+# ``app.domains.notification``'s real outbox (``NotificationService.enqueue``
+# -> a ``notification_deliveries`` row -> the Celery dispatch sweep -> the
+# real SMTP provider), the same pipeline ``auth``/``voucher``/``billing``
+# already use for their own account-credential/reminder emails. Asserts on
+# the actual ``NotificationSenderProtocol.enqueue`` call contract, not just
+# that *some* string ended up in a fake mailbox.
+# ============================================================================
+
+
+class TestWelcomeEmailNotificationRouting:
+    async def test_provisioning_enqueues_welcome_email_via_the_real_outbox(
+        self,
+    ) -> None:
+        service, fakes, base_plan_id = make_service()
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert len(fakes.notifications_enqueued) == 1
+        enqueued = fakes.notifications_enqueued[0]
+        assert enqueued["event_type"] == NotificationEventType.LOCATION_WELCOME_EMAIL
+        assert enqueued["channel"] == NotificationChannelType.EMAIL
+        assert enqueued["recipient"] == "priya@example.com"
+        assert enqueued["organization_id"] == result.organization_id
+        assert result.owner_temporary_password in enqueued["body"]
+
+    async def test_resend_welcome_email_also_uses_the_real_outbox(self) -> None:
+        service, fakes, base_plan_id = make_service()
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+        fakes.notifications_enqueued.clear()
+
+        location = next(iter(service.location_service.repository.locations.values()))  # type: ignore[attr-defined]
+        await service.resend_welcome_email(location_id=location.id)
+
+        assert len(fakes.notifications_enqueued) == 1
+        enqueued = fakes.notifications_enqueued[0]
+        assert enqueued["event_type"] == NotificationEventType.LOCATION_WELCOME_EMAIL
+        assert enqueued["channel"] == NotificationChannelType.EMAIL
 
 
 # ============================================================================

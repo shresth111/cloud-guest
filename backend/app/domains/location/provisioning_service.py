@@ -182,6 +182,10 @@ from app.domains.billing.constants import (
 from app.domains.billing.models import Plan, PlanFeature, Subscription
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.guest.nas_number_generator import preview_first_nas_code
+from app.domains.notification.constants import (
+    NotificationChannelType,
+    NotificationEventType,
+)
 from app.domains.organization.enums import OrganizationStatus, OrganizationType
 from app.domains.organization.exceptions import (
     DuplicateSlugError,
@@ -425,6 +429,50 @@ class EmailProviderProtocol(Protocol):
 
 class SmsProviderProtocol(Protocol):
     async def send(self, phone_number: str, message: str) -> None: ...
+
+
+class NotificationSenderProtocol(Protocol):
+    """The minimal surface this service needs to actually deliver the
+    welcome email through the real outbox -- satisfied structurally by
+    ``app.domains.notification.service.NotificationService`` (see that
+    domain's own module docstring for the full outbox/dispatch design).
+    Mirrors ``app.domains.auth.service.NotificationSenderProtocol`` and
+    ``app.domains.user.service.NotificationSenderProtocol``'s identical
+    narrow, duck-typed shape -- not a hard import of the concrete class."""
+
+    async def enqueue(
+        self,
+        *,
+        event_type: NotificationEventType,
+        channel: NotificationChannelType,
+        recipient: str,
+        body: str,
+        organization_id: uuid.UUID | None,
+        subject: str | None = None,
+    ) -> object: ...
+
+
+class _NoopNotificationSender:
+    """Honest fallback when no real ``NotificationSenderProtocol`` is
+    wired in -- logs instead of silently discarding the welcome email,
+    mirroring ``app.domains.auth.service._NoopNotificationSender``'s
+    identical "logged, not faked, not silently dropped" precedent. Never
+    wired in production -- see ``provisioning_dependencies.py``."""
+
+    async def enqueue(
+        self,
+        *,
+        event_type: NotificationEventType,
+        channel: NotificationChannelType,
+        recipient: str,
+        body: str,
+        organization_id: uuid.UUID | None,
+        subject: str | None = None,
+    ) -> None:
+        logger.info(
+            "location_welcome_notification_would_send",
+            extra={"event_type": event_type.value, "recipient": recipient},
+        )
 
 
 # ============================================================================
@@ -698,6 +746,7 @@ class LocationProvisioningService:
         sms_provider: SmsProviderProtocol,
         *,
         login_url_base: str = _DEFAULT_LOGIN_URL_BASE,
+        notification_service: NotificationSenderProtocol | None = None,
     ) -> None:
         self.location_service = location_service
         self.organization_service = organization_service
@@ -713,6 +762,9 @@ class LocationProvisioningService:
         self.email_provider = email_provider
         self.sms_provider = sms_provider
         self.login_url_base = login_url_base
+        self.notification_service: NotificationSenderProtocol = (
+            notification_service or _NoopNotificationSender()
+        )
 
     # -- preview (read-only dry run) ----------------------------------------
 
@@ -738,9 +790,7 @@ class LocationProvisioningService:
             if data.new_organization is None:
                 raise NewOrganizationRequiredError()
             try:
-                await self.organization_service.get_by_slug(
-                    data.new_organization.slug
-                )
+                await self.organization_service.get_by_slug(data.new_organization.slug)
             except OrganizationNotFoundError:
                 pass
             else:
@@ -1197,7 +1247,14 @@ class LocationProvisioningService:
                 "If you no longer have your temporary password, use "
                 "'Forgot password' on the login page to set a new one."
             )
-        await self.email_provider.send(owner.email, subject, body)
+        await self.notification_service.enqueue(
+            event_type=NotificationEventType.LOCATION_WELCOME_EMAIL,
+            channel=NotificationChannelType.EMAIL,
+            recipient=owner.email,
+            subject=subject,
+            body=body,
+            organization_id=location.organization_id,
+        )
 
 
 __all__ = [
