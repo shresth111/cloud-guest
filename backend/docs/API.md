@@ -629,11 +629,12 @@ separately supplied), else the organization's active default, else a
 `404` (`CaptivePortalConfigNotConfiguredError`) -- there is no hardcoded
 platform-wide fallback branding; every organization must configure at
 least one active default portal before going live (`FLOW.md` §2).
-`social_login_enabled`/`social_login_providers` and
-`username_password_enabled` are schema-only readiness flags -- no real
-OAuth/social-login integration or guest username/password authentication
-exists anywhere in this codebase; setting them only changes what this
-resolve response reports as enabled (`FLOW.md` §5).
+`social_login_enabled`/`social_login_providers` are schema-only readiness
+flags -- no real OAuth/social-login integration exists anywhere in this
+codebase; setting them only changes what this resolve response reports as
+enabled (`FLOW.md` §5). `username_password_enabled` is a real, working
+gate for `GuestService.login_via_password` (`POST /guest/login/
+password`), defaulting to `true`.
 
 ## Guest Endpoints (Module 010 Part 4, the final BE-010 module)
 

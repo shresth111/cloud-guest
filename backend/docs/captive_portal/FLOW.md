@@ -199,8 +199,9 @@ not silently allowed to produce an invalid combined row.
 **Decision: which guest login methods a portal enables is modeled as five
 explicit booleans (`otp_sms_enabled`, `otp_email_enabled`,
 `voucher_enabled`, `username_password_enabled`, `social_login_enabled`),
-not a JSONB bag -- and `social_login_enabled`/`username_password_enabled`
-are schema-only readiness flags, not working features.**
+not a JSONB bag. `social_login_enabled` is a schema-only readiness flag,
+not a working feature; `username_password_enabled` no longer is one --
+see below.**
 
 Explicit columns over JSONB: this is a small, fixed, individually
 meaningful set the guest-facing resolve response needs to expose directly
@@ -225,11 +226,15 @@ registry**, because no such registry exists to validate against (see
 .test_no_provider_registry_validation_is_performed`, which confirms an
 obviously-fake provider slug is accepted without error).
 
-`username_password_enabled` is the identical kind of placeholder: no
-`Guest` model exists yet in this codebase (a later module in this same
-BE-010 sequence) to authenticate a username/password against, so this flag
-too is a forward-compatible extension point for the future `guest` module
-to act on, not a working login path today.
+`username_password_enabled` was the identical kind of placeholder when
+this module was first built (no `Guest` model existed yet to authenticate
+against) -- it no longer is. `GuestService.login_via_password` (`POST
+/guest/login/password`, a later module in this same BE-010 sequence) is a
+real, working login path, and this flag genuinely gates it. It defaults
+to `true`: the standard baseline every location gets (a guest verifies
+once via OTP, sets a password right after, and signs in with phone/email
++ password from then on) -- an admin can still turn it off per location
+(e.g. an SMS-OTP-only kiosk).
 
 ## 6. Guest-facing resolve endpoint: no RBAC, but still enveloped
 

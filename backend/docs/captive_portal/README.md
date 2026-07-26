@@ -46,10 +46,11 @@ endpoints.
   social-login integration anywhere in this codebase, and none is
   attempted here. The same honest-boundary posture `app.domains.otp`'s
   logging-only SMS/email providers already establish. See `FLOW.md` §5.
-* **It does not implement guest username/password authentication.**
-  `username_password_enabled` is the same kind of placeholder -- no
-  `Guest` model exists yet (a later module in this same BE-010 sequence)
-  to authenticate against.
+* **`username_password_enabled` is a real, working login-method gate**,
+  not a placeholder -- `GuestService.login_via_password` (`POST /guest/
+  login/password`) is real guest username/password authentication, and
+  this flag genuinely controls whether a location offers it. Defaults to
+  `true` (the standard "OTP once, then a saved password" baseline).
 * **It does not invent a platform-wide default branding.** If neither a
   location override nor an active organization default exists,
   `resolve_portal_config` raises rather than falling back to some

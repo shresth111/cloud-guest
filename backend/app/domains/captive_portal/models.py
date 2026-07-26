@@ -107,11 +107,17 @@ performs a social login. ``social_login_providers`` (JSONB, default
 to list configured provider slugs (e.g. ``["google", "facebook"]``) --
 today it is stored and returned verbatim, never interpreted or validated
 against a real provider registry, because no such registry exists.
-``username_password_enabled`` is the same kind of readiness flag for
-guest-account username/password login -- no ``Guest`` model exists yet in
-this codebase (a later module in this same BE-010 sequence) to authenticate
-against, so this too is a placeholder the future ``guest`` module may act
-on, not a working login path today.
+``username_password_enabled`` was originally the same kind of readiness
+placeholder, written before the ``guest`` module existed to authenticate
+against -- it no longer is. ``app.domains.guest.service.GuestService
+.login_via_password``/``POST /guest/login/password`` is a real, working
+login path today, and this flag genuinely gates it (see
+``GuestService._resolve_and_validate_method``). It defaults to ``True``
+-- the standard baseline every location gets (OTP once, then a saved
+password from then on) -- mirroring
+``app.domains.location.provisioning_service._resolve_login_methods``'s
+identical always-on default for a freshly provisioned location; an admin
+can still turn it off per location.
 """
 
 from __future__ import annotations
@@ -208,10 +214,10 @@ class CaptivePortalConfig(BaseModel):
         Boolean, default=False, nullable=False
     )
     voucher_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    # Placeholder readiness flag -- see module docstring. No Guest model
-    # exists yet to authenticate a username/password against.
+    # Real, working login-method gate -- see module docstring. Defaults
+    # on: the standard "OTP once, then a saved password" baseline.
     username_password_enabled: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False
+        Boolean, default=True, nullable=False
     )
     # Schema-only placeholder -- see module docstring. No real OAuth/
     # social-login integration exists anywhere in this codebase.

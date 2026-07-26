@@ -78,10 +78,13 @@ Accounting packets, translated into this module's own HTTP endpoints
 * **It does not live-disconnect a device at the network level.**
   `enforce_timeouts`/quota detection are status-transition/reporting
   mechanisms only -- see `FLOW.md` §6.
-* **It does not implement guest username/password authentication.**
-  `GuestAuthMethod.USERNAME_PASSWORD` exists for schema parity with
-  `CaptivePortalConfig.username_password_enabled` but no login path in this
-  module implements it (mirrors that flag's own placeholder status).
+* **It does implement guest username/password authentication.**
+  `GuestAuthMethod.USERNAME_PASSWORD` is real:
+  `GuestService.login_via_password` (`POST /guest/login/password`) gates
+  on the real, working `CaptivePortalConfig.username_password_enabled`
+  flag (default `true`) -- a guest sets their password once via
+  `set_guest_password` (right after a real OTP login) and signs in with
+  it from then on.
 
 ## Folder Structure
 

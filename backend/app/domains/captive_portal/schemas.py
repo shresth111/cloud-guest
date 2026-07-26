@@ -79,13 +79,16 @@ class CaptivePortalConfigCreateRequest(BaseModel):
     otp_sms_enabled: bool = Field(default=True)
     otp_email_enabled: bool = Field(default=False)
     voucher_enabled: bool = Field(default=True)
-    username_password_enabled: bool = Field(
-        default=False,
-        description=(
-            "Schema-only placeholder -- no Guest model exists yet to "
-            "authenticate a username/password against."
-        ),
-    )
+    # Real, functional login method (GuestService.login_via_password /
+    # POST /guest/login/password) -- no longer the placeholder this field
+    # started as. Defaults to True (the standard baseline: every guest can
+    # verify once via OTP, set a password right after, and use phone/email
+    # + password from then on) -- mirrors
+    # app.domains.location.provisioning_service._resolve_login_methods's
+    # identical "always-on baseline" default for a newly provisioned
+    # location. An admin can still explicitly turn it off per location
+    # (e.g. an SMS-OTP-only kiosk) via CaptivePortalConfigUpdateRequest.
+    username_password_enabled: bool = Field(default=True)
     social_login_enabled: bool = Field(
         default=False,
         description=(

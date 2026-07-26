@@ -320,6 +320,11 @@ async def _create_config(
     privacy_policy_url: str | None = None,
     social_login_enabled: bool = False,
     social_login_providers: list[str] | None = None,
+    # True (the real, standard "OTP once, then a saved password" baseline
+    # -- see CaptivePortalConfig.username_password_enabled's own
+    # docstring) mirrors this helper's own otp_sms_enabled/voucher_enabled
+    # defaults being the actually-enabled-by-default methods.
+    username_password_enabled: bool = True,
     requesting_organization_id: uuid.UUID | None = None,
     organization_id: uuid.UUID | None = None,
 ) -> CaptivePortalConfig:
@@ -356,7 +361,7 @@ async def _create_config(
         otp_sms_enabled=True,
         otp_email_enabled=False,
         voucher_enabled=True,
-        username_password_enabled=False,
+        username_password_enabled=username_password_enabled,
         social_login_enabled=social_login_enabled,
         social_login_providers=social_login_providers or [],
     )
@@ -823,9 +828,19 @@ class TestSocialLoginPlaceholder:
         assert config.social_login_enabled is False
         assert config.social_login_providers == []
 
-    async def test_username_password_disabled_by_default(self) -> None:
+    async def test_username_password_enabled_by_default(self) -> None:
+        """The standard baseline every location gets: a guest verifies
+        once via OTP, sets a password right after, and signs in with
+        phone/email + password from then on -- real and on by default,
+        same as otp_sms_enabled/voucher_enabled (an admin can still turn
+        it off per location, e.g. an SMS-OTP-only kiosk)."""
         fx = make_service()
         config = await _create_config(fx)
+        assert config.username_password_enabled is True
+
+    async def test_username_password_can_be_disabled_per_location(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, username_password_enabled=False)
         assert config.username_password_enabled is False
 
     async def test_no_provider_registry_validation_is_performed(self) -> None:

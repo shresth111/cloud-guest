@@ -38,7 +38,7 @@ guest WiFi captive portal -- either an organization-level default
 | `otp_sms_enabled` | Boolean, default `true` | |
 | `otp_email_enabled` | Boolean, default `false` | |
 | `voucher_enabled` | Boolean, default `true` | |
-| `username_password_enabled` | Boolean, default `false` | **Placeholder** -- no `Guest` model exists yet to authenticate against (`FLOW.md` §5) |
+| `username_password_enabled` | Boolean, default `true` | Real, working login-method gate for `GuestService.login_via_password` (`POST /guest/login/password`) -- the standard "OTP once, then a saved password" baseline every location gets unless an admin turns it off |
 | `social_login_enabled` | Boolean, default `false` | **Schema-only placeholder** -- no real OAuth/social-login integration anywhere in this codebase (`FLOW.md` §5) |
 | `social_login_providers` | JSONB, default `[]` | Forward-compatible extension point; stored/returned verbatim, never validated against a real provider registry |
 
