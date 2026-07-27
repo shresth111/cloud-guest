@@ -93,6 +93,15 @@ class PolicyRepositoryProtocol(Protocol):
         guest_id: uuid.UUID | None = None,
     ) -> list[PolicyAssignment]: ...
 
+    async def find_active_target_assignment(
+        self,
+        *,
+        policy_type: str,
+        target_type: str,
+        target_id: uuid.UUID,
+        exclude_policy_id: uuid.UUID | None = None,
+    ) -> PolicyAssignment | None: ...
+
 
 class PolicyRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -253,6 +262,47 @@ class PolicyRepository:
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    async def find_active_target_assignment(
+        self,
+        *,
+        policy_type: str,
+        target_type: str,
+        target_id: uuid.UUID,
+        exclude_policy_id: uuid.UUID | None = None,
+    ) -> PolicyAssignment | None:
+        """The active, ``target_type``-targeted assignment naming
+        ``target_id`` for any active/non-deleted policy of ``policy_type``
+        -- across *every* such policy, not just one (unlike
+        ``list_assignments_for_policy``). Backs the one-guest-one-group
+        enforcement in ``PolicyService.create_assignment`` (a guest may
+        only have one active GUEST-targeted assignment per
+        ``PolicyType.BANDWIDTH`` policy at a time -- see
+        ``exceptions.PolicyAssignmentGuestAlreadyMappedError``) and the
+        "which group is this guest currently in" lookup the frontend's Map
+        users modal needs before offering to map them into a different
+        one. ``exclude_policy_id``, when given, skips that one policy's own
+        assignments -- lets a caller ask "is this guest mapped to any
+        *other* policy of this type" in one query instead of fetching
+        every match and filtering client-side."""
+        stmt = (
+            select(PolicyAssignment)
+            .join(Policy, Policy.id == PolicyAssignment.policy_id)
+            .where(
+                PolicyAssignment.is_active.is_(True),
+                PolicyAssignment.is_deleted.is_(False),
+                PolicyAssignment.target_type == target_type,
+                PolicyAssignment.target_id == target_id,
+                Policy.is_active.is_(True),
+                Policy.is_deleted.is_(False),
+                Policy.policy_type == policy_type,
+            )
+            .order_by(PolicyAssignment.created_at.asc())
+        )
+        if exclude_policy_id is not None:
+            stmt = stmt.where(PolicyAssignment.policy_id != exclude_policy_id)
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
 
 
 __all__ = ["PolicyRepositoryProtocol", "PolicyRepository"]

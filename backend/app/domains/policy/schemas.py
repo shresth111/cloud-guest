@@ -34,6 +34,8 @@ __all__ = [
     "SessionPolicyRules",
     "AuthNPolicyRules",
     "BandwidthPolicyRules",
+    "GroupLoginHoursRules",
+    "GroupDataLimitRules",
     "QoSPolicyRules",
     "FUPPolicyRules",
     "TimeWindow",
@@ -48,6 +50,7 @@ __all__ = [
     "PolicyResponse",
     "PolicyVersionResponse",
     "PolicyAssignmentResponse",
+    "GuestGroupAssignmentResponse",
     "PolicyListResponse",
     "PolicyDetailResponse",
     "ResolvedPolicyResponse",
@@ -76,6 +79,29 @@ class AuthNPolicyRules(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class GroupLoginHoursRules(BaseModel):
+    """A Group Policies group's "restrict login hours" window -- see
+    ``BandwidthPolicyRules.login_hours``'s own doc comment for why this
+    lives here rather than a separate policy type."""
+
+    days: list[str] = Field(default_factory=list)
+    start_time: str
+    end_time: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GroupDataLimitRules(BaseModel):
+    """A Group Policies group's optional data quota -- see
+    ``BandwidthPolicyRules.data_limit``'s own doc comment."""
+
+    quota: float = Field(..., ge=0)
+    unit: str
+    resets: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class BandwidthPolicyRules(BaseModel):
     """Validated shape of a ``PolicyType.BANDWIDTH`` version's ``rules``
     payload -- raw rate-limit values ``app.domains.queue_management``
@@ -85,7 +111,25 @@ class BandwidthPolicyRules(BaseModel):
     domain's own ``FLOW.md`` for exactly how these raw values become a
     concrete queue assignment. ``None`` on a burst/priority field means
     "no burst configured"/"use the adapter's own default priority", not
-    zero."""
+    zero.
+
+    ``session_timeout_minutes``/``idle_timeout_minutes``/
+    ``devices_per_user``/``daily_limit_minutes``/``login_hours``/
+    ``data_limit`` are *not* queue_management concerns -- they're Group
+    Policies' (``CreateGroup.tsx``) own per-group settings, stored here
+    because a ``BANDWIDTH`` policy is exactly what a "group" already is in
+    this codebase and there is no separate group-metadata policy type.
+    Bug report: "edit kaam nahi karta" -- before these fields existed here,
+    the frontend never persisted them at all (see
+    ``bandwidth-policy.service.ts``'s own former comment), so every reload
+    read every group's session/idle timeout and devices-per-user back as
+    blank; those three are *required* fields on the create/edit form, so
+    clicking Edit on any already-saved group, then Save, always failed
+    client-side validation with "Required." on fields the user never
+    touched -- reading as "Edit is broken" even though nothing else about
+    it was. All six are optional here (``None``/empty means "not set") so
+    a policy created before this change, or directly via the API with only
+    rate fields, still validates."""
 
     download_rate_kbps: int = Field(..., ge=0)
     upload_rate_kbps: int = Field(..., ge=0)
@@ -94,6 +138,12 @@ class BandwidthPolicyRules(BaseModel):
     burst_threshold_kbps: int | None = Field(default=None, ge=0)
     burst_time_seconds: int | None = Field(default=None, ge=0)
     priority: int | None = Field(default=None, ge=1, le=8)
+    session_timeout_minutes: int | None = Field(default=None, ge=1)
+    idle_timeout_minutes: int | None = Field(default=None, ge=1)
+    devices_per_user: int | None = Field(default=None, ge=1)
+    daily_limit_minutes: int | None = Field(default=None, ge=1)
+    login_hours: GroupLoginHoursRules | None = None
+    data_limit: GroupDataLimitRules | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -310,6 +360,20 @@ class PolicyAssignmentResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class GuestGroupAssignmentResponse(BaseModel):
+    """"Which bandwidth group is this guest currently in, if any" -- backs
+    the Map users modal's pre-check (see
+    ``exceptions.PolicyAssignmentGuestAlreadyMappedError``'s own
+    docstring). ``mapped=False`` means the guest has no active
+    GUEST-targeted ``BANDWIDTH`` assignment anywhere; every other field is
+    ``None`` in that case."""
+
+    mapped: bool
+    policy_id: str | None = None
+    policy_name: str | None = None
+    assignment_id: str | None = None
 
 
 class PolicyListResponse(BaseModel):

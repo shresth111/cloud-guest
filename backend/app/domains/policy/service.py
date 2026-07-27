@@ -81,6 +81,7 @@ from .events import (
 )
 from .exceptions import (
     CrossOrganizationPolicyAccessError,
+    PolicyAssignmentGuestAlreadyMappedError,
     PolicyAssignmentNotFoundError,
     PolicyAssignmentRequiresPublishedVersionError,
     PolicyAssignmentTargetRoleNotFoundError,
@@ -527,6 +528,35 @@ class PolicyService:
             if role is None:
                 raise PolicyAssignmentTargetRoleNotFoundError(target_id)
 
+        # One-guest-one-group: a GUEST-targeted assignment on a BANDWIDTH
+        # policy is Group Policies' "Map users" step naming one specific
+        # guest into one specific group. Allowing that same guest to be
+        # simultaneously GUEST-targeted on a *different* bandwidth policy
+        # would leave two active, ambiguous group memberships active for
+        # them at once -- block it here (the real source of truth, not
+        # bypassable via a direct API call) rather than relying on the
+        # frontend's own pre-check. Re-mapping the guest into *this same*
+        # policy (already handled idempotently by the frontend before it
+        # ever calls this) is deliberately left alone -- only a genuinely
+        # *different* policy claiming this guest is a conflict.
+        if (
+            target_type == PolicyAssignmentTargetType.GUEST.value
+            and target_id is not None
+            and policy.policy_type == PolicyType.BANDWIDTH.value
+        ):
+            existing = await self.repository.find_active_target_assignment(
+                policy_type=PolicyType.BANDWIDTH.value,
+                target_type=PolicyAssignmentTargetType.GUEST.value,
+                target_id=target_id,
+                exclude_policy_id=policy.id,
+            )
+            if existing is not None:
+                raise PolicyAssignmentGuestAlreadyMappedError(
+                    target_id,
+                    existing_policy_id=existing.policy_id,
+                    existing_assignment_id=existing.id,
+                )
+
         assignment = await self.repository.create_assignment(
             policy_id=policy.id,
             scope_type=scope_type,
@@ -567,6 +597,23 @@ class PolicyService:
             policy_id, requesting_organization_id=requesting_organization_id
         )
         return await self.repository.list_assignments_for_policy(policy.id)
+
+    async def get_guest_group_assignment(
+        self,
+        *,
+        guest_id: uuid.UUID,
+    ) -> PolicyAssignment | None:
+        """The guest's current active GUEST-targeted BANDWIDTH-policy
+        assignment, if any -- "which group is this guest already in"
+        for Group Policies' Map users modal to show *before* it lets the
+        caller pick a different group (see
+        ``exceptions.PolicyAssignmentGuestAlreadyMappedError``'s own
+        docstring for why only one may ever be active)."""
+        return await self.repository.find_active_target_assignment(
+            policy_type=PolicyType.BANDWIDTH.value,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
 
     async def deactivate_assignment(
         self,

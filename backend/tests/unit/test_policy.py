@@ -41,6 +41,7 @@ from app.domains.policy.exceptions import (
     InvalidPolicyAssignmentScopeTypeError,
     InvalidPolicyAssignmentTargetTypeError,
     InvalidPolicyVersionStatusTransitionError,
+    PolicyAssignmentGuestAlreadyMappedError,
     PolicyAssignmentRequiresPublishedVersionError,
     PolicyAssignmentScopeIdNotAllowedError,
     PolicyAssignmentScopeIdRequiredError,
@@ -328,6 +329,36 @@ class FakePolicyRepository:
                 candidates.append(assignment)
         return candidates
 
+    async def find_active_target_assignment(
+        self,
+        *,
+        policy_type: str,
+        target_type: str,
+        target_id: uuid.UUID,
+        exclude_policy_id: uuid.UUID | None = None,
+    ) -> PolicyAssignment | None:
+        matches = []
+        for assignment in self.assignments.values():
+            if not assignment.is_active or assignment.is_deleted:
+                continue
+            if (assignment.target_type or "none") != target_type:
+                continue
+            if assignment.target_id != target_id:
+                continue
+            if (
+                exclude_policy_id is not None
+                and assignment.policy_id == exclude_policy_id
+            ):
+                continue
+            policy = self.policies.get(assignment.policy_id)
+            if policy is None or not policy.is_active or policy.is_deleted:
+                continue
+            if policy.policy_type != policy_type:
+                continue
+            matches.append(assignment)
+        matches.sort(key=lambda a: a.created_at)
+        return matches[0] if matches else None
+
 
 def _build_service() -> (
     tuple[
@@ -406,6 +437,41 @@ async def _create_published_session_policy(
             "max_concurrent_sessions_per_guest": 2,
             "termination_reconnect_cooldown_minutes": 30,
             "reconnect_grace_minutes": 15,
+        },
+    )
+    await service.publish_version(
+        policy_id=policy.id,
+        version_id=version.id,
+        requesting_organization_id=organization_id,
+        actor_user_id=None,
+    )
+    return await service.get_policy(
+        policy.id, requesting_organization_id=organization_id
+    )
+
+
+async def _create_published_bandwidth_policy(
+    service: PolicyService,
+    *,
+    organization_id: uuid.UUID | None,
+    name: str = "Bandwidth Policy",
+    download_rate_kbps: int = 1024,
+) -> Policy:
+    policy = await service.create_policy(
+        actor_user_id=None,
+        requesting_organization_id=organization_id,
+        organization_id=organization_id,
+        policy_type=PolicyType.BANDWIDTH,
+        name=name,
+        description=None,
+    )
+    version = await service.create_version(
+        policy_id=policy.id,
+        requesting_organization_id=organization_id,
+        actor_user_id=None,
+        rules={
+            "download_rate_kbps": download_rate_kbps,
+            "upload_rate_kbps": download_rate_kbps,
         },
     )
     await service.publish_version(
@@ -623,6 +689,73 @@ class TestRulesValidation:
                     "unexpected": True,
                 },
             )
+
+    async def test_bandwidth_rules_persist_group_policies_metadata(self) -> None:
+        """Group Policies' (CreateGroup.tsx) own per-group settings --
+        session/idle timeout, devices-per-user, daily limit, login hours,
+        data limit -- round-trip through the same BANDWIDTH policy's rules
+        instead of being silently dropped. Bug report: "edit kaam nahi
+        karta" traced back to exactly these fields never being persisted
+        at all (see BandwidthPolicyRules' own doc comment)."""
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.BANDWIDTH,
+            name="Staff",
+            description=None,
+        )
+        version = await service.create_version(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={
+                "download_rate_kbps": 1024,
+                "upload_rate_kbps": 1024,
+                "session_timeout_minutes": 60,
+                "idle_timeout_minutes": 10,
+                "devices_per_user": 2,
+                "daily_limit_minutes": 240,
+                "login_hours": {
+                    "days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                    "start_time": "09:00",
+                    "end_time": "18:00",
+                },
+                "data_limit": {"quota": 10, "unit": "GB", "resets": "Monthly"},
+            },
+        )
+        assert version.rules["session_timeout_minutes"] == 60
+        assert version.rules["idle_timeout_minutes"] == 10
+        assert version.rules["devices_per_user"] == 2
+        assert version.rules["daily_limit_minutes"] == 240
+        assert version.rules["login_hours"]["start_time"] == "09:00"
+        assert version.rules["data_limit"]["quota"] == 10
+
+    async def test_bandwidth_rules_group_metadata_is_optional(self) -> None:
+        """A policy created before these fields existed, or created via the
+        API with only rate fields, must keep validating -- these are all
+        optional, not a new required shape."""
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.BANDWIDTH,
+            name="Bandwidth-only",
+            description=None,
+        )
+        version = await service.create_version(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={"download_rate_kbps": 2048, "upload_rate_kbps": 2048},
+        )
+        assert version.rules["session_timeout_minutes"] is None
+        assert version.rules["login_hours"] is None
+        assert version.rules["data_limit"] is None
 
     async def test_qos_rules_validates_against_typed_schema(self) -> None:
         service, _, org_lookup, _ = _build_service()
@@ -1642,6 +1775,229 @@ class TestGuestTargetedAssignment:
 
 
 # ============================================================================
+# One-guest-one-group (Group Policies "Map users")
+# ============================================================================
+
+
+class TestOneGuestOneGroupConstraint:
+    """A guest may only have one active GUEST-targeted assignment across
+    every ``PolicyType.BANDWIDTH`` policy at a time -- see
+    ``exceptions.PolicyAssignmentGuestAlreadyMappedError``'s own
+    docstring. Bug report: "map user" silently allowed a guest to end up
+    simultaneously mapped into two different groups' bandwidth policies at
+    once with no warning."""
+
+    async def test_mapping_guest_into_a_second_group_is_rejected(self) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        group_a = await _create_published_bandwidth_policy(
+            service, organization_id=org.id, name="Group A"
+        )
+        group_b = await _create_published_bandwidth_policy(
+            service, organization_id=org.id, name="Group B"
+        )
+        guest_id = uuid.uuid4()
+
+        first = await service.create_assignment(
+            policy_id=group_a.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+
+        with pytest.raises(PolicyAssignmentGuestAlreadyMappedError) as exc_info:
+            await service.create_assignment(
+                policy_id=group_b.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                scope_type=ScopeType.GLOBAL.value,
+                scope_id=None,
+                priority=0,
+                target_type=PolicyAssignmentTargetType.GUEST.value,
+                target_id=guest_id,
+            )
+        assert exc_info.value.data["existing_policy_id"] == str(group_a.id)
+        assert exc_info.value.data["existing_assignment_id"] == str(first.id)
+        assert exc_info.value.status_code == 409
+
+    async def test_remapping_into_the_same_group_is_still_allowed(self) -> None:
+        """Re-mapping the identical (policy, guest) pair isn't a conflict --
+        only a genuinely different policy claiming this guest is."""
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        group = await _create_published_bandwidth_policy(
+            service, organization_id=org.id
+        )
+        guest_id = uuid.uuid4()
+
+        await service.create_assignment(
+            policy_id=group.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+        second = await service.create_assignment(
+            policy_id=group.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+        assert second.policy_id == group.id
+
+    async def test_unmapping_first_then_mapping_a_new_group_succeeds(self) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        group_a = await _create_published_bandwidth_policy(
+            service, organization_id=org.id, name="Group A"
+        )
+        group_b = await _create_published_bandwidth_policy(
+            service, organization_id=org.id, name="Group B"
+        )
+        guest_id = uuid.uuid4()
+
+        first = await service.create_assignment(
+            policy_id=group_a.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+        await service.deactivate_assignment(
+            policy_id=group_a.id,
+            assignment_id=first.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+        )
+
+        second = await service.create_assignment(
+            policy_id=group_b.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+        assert second.policy_id == group_b.id
+
+    async def test_constraint_is_per_guest_not_global(self) -> None:
+        """Two different guests, each mapped into their own group, must
+        not conflict with each other."""
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        group_a = await _create_published_bandwidth_policy(
+            service, organization_id=org.id, name="Group A"
+        )
+        group_b = await _create_published_bandwidth_policy(
+            service, organization_id=org.id, name="Group B"
+        )
+        guest_1, guest_2 = uuid.uuid4(), uuid.uuid4()
+
+        await service.create_assignment(
+            policy_id=group_a.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_1,
+        )
+        second = await service.create_assignment(
+            policy_id=group_b.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_2,
+        )
+        assert second.policy_id == group_b.id
+
+    async def test_constraint_does_not_apply_outside_bandwidth_policies(self) -> None:
+        """GUEST-targeted assignments on non-BANDWIDTH policy types (e.g.
+        SESSION) are a distinct, pre-existing mechanism this new
+        Group-Policies-specific rule must not touch."""
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        session_policy = await _create_published_session_policy(
+            service, organization_id=org.id
+        )
+        group = await _create_published_bandwidth_policy(
+            service, organization_id=org.id
+        )
+        guest_id = uuid.uuid4()
+
+        await service.create_assignment(
+            policy_id=session_policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+        # Must not raise -- a SESSION-level guest target coexists fine with
+        # a BANDWIDTH-level one for the same guest.
+        bandwidth_assignment = await service.create_assignment(
+            policy_id=group.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+        assert bandwidth_assignment.policy_id == group.id
+
+    async def test_get_guest_group_assignment_returns_none_when_unmapped(self) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        assert await service.get_guest_group_assignment(guest_id=uuid.uuid4()) is None
+
+    async def test_get_guest_group_assignment_returns_the_active_mapping(self) -> None:
+        service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
+        org = service.organization_lookup.add()
+        group = await _create_published_bandwidth_policy(
+            service, organization_id=org.id, name="VIP Guests"
+        )
+        guest_id = uuid.uuid4()
+        created = await service.create_assignment(
+            policy_id=group.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            scope_type=ScopeType.GLOBAL.value,
+            scope_id=None,
+            priority=0,
+            target_type=PolicyAssignmentTargetType.GUEST.value,
+            target_id=guest_id,
+        )
+
+        found = await service.get_guest_group_assignment(guest_id=guest_id)
+        assert found is not None
+        assert found.id == created.id
+        assert found.policy_id == group.id
+
+
+# ============================================================================
 # Tenant isolation
 # ============================================================================
 
@@ -1708,7 +2064,7 @@ class TestTenantIsolation:
 
 class TestEveryRouteRequiresPermission:
     def test_every_policy_route_has_a_permission_dependency(self) -> None:
-        assert len(policy_router.routes) == 11
+        assert len(policy_router.routes) == 12
         for route in policy_router.routes:
             # Mirrors app.domains.guest_teams.router's own guest-facing
             # "route.dependencies == []" check, in reverse: every route in

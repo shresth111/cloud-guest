@@ -28,6 +28,7 @@ __all__ = [
     "InvalidPolicyAssignmentScopeTypeError",
     "PolicyRollbackTargetNotPublishedError",
     "PolicyRollbackTargetMismatchError",
+    "PolicyAssignmentGuestAlreadyMappedError",
 ]
 
 
@@ -184,6 +185,41 @@ class PolicyAssignmentTargetRoleNotFoundError(PolicyError):
         super().__init__(
             f"Cannot target a policy assignment at unknown role: {role_id}",
             status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class PolicyAssignmentGuestAlreadyMappedError(PolicyError):
+    """A guest may only have one active GUEST-targeted assignment per
+    ``PolicyType.BANDWIDTH`` policy at a time -- Group Policies' "Map
+    users" step maps a guest into exactly one group's bandwidth policy, so
+    a second, different policy claiming the same guest would leave two
+    simultaneous, ambiguous bandwidth assignments active for them instead
+    of a clean single membership. Raised by
+    ``PolicyService.create_assignment`` *before* the new assignment is
+    written, not cleaned up after -- the guest must be explicitly unmapped
+    from their current group (``deactivate_assignment`` on that other
+    policy's assignment) before being mapped into a new one. ``data``
+    carries the conflicting policy/assignment ids so a caller (the
+    frontend's Map users modal) can show *which* group to unmap from
+    without a second lookup."""
+
+    def __init__(
+        self,
+        guest_id: uuid.UUID | str,
+        *,
+        existing_policy_id: uuid.UUID | str,
+        existing_assignment_id: uuid.UUID | str,
+    ) -> None:
+        super().__init__(
+            f"Guest {guest_id} is already mapped to another group "
+            f"(policy {existing_policy_id}) -- unmap them from that group "
+            "before mapping them into a new one.",
+            status_code=status.HTTP_409_CONFLICT,
+            data={
+                "guest_id": str(guest_id),
+                "existing_policy_id": str(existing_policy_id),
+                "existing_assignment_id": str(existing_assignment_id),
+            },
         )
 
 

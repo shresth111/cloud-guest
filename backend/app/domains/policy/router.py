@@ -32,6 +32,7 @@ from .constants import PolicyType
 from .dependencies import get_policy_service, get_role_resolver
 from .models import Policy, PolicyAssignment, PolicyVersion
 from .schemas import (
+    GuestGroupAssignmentResponse,
     PolicyAssignmentCreateRequest,
     PolicyAssignmentResponse,
     PolicyCreateRequest,
@@ -155,6 +156,42 @@ async def resolve_effective_policy(
             source=resolved.source,
             user_id=resolved.user_id,
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/guest-mapping/{guest_id}",
+    response_model=ApiResponse[GuestGroupAssignmentResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("policy.read"))],
+)
+async def get_guest_group_assignment(
+    request: Request,
+    guest_id: uuid.UUID,
+    service: PolicyService = Depends(get_policy_service),
+):
+    """Group Policies' Map users modal calls this before offering to map a
+    guest into a group -- if they're already actively mapped into a
+    *different* one, the caller must unmap them first rather than create a
+    second, ambiguous membership (see
+    ``exceptions.PolicyAssignmentGuestAlreadyMappedError``'s own
+    docstring)."""
+    assignment = await service.get_guest_group_assignment(guest_id=guest_id)
+    if assignment is None:
+        payload = GuestGroupAssignmentResponse(mapped=False)
+    else:
+        policy = await service.repository.get_policy_by_id(assignment.policy_id)
+        payload = GuestGroupAssignmentResponse(
+            mapped=True,
+            policy_id=str(assignment.policy_id),
+            policy_name=policy.name if policy is not None else None,
+            assignment_id=str(assignment.id),
+        )
+    return build_response(
+        success=True,
+        message="Guest group assignment retrieved",
+        data=payload.model_dump(),
         request_id=_request_id(request),
     )
 
