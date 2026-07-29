@@ -29,6 +29,8 @@ import uuid
 
 from fastapi import APIRouter, Depends, status
 
+from app.domains.guest.dependencies import get_guest_repository
+from app.domains.guest.repository import GuestRepositoryProtocol
 from app.domains.monitoring.constants import HeartbeatComponentType
 from app.domains.monitoring.dependencies import get_monitoring_service
 from app.domains.monitoring.service import MonitoringService
@@ -45,6 +47,7 @@ from .schemas import (
     AgentHeartbeatResponse,
     AgentStatusReportRequest,
     AgentStatusReportResponse,
+    AuthorizedMacsResponse,
 )
 from .service import RouterAgentService
 
@@ -202,6 +205,37 @@ async def agent_complete_action(
         error_message=payload.error_message,
     )
     return AgentActionCompleteResponse(job_id=str(job.id), status=job.status)
+
+
+@router.get(
+    "/authorized-macs",
+    response_model=AuthorizedMacsResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def agent_authorized_macs(
+    identity: AgentIdentity = Depends(CurrentAgent),
+    guest_repository: GuestRepositoryProtocol = Depends(get_guest_repository),
+) -> AuthorizedMacsResponse:
+    """The missing link between the real captive-portal OTP flow and this
+    router's physical hotspot: every guest with a currently ``ACTIVE``
+    session against this router, resolved to the MAC address captured at
+    ``login_via_otp`` time. The agent's heartbeat script polls this
+    alongside the heartbeat itself and applies a local
+    ``/ip hotspot ip-binding`` (bypassed) for each MAC returned -- this
+    endpoint only ever reports state, it never grants anything itself, the
+    same "reporting, not live enforcement" posture already established for
+    ``AgentActionItem``/config-pull above."""
+    sessions = await guest_repository.list_active_sessions_for_router(
+        identity.router.id
+    )
+    macs: list[str] = []
+    for session in sessions:
+        if session.device_id is None:
+            continue
+        device = await guest_repository.get_device_by_id(session.device_id)
+        if device is not None:
+            macs.append(device.mac_address)
+    return AuthorizedMacsResponse(mac_addresses=sorted(set(macs)))
 
 
 __all__ = ["router"]

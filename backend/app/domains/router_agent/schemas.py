@@ -32,6 +32,7 @@ __all__ = [
     "AgentActionListResponse",
     "AgentActionCompleteRequest",
     "AgentActionCompleteResponse",
+    "AuthorizedMacsResponse",
 ]
 
 
@@ -138,3 +139,22 @@ class AgentActionCompleteRequest(BaseModel):
 class AgentActionCompleteResponse(BaseModel):
     job_id: str
     status: str
+
+
+# ============================================================================
+# Authorized guest MACs (portal <-> hotspot bridge)
+# ============================================================================
+
+
+class AuthorizedMacsResponse(BaseModel):
+    """MAC addresses with a currently ``ACTIVE`` guest session on this
+    router -- polled by the agent's heartbeat script alongside the regular
+    heartbeat so it can apply a local hotspot ip-binding (bypassed) for
+    each one, the missing link between the real captive-portal OTP flow
+    (``app.domains.guest.login_via_otp``, which already accepts and stores
+    ``device_mac``) and the physical device actually granting that guest
+    internet access. Composes with ``GuestRepository
+    .list_active_sessions_for_router``/``get_device_by_id`` directly (both
+    already exist -- see that module) rather than duplicating the query."""
+
+    mac_addresses: list[str] = Field(default_factory=list)

@@ -33,6 +33,8 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
+from app.domains.guest.dependencies import get_guest_repository
+from app.domains.guest.repository import GuestRepositoryProtocol
 from app.domains.router.dependencies import get_router_repository, get_router_service
 from app.domains.router.models import Router
 from app.domains.router.repository import RouterRepositoryProtocol
