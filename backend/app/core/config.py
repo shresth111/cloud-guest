@@ -791,12 +791,33 @@ class Settings(BaseSettings):
         description=(
             "Which concrete SmsProviderProtocol implementation "
             "app.domains.otp.service.get_configured_sms_provider selects: "
-            "'logging' (default, no real send) or 'twilio'."
+            "'logging' (default, no real send), 'twilio', or 'exotel'."
         ),
     )
     twilio_account_sid: str = Field(default="")
     twilio_auth_token: str = Field(default="")
     twilio_from_number: str = Field(default="")
+    exotel_api_key: str = Field(default="")
+    exotel_api_token: str = Field(default="")
+    exotel_account_sid: str = Field(default="")
+    exotel_from_number: str = Field(
+        default="", description="DLT-approved sender ID Exotel sends SMS as."
+    )
+    exotel_subdomain: str = Field(
+        default="api.exotel.com",
+        description="'api.exotel.com' or 'api.in.exotel.com' (Mumbai region).",
+    )
+    exotel_dlt_entity_id: str = Field(
+        default="", description="TRAI DLT-registered entity id (India SMS compliance)."
+    )
+    exotel_dlt_template_id: str = Field(
+        default="",
+        description=(
+            "TRAI DLT-registered template id -- the OTP message body sent "
+            "must match this template's approved text exactly, or Indian "
+            "carriers silently drop the message."
+        ),
+    )
 
     s3_endpoint_url: str = Field(
         default="http://minio:9000",

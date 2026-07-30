@@ -345,6 +345,57 @@ class TwilioSmsProvider:
             response.raise_for_status()
 
 
+class ExotelSmsProvider:
+    """Real ``SmsProviderProtocol`` implementation: a plain
+    ``httpx.AsyncClient`` POST to Exotel's documented SMS API
+    (https://developer.exotel.com/api/sms), HTTP Basic auth with
+    ``api_key``/``api_token`` per Exotel's own convention (mirrors
+    :class:`TwilioSmsProvider`'s identical "real, documented third-party
+    API" bar).
+
+    ``dlt_entity_id``/``dlt_template_id`` are TRAI DLT compliance fields,
+    mandatory for any transactional SMS to an Indian number -- when set,
+    they're forwarded as-is; the caller (``OtpService``) is responsible
+    for composing ``message`` to match the DLT-approved template's exact
+    text, since carriers silently drop a body that doesn't match."""
+
+    _TIMEOUT_SECONDS = 10.0
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        api_token: str,
+        account_sid: str,
+        from_number: str,
+        subdomain: str,
+        dlt_entity_id: str = "",
+        dlt_template_id: str = "",
+    ) -> None:
+        self.api_key = api_key
+        self.api_token = api_token
+        self.account_sid = account_sid
+        self.from_number = from_number
+        self.subdomain = subdomain
+        self.dlt_entity_id = dlt_entity_id
+        self.dlt_template_id = dlt_template_id
+
+    async def send(self, phone_number: str, message: str) -> None:
+        import httpx
+
+        url = f"https://{self.subdomain}/v1/Accounts/{self.account_sid}/Sms/send"
+        data = {"From": self.from_number, "To": phone_number, "Body": message}
+        if self.dlt_entity_id:
+            data["DltEntityId"] = self.dlt_entity_id
+        if self.dlt_template_id:
+            data["DltTemplateId"] = self.dlt_template_id
+        async with httpx.AsyncClient(timeout=self._TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                url, auth=(self.api_key, self.api_token), data=data
+            )
+            response.raise_for_status()
+
+
 def get_configured_email_provider(settings: Settings) -> EmailProviderProtocol:
     """Selects the real ``EmailProviderProtocol`` implementation
     ``Settings.email_delivery_provider`` names, or :class:`LoggingEmailProvider`
@@ -395,6 +446,26 @@ def get_configured_sms_provider(settings: Settings) -> SmsProviderProtocol:
             account_sid=settings.twilio_account_sid,
             auth_token=settings.twilio_auth_token,
             from_number=settings.twilio_from_number,
+        )
+    if provider == "exotel":
+        if (
+            not settings.exotel_api_key
+            or not settings.exotel_api_token
+            or not settings.exotel_account_sid
+            or not settings.exotel_from_number
+        ):
+            raise SmsProviderNotConfiguredError(
+                "sms_delivery_provider='exotel' but exotel_api_key/"
+                "exotel_api_token/exotel_account_sid/exotel_from_number is empty."
+            )
+        return ExotelSmsProvider(
+            api_key=settings.exotel_api_key,
+            api_token=settings.exotel_api_token,
+            account_sid=settings.exotel_account_sid,
+            from_number=settings.exotel_from_number,
+            subdomain=settings.exotel_subdomain,
+            dlt_entity_id=settings.exotel_dlt_entity_id,
+            dlt_template_id=settings.exotel_dlt_template_id,
         )
     return LoggingSmsProvider()
 
