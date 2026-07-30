@@ -82,6 +82,7 @@ from .dependencies import get_router_service
 from .enums import RouterStatus
 from .models import Router
 from .schemas import (
+    DeviceConnectionResponse,
     HeartbeatRequest,
     MessageResponse,
     ProvisioningCheckInRequest,
@@ -339,6 +340,42 @@ async def reinstate_router(
         success=True,
         message="Router reinstated",
         data=_router_response(updated).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/device-connection",
+    response_model=ApiResponse[DeviceConnectionResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def get_device_connection(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """The one place this domain hands back a *decrypted* credential, not
+    just its encrypted-at-rest form -- gated by the same ``routers.manage``
+    permission as heartbeat/suspend/reinstate (real, high-trust device
+    operations), never a lower-tier read permission. Exists for the
+    dashboard's own SSH-capable config-push bridge (a small agent the
+    browser calls directly, since a browser cannot open an SSH connection
+    itself) to apply a rendered network config to the real device without
+    routing the push itself through this backend."""
+    router_row = await router_service.get_router(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    password = router_service.get_decrypted_api_secret(router_row)
+    return build_response(
+        success=True,
+        message="Device connection resolved",
+        data=DeviceConnectionResponse(
+            host=router_row.management_ip_address or router_row.public_ip_address,
+            username=router_row.api_username,
+            password=password,
+        ).model_dump(),
         request_id=_request_id(request),
     )
 

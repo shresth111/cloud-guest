@@ -272,3 +272,14 @@ class ProvisioningCheckInRequest(BaseModel):
 class HeartbeatRequest(BaseModel):
     routeros_version: str | None = Field(default=None, max_length=50)
     management_ip_address: str | None = Field(default=None, max_length=45)
+
+
+class DeviceConnectionResponse(BaseModel):
+    """Decrypted device connection info -- see
+    ``router.py::get_device_connection``'s own docstring for why this is
+    the one endpoint in this domain that returns a plaintext credential
+    rather than its encrypted-at-rest form."""
+
+    host: str | None
+    username: str | None
+    password: str | None
