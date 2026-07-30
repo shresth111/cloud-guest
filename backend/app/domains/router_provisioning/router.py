@@ -370,6 +370,79 @@ async def create_template(
 
 
 @router.get(
+    "/router-templates/variables",
+    response_model=ApiResponse[ConfigVariableListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("templates.read"))],
+)
+async def list_variables(
+    request: Request,
+    scope_type: ConfigVariableScope | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    service: RouterProvisioningService = Depends(get_router_provisioning_service),
+):
+    variables, meta = await service.list_variables(
+        scope_type=scope_type, page=page, page_size=page_size
+    )
+    payload = ConfigVariableListResponse(
+        items=[_variable_response(v) for v in variables], **_pagination_fields(meta)
+    )
+    return build_response(
+        success=True,
+        message="Config variables retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/router-templates/variables",
+    response_model=ApiResponse[ConfigVariableResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("templates.create"))],
+)
+async def create_variable(
+    request: Request,
+    payload: ConfigVariableCreateRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RouterProvisioningService = Depends(get_router_provisioning_service),
+):
+    scope_id = uuid.UUID(payload.scope_id) if payload.scope_id else None
+    variable = await service.create_variable(
+        actor_user_id=uuid.UUID(user.id),
+        scope_type=payload.scope_type,
+        key=payload.key,
+        value=payload.value,
+        is_secret=payload.is_secret,
+        organization_id=scope_id
+        if payload.scope_type == ConfigVariableScope.ORGANIZATION
+        else None,
+        location_id=scope_id
+        if payload.scope_type == ConfigVariableScope.LOCATION
+        else None,
+        router_id=scope_id
+        if payload.scope_type == ConfigVariableScope.ROUTER
+        else None,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Config variable created",
+        data=_variable_response(variable).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+# route-ordering matters: /router-templates/variables (above) must be
+# registered before /router-templates/{template_id} (below) -- Starlette
+# matches routes in registration order, so the literal "variables" path
+# was previously being captured by {template_id} and failing UUID
+# parsing with a 422 ("Input should be a valid UUID... found 'v' at 1"),
+# confirmed live. The variables/{variable_id} PUT/DELETE routes further
+# below have a second path segment and never collided with either.
+@router.get(
     "/router-templates/{template_id}",
     response_model=ApiResponse[ConfigTemplateResponse],
     status_code=status.HTTP_200_OK,
