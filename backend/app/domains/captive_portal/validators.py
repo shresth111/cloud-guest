@@ -7,14 +7,29 @@ service layer calls before touching the database.
 
 from __future__ import annotations
 
+import re
 import uuid
+from datetime import datetime, time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .constants import HEX_COLOR_PATTERN
 from .exceptions import (
+    InvalidBusinessHoursScheduleError,
     InvalidDefaultConfigScopeError,
     InvalidHexColorError,
     InvalidPortalContentSourceError,
 )
+
+_WEEKDAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+_HHMM_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
 def validate_hex_color(value: str, *, field_name: str) -> None:
@@ -57,8 +72,91 @@ def validate_default_scope(*, is_default: bool, location_id: uuid.UUID | None) -
         raise InvalidDefaultConfigScopeError()
 
 
+def validate_business_hours_timezone(value: str) -> None:
+    """Raises ``InvalidBusinessHoursScheduleError`` unless ``value`` is a
+    real IANA zone name Python's own ``zoneinfo`` can load -- rejected at
+    write time, not silently defaulted to UTC on first use days later."""
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise InvalidBusinessHoursScheduleError(
+            f"'{value}' is not a real timezone name (e.g. 'Asia/Kolkata')"
+        ) from exc
+
+
+def validate_business_hours_schedule(schedule: dict) -> None:
+    """Raises ``InvalidBusinessHoursScheduleError`` on the first malformed
+    entry. A valid schedule is a dict whose keys are a subset of the
+    seven lowercase weekday names; each value is either
+    ``{"open": false}`` (or simply absent -- a missing day is closed all
+    day, see model docstring) or ``{"open": true, "start": "HH:MM",
+    "end": "HH:MM"}`` with ``start`` strictly before ``end`` (a schedule
+    has no concept of a window spanning midnight -- an honest limitation,
+    not silently wrapped)."""
+    if not isinstance(schedule, dict):
+        raise InvalidBusinessHoursScheduleError("must be an object")
+    for day, entry in schedule.items():
+        if day not in _WEEKDAYS:
+            raise InvalidBusinessHoursScheduleError(
+                f"'{day}' is not a real weekday name"
+            )
+        if not isinstance(entry, dict) or "open" not in entry:
+            raise InvalidBusinessHoursScheduleError(
+                f"{day}: must be an object with an 'open' boolean"
+            )
+        if entry["open"] is not True:
+            continue
+        start, end = entry.get("start"), entry.get("end")
+        if not isinstance(start, str) or not _HHMM_PATTERN.match(start):
+            raise InvalidBusinessHoursScheduleError(
+                f"{day}: 'start' must be HH:MM (24-hour)"
+            )
+        if not isinstance(end, str) or not _HHMM_PATTERN.match(end):
+            raise InvalidBusinessHoursScheduleError(
+                f"{day}: 'end' must be HH:MM (24-hour)"
+            )
+        if start >= end:
+            raise InvalidBusinessHoursScheduleError(
+                f"{day}: 'start' must be before 'end' (no overnight windows)"
+            )
+
+
+def is_open_now(
+    *, enabled: bool, timezone: str, schedule: dict, now: datetime | None = None
+) -> bool:
+    """Whether the venue is open right now, per ``schedule`` evaluated in
+    ``timezone`` -- ``enabled=False`` always returns ``True`` (business
+    hours off means always open, the previous/default behavior). A
+    malformed stored timezone falls back to UTC rather than raising --
+    this runs on every guest-facing portal resolve, so a bad row must
+    degrade to "always open," never 500 a guest trying to connect."""
+    if not enabled:
+        return True
+    try:
+        zone = ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = ZoneInfo("UTC")
+    moment = (now or datetime.now(zone)).astimezone(zone)
+    day_name = _WEEKDAYS[moment.weekday()]
+    entry = schedule.get(day_name)
+    if not isinstance(entry, dict) or entry.get("open") is not True:
+        return False
+    start, end = entry.get("start"), entry.get("end")
+    if not isinstance(start, str) or not isinstance(end, str):
+        return False
+    try:
+        start_t = time.fromisoformat(start)
+        end_t = time.fromisoformat(end)
+    except ValueError:
+        return False
+    return start_t <= moment.time() <= end_t
+
+
 __all__ = [
     "validate_hex_color",
     "validate_single_content_source",
     "validate_default_scope",
+    "validate_business_hours_timezone",
+    "validate_business_hours_schedule",
+    "is_open_now",
 ]

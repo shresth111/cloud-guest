@@ -62,6 +62,7 @@ from .schemas import (
     ResolvedCaptivePortalConfigResponse,
 )
 from .service import CaptivePortalService
+from .validators import is_open_now
 
 router = APIRouter(tags=["Captive Portal"])
 
@@ -406,6 +407,11 @@ async def resolve_captive_portal_config(
     response_payload = ResolvedCaptivePortalConfigResponse(
         **config_payload,
         resolved_via_location_override=resolved.resolved_via_location_override,
+        is_open_now=is_open_now(
+            enabled=resolved.config.business_hours_enabled,
+            timezone=resolved.config.business_hours_timezone,
+            schedule=resolved.config.business_hours_schedule,
+        ),
     )
     return build_response(
         success=True,

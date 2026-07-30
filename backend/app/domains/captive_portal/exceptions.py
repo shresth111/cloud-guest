@@ -24,6 +24,7 @@ __all__ = [
     "CaptivePortalConfigNotConfiguredError",
     "MissingPortalResolutionParamsError",
     "CaptivePortalConfigImmutableFieldError",
+    "InvalidBusinessHoursScheduleError",
 ]
 
 
@@ -115,6 +116,14 @@ class MissingPortalResolutionParamsError(CaptivePortalError):
         super().__init__(
             "Either location_id or organization_id must be supplied to "
             "resolve a captive portal config",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidBusinessHoursScheduleError(CaptivePortalError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"Invalid business hours schedule: {reason}",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 

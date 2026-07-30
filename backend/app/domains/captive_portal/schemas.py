@@ -160,6 +160,10 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     username_password_enabled: bool | None = Field(default=None)
     social_login_enabled: bool | None = Field(default=None)
     social_login_providers: list[str] | None = Field(default=None)
+    business_hours_enabled: bool | None = Field(default=None)
+    business_hours_timezone: str | None = Field(default=None, max_length=64)
+    business_hours_schedule: dict | None = Field(default=None)
+    business_hours_closed_message: str | None = Field(default=None)
 
 
 # ============================================================================
@@ -196,6 +200,10 @@ class CaptivePortalConfigResponse(BaseModel):
     username_password_enabled: bool
     social_login_enabled: bool
     social_login_providers: list[str]
+    business_hours_enabled: bool
+    business_hours_timezone: str
+    business_hours_schedule: dict
+    business_hours_closed_message: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -220,3 +228,6 @@ class ResolvedCaptivePortalConfigResponse(CaptivePortalConfigResponse):
     to separately compare ``location_id`` against what it asked for."""
 
     resolved_via_location_override: bool
+    # Computed live at resolve time (validators.is_open_now), never a
+    # stored column -- see that function's own docstring.
+    is_open_now: bool

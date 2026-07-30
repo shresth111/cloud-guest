@@ -228,6 +228,38 @@ class CaptivePortalConfig(BaseModel):
         JSONB, default=list, nullable=False
     )
 
+    # -- business hours -----------------------------------------------------
+    # Real, guest-facing effect (service.py's own resolve_portal_config
+    # computes `is_open_now` from these at read time -- never stored/
+    # cached, always evaluated against the current moment): when enabled
+    # and the current time in `business_hours_timezone` falls outside the
+    # matching day's open window, a guest hitting the portal sees a
+    # "business is closed" screen instead of the sign-in card. Disabled
+    # (False) leaves the portal open 24/7, unaffected by whatever schedule
+    # is stored below -- exactly the previous, always-open behavior.
+    business_hours_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    # IANA zone name (e.g. "Asia/Kolkata") -- the schedule's start/end
+    # times are local to this zone, not UTC or the server's own zone.
+    business_hours_timezone: Mapped[str] = mapped_column(
+        String(64), default="UTC", nullable=False
+    )
+    # {"monday": {"open": true, "start": "09:00", "end": "18:00"}, ...} --
+    # one entry per lowercase weekday name; a day with "open": false (or
+    # missing entirely) is treated as closed all day. Validated by
+    # validators.validate_business_hours_schedule before it's ever stored.
+    business_hours_schedule: Mapped[dict] = mapped_column(
+        JSONB, default=dict, nullable=False
+    )
+    # Shown on the guest-facing closed screen in place of the normal
+    # sign-in card; a generic default is used when unset (see
+    # renderers/service -- this domain has no renderer, the frontend
+    # supplies the default copy).
+    business_hours_closed_message: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+
     __table_args__ = (
         Index("ix_captive_portal_configs_organization_id", "organization_id"),
         Index("ix_captive_portal_configs_location_id", "location_id"),

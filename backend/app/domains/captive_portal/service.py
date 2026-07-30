@@ -88,6 +88,8 @@ from .exceptions import (
 from .models import CaptivePortalConfig
 from .repository import CaptivePortalRepositoryProtocol
 from .validators import (
+    validate_business_hours_schedule,
+    validate_business_hours_timezone,
     validate_default_scope,
     validate_hex_color,
     validate_single_content_source,
@@ -359,6 +361,13 @@ class CaptivePortalService:
         validate_default_scope(
             is_default=merged_is_default, location_id=config.location_id
         )
+
+        if "business_hours_timezone" in update_data:
+            validate_business_hours_timezone(str(update_data["business_hours_timezone"]))
+        if "business_hours_schedule" in update_data:
+            validate_business_hours_schedule(
+                dict(update_data["business_hours_schedule"] or {})
+            )
 
         if merged_is_default and not config.is_default:
             await self._clear_existing_default(
