@@ -61,6 +61,43 @@ async def list_available_device_interfaces(
     return await asyncio.to_thread(_list_sync, host, username, password)
 
 
+async def reboot_device(*, host: str, username: str, password: str) -> None:
+    """Issues a real ``/system reboot`` -- the device drops the connection
+    the instant it accepts the command (it's already restarting), so a
+    connection-reset/timeout on read here is the *expected* success case,
+    not a failure: there is no "reboot accepted" acknowledgment a device
+    that's already powering down could ever send back. Only a failure to
+    even *open* the connection (bad credentials, unreachable host) is a
+    real error."""
+    await asyncio.to_thread(_reboot_sync, host, username, password)
+
+
+def _reboot_sync(host: str, username: str, password: str) -> None:
+    try:
+        api = librouteros.connect(
+            host=host,
+            username=username,
+            password=password,
+            port=_DEFAULT_API_PORT,
+            timeout=_DEFAULT_TIMEOUT_SECONDS,
+        )
+    except (LibRouterosError, OSError) as exc:
+        raise DeviceInterfaceQueryError(host, str(exc)) from exc
+
+    try:
+        try:
+            tuple(api.path("system", "reboot")())
+        except (LibRouterosError, OSError, EOFError):
+            # The device disconnected mid-command -- exactly what a real
+            # reboot looks like from the caller's side. See docstring.
+            pass
+    finally:
+        try:
+            api.close()
+        except (LibRouterosError, OSError, EOFError):
+            pass
+
+
 def _list_sync(host: str, username: str, password: str) -> list[DeviceInterface]:
     try:
         api = librouteros.connect(

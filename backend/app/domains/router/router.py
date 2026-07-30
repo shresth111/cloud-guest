@@ -78,7 +78,11 @@ from app.domains.router_agent.service import RouterAgentService
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
-from .device_adapters import DeviceInterfaceQueryError, list_available_device_interfaces
+from .device_adapters import (
+    DeviceInterfaceQueryError,
+    list_available_device_interfaces,
+    reboot_device,
+)
 from .dependencies import get_router_service
 from .enums import RouterStatus
 from .models import Router
@@ -442,6 +446,54 @@ async def get_device_interfaces(
                 for i in interfaces
             ]
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/reboot",
+    response_model=ApiResponse[MessageResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def reboot_router(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Real, immediate ``/system reboot`` on the physical device -- a
+    genuinely disruptive, hard-to-undo action (every guest currently
+    connected drops, and the device is unreachable for its normal ~1-2
+    minute boot cycle), gated by the same ``routers.manage`` permission as
+    every other high-trust device operation in this domain. See
+    ``device_adapters.reboot_device``'s own docstring for why a dropped
+    connection here is the expected success signal, not a failure."""
+    router_row = await router_service.get_router(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    host = router_row.management_ip_address or router_row.public_ip_address
+    password = router_service.get_decrypted_api_secret(router_row)
+    if not host or not router_row.api_username or not password:
+        return build_response(
+            success=False,
+            message="Device has no API credentials configured",
+            data=MessageResponse(message="Cannot reboot: no device credentials").model_dump(),
+            request_id=_request_id(request),
+        )
+    try:
+        await reboot_device(host=host, username=router_row.api_username, password=password)
+    except DeviceInterfaceQueryError as exc:
+        return build_response(
+            success=False,
+            message=f"Could not reach device: {exc.detail}",
+            data=MessageResponse(message="Reboot not sent").model_dump(),
+            request_id=_request_id(request),
+        )
+    return build_response(
+        success=True,
+        message="Reboot command sent",
+        data=MessageResponse(message="Router is rebooting").model_dump(),
         request_id=_request_id(request),
     )
 
