@@ -152,21 +152,31 @@ class MikroTikConnectedDeviceAdapter:
             raise ConnectedDeviceConnectionError(credentials.host, str(exc)) from exc
 
     def _discover_sync(self, credentials: DeviceCredentials) -> list[DiscoveredDevice]:
+        """Each menu is queried independently -- a wired-only device (e.g.
+        a hEX lite/hEX/RB750-class router with no wireless package at all,
+        a common real deployment, confirmed live this session) has no
+        ``interface wireless registration-table`` menu and previously
+        aborted the *entire* discovery with a 500 on that one missing
+        command, even though the DHCP-lease and ARP queries -- which carry
+        every wired device -- would have succeeded fine on their own."""
         api = self._connect_api(credentials)
         try:
-            try:
-                leases = list(api.path("ip", "dhcp-server", "lease"))
-                arp_entries = list(api.path("ip", "arp"))
-                wireless_entries = list(
-                    api.path("interface", "wireless", "registration-table")
-                )
-            except LibRouterosError as exc:
-                raise ConnectedDeviceOperationError(
-                    "discover_devices", str(exc)
-                ) from exc
+            leases = self._safe_query(api, "ip", "dhcp-server", "lease")
+            arp_entries = self._safe_query(api, "ip", "arp")
+            wireless_entries = self._safe_query(api, "interface", "wireless", "registration-table")
         finally:
             api.close()
         return _merge_discovered_devices(leases, arp_entries, wireless_entries)
+
+    def _safe_query(self, api, *path: str) -> list[dict[str, object]]:  # noqa: ANN001
+        try:
+            return list(api.path(*path))
+        except LibRouterosError as exc:
+            logger.info(
+                "connected_devices_menu_unavailable",
+                extra={"menu": "/".join(path), "detail": str(exc)},
+            )
+            return []
 
     def _disconnect_sync(
         self,
