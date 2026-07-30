@@ -11,6 +11,7 @@ duplicated.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -32,6 +33,8 @@ class VlanCreateRequest(BaseModel):
     gateway_ip_address: str | None = None
     cidr: str | None = None
     interface: str | None = None
+    port_mode: Literal["trunk", "access"] = "trunk"
+    enable_hotspot: bool = False
     description: str | None = None
     is_enabled: bool = True
 
@@ -42,6 +45,8 @@ class VlanUpdateRequest(BaseModel):
     gateway_ip_address: str | None = None
     cidr: str | None = None
     interface: str | None = None
+    port_mode: Literal["trunk", "access"] | None = None
+    enable_hotspot: bool | None = None
     description: str | None = None
     is_enabled: bool | None = None
 
@@ -56,6 +61,8 @@ class VlanResponse(BaseModel):
     gateway_ip_address: str | None
     cidr: str | None
     interface: str | None
+    port_mode: str
+    enable_hotspot: bool
     description: str | None
     is_enabled: bool
     created_at: datetime

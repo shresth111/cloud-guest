@@ -476,13 +476,85 @@ def render_dhcp_pool(pool: DhcpPool) -> list[str]:
     return lines
 
 
+def _vlan_address_line(vlan: Vlan, bind_interface: str) -> str | None:
+    if not vlan.cidr:
+        return None
+    address = (
+        f"{vlan.gateway_ip_address}/{vlan.cidr.split('/')[-1]}"
+        if vlan.gateway_ip_address
+        else vlan.cidr
+    )
+    return f"/ip address add address={address} interface={bind_interface}"
+
+
+def _render_vlan_hotspot(vlan: Vlan, bind_interface: str) -> list[str]:
+    """Renders a standalone captive-portal hotspot (pool + dhcp-server +
+    hotspot profile + hotspot server) bound to one VLAN's own interface --
+    mirrors the exact command shape ``buildRouterSetupScript`` (frontend,
+    ``RouterDetailTabs.tsx``) already proved live for the router's default
+    ``hotspot1``, just re-targeted at this VLAN's own interface/subnet so
+    it never touches ``hotspot1`` or the shared LAN bridge. Requires both
+    ``cidr`` and ``gateway_ip_address`` (a hotspot needs a real pool to
+    hand out) -- emits an explanatory skip comment otherwise, the same
+    "skip, don't guess" discipline every other render_* function here
+    already follows."""
+    tag = f"vlan{vlan.vlan_id}"
+    if not vlan.cidr or not vlan.gateway_ip_address:
+        return [f"# {tag}-hotspot: needs both cidr and gateway_ip_address -- skipping"]
+    network = ipaddress.ip_network(vlan.cidr, strict=False)
+    usable = [str(h) for h in network.hosts() if str(h) != vlan.gateway_ip_address]
+    if not usable:
+        return [f"# {tag}-hotspot: no usable addresses left in {network} -- skipping"]
+    pool_name = f"{tag}-hs-pool"
+    profile_name = f"{tag}-hsprof"
+    return [
+        f"/ip pool add name={pool_name} ranges={usable[0]}-{usable[-1]}",
+        f"/ip dhcp-server add name={tag}-hs-dhcp interface={bind_interface} "
+        f"address-pool={pool_name} disabled=no",
+        f"/ip dhcp-server network add address={network} "
+        f"gateway={vlan.gateway_ip_address} dns-server={vlan.gateway_ip_address}",
+        f"/ip hotspot profile add name={profile_name} "
+        f"hotspot-address={vlan.gateway_ip_address} html-directory=cloudguest-hotspot",
+        f"/ip hotspot add name={tag}-hotspot interface={bind_interface} "
+        f"address-pool={pool_name} profile={profile_name} disabled=no",
+    ]
+
+
 def render_vlan(vlan: Vlan) -> list[str]:
-    """Renders one enabled ``Vlan`` row -- see module docstring for why
-    ``vlan{vlan_id}`` needs no fabricated uniqueness suffix. Emits the
-    tagged interface only (no ``/ip address``) when ``interface`` (the
-    parent) is unset, since RouterOS requires a real parent interface to
-    tag a VLAN onto."""
+    """Renders one enabled ``Vlan`` row. Branches on ``port_mode``:
+
+    ``"trunk"`` (default) -- ``interface`` is the parent trunk carrying
+    802.1Q-tagged traffic; emits the tagged ``/interface vlan``
+    sub-interface, the original, always-safe behavior (no bridge change).
+
+    ``"access"`` -- ``interface`` is a dedicated *physical* port (e.g.
+    ``ether3``); that port is pulled out of the shared LAN bridge and
+    given this VLAN's subnet directly, untagged. Deliberately implemented
+    as a dedicated port rather than bridge-wide ``vlan-filtering=yes`` +
+    PVID -- see ``app.domains.vlan.models.Vlan.port_mode``'s own
+    docstring for why: this way, enabling "access" mode can never disrupt
+    the shared bridge's already-live traffic.
+
+    Either mode additionally renders a standalone hotspot on this VLAN's
+    own interface when ``enable_hotspot`` is set (see
+    ``_render_vlan_hotspot``)."""
     vlan_interface = f"vlan{vlan.vlan_id}"
+
+    if vlan.port_mode == "access":
+        if vlan.interface is None:
+            return [
+                f"# vlan{vlan.vlan_id} (access): no physical port configured -- "
+                "skipping, cannot dedicate an access port without one"
+            ]
+        physical = vlan.interface
+        lines = [f"/interface bridge port remove [find interface={physical}]"]
+        address_line = _vlan_address_line(vlan, physical)
+        if address_line:
+            lines.append(address_line)
+        if vlan.enable_hotspot:
+            lines.extend(_render_vlan_hotspot(vlan, physical))
+        return lines
+
     if vlan.interface is None:
         return [
             f"# {vlan_interface}: no parent interface configured -- "
@@ -492,13 +564,11 @@ def render_vlan(vlan: Vlan) -> list[str]:
         f"/interface vlan add name={vlan_interface} vlan-id={vlan.vlan_id} "
         f"interface={vlan.interface}"
     ]
-    if vlan.cidr:
-        address = (
-            f"{vlan.gateway_ip_address}/{vlan.cidr.split('/')[-1]}"
-            if vlan.gateway_ip_address
-            else vlan.cidr
-        )
-        lines.append(f"/ip address add address={address} interface={vlan_interface}")
+    address_line = _vlan_address_line(vlan, vlan_interface)
+    if address_line:
+        lines.append(address_line)
+    if vlan.enable_hotspot:
+        lines.extend(_render_vlan_hotspot(vlan, vlan_interface))
     return lines
 
 

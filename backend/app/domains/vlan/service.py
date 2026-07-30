@@ -101,6 +101,8 @@ class VlanService:
         gateway_ip_address: str | None = None,
         cidr: str | None = None,
         interface: str | None = None,
+        port_mode: str = "trunk",
+        enable_hotspot: bool = False,
         description: str | None = None,
         is_enabled: bool = True,
     ) -> Vlan:
@@ -110,6 +112,8 @@ class VlanService:
         validate_vlan_id(vlan_id)
         validate_cidr(cidr)
         validate_gateway_ip_address(gateway_ip_address)
+        if port_mode not in ("trunk", "access"):
+            raise ValueError("port_mode must be 'trunk' or 'access'")
         existing = await self.repository.get_vlan_by_router_and_tag(router.id, vlan_id)
         if existing is not None:
             raise VlanIdAlreadyExistsError(router.id, vlan_id)
@@ -123,6 +127,8 @@ class VlanService:
             gateway_ip_address=gateway_ip_address,
             cidr=cidr,
             interface=interface,
+            port_mode=port_mode,
+            enable_hotspot=enable_hotspot,
             description=description,
             is_enabled=is_enabled,
             created_by=actor_user_id,
@@ -210,6 +216,8 @@ class VlanService:
             validate_cidr(fields["cidr"])
         if "gateway_ip_address" in fields:
             validate_gateway_ip_address(fields["gateway_ip_address"])
+        if fields.get("port_mode") not in (None, "trunk", "access"):
+            raise ValueError("port_mode must be 'trunk' or 'access'")
 
         updated = await self.repository.update_vlan(
             vlan, {**fields, "updated_by": actor_user_id}

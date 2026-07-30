@@ -70,6 +70,8 @@ def _vlan_response(vlan: Vlan) -> VlanResponse:
         gateway_ip_address=vlan.gateway_ip_address,
         cidr=vlan.cidr,
         interface=vlan.interface,
+        port_mode=vlan.port_mode,
+        enable_hotspot=vlan.enable_hotspot,
         description=vlan.description,
         is_enabled=vlan.is_enabled,
         created_at=vlan.created_at,
@@ -98,6 +100,8 @@ async def create_vlan(
         gateway_ip_address=payload.gateway_ip_address,
         cidr=payload.cidr,
         interface=payload.interface,
+        port_mode=payload.port_mode,
+        enable_hotspot=payload.enable_hotspot,
         description=payload.description,
         is_enabled=payload.is_enabled,
     )

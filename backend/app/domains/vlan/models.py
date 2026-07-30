@@ -53,6 +53,25 @@ class Vlan(BaseModel):
     # "ether1") -- informational/provisioning-facing only, mirrors
     # app.domains.isp.models.IspLink.interface's identical scope.
     interface: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # "trunk" (default): ``interface`` is the parent trunk carrying tagged
+    # traffic -- renders as a standard ``/interface vlan`` sub-interface,
+    # the existing, always-safe behavior. "access": ``interface`` is a
+    # dedicated physical port (e.g. "ether3") that is pulled out of the
+    # shared LAN bridge and given this VLAN's subnet directly, untagged --
+    # deliberately implemented this way (a dedicated port/bridge) rather
+    # than via bridge-wide vlan-filtering + PVID, so enabling "access" mode
+    # never touches -- and can never break -- the shared production
+    # bridge's already-live traffic. See renderers.render_vlan.
+    port_mode: Mapped[str] = mapped_column(
+        String(20), default="trunk", server_default="trunk", nullable=False
+    )
+    # When true, this VLAN's own interface gets its own captive-portal
+    # hotspot (pool + dhcp-server + hotspot profile + hotspot server),
+    # independent of the router's default "hotspot1" -- when false, the
+    # VLAN is a plain routed/DHCP network with no portal challenge.
+    enable_hotspot: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
