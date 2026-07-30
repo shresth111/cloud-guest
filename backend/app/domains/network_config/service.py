@@ -47,6 +47,7 @@ from app.domains.firewall.models import FirewallRule
 from app.domains.guest.constants import NasStatus
 from app.domains.guest.models import RadiusNasClient
 from app.domains.hotspot.models import HotspotProfile
+from app.domains.mac_authorization.models import MacAuthorizationEntry
 from app.domains.port_forwarding.models import PortForwardingRule
 from app.domains.qos.models import QosTrafficRule
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
@@ -110,6 +111,15 @@ class WireGuardLookupProtocol(Protocol):
     ) -> WireGuardPeer: ...
 
     async def get_server(self, server_id: uuid.UUID) -> WireGuardServer: ...
+
+
+class MacAuthorizationLookupProtocol(Protocol):
+    """The subset of ``MacAuthorizationService``'s surface this module
+    needs to render a router's own currently-valid whitelist entries."""
+
+    async def list_active_entries_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[MacAuthorizationEntry]: ...
 
 
 class RadiusNasLookupProtocol(Protocol):
@@ -198,6 +208,7 @@ class NetworkConfigPreview:
     firewall_rule_count: int
     has_wireguard_peer: bool
     has_radius_nas_client: bool
+    mac_authorization_entry_count: int
 
 
 class NetworkConfigService:
@@ -217,6 +228,7 @@ class NetworkConfigService:
         firewall_lookup: FirewallLookupProtocol,
         wireguard_lookup: WireGuardLookupProtocol | None = None,
         radius_nas_lookup: RadiusNasLookupProtocol | None = None,
+        mac_authorization_lookup: MacAuthorizationLookupProtocol | None = None,
     ) -> None:
         self.dhcp_lookup = dhcp_lookup
         self.vlan_lookup = vlan_lookup
@@ -234,6 +246,12 @@ class NetworkConfigService:
         # in yet should still be able to render/push its other categories.
         self.wireguard_lookup = wireguard_lookup
         self.radius_nas_lookup = radius_nas_lookup
+        # Optional, additive, same story as wireguard_lookup/radius_nas_lookup
+        # above: the real device-config-generation seam for MAC
+        # Authorization (previously pure database bookkeeping with zero
+        # effect on the physical device -- see
+        # app.domains.mac_authorization.service module docstring).
+        self.mac_authorization_lookup = mac_authorization_lookup
 
     async def _gather_enabled_rows(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
@@ -320,6 +338,15 @@ class NetworkConfigService:
 
         return peer, server, nas_client
 
+    async def _gather_mac_authorization(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[MacAuthorizationEntry]:
+        if self.mac_authorization_lookup is None:
+            return []
+        return await self.mac_authorization_lookup.list_active_entries_for_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+
     async def preview_config(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> NetworkConfigPreview:
@@ -335,6 +362,9 @@ class NetworkConfigService:
             router_id, requesting_organization_id=requesting_organization_id
         )
         peer, server, nas_client = await self._gather_wireguard_and_radius(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        mac_authorization_entries = await self._gather_mac_authorization(
             router_id, requesting_organization_id=requesting_organization_id
         )
         rendered = render_network_config(
@@ -354,6 +384,7 @@ class NetworkConfigService:
             # separate "RADIUS server host" column anywhere to draw from
             # instead.
             radius_server_host=server.endpoint_host if server is not None else None,
+            mac_authorization_entries=mac_authorization_entries,
         )
         return NetworkConfigPreview(
             router_id=router_id,
@@ -367,6 +398,7 @@ class NetworkConfigService:
             firewall_rule_count=len(firewall_rules),
             has_wireguard_peer=peer is not None,
             has_radius_nas_client=nas_client is not None,
+            mac_authorization_entry_count=len(mac_authorization_entries),
         )
 
     async def push_config(
@@ -390,6 +422,9 @@ class NetworkConfigService:
         peer, server, nas_client = await self._gather_wireguard_and_radius(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        mac_authorization_entries = await self._gather_mac_authorization(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
         rendered = render_network_config(
             dhcp_pools=pools,
             vlans=vlans,
@@ -402,6 +437,7 @@ class NetworkConfigService:
             wireguard_server=server,
             radius_nas_client=nas_client,
             radius_server_host=server.endpoint_host if server is not None else None,
+            mac_authorization_entries=mac_authorization_entries,
         )
         if not rendered:
             raise EmptyNetworkConfigError(router_id)
@@ -494,6 +530,7 @@ __all__ = [
     "FirewallLookupProtocol",
     "WireGuardLookupProtocol",
     "RadiusNasLookupProtocol",
+    "MacAuthorizationLookupProtocol",
     "RouterProvisioningLookupProtocol",
     "NetworkConfigPreview",
     "NetworkConfigService",

@@ -1,14 +1,17 @@
 """MAC Authorization business logic: organization-scoped MAC whitelist
 CRUD, bulk import/export, and the ``is_mac_authorized`` read-model query.
 
-## No device/router composition
+## Device/router composition (device-config-generation only)
 
-Unlike most domains built in this batch, this one composes nothing --
-it is purely organization/location scoped, trusting
-``requesting_organization_id`` directly the same way
-``app.domains.policy`` does (RBAC's own dependency layer already
-validates real organization membership before a request reaches this
-service; there is no router/device concept to resolve here at all).
+Every CRUD method here is purely organization/location scoped, trusting
+``requesting_organization_id`` directly the same way ``app.domains
+.policy`` does (RBAC's own dependency layer already validates real
+organization membership before a request reaches this service) -- rows
+themselves carry no ``router_id`` (see ``models.py``). ``router_lookup``
+(optional, additive) exists for exactly one method,
+``list_active_entries_for_router``: resolving "which entries apply to
+*this* router" needs a real router's ``organization_id``/``location_id``,
+which nothing else in this file needs to know.
 
 ## Honest scope: not yet wired into guest login
 
@@ -42,6 +45,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
+from app.domains.router.models import Router
 
 from .constants import MacAuthorizationType
 from .events import (
@@ -79,6 +83,16 @@ class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
 
+class RouterLookupProtocol(Protocol):
+    async def get_router(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
+    ) -> Router: ...
+
+
 @dataclass(frozen=True, slots=True)
 class RejectedImportRow:
     mac_address: str
@@ -100,9 +114,16 @@ class MacAuthorizationService:
         repository: MacAuthorizationRepositoryProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        router_lookup: RouterLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.audit_writer = audit_writer
+        # Optional, additive (mirrors app.domains.network_config.service
+        # .NetworkConfigService's own wireguard_lookup/radius_nas_lookup
+        # convention): only needed for list_active_entries_for_router,
+        # this domain's real device-config-generation seam -- see that
+        # method's own docstring.
+        self.router_lookup = router_lookup
 
     async def create_entry(
         self,
@@ -328,6 +349,39 @@ class MacAuthorizationService:
                 ]
             )
         return buffer.getvalue()
+
+    async def list_active_entries_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[MacAuthorizationEntry]:
+        """Real device-config-generation seam for this domain -- see
+        ``app.domains.network_config.renderers.render_mac_authorization_entry``,
+        the consumer this composes into (mirrors
+        ``app.domains.network_config.service.NetworkConfigService``'s own
+        ``wireguard_lookup``/``radius_nas_lookup`` "optional, additive
+        composed lookup" convention exactly). Entries are org-scoped, not
+        router-scoped (see module docstring) -- an entry with no
+        ``location_id`` applies to every router in the organization; one
+        with a ``location_id`` applies only to routers at that location.
+        Only currently-valid (enabled, non-expired) entries are returned,
+        never a disabled or lapsed one -- this domain's own
+        ``is_mac_authorized`` read-model query already establishes that
+        "currently valid" is the only meaningful notion of "authorized"
+        here, not just "a row exists"."""
+        if self.router_lookup is None:
+            return []
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        entries = await self.repository.list_all_for_organization(router.organization_id)
+        now = datetime.now(UTC)
+        return [
+            entry
+            for entry in entries
+            if (entry.location_id is None or entry.location_id == router.location_id)
+            and is_currently_valid(
+                is_enabled=entry.is_enabled, expires_at=entry.expires_at, now=now
+            )
+        ]
 
     async def is_mac_authorized(
         self, mac_address: str, *, organization_id: uuid.UUID

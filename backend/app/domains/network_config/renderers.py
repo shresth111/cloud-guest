@@ -365,6 +365,7 @@ from app.domains.firewall.constants import FirewallProtocol
 from app.domains.firewall.models import FirewallRule
 from app.domains.guest.models import RadiusNasClient
 from app.domains.hotspot.models import HotspotProfile
+from app.domains.mac_authorization.models import MacAuthorizationEntry
 from app.domains.port_forwarding.constants import PortForwardingProtocol
 from app.domains.port_forwarding.models import PortForwardingRule
 from app.domains.qos.models import QosTrafficRule
@@ -383,6 +384,7 @@ from .constants import (
     DNS_SECTION_HEADER,
     FIREWALL_SECTION_HEADER,
     HOTSPOT_SECTION_HEADER,
+    MAC_AUTHORIZATION_SECTION_HEADER,
     PORT_FORWARDING_SECTION_HEADER,
     QOS_SECTION_HEADER,
     RADIUS_SECTION_HEADER,
@@ -677,6 +679,26 @@ def render_firewall_rule(rule: FirewallRule) -> list[str]:
     return [" ".join(parts)]
 
 
+def render_mac_authorization_entry(entry: MacAuthorizationEntry) -> list[str]:
+    """Renders one currently-valid ``MacAuthorizationEntry`` -- the real
+    device-config-generation seam this domain previously had no way to
+    reach (see ``app.domains.mac_authorization.service`` module
+    docstring's own "Device/router composition" section): until now, a
+    whitelist entry was pure database bookkeeping with zero effect on
+    the physical device. Rendered as a real ``/ip hotspot ip-binding
+    type=bypassed`` -- the same mechanism (and RouterOS command shape)
+    this platform's own device-agent heartbeat sync already uses for
+    post-login authorized-MAC bypass (see
+    ``app.domains.router_agent``'s ``/agent/authorized-macs`` consumer
+    script), applied here to a MAC that should never need to log in
+    through the captive portal at all."""
+    identifier = f"mac-auth-{entry.id}"
+    return [
+        f"/ip hotspot ip-binding add mac-address={entry.mac_address} "
+        f'type=bypassed comment="{identifier}"'
+    ]
+
+
 def _hub_tunnel_address(server: WireGuardServer) -> str:
     """The hub's own conventional tunnel address: the first usable host in
     ``tunnel_network_cidr``. See module docstring's WireGuard section --
@@ -910,6 +932,7 @@ def render_network_config(
     wireguard_server: WireGuardServer | None = None,
     radius_nas_client: RadiusNasClient | None = None,
     radius_server_host: str | None = None,
+    mac_authorization_entries: list[MacAuthorizationEntry] | None = None,
 ) -> str:
     """Combines every enabled row across all categories into one
     router-wide RouterOS script -- a full desired-state snapshot, mirroring
@@ -963,6 +986,10 @@ def render_network_config(
         sections.append(FIREWALL_SECTION_HEADER)
         for rule in firewall_rules:
             sections.extend(_idempotent_lines(render_firewall_rule(rule)))
+    if mac_authorization_entries:
+        sections.append(MAC_AUTHORIZATION_SECTION_HEADER)
+        for entry in mac_authorization_entries:
+            sections.extend(_idempotent_lines(render_mac_authorization_entry(entry)))
     if wireguard_peer is not None and wireguard_server is not None:
         sections.append(WIREGUARD_SECTION_HEADER)
         sections.extend(
@@ -1014,6 +1041,7 @@ __all__ = [
     "render_qos_traffic_rule",
     "render_dns_record",
     "render_firewall_rule",
+    "render_mac_authorization_entry",
     "render_wireguard_peer",
     "render_radius_client",
     "render_bootstrap_script",

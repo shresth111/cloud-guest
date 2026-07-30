@@ -23,6 +23,8 @@ from app.domains.guest.dependencies import get_radius_service
 from app.domains.guest.service import RadiusService
 from app.domains.hotspot.dependencies import get_hotspot_service
 from app.domains.hotspot.service import HotspotService
+from app.domains.mac_authorization.dependencies import get_mac_authorization_service
+from app.domains.mac_authorization.service import MacAuthorizationService
 from app.domains.port_forwarding.dependencies import get_port_forwarding_service
 from app.domains.port_forwarding.service import PortForwardingService
 from app.domains.qos.dependencies import get_qos_service
@@ -52,6 +54,9 @@ def get_network_config_service(
     firewall_service: FirewallService = Depends(get_firewall_service),
     wireguard_service: WireGuardService = Depends(get_wireguard_service),
     radius_service: RadiusService = Depends(get_radius_service),
+    mac_authorization_service: MacAuthorizationService = Depends(
+        get_mac_authorization_service
+    ),
 ) -> NetworkConfigService:
     return NetworkConfigService(
         dhcp_service,
@@ -69,6 +74,10 @@ def get_network_config_service(
         # application already composes -- never a second, parallel one.
         wireguard_lookup=wireguard_service,
         radius_nas_lookup=radius_service,
+        # Real integration point for render_mac_authorization_entry: the
+        # identical, already-wired MacAuthorizationService every other
+        # MAC-authorization endpoint composes, never a second one.
+        mac_authorization_lookup=mac_authorization_service,
     )
 
 

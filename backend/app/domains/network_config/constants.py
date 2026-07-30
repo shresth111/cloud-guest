@@ -15,6 +15,7 @@ DNS_SECTION_HEADER = "# --- DNS Records (CloudGuest-managed) ---"
 FIREWALL_SECTION_HEADER = "# --- Firewall Rules (CloudGuest-managed) ---"
 WIREGUARD_SECTION_HEADER = "# --- WireGuard Peer (CloudGuest-managed) ---"
 RADIUS_SECTION_HEADER = "# --- RADIUS Client (CloudGuest-managed) ---"
+MAC_AUTHORIZATION_SECTION_HEADER = "# --- MAC Authorization (CloudGuest-managed) ---"
 
 __all__ = [
     "DHCP_SECTION_HEADER",
@@ -26,4 +27,5 @@ __all__ = [
     "FIREWALL_SECTION_HEADER",
     "WIREGUARD_SECTION_HEADER",
     "RADIUS_SECTION_HEADER",
+    "MAC_AUTHORIZATION_SECTION_HEADER",
 ]

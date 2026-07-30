@@ -127,6 +127,7 @@ async def preview_network_config(
         qos_traffic_rule_count=preview.qos_traffic_rule_count,
         dns_record_count=preview.dns_record_count,
         firewall_rule_count=preview.firewall_rule_count,
+        mac_authorization_entry_count=preview.mac_authorization_entry_count,
     )
     return build_response(
         success=True,
