@@ -321,6 +321,33 @@ async def guest_login_via_password(
     )
 
 
+@guest_router.get(
+    "/session/active",
+    response_model=ApiResponse[GuestLoginResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_active_session(
+    request: Request,
+    router_id: uuid.UUID = Query(...),
+    device_mac: str = Query(...),
+    service: GuestService = Depends(get_guest_service),
+):
+    """Guest-facing, unauthenticated (no RBAC/JWT -- same posture as
+    ``/login/*``): lets the captive portal check, on load, whether this
+    device already has a live session on this router before ever showing
+    a sign-in form. ``data`` is ``null`` (not an error) when there is
+    none -- a normal first-time visit."""
+    result = await service.get_active_session_for_device(
+        router_id=router_id, device_mac=device_mac
+    )
+    return build_response(
+        success=True,
+        message="Active session found" if result else "No active session",
+        data=_login_response(result).model_dump() if result else None,
+        request_id=_request_id(request),
+    )
+
+
 @guest_router.post(
     "/set-password",
     response_model=ApiResponse[GuestSetPasswordResponse],

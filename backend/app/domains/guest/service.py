@@ -236,6 +236,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from app.common.exceptions import CloudGuestError
+from app.database.constants import SortOrder
 from app.domains.auth.password import (
     PasswordManager,
     PasswordStrengthError,
@@ -2102,6 +2103,49 @@ class GuestService:
         if device_name is not None:
             update_data["device_name"] = device_name
         return await self.repository.update_device(device, update_data)
+
+    async def get_active_session_for_device(
+        self,
+        *,
+        router_id: uuid.UUID,
+        device_mac: str,
+    ) -> GuestLoginResult | None:
+        """Real "is this device already connected?" check -- backs the
+        captive portal's own re-visit case: a guest whose browser reopens
+        the portal URL (a fresh RouterOS redirect, a re-scanned QR code, a
+        bookmark) while their device already has a live, RADIUS-authorized
+        session should see their existing session, not the sign-in form
+        again. ``device_mac`` is the one MAC a captive-portal page can
+        trust without RADIUS -- it's RouterOS's own ``$(mac)`` substitution
+        that generated this very redirect (see
+        ``app.domains.router_provisioning``'s bootstrap-script templating
+        and this same reasoning already applied to
+        ``ProvisioningCheckInRequest.wireguard_public_key``'s docstring).
+        Returns ``None`` -- not an error -- when no device/active session
+        matches, exactly like a normal first-time visit."""
+        device = await self.repository.get_device_by_mac(normalize_mac_address(device_mac))
+        if device is None:
+            return None
+        sessions, _ = await self.repository.list_sessions(
+            page=1,
+            page_size=1,
+            filters={
+                "router_id": router_id,
+                "device_id": device.id,
+                "status": GuestSessionStatus.ACTIVE.value,
+            },
+            sort_by="started_at",
+            sort_order=SortOrder.DESC,
+        )
+        if not sessions:
+            return None
+        session = sessions[0]
+        guest = await self.repository.get_guest_by_id(session.guest_id)
+        if guest is None:
+            return None
+        return GuestLoginResult(
+            guest=guest, session=session, device=device, is_new_guest=False
+        )
 
     # ========================================================================
     # Session management
