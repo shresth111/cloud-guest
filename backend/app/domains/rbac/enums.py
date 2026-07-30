@@ -202,6 +202,7 @@ class AuditAction(StrEnum):
     USER_UPDATED = "user_updated"
     USER_DEACTIVATED = "user_deactivated"
     USER_REACTIVATED = "user_reactivated"
+    USER_FORCE_LOGGED_OUT = "user_force_logged_out"
 
     # Router domain events (Module 008) -- written through this same table by
     # ``app.domains.router.service.RouterService`` via the same narrow

@@ -74,6 +74,19 @@ class User(BaseModel):
         DateTime(timezone=True), nullable=True
     )
 
+    # Set by an admin's "force logout" action (app.domains.user.service
+    # .UserService.force_logout_user) -- any access token whose own `iat`
+    # predates this timestamp is rejected on its very next authenticated
+    # request (see dependencies.py::_resolve_user_from_jwt), regardless of
+    # how much of its normal expiry window is left. Companion to
+    # revoke_all_sessions (which only stops a *new* access token being
+    # minted via refresh) -- together they invalidate both an already-
+    # issued access token and any refresh token, immediately, not just on
+    # next natural expiry.
+    tokens_invalidated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # Login tracking / brute-force protection
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

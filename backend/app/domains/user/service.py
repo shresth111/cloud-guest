@@ -30,7 +30,7 @@ import secrets
 import string
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from app.common.exceptions import CloudGuestError
@@ -617,6 +617,46 @@ class UserService:
             AuditAction.USER_REACTIVATED,
             entity_id=updated.id,
             description=f"User '{updated.email}' reactivated",
+            organization_id=requesting_organization_id,
+        )
+        return updated
+
+    async def force_logout_user(
+        self,
+        *,
+        actor_user_id: uuid.UUID,
+        user_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> User:
+        """Real, immediate session termination -- unlike ``deactivate_user``
+        (which only takes effect reactively, on the target's *next*
+        request, and also locks them out of the account entirely), this
+        ends their current sessions right now without touching
+        ``is_active``: they're logged out everywhere, but can sign back in
+        immediately.
+
+        Two real, independent steps, both required: ``revoke_all_sessions``
+        stops a *new* access token being minted via a still-valid refresh
+        token; setting ``tokens_invalidated_at`` rejects any access token
+        already issued, on its very next authenticated request, regardless
+        of how much of its normal ~15-minute expiry window is left (see
+        ``auth.dependencies._resolve_user_from_jwt``). Neither alone is a
+        complete "force logout" -- revoking sessions without the timestamp
+        would leave an already-issued access token working for up to 15
+        more minutes; setting the timestamp without revoking sessions
+        would let a still-valid refresh token quietly mint a fresh one
+        right after."""
+        user = await self._get_user_or_raise(user_id)
+        await self._enforce_user_tenant_access(user, requesting_organization_id)
+        revoked = await self.identity_repository.revoke_all_sessions(user_id)
+        updated = await self.identity_repository.update_user(
+            user, tokens_invalidated_at=datetime.now(UTC)
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.USER_FORCE_LOGGED_OUT,
+            entity_id=updated.id,
+            description=f"User '{updated.email}' force-logged-out ({revoked} session(s) revoked)",
             organization_id=requesting_organization_id,
         )
         return updated

@@ -15,6 +15,7 @@ normal permission resolution already runs against.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -117,6 +118,18 @@ async def _resolve_user_from_jwt(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User is not active",
         )
+    # An admin's "force logout" (app.domains.user.service.UserService
+    # .force_logout_user) sets tokens_invalidated_at -- any access token
+    # issued *before* that moment is rejected right here, on its very next
+    # authenticated request, even though its own `exp` claim hasn't lapsed
+    # yet. See User.tokens_invalidated_at's own docstring.
+    if user.tokens_invalidated_at is not None:
+        issued_at = datetime.fromtimestamp(int(payload["iat"]), tz=UTC)
+        if issued_at < user.tokens_invalidated_at:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session has been terminated",
+            )
     return user
 
 

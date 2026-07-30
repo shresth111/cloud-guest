@@ -312,6 +312,38 @@ async def deactivate_user(
 
 
 @router.post(
+    "/users/{user_id}/force-logout",
+    response_model=ApiResponse[UserResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("users.manage"))],
+)
+async def force_logout_user(
+    request: Request,
+    user_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    user_service: UserService = Depends(get_user_service),
+):
+    """Real, immediate session termination for another user -- revokes
+    their sessions/refresh tokens and rejects any already-issued access
+    token on its very next request (see
+    ``UserService.force_logout_user``'s own docstring). Unlike deactivate,
+    the account itself is left active -- they can sign back in right
+    away, just not with the session(s) that existed a moment ago."""
+    updated = await user_service.force_logout_user(
+        actor_user_id=uuid.UUID(user.id),
+        user_id=user_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="User logged out",
+        data=_user_response(updated).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
     "/users/{user_id}/activate",
     response_model=ApiResponse[UserResponse],
     status_code=status.HTTP_200_OK,
