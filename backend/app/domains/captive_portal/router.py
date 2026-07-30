@@ -101,6 +101,10 @@ def _config_response(config: CaptivePortalConfig) -> CaptivePortalConfigResponse
         username_password_enabled=config.username_password_enabled,
         social_login_enabled=config.social_login_enabled,
         social_login_providers=list(config.social_login_providers),
+        business_hours_enabled=config.business_hours_enabled,
+        business_hours_timezone=config.business_hours_timezone,
+        business_hours_schedule=dict(config.business_hours_schedule),
+        business_hours_closed_message=config.business_hours_closed_message,
         created_at=config.created_at,
         updated_at=config.updated_at,
     )
