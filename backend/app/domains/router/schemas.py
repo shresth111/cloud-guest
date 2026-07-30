@@ -283,3 +283,21 @@ class DeviceConnectionResponse(BaseModel):
     host: str | None
     username: str | None
     password: str | None
+
+
+class DeviceInterfaceResponse(BaseModel):
+    """One real, currently-available interface on the physical device --
+    see ``device_adapters.list_available_device_interfaces``'s own
+    docstring for what "available" excludes (already bound to a
+    dhcp-server/dhcp-client, or loopback)."""
+
+    name: str
+    type: str | None
+    running: bool
+    disabled: bool
+    bridge: str | None
+    has_ip_address: bool
+
+
+class DeviceInterfacesResponse(BaseModel):
+    interfaces: list[DeviceInterfaceResponse]

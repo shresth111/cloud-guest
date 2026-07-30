@@ -78,11 +78,14 @@ from app.domains.router_agent.service import RouterAgentService
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
+from .device_adapters import DeviceInterfaceQueryError, list_available_device_interfaces
 from .dependencies import get_router_service
 from .enums import RouterStatus
 from .models import Router
 from .schemas import (
     DeviceConnectionResponse,
+    DeviceInterfaceResponse,
+    DeviceInterfacesResponse,
     HeartbeatRequest,
     MessageResponse,
     ProvisioningCheckInRequest,
@@ -375,6 +378,69 @@ async def get_device_connection(
             host=router_row.management_ip_address or router_row.public_ip_address,
             username=router_row.api_username,
             password=password,
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/device-interfaces",
+    response_model=ApiResponse[DeviceInterfacesResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def get_device_interfaces(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Real, currently-available interfaces read live off the physical
+    device -- backs the dashboard's Interface picker (DHCP Pool / VLAN
+    forms) so an admin selects from what the router actually has instead
+    of typing a name that might not exist, or might already be in use.
+    See ``device_adapters.list_available_device_interfaces`` for what
+    "available" excludes. Read-only (never applies anything), so unlike
+    the config-push path this stays a backend-owned live query, same
+    posture as ``get_device_connection`` above."""
+    router_row = await router_service.get_router(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    host = router_row.management_ip_address or router_row.public_ip_address
+    password = router_service.get_decrypted_api_secret(router_row)
+    if not host or not router_row.api_username or not password:
+        return build_response(
+            success=True,
+            message="Device has no API credentials configured",
+            data=DeviceInterfacesResponse(interfaces=[]).model_dump(),
+            request_id=_request_id(request),
+        )
+    try:
+        interfaces = await list_available_device_interfaces(
+            host=host, username=router_row.api_username, password=password
+        )
+    except DeviceInterfaceQueryError as exc:
+        return build_response(
+            success=False,
+            message=f"Could not reach device: {exc.detail}",
+            data=DeviceInterfacesResponse(interfaces=[]).model_dump(),
+            request_id=_request_id(request),
+        )
+    return build_response(
+        success=True,
+        message="Device interfaces retrieved",
+        data=DeviceInterfacesResponse(
+            interfaces=[
+                DeviceInterfaceResponse(
+                    name=i.name,
+                    type=i.type,
+                    running=i.running,
+                    disabled=i.disabled,
+                    bridge=i.bridge,
+                    has_ip_address=i.has_ip_address,
+                )
+                for i in interfaces
+            ]
         ).model_dump(),
         request_id=_request_id(request),
     )
