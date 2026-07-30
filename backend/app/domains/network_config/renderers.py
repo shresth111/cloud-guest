@@ -12,8 +12,11 @@ RouterOS command."
 ``DhcpPool`` stores an address *range* (``address_range_start``/
 ``address_range_end``) and an optional ``gateway_ip_address`` -- it has no
 subnet-mask/CIDR column at all. RouterOS's own ``/ip dhcp-server network``
-entry (which is what actually carries the gateway/DNS/lease-time options
-out to clients) needs a real CIDR block, not a bare range. Rather than
+entry (which is what actually carries the gateway/DNS options out to
+clients -- ``lease-time`` is a ``/ip dhcp-server`` server-object parameter,
+not a network-object one; confirmed live against a real hEX lite, RouterOS
+rejects it on ``network add`` with "expected end of command") needs a real
+CIDR block, not a bare range. Rather than
 fabricate a conventional ``/24`` that could be flatly wrong for a given
 deployment, :func:`_smallest_enclosing_network` computes the mathematically
 smallest real CIDR block that is guaranteed to contain the configured
@@ -460,18 +463,22 @@ def render_dhcp_pool(pool: DhcpPool) -> list[str]:
 
     lines.append(
         f"/ip dhcp-server add name={identifier}-dhcp interface={pool.interface} "
-        f"address-pool={identifier}-pool disabled=no"
+        f"address-pool={identifier}-pool lease-time={pool.lease_time_seconds}s "
+        "disabled=no"
     )
     network = _smallest_enclosing_network(
         pool.address_range_start, pool.address_range_end
     )
+    # ``lease-time`` is a ``/ip dhcp-server`` (the server object above)
+    # parameter, not a ``/ip dhcp-server network`` one -- RouterOS rejects
+    # it here with "expected end of command", confirmed live against the
+    # real hEX lite this session.
     network_parts = [f"/ip dhcp-server network add address={network}"]
     if pool.gateway_ip_address:
         network_parts.append(f"gateway={pool.gateway_ip_address}")
     dns_servers = [dns for dns in (pool.dns_primary, pool.dns_secondary) if dns]
     if dns_servers:
         network_parts.append(f"dns-server={','.join(dns_servers)}")
-    network_parts.append(f"lease-time={pool.lease_time_seconds}s")
     lines.append(" ".join(network_parts))
     return lines
 
