@@ -46,6 +46,17 @@ __all__ = [
 # ============================================================================
 
 
+class RegisterExternalWireGuardPeerRequest(BaseModel):
+    """Body for ``POST .../wireguard-peer/register-external`` -- both
+    values are already-decided facts about a tunnel an out-of-band agent
+    bridge already configured directly on the real hub, not a request for
+    this domain to allocate or generate anything (see
+    ``WireGuardService.register_agent_allocated_peer``'s own docstring)."""
+
+    tunnel_ip_address: str = Field(..., min_length=1, max_length=45)
+    public_key: str = Field(..., min_length=1, max_length=64)
+
+
 class WireGuardPeerResponse(BaseModel):
     """The read-only admin view of a router's current tunnel/peer -- never
     includes key material (see module docstring)."""

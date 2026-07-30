@@ -33,7 +33,7 @@ from .jwt import InvalidTokenError as JWTInvalidTokenError
 from .jwt import JWTManager
 from .jwt import TokenExpiredError as JWTTokenExpiredError
 from .models import AuthUser, TokenPair, User
-from .password import PasswordManager
+from .password import PasswordManager, PasswordVerificationError
 from .repository import AuthRepositoryProtocol
 from .security import AuthSecurity
 
@@ -247,6 +247,30 @@ class AuthService:
             notification_service or _NoopNotificationSender()
         )
 
+    @staticmethod
+    def _verify_password_safe(
+        password: str, password_hash: str, *, user_id: uuid.UUID | None = None
+    ) -> bool:
+        """Same contract as ``PasswordManager.verify`` (a normal mismatch
+        returns ``False``), except a malformed/unparseable stored hash --
+        ``PasswordManager.verify`` raises ``PasswordVerificationError`` for
+        that case, not a mismatch -- is *also* treated as "does not match"
+        rather than left to crash the caller with an unhandled 500.
+        Mirrors the identical try/except already established in
+        ``app.domains.guest.service._verify_guest_password``; that
+        precedent still relies on ``PasswordManager.verify`` itself
+        raising, so this wraps the call site instead of changing its
+        contract. Confirmed live this session: a corrupted password_hash
+        row crashed login with a raw 500 before this existed."""
+        try:
+            return PasswordManager.verify(password, password_hash)
+        except PasswordVerificationError:
+            logger.warning(
+                "malformed_password_hash",
+                extra={"user_id": str(user_id) if user_id else None},
+            )
+            return False
+
     # -- registration -----------------------------------------------------
 
     async def register(
@@ -346,7 +370,7 @@ class AuthService:
 
         AuthSecurity.check_account_lock(user.locked_until)
 
-        if not PasswordManager.verify(password, user.password_hash):
+        if not self._verify_password_safe(password, user.password_hash, user_id=user.id):
             await self._register_failed_attempt(user)
             await self._record_attempt(
                 user.id, email, device_info, success=False, reason="invalid_password"
@@ -467,9 +491,9 @@ class AuthService:
         if not user:
             raise UserNotFoundError()
 
-        if not PasswordManager.verify(current_password, user.password_hash):
+        if not self._verify_password_safe(current_password, user.password_hash, user_id=user.id):
             raise InvalidCredentialsError("Current password is incorrect")
-        if PasswordManager.verify(new_password, user.password_hash):
+        if self._verify_password_safe(new_password, user.password_hash, user_id=user.id):
             raise PasswordReuseError(
                 "New password must be different from the current password"
             )
@@ -680,7 +704,7 @@ class AuthService:
             raise UserNotFoundError()
         if not user.mfa_enabled:
             raise MfaNotEnabledError()
-        if not PasswordManager.verify(password, user.password_hash):
+        if not self._verify_password_safe(password, user.password_hash, user_id=user.id):
             raise InvalidCredentialsError()
         if not await self._verify_mfa_or_recovery_code(user_id, code):
             raise InvalidMfaCodeError()
@@ -786,7 +810,7 @@ class AuthService:
             user_id, settings.password_history_limit
         )
         for old_hash in recent_hashes:
-            if PasswordManager.verify(new_password, old_hash):
+            if self._verify_password_safe(new_password, old_hash, user_id=user_id):
                 raise PasswordReuseError(
                     "This password was used recently. Please choose a different one."
                 )

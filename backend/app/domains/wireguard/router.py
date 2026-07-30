@@ -66,6 +66,7 @@ from .schemas import (
     AgentWireGuardConfigResponse,
     AgentWireGuardHandshakeResponse,
     MessageResponse,
+    RegisterExternalWireGuardPeerRequest,
     WireGuardPeerResponse,
     WireGuardTunnelCreateResponse,
     WireGuardTunnelRotateResponse,
@@ -171,6 +172,41 @@ async def create_wireguard_peer(
             "device itself via GET /agent/wireguard-config"
         ),
         data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/wireguard-peer/register-external",
+    response_model=ApiResponse[WireGuardPeerResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("wireguard.create"))],
+)
+async def register_external_wireguard_peer(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: RegisterExternalWireGuardPeerRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: WireGuardService = Depends(get_wireguard_service),
+):
+    """Records a peer the Master console's Setup Script panel already had
+    allocated and configured directly against the real hub through its
+    own out-of-band agent bridge (not this domain) -- see
+    ``WireGuardService.register_agent_allocated_peer``'s own docstring
+    for the full "why this exists" write-up. Never allocates a new IP or
+    generates a keypair; both are already decided by the caller."""
+    peer = await service.register_agent_allocated_peer(
+        actor_user_id=uuid.UUID(user.id),
+        router_id=router_id,
+        requesting_organization_id=requesting_organization_id,
+        tunnel_ip_address=payload.tunnel_ip_address,
+        public_key=payload.public_key,
+    )
+    return build_response(
+        success=True,
+        message="WireGuard tunnel registered",
+        data=_peer_response(peer, service=service).model_dump(),
         request_id=_request_id(request),
     )
 

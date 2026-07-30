@@ -394,6 +394,85 @@ class WireGuardService:
             peer=peer, peer_private_key=private_key, server=server
         )
 
+    async def register_agent_allocated_peer(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        tunnel_ip_address: str,
+        public_key: str,
+    ) -> WireGuardPeer:
+        """Records a peer the Master console's Setup Script panel already
+        had a *different*, out-of-band bridge (a small agent process on
+        the hub itself, not this domain) allocate and configure directly
+        against the real hub -- see that panel's own comment for why:
+        this domain's own ``create_tunnel`` has never had a way to
+        actually reach a live hub (a genuine, honestly-documented gap,
+        not a bug in this method), so the panel used the one thing that
+        could, and this platform's own ``WireGuardPeer`` table never
+        found out a tunnel existed at all. Confirmed live this session:
+        the real, working production tunnel had no DB row whatsoever.
+
+        Unlike ``create_tunnel``/``_allocate_and_persist``, this does
+        **not** allocate a fresh IP or generate a keypair -- both are
+        already decided (by the external bridge, before this call), so
+        recording anything else here would just be wrong. It only
+        validates the given IP isn't already claimed by a *different*
+        peer on this hub (``TunnelIPAllocationConflictError`` if so) and
+        writes/updates a real row with the exact values already live on
+        the device. The private key is never known to this domain (the
+        bridge is what generated and pushed it to the hub) -- stored as
+        ``EXTERNALLY_MANAGED_KEY_SENTINEL``, the same convention
+        ``create_tunnel``'s own ``external_public_key`` path already
+        establishes for "a real key exists, but not one this domain ever
+        held or can hand back."
+        """
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        server = await self.get_active_server()
+        existing = await self.repository.get_peer_by_router_id(router.id)
+
+        occupied = await self.repository.list_occupied_tunnel_ips(
+            server.id, exclude_peer_id=existing.id if existing is not None else None
+        )
+        if tunnel_ip_address in occupied:
+            raise TunnelIPAllocationConflictError()
+
+        fields = {
+            "server_id": server.id,
+            "tunnel_ip_address": tunnel_ip_address,
+            "public_key": public_key,
+            "private_key_encrypted": encrypt_secret(EXTERNALLY_MANAGED_KEY_SENTINEL),
+            "status": PeerStatus.PENDING.value,
+            "revoked_at": None,
+        }
+        if existing is not None:
+            fields["rotation_count"] = existing.rotation_count + 1
+            fields["last_handshake_at"] = None
+            peer = await self.repository.update_peer(existing, fields)
+        else:
+            peer = await self.repository.create_peer(
+                router_id=router.id, created_by=actor_user_id, **fields
+            )
+
+        await self._record_event_and_audit(
+            actor_user_id,
+            AuditAction.WIREGUARD_TUNNEL_CREATED,
+            router=router,
+            peer=peer,
+            description=(
+                f"WireGuard tunnel for router '{router.name}' registered "
+                "from agent-allocated values"
+            ),
+        )
+        logger.info(
+            "wireguard_agent_peer_registered",
+            extra={"router_id": str(router.id), "tunnel_ip_address": tunnel_ip_address},
+        )
+        return peer
+
     async def _allocate_and_persist(
         self,
         *,
