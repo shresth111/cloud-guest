@@ -773,7 +773,18 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         overrides={
             _M.ORGANIZATIONS: _L.READ,
             _M.PERMISSIONS: _L.READ,
-            _M.ROLES: _L.OPERATE,
+            # FULL, not OPERATE: an Organization Owner is this role's own
+            # "full control over a single organization's configuration and
+            # operations" -- OPERATE would silently exclude roles.delete/
+            # roles.manage (see expand_grant_level's own docstring),
+            # meaning an owner could create a custom role for their own
+            # organization but never delete it or attach/detach its
+            # permissions. Confirmed live this session: a real Organization
+            # Owner session 403'd on both, even with a correct
+            # X-Organization-Id header -- a real gap, not intentional
+            # scope-limiting (contrast DEVICE_CONSOLE below, which *is* a
+            # deliberate, documented exception to "full control").
+            _M.ROLES: _L.FULL,
             _M.SYSTEM_SETTINGS: _L.NONE,
             _M.SUBSCRIPTIONS: _L.READ,
             _M.BILLING: _L.OPERATE,
