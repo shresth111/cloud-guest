@@ -455,12 +455,37 @@ class RouterService:
     ) -> tuple[RouterProvisioningToken, str]:
         """Generates a single-use provisioning bearer token, returning the
         plaintext exactly once -- it is never retrievable again (only its
-        SHA-256 hash is persisted)."""
+        SHA-256 hash is persisted).
+
+        Also allowed while ``PROVISIONING`` (not just ``PENDING_PROVISIONING``):
+        the dashboard's own Setup Script panel calls check-in itself right
+        after minting a token, to bake the resulting agent credential into a
+        ready-to-paste script -- which already advances the router to
+        ``PROVISIONING`` before a single line has actually been pasted onto
+        the device. If that admin never finishes pasting the script (closed
+        the tab, the bridge call for an optional add-on failed, wanted to
+        regenerate with different options), the router was previously stuck
+        in ``PROVISIONING`` forever with no real device having claimed the
+        old token -- regenerating is safe here since nothing physical has
+        happened yet; the only actual completion signal is a real heartbeat
+        (see ``heartbeat``'s own docstring)."""
         router = await self.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
-        if router.status != RouterStatus.PENDING_PROVISIONING.value:
+        if router.status not in (
+            RouterStatus.PENDING_PROVISIONING.value,
+            RouterStatus.PROVISIONING.value,
+        ):
             raise ProvisioningTokenGenerationNotAllowedError(router_id, router.status)
+
+        # `check_in` below only ever accepts PENDING_PROVISIONING -- a fresh
+        # attempt from PROVISIONING must rewind first, or the token this
+        # just minted would be unusable by the very check-in call the
+        # dashboard makes right after (see this method's own docstring).
+        if router.status == RouterStatus.PROVISIONING.value:
+            router = await self.repository.update_router(
+                router, {"status": RouterStatus.PENDING_PROVISIONING.value}
+            )
 
         plaintext = secrets.token_urlsafe(_TOKEN_BYTES)
         now = datetime.now(UTC)
