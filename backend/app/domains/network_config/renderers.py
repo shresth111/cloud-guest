@@ -861,34 +861,36 @@ def render_network_config(
     if dhcp_pools:
         sections.append(DHCP_SECTION_HEADER)
         for pool in dhcp_pools:
-            sections.extend(render_dhcp_pool(pool))
+            sections.extend(_idempotent_lines(render_dhcp_pool(pool)))
     if vlans:
         sections.append(VLAN_SECTION_HEADER)
         for vlan in vlans:
-            sections.extend(render_vlan(vlan))
+            sections.extend(_idempotent_lines(render_vlan(vlan)))
     if port_forwarding_rules:
         sections.append(PORT_FORWARDING_SECTION_HEADER)
         for rule in port_forwarding_rules:
-            sections.extend(render_port_forwarding_rule(rule))
+            sections.extend(_idempotent_lines(render_port_forwarding_rule(rule)))
     if hotspot_profiles:
         sections.append(HOTSPOT_SECTION_HEADER)
         for profile in hotspot_profiles:
-            sections.extend(render_hotspot_profile(profile))
+            sections.extend(_idempotent_lines(render_hotspot_profile(profile)))
     if qos_traffic_rules:
         sections.append(QOS_SECTION_HEADER)
         for rule in qos_traffic_rules:
-            sections.extend(render_qos_traffic_rule(rule))
+            sections.extend(_idempotent_lines(render_qos_traffic_rule(rule)))
     if dns_records:
         sections.append(DNS_SECTION_HEADER)
         for record in dns_records:
-            sections.extend(render_dns_record(record))
+            sections.extend(_idempotent_lines(render_dns_record(record)))
     if firewall_rules:
         sections.append(FIREWALL_SECTION_HEADER)
         for rule in firewall_rules:
-            sections.extend(render_firewall_rule(rule))
+            sections.extend(_idempotent_lines(render_firewall_rule(rule)))
     if wireguard_peer is not None and wireguard_server is not None:
         sections.append(WIREGUARD_SECTION_HEADER)
-        sections.extend(render_wireguard_peer(wireguard_peer, wireguard_server))
+        sections.extend(
+            _idempotent_lines(render_wireguard_peer(wireguard_peer, wireguard_server))
+        )
     if (
         radius_nas_client is not None
         and radius_server_host is not None
@@ -903,11 +905,28 @@ def render_network_config(
         # here rather than assumed.
         sections.append(RADIUS_SECTION_HEADER)
         sections.extend(
-            render_radius_client(
-                radius_nas_client, wireguard_peer.tunnel_ip_address, radius_server_host
+            _idempotent_lines(
+                render_radius_client(
+                    radius_nas_client, wireguard_peer.tunnel_ip_address, radius_server_host
+                )
             )
         )
     return "\n".join(sections)
+
+
+def _idempotent_lines(lines: list[str]) -> list[str]:
+    """Wraps each real RouterOS command in ``:do {...} on-error={}`` so a
+    full-desired-state push (this function re-renders *every* enabled row,
+    not just new ones -- see this module's own docstring) can safely
+    re-apply an object that's already present on the device instead of
+    aborting the whole script on the first "already have such X" error.
+    Comment lines (``# ...``, emitted by a render_* function for a row it
+    deliberately skipped, e.g. a VLAN with no parent interface) pass
+    through unwrapped -- there is nothing to retry-guard there."""
+    return [
+        line if line.lstrip().startswith("#") else f":do {{ {line} }} on-error={{}}"
+        for line in lines
+    ]
 
 
 __all__ = [
