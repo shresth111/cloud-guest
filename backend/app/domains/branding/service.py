@@ -3,9 +3,12 @@ default fallback."""
 
 from __future__ import annotations
 
+import io
 import logging
 import uuid
 from typing import Protocol
+
+from PIL import Image, ImageDraw, UnidentifiedImageError
 
 from app.core.storage import ObjectStorageError, ObjectStorageProtocol
 
@@ -77,6 +80,70 @@ PUBLIC_LOGO_PATH_TEMPLATE = "/branding/{organization_id}/logo/public"
 PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE = (
     "/branding/{organization_id}/background-image/public"
 )
+
+
+# Logos most customers export "as-is" from a design tool ship on a
+# solid-color (usually white) square canvas with heavy padding -- the
+# mark itself only fills a small fraction of it. Rendered at any fixed
+# display size, that padding is what makes the logo look tiny even
+# though the box around it is large. This makes uploads robust to that
+# by hand: flood-fill the padding transparent (seeded from every border
+# pixel, so only background connected to the edge is removed -- a same-
+# colored shape fully enclosed *inside* the mark, e.g. a letterform's
+# counter, is left alone), then crop tight to the remaining content
+# with a small transparent margin re-added. Always outputs PNG (the
+# whole point is real alpha), regardless of what was uploaded.
+_LOGO_MAX_PROCESS_DIM = 4096
+_LOGO_FLOODFILL_THRESHOLD = 24
+_LOGO_MARGIN_FRACTION = 0.06
+
+
+def _process_logo(content: bytes) -> tuple[bytes, str, str] | None:
+    """Returns (processed_bytes, content_type, extension), or ``None`` if
+    the image couldn't be safely processed (unreadable, too large, or
+    already blank) -- callers should fall back to storing the original
+    upload unchanged in that case rather than failing it."""
+    try:
+        img = Image.open(io.BytesIO(content))
+        img.load()
+    except (UnidentifiedImageError, OSError):
+        return None
+
+    width, height = img.size
+    if width == 0 or height == 0 or width > _LOGO_MAX_PROCESS_DIM or height > _LOGO_MAX_PROCESS_DIM:
+        return None
+
+    img = img.convert("RGBA")
+    alpha_min, _alpha_max = img.split()[3].getextrema()
+    already_has_transparency = alpha_min < 250
+
+    if not already_has_transparency:
+        for x in range(width):
+            for y in (0, height - 1):
+                if img.getpixel((x, y))[3] != 0:
+                    ImageDraw.floodfill(
+                        img, (x, y), (0, 0, 0, 0), thresh=_LOGO_FLOODFILL_THRESHOLD
+                    )
+        for y in range(height):
+            for x in (0, width - 1):
+                if img.getpixel((x, y))[3] != 0:
+                    ImageDraw.floodfill(
+                        img, (x, y), (0, 0, 0, 0), thresh=_LOGO_FLOODFILL_THRESHOLD
+                    )
+
+    bbox = img.getbbox()
+    if bbox is None:
+        return None
+
+    cropped = img.crop(bbox)
+    content_w, content_h = cropped.size
+    margin = max(4, round(max(content_w, content_h) * _LOGO_MARGIN_FRACTION))
+    canvas = Image.new("RGBA", (content_w + margin * 2, content_h + margin * 2), (0, 0, 0, 0))
+    canvas.paste(cropped, (margin, margin), cropped)
+
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), "image/png", "png"
 
 
 class AuditLogWriter(Protocol):
@@ -230,6 +297,15 @@ class BrandingService:
         if len(content) > LOGO_MAX_BYTES:
             max_mb = LOGO_MAX_BYTES // (1024 * 1024)
             raise InvalidLogoError(f"file exceeds the {max_mb}MB limit")
+
+        processed = _process_logo(content)
+        if processed is not None:
+            content, content_type, extension = processed
+        else:
+            logger.warning(
+                "logo_autocrop_skipped",
+                extra={"organization_id": str(organization_id)},
+            )
 
         key = f"branding/{organization_id}/logo/{uuid.uuid4()}.{extension}"
         try:
