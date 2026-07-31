@@ -34,6 +34,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.responses import ApiResponse, build_response
@@ -422,6 +423,44 @@ async def resolve_captive_portal_config(
         message="Captive portal config resolved",
         data=response_payload.model_dump(),
         request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/captive-portal/rfc8908",
+    include_in_schema=False,
+)
+async def captive_portal_api(portal_url: str = Query(...)):
+    """RFC 8908 Captive Portal API -- the response a device's OS fetches
+    (via the RFC 8910 DHCP Option 114 URI the Setup Script's "DHCP Option
+    114" chunk configures) to discover *where* the captive portal is,
+    without relying on the older, unreliable heuristic of noticing an
+    HTTP connectivity-check probe got intercepted. No RequirePermission/
+    CurrentUser, same reasoning as resolve_captive_portal_config above --
+    this is fetched by an unauthenticated guest device, before it has any
+    platform identity at all.
+
+    `portal_url` is supplied by the caller (this platform's own Setup
+    Script, baking in this router's real hotspot address at script-
+    generation time) rather than looked up from a stored field -- no
+    domain object here persists a router's LAN/hotspot IP today, and
+    round-tripping it through the DHCP option's own URL avoids adding
+    one just for this. The device's OS itself then opens `user-portal-url`
+    (which is always the router's own local hotspot address -- reachable
+    without a route to the outside world), so it flows through the exact
+    same $(mac)/$(link-login-only)/$(link-orig) hotspot-side substitution
+    every other entry into this flow already goes through -- this
+    endpoint is a discovery hint, not a second, divergent portal path.
+
+    Uses a bare JSONResponse, not this codebase's ApiResponse envelope --
+    RFC 8908 defines this exact response shape and the
+    `application/captive+json` media type; wrapping it in a
+    success/message/data envelope would make it a non-conformant response
+    the OS's own captive-portal-detection client can't parse."""
+    return JSONResponse(
+        content={"captive": True, "user-portal-url": portal_url},
+        media_type="application/captive+json",
+        headers={"Cache-Control": "private"},
     )
 
 
