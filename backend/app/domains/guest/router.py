@@ -38,7 +38,8 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query, Request, status
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
@@ -48,6 +49,8 @@ from app.domains.rbac.dependencies import (
     RequireOrganization,
     RequirePermission,
 )
+from app.domains.wireguard.dependencies import get_wireguard_service
+from app.domains.wireguard.service import WireGuardService
 
 from .constants import (
     RADIUS_ACCT_STATUS_ACCOUNTING_OFF,
@@ -121,6 +124,12 @@ radius_router = APIRouter(prefix="/radius", tags=["RADIUS"])
 nas_router = APIRouter(prefix="/radius/nas", tags=["RADIUS NAS Admin"])
 nas_cross_reference_router = APIRouter(tags=["RADIUS NAS Admin"])
 analytics_router = APIRouter(prefix="/guest-analytics", tags=["Guest Analytics"])
+
+# Same single-tenant FreeRADIUS bridge the Master console's Setup Script
+# panel calls directly from the browser -- duplicated here (not read from
+# settings) to match that existing convention exactly.
+_RADIUS_AGENT_URL = "http://20.219.72.235:9092/radius/client"
+_RADIUS_AGENT_SECRET = "radiusagent-f37ae8fca1db9695975657196ea19b2e"
 
 
 def _request_id(request: Request) -> str:
@@ -826,6 +835,85 @@ async def register_radius_nas(
         ip_address=payload.ip_address,
         requesting_organization_id=requesting_organization_id,
     )
+    return build_response(
+        success=True,
+        message="RADIUS NAS client registered",
+        data=RadiusNasCreatedResponse(
+            **_nas_response(result.nas_client).model_dump(),
+            shared_secret=result.shared_secret,
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_router.post(
+    "/register-external/{router_id}",
+    response_model=ApiResponse[RadiusNasCreatedResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("radius.create"))],
+)
+async def register_external_radius_nas(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+    wireguard_service: WireGuardService = Depends(get_wireguard_service),
+):
+    """Server-side equivalent of the Master console's Setup Script panel
+    previously calling the FreeRADIUS agent bridge directly from the
+    browser -- that bridge is a bare ``http.server.BaseHTTPRequestHandler``
+    with no CORS/OPTIONS support, so a browser ``fetch()`` to it always
+    failed once a custom auth header was involved (confirmed live, same
+    root cause as the WireGuard bridge). Creates (or, if one already
+    exists for this router, rotates) this router's NAS client, then pushes
+    it to the real FreeRADIUS server from here instead -- using the
+    router's already-allocated WireGuard tunnel IP as its NAS address,
+    which is why this requires a WireGuard peer to exist first."""
+    peer = await wireguard_service.get_peer(
+        router_id=router_id, requesting_organization_id=requesting_organization_id
+    )
+
+    existing, _meta = await service.list_nas_clients(
+        requesting_organization_id=requesting_organization_id,
+        router_id=router_id,
+        page=1,
+        page_size=1,
+    )
+    if existing:
+        result = await service.regenerate_secret(
+            nas_id=existing[0].id,
+            requesting_organization_id=requesting_organization_id,
+            actor_user_id=uuid.UUID(user.id),
+        )
+    else:
+        result = await service.register_nas(
+            actor_user_id=uuid.UUID(user.id),
+            router_id=router_id,
+            nas_identifier=f"cg-{str(router_id)[:8]}",
+            requesting_organization_id=requesting_organization_id,
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                _RADIUS_AGENT_URL,
+                headers={
+                    "X-Agent-Secret": _RADIUS_AGENT_SECRET,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "tunnel_ip": peer.tunnel_ip_address,
+                    "nas_identifier": result.nas_client.nas_identifier,
+                    "secret": result.shared_secret,
+                },
+            )
+            resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail="Could not reach the RADIUS server bridge"
+        ) from exc
+
     return build_response(
         success=True,
         message="RADIUS NAS client registered",

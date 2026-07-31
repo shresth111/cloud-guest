@@ -49,7 +49,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Request, status
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
@@ -74,6 +75,14 @@ from .schemas import (
 from .service import TunnelDeliveryInfo, WireGuardService
 
 router = APIRouter(tags=["WireGuard"])
+
+# Same single-tenant hub bridge the Master console's Setup Script panel
+# calls directly from the browser -- duplicated here (not read from
+# settings) to match that existing convention exactly, see
+# RouterSetupScriptPanel's own comment on why these are constants rather
+# than per-router secrets today.
+_WG_AGENT_URL = "http://20.219.72.235:9091/wg/peer"
+_WG_AGENT_SECRET = "wgagent-7a647fb42b822aa44cb2da2092a4b79a"
 
 
 def _request_id(request: Request) -> str:
@@ -207,6 +216,67 @@ async def register_external_wireguard_peer(
         success=True,
         message="WireGuard tunnel registered",
         data=_peer_response(peer, service=service).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/wireguard-peer/allocate-external",
+    response_model=ApiResponse[WireGuardTunnelCreateResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("wireguard.create"))],
+)
+async def allocate_external_wireguard_peer(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: WireGuardService = Depends(get_wireguard_service),
+):
+    """Server-side equivalent of the Master console calling the hub's agent
+    bridge directly from the browser -- that bridge is a bare
+    ``http.server.BaseHTTPRequestHandler`` with no CORS/OPTIONS support at
+    all, so a browser ``fetch()`` to it always fails once a custom auth
+    header is involved (confirmed live: the bridge 501s any OPTIONS
+    preflight). CORS is a browser-enforced restriction on cross-origin
+    requests -- it never applies to this server calling that bridge itself,
+    so doing the exact same call from here sidesteps the problem entirely.
+    Combines what the frontend previously did in two steps (call the
+    bridge, then ``register-external``) into one, returning the same
+    "everything needed to configure the device" bundle
+    ``POST .../wireguard-peer`` does."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                _WG_AGENT_URL, headers={"X-Agent-Secret": _WG_AGENT_SECRET}
+            )
+            resp.raise_for_status()
+            wg = resp.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail="Could not reach the WireGuard hub bridge"
+        ) from exc
+
+    peer = await service.register_agent_allocated_peer(
+        actor_user_id=uuid.UUID(user.id),
+        router_id=router_id,
+        requesting_organization_id=requesting_organization_id,
+        tunnel_ip_address=wg["router_tunnel_ip"],
+        public_key=wg["router_public_key"],
+    )
+    base = _peer_response(peer, service=service)
+    payload = WireGuardTunnelCreateResponse(
+        **base.model_dump(),
+        peer_private_key=wg["router_private_key"],
+        hub_public_key=wg["server_public_key"],
+        hub_endpoint_host=wg["server_endpoint_host"],
+        hub_endpoint_port=int(wg["server_endpoint_port"]),
+        tunnel_network_cidr=wg["tunnel_subnet"],
+    )
+    return build_response(
+        success=True,
+        message="WireGuard tunnel allocated",
+        data=payload.model_dump(),
         request_id=_request_id(request),
     )
 
