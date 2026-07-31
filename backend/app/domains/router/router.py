@@ -73,6 +73,7 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 from app.domains.router_agent.dependencies import get_router_agent_service
 from app.domains.router_agent.service import RouterAgentService
 from app.domains.wireguard.dependencies import get_wireguard_service
@@ -277,7 +278,15 @@ async def update_router(
     "/routers/{router_id}",
     response_model=ApiResponse[MessageResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("routers.delete"))],
+    # Decommissioning a router is infra-level and hard to reverse (this is
+    # exactly the action that, when reachable by an org-scoped role, let a
+    # QA pass on a customer token delete a live physical router's platform
+    # record in production). Explicit GLOBAL scope means only a
+    # master-console role assignment can call this, regardless of which
+    # X-Organization-Id header the caller sends -- an "Organization Owner"
+    # role holding routers.delete at *organization* scope (legitimate for
+    # normal router CRUD) no longer qualifies.
+    dependencies=[Depends(RequirePermission("routers.delete", scope=ScopeType.GLOBAL))],
 )
 async def decommission_router(
     request: Request,

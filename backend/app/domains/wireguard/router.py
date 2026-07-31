@@ -59,6 +59,7 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 from app.domains.router_agent.dependencies import AgentIdentity, CurrentAgent
 
 from .dependencies import get_wireguard_service
@@ -133,7 +134,12 @@ def _tunnel_delivery_response(
     "/routers/{router_id}/wireguard-peer",
     response_model=ApiResponse[WireGuardPeerResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("wireguard.read"))],
+    # GLOBAL, not header-inferred -- WireGuard/tunnel internals must never
+    # be reachable by an org-scoped role, even the router's own owning
+    # organization (confirmed live: sending this org's own X-Organization-Id
+    # let an Organization Owner token read full tunnel metadata, violating
+    # the standing "no WireGuard on customer dashboard" product rule).
+    dependencies=[Depends(RequirePermission("wireguard.read", scope=ScopeType.GLOBAL))],
 )
 async def get_wireguard_peer(
     request: Request,
@@ -156,7 +162,8 @@ async def get_wireguard_peer(
     "/routers/{router_id}/wireguard-peer",
     response_model=ApiResponse[WireGuardTunnelCreateResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("wireguard.create"))],
+    # See get_wireguard_peer's own comment -- GLOBAL scope only.
+    dependencies=[Depends(RequirePermission("wireguard.create", scope=ScopeType.GLOBAL))],
 )
 async def create_wireguard_peer(
     request: Request,
@@ -189,7 +196,8 @@ async def create_wireguard_peer(
     "/routers/{router_id}/wireguard-peer/register-external",
     response_model=ApiResponse[WireGuardPeerResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("wireguard.create"))],
+    # See get_wireguard_peer's own comment -- GLOBAL scope only.
+    dependencies=[Depends(RequirePermission("wireguard.create", scope=ScopeType.GLOBAL))],
 )
 async def register_external_wireguard_peer(
     request: Request,
@@ -224,7 +232,8 @@ async def register_external_wireguard_peer(
     "/routers/{router_id}/wireguard-peer/allocate-external",
     response_model=ApiResponse[WireGuardTunnelCreateResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("wireguard.create"))],
+    # See get_wireguard_peer's own comment -- GLOBAL scope only.
+    dependencies=[Depends(RequirePermission("wireguard.create", scope=ScopeType.GLOBAL))],
 )
 async def allocate_external_wireguard_peer(
     request: Request,
@@ -285,7 +294,8 @@ async def allocate_external_wireguard_peer(
     "/routers/{router_id}/wireguard-peer",
     response_model=ApiResponse[MessageResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("wireguard.delete"))],
+    # See get_wireguard_peer's own comment -- GLOBAL scope only.
+    dependencies=[Depends(RequirePermission("wireguard.delete", scope=ScopeType.GLOBAL))],
 )
 async def revoke_wireguard_peer(
     request: Request,
@@ -311,7 +321,8 @@ async def revoke_wireguard_peer(
     "/routers/{router_id}/wireguard-peer/rotate",
     response_model=ApiResponse[WireGuardTunnelRotateResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("wireguard.execute"))],
+    # See get_wireguard_peer's own comment -- GLOBAL scope only.
+    dependencies=[Depends(RequirePermission("wireguard.execute", scope=ScopeType.GLOBAL))],
 )
 async def rotate_wireguard_peer(
     request: Request,
