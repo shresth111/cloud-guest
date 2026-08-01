@@ -38,6 +38,7 @@ from app.domains.network_config.constants import (
 )
 from app.domains.network_config.exceptions import EmptyNetworkConfigError
 from app.domains.network_config.renderers import (
+    HOTSPOT_DNS_NAME,
     render_agent_heartbeat_scheduler,
     render_bootstrap_script,
     render_dhcp_pool,
@@ -291,6 +292,53 @@ class TestRenderVlan:
         joined = "\n".join(lines)
         assert "/interface vlan add" not in joined
         assert "vlan100" in joined  # explanatory comment still names it
+
+
+class TestRenderVlanHotspot:
+    """``render_vlan(..., enable_hotspot=True)`` -- see renderers.py module
+    docstring's "Hotspot dns-name" section for why both a ``dns-name`` on
+    the hotspot profile and a matching ``/ip dns static`` record are
+    rendered together, and why the name is per-VLAN rather than one fixed
+    global literal."""
+
+    def test_renders_dns_name_and_matching_static_dns_record(self) -> None:
+        vlan = _make_vlan(vlan_id=100, enable_hotspot=True)
+        lines = render_vlan(vlan)
+        joined = "\n".join(lines)
+        assert f"dns-name=vlan100.{HOTSPOT_DNS_NAME}" in joined
+        assert (
+            f"/ip dns static add name=vlan100.{HOTSPOT_DNS_NAME} "
+            "address=10.0.100.1" in joined
+        )
+        assert "/ip hotspot profile add" in joined
+        assert "/ip hotspot add name=vlan100-hotspot" in joined
+
+    def test_two_hotspot_vlans_get_distinct_dns_names(self) -> None:
+        vlan_a = _make_vlan(vlan_id=100, enable_hotspot=True)
+        vlan_b = _make_vlan(
+            vlan_id=200,
+            enable_hotspot=True,
+            gateway_ip_address="10.0.200.1",
+            cidr="10.0.200.0/24",
+        )
+        joined_a = "\n".join(render_vlan(vlan_a))
+        joined_b = "\n".join(render_vlan(vlan_b))
+        assert f"vlan100.{HOTSPOT_DNS_NAME}" in joined_a
+        assert f"vlan200.{HOTSPOT_DNS_NAME}" in joined_b
+        assert f"vlan200.{HOTSPOT_DNS_NAME}" not in joined_a
+
+    def test_skips_entirely_without_cidr_or_gateway(self) -> None:
+        vlan = _make_vlan(enable_hotspot=True, cidr=None, gateway_ip_address=None)
+        lines = render_vlan(vlan)
+        joined = "\n".join(lines)
+        assert "dns-name" not in joined
+        assert "needs both cidr and gateway_ip_address" in joined
+
+    def test_disabled_by_default(self) -> None:
+        lines = render_vlan(_make_vlan())
+        joined = "\n".join(lines)
+        assert "/ip hotspot profile add" not in joined
+        assert "dns-name" not in joined
 
 
 class TestRenderPortForwardingRule:

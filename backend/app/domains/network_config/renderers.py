@@ -60,6 +60,63 @@ which would need an interface/address-pool this table has no data for.
 substituting ``0`` (RouterOS's own "unlimited" value) for whichever half
 of the pair is unset.
 
+## Hotspot dns-name: replacing the raw IP in the guest's address bar
+
+RouterOS's ``/ip hotspot profile`` has a real, built-in ``dns-name`` field:
+once set, RouterOS's own hotspot redirect (the ``302`` that sends a
+newly-connected, not-yet-authenticated guest to the login page) uses that
+name instead of the hotspot's raw IP in the URL it builds -- confirmed
+against MikroTik's own published ``/ip hotspot profile`` reference. This is
+what turns ``http://10.5.50.1/login`` in a guest's address bar into
+``http://wyfy.portal/login``, the exact UX complaint this addition fixes.
+
+**``dns-name`` alone is not sufficient -- it changes the redirect URL, it
+does not by itself make that hostname resolve.** MikroTik's own
+documentation for this exact feature is explicit that a ``dns-name`` you
+set must *separately* be made to resolve to the hotspot's own address, and
+the standard way to do that for a name with no real public DNS record is a
+plain ``/ip dns static`` entry pointing it at the hotspot's own address --
+this is why ``_render_vlan_hotspot`` below emits both lines, never
+``dns-name`` on its own. Guest devices already receive this router's own
+address as their DNS server via the ``dns-server=`` option this same
+function's ``/ip dhcp-server network add`` line has always set, and
+``/ip dns set ... allow-remote-requests=yes`` (already rendered platform-
+wide in the master-console bootstrap script) makes the router answer that
+query -- no real registrable domain or public DNS record is created or
+needed anywhere in this scheme, it is resolved entirely locally, by this
+router, for its own guests.
+
+**Not independently confirmed against a real device this session** (unlike
+most of the rest of this file's decisions, which carry an explicit "live
+this session" note): whether RouterOS's hotspot-specific DNS interception
+path for an *unauthenticated* client takes precedence over, conflicts
+with, or is simply additive to, a plain ``/ip dns static`` answer for the
+same name is not something this addition verifies live. The
+``/ip dns static`` record is the documented, standard-pattern fallback
+regardless, so it is included rather than relying on ``dns-name``'s
+redirect-only behavior alone -- but a real device test (connect an
+unauthenticated guest, confirm the address bar shows the hostname *and*
+the page actually loads, not an NXDOMAIN/timeout) is the one piece of
+verification the module docstring's own "confirmed live" standard would
+otherwise require, and is flagged here as genuinely outstanding rather
+than assumed.
+
+**Per-VLAN name, not one fixed global literal, to avoid a real collision
+this function's own multi-VLAN-hotspot shape would otherwise create.**
+``_render_vlan_hotspot`` can render more than one independent hotspot per
+router (one per ``enable_hotspot`` VLAN, each with its own
+``hotspot-address``) -- a single fixed ``dns-name``/static-DNS pair shared
+by every one of them would leave the router's ``/ip dns static`` table
+with either a name collision (RouterOS rejects a second ``add`` of the
+same ``name=``) or, worse, multiple different addresses silently
+round-robined under one name, sending some fraction of guests on VLAN A's
+hotspot to VLAN B's gateway. ``{tag}.wyfy.portal`` (``tag`` already being
+this function's own real, ``vlan_id``-derived, guaranteed-unique-per-router
+identifier) sidesteps that entirely, the same "derive a real, already-
+unique value rather than fabricate a shared one" discipline
+``_dhcp_identifier``/``_hotspot_identifier`` already establish for their
+own name-collision problem above.
+
 ## DNS: type inferred from the record itself, never a separate column
 
 ``DnsRecord.record_type`` already carries A/AAAA/CNAME -- ``/ip dns
@@ -400,6 +457,16 @@ from .constants import (
 # here.
 WIREGUARD_INTERFACE_NAME = "wg-cloudguard"
 
+# The base ``dns-name`` used for the captive-portal redirect on every
+# per-VLAN standalone hotspot ``_render_vlan_hotspot`` renders -- see
+# module docstring's "Hotspot dns-name" section for why this is a pseudo-
+# TLD used purely for the router's own local DNS resolution (never a real,
+# registrable public domain), why a bare static DNS record is rendered
+# alongside it rather than relying on ``dns-name`` alone, and why each
+# VLAN's own hotspot gets a ``{tag}.`` prefixed variant of this rather than
+# this exact literal.
+HOTSPOT_DNS_NAME = "wyfy.portal"
+
 
 def _sanitize_identifier(name: str) -> str:
     """Lowercases and replaces every character that is not alphanumeric/
@@ -516,6 +583,11 @@ def _render_vlan_hotspot(vlan: Vlan, bind_interface: str) -> list[str]:
         return [f"# {tag}-hotspot: no usable addresses left in {network} -- skipping"]
     pool_name = f"{tag}-hs-pool"
     profile_name = f"{tag}-hsprof"
+    # See module docstring's "Hotspot dns-name" section: a per-VLAN
+    # variant of the platform-wide default, not the bare literal, since
+    # this function can render more than one independent hotspot per
+    # router.
+    dns_name = f"{tag}.{HOTSPOT_DNS_NAME}"
     return [
         f"/ip pool add name={pool_name} ranges={usable[0]}-{usable[-1]}",
         f"/ip dhcp-server add name={tag}-hs-dhcp interface={bind_interface} "
@@ -523,7 +595,10 @@ def _render_vlan_hotspot(vlan: Vlan, bind_interface: str) -> list[str]:
         f"/ip dhcp-server network add address={network} "
         f"gateway={vlan.gateway_ip_address} dns-server={vlan.gateway_ip_address}",
         f"/ip hotspot profile add name={profile_name} "
-        f"hotspot-address={vlan.gateway_ip_address} html-directory=cloudguest-hotspot",
+        f"hotspot-address={vlan.gateway_ip_address} html-directory=cloudguest-hotspot "
+        f"dns-name={dns_name}",
+        f"/ip dns static add name={dns_name} address={vlan.gateway_ip_address} "
+        f'comment="{tag}-hotspot-dns-name"',
         f"/ip hotspot add name={tag}-hotspot interface={bind_interface} "
         f"address-pool={pool_name} profile={profile_name} disabled=no",
     ]
@@ -1034,6 +1109,7 @@ def _idempotent_lines(lines: list[str]) -> list[str]:
 
 
 __all__ = [
+    "HOTSPOT_DNS_NAME",
     "render_dhcp_pool",
     "render_vlan",
     "render_port_forwarding_rule",
