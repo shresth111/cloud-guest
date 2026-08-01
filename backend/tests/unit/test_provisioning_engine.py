@@ -1465,6 +1465,64 @@ class TestRouterHealthPollSweep:
             checked=0, unreachable=0, skipped=0, errors=0
         )
 
+    async def test_explicit_routers_override_polls_only_that_router(self) -> None:
+        """The real per-router fan-out leaf task
+        (``tasks.poll_single_router_health``) calls this exact function
+        with ``routers=[one_router]`` so each Celery task invocation polls
+        only the single router it was dispatched for -- never the whole
+        platform-wide fleet ``repository.list_routers_for_health_poll``
+        would otherwise return. Seeds the fake repository with three
+        routers but passes an explicit one-element ``routers=`` list, and
+        asserts only that one router was ever actually checked/recorded."""
+        repository = FakeProvisioningEngineRepository()
+        router_lookup = FakeRouterLookup()
+        router_provisioning = FakeRouterProvisioningLookup()
+
+        target_router = router_lookup.add(_make_router(), secret="secret-1")
+        target_router.management_ip_address = "10.0.0.1"
+        other_router = router_lookup.add(_make_router(), secret="secret-2")
+        other_router.management_ip_address = "10.0.0.2"
+
+        # Seeded platform-wide, but never consulted -- proves the
+        # ``routers=`` override, not ``list_routers_for_health_poll``,
+        # drives what this call actually polls.
+        repository.routers_for_health_poll = [target_router, other_router]
+
+        adapter = _HealthPollAdapter(
+            healthy_hosts={
+                "10.0.0.1": DeviceHealthResult(
+                    healthy=True,
+                    cpu_load_percent=5.0,
+                    free_memory_bytes=1000,
+                    uptime_seconds=100,
+                ),
+                "10.0.0.2": DeviceHealthResult(
+                    healthy=True,
+                    cpu_load_percent=5.0,
+                    free_memory_bytes=1000,
+                    uptime_seconds=100,
+                ),
+            },
+            unhealthy_hosts={},
+            raising_hosts={},
+        )
+
+        summary = await run_router_health_poll_sweep(
+            repository,
+            router_lookup,
+            router_provisioning,
+            device_adapter_resolver=lambda vendor: adapter,
+            routers=[target_router],
+        )
+
+        assert summary == HealthPollSweepSummary(
+            checked=1, unreachable=0, skipped=0, errors=0
+        )
+        recorded_ids = {
+            r["router_id"] for r in router_provisioning.health_snapshots_recorded
+        }
+        assert recorded_ids == {target_router.id}
+
 
 class TestProvisioningEngineRepositoryConstruction:
     def test_wires_four_generic_repositories(self) -> None:

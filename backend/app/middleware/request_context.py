@@ -140,7 +140,30 @@ async def _flush_pii_access_audit(request: Request, context: MaskingContext) -> 
     tasks already open ad-hoc sessions -- e.g.
     ``app.domains.provisioning_engine.tasks``) since ``BaseHTTPMiddleware
     .dispatch`` runs outside FastAPI's own per-route dependency injection
-    and therefore has no request-scoped session to reuse."""
+    and therefore has no request-scoped session to reuse.
+
+    ``context.organization_id`` was captured opportunistically by
+    ``CurrentOrganization`` at the *start* of request handling (see that
+    dependency's own docstring); this flush runs in ``RequestContextMiddleware
+    .dispatch``'s ``finally`` block, i.e. only after the wrapped handler
+    (and its own response) has already completed. A concurrent deletion of
+    that organization somewhere in between -- another admin's legitimate
+    ``DELETE /organizations/{id}``, not just direct DB surgery -- leaves a
+    real, if narrow, window where ``organization_id`` names a row that no
+    longer exists by the time this INSERT runs, which
+    ``GenericRepository.create``/``_flush_or_raise`` surfaces as a
+    ``DuplicateRecordError`` (it labels *any* ``IntegrityError``, FK
+    violations included, as a duplicate -- see that method's own
+    docstring). Neither ``DuplicateRecordError``
+    (``app.database.exceptions.DatabaseError``) nor a raw
+    ``SQLAlchemyError`` is a ``CloudGuestError``, so left uncaught here
+    either propagates out of this ``finally`` block and replaces the
+    response Starlette was about to send -- silently turning an otherwise-
+    successful request into a raw 500, purely because of a best-effort,
+    descriptive-only PII-access audit row (see this function's own
+    docstring above). Caught and logged instead: this audit row is a
+    nice-to-have, never worth failing -- or un-succeeding -- the request
+    it describes."""
     if not context.accessed_kinds:
         return
 
@@ -148,14 +171,28 @@ async def _flush_pii_access_audit(request: Request, context: MaskingContext) -> 
     # cycle: app.domains.rbac.repository -> ... -> app.database.session,
     # and this middleware module is imported very early (app.main, before
     # the domain layer is guaranteed to be fully initialized).
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.database.exceptions import DatabaseError
     from app.database.session import SessionLocal
     from app.domains.rbac.repository import RBACRepository
 
     fields = _build_pii_audit_fields(request, context)
-    async with SessionLocal() as session:
-        repository = RBACRepository(session)
-        await repository.create_audit_log_entry(**fields)
-        await session.commit()
+    try:
+        async with SessionLocal() as session:
+            repository = RBACRepository(session)
+            await repository.create_audit_log_entry(**fields)
+            await session.commit()
+    except (SQLAlchemyError, DatabaseError):
+        logger.warning(
+            "pii_access_audit_write_failed",
+            extra={
+                "path": request.url.path,
+                "organization_id": context.organization_id,
+                "user_id": context.user_id,
+            },
+            exc_info=True,
+        )
 
 
 def _parse_uuid(value: str | None) -> uuid.UUID | None:

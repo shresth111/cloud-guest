@@ -51,6 +51,8 @@ from app.domains.auth.service import (
     MfaNotEnabledError,
     MfaNotEnrolledError,
     MfaRequiredError,
+    PasswordChangeRequiredError,
+    PasswordReuseError,
     UsernameAlreadyExistsError,
 )
 from app.domains.auth.service import InvalidTokenError as ResetTokenInvalidError
@@ -793,6 +795,118 @@ class TestAuthServiceLogin:
             await service.login(
                 "wrongpass@example.com", "NotTheRightPass123!@#", make_device_info()
             )
+
+
+class TestAuthServiceMustChangePassword:
+    """Real incident regression: a freshly-provisioned owner's welcome-email
+    temporary password used to be permanently unusable for login --
+    ``PasswordChangeRequiredError`` blocked the call with no retry path,
+    unlike the ``mfa_code`` precedent it explicitly documents. See
+    ``AuthService.login``'s docstring for the full incident writeup."""
+
+    async def _make_must_change_password_user(
+        self, service: AuthService, repository: FakeAuthRepository
+    ):
+        user, verification_token = await service.register(
+            first_name="Test",
+            last_name="Owner",
+            email="mustchange@example.com",
+            username="mustchangeuser",
+            password=STRONG_PASSWORD,
+        )
+        await service.verify_email(verification_token)
+        await repository.update_user(user, must_change_password=True)
+        return user
+
+    async def test_login_blocks_without_new_password(self) -> None:
+        service, repository, _redis = make_service()
+        await self._make_must_change_password_user(service, repository)
+
+        with pytest.raises(PasswordChangeRequiredError):
+            await service.login(
+                "mustchange@example.com", STRONG_PASSWORD, make_device_info()
+            )
+
+    async def test_login_succeeds_with_new_password_in_same_call(self) -> None:
+        service, repository, _redis = make_service()
+        user = await self._make_must_change_password_user(service, repository)
+
+        logged_in_user, tokens, _session_id = await service.login(
+            "mustchange@example.com",
+            STRONG_PASSWORD,
+            make_device_info(),
+            new_password="BrandNewPass456!@#",
+        )
+
+        assert logged_in_user.id == user.id
+        assert tokens.access_token
+        assert logged_in_user.must_change_password is False
+
+        # The new password now works for an ordinary login; the old
+        # temporary one no longer does.
+        await service.login(
+            "mustchange@example.com", "BrandNewPass456!@#", make_device_info()
+        )
+        with pytest.raises(InvalidCredentialsError):
+            await service.login(
+                "mustchange@example.com", STRONG_PASSWORD, make_device_info()
+            )
+
+    async def test_login_rejects_new_password_same_as_temporary(self) -> None:
+        service, repository, _redis = make_service()
+        await self._make_must_change_password_user(service, repository)
+
+        with pytest.raises(PasswordReuseError):
+            await service.login(
+                "mustchange@example.com",
+                STRONG_PASSWORD,
+                make_device_info(),
+                new_password=STRONG_PASSWORD,
+            )
+
+    async def test_mfa_is_required_before_password_change_commits(self) -> None:
+        """Real bug: MFA used to be checked *after* the must_change_password
+        branch already hashed and persisted new_password -- an account with
+        both set, retried with new_password but no mfa_code yet (the client
+        can't know mfa_code is needed until this call says so), would have
+        its temporary password permanently overwritten and then still get
+        MfaRequiredError, leaving no credential the user actually knows."""
+        service, repository, _redis = make_service()
+        user = await self._make_must_change_password_user(service, repository)
+        await _enable_mfa(service, user.id)
+
+        with pytest.raises(MfaRequiredError):
+            await service.login(
+                "mustchange@example.com",
+                STRONG_PASSWORD,
+                make_device_info(),
+                new_password="BrandNewPass456!@#",
+            )
+
+        # The temporary password must still work -- it was never committed.
+        stored_user = await repository.get_user_by_email("mustchange@example.com")
+        assert stored_user is not None
+        assert stored_user.must_change_password is True
+        assert service._verify_password_safe(STRONG_PASSWORD, stored_user.password_hash)
+
+    async def test_mfa_code_and_new_password_together_succeed(self) -> None:
+        service, repository, _redis = make_service()
+        user = await self._make_must_change_password_user(service, repository)
+        secret = await _enable_mfa(service, user.id)
+
+        import pyotp
+
+        logged_in_user, tokens, _session_id = await service.login(
+            "mustchange@example.com",
+            STRONG_PASSWORD,
+            make_device_info(),
+            new_password="BrandNewPass456!@#",
+            mfa_code=pyotp.TOTP(secret).now(),
+        )
+
+        assert logged_in_user.id == user.id
+        assert tokens.access_token
+        assert logged_in_user.must_change_password is False
 
 
 class TestAuthServiceRefreshAndSessions:

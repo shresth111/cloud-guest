@@ -56,14 +56,46 @@ DEVICE_SYNC_TIMEOUT_SECONDS = 15
 TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP = (
     "app.domains.connected_devices.tasks.run_connected_device_sync_sweep"
 )
-# Every 5 minutes -- a connected-device list is operationally visible
-# (an admin's live-devices view) but does not need ISP-link-sweep's own
-# 60-second cadence (nothing here drives an automatic failover decision
-# the way a WAN health check does) -- mirrors
-# app.domains.guest.constants.SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS's
-# own 5-minute cadence reasoning for an identically "visible, not
-# safety-critical" concern.
-CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS = 300.0
+
+# The real per-router fan-out leaf task ``TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP``
+# (the Beat-scheduled coordinator) dispatches one of per router, instead of
+# syncing every router sequentially, in-process, itself -- see
+# ``tasks.sync_single_router_devices``'s own docstring for the full
+# scale-readiness write-up (a real DHCP-lease/ARP/wireless-registration-
+# table discovery call per router, potentially more expensive than
+# ``app.domains.provisioning_engine``'s simple health ping, made the
+# original sequential loop's own overrun risk even worse).
+TASK_SYNC_SINGLE_ROUTER_DEVICES = (
+    "app.domains.connected_devices.tasks.sync_single_router_devices"
+)
+
+# Raised from an original 300s (5 minutes): defense in depth, not the real
+# fix (fan-out + the lock below is). Slightly more conservative than
+# app.domains.provisioning_engine.constants
+# .ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS's own 600s, since this sweep's
+# real per-router RouterOS call (full DHCP-lease/ARP/wireless-registration
+# discovery) is potentially heavier than that domain's simple health ping,
+# so real-world device-timeout variance deserves a bit more headroom here.
+CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS = 900.0
+
+# Redis SETNX-style overlap-prevention lock -- identical shape and identical
+# scope to app.domains.provisioning_engine.constants
+# .ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY's own (guards only the
+# coordinator's own listing+dispatch phase, not the fanned-out per-router
+# leaf tasks' own independent run times) -- see that constant's own
+# docstring for the full "what this protects against, and what it
+# deliberately does not" write-up, which applies here unchanged.
+CONNECTED_DEVICE_SYNC_SWEEP_LOCK_REDIS_KEY = (
+    "connected_devices:sync_sweep:lock"
+)
+
+# Same reasoning as
+# app.domains.provisioning_engine.constants
+# .ROUTER_HEALTH_POLL_SWEEP_LOCK_TTL_SECONDS's own identical constant: a
+# crash-safety backstop for the coordinator's own quick listing+dispatch
+# phase, not a bound on how long any fanned-out leaf task's own device I/O
+# may take.
+CONNECTED_DEVICE_SYNC_SWEEP_LOCK_TTL_SECONDS = 300
 
 
 __all__ = [
@@ -71,5 +103,8 @@ __all__ = [
     "OUI_VENDOR_PREFIXES",
     "DEVICE_SYNC_TIMEOUT_SECONDS",
     "TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP",
+    "TASK_SYNC_SINGLE_ROUTER_DEVICES",
     "CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS",
+    "CONNECTED_DEVICE_SYNC_SWEEP_LOCK_REDIS_KEY",
+    "CONNECTED_DEVICE_SYNC_SWEEP_LOCK_TTL_SECONDS",
 ]

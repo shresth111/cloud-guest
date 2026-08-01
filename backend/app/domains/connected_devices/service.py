@@ -581,6 +581,7 @@ async def run_device_sync_sweep(
     audit_writer: AuditLogWriter | None = None,
     device_adapter_resolver=get_connected_device_adapter,
     organization_id: uuid.UUID | None = None,
+    routers: list[Router] | None = None,
 ) -> DeviceSyncSweepSummary:
     """The platform-wide device-sync sweep
     ``tasks.run_connected_device_sync_sweep`` (Celery Beat) drives --
@@ -593,7 +594,17 @@ async def run_device_sync_sweep(
     (``connected_device_sync_sweep_router_failed``), and skipped, never
     aborting the sweep for every other router -- mirrors
     ``app.domains.isp.service.run_health_check_sweep``'s identical
-    per-item isolation contract."""
+    per-item isolation contract.
+
+    ``routers``, when passed explicitly, is synced instead of
+    ``repository.list_routers_for_sync()``'s own full, platform-wide
+    result -- lets ``tasks.sync_single_router_devices`` (the real
+    per-router fan-out leaf task the Beat-scheduled coordinator dispatches
+    one of per router, instead of this function looping over every router
+    in one process/worker slot) reuse this exact same per-router sync
+    logic for a single-element list. The default (``None``) preserves this
+    function's original, platform-wide-sweep behavior for any caller --
+    including this module's own test suite -- that still wants that."""
     service = ConnectedDeviceService(
         repository,
         router_lookup,
@@ -602,7 +613,10 @@ async def run_device_sync_sweep(
         audit_writer=audit_writer,
         device_adapter_resolver=device_adapter_resolver,
     )
-    routers = await repository.list_routers_for_sync(organization_id=organization_id)
+    if routers is None:
+        routers = await repository.list_routers_for_sync(
+            organization_id=organization_id
+        )
     routers_synced = 0
     routers_failed = 0
     discovered = 0

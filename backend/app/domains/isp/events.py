@@ -65,6 +65,18 @@ class IspFailbackTriggered:
     occurred_at: datetime = field(default_factory=_now)
 
 
+@dataclass(frozen=True, slots=True)
+class IspLinkManualStatusSet:
+    """An admin overrode a link's own current status by hand -- see
+    ``IspService.set_manual_health_status``. Never involves a device
+    connection; this is a pure database write."""
+
+    link_id: uuid.UUID
+    health_status: str
+    reason: str | None
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "IspLinkCreated",
     "IspLinkUpdated",
@@ -72,4 +84,5 @@ __all__ = [
     "IspHealthCheckRecorded",
     "IspFailoverTriggered",
     "IspFailbackTriggered",
+    "IspLinkManualStatusSet",
 ]

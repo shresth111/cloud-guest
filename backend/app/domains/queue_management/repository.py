@@ -107,6 +107,10 @@ class QueueManagementRepositoryProtocol(Protocol):
         sort_order: SortOrder = SortOrder.DESC,
     ) -> tuple[list[QueueAssignment], PaginationMeta]: ...
 
+    async def list_assignments_by_status(
+        self, *, status: str
+    ) -> list[QueueAssignment]: ...
+
     async def get_active_assignment_for_target(
         self, *, target_type: str, target_id: uuid.UUID | None
     ) -> QueueAssignment | None: ...
@@ -282,6 +286,25 @@ class QueueManagementRepository:
         if not active:
             return None
         return max(active, key=lambda a: a.created_at)
+
+    async def list_assignments_by_status(
+        self, *, status: str
+    ) -> list[QueueAssignment]:
+        """Every non-deleted assignment with this exact status, platform-
+        wide, **unpaginated** -- for
+        ``QueueManagementService.sweep_schedule_transitions``, which must
+        re-evaluate every ACTIVE/SUSPENDED assignment on each tick, not
+        just the first page (``GenericRepository.get_all`` with no
+        ``limit`` returns the full matching set in one query). Mirrors
+        ``app.domains.provisioning_engine.repository
+        .ProvisioningEngineRepository.list_routers_for_health_poll``'s/
+        ``app.domains.connected_devices.repository.ConnectedDeviceRepository
+        .list_routers_for_sync``'s identical "a platform-wide sweep needs
+        the full table, not one page of it" precedent -- a ``page=1,
+        page_size=1000`` call here silently dropped every assignment past
+        the first 1000, a real, growing correctness bug as assignment
+        count increases, independent of scale."""
+        return await self.assignments.get_all(filters={"status": status})
 
 
 __all__ = ["QueueManagementRepositoryProtocol", "QueueManagementRepository"]

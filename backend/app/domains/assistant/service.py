@@ -146,6 +146,75 @@ _VOUCHER_CREATE_KEYWORDS = (
     "make a voucher",
 )
 _VOUCHER_KEYWORDS = ("voucher", "redeem", "redemption")
+# Network-domain keyword groups -- all checked before the generic
+# _WIFI_KEYWORDS bucket below, for the same substring-collision reason
+# _GUEST_MANAGEMENT is checked before _ROUTER_STATUS: broad words like
+# "network"/"connect"/"login" appear inside many of these more specific
+# phrases ("login page not showing" contains "login"), so the specific
+# group must win first or the generic WiFi reply would swallow it.
+_CAPTIVE_PORTAL_KEYWORDS = (
+    "captive portal",
+    "splash page",
+    "login page not showing",
+    "guest login page",
+    "portal not loading",
+    "welcome page",
+    "sign-in page",
+    "sign in page",
+)
+_DHCP_KEYWORDS = (
+    "dhcp",
+    "ip address pool",
+    "ip pool",
+    "ip lease",
+    "no ip address",
+    "ip conflict",
+    "didn't get an ip",
+    "did not get an ip",
+)
+_VLAN_KEYWORDS = ("vlan", "802.1q", "vlan tag")
+_PORT_FORWARDING_KEYWORDS = (
+    "port forward",
+    "port forwarding",
+    "open a port",
+    "expose a server",
+    "nat rule",
+)
+_FAILOVER_KEYWORDS = (
+    "failover",
+    "backup internet",
+    "second isp",
+    "backup uplink",
+    "primary link down",
+    "auto failback",
+    "isp down",
+)
+_TRUSTED_DEVICE_KEYWORDS = (
+    "mac address",
+    "trusted device",
+    "skip the captive portal",
+    "bypass the login",
+    "bypass captive portal",
+    "mac auth",
+    "whitelist a device",
+    "whitelist this device",
+)
+_BUSINESS_HOURS_KEYWORDS = (
+    "business hours",
+    "closed message",
+    "outside business hours",
+    "opening hours",
+    "closing hours",
+)
+_QOS_KEYWORDS = (
+    "qos",
+    "bandwidth limit",
+    "slow wifi",
+    "slow internet",
+    "throttle",
+    "speed limit",
+    "buffering",
+)
 _BILLING_KEYWORDS = ("bill", "invoice", "payment", "charge", "subscription", "refund")
 _LOCATION_KEYWORDS = (
     "location",
@@ -204,6 +273,75 @@ _VOUCHER_REPLY = (
     "and does not refresh; ask your front-desk/reception team to issue a "
     "new one from the Vouchers section of the dashboard."
 )
+_CAPTIVE_PORTAL_REPLY = (
+    "Your guest sign-in screen is configured in the Portal section of "
+    "your dashboard -- headline, welcome message, brand color, logo, and "
+    "which sign-in methods guests see (Mobile OTP, Email OTP, Voucher, "
+    "Social Login) all live there, with a Live Preview so you can check "
+    "changes before saving. If the page isn't showing at all for guests, "
+    "two common causes: the router is offline (check the Routers page), "
+    "or Business Hours is configured and you're currently outside the "
+    "open hours -- guests see a closed screen instead of sign-in during "
+    "that window."
+)
+_DHCP_REPLY = (
+    "IP addresses for guests are handed out from a DHCP pool, configured "
+    "in the IP Address Pool section -- each pool belongs to exactly one "
+    "router, with a range start/end, an optional gateway IP, and DNS "
+    "servers. If a device isn't getting an IP, check that a pool exists "
+    "for that router's interface and that the range isn't already fully "
+    "used (an exhausted pool is the most common cause of 'no IP address' "
+    "reports)."
+)
+_VLAN_REPLY = (
+    "VLANs separate traffic on one router -- each VLAN belongs to "
+    "exactly one router for its lifetime, with an 802.1Q tag and a trunk "
+    "interface. Creating a VLAN only creates the network segment; it "
+    "does not hand out addresses by itself -- create a DHCP Pool "
+    "afterward with its Interface set to that VLAN (e.g. vlan100) so "
+    "guests on it actually get an IP. A VLAN can also have its own "
+    "captive portal if you want guests on it to sign in separately."
+)
+_PORT_FORWARDING_REPLY = (
+    "Port forwarding rules (Port Forwarding section) map an external "
+    "port on a router to an internal address and port -- each rule "
+    "belongs to one router and has a protocol (TCP/UDP/both), "
+    "destination port, internal address/port, and an Enabled toggle. "
+    "Double-check the internal address is reachable from that router's "
+    "network and the rule is enabled if traffic isn't getting through."
+)
+_FAILOVER_REPLY = (
+    "Internet failover is set up under Internet Failover / ISP Uplinks -- "
+    "add each uplink with a role (Primary or Backup) and a priority; "
+    "with Auto Failback on, traffic automatically returns to the primary "
+    "link once it's healthy again. If failover isn't kicking in, confirm "
+    "the backup uplink is itself online and has a lower priority number "
+    "than the primary."
+)
+_TRUSTED_DEVICE_REPLY = (
+    "Trusted Devices lets you authorize a specific MAC address to skip "
+    "the captive portal entirely -- add the address, choose a type "
+    "(e.g. Permanent), and an optional comment so you remember what it's "
+    "for. This is the right tool for staff devices, printers, or POS "
+    "terminals that shouldn't have to sign in like a guest every time."
+)
+_BUSINESS_HOURS_REPLY = (
+    "Business Hours (in your dashboard) controls when the guest sign-in "
+    "screen is available -- toggle each day open/closed and set opening "
+    "and closing times. Outside those hours, guests see a 'we're closed' "
+    "screen with your configured message instead of the sign-in page, "
+    "so if guests report they can't connect, check this isn't "
+    "unintentionally set for the current time."
+)
+_QOS_REPLY = (
+    "Bandwidth shaping for guest traffic is configured through QoS "
+    "rules on the router. If WiFi feels slow for everyone, check "
+    "whether a QoS limit is set lower than expected, and confirm the "
+    "actual uplink speed (Download/Upload Mbps) on the Internet "
+    "Connection page matches what your ISP is actually providing -- a "
+    "capped or degraded uplink looks identical to a QoS limit from a "
+    "guest's perspective."
+)
 _BILLING_REPLY = (
     "For billing questions -- invoices, payment methods, or a charge you "
     "don't recognize -- the Billing section of your dashboard has your "
@@ -261,6 +399,25 @@ class LoggingAssistantProvider:
             return _VOUCHER_CREATE_REPLY
         if any(keyword in lowered for keyword in _VOUCHER_KEYWORDS):
             return _VOUCHER_REPLY
+        # Network-domain groups, checked before the generic _WIFI_KEYWORDS
+        # bucket -- see the comment above _CAPTIVE_PORTAL_KEYWORDS for why
+        # the order matters here.
+        if any(keyword in lowered for keyword in _CAPTIVE_PORTAL_KEYWORDS):
+            return _CAPTIVE_PORTAL_REPLY
+        if any(keyword in lowered for keyword in _DHCP_KEYWORDS):
+            return _DHCP_REPLY
+        if any(keyword in lowered for keyword in _VLAN_KEYWORDS):
+            return _VLAN_REPLY
+        if any(keyword in lowered for keyword in _PORT_FORWARDING_KEYWORDS):
+            return _PORT_FORWARDING_REPLY
+        if any(keyword in lowered for keyword in _FAILOVER_KEYWORDS):
+            return _FAILOVER_REPLY
+        if any(keyword in lowered for keyword in _TRUSTED_DEVICE_KEYWORDS):
+            return _TRUSTED_DEVICE_REPLY
+        if any(keyword in lowered for keyword in _BUSINESS_HOURS_KEYWORDS):
+            return _BUSINESS_HOURS_REPLY
+        if any(keyword in lowered for keyword in _QOS_KEYWORDS):
+            return _QOS_REPLY
         if any(keyword in lowered for keyword in _BILLING_KEYWORDS):
             return _BILLING_REPLY
         if any(keyword in lowered for keyword in _LOCATION_KEYWORDS):
@@ -332,7 +489,45 @@ class AnthropicAssistantProvider:
                 "and assigned a role (Owner, Admin, or a custom role) "
                 "that controls what they can see and do.\n"
                 "- Billing: invoices, payment methods, and subscription "
-                "status live in the Billing section.\n\n"
+                "status live in the Billing section.\n"
+                "- Captive portal (guest sign-in screen): configured in "
+                "the Portal section -- headline, welcome message, brand "
+                "color, logo, and which sign-in methods guests see "
+                "(Mobile OTP, Email OTP, Voucher, Social Login), with a "
+                "Live Preview before saving.\n"
+                "- IP addresses / DHCP: guests get an IP from a DHCP "
+                "pool (IP Address Pool section) -- each pool belongs to "
+                "exactly one router, with a range start/end, optional "
+                "gateway IP, and DNS servers. An exhausted range is the "
+                "most common cause of a device not getting an IP.\n"
+                "- VLANs: each VLAN belongs to exactly one router for "
+                "its lifetime (802.1Q tag + trunk interface). Creating a "
+                "VLAN only creates the network segment -- a DHCP Pool "
+                "must be created afterward with its Interface set to "
+                "that VLAN for guests on it to actually get an address. "
+                "A VLAN can have its own separate captive portal.\n"
+                "- Port forwarding: each rule belongs to one router, "
+                "with a protocol (TCP/UDP/both), destination port, "
+                "internal address/port, and an Enabled toggle.\n"
+                "- Internet failover: uplinks are added under Internet "
+                "Failover / ISP Uplinks with a role (Primary/Backup) and "
+                "priority; Auto Failback returns traffic to the primary "
+                "automatically once it's healthy again.\n"
+                "- Trusted devices: a specific MAC address can be "
+                "authorized to skip the captive portal entirely (type + "
+                "optional comment) -- the right tool for staff devices, "
+                "printers, or POS terminals.\n"
+                "- Business Hours: controls when the guest sign-in "
+                "screen is available at all -- toggle each day open/"
+                "closed with times; outside those hours guests see a "
+                "configured 'closed' screen instead of sign-in, which is "
+                "a common cause of 'guests can't connect' reports that "
+                "isn't a router problem.\n"
+                "- Bandwidth/QoS: guest traffic shaping is configured "
+                "through QoS rules on the router; also check the actual "
+                "uplink Download/Upload Mbps on the Internet Connection "
+                "page, since a capped ISP link looks identical to a QoS "
+                "limit from a guest's perspective.\n\n"
                 "Be concise and practical, and answer the actual question "
                 "asked -- e.g. a question about *creating* a voucher is "
                 "about the staff-facing plan/generate flow, not the "

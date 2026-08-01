@@ -71,6 +71,12 @@ class GuestAccessRule(BaseModel):
     identifier: Mapped[str] = mapped_column(String(255), nullable=False)
     rule_type: Mapped[str] = mapped_column(String(20), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Contact email captured on the customer dashboard's Whitelist form
+    # (WhiteList.tsx) -- previously collected client-side, validated, and
+    # then silently dropped before the API call. Nullable: guest/device
+    # rules created any other way (API, future bulk import) never required
+    # one.
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # NULL == never expires (permanent WHITELIST/BLOCKLIST/VIP). Required,
     # in practice, for TEMPORARY -- enforced by
     # validators.validate_rule_expiry, not a DB constraint (mirrors
@@ -115,6 +121,9 @@ class DeviceAccessRule(BaseModel):
     mac_address: Mapped[str] = mapped_column(String(17), nullable=False)
     rule_type: Mapped[str] = mapped_column(String(20), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # See GuestAccessRule.email's docstring -- identical "captured on the
+    # dashboard form, previously dropped before the API call" fix.
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

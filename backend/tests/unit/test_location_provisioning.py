@@ -977,13 +977,48 @@ class TestHappyPath:
             data=_input(new_organization=_new_org(), plan_id=base_plan_id),
         )
 
-        # MOBILE_OTP=True on the plan -> both OTP channels enabled;
-        # VOUCHER_LOGIN=False on the plan -> voucher disabled.
+        # MOBILE_OTP=True on the plan -> SMS OTP enabled;
+        # VOUCHER_LOGIN=False on the plan -> voucher disabled;
+        # otp_email_enabled is unconditional (see next test).
         assert captured["otp_sms_enabled"] is True
         assert captured["otp_email_enabled"] is True
         assert captured["voucher_enabled"] is False
         assert captured["is_default"] is False
         assert captured["location_id"] is not None
+
+    async def test_email_otp_enabled_even_without_mobile_otp_plan_feature(
+        self,
+    ) -> None:
+        """Real incident regression: a plan without the MOBILE_OTP add-on
+        used to provision a location with BOTH SMS and email OTP disabled
+        (``otp_email_enabled`` incorrectly reused ``mobile_otp_enabled`` as
+        its source), leaving no login method a guest with only an email
+        address could use -- every attempt fell through to the
+        password-login form and failed with no saved password. Email OTP
+        has no per-send cost the way SMS does, so it must stay enabled
+        regardless of the plan's mobile-OTP add-on."""
+        service, fakes, base_plan_id = make_service()
+        # Flip MOBILE_OTP off on the existing fixture plan.
+        for feature in fakes.features_by_plan_id[base_plan_id]:
+            if feature.feature_key == PlanFeatureKey.MOBILE_OTP.value:
+                feature.is_enabled = False
+
+        captured: dict[str, object] = {}
+        original_create_config = fakes.create_config
+
+        async def _spy_create_config(**fields):
+            captured.update(fields)
+            return await original_create_config(**fields)
+
+        fakes.create_config = _spy_create_config  # type: ignore[method-assign]
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert captured["otp_sms_enabled"] is False
+        assert captured["otp_email_enabled"] is True
 
 
 # ============================================================================

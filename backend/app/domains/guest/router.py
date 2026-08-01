@@ -35,6 +35,7 @@ envelope).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 
@@ -88,6 +89,8 @@ from .schemas import (
     GuestSessionResponse,
     GuestSetPasswordRequest,
     GuestSetPasswordResponse,
+    GuestUpdateProfileRequest,
+    GuestUpdateProfileResponse,
     GuestVoucherLoginRequest,
     OtpSuccessRateResponse,
     RadiusAccountingRequest,
@@ -131,9 +134,79 @@ analytics_router = APIRouter(prefix="/guest-analytics", tags=["Guest Analytics"]
 _RADIUS_AGENT_URL = "http://20.219.72.235:9092/radius/client"
 _RADIUS_AGENT_SECRET = "radiusagent-f37ae8fca1db9695975657196ea19b2e"
 
+logger = logging.getLogger(__name__)
+
 
 def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
+
+
+async def _deregister_nas_from_radius_bridge(nas_identifier: str) -> None:
+    """Best-effort removal of ``nas_identifier``'s live entry from the real
+    FreeRADIUS server's ``clients.conf`` -- the exact symmetric counterpart
+    ``register_external_radius_nas``'s own bridge ``POST`` never had.
+    Confirmed gap: neither this NAS-delete path nor a decommissioned
+    router's cascade ever called the bridge to remove the entry it added at
+    registration time, so a stale entry could silently collide with a later
+    router that ends up sharing the same physical public IP (a decommission
+    -then-re-provision at the same site, same ISP connection, is the
+    plausible real case). Deliberately never raises -- a bridge outage at
+    delete time must not block the DB-level soft-delete this always follows
+    (or the router decommission it's a part of), mirroring
+    ``app.domains.router_agent.router.agent_heartbeat``'s identical "a
+    failure to record this additive side effect is not a reason to fail the
+    call" reasoning; a failure is logged instead, for the same manual-SSH
+    cleanup this replaces to fall back on.
+
+    The bridge process itself is external infrastructure -- not part of
+    this repository, so its actual handler for this ``DELETE`` cannot be
+    inspected or deployed from here. This call assumes it exposes a
+    ``DELETE`` counterpart to the ``POST`` it already answers at the same
+    URL, keyed by ``nas_identifier`` (the one stable identifier a NAS
+    client keeps for its whole lifetime, unlike ``tunnel_ip``, which a
+    WireGuard rotation could change). **Whoever owns that bridge script
+    needs to confirm/add a matching handler and verify this live** -- this
+    closes only the platform-side half of the gap (the call that was
+    previously never made at all)."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.request(
+                "DELETE",
+                _RADIUS_AGENT_URL,
+                headers={
+                    "X-Agent-Secret": _RADIUS_AGENT_SECRET,
+                    "Content-Type": "application/json",
+                },
+                json={"nas_identifier": nas_identifier},
+            )
+            resp.raise_for_status()
+    except httpx.HTTPError:
+        logger.warning(
+            "radius_nas_bridge_deregister_failed",
+            extra={"nas_identifier": nas_identifier},
+        )
+
+
+async def deregister_radius_nas_client(
+    service: RadiusService,
+    *,
+    nas_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None,
+    actor_user_id: uuid.UUID | None,
+) -> RadiusNasClient:
+    """Soft-deletes ``nas_id`` (DB) *and* removes its live entry from the
+    real FreeRADIUS server (bridge) -- the one place both halves of a NAS's
+    deletion happen together, so every caller (the explicit admin endpoint
+    below, and ``app.domains.router.router.decommission_router``'s
+    composition of this same function) gets the fix, not just one of
+    them."""
+    nas_client = await service.delete_nas(
+        nas_id=nas_id,
+        requesting_organization_id=requesting_organization_id,
+        actor_user_id=actor_user_id,
+    )
+    await _deregister_nas_from_radius_bridge(nas_client.nas_identifier)
+    return nas_client
 
 
 def _device_response(device: GuestDevice) -> dict[str, object]:
@@ -377,6 +450,34 @@ async def guest_set_password(
         message="Password set",
         data=GuestSetPasswordResponse(
             guest_id=str(guest.id), password_set=True
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/profile",
+    response_model=ApiResponse[GuestUpdateProfileResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_update_profile(
+    request: Request,
+    payload: GuestUpdateProfileRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    guest = await service.update_guest_profile(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        display_name=payload.display_name,
+        email=payload.email,
+    )
+    return build_response(
+        success=True,
+        message="Profile updated",
+        data=GuestUpdateProfileResponse(
+            guest_id=str(guest.id),
+            display_name=guest.display_name,
+            email=guest.email,
         ).model_dump(),
         request_id=_request_id(request),
     )
@@ -1032,7 +1133,8 @@ async def delete_radius_nas(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RadiusService = Depends(get_radius_service),
 ):
-    nas_client = await service.delete_nas(
+    nas_client = await deregister_radius_nas_client(
+        service,
         nas_id=nas_id,
         requesting_organization_id=requesting_organization_id,
         actor_user_id=uuid.UUID(user.id),
@@ -1205,33 +1307,64 @@ async def get_radius_nas_for_router(
 
 @radius_router.post(
     "/authorize",
-    response_model=RadiusAuthorizeResponse,
     status_code=status.HTTP_200_OK,
 )
 async def radius_authorize(
     payload: RadiusAuthorizeRequest,
     nas_client=Depends(CurrentNas),
     service: RadiusService = Depends(get_radius_service),
-) -> RadiusAuthorizeResponse:
+) -> dict:
     """The real MAC-whitelist auto-connect bypass lives here, not a
     separate public endpoint -- see ``RadiusService.authorize``'s
     docstring. ``payload.calling_station_id`` (the NAS-asserted MAC, RFC
     2865 Section 5.31) only ever reaches this call alongside a shared-
     secret-authenticated ``nas_client``, so -- unlike the former
     ``POST /guest/login/mac`` -- a MAC address can never grant access
-    here on the strength of an unauthenticated client's own claim."""
+    here on the strength of an unauthenticated client's own claim.
+
+    This endpoint's only real consumer is FreeRADIUS's own ``rlm_rest``
+    module (``mods-enabled/rest``'s ``authorize {}`` block). Confirmed
+    live via ``freeradius -X``: rlm_rest's JSON response decoder treats
+    every top-level key as a literal RADIUS attribute name
+    (``[list:]Attribute-Name``) -- this endpoint's previous plain
+    ``{"authorized": true, ...}`` shape has no key rlm_rest recognizes,
+    so every field was silently discarded ("Invalid vendor name in
+    attribute name 'authorized', skipping..."). With nothing ever
+    setting ``control:Auth-Type``, and no local password for FreeRADIUS's
+    own ``pap``/``files`` modules to check (this architecture is
+    session-lookup, not password verification, by design), FreeRADIUS
+    fell through to its own hardcoded default -- "No Auth-Type found:
+    rejecting the user" -- an Access-Reject on *every* login, regardless
+    of this endpoint's own (correct) accept/reject decision, invisible
+    behind an HTTP 200. The wire response below uses rlm_rest's real
+    attribute-name convention instead."""
     result = await service.authorize(
         nas_client=nas_client,
         username=payload.username,
         calling_station_id=payload.calling_station_id,
     )
-    return RadiusAuthorizeResponse(
-        authorized=result.authorized,
-        session_timeout_seconds=result.session_timeout_seconds,
-        data_limit_mb=result.data_limit_mb,
-        rate_limit=result.rate_limit,
-        reply_message="accept" if result.authorized else "reject",
-    )
+    reply: dict = {
+        "control:Auth-Type": "Accept" if result.authorized else "Reject",
+    }
+    if result.authorized:
+        if result.session_timeout_seconds is not None:
+            reply["Session-Timeout"] = result.session_timeout_seconds
+        if result.rate_limit is not None:
+            reply["Mikrotik-Rate-Limit"] = result.rate_limit
+        # Without this, RouterOS's hotspot profile (radius-interim-update
+        # ="received" -- confirmed live, this platform's own setup script
+        # never sets a fixed interval) never sends a single
+        # Accounting-Interim-Update for the session's whole lifetime: it
+        # only starts that periodic reporting once it's TOLD an interval
+        # via this exact reply attribute (RFC 2869 §2.1). Confirmed live:
+        # every real GuestSession's bytes_uploaded/bytes_downloaded stayed
+        # 0 for the session's entire active lifetime as a direct result --
+        # only a final Accounting-Stop (session end) ever carried real
+        # totals, so "Reports" showed no usage for any still-active or
+        # recently-active guest. 300s balances real-time-enough usage data
+        # against accounting request volume at scale.
+        reply["Acct-Interim-Interval"] = 300
+    return reply
 
 
 @radius_router.post(
@@ -1263,23 +1396,23 @@ async def radius_accounting(
             closed_session_count=len(closed),
         )
 
-    # payload's own model_validator already guarantees session_id is set
+    # payload's own model_validator already guarantees username is set
     # for every status_type reachable below.
     if payload.status_type == RADIUS_ACCT_STATUS_START:
         session = await service.accounting_start(
-            nas_client=nas_client, session_id=payload.session_id
+            nas_client=nas_client, username=payload.username
         )
     elif payload.status_type == RADIUS_ACCT_STATUS_INTERIM_UPDATE:
         session = await service.accounting_interim_update(
             nas_client=nas_client,
-            session_id=payload.session_id,
+            username=payload.username,
             bytes_uploaded_delta=payload.bytes_uploaded_delta,
             bytes_downloaded_delta=payload.bytes_downloaded_delta,
         )
     elif payload.status_type == RADIUS_ACCT_STATUS_STOP:
         session = await service.accounting_stop(
             nas_client=nas_client,
-            session_id=payload.session_id,
+            username=payload.username,
             bytes_uploaded_total=payload.bytes_uploaded_total,
             bytes_downloaded_total=payload.bytes_downloaded_total,
             disconnect_reason=payload.disconnect_reason,
@@ -1474,4 +1607,5 @@ __all__ = [
     "nas_router",
     "nas_cross_reference_router",
     "analytics_router",
+    "deregister_radius_nas_client",
 ]

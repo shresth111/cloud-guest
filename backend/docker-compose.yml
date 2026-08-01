@@ -24,7 +24,29 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: cloudguest-celery-worker
-    command: ["celery", "-A", "app.core.celery_app", "worker", "--loglevel=info"]
+    # -Q celery,device_io: this one worker process consumes both the
+    # default queue (every pure-DB Beat sweep) and the device_io queue
+    # (app.core.celery_app.DEVICE_IO_QUEUE_NAME -- the real per-router/
+    # per-link RouterOS device-I/O tasks app.core.celery_app.celery_app's
+    # own task_routes routes there). Single-worker-multi-queue, not a
+    # second worker service, is the simplest fix that actually separates
+    # the two workloads at the queue level -- see that module's own
+    # docstring for exactly which task names land on device_io and why. A
+    # genuinely separate worker service/container per queue would fully
+    # isolate device-I/O-bound tasks from pure-DB ones at the *process*
+    # level too (one worker's device I/O backlog could never even compete
+    # for the same worker slots as the other's DB sweeps) -- a real further
+    # improvement, not implemented here to keep this change minimal.
+    command:
+      [
+        "celery",
+        "-A",
+        "app.core.celery_app",
+        "worker",
+        "--loglevel=info",
+        "-Q",
+        "celery,device_io",
+      ]
     env_file:
       - .env
     depends_on:

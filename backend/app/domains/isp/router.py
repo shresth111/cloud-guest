@@ -23,6 +23,7 @@ resolves the literal path first, mirroring the same discipline
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query, Request, status
 
@@ -35,7 +36,7 @@ from app.domains.rbac.dependencies import (
     RequirePermission,
 )
 
-from .constants import IspLinkRole
+from .constants import HealthStatus, IspLinkRole
 from .dependencies import get_isp_service
 from .models import IspHealthCheck, IspLink
 from .schemas import (
@@ -44,6 +45,7 @@ from .schemas import (
     IspHealthCheckResponse,
     IspLinkCreateRequest,
     IspLinkListResponse,
+    IspLinkManualStatusRequest,
     IspLinkResponse,
     IspLinkUpdateRequest,
     MessageResponse,
@@ -73,7 +75,9 @@ def _pagination_fields(meta: PaginationMeta) -> dict[str, int | bool]:
 # ============================================================================
 
 
-def _link_response(link: IspLink) -> IspLinkResponse:
+def _link_response(
+    link: IspLink, *, unhealthy_since: datetime | None = None
+) -> IspLinkResponse:
     return IspLinkResponse(
         id=str(link.id),
         router_id=str(link.router_id),
@@ -81,6 +85,7 @@ def _link_response(link: IspLink) -> IspLinkResponse:
         location_id=str(link.location_id),
         provider_name=link.provider_name,
         link_type=link.link_type,
+        connection_mode=link.connection_mode,
         role=link.role,
         is_active_uplink=link.is_active_uplink,
         auto_failback=link.auto_failback,
@@ -93,8 +98,12 @@ def _link_response(link: IspLink) -> IspLinkResponse:
         download_bandwidth_mbps=link.download_bandwidth_mbps,
         upload_bandwidth_mbps=link.upload_bandwidth_mbps,
         health_status=link.health_status,
+        health_status_source=link.health_status_source,
+        unhealthy_since=unhealthy_since,
         latency_ms=link.latency_ms,
         packet_loss_percentage=link.packet_loss_percentage,
+        current_download_mbps=link.current_download_mbps,
+        current_upload_mbps=link.current_upload_mbps,
         last_checked_at=link.last_checked_at,
         consecutive_unhealthy_count=link.consecutive_unhealthy_count,
         created_at=link.created_at,
@@ -107,9 +116,12 @@ def _health_check_response(check: IspHealthCheck) -> IspHealthCheckResponse:
         isp_link_id=str(check.isp_link_id),
         checked_at=check.checked_at,
         status=check.status,
+        source=check.source,
         latency_ms=check.latency_ms,
         packet_loss_percentage=check.packet_loss_percentage,
         error_message=check.error_message,
+        download_mbps=check.download_mbps,
+        upload_mbps=check.upload_mbps,
     )
 
 
@@ -137,6 +149,7 @@ async def create_isp_link(
         router_id=uuid.UUID(payload.router_id),
         provider_name=payload.provider_name,
         link_type=payload.link_type,
+        connection_mode=payload.connection_mode,
         role=IspLinkRole(payload.role),
         priority=payload.priority,
         interface=payload.interface,
@@ -175,9 +188,11 @@ async def list_isp_links(
         page=page,
         page_size=page_size,
     )
-    payload = IspLinkListResponse(
-        items=[_link_response(link) for link in links], **_pagination_fields(meta)
-    )
+    items = [
+        _link_response(link, unhealthy_since=await service.compute_unhealthy_since(link))
+        for link in links
+    ]
+    payload = IspLinkListResponse(items=items, **_pagination_fields(meta))
     return build_response(
         success=True,
         message="ISP links retrieved",
@@ -201,10 +216,11 @@ async def get_isp_link(
     link = await service.get_link(
         link_id, requesting_organization_id=requesting_organization_id
     )
+    unhealthy_since = await service.compute_unhealthy_since(link)
     return build_response(
         success=True,
         message="ISP link retrieved",
-        data=_link_response(link).model_dump(),
+        data=_link_response(link, unhealthy_since=unhealthy_since).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -230,10 +246,11 @@ async def update_isp_link(
         requesting_organization_id=requesting_organization_id,
         **fields,
     )
+    unhealthy_since = await service.compute_unhealthy_since(link)
     return build_response(
         success=True,
         message="ISP link updated",
-        data=_link_response(link).model_dump(),
+        data=_link_response(link, unhealthy_since=unhealthy_since).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -284,10 +301,46 @@ async def check_isp_link_health(
     link = await service.check_link_health(
         link_id, requesting_organization_id=requesting_organization_id
     )
+    unhealthy_since = await service.compute_unhealthy_since(link)
     return build_response(
         success=True,
         message="ISP link health check completed",
-        data=_link_response(link).model_dump(),
+        data=_link_response(link, unhealthy_since=unhealthy_since).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/links/{link_id}/status",
+    response_model=ApiResponse[IspLinkResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("isp.update"))],
+)
+async def set_isp_link_manual_status(
+    request: Request,
+    link_id: uuid.UUID,
+    payload: IspLinkManualStatusRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: IspService = Depends(get_isp_service),
+):
+    """An admin's own manual override of a link's current status --
+    ``isp.update`` (the same permission ``PUT /links/{link_id}`` already
+    requires) since this is a state change to the link's own row, not a
+    new class of action. Never opens a device connection -- see
+    ``IspService.set_manual_health_status``'s own docstring."""
+    link = await service.set_manual_health_status(
+        link_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+        health_status=HealthStatus(payload.health_status),
+        reason=payload.reason,
+    )
+    unhealthy_since = await service.compute_unhealthy_since(link)
+    return build_response(
+        success=True,
+        message="ISP link status updated",
+        data=_link_response(link, unhealthy_since=unhealthy_since).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -351,10 +404,11 @@ async def trigger_isp_failover(
         reason=payload.reason,
         requesting_organization_id=requesting_organization_id,
     )
+    unhealthy_since = await service.compute_unhealthy_since(link)
     return build_response(
         success=True,
         message="ISP failover triggered",
-        data=_link_response(link).model_dump(),
+        data=_link_response(link, unhealthy_since=unhealthy_since).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -377,10 +431,11 @@ async def trigger_isp_failback(
         actor_user_id=uuid.UUID(actor.id),
         requesting_organization_id=requesting_organization_id,
     )
+    unhealthy_since = await service.compute_unhealthy_since(link)
     return build_response(
         success=True,
         message="ISP failback triggered",
-        data=_link_response(link).model_dump(),
+        data=_link_response(link, unhealthy_since=unhealthy_since).model_dump(),
         request_id=_request_id(request),
     )
 

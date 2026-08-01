@@ -90,6 +90,17 @@ class WireGuardTunnelCreateResponse(WireGuardPeerResponse):
     hub_endpoint_host: str
     hub_endpoint_port: int
     tunnel_network_cidr: str
+    # The hub's own address *inside* the tunnel (e.g. "10.20.0.1"), derived
+    # from `tunnel_network_cidr` via validators.hub_reserved_ip -- distinct
+    # from hub_endpoint_host, which is the hub's *public* address a router
+    # dials to establish the tunnel in the first place. Callers that need
+    # to reach the hub's own services (e.g. RADIUS) *through* the tunnel,
+    # rather than dial the tunnel itself, need this address instead --
+    # some sites' ISPs block RADIUS's own UDP ports (1812/1813) outbound
+    # but never touch WireGuard's single UDP port, so pointing a router's
+    # `/radius add address=...` at this address instead of the hub's
+    # public IP is what actually gets RADIUS traffic through in that case.
+    hub_tunnel_ip_address: str
     persistent_keepalive_seconds: int = DEFAULT_PERSISTENT_KEEPALIVE_SECONDS
 
 

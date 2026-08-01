@@ -47,6 +47,37 @@ class IspLinkType(StrEnum):
     OTHER = "other"
 
 
+class IspConnectionMode(StrEnum):
+    """How this WAN link actually obtains its own gateway/IP configuration
+    -- drives which real health-check *target-resolution* strategy
+    ``IspService.ping_link`` uses (see ``device_adapters.py``'s own module
+    docstring for the real RouterOS calls each one issues). Deliberately
+    its own field, never folded into :class:`IspLinkType` -- a fiber
+    connection can be ``STATIC``, ``DHCP``, or ``PPPOE``-authenticated all
+    the same (the two are orthogonal: one is the physical medium, this is
+    the addressing/authentication mode on top of it), so conflating them
+    would make ``IspLinkType`` lie about a link's real physical medium the
+    moment an admin needed to record its addressing mode.
+
+    * ``STATIC`` -- a fixed, admin-known gateway IP (``IspLink
+      .gateway_ip_address``, typed in once). The original, only-ever-
+      supported mode -- default for every pre-existing row.
+    * ``DHCP`` -- the gateway is assigned dynamically by the ISP and can
+      change at any time. Never typed in manually -- resolved live at
+      every health check from the router's own *current* dynamic default
+      route (``/ip route print`` where ``dst-address=0.0.0.0/0`` and
+      ``dynamic=true``), so a re-lease never goes stale against a
+      manually-entered value nobody updated.
+    * ``PPPOE`` -- no IP-layer gateway concept at all; health is the
+      PPPoE client interface's own up/down (``running``/``disabled``)
+      state, checked directly rather than pinged.
+    """
+
+    STATIC = "static"
+    DHCP = "dhcp"
+    PPPOE = "pppoe"
+
+
 class IspLinkRole(StrEnum):
     """A router's own static, admin-assigned uplink priority -- distinct
     from :attr:`~.models.IspLink.is_active_uplink` (which link is
@@ -72,6 +103,24 @@ class HealthStatus(StrEnum):
     DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
     UNKNOWN = "unknown"
+
+
+class HealthStatusSource(StrEnum):
+    """Where a link's own *current* ``IspLink.health_status`` (and each
+    ``IspHealthCheck`` row's own ``status``) actually came from --
+    ``AUTOMATED`` for a real RouterOS ``/tool/ping`` reading (the sweep or
+    a manual on-demand check), ``MANUAL`` for an admin's own override (see
+    ``IspService.set_manual_health_status``). Deliberately a source tag on
+    the *existing* ``healthy``/``degraded``/``unhealthy``/``unknown``
+    vocabulary, never a parallel status enum -- the founder's own
+    "map onto the existing healthy/unhealthy vocabulary, don't invent a
+    new one" instruction. The *next* real ping naturally reclaims a link
+    back to ``AUTOMATED`` (``record_health_check_result`` always writes
+    this field), so a manual override is a point-in-time statement, not a
+    permanent lockout of the real health-check sweep."""
+
+    AUTOMATED = "automated"
+    MANUAL = "manual"
 
 
 # ============================================================================
@@ -101,24 +150,52 @@ DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER = 3
 ISP_PING_COUNT = 5
 ISP_PING_TIMEOUT_SECONDS = 10
 
+# How far back (in real IspHealthCheck rows) IspService
+# .compute_unhealthy_since is willing to scan looking for where the
+# link's *current* unbroken UNHEALTHY streak actually began -- capped,
+# not unbounded, mirroring this domain's "small, proportionate, never a
+# full historical-analytics system" scope elsewhere (e.g.
+# compute_availability_percentage's own bounded page). At the sweep's own
+# 60-second cadence this covers a little over 3 hours of continuous
+# downtime before falling back to reporting the window's own oldest
+# checked_at as an honest lower bound rather than an exact instant.
+UNHEALTHY_SINCE_LOOKBACK_LIMIT = 200
+
 # ============================================================================
-# Health-check sweep -- Celery Beat task wiring. Every 60 seconds: a WAN
-# uplink failing is exactly as operationally urgent as a stale guest
-# session (see app.domains.guest.constants
+# Health-check sweep -- Celery Beat task wiring.
+#
+# Was 60 seconds (a WAN uplink failing is exactly as operationally urgent
+# as a stale guest session -- see app.domains.guest.constants
 # .SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS's own 5-minute cadence
-# reasoning) -- arguably more so, since every guest at a site rides on
-# whichever link is currently active, hence a tighter interval than that
-# precedent.
+# reasoning -- arguably more so). Raised to 10 minutes: the sweep
+# (service.run_health_check_sweep) is a single Celery Beat task that
+# fetches every enabled IspLink platform-wide and health-checks them
+# **sequentially, one real RouterOS API connection at a time**, in one
+# plain `for` loop inside one task run -- not fanned out per-link/
+# per-router, and this codebase has no overlap-prevention lock on any
+# Celery Beat task (here or elsewhere). At real scale (1000+ links) a
+# real RouterOS connection+ping is meaningfully more expensive than a
+# bare ICMP ping from a control server, so a 60-second interval risked
+# the sweep's own wall-clock runtime exceeding the interval itself and
+# queuing up overlapping runs -- a materially bigger risk than any single
+# link's own API load. 10 minutes is a real, accepted mitigation (fewer,
+# less-frequent runs), not a full fix -- true safety at 1000+ links still
+# needs either bounded concurrency within one sweep run (e.g.
+# `asyncio.gather` with a semaphore) or an overlap-prevention lock so a
+# slow run is skipped-not-queued rather than doubled up; out of scope for
+# this pass, flagged here for whoever picks up that follow-on work.
 # ============================================================================
 
 TASK_RUN_ISP_HEALTH_CHECK_SWEEP = "app.domains.isp.tasks.run_isp_health_check_sweep"
-ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS = 60.0
+ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS = 600.0
 
 
 __all__ = [
     "IspLinkType",
+    "IspConnectionMode",
     "IspLinkRole",
     "HealthStatus",
+    "HealthStatusSource",
     "DEFAULT_LATENCY_DEGRADED_THRESHOLD_MS",
     "DEFAULT_LATENCY_UNHEALTHY_THRESHOLD_MS",
     "DEFAULT_PACKET_LOSS_DEGRADED_THRESHOLD_PERCENT",
@@ -126,6 +203,7 @@ __all__ = [
     "DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER",
     "ISP_PING_COUNT",
     "ISP_PING_TIMEOUT_SECONDS",
+    "UNHEALTHY_SINCE_LOOKBACK_LIMIT",
     "TASK_RUN_ISP_HEALTH_CHECK_SWEEP",
     "ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS",
 ]

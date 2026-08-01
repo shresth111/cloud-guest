@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from .constants import AccessRuleType
 
@@ -57,6 +57,10 @@ class GuestAccessRuleCreate(BaseModel):
     identifier: str = Field(..., min_length=1, max_length=255)
     rule_type: AccessRuleType
     reason: str | None = Field(default=None, max_length=2000)
+    email: EmailStr | None = Field(
+        default=None,
+        description="Optional contact email for whoever this rule was created for.",
+    )
     expires_at: datetime | None = Field(
         default=None,
         description=(
@@ -74,6 +78,7 @@ class DeviceAccessRuleCreate(BaseModel):
     mac_address: str = Field(..., min_length=12, max_length=17)
     rule_type: AccessRuleType
     reason: str | None = Field(default=None, max_length=2000)
+    email: EmailStr | None = Field(default=None)
     expires_at: datetime | None = Field(default=None)
 
     _normalize_expires_at = field_validator("expires_at")(_assume_utc_if_naive)
@@ -100,6 +105,7 @@ class GuestAccessRuleResponse(BaseModel):
     identifier: str
     rule_type: str
     reason: str | None
+    email: str | None
     expires_at: datetime | None
     is_active: bool
     created_at: datetime
@@ -115,6 +121,7 @@ class DeviceAccessRuleResponse(BaseModel):
     mac_address: str
     rule_type: str
     reason: str | None
+    email: str | None
     expires_at: datetime | None
     is_active: bool
     created_at: datetime

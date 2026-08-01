@@ -21,6 +21,7 @@ __all__ = [
     "IspPrimaryLinkAlreadyExistsError",
     "IspNoBackupLinkAvailableError",
     "IspLinkDisabledError",
+    "IspHealthCheckTargetUnavailableError",
     "IspMissingCredentialsError",
     "IspDeviceConnectionError",
     "IspDeviceOperationError",
@@ -91,6 +92,25 @@ class IspLinkDisabledError(IspError):
     def __init__(self, link_id: uuid.UUID) -> None:
         super().__init__(
             f"ISP link '{link_id}' is disabled and cannot be used",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class IspHealthCheckTargetUnavailableError(IspError):
+    """Raised by ``IspService.ping_link`` when a DHCP/PPPOE-mode link's
+    own real target can't be resolved right now -- a DHCP link with no
+    dynamic default route currently present on the router, or a PPPOE
+    link with no ``interface`` configured at all. Distinct from
+    ``IspMissingCredentialsError`` (that one is about the router's own
+    API connection details being absent; this one is about the *link's*
+    own connection-mode-specific target, reachable router or not). The
+    platform-wide sweep's own per-link isolation catches this exactly
+    like any other per-link failure -- it is never a reason to fail the
+    whole sweep."""
+
+    def __init__(self, link_id: uuid.UUID, reason: str) -> None:
+        super().__init__(
+            f"ISP link '{link_id}' health-check target unavailable: {reason}",
             status_code=status.HTTP_409_CONFLICT,
         )
 

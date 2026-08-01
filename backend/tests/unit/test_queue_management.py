@@ -281,6 +281,21 @@ class FakeQueueManagementRepository:
             return None
         return max(candidates, key=lambda a: a.created_at)
 
+    async def list_assignments_by_status(
+        self, *, status: str
+    ) -> list[QueueAssignment]:
+        """Unpaginated, full-match fake -- mirrors the real
+        ``QueueManagementRepository.list_assignments_by_status``'s own
+        "no page, no cap, every matching row" contract exactly (deliberately
+        does *not* slice by any page/page_size the way
+        ``list_assignments`` above does, since the whole point of this
+        method is that a sweep never silently truncates at 1000)."""
+        return [
+            a
+            for a in self.assignments.values()
+            if not a.is_deleted and a.status == status
+        ]
+
 
 @dataclass
 class FakeAuditLogWriter:
@@ -1386,6 +1401,59 @@ class TestSweepScheduleTransitions:
         assert result["resumed"] == 1
         refetched = await h.repository.get_assignment_by_id(assignment.id)
         assert refetched.status == QueueStatus.ACTIVE.value
+
+    async def test_sweep_does_not_drop_assignments_past_the_first_1000(self) -> None:
+        """Regression test for a real pagination bug: the sweep used to call
+        ``repository.list_assignments(page=1, page_size=1000, ...)`` and
+        never fetched subsequent pages, silently leaving every ACTIVE
+        assignment past the first 1000 un-suspended even though its
+        schedule window had closed. Seeds 1500 ACTIVE assignments (each
+        with ``device_queue_id=None`` so suspension never needs a real
+        device connection) against a schedule that is never active, then
+        asserts every single one -- not just the first 1000 -- gets
+        suspended in one sweep pass."""
+        h = make_harness()
+        organization_id = uuid.uuid4()
+        schedule = await h.service.create_schedule(
+            actor_user_id=None,
+            requesting_organization_id=organization_id,
+            name="Never",
+            schedule_type=QueueScheduleType.HOLIDAY,
+            specific_dates=["1999-01-01"],
+        )
+        total = 1500
+        for _ in range(total):
+            assignment = QueueAssignment(
+                **_base_fields(
+                    organization_id=organization_id,
+                    location_id=None,
+                    router_id=None,
+                    target_type=QueueTargetType.SESSION.value,
+                    target_id=uuid.uuid4(),
+                    device_target=None,
+                    device_queue_id=None,
+                    queue_profile_id=None,
+                    queue_schedule_id=schedule.id,
+                    status=QueueStatus.ACTIVE.value,
+                    priority_override=None,
+                    applied_at=None,
+                    expires_at=None,
+                    error_message=None,
+                    superseded_by_assignment_id=None,
+                    created_by_user_id=None,
+                )
+            )
+            h.repository.assignments[assignment.id] = assignment
+
+        result = await h.service.sweep_schedule_transitions()
+
+        assert result["suspended"] == total
+        suspended = [
+            a
+            for a in h.repository.assignments.values()
+            if a.status == QueueStatus.SUSPENDED.value
+        ]
+        assert len(suspended) == total
 
 
 # ============================================================================

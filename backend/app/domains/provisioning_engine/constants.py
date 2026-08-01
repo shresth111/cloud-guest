@@ -286,17 +286,56 @@ TASK_RUN_ROUTER_HEALTH_POLL_SWEEP = (
     "app.domains.provisioning_engine.tasks.run_router_health_poll_sweep"
 )
 
-# Every 5 minutes -- the same "operationally visible, dashboard-facing, not
-# safety-critical" tier app.domains.guest.constants
-# .SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS's/app.domains.connected_devices
-# .constants.CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS's own docstrings
-# establish -- a router's CPU/memory/uptime history is admin-dashboard
-# telemetry, not a live guest-facing failover trigger the way
-# app.domains.isp.constants.ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS's own
-# 60-second WAN-uplink cadence is (nothing in this codebase reacts to a
-# RouterHealthSnapshot reading in real time the way ISP failover does to a
-# ping result), so the tighter 60-second cadence is not warranted here.
-ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS = 300.0
+# The real per-router fan-out leaf task ``TASK_RUN_ROUTER_HEALTH_POLL_SWEEP``
+# (the Beat-scheduled coordinator) dispatches one of per router, instead of
+# polling every router sequentially, in-process, itself -- see
+# ``tasks.poll_single_router_health``'s own docstring for the full
+# scale-readiness write-up (a single sequential loop over every router, each
+# a real ~10s-timeout RouterOS API round trip, could exceed this sweep's own
+# interval once the router fleet is large enough, causing overlapping/
+# queued coordinator runs forever).
+TASK_POLL_SINGLE_ROUTER_HEALTH = (
+    "app.domains.provisioning_engine.tasks.poll_single_router_health"
+)
+
+# Raised from an original 300s (5 minutes): defense in depth, not the real
+# fix (fan-out + the lock below is) -- gives real-world device-timeout
+# variance (some fraction of a large router fleet legitimately taking the
+# full ~10s per-router timeout to answer or time out) more headroom before
+# a slow tick could ever butt up against the next one, even after fan-out
+# removes the sequential-loop bottleneck that made the original 300s
+# genuinely too tight at scale.
+ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS = 600.0
+
+# Redis SETNX-style overlap-prevention lock (mirrors this codebase's
+# existing ``redis.set(key, "1", nx=True, ex=...)`` idiom -- see
+# ``app.domains.analytics.dashboard_audit.DashboardAuditThrottle``'s/
+# ``app.domains.billing.service._should_write_dashboard_audit``'s identical
+# pattern) guarding only the *coordinator* task's own listing+dispatch
+# phase (a DB query plus N cheap ``.delay()`` calls) -- not the fanned-out
+# per-router leaf tasks' own, independent run times, which Celery's queue
+# already lets run concurrently across worker slots without blocking the
+# next Beat tick. This is the real "skip starting a new sweep tick if a
+# previous one for this job is still running" backstop the fan-out design
+# still needs: it protects against overlapping *coordinator* invocations
+# (e.g. Beat restarting mid-tick, a manual trigger racing a scheduled one),
+# not against a slow router -- a slow router only ever delays its own leaf
+# task, never the coordinator or any other router's leaf task.
+ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY = (
+    "provisioning_engine:router_health_poll_sweep:lock"
+)
+
+# A generous ceiling for the coordinator's own listing+dispatch phase
+# (expected to take low seconds even for a large router fleet -- it is one
+# DB query plus N in-memory ``.delay()`` calls, no device I/O) -- not tied
+# to ``ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS`` above, since gating the
+# lock's release on the *leaf* tasks' own device-I/O-bound completion would
+# defeat the purpose of fan-out (the next tick would still have to wait for
+# the slowest single router). The coordinator always explicitly releases
+# this lock in a ``finally`` once dispatch completes; this TTL is purely
+# the crash-safety backstop (e.g. a worker killed mid-dispatch) so the lock
+# can never wedge the sweep off indefinitely.
+ROUTER_HEALTH_POLL_SWEEP_LOCK_TTL_SECONDS = 300
 
 __all__ = [
     "ProvisionJobStatus",
@@ -317,5 +356,8 @@ __all__ = [
     "PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS",
     "PROVISION_QUEUE_DRAIN_BATCH_SIZE",
     "TASK_RUN_ROUTER_HEALTH_POLL_SWEEP",
+    "TASK_POLL_SINGLE_ROUTER_HEALTH",
     "ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS",
+    "ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY",
+    "ROUTER_HEALTH_POLL_SWEEP_LOCK_TTL_SECONDS",
 ]

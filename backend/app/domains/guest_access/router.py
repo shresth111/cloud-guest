@@ -80,6 +80,7 @@ async def create_guest_rule(
         identifier=payload.identifier,
         rule_type=payload.rule_type,
         reason=payload.reason,
+        email=payload.email,
         expires_at=payload.expires_at,
         actor_user_id=uuid.UUID(user.id),
     )
@@ -232,6 +233,7 @@ async def create_device_rule(
         mac_address=payload.mac_address,
         rule_type=payload.rule_type,
         reason=payload.reason,
+        email=payload.email,
         expires_at=payload.expires_at,
         actor_user_id=uuid.UUID(user.id),
     )

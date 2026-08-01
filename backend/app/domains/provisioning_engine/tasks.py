@@ -51,6 +51,23 @@ per-item isolation belongs instead: one job raising must never stop the
 tick from draining the rest of the batch -- mirrors every other batch sweep
 in this codebase (e.g. ``RenewalService.run_renewal_sweep``'s own
 per-subscription isolation).
+
+## Router health poll: coordinator + real per-router fan-out, not one
+## sequential loop
+
+``run_router_health_poll_sweep`` (Beat-scheduled) is a *coordinator*: it
+acquires a Redis overlap-prevention lock, lists every router due a health
+poll via ``ProvisioningEngineRepository.list_routers_for_health_poll``, and
+dispatches one real Celery task (``poll_single_router_health``) per router
+-- never itself performing the real per-router RouterOS API health-check
+call. This replaces the original design, which polled every router
+sequentially inside one process with a real ~10s timeout per router (a
+single sweep run could exceed its own scheduling interval once the router
+fleet was large enough, causing overlapping/queued coordinator runs
+forever). See ``_dispatch_router_health_poll_sweep_async``'s and
+``poll_single_router_health``'s own docstrings for the full write-up, and
+``constants.ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY``'s for exactly what
+the lock does and does not protect against.
 """
 
 from __future__ import annotations
@@ -91,10 +108,15 @@ from app.domains.router_provisioning.service import RouterProvisioningService
 from app.domains.voucher.repository import VoucherRepository
 from app.domains.voucher.service import VoucherService
 
+from app.domains.router.exceptions import RouterNotFoundError
+
 from .constants import (
     PROVISION_ENGINE_QUEUE_REDIS_KEY,
     PROVISION_QUEUE_DRAIN_BATCH_SIZE,
+    ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY,
+    ROUTER_HEALTH_POLL_SWEEP_LOCK_TTL_SECONDS,
     TASK_DRAIN_PROVISION_QUEUE,
+    TASK_POLL_SINGLE_ROUTER_HEALTH,
     TASK_RUN_ROUTER_HEALTH_POLL_SWEEP,
 )
 from .exceptions import ProvisioningEngineError
@@ -263,55 +285,142 @@ def drain_provision_queue() -> dict[str, int]:
     return result
 
 
-async def _run_router_health_poll_sweep_async() -> HealthPollSweepSummary:
-    """A fresh session *and* a fresh Redis client per task run, never shared
-    across separate task invocations/worker ticks -- mirrors every other
-    sweep task's identical per-run session discipline and
-    ``_drain_provision_queue_async``'s identical per-run Redis-client
-    discipline (see that function's own docstring for why the shared
-    module-level ``redis_client`` singleton must never be reused across
-    separate ``asyncio.run`` calls). Only the three narrow pieces
-    ``run_router_health_poll_sweep`` actually needs are built (this
-    domain's own repository, a real ``RouterService`` for credential
-    decryption/heartbeat, and a real ``RouterProvisioningService`` for
-    ``RouterHealthSnapshot`` persistence) -- not the full
-    ``ProvisioningEngineService`` graph ``_build_provisioning_engine_service``
-    builds for job orchestration, which this sweep never touches. A fresh
-    Redis client is still required here even though a typical tick never
-    calls ``RedisProvisioningQueueDispatcher.enqueue`` (only a router that
-    actually needs re-provisioning triggers it) -- the client must not be
-    the shared singleton regardless of how often it ends up used."""
+def _build_router_and_provisioning_services(
+    session,  # noqa: ANN001
+    redis: Redis,
+) -> tuple[RouterService, RouterProvisioningService]:
+    """The narrow pair ``run_router_health_poll_sweep`` actually needs
+    (a real ``RouterService`` for credential decryption/heartbeat, and a
+    real ``RouterProvisioningService`` for ``RouterHealthSnapshot``
+    persistence) -- not the full ``ProvisioningEngineService`` graph
+    ``_build_provisioning_engine_service`` builds for job orchestration,
+    which this sweep never touches. Shared by both the coordinator (below)
+    and ``poll_single_router_health``'s own leaf-task body so the two never
+    drift."""
+    audit_repository = RBACRepository(session)
+    organization_service = OrganizationService(
+        OrganizationRepository(session), audit_writer=audit_repository
+    )
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+        audit_writer=audit_repository,
+    )
+    router_service = RouterService(
+        RouterRepository(session),
+        location_service,
+        organization_service,
+        audit_writer=audit_repository,
+    )
+    router_provisioning_service = RouterProvisioningService(
+        RouterProvisioningRepository(session),
+        router_service,
+        location_service,
+        queue_dispatcher=RedisProvisioningQueueDispatcher(redis),
+        audit_writer=audit_repository,
+    )
+    return router_service, router_provisioning_service
+
+
+async def _dispatch_router_health_poll_sweep_async() -> dict[str, object]:
+    """The Beat-scheduled coordinator's real work: acquire the overlap-
+    prevention lock, list every router due a health poll, and fan out one
+    real Celery task (``poll_single_router_health``) per router instead of
+    polling them sequentially, in this same process, the way the original
+    implementation did. See ``constants
+    .ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY``'s own docstring for exactly
+    what this lock does and does not protect against, and
+    ``poll_single_router_health``'s own docstring for the leaf task each
+    dispatched job runs.
+
+    A fresh Redis client per invocation -- never the shared module-level
+    singleton -- for the identical "a fresh ``asyncio.run`` event loop every
+    tick" reason ``_drain_provision_queue_async``'s own docstring documents
+    in full."""
+    redis = create_redis_client()
+    try:
+        acquired = await redis.set(
+            ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY,
+            "1",
+            nx=True,
+            ex=ROUTER_HEALTH_POLL_SWEEP_LOCK_TTL_SECONDS,
+        )
+        if not acquired:
+            logger.warning(
+                "provisioning_engine_task_router_health_poll_sweep_skipped_locked",
+                extra={"lock_key": ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY},
+            )
+            return {"dispatched": 0, "skipped_locked": True}
+        try:
+            async with SessionLocal() as session:
+                repository = ProvisioningEngineRepository(session)
+                routers = await repository.list_routers_for_health_poll()
+            for router in routers:
+                poll_single_router_health.delay(str(router.id))
+            return {"dispatched": len(routers), "skipped_locked": False}
+        finally:
+            # Explicit release the moment dispatch finishes -- the lock's
+            # own ``ex`` above is purely a crash-safety backstop, not the
+            # normal release path. See constants module docstring.
+            await redis.delete(ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY)
+    finally:
+        await redis.aclose()
+
+
+@celery_app.task(name=TASK_RUN_ROUTER_HEALTH_POLL_SWEEP)
+def run_router_health_poll_sweep() -> dict[str, object]:
+    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
+    ``beat_schedule`` -- runs every
+    ``constants.ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS``). This is now
+    purely a *coordinator*: it lists due routers and fans out one real
+    ``poll_single_router_health`` Celery task per router (see that task's
+    own docstring for why) rather than polling every router sequentially,
+    in-process, itself. Its own return value is therefore a dispatch count,
+    not a health-check-outcome summary -- those outcomes are only known
+    once each dispatched leaf task actually completes, asynchronously and
+    independently, on whichever worker slot picks it up."""
+    result = run_celery_task(_dispatch_router_health_poll_sweep_async())
+    logger.info(
+        "provisioning_engine_task_run_router_health_poll_sweep_dispatched",
+        extra=result,
+    )
+    return result
+
+
+async def _poll_single_router_health_async(router_id: uuid.UUID) -> HealthPollSweepSummary:
+    """The real per-router fan-out leaf task's own async body -- a fresh
+    session *and* a fresh Redis client per invocation (this task runs once
+    per router, potentially many times concurrently across worker slots),
+    mirroring every other sweep task's identical per-run discipline. Loads
+    exactly the one router this invocation was dispatched for, then reuses
+    ``service.run_router_health_poll_sweep``'s exact same per-router polling
+    logic (via its ``routers=`` override) for that single-element list --
+    no duplicated health-check/recording logic between the old sequential
+    sweep and this new fan-out leaf task.
+
+    A missing/deleted router (raced with the coordinator's own listing
+    query -- e.g. deleted between dispatch and this task actually running)
+    is treated as an honest no-op, not a task failure: there is nothing
+    left to poll."""
     redis = create_redis_client()
     try:
         async with SessionLocal() as session:
             try:
-                audit_repository = RBACRepository(session)
-                organization_service = OrganizationService(
-                    OrganizationRepository(session), audit_writer=audit_repository
+                router_service, router_provisioning_service = (
+                    _build_router_and_provisioning_services(session, redis)
                 )
-                location_service = LocationService(
-                    LocationRepository(session),
-                    organization_service,
-                    location_code_counter=LocationCodeCounterRepository(session),
-                    audit_writer=audit_repository,
-                )
-                router_service = RouterService(
-                    RouterRepository(session),
-                    location_service,
-                    organization_service,
-                    audit_writer=audit_repository,
-                )
-                router_provisioning_service = RouterProvisioningService(
-                    RouterProvisioningRepository(session),
-                    router_service,
-                    location_service,
-                    queue_dispatcher=RedisProvisioningQueueDispatcher(redis),
-                    audit_writer=audit_repository,
-                )
+                try:
+                    router = await router_service.get_router(router_id)
+                except RouterNotFoundError:
+                    return HealthPollSweepSummary(
+                        checked=0, unreachable=0, skipped=1, errors=0
+                    )
                 summary = await _run_router_health_poll_sweep(
                     ProvisioningEngineRepository(session),
                     router_service,
                     router_provisioning_service,
+                    routers=[router],
                 )
                 await session.commit()
                 return summary
@@ -322,15 +431,19 @@ async def _run_router_health_poll_sweep_async() -> HealthPollSweepSummary:
         await redis.aclose()
 
 
-@celery_app.task(name=TASK_RUN_ROUTER_HEALTH_POLL_SWEEP)
-def run_router_health_poll_sweep() -> dict[str, int]:
-    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
-    ``beat_schedule`` -- runs every
-    ``constants.ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS``). Bridges to the
-    real async implementation of the same name in ``service.py`` (imported
-    here as ``_run_router_health_poll_sweep`` purely to avoid shadowing this
-    task function's own name within this module)."""
-    summary = run_celery_task(_run_router_health_poll_sweep_async())
+@celery_app.task(name=TASK_POLL_SINGLE_ROUTER_HEALTH)
+def poll_single_router_health(router_id: str) -> dict[str, int]:
+    """The real fan-out leaf task ``run_router_health_poll_sweep`` (the
+    Beat-scheduled coordinator, above) dispatches one of per router that
+    still needs a health poll -- this, not one giant sequential loop inside
+    the coordinator itself, is the actual scale fix: N routers means N
+    independent, real Celery tasks each worker slot picks up and runs
+    concurrently (up to worker pool capacity), rather than one task
+    blocking on N sequential ~10s-timeout RouterOS round trips. One
+    router's own connection failure/timeout only ever fails/delays this one
+    task -- it can never block or slow down any other router's own poll,
+    which the original single-process sequential loop could not say."""
+    summary = run_celery_task(_poll_single_router_health_async(uuid.UUID(router_id)))
     result = {
         "checked": summary.checked,
         "unreachable": summary.unreachable,
@@ -338,10 +451,14 @@ def run_router_health_poll_sweep() -> dict[str, int]:
         "errors": summary.errors,
     }
     logger.info(
-        "provisioning_engine_task_run_router_health_poll_sweep_completed",
-        extra=result,
+        "provisioning_engine_task_poll_single_router_health_completed",
+        extra={"router_id": router_id, **result},
     )
     return result
 
 
-__all__ = ["drain_provision_queue", "run_router_health_poll_sweep"]
+__all__ = [
+    "drain_provision_queue",
+    "run_router_health_poll_sweep",
+    "poll_single_router_health",
+]

@@ -637,6 +637,11 @@ class AuditAction(StrEnum):
     ISP_LINK_DELETED = "isp_link_deleted"
     ISP_FAILOVER_TRIGGERED = "isp_failover_triggered"
     ISP_FAILBACK_TRIGGERED = "isp_failback_triggered"
+    # An admin's own manual override of a link's current status (the
+    # "Internet Connection" dashboard view's one real write -- never a
+    # device push). Always audited, the same "moderate-volume, admin-
+    # relevant" profile ISP_LINK_UPDATED already carries.
+    ISP_LINK_MANUAL_STATUS_SET = "isp_link_manual_status_set"
 
     # ISP Routing domain events -- written through this same table by
     # ``app.domains.isp_routing.service.IspRoutingService`` via the same

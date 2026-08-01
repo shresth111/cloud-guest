@@ -62,12 +62,16 @@ generated one.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
+from app.domains.guest.dependencies import get_radius_service
+from app.domains.guest.router import deregister_radius_nas_client
+from app.domains.guest.service import RadiusService
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -77,14 +81,15 @@ from app.domains.rbac.enums import ScopeType
 from app.domains.router_agent.dependencies import get_router_agent_service
 from app.domains.router_agent.service import RouterAgentService
 from app.domains.wireguard.dependencies import get_wireguard_service
+from app.domains.wireguard.exceptions import WireGuardPeerNotFoundError
 from app.domains.wireguard.service import WireGuardService
 
+from .dependencies import get_router_service
 from .device_adapters import (
     DeviceInterfaceQueryError,
     list_available_device_interfaces,
     reboot_device,
 )
-from .dependencies import get_router_service
 from .enums import RouterStatus
 from .models import Router
 from .schemas import (
@@ -104,6 +109,8 @@ from .schemas import (
 from .service import RouterService
 
 router = APIRouter(tags=["Routers"])
+
+logger = logging.getLogger(__name__)
 
 
 def _request_id(request: Request) -> str:
@@ -294,12 +301,73 @@ async def decommission_router(
     user: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     router_service: RouterService = Depends(get_router_service),
+    radius_service: RadiusService = Depends(get_radius_service),
+    wireguard_service: WireGuardService = Depends(get_wireguard_service),
 ):
+    # Confirmed gap, same shape as the RadiusNasClient one below: a
+    # decommissioned router's WireGuardPeer row was never revoked here --
+    # ``WireGuardService.revoke_tunnel`` exists (releases the tunnel IP
+    # back to the pool and marks the peer REVOKED) but nothing ever called
+    # it from this endpoint. Run *before* ``decommission_router`` below,
+    # not after: that call soft-deletes the Router row, and
+    # ``revoke_tunnel``'s own router lookup excludes soft-deleted routers
+    # by default, so revocation would 404 on its own target if attempted
+    # afterward. Best-effort and non-fatal for the same reason the RADIUS
+    # cleanup below is: most routers may not have completed WireGuard
+    # enrollment at all, and a WireGuard-side failure here must not block
+    # the decommission itself.
+    try:
+        await wireguard_service.revoke_tunnel(
+            actor_user_id=uuid.UUID(user.id),
+            router_id=router_id,
+            requesting_organization_id=requesting_organization_id,
+        )
+    except WireGuardPeerNotFoundError:
+        pass
+    except Exception:
+        logger.warning(
+            "router_decommission_wireguard_revoke_failed",
+            extra={"router_id": str(router_id)},
+        )
+
     await router_service.decommission_router(
         actor_user_id=uuid.UUID(user.id),
         router_id=router_id,
         requesting_organization_id=requesting_organization_id,
     )
+    # Confirmed gap: this router's RadiusNasClient row (if it ever
+    # registered one) previously outlived decommissioning untouched --
+    # ``ondelete="CASCADE"`` on that table's router_id FK never fires,
+    # since decommissioning only soft-deletes the Router row rather than
+    # actually deleting it, and even a real DB-level delete would still
+    # never have told the live FreeRADIUS server to drop its
+    # clients.conf entry. Left uncleaned, that stale entry can collide
+    # with a future router re-provisioned onto the same physical public
+    # IP (same site, ISP just handed the connection to a new device
+    # registration) -- see ``deregister_radius_nas_client``'s own
+    # docstring for the full write-up. Best-effort and non-fatal: most
+    # routers never register a NAS at all, and a RADIUS-side failure here
+    # must not block the decommission itself, which has already
+    # succeeded by this point.
+    try:
+        existing, _meta = await radius_service.list_nas_clients(
+            requesting_organization_id=None,
+            router_id=router_id,
+            page=1,
+            page_size=1,
+        )
+        if existing:
+            await deregister_radius_nas_client(
+                radius_service,
+                nas_id=existing[0].id,
+                requesting_organization_id=None,
+                actor_user_id=uuid.UUID(user.id),
+            )
+    except Exception:
+        logger.warning(
+            "router_decommission_radius_nas_cleanup_failed",
+            extra={"router_id": str(router_id)},
+        )
     return build_response(
         success=True,
         message="Router decommissioned",

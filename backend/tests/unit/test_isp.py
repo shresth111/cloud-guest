@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -29,12 +29,14 @@ from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.isp.constants import (
     DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER,
     HealthStatus,
+    IspConnectionMode,
     IspLinkRole,
     IspLinkType,
 )
 from app.domains.isp.device_adapters import IspCredentials, PingResult
 from app.domains.isp.exceptions import (
     CrossOrganizationIspLinkAccessError,
+    IspHealthCheckTargetUnavailableError,
     IspLinkDisabledError,
     IspLinkNotFoundError,
     IspMissingCredentialsError,
@@ -46,6 +48,7 @@ from app.domains.isp.router import router as isp_router
 from app.domains.isp.service import (
     HealthCheckSweepSummary,
     IspService,
+    TrafficCounters,
     run_health_check_sweep,
 )
 from app.domains.router.exceptions import RouterNotFoundError
@@ -215,6 +218,13 @@ class FakeIspRepository:
         paged = values[params.offset : params.offset + params.page_size]
         return paged, PaginationMeta.from_total(params, len(values))
 
+    async def list_recent_health_checks_for_link(
+        self, link_id: uuid.UUID, *, limit: int
+    ) -> list[IspHealthCheck]:
+        values = [c for c in self.health_checks.values() if c.isp_link_id == link_id]
+        values.sort(key=lambda c: c.checked_at, reverse=True)
+        return values[:limit]
+
 
 @dataclass
 class FakeAuditLogWriter:
@@ -262,6 +272,14 @@ class FakeIspHealthAdapter:
     next_result: PingResult | None = None
     should_raise: Exception | None = None
     calls: list[dict[str, object]] = field(default_factory=list)
+    # DHCP/PPPoE target-resolution fakes -- see IspService.ping_link's own
+    # per-connection-mode branching.
+    dynamic_gateway: str | None = None
+    pppoe_status_by_interface: dict[str, bool] = field(default_factory=dict)
+    # Traffic-load fakes -- see IspService.sample_link_traffic.
+    traffic_counters_by_interface: dict[str, tuple[int, int]] = field(
+        default_factory=dict
+    )
 
     async def ping(
         self,
@@ -277,6 +295,21 @@ class FakeIspHealthAdapter:
         return self.next_result or PingResult(
             sent=count, received=count, packet_loss_percentage=0.0, avg_rtt_ms=10.0
         )
+
+    async def get_dynamic_default_gateway(
+        self, credentials: IspCredentials
+    ) -> str | None:
+        return self.dynamic_gateway
+
+    async def get_pppoe_interface_status(
+        self, credentials: IspCredentials, *, interface_name: str
+    ) -> bool:
+        return self.pppoe_status_by_interface.get(interface_name, False)
+
+    async def get_interface_traffic_counters(
+        self, credentials: IspCredentials, *, interface_name: str
+    ) -> tuple[int, int] | None:
+        return self.traffic_counters_by_interface.get(interface_name)
 
 
 # ============================================================================
@@ -493,6 +526,452 @@ class TestHealthChecks:
 
 
 # ============================================================================
+# Manual status override -- the "Internet Connection" dashboard view's one
+# real write. Never opens a device connection; see
+# IspService.set_manual_health_status's own docstring.
+# ============================================================================
+
+
+class TestManualStatusOverride:
+    async def test_manual_override_persists_status_and_source(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        updated = await h.service.set_manual_health_status(
+            link.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            health_status=HealthStatus.UNHEALTHY,
+            reason="ISP outage confirmed by phone",
+        )
+        assert updated.health_status == HealthStatus.UNHEALTHY.value
+        assert updated.health_status_source == "manual"
+
+        checks, meta = await h.repository.list_health_checks_for_link(
+            link.id, page=1, page_size=10
+        )
+        assert meta.total_items == 1
+        assert checks[0].status == HealthStatus.UNHEALTHY.value
+        assert checks[0].source == "manual"
+        assert checks[0].error_message == "ISP outage confirmed by phone"
+
+    async def test_manual_override_is_audited(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        await h.service.set_manual_health_status(
+            link.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            health_status=HealthStatus.HEALTHY,
+        )
+        entries = [
+            e
+            for e in h.audit_writer.entries
+            if e["action"] == "isp_link_manual_status_set"
+        ]
+        assert len(entries) == 1
+        assert entries[0]["entity_id"] == link.id
+
+    async def test_cross_organization_override_raises(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        with pytest.raises(CrossOrganizationIspLinkAccessError):
+            await h.service.set_manual_health_status(
+                link.id,
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+                health_status=HealthStatus.UNHEALTHY,
+            )
+
+    async def test_real_ping_reclaims_link_back_to_automated(self) -> None:
+        """A manual override is a point-in-time statement, never a
+        permanent lockout of the real health-check sweep -- the very next
+        real ping must reclaim the link back to AUTOMATED regardless of
+        what an admin last set."""
+        h = make_harness(
+            health_adapter=FakeIspHealthAdapter(
+                next_result=PingResult(
+                    sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=15.0
+                )
+            )
+        )
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        await h.service.set_manual_health_status(
+            link.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            health_status=HealthStatus.UNHEALTHY,
+        )
+        updated = await h.service.check_link_health(
+            link.id, requesting_organization_id=router.organization_id
+        )
+        assert updated.health_status == HealthStatus.HEALTHY.value
+        assert updated.health_status_source == "automated"
+
+
+# ============================================================================
+# Connection-mode-aware health-check target resolution (static/dhcp/pppoe)
+# -- IspService.ping_link's own real-world gap fix: only a STATIC link
+# ever has a fixed, admin-known gateway IP. Generic, driven entirely by
+# each link's own `connection_mode` -- never hardcoded to a specific
+# link/router.
+# ============================================================================
+
+
+class TestConnectionModeHealthChecks:
+    async def test_dhcp_resolves_live_gateway_and_pings_it(self) -> None:
+        adapter = FakeIspHealthAdapter(dynamic_gateway="198.51.100.7")
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="DHCP ISP",
+            link_type=IspLinkType.FIBER.value,
+            connection_mode=IspConnectionMode.DHCP.value,
+            role=IspLinkRole.PRIMARY,
+            gateway_ip_address=None,
+        )
+        assert link.connection_mode == IspConnectionMode.DHCP.value
+        result = await h.service.ping_link(link)
+        assert result.packet_loss_percentage == 0.0
+        assert adapter.calls[-1]["target_ip"] == "198.51.100.7"
+
+    async def test_dhcp_with_no_dynamic_route_raises_target_unavailable(self) -> None:
+        adapter = FakeIspHealthAdapter(dynamic_gateway=None)
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="DHCP ISP",
+            link_type=IspLinkType.FIBER.value,
+            connection_mode=IspConnectionMode.DHCP.value,
+            role=IspLinkRole.PRIMARY,
+            gateway_ip_address=None,
+        )
+        with pytest.raises(IspHealthCheckTargetUnavailableError):
+            await h.service.ping_link(link)
+
+    async def test_pppoe_interface_up_classifies_healthy(self) -> None:
+        adapter = FakeIspHealthAdapter(
+            pppoe_status_by_interface={"pppoe-out1": True}
+        )
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="PPPoE ISP",
+            link_type=IspLinkType.FIBER.value,
+            connection_mode=IspConnectionMode.PPPOE.value,
+            role=IspLinkRole.PRIMARY,
+            interface="pppoe-out1",
+        )
+        updated = await h.service.check_link_health(
+            link.id, requesting_organization_id=router.organization_id
+        )
+        assert updated.health_status == HealthStatus.HEALTHY.value
+
+    async def test_pppoe_interface_down_classifies_unhealthy(self) -> None:
+        adapter = FakeIspHealthAdapter(
+            pppoe_status_by_interface={"pppoe-out1": False}
+        )
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="PPPoE ISP",
+            link_type=IspLinkType.FIBER.value,
+            connection_mode=IspConnectionMode.PPPOE.value,
+            role=IspLinkRole.PRIMARY,
+            interface="pppoe-out1",
+        )
+        updated = await h.service.check_link_health(
+            link.id, requesting_organization_id=router.organization_id
+        )
+        assert updated.health_status == HealthStatus.UNHEALTHY.value
+
+    async def test_pppoe_with_no_interface_configured_raises(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="PPPoE ISP",
+            link_type=IspLinkType.FIBER.value,
+            connection_mode=IspConnectionMode.PPPOE.value,
+            role=IspLinkRole.PRIMARY,
+        )
+        with pytest.raises(IspHealthCheckTargetUnavailableError):
+            await h.service.ping_link(link)
+
+    async def test_sweep_never_skips_dhcp_link_with_blank_gateway(self) -> None:
+        """The real bug this fix addresses: the sweep's own pre-flight
+        skip used to check `gateway_ip_address` unconditionally, silently
+        skipping every DHCP/PPPoE link forever since neither ever has one
+        set."""
+        adapter = FakeIspHealthAdapter(dynamic_gateway="198.51.100.9")
+        repository = FakeIspRepository()
+        router_lookup = FakeRouterLookup()
+        router = router_lookup.add(_make_router())
+        service = IspService(
+            repository,
+            router_lookup,
+            device_adapter_resolver=lambda vendor: adapter,
+        )
+        link = await service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="DHCP ISP",
+            link_type=IspLinkType.FIBER.value,
+            connection_mode=IspConnectionMode.DHCP.value,
+            role=IspLinkRole.PRIMARY,
+            gateway_ip_address=None,
+        )
+        assert link.gateway_ip_address is None
+        summary = await run_health_check_sweep(
+            repository,
+            router_lookup,
+            device_adapter_resolver=lambda vendor: adapter,
+        )
+        assert summary.skipped == 0
+        assert summary.checked == 1
+
+
+# ============================================================================
+# "Down since" -- a computed read-model derived from real IspHealthCheck
+# history, never a new stored column.
+# ============================================================================
+
+
+class TestUnhealthySince:
+    async def test_none_when_link_is_currently_healthy(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        assert await h.service.compute_unhealthy_since(link) is None
+
+    async def test_returns_start_of_current_unhealthy_streak(self) -> None:
+        h = make_harness(
+            health_adapter=FakeIspHealthAdapter(
+                next_result=PingResult(
+                    sent=5, received=0, packet_loss_percentage=100.0, avg_rtt_ms=None
+                )
+            )
+        )
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        # Three consecutive real unhealthy pings -- "since" must be the
+        # *first* one's timestamp, not the most recent.
+        for _ in range(3):
+            link = await h.service.check_link_health(
+                link.id, requesting_organization_id=router.organization_id
+            )
+        checks, _ = await h.repository.list_health_checks_for_link(
+            link.id, page=1, page_size=10
+        )
+        checks.sort(key=lambda c: c.checked_at)
+        since = await h.service.compute_unhealthy_since(link)
+        assert since == checks[0].checked_at
+
+    async def test_manual_override_counts_toward_the_streak(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        updated = await h.service.set_manual_health_status(
+            link.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            health_status=HealthStatus.UNHEALTHY,
+        )
+        since = await h.service.compute_unhealthy_since(updated)
+        assert since == updated.last_checked_at
+
+    async def test_stops_at_the_last_healthy_reading(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        # Healthy first (from _create_primary's own default adapter
+        # result), then manually marked down -- "since" must be the
+        # manual override's own timestamp, not further back.
+        updated = await h.service.check_link_health(
+            link.id, requesting_organization_id=router.organization_id
+        )
+        assert updated.health_status == HealthStatus.HEALTHY.value
+        updated = await h.service.set_manual_health_status(
+            link.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            health_status=HealthStatus.UNHEALTHY,
+        )
+        since = await h.service.compute_unhealthy_since(updated)
+        assert since == updated.last_checked_at
+
+
+# ============================================================================
+# Traffic-load monitoring -- "how much traffic is flowing on this link
+# right now", real interface byte counters, connection-mode-independent.
+# ============================================================================
+
+
+class TestTrafficLoad:
+    async def test_no_interface_configured_returns_none(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)  # no interface set
+        assert await h.service.sample_link_traffic(link) is None
+
+    async def test_first_sample_stores_counters_without_a_rate(self) -> None:
+        adapter = FakeIspHealthAdapter(
+            traffic_counters_by_interface={"ether1": (1_000_000, 500_000)}
+        )
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="Static ISP",
+            link_type=IspLinkType.FIBER.value,
+            role=IspLinkRole.PRIMARY,
+            gateway_ip_address="203.0.113.1",
+            interface="ether1",
+        )
+        updated = await h.service.check_link_health(
+            link.id, requesting_organization_id=router.organization_id
+        )
+        assert updated.last_rx_bytes == 1_000_000
+        assert updated.last_tx_bytes == 500_000
+        # No previous reading yet -- a rate needs two points, never
+        # fabricated from one.
+        assert updated.current_download_mbps is None
+        assert updated.current_upload_mbps is None
+
+    async def test_second_sample_computes_a_real_rate(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="Static ISP",
+            link_type=IspLinkType.FIBER.value,
+            role=IspLinkRole.PRIMARY,
+            gateway_ip_address="203.0.113.1",
+            interface="ether1",
+        )
+        # Seed a "previous reading" 10 real seconds in the past.
+        ten_seconds_ago = datetime.now(UTC) - timedelta(seconds=10)
+        link = await h.repository.update_link(
+            link,
+            {
+                "last_rx_bytes": 0,
+                "last_tx_bytes": 0,
+                "last_checked_at": ten_seconds_ago,
+            },
+        )
+        # 10 MB down, 5 MB up over ~10 seconds -> ~8 Mbps down, ~4 Mbps up.
+        traffic = TrafficCounters(rx_bytes=10_000_000, tx_bytes=5_000_000)
+        updated = await h.service.record_health_check_result(
+            link,
+            ping_result=PingResult(
+                sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=10.0
+            ),
+            traffic=traffic,
+        )
+        assert updated.current_download_mbps == pytest.approx(8.0, rel=0.05)
+        assert updated.current_upload_mbps == pytest.approx(4.0, rel=0.05)
+        checks, _ = await h.repository.list_health_checks_for_link(
+            link.id, page=1, page_size=10
+        )
+        assert checks[0].download_mbps == pytest.approx(8.0, rel=0.05)
+        assert checks[0].upload_mbps == pytest.approx(4.0, rel=0.05)
+
+    async def test_counter_regression_yields_no_rate_but_updates_counters(
+        self,
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="Static ISP",
+            link_type=IspLinkType.FIBER.value,
+            role=IspLinkRole.PRIMARY,
+            gateway_ip_address="203.0.113.1",
+            interface="ether1",
+        )
+        ten_seconds_ago = datetime.now(UTC) - timedelta(seconds=10)
+        link = await h.repository.update_link(
+            link,
+            {
+                "last_rx_bytes": 10_000_000,
+                "last_tx_bytes": 5_000_000,
+                "last_checked_at": ten_seconds_ago,
+                "current_download_mbps": 8.0,
+                "current_upload_mbps": 4.0,
+            },
+        )
+        # Interface reset (reboot/disable-enable): counters went backwards.
+        traffic = TrafficCounters(rx_bytes=100, tx_bytes=50)
+        updated = await h.service.record_health_check_result(
+            link,
+            ping_result=PingResult(
+                sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=10.0
+            ),
+            traffic=traffic,
+        )
+        assert updated.last_rx_bytes == 100
+        assert updated.last_tx_bytes == 50
+        # No fabricated negative rate -- and the last known-real rate is
+        # left untouched rather than blanked to None.
+        assert updated.current_download_mbps == 8.0
+        assert updated.current_upload_mbps == 4.0
+
+    async def test_pppoe_link_samples_traffic_on_its_own_virtual_interface(
+        self,
+    ) -> None:
+        """Confirms the same `interface` field ping_link's PPPoE branch
+        checks for up/down is also the one traffic sampling reads from --
+        real RouterOS PPPoE client interfaces carry their own independent
+        counters, not the underlying physical port's."""
+        adapter = FakeIspHealthAdapter(
+            pppoe_status_by_interface={"pppoe-out1": True},
+            traffic_counters_by_interface={"pppoe-out1": (2_000_000, 1_000_000)},
+        )
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="PPPoE ISP",
+            link_type=IspLinkType.FIBER.value,
+            connection_mode=IspConnectionMode.PPPOE.value,
+            role=IspLinkRole.PRIMARY,
+            interface="pppoe-out1",
+        )
+        updated = await h.service.check_link_health(
+            link.id, requesting_organization_id=router.organization_id
+        )
+        assert updated.health_status == HealthStatus.HEALTHY.value
+        assert updated.last_rx_bytes == 2_000_000
+        assert updated.last_tx_bytes == 1_000_000
+
+
+# ============================================================================
 # Failover / failback
 # ============================================================================
 
@@ -687,6 +1166,7 @@ class TestHealthCheckSweep:
                 location_id=good_router.location_id,
                 provider_name="Good ISP",
                 link_type=IspLinkType.FIBER.value,
+                connection_mode=IspConnectionMode.STATIC.value,
                 role=IspLinkRole.PRIMARY.value,
                 is_active_uplink=True,
                 auto_failback=True,
@@ -714,6 +1194,7 @@ class TestHealthCheckSweep:
                 location_id=bad_router.location_id,
                 provider_name="Bad ISP",
                 link_type=IspLinkType.FIBER.value,
+                connection_mode=IspConnectionMode.STATIC.value,
                 role=IspLinkRole.PRIMARY.value,
                 is_active_uplink=True,
                 auto_failback=True,
@@ -741,6 +1222,7 @@ class TestHealthCheckSweep:
                 location_id=good_router.location_id,
                 provider_name="No Gateway ISP",
                 link_type=IspLinkType.FIBER.value,
+                connection_mode=IspConnectionMode.STATIC.value,
                 role=IspLinkRole.BACKUP.value,
                 is_active_uplink=False,
                 auto_failback=True,
@@ -798,7 +1280,9 @@ class TestHealthCheckSweep:
 
 class TestEveryRouteRequiresPermission:
     def test_every_isp_route_has_a_permission_dependency(self) -> None:
-        assert len(isp_router.routes) == 9
+        # 9 original routes + POST /links/{link_id}/status (manual
+        # health-status override, see IspService.set_manual_health_status).
+        assert len(isp_router.routes) == 10
         for route in isp_router.routes:
             assert (
                 route.dependencies != []

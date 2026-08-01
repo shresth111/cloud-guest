@@ -812,6 +812,57 @@ class TestSyncSweep:
         assert summary.routers_failed == 1
         assert summary.discovered == 1
 
+    async def test_explicit_routers_override_syncs_only_that_router(self) -> None:
+        """The real per-router fan-out leaf task
+        (``tasks.sync_single_router_devices``) calls this exact function
+        with ``routers=[one_router]`` so each Celery task invocation syncs
+        only the single router it was dispatched for -- never the whole
+        platform-wide fleet ``repository.list_routers_for_sync`` would
+        otherwise return. Seeds the fake repository with two routers but
+        passes an explicit one-element ``routers=`` list, and asserts only
+        that one router was ever actually synced."""
+        repository = FakeConnectedDeviceRepository()
+        router_lookup = FakeRouterLookup()
+        guest_access = FakeGuestAccessService()
+        guest_lookup = FakeGuestLookup()
+        audit_writer = FakeAuditLogWriter()
+
+        target_router = router_lookup.add(_make_router())
+        other_router = router_lookup.add(_make_router())
+        # Seeded platform-wide, but never consulted -- proves the
+        # ``routers=`` override, not ``list_routers_for_sync``, drives
+        # what this call actually syncs.
+        repository.routers = [target_router, other_router]
+
+        adapter = FakeConnectedDeviceAdapter(
+            discovered=[
+                DiscoveredDevice(
+                    mac_address="AA:BB:CC:DD:EE:34",
+                    ip_address="192.168.1.90",
+                    hostname=None,
+                    interface="ether3",
+                    is_wireless=False,
+                    signal_strength_dbm=None,
+                )
+            ]
+        )
+        summary = await run_device_sync_sweep(
+            repository,
+            router_lookup,
+            guest_access,
+            guest_lookup,
+            audit_writer=audit_writer,
+            device_adapter_resolver=lambda vendor: adapter,
+            routers=[target_router],
+        )
+        assert summary.routers_synced == 1
+        assert summary.routers_failed == 0
+        assert summary.discovered == 1
+        synced_router_ids = {
+            device.router_id for device in repository.devices.values()
+        }
+        assert synced_router_ids == {target_router.id}
+
 
 # ============================================================================
 # RBAC -- every route requires a permission dependency

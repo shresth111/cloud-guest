@@ -33,7 +33,7 @@ from .jwt import InvalidTokenError as JWTInvalidTokenError
 from .jwt import JWTManager
 from .jwt import TokenExpiredError as JWTTokenExpiredError
 from .models import AuthUser, TokenPair, User
-from .password import PasswordManager, PasswordVerificationError
+from .password import PasswordManager, PasswordStrengthError, PasswordVerificationError
 from .repository import AuthRepositoryProtocol
 from .security import AuthSecurity
 
@@ -104,14 +104,30 @@ class PasswordChangeRequiredError(AuthServiceError):
     def __init__(
         self,
         message: str = (
-            "Password change required. Use the forgot-password flow to set a new "
-            "password before logging in."
+            "Password change required. Retry this login with a new_password to "
+            "set one and finish signing in."
         ),
     ) -> None:
         super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
 
 
 class PasswordReuseError(AuthServiceError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
+
+
+class PasswordTooWeakError(AuthServiceError):
+    """Wraps ``app.domains.auth.password.PasswordStrengthError`` (a plain
+    ``Exception``, not a ``CloudGuestError``) into a proper 400 with that
+    validator's own message. Confirmed reachable: a `new_password` that's
+    12+ chars (passing the frontend's/Pydantic's length-only check) but
+    missing a required character class fell through every one of this
+    domain's three ``PasswordManager.hash`` call sites uncaught, surfacing
+    as a raw "Internal server error" 500 instead of an actionable message
+    -- exactly the gap ``app.domains.guest.service.set_guest_password``
+    already closed for guest passwords via ``GuestPasswordTooWeakError``,
+    never applied here."""
+
     def __init__(self, message: str) -> None:
         super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
 
@@ -340,6 +356,7 @@ class AuthService:
         device_info: DeviceInfo,
         *,
         mfa_code: str | None = None,
+        new_password: str | None = None,
     ) -> tuple[User, TokenPair, uuid.UUID]:
         """Authenticate a user and start a session.
 
@@ -352,6 +369,19 @@ class AuthService:
         module docstring's ``PasswordChangeRequiredError`` precedent for
         why this is a single-endpoint retry rather than a separate
         challenge-token flow.
+
+        Real incident: ``PasswordChangeRequiredError`` used to permanently
+        block login with no retry path at all -- unlike the ``mfa_code``
+        precedent it explicitly documents, it just told the caller to use
+        the (separate, email-dependent) forgot-password flow instead. Every
+        freshly-provisioned location owner's welcome-email temporary
+        password was therefore unusable for its one purpose: "customer ke
+        pass aisa password aur email jata hai jo invalid hota hai... use
+        nahi kr paayega". Now mirrors ``mfa_code`` exactly: omit
+        ``new_password`` on a must-change-password account and this raises
+        ``PasswordChangeRequiredError`` as before (the retry signal); supply
+        it and the correct temporary password sets it as the new password
+        in the same call, then proceeds to a normal login.
         """
         await AuthSecurity.check_rate_limit(self.redis, email, device_info.ip_address)
 
@@ -383,16 +413,15 @@ class AuthService:
             )
             raise EmailNotVerifiedError()
 
-        if user.must_change_password:
-            await self._record_attempt(
-                user.id,
-                email,
-                device_info,
-                success=False,
-                reason="password_change_required",
-            )
-            raise PasswordChangeRequiredError()
-
+        # MFA is checked BEFORE the must_change_password branch commits a new
+        # password (not after, as originally written) -- an account with
+        # both must_change_password and mfa_enabled set would otherwise have
+        # its temporary password permanently overwritten and hashed on the
+        # very first call (which can't have supplied mfa_code yet, since the
+        # client doesn't know it's needed until this method says so), then
+        # raise MfaRequiredError -- leaving no credential the user actually
+        # knows to retry with. Committing the password change only after
+        # every other check has passed avoids that dead end.
         if user.mfa_enabled:
             if not mfa_code:
                 await self._record_attempt(
@@ -412,6 +441,36 @@ class AuthService:
                     reason="invalid_mfa_code",
                 )
                 raise InvalidMfaCodeError()
+
+        if user.must_change_password:
+            if not new_password:
+                await self._record_attempt(
+                    user.id,
+                    email,
+                    device_info,
+                    success=False,
+                    reason="password_change_required",
+                )
+                raise PasswordChangeRequiredError()
+
+            if self._verify_password_safe(new_password, user.password_hash, user_id=user.id):
+                raise PasswordReuseError(
+                    "New password must be different from the temporary password"
+                )
+            await self._reject_recent_passwords(user.id, new_password)
+
+            try:
+                new_hash = PasswordManager.hash(new_password)
+            except PasswordStrengthError as exc:
+                raise PasswordTooWeakError(str(exc)) from exc
+            user = await self.repository.update_user(
+                user,
+                password_hash=new_hash,
+                password_changed_at=datetime.now(UTC),
+                must_change_password=False,
+            )
+            await self.repository.add_password_history(user.id, new_hash)
+            logger.info("password_changed_at_first_login", extra={"user_id": str(user.id)})
 
         await self.repository.update_user(
             user,
@@ -500,7 +559,10 @@ class AuthService:
 
         await self._reject_recent_passwords(user_id, new_password)
 
-        new_hash = PasswordManager.hash(new_password)
+        try:
+            new_hash = PasswordManager.hash(new_password)
+        except PasswordStrengthError as exc:
+            raise PasswordTooWeakError(str(exc)) from exc
         await self.repository.update_user(
             user,
             password_hash=new_hash,
@@ -561,7 +623,10 @@ class AuthService:
 
         await self._reject_recent_passwords(user_id, new_password)
 
-        new_hash = PasswordManager.hash(new_password)
+        try:
+            new_hash = PasswordManager.hash(new_password)
+        except PasswordStrengthError as exc:
+            raise PasswordTooWeakError(str(exc)) from exc
         await self.repository.update_user(
             user,
             password_hash=new_hash,

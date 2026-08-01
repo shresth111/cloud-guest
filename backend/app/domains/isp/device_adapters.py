@@ -46,6 +46,56 @@ those four fields, mirroring
 ``"1ms200us"``, ``"850us"``, ``"12ms"``) -- ``_parse_routeros_duration_ms``
 is a small, real parser for that specific format (RouterOS never emits
 plain ISO-8601 durations here), not a generic duration library.
+
+## DHCP/PPPOE: real target *discovery*, not a manually-typed value
+
+A real WAN uplink is one of three connection modes (see
+``constants.IspConnectionMode``), and only ``STATIC`` ever has a fixed
+gateway IP an admin can type in ahead of time:
+
+* ``get_dynamic_default_gateway`` -- for ``DHCP`` links. Reads
+  ``/ip/route`` (a stable RouterOS *menu*, so the established
+  ``.path(*segments)`` + client-side filter form is used here, exactly
+  like ``MikroTikQueueAdapter._read_status_sync``'s own precedent --
+  unlike ``/tool/ping``, this is real menu CRUD/print, not a one-shot
+  command) and returns the ``gateway`` field of whichever row has
+  ``dst-address == "0.0.0.0/0"`` and ``dynamic == "true"`` -- RouterOS's
+  own real, live representation of "the gateway my DHCP client actually
+  negotiated right now." Deliberately never filtered by interface name:
+  a router has at most one live default route regardless of how many
+  interfaces exist, and filtering by this link's own (possibly stale --
+  interfaces get renamed on the router independently of this platform)
+  ``interface`` field would only add a real failure mode for no real
+  benefit.
+* ``get_pppoe_interface_status`` -- for ``PPPOE`` links. Reads
+  ``/interface/pppoe-client`` the same way and reports whether the named
+  interface is up (``running == "true"`` and ``disabled != "true"``).
+  Unlike the route lookup above, this genuinely needs to know *which*
+  interface -- but a renamed/stale ``IspLink.interface`` value is a real,
+  expected failure mode (an admin renames interfaces on the router
+  without this platform ever being told), so an exact-name miss falls
+  back to the router's own single PPPoE interface when there is exactly
+  one, rather than hard-failing on a name mismatch alone. Genuine
+  ambiguity (zero or multiple candidates with no exact match) still
+  raises rather than guessing.
+
+## Traffic load: raw counters here, rate computed in ``service.py``
+
+``get_interface_traffic_counters`` reads ``/interface``'s own
+``rx-byte``/``tx-byte`` fields for a link's own ``interface`` -- real,
+cumulative-since-last-reset counters RouterOS already tracks on every
+interface, always present (unlike ``/interface monitor-traffic``, a
+streaming/blocking command genuinely unsuited to a periodic poll -- this
+module never uses it). This adapter returns one snapshot; turning two
+successive snapshots into a Mbps rate is ``IspService
+.sample_link_traffic``'s job, mirroring ``app.domains.guest.service``'s
+own "store the counter, compute the delta against the previous reading"
+convention. This holds uniformly for STATIC/DHCP/PPPOE alike -- for a
+PPPOE link, ``interface`` names the PPPoE client's own virtual interface
+(e.g. ``"pppoe-out1"``), which RouterOS gives independent counters
+reflecting only the traffic actually inside that PPP tunnel, not the
+underlying physical port's raw counters (which would double-count
+encapsulation overhead and any other traffic sharing that port).
 """
 
 from __future__ import annotations
@@ -129,6 +179,33 @@ class BaseIspHealthAdapter(Protocol):
         cumulative result."""
         ...
 
+    async def get_dynamic_default_gateway(
+        self, credentials: IspCredentials
+    ) -> str | None:
+        """Real, live lookup of the router's own current DHCP-negotiated
+        default gateway -- ``None`` if no dynamic default route currently
+        exists (e.g. the DHCP client hasn't leased yet). See module
+        docstring."""
+        ...
+
+    async def get_pppoe_interface_status(
+        self, credentials: IspCredentials, *, interface_name: str
+    ) -> bool:
+        """Whether the named PPPoE client interface is really up right
+        now (``running`` and not ``disabled``). See module docstring for
+        the stale-interface-name fallback."""
+        ...
+
+    async def get_interface_traffic_counters(
+        self, credentials: IspCredentials, *, interface_name: str
+    ) -> tuple[int, int] | None:
+        """Real, cumulative ``(rx_bytes, tx_bytes)`` counters for the
+        named interface right now -- ``None`` if no interface with that
+        name exists on the router. A single snapshot, never a rate (the
+        caller computes the rate from two successive snapshots -- see
+        module docstring)."""
+        ...
+
 
 class MikroTikIspHealthAdapter:
     """See module docstring for the full "real client code, untested
@@ -175,6 +252,119 @@ class MikroTikIspHealthAdapter:
         finally:
             api.close()
         return _parse_ping_rows(rows, requested_count=count)
+
+    async def get_dynamic_default_gateway(
+        self, credentials: IspCredentials
+    ) -> str | None:
+        return await asyncio.to_thread(
+            self._get_dynamic_default_gateway_sync, credentials
+        )
+
+    def _get_dynamic_default_gateway_sync(
+        self, credentials: IspCredentials
+    ) -> str | None:
+        api = self._connect_api(credentials)
+        try:
+            # `/ip/route` is a real menu (not a one-shot command like
+            # `/tool/ping`), so this uses the same `.path(*segments)` +
+            # client-side filter form `MikroTikQueueAdapter
+            # ._read_status_sync` already establishes -- a router's own
+            # routing table is small, so a full print + filter is a real,
+            # correct, easily-testable-via-fake-transport choice, not a
+            # shortcut. See module docstring for why this is never
+            # filtered by interface.
+            rows = list(api.path("ip", "route"))
+        except LibRouterosError as exc:
+            raise IspDeviceOperationError(
+                "read_dynamic_default_route", str(exc)
+            ) from exc
+        finally:
+            api.close()
+        for row in rows:
+            if (
+                row.get("dst-address") == "0.0.0.0/0"
+                and str(row.get("dynamic", "false")).lower() == "true"
+            ):
+                gateway = row.get("gateway")
+                return str(gateway) if gateway else None
+        return None
+
+    async def get_pppoe_interface_status(
+        self, credentials: IspCredentials, *, interface_name: str
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._get_pppoe_interface_status_sync, credentials, interface_name
+        )
+
+    def _get_pppoe_interface_status_sync(
+        self, credentials: IspCredentials, interface_name: str
+    ) -> bool:
+        api = self._connect_api(credentials)
+        try:
+            rows = list(api.path("interface", "pppoe-client"))
+        except LibRouterosError as exc:
+            raise IspDeviceOperationError(
+                "read_pppoe_interface_status", str(exc)
+            ) from exc
+        finally:
+            api.close()
+        row = next((r for r in rows if r.get("name") == interface_name), None)
+        if row is None and len(rows) == 1:
+            # Exact-name miss but exactly one real PPPoE client interface
+            # exists on this router -- almost certainly the same
+            # interface under a name this platform's own stored
+            # `IspLink.interface` hasn't caught up with (renamed directly
+            # on the router). See module docstring: a real, expected
+            # staleness case, not guessed data -- we still read that one
+            # real interface's own live state, never fabricate a result.
+            logger.warning(
+                "isp_pppoe_interface_name_mismatch_fallback",
+                extra={
+                    "requested_interface": interface_name,
+                    "actual_interface": rows[0].get("name"),
+                },
+            )
+            row = rows[0]
+        if row is None:
+            raise IspDeviceOperationError(
+                "read_pppoe_interface_status",
+                f"no PPPoE client interface named '{interface_name}' found "
+                f"(and {len(rows)} candidates exist, too ambiguous to guess)",
+            )
+        running = str(row.get("running", "false")).lower() == "true"
+        disabled = str(row.get("disabled", "false")).lower() == "true"
+        return running and not disabled
+
+    async def get_interface_traffic_counters(
+        self, credentials: IspCredentials, *, interface_name: str
+    ) -> tuple[int, int] | None:
+        return await asyncio.to_thread(
+            self._get_interface_traffic_counters_sync, credentials, interface_name
+        )
+
+    def _get_interface_traffic_counters_sync(
+        self, credentials: IspCredentials, interface_name: str
+    ) -> tuple[int, int] | None:
+        api = self._connect_api(credentials)
+        try:
+            # `/interface` (real menu, same `.path(*segments)` + client-
+            # side filter form as the two lookups above) -- every real
+            # interface row RouterOS returns already carries its own
+            # cumulative `rx-byte`/`tx-byte` counters, no separate
+            # "stats" mode needed over the API.
+            rows = list(api.path("interface"))
+        except LibRouterosError as exc:
+            raise IspDeviceOperationError(
+                "read_interface_traffic_counters", str(exc)
+            ) from exc
+        finally:
+            api.close()
+        row = next((r for r in rows if r.get("name") == interface_name), None)
+        if row is None:
+            return None
+        rx_bytes = _safe_int(row.get("rx-byte"), default=0)
+        tx_bytes = _safe_int(row.get("tx-byte"), default=0)
+        return rx_bytes, tx_bytes
 
 
 def _parse_ping_rows(

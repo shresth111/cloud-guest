@@ -75,6 +75,10 @@ class IspRepositoryProtocol(Protocol):
         page_size: int,
     ) -> tuple[list[IspHealthCheck], PaginationMeta]: ...
 
+    async def list_recent_health_checks_for_link(
+        self, link_id: uuid.UUID, *, limit: int
+    ) -> list[IspHealthCheck]: ...
+
 
 class IspRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -180,6 +184,22 @@ class IspRepository:
             filters={"isp_link_id": link_id},
             sort_by="checked_at",
             sort_order=SortOrder.DESC,
+        )
+
+    async def list_recent_health_checks_for_link(
+        self, link_id: uuid.UUID, *, limit: int
+    ) -> list[IspHealthCheck]:
+        """DESC-ordered, unpaginated (capped at ``limit``) -- backs
+        ``IspService.compute_unhealthy_since``'s own "how far back does
+        the current unhealthy streak go" scan. Deliberately separate from
+        ``list_health_checks_for_link`` (paginated, client-facing): this
+        is an internal computation that needs a plain ordered slice, not
+        a ``PaginationMeta``-wrapped page."""
+        return await self.health_checks.get_all(
+            filters={"isp_link_id": link_id},
+            sort_by="checked_at",
+            sort_order=SortOrder.DESC,
+            limit=limit,
         )
 
 

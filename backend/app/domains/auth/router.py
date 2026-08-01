@@ -135,7 +135,11 @@ async def login(
         device_info.device_name = payload.device_name
 
     user, tokens, session_id = await auth_service.login(
-        payload.email, payload.password, device_info, mfa_code=payload.mfa_code
+        payload.email,
+        payload.password,
+        device_info,
+        mfa_code=payload.mfa_code,
+        new_password=payload.new_password,
     )
 
     roles = await _role_assignment_summaries(role_resolver, user.id)

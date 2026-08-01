@@ -34,6 +34,21 @@ health readings above are not (mirrors
 ``app.domains.guest.service``'s own "high-volume, no per-call audit row"
 judgment call for login attempts).
 
+## Manual status override: a source tag, not a third status vocabulary
+
+The dashboard's "Internet Connection" view is read/observe-only -- it
+never pushes real config to a router. The one *write* it does offer is a
+human override of a link's own current status (see ``IspService
+.set_manual_health_status``), for when an admin knows a link is up/down
+before (or instead of) the next automated sweep tick confirms it. That
+override is real and persisted -- both tables gain a ``source`` column
+(``constants.HealthStatusSource``: ``AUTOMATED``/``MANUAL``) rather than a
+second status vocabulary, so the "Status Timeline" built from
+``IspHealthCheck`` history renders manual and real readings on one
+uniform scale. The very next real ping always reclaims a link back to
+``AUTOMATED`` -- an override is a point-in-time statement, never a
+permanent lockout of the real health-check sweep.
+
 ## Why ``router_id``, not ``location_id``
 
 An ISP/WAN link is physically terminated at one router (the device with
@@ -50,6 +65,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -65,7 +81,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-from .constants import HealthStatus, IspLinkType
+from .constants import HealthStatus, HealthStatusSource, IspConnectionMode, IspLinkType
 
 
 class IspLink(BaseModel):
@@ -93,6 +109,15 @@ class IspLink(BaseModel):
     provider_name: Mapped[str] = mapped_column(String(200), nullable=False)
     link_type: Mapped[str] = mapped_column(
         String(20), default=IspLinkType.OTHER.value, nullable=False
+    )
+    # How this link's own gateway/IP is actually obtained -- STATIC/DHCP/
+    # PPPOE, orthogonal to link_type above (physical medium). Drives which
+    # real health-check target-resolution strategy IspService.ping_link
+    # uses; see constants.IspConnectionMode's own docstring. Defaults to
+    # STATIC -- every pre-existing row really was a manually-entered
+    # gateway IP before this field existed.
+    connection_mode: Mapped[str] = mapped_column(
+        String(20), default=IspConnectionMode.STATIC.value, nullable=False
     )
     role: Mapped[str] = mapped_column(String(10), nullable=False)
     # Which link is *currently* carrying traffic -- flips during a real
@@ -122,9 +147,20 @@ class IspLink(BaseModel):
     # single, unconditional query.
     priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # The router's own WAN-facing interface name this link terminates on
-    # (e.g. "ether1", "sfp1") -- informational/provisioning-facing only,
-    # mirrors `link_type`'s identical "not branched on internally" scope.
+    # (e.g. "ether1", "sfp1") -- informational/provisioning-facing only
+    # for STATIC/DHCP links (mirrors `link_type`'s identical "not branched
+    # on internally" scope), but for a PPPOE link (connection_mode above)
+    # this field IS branched on internally: it names the real RouterOS
+    # `/interface/pppoe-client` entry IspService.ping_link checks for its
+    # own running/disabled state as that link's actual health signal (see
+    # device_adapters.get_pppoe_interface_status). A stale/renamed value
+    # here degrades gracefully rather than hard-failing -- see that
+    # adapter method's own single-candidate-fallback docstring.
     interface: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # STATIC mode only -- the manually-entered ping target. Never read for
+    # DHCP (re-resolved live every check from the router's own current
+    # dynamic default route) or PPPOE (no gateway concept at all) -- see
+    # constants.IspConnectionMode's own docstring.
     gateway_ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
     dns_primary: Mapped[str | None] = mapped_column(String(45), nullable=True)
     dns_secondary: Mapped[str | None] = mapped_column(String(45), nullable=True)
@@ -135,6 +171,16 @@ class IspLink(BaseModel):
     # defaulted to HEALTHY.
     health_status: Mapped[str] = mapped_column(
         String(20), default=HealthStatus.UNKNOWN.value, nullable=False
+    )
+    # Whether the *current* health_status above came from a real RouterOS
+    # ping (AUTOMATED -- the sweep or a manual on-demand check) or an
+    # admin's own override (MANUAL -- see IspService
+    # .set_manual_health_status). The next real ping always reclaims this
+    # back to AUTOMATED (record_health_check_result writes it
+    # unconditionally) -- see constants.HealthStatusSource's own
+    # docstring.
+    health_status_source: Mapped[str] = mapped_column(
+        String(20), default=HealthStatusSource.AUTOMATED.value, nullable=False
     )
     latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     packet_loss_percentage: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -147,6 +193,31 @@ class IspLink(BaseModel):
     consecutive_unhealthy_count: Mapped[int] = mapped_column(
         Integer, default=0, nullable=False
     )
+    # Live traffic-load monitoring -- "how much traffic is flowing on
+    # this link right now", distinct from download_bandwidth_mbps/
+    # upload_bandwidth_mbps above (the link's *provisioned* plan
+    # capacity, e.g. "500 Mbps fiber", never measured). Sampled from the
+    # router's own interface byte counters (rx-byte/tx-byte on
+    # `interface` -- for PPPOE links this is the PPPoE client's own
+    # virtual interface, which carries its own independent counters, not
+    # the underlying physical interface) every health check, on every
+    # connection mode uniformly -- see IspService.sample_link_traffic.
+    # last_rx_bytes/last_tx_bytes are the raw cumulative counters from
+    # the most recent successful sample, kept only to compute the next
+    # tick's delta -- never displayed directly (mirrors
+    # app.domains.guest.service's own "counter now, delta computed
+    # against the previous reading" convention). A counter that goes
+    # backwards (interface reset/reboot) yields no rate that tick rather
+    # than a garbage negative one -- see that method's own docstring.
+    last_rx_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    last_tx_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # The most recently *computed* rate -- current state, mirroring this
+    # table's own "current state, not history" split (see module
+    # docstring); IspHealthCheck.download_mbps/upload_mbps is the history.
+    current_download_mbps: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    current_upload_mbps: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (
         Index("ix_isp_links_router_id", "router_id"),
@@ -188,9 +259,27 @@ class IspHealthCheck(BaseModel):
         DateTime(timezone=True), nullable=False
     )
     status: Mapped[str] = mapped_column(String(20), nullable=False)
+    # AUTOMATED for a real /tool/ping row (sweep or manual on-demand
+    # check), MANUAL for a synthetic row written by an admin's own status
+    # override (IspService.set_manual_health_status) -- see
+    # constants.HealthStatusSource. The "Status Timeline" this history
+    # backs renders both uniformly, distinguishing them only visually.
+    source: Mapped[str] = mapped_column(
+        String(20), default=HealthStatusSource.AUTOMATED.value, nullable=False
+    )
     latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     packet_loss_percentage: Mapped[float | None] = mapped_column(Float, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Live traffic-load reading for this same tick -- null whenever a
+    # rate genuinely couldn't be computed yet (the link's very first
+    # sample ever, a manual status override with no real device read, or
+    # a counter that went backwards -- see IspService
+    # .sample_link_traffic's own docstring), never a fabricated 0. This
+    # is what the "Traffic Load" graph renders from -- the exact same
+    # history rows the up/down "Status Timeline" already uses, not a
+    # second, parallel monitoring table.
+    download_mbps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    upload_mbps: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (
         Index("ix_isp_health_checks_isp_link_id", "isp_link_id"),

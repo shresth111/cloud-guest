@@ -1302,6 +1302,7 @@ async def run_router_health_poll_sweep(
     router_provisioning: RouterProvisioningLookupProtocol,
     *,
     device_adapter_resolver=get_device_adapter,
+    routers: list[Router] | None = None,
 ) -> HealthPollSweepSummary:
     """The platform-wide router device-health poll sweep
     ``tasks.run_router_health_poll_sweep`` (Celery Beat) drives -- pulled
@@ -1358,8 +1359,20 @@ async def run_router_health_poll_sweep(
     so that liveness signal is honest). On an unreachable read
     (``healthy=False``), records the failed reading via
     ``record_failed_health_check`` instead -- see that method's own
-    docstring for why it deliberately never calls ``heartbeat``."""
-    routers = await repository.list_routers_for_health_poll()
+    docstring for why it deliberately never calls ``heartbeat``.
+
+    ``routers``, when passed explicitly, is polled instead of
+    ``repository.list_routers_for_health_poll()``'s own full,
+    platform-wide result -- this is what lets
+    ``tasks.poll_single_router_health`` (the real per-router fan-out leaf
+    task Celery Beat's coordinator dispatches one of per router, instead of
+    this function itself looping over every router in one process/worker
+    slot) reuse this exact same per-router polling logic for a
+    single-element list. The default (``None``) preserves this function's
+    original, platform-wide-sweep behavior for any caller -- including this
+    module's own test suite -- that still wants that."""
+    if routers is None:
+        routers = await repository.list_routers_for_health_poll()
     checked = 0
     unreachable = 0
     skipped = 0

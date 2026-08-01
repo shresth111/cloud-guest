@@ -122,6 +122,7 @@ from app.domains.campaigns.constants import (
 from app.domains.connected_devices.constants import (
     CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
+    TASK_SYNC_SINGLE_ROUTER_DEVICES,
 )
 from app.domains.guest.constants import (
     FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
@@ -140,6 +141,7 @@ from app.domains.provisioning_engine.constants import (
     PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
     ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS,
     TASK_DRAIN_PROVISION_QUEUE,
+    TASK_POLL_SINGLE_ROUTER_HEALTH,
     TASK_RUN_ROUTER_HEALTH_POLL_SWEEP,
 )
 from app.domains.queue_management.constants import (
@@ -161,6 +163,19 @@ _settings = get_settings()
 # field -- this app instance's own directory rule keeps
 # `app/core/config.py` untouched for this part.
 CELERY_HEALTH_CHECK_TIMEOUT_SECONDS = 2.0
+
+# The one non-default queue this app instance routes onto -- every
+# device-I/O-bound task (a real, per-router/per-link RouterOS API round
+# trip, each with its own multi-second timeout) is routed here, off the
+# default ``celery`` queue every pure-DB sweep (analytics, billing,
+# campaigns, guest, notification, queue-management, router-token-cleanup,
+# the two provisioning-engine/connected-devices *coordinator* tasks, ...)
+# otherwise shares. See ``task_routes`` below for exactly which task names
+# land here and why -- this is the real fix for one stuck/slow
+# device-I/O-bound sweep starving every other scheduled task's own worker
+# capacity, which sharing one single default queue for everything cannot
+# prevent no matter how fast any individual task itself is.
+DEVICE_IO_QUEUE_NAME = "device_io"
 
 celery_app = Celery(
     "cloudguest",
@@ -205,6 +220,39 @@ celery_app.conf.update(
     # scheduled run -- a generous, but finite, ceiling.
     task_time_limit=600,
     task_soft_time_limit=540,
+    # Queue separation: device-I/O-bound tasks (a real per-router/per-link
+    # RouterOS API round trip apiece) go on ``DEVICE_IO_QUEUE_NAME``, off
+    # the default ``celery`` queue every cheap, pure-DB sweep otherwise
+    # shares -- see that constant's own docstring for the full "why" and
+    # the risk this closes.
+    #
+    # * ``TASK_POLL_SINGLE_ROUTER_HEALTH``/``TASK_SYNC_SINGLE_ROUTER_DEVICES``
+    #   are the real per-router fan-out *leaf* tasks
+    #   ``app.domains.provisioning_engine.tasks``'s/
+    #   ``app.domains.connected_devices.tasks``'s own Beat-scheduled
+    #   coordinators dispatch one of per router (see each module's own
+    #   docstring) -- these, not their coordinators, are where the actual
+    #   device I/O happens.
+    # * ``TASK_RUN_ISP_HEALTH_CHECK_SWEEP`` (``app.domains.isp`` -- owned by
+    #   a different in-flight change today, not modified here) is still a
+    #   single sequential per-link sweep, not yet fanned out the way the
+    #   two tasks above now are -- exactly the kind of task queue
+    #   separation protects everything else from: even un-fanned-out, its
+    #   own real device I/O can no longer starve a pure-DB sweep waiting
+    #   behind it in a shared default queue.
+    #
+    # ``TASK_RUN_ROUTER_HEALTH_POLL_SWEEP``/
+    # ``TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP`` (the *coordinators* Celery
+    # Beat actually schedules) are deliberately left off this queue: since
+    # fan-out, each is just one DB query plus N cheap ``.delay()`` calls --
+    # no device I/O of its own -- so it belongs with the rest of the
+    # pure-DB sweeps on the default queue, not on the one reserved for
+    # actual device round trips.
+    task_routes={
+        TASK_POLL_SINGLE_ROUTER_HEALTH: {"queue": DEVICE_IO_QUEUE_NAME},
+        TASK_SYNC_SINGLE_ROUTER_DEVICES: {"queue": DEVICE_IO_QUEUE_NAME},
+        TASK_RUN_ISP_HEALTH_CHECK_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+    },
     beat_schedule={
         "analytics-rolling-today": {
             "task": TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS,
@@ -351,13 +399,14 @@ celery_app.conf.update(
             "schedule": SCHEDULE_SWEEP_INTERVAL_SECONDS,
         },
         # ISP Management domain: real RouterOS-backed health-check sweep --
-        # every 60 seconds, shorter than every other cadence in this
-        # schedule, since every guest at a site rides on whichever WAN
-        # uplink is currently active. See
+        # every 10 minutes. See
         # app.domains.isp.service.run_health_check_sweep's own docstring
         # (per-link failure isolation) and app.domains.isp.constants
         # .ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS's own docstring for the
-        # cadence reasoning.
+        # cadence reasoning, including why this was raised from an
+        # original 60 seconds (single sequential Celery Beat task, no
+        # per-link fan-out, no overlap-prevention lock -- real scale risk
+        # this raise mitigates but doesn't fully close).
         "isp-health-check-sweep": {
             "task": TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
             "schedule": ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
@@ -448,4 +497,9 @@ def ping_celery_workers(
     return celery_app.control.inspect(timeout=timeout).ping()
 
 
-__all__ = ["celery_app", "ping_celery_workers", "CELERY_HEALTH_CHECK_TIMEOUT_SECONDS"]
+__all__ = [
+    "celery_app",
+    "ping_celery_workers",
+    "CELERY_HEALTH_CHECK_TIMEOUT_SECONDS",
+    "DEVICE_IO_QUEUE_NAME",
+]

@@ -183,7 +183,17 @@ SET_PASSWORD_SESSION_WINDOW_MINUTES = 15
 # platform-wide default until that seam exists, exactly the same "additive
 # default now, resolver-driven override later" posture
 # ``DEFAULT_SESSION_TIMEOUT_MINUTES`` above already establishes.
-DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST = 3
+DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST = 20
+# Raised from 3 -- real incident during launch testing: the same guest
+# identifier logging in repeatedly (multiple devices, or the same device
+# across several test rounds without ever properly disconnecting) hit this
+# cap after only 3 attempts, then had every further login rejected with
+# ConcurrentSessionLimitExceededError -- indistinguishable, from a guest's
+# perspective, from "the WiFi is broken" ("phir 3 session wala aa raha
+# hai"). 20 keeps this a real abuse guardrail (an identifier spawning
+# dozens of concurrent sessions is still caught) without it being the
+# thing a single legitimate guest with a phone + laptop + a few retries
+# actually hits in practice.
 
 # ============================================================================
 # Device limit -- Guest Session Engine (Phase 1).

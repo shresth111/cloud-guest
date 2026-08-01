@@ -63,6 +63,30 @@ def validate_cidr(cidr: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
         raise InvalidWireGuardCidrError(cidr) from exc
 
 
+def hub_reserved_ip(cidr: str) -> str:
+    """Returns the hub's own conventional tunnel-side address within
+    ``cidr`` -- the first usable host address, i.e. exactly the leading
+    slot ``allocate_tunnel_ip`` skips via ``HUB_RESERVED_HOST_COUNT`` and
+    never hands out to a peer (e.g. ``10.20.0.1`` for ``10.20.0.0/24``).
+
+    This is a pure convention, not a value stored anywhere on
+    ``WireGuardServer`` -- the hub's own WireGuard interface is configured
+    with this address out-of-band (by whoever operates the real hub
+    machine), and this function is simply the one place that convention is
+    computed from ``tunnel_network_cidr`` instead of being hand-copied
+    (and hand-kept-in-sync) wherever a caller needs to know it -- e.g. a
+    generated RouterOS script that needs to point a router's own
+    ``/radius add address=...`` at the hub's tunnel IP (reachable over the
+    WireGuard tunnel's single UDP port) rather than the hub's public IP
+    (which some sites' ISPs block on RADIUS's own 1812/1813 ports)."""
+    network = validate_cidr(cidr)
+    hosts = network.hosts()
+    reserved = next(hosts, None)
+    if reserved is None:
+        raise InvalidWireGuardCidrError(cidr)
+    return str(reserved)
+
+
 def allocate_tunnel_ip(cidr: str, occupied: set[str]) -> str:
     """Returns the next free host address in ``cidr`` not present in
     ``occupied``, skipping the hub's own reserved address(es) (see
@@ -111,5 +135,6 @@ __all__ = [
     "validate_router_eligible_for_wireguard",
     "validate_peer_transition",
     "validate_cidr",
+    "hub_reserved_ip",
     "allocate_tunnel_ip",
 ]

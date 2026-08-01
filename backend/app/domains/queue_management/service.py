@@ -609,6 +609,16 @@ class QueueManagementService:
         profile = await self.repository.get_profile_by_id(assignment.queue_profile_id)
         if profile is None:
             return None
+        # A profile with both rates at 0 is this codebase's own convention
+        # for "unlimited" (see e.g. the seeded "Unlimited" profile) -- but
+        # RouterOS's real Mikrotik-Rate-Limit wire format has no such
+        # convention: a literal "0k/0k" reply is throttled to zero
+        # bandwidth, not unlimited. Confirmed live: a guest authorized with
+        # this profile got Access-Accept yet had no real throughput at all.
+        # RouterOS's own convention for "no limit" is to omit the attribute
+        # entirely, which is exactly what returning None here achieves.
+        if profile.upload_rate_kbps == 0 and profile.download_rate_kbps == 0:
+            return None
         return format_mikrotik_rate_limit(
             profile, priority_override=assignment.priority_override
         )
@@ -778,12 +788,21 @@ class QueueManagementService:
         moment the window opens or closes -- the real background executor
         behind the module brief's own "Automatically change assigned
         queues based on time" requirement. See ``tasks.py``'s own module
-        docstring for the Beat-scheduled caller."""
+        docstring for the Beat-scheduled caller.
+
+        Uses ``repository.list_assignments_by_status`` (an unpaginated,
+        platform-wide query), not ``list_assignments``'s own paginated
+        ``page``/``page_size`` interface -- an earlier version of this
+        sweep called ``list_assignments(page=1, page_size=1000, ...)`` and
+        never fetched subsequent pages, silently dropping every assignment
+        past the first 1000 from schedule-transition evaluation. A sweep
+        that must evaluate *every* matching row on each tick has no natural
+        "page" to stop at."""
         suspended_count = 0
         resumed_count = 0
         for status_value in (QueueStatus.ACTIVE, QueueStatus.SUSPENDED):
-            assignments, _meta = await self.repository.list_assignments(
-                page=1, page_size=1000, filters={"status": status_value.value}
+            assignments = await self.repository.list_assignments_by_status(
+                status=status_value.value
             )
             for assignment in assignments:
                 if assignment.queue_schedule_id is None:

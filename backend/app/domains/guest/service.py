@@ -58,13 +58,21 @@ docstring -- by ``RadiusService.authorize`` itself, when a NAS-asserted
 former is a guest interactively proving an OTP/voucher/password over a
 rate-limited, purpose-built flow; the latter only ever runs behind
 ``dependencies.CurrentNas``'s shared-secret authentication, i.e. the MAC
-value is the NAS's own assertion, not a browser's. The session id handed
-back to the guest's device (and, in a real deployment, echoed into the
-router's RADIUS accounting attributes as ``Acct-Session-Id``) is exactly
-the ``GuestSession.id`` one of those two paths already created --
-``accounting_start``'s job is to confirm that id exists and belongs to a
-router this NAS is registered for, not to fabricate a session with no
-known auth method.
+value is the NAS's own assertion, not a browser's.
+
+Accounting resolves *which* session by ``username`` (RADIUS User-Name),
+the same ``_find_active_session_for_identifier`` lookup ``authorize``
+itself uses -- **not** by treating the NAS's own ``Acct-Session-Id`` as
+this platform's ``GuestSession.id``. Confirmed live via
+``freeradius -X`` against a real MikroTik hotspot: RouterOS originates
+Acct-Session-Id locally (an internal counter, e.g. ``"80000006"``) --
+there is no hotspot-login-form field through which this platform's own
+session id could ever reach the NAS to be echoed back. An earlier
+version of this module assumed otherwise (see git history) and every
+real Accounting-Request failed UUID validation as a result --
+``accounting_start``'s job is to confirm an ACTIVE session exists for
+this NAS/username pair, not to fabricate one or to look one up by an id
+the NAS never actually has.
 
 ## ``data_limit_mb``/``session_timeout_minutes``: copied, not referenced
 
@@ -311,6 +319,7 @@ from .exceptions import (
     GuestPasswordLoginFailedError,
     GuestPasswordSetupNotAuthorizedError,
     GuestPasswordTooWeakError,
+    GuestProfileUpdateNotAuthorizedError,
     GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
     InvalidSessionStatusTransitionError,
@@ -1899,6 +1908,66 @@ class GuestService:
         logger.info(
             "guest_password_set",
             extra={"event_guest_id": str(updated.id)},
+        )
+        return updated
+
+    async def update_guest_profile(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        session_id: uuid.UUID,
+        display_name: str | None,
+        email: str | None,
+    ) -> Guest:
+        """Lets a guest fill in their name/email right after a real OTP
+        verification -- the skippable "tell us about yourself" prompt shown
+        once, only to a brand-new guest, immediately after their first
+        ``login_via_otp`` succeeds (mirrors ``set_guest_password``'s
+        identical placement and purpose exactly).
+
+        **Authenticated by the just-completed OTP session, not a separate
+        unauthenticated hole** -- same proof-of-session eligibility check
+        as ``set_guest_password`` (session belongs to this guest, is an
+        OTP-authenticated session, is still ``ACTIVE``, started within
+        ``SET_PASSWORD_SESSION_WINDOW_MINUTES``), reusing that same window
+        constant rather than inventing a second one for an equivalent
+        "prove you just logged in" guarantee. Any failed leg raises
+        ``GuestProfileUpdateNotAuthorizedError``.
+
+        Both fields are optional and independently settable (a guest may
+        fill in only one) -- this call is only ever reached by choice; a
+        guest who skips the prompt entirely never calls it at all, and
+        network access is never gated on it."""
+        guest = await self._require_guest(guest_id)
+        session = await self.repository.get_session_by_id(session_id)
+        now = datetime.now(UTC)
+        window_start = now - timedelta(minutes=SET_PASSWORD_SESSION_WINDOW_MINUTES)
+        eligible = (
+            session is not None
+            and session.guest_id == guest.id
+            and session.auth_method
+            in (GuestAuthMethod.OTP_SMS.value, GuestAuthMethod.OTP_EMAIL.value)
+            and session.status == GuestSessionStatus.ACTIVE.value
+            and session.started_at >= window_start
+        )
+        if not eligible:
+            raise GuestProfileUpdateNotAuthorizedError()
+
+        update_data: dict[str, object] = {}
+        if display_name is not None:
+            update_data["display_name"] = display_name
+        if email is not None:
+            update_data["email"] = email
+        if not update_data:
+            return guest
+
+        updated = await self.repository.update_guest(guest, update_data)
+        logger.info(
+            "guest_profile_updated",
+            extra={
+                "event_guest_id": str(updated.id),
+                "event_fields": list(update_data.keys()),
+            },
         )
         return updated
 
@@ -3646,9 +3715,18 @@ class RadiusService:
         session-less guest, or a session that exists but is inactive or
         bound to a different router -- never raises, mirroring
         ``authorize``'s own "no notion of why, only accept/reject"
-        contract."""
+        contract.
+
+        Normalizes ``identifier`` the same way every guest-creation path
+        already does before writing it (``login_via_otp``/``_password``/
+        ``_voucher``, all via ``normalize_identifier``) -- this is an
+        exact-string DB lookup, so a caller (the NAS, forwarding whatever
+        the guest's browser POSTed) sending un-normalized whitespace would
+        otherwise silently never match a real, active session, reopening
+        the exact "logged in, zero internet" class of bug this method's
+        own username-matching design was built to fix."""
         guest = await self.repository.get_guest_by_identifier(
-            router.organization_id, identifier
+            router.organization_id, normalize_identifier(identifier)
         )
         if guest is None or guest.is_blocked:
             return None
@@ -3679,24 +3757,24 @@ class RadiusService:
             return None
 
     async def accounting_start(
-        self, *, nas_client: RadiusNasClient, session_id: uuid.UUID
+        self, *, nas_client: RadiusNasClient, username: str
     ) -> GuestSession:
         """See module docstring for why this confirms an existing session
         rather than fabricating one."""
-        session = await self._get_session_for_nas(nas_client, session_id)
+        session = await self._get_session_for_nas(nas_client, username)
         return session
 
     async def accounting_interim_update(
         self,
         *,
         nas_client: RadiusNasClient,
-        session_id: uuid.UUID,
+        username: str,
         bytes_uploaded_delta: int,
         bytes_downloaded_delta: int,
     ) -> GuestSession:
-        await self._get_session_for_nas(nas_client, session_id)
+        session = await self._get_session_for_nas(nas_client, username)
         return await self.guest_service.record_usage(
-            session_id=session_id,
+            session_id=session.id,
             bytes_uploaded_delta=bytes_uploaded_delta,
             bytes_downloaded_delta=bytes_downloaded_delta,
         )
@@ -3705,12 +3783,12 @@ class RadiusService:
         self,
         *,
         nas_client: RadiusNasClient,
-        session_id: uuid.UUID,
+        username: str,
         bytes_uploaded_total: int | None = None,
         bytes_downloaded_total: int | None = None,
         disconnect_reason: str | None = None,
     ) -> GuestSession:
-        session = await self._get_session_for_nas(nas_client, session_id)
+        session = await self._get_session_for_nas(nas_client, username)
 
         if bytes_uploaded_total is not None or bytes_downloaded_total is not None:
             update_data: dict[str, object] = {}
@@ -3757,14 +3835,34 @@ class RadiusService:
         )
 
     async def _get_session_for_nas(
-        self, nas_client: RadiusNasClient, session_id: uuid.UUID
+        self, nas_client: RadiusNasClient, username: str
     ) -> GuestSession:
-        session = await self.repository.get_session_by_id(session_id)
-        if session is None:
-            raise GuestSessionNotFoundError(session_id)
-        if session.router_id != nas_client.router_id:
-            raise RadiusNasAuthenticationError()
-        return session
+        """Resolves accounting's target session by ``username`` against
+        this NAS's own router -- never by treating the NAS's own
+        Acct-Session-Id as this platform's ``GuestSession.id``. See
+        ``RadiusAccountingRequest``'s own docstring for why: a real
+        MikroTik hotspot originates its Acct-Session-Id locally and has
+        no way to echo back a caller-supplied UUID.
+
+        Deliberately not ``_find_active_session_for_identifier`` (which
+        ``authorize`` uses) -- that only ever returns an ACTIVE session,
+        but Accounting-Stop for an already-disconnected session (e.g. a
+        RADIUS retransmit, or this platform closing the session first via
+        a different path) must still resolve it and no-op, not 404. This
+        matches the latest session for the identifier on this router
+        regardless of status, same as ``_find_active_session_for_identifier``
+        minus its ``is_active()`` filter."""
+        router = await self.router_lookup.get_router(
+            nas_client.router_id, include_deleted=True
+        )
+        guest = await self.repository.get_guest_by_identifier(
+            router.organization_id, normalize_identifier(username)
+        )
+        if guest is not None and not guest.is_blocked:
+            candidate = await self.repository.get_latest_session_for_guest(guest.id)
+            if candidate is not None and candidate.router_id == router.id:
+                return candidate
+        raise GuestSessionNotFoundError(username)
 
 
 # ============================================================================

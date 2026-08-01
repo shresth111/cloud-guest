@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 from app.common.masking import MaskedIdentifier, MaskedMac, MaskedName
 
@@ -36,6 +36,8 @@ __all__ = [
     "GuestPasswordLoginRequest",
     "GuestSetPasswordRequest",
     "GuestSetPasswordResponse",
+    "GuestUpdateProfileRequest",
+    "GuestUpdateProfileResponse",
     "GuestConsentRequest",
     "GuestBlockRequest",
     "SessionDisconnectRequest",
@@ -154,6 +156,27 @@ class GuestSetPasswordRequest(BaseModel):
 class GuestSetPasswordResponse(BaseModel):
     guest_id: str
     password_set: bool
+
+
+class GuestUpdateProfileRequest(BaseModel):
+    """The skippable "tell us about yourself" prompt shown once, right
+    after a brand-new guest's first OTP verification -- ``guest_id``/
+    ``session_id`` mirror ``GuestSetPasswordRequest``'s identical "prove it
+    with the real ``GuestLoginResponse`` you were just issued" shape (see
+    ``service.GuestService.update_guest_profile``'s docstring). Both
+    profile fields are optional and independently settable; the frontend
+    only calls this at all if the guest actually filled in something."""
+
+    guest_id: uuid.UUID
+    session_id: uuid.UUID
+    display_name: str | None = Field(default=None, min_length=1, max_length=200)
+    email: EmailStr | None = Field(default=None)
+
+
+class GuestUpdateProfileResponse(BaseModel):
+    guest_id: str
+    display_name: str | None
+    email: str | None
 
 
 class GuestDisconnectRequest(BaseModel):
@@ -473,12 +496,25 @@ class RadiusAccountingRequest(BaseModel):
     ``_ACCOUNTING_ON``/``_ACCOUNTING_OFF``) in one schema -- fields not
     relevant to a given ``status_type`` are simply left ``None``/default.
 
-    ``session_id`` is optional (unlike the original three-status-type
-    shape) because Accounting-On/Accounting-Off (RFC 2866 §5.13) are
-    NAS-level events, not session-level ones -- the real RADIUS protocol
-    carries no Acct-Session-Id on either packet at all, since the NAS is
-    signalling its own boot/shutdown, not reporting on one specific
-    session."""
+    ``username`` (not ``session_id``) is what actually resolves the real
+    ``GuestSession`` here -- confirmed live via ``freeradius -X``: a real
+    MikroTik hotspot originates its *own* Acct-Session-Id locally (a short
+    NAS-internal counter like ``"80000006"``), never this platform's own
+    ``GuestSession.id`` UUID -- there is no hotspot-login-form field that
+    could ever hand RouterOS a caller-supplied session identifier to echo
+    back. Every real Accounting-Request from a real router therefore
+    always failed UUID validation before this fix. ``session_id`` is kept
+    only as an opaque, NAS-originated reference string for logging/
+    correlation -- the same ``_find_active_session_for_identifier``
+    username-based lookup ``RadiusService.authorize`` already uses is what
+    actually finds the session.
+
+    ``username``/``session_id`` are optional (unlike the original
+    three-status-type shape) because Accounting-On/Accounting-Off (RFC
+    2866 §5.13) are NAS-level events, not session-level ones -- the real
+    RADIUS protocol carries no Acct-Session-Id (or User-Name) on either
+    packet at all, since the NAS is signalling its own boot/shutdown, not
+    reporting on one specific session."""
 
     status_type: str = Field(
         ...,
@@ -486,13 +522,19 @@ class RadiusAccountingRequest(BaseModel):
             "One of: start, interim-update, stop, accounting-on, " "accounting-off."
         ),
     )
-    session_id: uuid.UUID | None = Field(
+    username: str | None = Field(
         default=None,
-        description="The GuestSession id -- echoed back by the NAS as "
-        "Acct-Session-Id, originated by this module's own login endpoints. "
-        "Required for start/interim-update/stop; omitted (ignored if sent) "
-        "for accounting-on/accounting-off, which are NAS-level, not "
-        "session-level, events.",
+        description="The guest's identifier (RADIUS User-Name) -- resolves "
+        "the currently-ACTIVE GuestSession for this NAS, the same lookup "
+        "Authorize itself uses. Required for start/interim-update/stop; "
+        "omitted for accounting-on/accounting-off.",
+    )
+    session_id: str | None = Field(
+        default=None,
+        description="The NAS's own Acct-Session-Id -- an opaque, "
+        "NAS-originated string (e.g. RouterOS's own internal counter), "
+        "kept only for logging/correlation. Never this platform's "
+        "GuestSession id, and never used to look one up.",
     )
     bytes_uploaded_delta: int = Field(default=0, ge=0)
     bytes_downloaded_delta: int = Field(default=0, ge=0)
@@ -501,24 +543,23 @@ class RadiusAccountingRequest(BaseModel):
     disconnect_reason: str | None = Field(default=None, max_length=255)
 
     @model_validator(mode="after")
-    def _require_session_id_for_session_scoped_status_types(
+    def _require_username_for_session_scoped_status_types(
         self,
     ) -> RadiusAccountingRequest:
         """``accounting-on``/``accounting-off`` are NAS-level events with no
-        Acct-Session-Id at all -- deliberately not enforced here (their
-        ``session_id`` stays ``None``/is ignored). Every other, genuinely
-        session-scoped status type still requires one; this catches a
-        malformed request at the schema boundary rather than letting a
-        ``None`` reach the service layer's ``uuid.UUID``-typed
-        ``session_id`` parameter."""
+        User-Name at all -- deliberately not enforced here (``username``
+        stays ``None``/is ignored). Every other, genuinely session-scoped
+        status type still requires one; this catches a malformed request
+        at the schema boundary rather than letting a ``None`` reach the
+        service layer's ``str``-typed ``username`` parameter."""
         session_scoped = {
             RADIUS_ACCT_STATUS_START,
             RADIUS_ACCT_STATUS_INTERIM_UPDATE,
             RADIUS_ACCT_STATUS_STOP,
         }
-        if self.status_type in session_scoped and self.session_id is None:
+        if self.status_type in session_scoped and not self.username:
             raise ValueError(
-                f"session_id is required for status_type '{self.status_type}'"
+                f"username is required for status_type '{self.status_type}'"
             )
         return self
 

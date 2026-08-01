@@ -65,7 +65,10 @@ from .constants import (
     DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER,
     ISP_PING_COUNT,
     ISP_PING_TIMEOUT_SECONDS,
+    UNHEALTHY_SINCE_LOOKBACK_LIMIT,
     HealthStatus,
+    HealthStatusSource,
+    IspConnectionMode,
     IspLinkRole,
 )
 from .device_adapters import IspCredentials, PingResult, get_isp_health_adapter
@@ -75,10 +78,12 @@ from .events import (
     IspHealthCheckRecorded,
     IspLinkCreated,
     IspLinkDeleted,
+    IspLinkManualStatusSet,
     IspLinkUpdated,
 )
 from .exceptions import (
     CrossOrganizationIspLinkAccessError,
+    IspHealthCheckTargetUnavailableError,
     IspLinkDisabledError,
     IspLinkNotFoundError,
     IspMissingCredentialsError,
@@ -144,6 +149,19 @@ class HealthCheckSweepSummary:
     errors: int
 
 
+@dataclass(frozen=True, slots=True)
+class TrafficCounters:
+    """One real, raw snapshot of a link's own interface byte counters --
+    see ``IspService.sample_link_traffic``. Deliberately not a rate: the
+    caller (``record_health_check_result``, which already owns ``now``
+    and the link's *previous* reading) computes the Mbps delta, the same
+    "counter now, delta computed against the previous reading" split
+    ``app.domains.guest.service`` already establishes."""
+
+    rx_bytes: int
+    tx_bytes: int
+
+
 # ============================================================================
 # Service
 # ============================================================================
@@ -177,6 +195,7 @@ class IspService:
         router_id: uuid.UUID,
         provider_name: str,
         link_type: str,
+        connection_mode: str = IspConnectionMode.STATIC.value,
         role: IspLinkRole,
         priority: int = 0,
         interface: str | None = None,
@@ -212,6 +231,7 @@ class IspService:
             location_id=router.location_id,
             provider_name=provider_name,
             link_type=link_type,
+            connection_mode=connection_mode,
             role=role.value,
             is_active_uplink=is_first_link,
             auto_failback=auto_failback,
@@ -367,9 +387,34 @@ class IspService:
         if not link.is_enabled:
             raise IspLinkDisabledError(link.id)
         ping_result = await self.ping_link(link)
-        return await self.record_health_check_result(link, ping_result=ping_result)
+        traffic = await self.safe_sample_link_traffic(link)
+        return await self.record_health_check_result(
+            link, ping_result=ping_result, traffic=traffic
+        )
 
     async def ping_link(self, link: IspLink) -> PingResult:
+        """Resolves this link's own real health-check target and executes
+        it -- the resolution strategy itself is driven entirely by the
+        link's own ``connection_mode`` (never anything hardcoded to a
+        particular link/router), so every ISP link platform-wide, on
+        every router, gets the strategy that actually matches how its own
+        WAN connection is configured:
+
+        * ``STATIC`` -- pings ``gateway_ip_address`` (the historical,
+          only-ever-supported behavior, unchanged).
+        * ``DHCP`` -- never trusts a manually-typed value (there isn't
+          one); resolves the router's own *live* dynamic default gateway
+          via ``get_dynamic_default_gateway`` at check time, then pings
+          that, so a mid-lease ISP-side gateway change is always
+          reflected on the very next check, never stale.
+        * ``PPPOE`` -- no gateway/ping involved at all; the link's own
+          ``interface`` PPPoE client's real up/down state *is* the health
+          signal, synthesized into a ``PingResult`` shape (0%
+          loss/0ms for up, 100% loss/``None`` latency for down) purely so
+          ``record_health_check_result``'s existing classification/
+          recording pipeline keeps working completely unchanged for this
+          mode too -- one recording path, three ways to arrive at it.
+        """
         router = await self.router_lookup.get_router(link.router_id)
         host = router.management_ip_address or router.public_ip_address
         secret = self.router_lookup.get_decrypted_api_secret(router)
@@ -378,8 +423,37 @@ class IspService:
         credentials = IspCredentials(
             host=host, username=router.api_username, password=secret
         )
-        target_ip = link.gateway_ip_address or host
         adapter = self._get_device_adapter(router.vendor)
+
+        if link.connection_mode == IspConnectionMode.PPPOE.value:
+            if not link.interface:
+                raise IspHealthCheckTargetUnavailableError(
+                    link.id, "PPPOE mode but no interface configured on this link"
+                )
+            is_up = await adapter.get_pppoe_interface_status(
+                credentials, interface_name=link.interface
+            )
+            return (
+                PingResult(
+                    sent=1, received=1, packet_loss_percentage=0.0, avg_rtt_ms=0.0
+                )
+                if is_up
+                else PingResult(
+                    sent=1, received=0, packet_loss_percentage=100.0, avg_rtt_ms=None
+                )
+            )
+
+        if link.connection_mode == IspConnectionMode.DHCP.value:
+            target_ip = await adapter.get_dynamic_default_gateway(credentials)
+            if not target_ip:
+                raise IspHealthCheckTargetUnavailableError(
+                    link.id,
+                    "DHCP mode but no dynamic default route currently present "
+                    "on the router",
+                )
+        else:
+            target_ip = link.gateway_ip_address or host
+
         return await adapter.ping(
             credentials,
             target_ip=target_ip,
@@ -387,8 +461,57 @@ class IspService:
             timeout_seconds=ISP_PING_TIMEOUT_SECONDS,
         )
 
+    async def sample_link_traffic(self, link: IspLink) -> TrafficCounters | None:
+        """Real, best-effort traffic-load sample for the "how much
+        traffic is flowing on this link right now" graph -- connection-
+        mode-independent (unlike ``ping_link``): a link's own interface
+        byte counters exist regardless of whether its IP is static/DHCP/
+        PPPoE, so this always reads ``link.interface`` directly, on every
+        mode uniformly. For a PPPOE link this is the same interface
+        ``ping_link`` already checks for up/down state -- RouterOS gives
+        that virtual interface its own real counters (see
+        ``device_adapters.py``'s own module docstring).
+
+        Returns ``None`` (never a fabricated ``0``) whenever there is
+        nothing real to attribute a counter to: no interface configured
+        on this link, no router credentials, or the router doesn't
+        recognize that interface name. Never raises on a *device*
+        failure either -- callers use ``safe_sample_link_traffic`` to turn
+        any real connection error into the same honest ``None``, since a
+        traffic-sampling failure is a value-add feature going dark for
+        one tick, never a reason to fail an otherwise-successful health
+        check."""
+        if not link.interface:
+            return None
+        router = await self.router_lookup.get_router(link.router_id)
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.router_lookup.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            return None
+        credentials = IspCredentials(
+            host=host, username=router.api_username, password=secret
+        )
+        adapter = self._get_device_adapter(router.vendor)
+        counters = await adapter.get_interface_traffic_counters(
+            credentials, interface_name=link.interface
+        )
+        if counters is None:
+            return None
+        rx_bytes, tx_bytes = counters
+        return TrafficCounters(rx_bytes=rx_bytes, tx_bytes=tx_bytes)
+
+    async def safe_sample_link_traffic(self, link: IspLink) -> TrafficCounters | None:
+        try:
+            return await self.sample_link_traffic(link)
+        except Exception as exc:  # noqa: BLE001 -- see sample_link_traffic's own docstring
+            logger.warning(
+                "isp_traffic_sample_failed",
+                extra={"isp_link_id": str(link.id), "error": str(exc)},
+            )
+            return None
+
     async def record_health_check_result(
-        self, link: IspLink, *, ping_result: PingResult
+        self, link: IspLink, *, ping_result: PingResult, traffic: TrafficCounters | None = None
     ) -> IspLink:
         now = datetime.now(UTC)
         status = classify_health_status(
@@ -400,24 +523,71 @@ class IspService:
             if status == HealthStatus.UNHEALTHY
             else 0
         )
+
+        # Traffic-load rate: a real delta between this tick's counters and
+        # the *previous* reading, over the real elapsed wall-clock time
+        # between them -- never computed from a single snapshot (that's
+        # not a rate, it's just a number), and never negative (an
+        # interface reset mid-window means "no valid rate this tick", not
+        # a garbage value) -- see sample_link_traffic's own docstring.
+        download_mbps: float | None = None
+        upload_mbps: float | None = None
+        if (
+            traffic is not None
+            and link.last_rx_bytes is not None
+            and link.last_tx_bytes is not None
+            and link.last_checked_at is not None
+        ):
+            elapsed_seconds = (now - link.last_checked_at).total_seconds()
+            if elapsed_seconds > 0:
+                rx_delta = traffic.rx_bytes - link.last_rx_bytes
+                tx_delta = traffic.tx_bytes - link.last_tx_bytes
+                if rx_delta >= 0:
+                    download_mbps = round(
+                        (rx_delta * 8) / elapsed_seconds / 1_000_000, 3
+                    )
+                if tx_delta >= 0:
+                    upload_mbps = round(
+                        (tx_delta * 8) / elapsed_seconds / 1_000_000, 3
+                    )
+
         await self.repository.create_health_check(
             isp_link_id=link.id,
             checked_at=now,
             status=status.value,
+            source=HealthStatusSource.AUTOMATED.value,
             latency_ms=ping_result.avg_rtt_ms,
             packet_loss_percentage=ping_result.packet_loss_percentage,
             error_message=None,
+            download_mbps=download_mbps,
+            upload_mbps=upload_mbps,
         )
-        updated = await self.repository.update_link(
-            link,
-            {
-                "health_status": status.value,
-                "latency_ms": ping_result.avg_rtt_ms,
-                "packet_loss_percentage": ping_result.packet_loss_percentage,
-                "last_checked_at": now,
-                "consecutive_unhealthy_count": new_consecutive_unhealthy,
-            },
-        )
+        update_fields: dict[str, object] = {
+            "health_status": status.value,
+            # A real ping always reclaims the link back to AUTOMATED,
+            # overwriting any earlier manual override -- see
+            # constants.HealthStatusSource's own docstring.
+            "health_status_source": HealthStatusSource.AUTOMATED.value,
+            "latency_ms": ping_result.avg_rtt_ms,
+            "packet_loss_percentage": ping_result.packet_loss_percentage,
+            "last_checked_at": now,
+            "consecutive_unhealthy_count": new_consecutive_unhealthy,
+        }
+        if traffic is not None:
+            # Always store this tick's own raw counters for the *next*
+            # tick's delta, regardless of whether a rate was computable
+            # this time (e.g. the link's very first sample ever) --
+            # current_download_mbps/upload_mbps are left untouched (not
+            # nulled) when a rate genuinely couldn't be computed, so a
+            # single transient sampling gap doesn't blank out the last
+            # known-real reading.
+            update_fields["last_rx_bytes"] = traffic.rx_bytes
+            update_fields["last_tx_bytes"] = traffic.tx_bytes
+            if download_mbps is not None:
+                update_fields["current_download_mbps"] = download_mbps
+            if upload_mbps is not None:
+                update_fields["current_upload_mbps"] = upload_mbps
+        updated = await self.repository.update_link(link, update_fields)
         event = IspHealthCheckRecorded(
             link_id=updated.id,
             status=status.value,
@@ -426,6 +596,74 @@ class IspService:
         )
         logger.info("isp_health_check_recorded", extra=_event_extra(event))
         return await self._maybe_transition_uplink(updated)
+
+    async def set_manual_health_status(
+        self,
+        link_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        health_status: HealthStatus,
+        reason: str | None = None,
+    ) -> IspLink:
+        """An admin's own manual override of a link's *current* status --
+        the "Internet Connection" dashboard view's one real write. Never
+        opens a device connection or triggers a failover/failback itself
+        (this view is read/observe-only against the router; see
+        ``models.py``'s own "Manual status override" write-up) -- it only
+        records what an admin has told this domain is true right now,
+        exactly like a real reading would, so the existing
+        ``health_status``/``health_status_source`` columns and the
+        ``IspHealthCheck`` history/"Status Timeline" stay a single source
+        of truth rather than growing a second, frontend-only notion of
+        status. The very next real ping (sweep or manual check) reclaims
+        the link back to ``HealthStatusSource.AUTOMATED`` regardless of
+        this override -- see ``record_health_check_result``.
+
+        Restricted to ``HEALTHY``/``UNHEALTHY`` at the schema layer
+        (``IspLinkManualStatusRequest``) -- an admin's override is a
+        binary "it's up" / "it's down" call, never a nuanced
+        ``DEGRADED``/``UNKNOWN`` classification only a real measurement
+        can produce.
+        """
+        link = await self.get_link(
+            link_id, requesting_organization_id=requesting_organization_id
+        )
+        now = datetime.now(UTC)
+        await self.repository.create_health_check(
+            isp_link_id=link.id,
+            checked_at=now,
+            status=health_status.value,
+            source=HealthStatusSource.MANUAL.value,
+            latency_ms=None,
+            packet_loss_percentage=None,
+            error_message=reason,
+        )
+        updated = await self.repository.update_link(
+            link,
+            {
+                "health_status": health_status.value,
+                "health_status_source": HealthStatusSource.MANUAL.value,
+                "last_checked_at": now,
+                "updated_by": actor_user_id,
+            },
+        )
+        event = IspLinkManualStatusSet(
+            link_id=updated.id, health_status=health_status.value, reason=reason
+        )
+        logger.info("isp_link_manual_status_set", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.ISP_LINK_MANUAL_STATUS_SET,
+            entity_id=updated.id,
+            organization_id=updated.organization_id,
+            description=(
+                f"ISP link '{updated.provider_name}' manually marked "
+                f"{health_status.value}"
+                + (f" ({reason})" if reason else "")
+            ),
+        )
+        return updated
 
     async def _maybe_transition_uplink(self, link: IspLink) -> IspLink:
         """After recording a health check, evaluates whether this reading
@@ -590,6 +828,38 @@ class IspService:
         )
         return round(100.0 * up_count / len(health_checks), 2)
 
+    async def compute_unhealthy_since(self, link: IspLink) -> datetime | None:
+        """"Down since when" -- a computed read-model derived entirely
+        from real, already-persisted ``IspHealthCheck`` history, never a
+        new stored column (identical "computed at read time" posture as
+        ``compute_availability_percentage`` above). ``None`` unless the
+        link's own *current* ``health_status`` is ``UNHEALTHY`` right
+        now.
+
+        Walks history newest-to-oldest and returns the ``checked_at`` of
+        the earliest row in the unbroken ``UNHEALTHY`` run ending at the
+        most recent reading -- this works uniformly whether that run is
+        entirely real ping failures, entirely a manual "Mark Down"
+        override, or a mix of both, precisely because both write into the
+        same ``IspHealthCheck`` table tagged only by ``source`` (see
+        ``models.py``'s own "Manual status override" write-up) rather
+        than two separate histories that would each need their own scan.
+        Capped at ``UNHEALTHY_SINCE_LOOKBACK_LIMIT`` rows -- if the entire
+        capped window is UNHEALTHY, returns that window's own oldest
+        ``checked_at`` as a real, honest lower bound rather than an exact
+        instant."""
+        if link.health_status != HealthStatus.UNHEALTHY.value:
+            return None
+        checks = await self.repository.list_recent_health_checks_for_link(
+            link.id, limit=UNHEALTHY_SINCE_LOOKBACK_LIMIT
+        )
+        since: datetime | None = None
+        for check in checks:
+            if check.status != HealthStatus.UNHEALTHY.value:
+                break
+            since = check.checked_at
+        return since
+
     # ========================================================================
     # Internal helpers
     # ========================================================================
@@ -647,15 +917,29 @@ async def run_health_check_sweep(
     skipped = 0
     errors = 0
     for link in links:
-        if not link.gateway_ip_address:
+        # Only a STATIC-mode link with no manually-entered gateway has
+        # nothing to check at all -- skipped before even trying, exactly
+        # as before this connection-mode split existed. DHCP links
+        # legitimately have no gateway_ip_address (resolved live every
+        # check -- see IspService.ping_link) and PPPOE links never had
+        # one in the first place, so neither is ever skipped here; any
+        # real resolution failure for either (e.g. DHCP hasn't leased
+        # yet) surfaces through the same per-link try/except isolation
+        # below as IspHealthCheckTargetUnavailableError, not a silent
+        # pre-emptive skip that looks identical to "nothing to do here."
+        if (
+            link.connection_mode == IspConnectionMode.STATIC.value
+            and not link.gateway_ip_address
+        ):
             skipped += 1
             continue
         try:
             ping_result = await service.ping_link(link)
+            traffic = await service.safe_sample_link_traffic(link)
             before_active = link.is_active_uplink
             before_role = link.role
             updated = await service.record_health_check_result(
-                link, ping_result=ping_result
+                link, ping_result=ping_result, traffic=traffic
             )
             checked += 1
             if (
@@ -689,6 +973,7 @@ __all__ = [
     "RouterLookupProtocol",
     "AuditLogWriter",
     "HealthCheckSweepSummary",
+    "TrafficCounters",
     "IspService",
     "run_health_check_sweep",
 ]

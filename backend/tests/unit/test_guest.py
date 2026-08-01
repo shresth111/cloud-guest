@@ -53,6 +53,7 @@ from app.domains.guest.exceptions import (
     GuestPasswordLoginFailedError,
     GuestPasswordSetupNotAuthorizedError,
     GuestPasswordTooWeakError,
+    GuestProfileUpdateNotAuthorizedError,
     GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
     InvalidExtensionMinutesError,
@@ -1662,6 +1663,121 @@ class TestSetGuestPassword:
                 password="short",
             )
         assert fx.repository.guests[otp_result.guest.id].hashed_password is None
+
+
+class TestUpdateGuestProfile:
+    """Real feature: the skippable "tell us about yourself" prompt shown
+    once, right after a brand-new guest's first mobile-OTP login -- see
+    GuestService.update_guest_profile's docstring."""
+
+    async def _otp_login(self, fx: Fixture) -> GuestLoginResult:
+        return await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+
+    async def test_happy_path_sets_display_name_and_email(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        updated = await fx.guest_service.update_guest_profile(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            display_name="Priya Sharma",
+            email="priya@example.com",
+        )
+        assert updated.display_name == "Priya Sharma"
+        assert updated.email == "priya@example.com"
+
+    async def test_only_email_supplied_leaves_display_name_untouched(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.update_guest_profile(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            display_name="Priya Sharma",
+            email=None,
+        )
+        updated = await fx.guest_service.update_guest_profile(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            display_name=None,
+            email="priya@example.com",
+        )
+        assert updated.display_name == "Priya Sharma"
+        assert updated.email == "priya@example.com"
+
+    async def test_rejects_a_session_belonging_to_a_different_guest(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        other_guest = await fx.repository.create_guest(
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+15550000000",
+            display_name=None,
+            first_seen_at=_now(),
+            last_seen_at=_now(),
+            total_visit_count=0,
+            is_blocked=False,
+            blocked_reason=None,
+        )
+        with pytest.raises(GuestProfileUpdateNotAuthorizedError):
+            await fx.guest_service.update_guest_profile(
+                guest_id=other_guest.id,
+                session_id=otp_result.session.id,
+                display_name="Someone Else",
+                email=None,
+            )
+
+    async def test_rejects_a_voucher_authenticated_session(self) -> None:
+        fx = make_fixture()
+        fx.voucher_service.register("VOUCHER1", data_limit_mb=500, validity_minutes=120)
+        voucher_result = await fx.guest_service.login_via_voucher(
+            code="VOUCHER1",
+            identifier="+15551234567",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        with pytest.raises(GuestProfileUpdateNotAuthorizedError):
+            await fx.guest_service.update_guest_profile(
+                guest_id=voucher_result.guest.id,
+                session_id=voucher_result.session.id,
+                display_name="Priya Sharma",
+                email=None,
+            )
+
+    async def test_rejects_a_no_longer_active_session(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.disconnect_session(
+            session_id=otp_result.session.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+            reason="guest left",
+        )
+        with pytest.raises(GuestProfileUpdateNotAuthorizedError):
+            await fx.guest_service.update_guest_profile(
+                guest_id=otp_result.guest.id,
+                session_id=otp_result.session.id,
+                display_name="Priya Sharma",
+                email=None,
+            )
+
+    async def test_no_fields_supplied_is_a_no_op(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        updated = await fx.guest_service.update_guest_profile(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            display_name=None,
+            email=None,
+        )
+        assert updated.display_name is None
+        assert updated.email is None
 
 
 class TestGuestSelfDisconnect:
@@ -3932,13 +4048,13 @@ class TestRadius:
         )
 
         started = await fx.radius_service.accounting_start(
-            nas_client=nas_client, session_id=login.session.id
+            nas_client=nas_client, username="+15554445555"
         )
         assert started.id == login.session.id
 
         updated = await fx.radius_service.accounting_interim_update(
             nas_client=nas_client,
-            session_id=login.session.id,
+            username="+15554445555",
             bytes_uploaded_delta=1024,
             bytes_downloaded_delta=2048,
         )
@@ -3947,7 +4063,7 @@ class TestRadius:
 
         stopped = await fx.radius_service.accounting_stop(
             nas_client=nas_client,
-            session_id=login.session.id,
+            username="+15554445555",
             bytes_uploaded_total=5000,
             bytes_downloaded_total=8000,
         )
@@ -3971,9 +4087,14 @@ class TestRadius:
         nas_client = await fx.radius_service.authenticate_nas(
             nas_identifier="nas-1", shared_secret="supersecret123"
         )
-        with pytest.raises(RadiusNasAuthenticationError):
+        # Username-based lookup is scoped to this NAS's own router from the
+        # start (mirrors authorize's own "no notion of why, only
+        # found-or-not" contract) -- a session on a different router
+        # collapses into the same not-found error as no session at all,
+        # rather than a distinguished ownership error.
+        with pytest.raises(GuestSessionNotFoundError):
             await fx.radius_service.accounting_start(
-                nas_client=nas_client, session_id=login.session.id
+                nas_client=nas_client, username="+15556667777"
             )
 
     async def test_accounting_stop_is_noop_on_already_terminal_session(self) -> None:
@@ -3992,7 +4113,7 @@ class TestRadius:
             nas_identifier="nas-1", shared_secret="supersecret123"
         )
         stopped = await fx.radius_service.accounting_stop(
-            nas_client=nas_client, session_id=login.session.id
+            nas_client=nas_client, username="+15557778888"
         )
         assert stopped.status == GuestSessionStatus.DISCONNECTED.value
 
@@ -4004,7 +4125,7 @@ class TestRadius:
         )
         with pytest.raises(GuestSessionNotFoundError):
             await fx.radius_service.accounting_start(
-                nas_client=nas_client, session_id=uuid.uuid4()
+                nas_client=nas_client, username="nobody@example.com"
             )
 
 

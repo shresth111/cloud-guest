@@ -144,6 +144,15 @@ class Guest(BaseModel):
     )
     identifier: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Optional, guest-supplied contact email -- distinct from `identifier`,
+    # which for an SMS-OTP guest is their phone number, not an email
+    # address. Only ever written by `GuestService.update_guest_profile`,
+    # itself only reachable with proof of a just-completed, still-`ACTIVE`
+    # OTP-authenticated `GuestSession` (same "prove it with the real
+    # session you were just issued" pattern as `set_guest_password`).
+    # Nullable and never required to obtain network access -- see that
+    # method's docstring.
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

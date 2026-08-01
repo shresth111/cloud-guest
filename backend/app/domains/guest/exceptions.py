@@ -421,6 +421,24 @@ class GuestPasswordSetupNotAuthorizedError(GuestError):
         )
 
 
+class GuestProfileUpdateNotAuthorizedError(GuestError):
+    """``GuestService.update_guest_profile`` requires the exact same proof
+    of a just-completed, still-``ACTIVE`` OTP-authenticated ``GuestSession``
+    that ``GuestPasswordSetupNotAuthorizedError`` documents for
+    ``set_guest_password`` -- same eligibility check, same one generic
+    message across every distinct reason it can fail (session doesn't
+    exist / wrong guest / not an OTP session / no longer active / too old),
+    same remedy: log in again via a one-time code and try again right
+    after."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This session isn't eligible to update your details -- please "
+            "sign in again with a one-time code and try again right after.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class GuestPasswordTooWeakError(GuestError):
     """Wraps ``app.domains.auth.password.PasswordStrengthError`` from
     ``PasswordManager.validate_strength`` (composed, not reimplemented --

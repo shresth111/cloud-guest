@@ -191,6 +191,7 @@ class GuestAccessService:
         identifier: str,
         rule_type: AccessRuleType,
         reason: str | None,
+        email: str | None = None,
         expires_at: datetime | None,
         actor_user_id: uuid.UUID | None,
     ) -> GuestAccessRule:
@@ -204,6 +205,7 @@ class GuestAccessService:
             identifier=identifier,
             rule_type=rule_type.value,
             reason=reason,
+            email=email,
             expires_at=expires_at,
             is_active=True,
             created_by=actor_user_id,
@@ -313,6 +315,7 @@ class GuestAccessService:
         mac_address: str,
         rule_type: AccessRuleType,
         reason: str | None,
+        email: str | None = None,
         expires_at: datetime | None,
         actor_user_id: uuid.UUID | None,
     ) -> DeviceAccessRule:
@@ -326,6 +329,7 @@ class GuestAccessService:
             mac_address=mac_address,
             rule_type=rule_type.value,
             reason=reason,
+            email=email,
             expires_at=expires_at,
             is_active=True,
             created_by=actor_user_id,

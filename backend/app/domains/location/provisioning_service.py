@@ -700,7 +700,21 @@ def _resolve_login_methods(feature_summary: dict[str, object]) -> _LoginMethods:
     gap (not fabricated), left for a future Captive Portal addition.
     ``username_password_enabled`` has no corresponding ``PlanFeatureKey`` in
     the spec's list either, so it defaults to always-on (the standard,
-    baseline login method)."""
+    baseline login method).
+
+    ``otp_email_enabled`` previously reused ``mobile_otp_enabled`` as its
+    source -- there is no dedicated ``PlanFeatureKey`` for email OTP either
+    (only SMS carries a real per-message cost via ``SMS_QUOTA``, hence
+    ``MOBILE_OTP`` gating it), so any location on a plan without the mobile
+    add-on silently provisioned with email login disabled too, with no
+    login method left for a guest who only has an email address. Real
+    incident: "koi bhi user email id se register nahi kr pa raha" -- every
+    guest hitting the disabled otp_email path fell through to the
+    password-login form, which always fails for a first-time guest with no
+    saved password (``GuestPasswordLoginFailedError``). Email OTP has no
+    comparable per-send cost, so -- like ``username_password_enabled`` --
+    it now defaults to always-on rather than piggybacking on an unrelated
+    feature flag."""
     mobile_otp_enabled = bool(
         feature_summary.get(PlanFeatureKey.MOBILE_OTP.value, False)
     )
@@ -712,7 +726,7 @@ def _resolve_login_methods(feature_summary: dict[str, object]) -> _LoginMethods:
     )
     return _LoginMethods(
         otp_sms_enabled=mobile_otp_enabled,
-        otp_email_enabled=mobile_otp_enabled,
+        otp_email_enabled=True,
         voucher_enabled=voucher_enabled,
         social_login_enabled=social_login_enabled,
     )

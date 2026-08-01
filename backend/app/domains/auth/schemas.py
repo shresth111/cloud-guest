@@ -36,6 +36,18 @@ class LoginRequest(BaseModel):
             "this field set."
         ),
     )
+    new_password: str | None = Field(
+        default=None,
+        min_length=12,
+        description=(
+            "Required only if the account has must_change_password set "
+            "(e.g. a freshly-provisioned owner account's temporary "
+            "password): omitting it returns a distinct error -- retry the "
+            "same call with this field set to the new password the user "
+            "wants, alongside the temporary one in `password`. Same "
+            "single-endpoint-retry shape as `mfa_code`."
+        ),
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
