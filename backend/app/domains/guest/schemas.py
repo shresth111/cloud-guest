@@ -83,8 +83,9 @@ class GuestOtpLoginRequest(BaseModel):
     code: str = Field(..., min_length=4, max_length=10)
     auth_method: GuestAuthMethod = Field(
         default=GuestAuthMethod.OTP_SMS,
-        description="Must be otp_sms or otp_email -- which enabled-method "
-        "flag on the resolved captive portal config to check.",
+        description="Must be otp_sms, otp_email, or otp_whatsapp -- which "
+        "enabled-method flag on the resolved captive portal config to "
+        "check.",
     )
     organization_id: uuid.UUID | None = Field(default=None)
     location_id: uuid.UUID = Field(...)

@@ -9,11 +9,13 @@ either. The admin-facing ``GET /otp/requests`` endpoint reuses the exact
 same ``get_otp_service`` dependency; its own authorization is provided
 entirely by RBAC's ``RequirePermission`` in ``router.py``.
 
-``sms_provider``/``email_provider`` are resolved via ``service.py``'s
-``get_configured_sms_provider``/``get_configured_email_provider`` --
-``Settings.sms_delivery_provider``/``Settings.email_delivery_provider``
-select a real provider, defaulting to the honest interim
-``LoggingSmsProvider``/``LoggingEmailProvider`` (see ``service.py``'s
+``sms_provider``/``email_provider``/``whatsapp_provider`` are resolved via
+``service.py``'s ``get_configured_sms_provider``/
+``get_configured_email_provider``/``get_configured_whatsapp_provider`` --
+``Settings.sms_delivery_provider``/``Settings.email_delivery_provider``/
+``Settings.whatsapp_delivery_provider`` each select a real provider,
+defaulting to the honest interim ``LoggingSmsProvider``/
+``LoggingEmailProvider``/``LoggingWhatsAppProvider`` (see ``service.py``'s
 module docstring) when unset.
 """
 
@@ -34,6 +36,7 @@ from .service import (
     OtpService,
     get_configured_email_provider,
     get_configured_sms_provider,
+    get_configured_whatsapp_provider,
 )
 
 
@@ -55,6 +58,7 @@ def get_otp_service(
         audit_writer=audit_repository,
         sms_provider=get_configured_sms_provider(settings),
         email_provider=get_configured_email_provider(settings),
+        whatsapp_provider=get_configured_whatsapp_provider(settings),
         code_length=settings.otp_code_length,
         expiry_seconds=settings.otp_expiry_seconds,
         max_verification_attempts=settings.otp_max_verification_attempts,

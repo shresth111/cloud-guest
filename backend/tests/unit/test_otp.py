@@ -18,13 +18,16 @@ provider protocols.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 
+from app.core.config import Settings
 from app.database.constants import SortOrder
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.otp.constants import OtpChannel, OtpPurpose
@@ -39,9 +42,13 @@ from app.domains.otp.exceptions import (
 )
 from app.domains.otp.models import OtpRequest
 from app.domains.otp.service import (
+    LoggingWhatsAppProvider,
     OtpRateLimiter,
     OtpService,
+    TwilioWhatsAppProvider,
+    WhatsAppProviderNotConfiguredError,
     generate_numeric_code,
+    get_configured_whatsapp_provider,
     hash_otp_code,
 )
 from app.domains.otp.validators import validate_identifier
@@ -191,12 +198,21 @@ class RecordingEmailProvider:
 
 
 @dataclass
+class RecordingWhatsAppProvider:
+    sent: list[tuple[str, str, str]] = field(default_factory=list)
+
+    async def send(self, phone_number: str, *, code: str, message: str) -> None:
+        self.sent.append((phone_number, code, message))
+
+
+@dataclass
 class Fixture:
     repository: FakeOtpRepository
     redis: FakeRedis
     audit_writer: FakeAuditLogWriter
     sms_provider: RecordingSmsProvider
     email_provider: RecordingEmailProvider
+    whatsapp_provider: RecordingWhatsAppProvider
     service: OtpService
 
 
@@ -213,11 +229,13 @@ def make_service(
     audit_writer = FakeAuditLogWriter()
     sms_provider = RecordingSmsProvider()
     email_provider = RecordingEmailProvider()
+    whatsapp_provider = RecordingWhatsAppProvider()
     service = OtpService(
         repository,
         redis,
         sms_provider=sms_provider,
         email_provider=email_provider,
+        whatsapp_provider=whatsapp_provider,
         audit_writer=audit_writer,
         code_length=code_length,
         expiry_seconds=expiry_seconds,
@@ -231,6 +249,7 @@ def make_service(
         audit_writer=audit_writer,
         sms_provider=sms_provider,
         email_provider=email_provider,
+        whatsapp_provider=whatsapp_provider,
         service=service,
     )
 
@@ -292,6 +311,32 @@ class TestRequestAndVerifyHappyPath:
         code = _extract_code(fx.email_provider.sent[0])
         verified = await fx.service.verify_otp(
             identifier="guest@example.com", code=code, purpose=OtpPurpose.GUEST_LOGIN
+        )
+        assert verified.is_consumed is True
+
+    async def test_whatsapp_request_then_verify_succeeds(self) -> None:
+        fx = make_service()
+        otp_request = await fx.service.request_otp(
+            identifier="+15551234567",
+            channel=OtpChannel.WHATSAPP,
+            purpose=OtpPurpose.GUEST_LOGIN,
+            organization_id=None,
+            location_id=None,
+        )
+        assert otp_request.channel == OtpChannel.WHATSAPP.value
+        assert len(fx.whatsapp_provider.sent) == 1
+        assert fx.whatsapp_provider.sent[0][0] == "+15551234567"
+        assert len(fx.sms_provider.sent) == 0
+        assert len(fx.email_provider.sent) == 0
+
+        code = _extract_code(fx.whatsapp_provider.sent[0])
+        # The provider is also handed the raw code directly (unlike
+        # SMS/email, which only ever get a composed message) -- see
+        # WhatsAppProviderProtocol's own docstring for why. Confirm both
+        # sources agree.
+        assert fx.whatsapp_provider.sent[0][1] == code
+        verified = await fx.service.verify_otp(
+            identifier="+15551234567", code=code, purpose=OtpPurpose.GUEST_LOGIN
         )
         assert verified.is_consumed is True
 
@@ -570,6 +615,15 @@ class TestIdentifierValidation:
         with pytest.raises(InvalidOtpIdentifierError):
             validate_identifier("not-an-email", OtpChannel.EMAIL)
 
+    def test_valid_whatsapp_phone_number_accepted(self) -> None:
+        """WHATSAPP shares SMS's phone-number identifier shape -- see
+        validators.validate_identifier's own docstring."""
+        validate_identifier("+15551234567", OtpChannel.WHATSAPP)
+
+    def test_malformed_whatsapp_identifier_rejected(self) -> None:
+        with pytest.raises(InvalidOtpIdentifierError):
+            validate_identifier("not-a-phone", OtpChannel.WHATSAPP)
+
     async def test_service_rejects_malformed_identifier_before_any_side_effect(
         self,
     ) -> None:
@@ -616,20 +670,42 @@ class TestProviderInvocation:
         assert len(fx.email_provider.sent) == 1
         assert len(fx.sms_provider.sent) == 0
 
+    async def test_whatsapp_channel_only_invokes_whatsapp_provider(self) -> None:
+        fx = make_service()
+        await fx.service.request_otp(
+            identifier="+15551234567",
+            channel=OtpChannel.WHATSAPP,
+            purpose=OtpPurpose.GUEST_LOGIN,
+            organization_id=None,
+            location_id=None,
+        )
+        assert len(fx.whatsapp_provider.sent) == 1
+        assert len(fx.sms_provider.sent) == 0
+        assert len(fx.email_provider.sent) == 0
+
     async def test_default_providers_are_the_logging_providers(self) -> None:
         """Without an explicit provider override, OtpService falls back to
-        the honest LoggingSmsProvider/LoggingEmailProvider default -- see
-        service.py's module docstring for why no real provider exists."""
-        from app.domains.otp.service import LoggingEmailProvider, LoggingSmsProvider
+        the honest LoggingSmsProvider/LoggingEmailProvider/
+        LoggingWhatsAppProvider default -- see service.py's module
+        docstring for why no real provider exists."""
+        from app.domains.otp.service import (
+            LoggingEmailProvider,
+            LoggingSmsProvider,
+            LoggingWhatsAppProvider,
+        )
 
         service = OtpService(FakeOtpRepository(), FakeRedis())
         assert isinstance(service.sms_provider, LoggingSmsProvider)
         assert isinstance(service.email_provider, LoggingEmailProvider)
+        assert isinstance(service.whatsapp_provider, LoggingWhatsAppProvider)
 
         # Exercising the logging providers directly should not raise -- they
         # only log, never call a real network API.
         await service.sms_provider.send("+15551234567", "hello")
         await service.email_provider.send("guest@example.com", "subject", "body")
+        await service.whatsapp_provider.send(
+            "+15551234567", code="042817", message="hello"
+        )
 
 
 # ============================================================================
@@ -653,3 +729,119 @@ class TestCodeGenerationAndHashing:
         assert digest == hash_otp_code(code)
         assert digest != code
         assert len(digest) == 64  # SHA-256 hex digest length
+
+
+# ============================================================================
+# Real WhatsApp provider selection + Twilio Content API call shape
+#
+# Mirrors test_billing_payments_webhooks.py's TestGatewayNotConfigured
+# pattern: real classes, genuinely unconfigured Settings (the honest,
+# permanent state of this sandbox), no network attempt when unconfigured --
+# and, for the configured case, a real outbound HTTP call asserted against
+# httpx.AsyncClient.post rather than trusting the implementation blindly.
+# ============================================================================
+
+
+class TestWhatsAppProviderSelection:
+    def test_default_is_logging_provider(self) -> None:
+        settings = Settings()
+        provider = get_configured_whatsapp_provider(settings)
+        assert isinstance(provider, LoggingWhatsAppProvider)
+
+    def test_twilio_selected_but_unconfigured_raises(self) -> None:
+        """whatsapp_delivery_provider='twilio' with no credentials at all
+        is a real error, not a silent fallback -- same posture
+        get_configured_sms_provider/get_configured_email_provider already
+        establish for their own 'twilio'/'smtp'/'ses' selections."""
+        settings = Settings(whatsapp_delivery_provider="twilio")
+        with pytest.raises(WhatsAppProviderNotConfiguredError):
+            get_configured_whatsapp_provider(settings)
+
+    def test_twilio_selected_with_sms_creds_but_no_whatsapp_sender_raises(self) -> None:
+        """Having twilio_account_sid/twilio_auth_token configured for SMS
+        is not sufficient on its own -- a real WhatsApp send also needs its
+        own sender number and an approved Content Template SID (see
+        TwilioWhatsAppProvider's own docstring)."""
+        settings = Settings(
+            whatsapp_delivery_provider="twilio",
+            twilio_account_sid="ACfake",
+            twilio_auth_token="tokenfake",
+        )
+        with pytest.raises(WhatsAppProviderNotConfiguredError):
+            get_configured_whatsapp_provider(settings)
+
+    def test_twilio_fully_configured_returns_real_provider(self) -> None:
+        settings = Settings(
+            whatsapp_delivery_provider="twilio",
+            twilio_account_sid="ACfake",
+            twilio_auth_token="tokenfake",
+            whatsapp_twilio_from_number="+14155238886",
+            whatsapp_twilio_content_sid="HXfake",
+        )
+        provider = get_configured_whatsapp_provider(settings)
+        assert isinstance(provider, TwilioWhatsAppProvider)
+        assert provider.account_sid == "ACfake"
+        assert provider.from_number == "+14155238886"
+        assert provider.content_sid == "HXfake"
+        assert provider.content_variable_key == "1"
+
+
+class TestTwilioWhatsAppProvider:
+    """Asserts the real outbound HTTP call shape -- ``httpx.AsyncClient``
+    is monkeypatched at the method level (no live network in this sandbox),
+    mirroring test_monitoring_alerts.py's own httpx.MockTransport
+    precedent for asserting a real provider's outbound request shape
+    without hitting the network."""
+
+    async def test_send_posts_content_template_not_freeform_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        async def fake_post(self, url, *, auth=None, data=None):  # noqa: ANN001
+            captured["url"] = url
+            captured["auth"] = auth
+            captured["data"] = data
+            return httpx.Response(201, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        provider = TwilioWhatsAppProvider(
+            account_sid="ACfake",
+            auth_token="tokenfake",
+            from_number="+14155238886",
+            content_sid="HXfake",
+        )
+        await provider.send("+15551234567", code="042817", message="ignored")
+
+        assert captured["url"] == (
+            "https://api.twilio.com/2010-04-01/Accounts/ACfake/Messages.json"
+        )
+        assert captured["auth"] == ("ACfake", "tokenfake")
+        data = captured["data"]
+        assert data["From"] == "whatsapp:+14155238886"
+        assert data["To"] == "whatsapp:+15551234567"
+        # The real OTP code must reach Twilio via ContentVariables (the
+        # approved template's {{1}} placeholder), never as a freeform Body
+        # -- see the provider's own docstring for why WhatsApp rejects a
+        # business-initiated freeform message.
+        assert data["ContentSid"] == "HXfake"
+        assert json.loads(data["ContentVariables"]) == {"1": "042817"}
+        assert "Body" not in data
+
+    async def test_send_raises_on_non_2xx_response(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_post(self, url, *, auth=None, data=None):  # noqa: ANN001
+            return httpx.Response(400, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        provider = TwilioWhatsAppProvider(
+            account_sid="ACfake",
+            auth_token="tokenfake",
+            from_number="+14155238886",
+            content_sid="HXfake",
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await provider.send("+15551234567", code="042817", message="ignored")

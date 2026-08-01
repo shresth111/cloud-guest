@@ -689,6 +689,14 @@ class _LoginMethods:
     voucher_enabled: bool
     social_login_enabled: bool
     username_password_enabled: bool = True
+    # Third real OTP channel -- see CaptivePortalConfig.otp_whatsapp_enabled's
+    # own docstring. No PlanFeatureKey exists for it (same gap as
+    # otp_email_enabled had before it defaulted on), but unlike email,
+    # a real WhatsApp send needs a Meta-approved Business template most
+    # freshly provisioned organizations won't have configured, so this
+    # defaults off rather than always-on -- an admin opts a location in
+    # once WhatsApp is actually set up, via CaptivePortalConfigUpdateRequest.
+    otp_whatsapp_enabled: bool = False
 
 
 def _resolve_login_methods(feature_summary: dict[str, object]) -> _LoginMethods:
@@ -1018,6 +1026,7 @@ class LocationProvisioningService:
             redirect_url=None,
             otp_sms_enabled=login_methods.otp_sms_enabled,
             otp_email_enabled=login_methods.otp_email_enabled,
+            otp_whatsapp_enabled=login_methods.otp_whatsapp_enabled,
             voucher_enabled=login_methods.voucher_enabled,
             username_password_enabled=login_methods.username_password_enabled,
             social_login_enabled=login_methods.social_login_enabled,

@@ -87,8 +87,9 @@ for the full reasoning on this "at most one", not "exactly one", choice).
 
 ## Authentication method flags -- and the honest ``social_login`` boundary
 
-``otp_sms_enabled``/``otp_email_enabled``/``voucher_enabled``/
-``username_password_enabled``/``social_login_enabled`` are plain booleans
+``otp_sms_enabled``/``otp_email_enabled``/``otp_whatsapp_enabled``/
+``voucher_enabled``/``username_password_enabled``/``social_login_enabled``
+are plain booleans
 (not a JSONB bag) because they are a small, fixed, individually-meaningful
 set this module's own guest-facing resolve response needs to expose
 directly -- the same "explicit columns over JSONB when the shape is known
@@ -211,6 +212,17 @@ class CaptivePortalConfig(BaseModel):
     # -- authentication method flags -----------------------------------------
     otp_sms_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     otp_email_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    # Third real OTP delivery channel, additive alongside otp_sms_enabled/
+    # otp_email_enabled -- see app.domains.otp.constants.OtpChannel.WHATSAPP
+    # and app.domains.otp.service.TwilioWhatsAppProvider for the backing
+    # delivery mechanism. Defaults off (unlike otp_sms_enabled): a real send
+    # requires a Meta-approved WhatsApp Business template
+    # (whatsapp_twilio_content_sid) most fresh deployments won't have
+    # configured yet, so this never silently promises a channel that isn't
+    # actually wired up for a given organization.
+    otp_whatsapp_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False
     )
     voucher_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

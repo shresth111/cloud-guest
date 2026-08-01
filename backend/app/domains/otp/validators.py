@@ -32,9 +32,12 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 def validate_identifier(identifier: str, channel: OtpChannel) -> None:
     """Raises ``InvalidOtpIdentifierError`` if ``identifier`` is not a
-    plausible phone number (``SMS``) or email address (``EMAIL``) for the
-    given channel."""
-    if channel == OtpChannel.SMS:
+    plausible phone number (``SMS``/``WHATSAPP``) or email address
+    (``EMAIL``) for the given channel. ``WHATSAPP`` shares ``SMS``'s
+    phone-number shape -- a WhatsApp message is always addressed to a real
+    phone number (``whatsapp:+1415...`` at the provider layer), never an
+    email-shaped identifier."""
+    if channel in (OtpChannel.SMS, OtpChannel.WHATSAPP):
         if not _PHONE_RE.match(identifier):
             raise InvalidOtpIdentifierError(channel.value, identifier)
     else:

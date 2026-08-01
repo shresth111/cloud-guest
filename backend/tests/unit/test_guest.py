@@ -240,6 +240,7 @@ class FakeCaptivePortalService:
         *,
         otp_sms_enabled: bool = True,
         otp_email_enabled: bool = False,
+        otp_whatsapp_enabled: bool = False,
         voucher_enabled: bool = True,
         username_password_enabled: bool = False,
     ) -> CaptivePortalConfig:
@@ -268,6 +269,7 @@ class FakeCaptivePortalService:
                 redirect_url=None,
                 otp_sms_enabled=otp_sms_enabled,
                 otp_email_enabled=otp_email_enabled,
+                otp_whatsapp_enabled=otp_whatsapp_enabled,
                 voucher_enabled=voucher_enabled,
                 username_password_enabled=username_password_enabled,
                 social_login_enabled=False,
@@ -1148,6 +1150,7 @@ class Fixture:
 def make_fixture(
     *,
     otp_sms_enabled: bool = True,
+    otp_whatsapp_enabled: bool = False,
     voucher_enabled: bool = True,
     username_password_enabled: bool = True,
     router_status: str = RouterStatus.ONLINE.value,
@@ -1171,6 +1174,7 @@ def make_fixture(
     captive_portal_service.register(
         organization_id,
         otp_sms_enabled=otp_sms_enabled,
+        otp_whatsapp_enabled=otp_whatsapp_enabled,
         voucher_enabled=voucher_enabled,
         username_password_enabled=username_password_enabled,
     )
@@ -1282,6 +1286,38 @@ class TestOtpLogin:
                 location_id=fx.location_id,
                 router_id=fx.router.id,
             )
+
+    async def test_whatsapp_rejected_when_location_has_not_enabled_it(self) -> None:
+        """otp_whatsapp_enabled defaults off (see CaptivePortalConfig's own
+        docstring) -- a location that never opted in must reject
+        GuestAuthMethod.OTP_WHATSAPP exactly like any other disabled
+        method, not silently fall through to some other channel."""
+        fx = make_fixture()
+        with pytest.raises(GuestAuthMethodNotEnabledError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15551234567",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_WHATSAPP,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_whatsapp_succeeds_once_location_enables_it(self) -> None:
+        """Once otp_whatsapp_enabled is on, WhatsApp verifies through the
+        exact same OtpService.verify_otp as SMS/email -- verification
+        doesn't care which channel delivered the code (see
+        GuestAuthMethod.OTP_WHATSAPP's own docstring)."""
+        fx = make_fixture(otp_whatsapp_enabled=True)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_WHATSAPP,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.auth_method == GuestAuthMethod.OTP_WHATSAPP.value
 
     async def test_blocked_guest_rejected_before_otp_verification(self) -> None:
         fx = make_fixture()

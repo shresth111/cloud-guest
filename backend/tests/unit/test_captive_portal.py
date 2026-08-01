@@ -360,6 +360,7 @@ async def _create_config(
         redirect_url=None,
         otp_sms_enabled=True,
         otp_email_enabled=False,
+        otp_whatsapp_enabled=False,
         voucher_enabled=True,
         username_password_enabled=username_password_enabled,
         social_login_enabled=social_login_enabled,

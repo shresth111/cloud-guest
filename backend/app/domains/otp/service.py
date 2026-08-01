@@ -116,6 +116,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import json
 import logging
 import secrets
 import uuid
@@ -184,6 +185,20 @@ class EmailProviderProtocol(Protocol):
     async def send(self, email: str, subject: str, body: str) -> None: ...
 
 
+class WhatsAppProviderProtocol(Protocol):
+    """Deliberately takes both the raw ``code`` and the already-composed
+    ``message`` -- unlike ``SmsProviderProtocol``'s plain ``message``-only
+    shape, a real WhatsApp send needs the bare code on its own (to
+    substitute into an approved Content Template's ``{{1}}`` placeholder;
+    see ``TwilioWhatsAppProvider``'s docstring for why a freeform message
+    body can't be sent the way SMS's can). ``message`` is still passed
+    through so ``LoggingWhatsAppProvider`` (and any future provider that
+    genuinely can send free text, e.g. within an already-open 24-hour
+    session window) has it available without recomposing it itself."""
+
+    async def send(self, phone_number: str, *, code: str, message: str) -> None: ...
+
+
 class LoggingSmsProvider:
     """Honest interim SMS provider -- logs the would-be-sent message
     instead of calling a real carrier/gateway API. See module docstring."""
@@ -204,6 +219,20 @@ class LoggingEmailProvider:
         logger.info(
             "otp_email_would_send",
             extra={"email": email, "subject": subject, "body_length": len(body)},
+        )
+
+
+class LoggingWhatsAppProvider:
+    """Honest interim WhatsApp provider -- logs the would-be-sent message
+    instead of calling a real WhatsApp Business API. Same posture as
+    ``LoggingSmsProvider``/``LoggingEmailProvider`` above, and the default
+    for a fresh checkout (``Settings.whatsapp_delivery_provider ==
+    'logging'``)."""
+
+    async def send(self, phone_number: str, *, code: str, message: str) -> None:
+        logger.info(
+            "otp_whatsapp_would_send",
+            extra={"phone_number": phone_number, "message_length": len(message)},
         )
 
 
@@ -230,6 +259,11 @@ class EmailProviderNotConfiguredError(Exception):
 class SmsProviderNotConfiguredError(Exception):
     """Same as :class:`EmailProviderNotConfiguredError`, for
     ``Settings.sms_delivery_provider``."""
+
+
+class WhatsAppProviderNotConfiguredError(Exception):
+    """Same as :class:`EmailProviderNotConfiguredError`, for
+    ``Settings.whatsapp_delivery_provider``."""
 
 
 class SmtpEmailProvider:
@@ -341,6 +375,73 @@ class TwilioSmsProvider:
                 url,
                 auth=(self.account_sid, self.auth_token),
                 data={"From": self.from_number, "To": phone_number, "Body": message},
+            )
+            response.raise_for_status()
+
+
+class TwilioWhatsAppProvider:
+    """Real ``WhatsAppProviderProtocol`` implementation via Twilio's
+    WhatsApp Business API -- the *same* Messages API endpoint and Account
+    SID/Auth Token :class:`TwilioSmsProvider` above already uses
+    (https://www.twilio.com/docs/whatsapp/api: "WhatsApp messages ... use
+    the same Messages resource as SMS", just a ``whatsapp:`` prefix on
+    ``From``/``To``) -- a natural, low-effort extension of the existing
+    Twilio integration, not a second provider account with its own
+    credential set.
+
+    **The one real constraint that makes this genuinely different from a
+    plain SMS send, not just a prefix swap:** WhatsApp Business API
+    requires every *business-initiated* message to use a pre-approved
+    Content Template (https://www.twilio.com/docs/content) unless it falls
+    inside a 24-hour customer-service session window opened by the *guest*
+    messaging this WhatsApp number first. An OTP send is never that --
+    the guest has never messaged this number before; this is always the
+    first, business-initiated contact -- so sending a freeform ``Body``
+    the way :class:`TwilioSmsProvider` does would be silently rejected by
+    WhatsApp. This provider therefore sends via Twilio's Content API
+    fields, ``ContentSid`` (the Twilio-Console-registered SID of a
+    Meta-approved template, e.g. one reading "Your CloudGuest code is
+    {{1}}") and ``ContentVariables`` (a JSON object substituting the real
+    OTP code into that template's ``{{1}}`` placeholder), instead of
+    ``Body``. A real deployment must create that template in the Twilio
+    Console and get it approved by Meta *before* any send here can
+    succeed -- ``get_configured_whatsapp_provider`` below raises a clear,
+    honest error if ``whatsapp_twilio_content_sid`` is left unset rather
+    than silently attempting (and failing) a freeform send."""
+
+    _API_URL_TEMPLATE = (
+        "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+    )
+    _TIMEOUT_SECONDS = 10.0
+
+    def __init__(
+        self,
+        *,
+        account_sid: str,
+        auth_token: str,
+        from_number: str,
+        content_sid: str,
+        content_variable_key: str = "1",
+    ) -> None:
+        self.account_sid = account_sid
+        self.auth_token = auth_token
+        self.from_number = from_number
+        self.content_sid = content_sid
+        self.content_variable_key = content_variable_key
+
+    async def send(self, phone_number: str, *, code: str, message: str) -> None:
+        import httpx
+
+        url = self._API_URL_TEMPLATE.format(sid=self.account_sid)
+        data = {
+            "From": f"whatsapp:{self.from_number}",
+            "To": f"whatsapp:{phone_number}",
+            "ContentSid": self.content_sid,
+            "ContentVariables": json.dumps({self.content_variable_key: code}),
+        }
+        async with httpx.AsyncClient(timeout=self._TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                url, auth=(self.account_sid, self.auth_token), data=data
             )
             response.raise_for_status()
 
@@ -470,6 +571,37 @@ def get_configured_sms_provider(settings: Settings) -> SmsProviderProtocol:
     return LoggingSmsProvider()
 
 
+def get_configured_whatsapp_provider(settings: Settings) -> WhatsAppProviderProtocol:
+    """Same selection contract as :func:`get_configured_sms_provider`, for
+    ``Settings.whatsapp_delivery_provider``. Deliberately reuses
+    ``settings.twilio_account_sid``/``twilio_auth_token`` -- the exact same
+    Twilio account SMS already authenticates with -- rather than a second
+    set of Twilio credentials; see :class:`TwilioWhatsAppProvider`'s own
+    docstring for why WhatsApp is the same Twilio account, just a
+    different sender/message shape."""
+    provider = settings.whatsapp_delivery_provider.lower()
+    if provider == "twilio":
+        if (
+            not settings.twilio_account_sid
+            or not settings.twilio_auth_token
+            or not settings.whatsapp_twilio_from_number
+            or not settings.whatsapp_twilio_content_sid
+        ):
+            raise WhatsAppProviderNotConfiguredError(
+                "whatsapp_delivery_provider='twilio' but twilio_account_sid/"
+                "twilio_auth_token/whatsapp_twilio_from_number/"
+                "whatsapp_twilio_content_sid is empty."
+            )
+        return TwilioWhatsAppProvider(
+            account_sid=settings.twilio_account_sid,
+            auth_token=settings.twilio_auth_token,
+            from_number=settings.whatsapp_twilio_from_number,
+            content_sid=settings.whatsapp_twilio_content_sid,
+            content_variable_key=settings.whatsapp_twilio_content_variable_key,
+        )
+    return LoggingWhatsAppProvider()
+
+
 class AuditLogWriter(Protocol):
     """The minimal surface this service needs to write into RBAC's shared
     ``audit_log_entries`` table -- the same narrow, duck-typed protocol
@@ -530,6 +662,7 @@ class OtpService:
         *,
         sms_provider: SmsProviderProtocol | None = None,
         email_provider: EmailProviderProtocol | None = None,
+        whatsapp_provider: WhatsAppProviderProtocol | None = None,
         audit_writer: AuditLogWriter | None = None,
         code_length: int = 6,
         expiry_seconds: int = 300,
@@ -542,6 +675,9 @@ class OtpService:
         self.sms_provider: SmsProviderProtocol = sms_provider or LoggingSmsProvider()
         self.email_provider: EmailProviderProtocol = (
             email_provider or LoggingEmailProvider()
+        )
+        self.whatsapp_provider: WhatsAppProviderProtocol = (
+            whatsapp_provider or LoggingWhatsAppProvider()
         )
         self.audit_writer = audit_writer
         self.code_length = code_length
@@ -612,6 +748,10 @@ class OtpService:
         )
         if channel == OtpChannel.SMS:
             await self.sms_provider.send(otp_request.identifier, message)
+        elif channel == OtpChannel.WHATSAPP:
+            await self.whatsapp_provider.send(
+                otp_request.identifier, code=code, message=message
+            )
         else:
             await self.email_provider.send(
                 otp_request.identifier,
@@ -731,15 +871,21 @@ __all__ = [
     "OtpService",
     "SmsProviderProtocol",
     "EmailProviderProtocol",
+    "WhatsAppProviderProtocol",
     "LoggingSmsProvider",
     "LoggingEmailProvider",
+    "LoggingWhatsAppProvider",
     "SmtpEmailProvider",
     "SesEmailProvider",
     "TwilioSmsProvider",
+    "TwilioWhatsAppProvider",
+    "ExotelSmsProvider",
     "EmailProviderNotConfiguredError",
     "SmsProviderNotConfiguredError",
+    "WhatsAppProviderNotConfiguredError",
     "get_configured_email_provider",
     "get_configured_sms_provider",
+    "get_configured_whatsapp_provider",
     "AuditLogWriter",
     "OtpRateLimiter",
     "generate_numeric_code",

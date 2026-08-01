@@ -739,17 +739,17 @@ class Settings(BaseSettings):
     )
 
     # ========================================================================
-    # Notification domain: real email/SMS providers + object storage +
-    # outbox dispatch
+    # Notification domain: real email/SMS/WhatsApp providers + object
+    # storage + outbox dispatch
     #
     # Mirrors the Stripe/Razorpay section's own "empty/'logging' = honest
     # unconfigured default" pattern: every real-provider setting below is
     # inert until explicitly selected via `email_delivery_provider`/
-    # `sms_delivery_provider`, so a fresh local checkout keeps today's
-    # log-only behavior with zero configuration. See
-    # app.domains.otp.service's `SmtpEmailProvider`/`SesEmailProvider`/
-    # `TwilioSmsProvider` and app.domains.notification for the full
-    # write-up.
+    # `sms_delivery_provider`/`whatsapp_delivery_provider`, so a fresh
+    # local checkout keeps today's log-only behavior with zero
+    # configuration. See app.domains.otp.service's `SmtpEmailProvider`/
+    # `SesEmailProvider`/`TwilioSmsProvider`/`TwilioWhatsAppProvider` and
+    # app.domains.notification for the full write-up.
     # ========================================================================
 
     email_delivery_provider: str = Field(
@@ -816,6 +816,52 @@ class Settings(BaseSettings):
             "TRAI DLT-registered template id -- the OTP message body sent "
             "must match this template's approved text exactly, or Indian "
             "carriers silently drop the message."
+        ),
+    )
+
+    whatsapp_delivery_provider: str = Field(
+        default="logging",
+        description=(
+            "Which concrete WhatsAppProviderProtocol implementation "
+            "app.domains.otp.service.get_configured_whatsapp_provider "
+            "selects: 'logging' (default, no real send), or 'twilio'."
+        ),
+    )
+    # Deliberately no separate whatsapp_twilio_account_sid/auth_token --
+    # Twilio's WhatsApp Business API runs on the exact same Account SID/
+    # Auth Token as SMS (twilio_account_sid/twilio_auth_token above), just
+    # a different sender identity and message shape. See
+    # app.domains.otp.service.TwilioWhatsAppProvider's own docstring.
+    whatsapp_twilio_from_number: str = Field(
+        default="",
+        description=(
+            "The Twilio WhatsApp-enabled sender number, e.g. "
+            "'+14155238886' (Twilio's own sandbox number) or a real "
+            "Meta-approved WhatsApp Business sender once one is "
+            "provisioned. Sent as 'whatsapp:{this}' in the From field -- "
+            "never include the 'whatsapp:' prefix here."
+        ),
+    )
+    whatsapp_twilio_content_sid: str = Field(
+        default="",
+        description=(
+            "The Twilio-Console SID (e.g. 'HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx') "
+            "of a Meta-approved WhatsApp Content Template -- required "
+            "because WhatsApp Business API rejects a freeform message body "
+            "for any business-initiated conversation (which every OTP send "
+            "is), unlike plain SMS. Create and get this template approved "
+            "in the Twilio Console before setting "
+            "whatsapp_delivery_provider='twilio' in any real deployment."
+        ),
+    )
+    whatsapp_twilio_content_variable_key: str = Field(
+        default="1",
+        description=(
+            "The approved template's placeholder key the OTP code is "
+            "substituted into, e.g. Twilio ContentVariables '{\"1\": "
+            "\"042817\"}' for a template body reading 'Your code is "
+            "{{1}}'. Only needs changing if the approved template numbers "
+            "its variables differently."
         ),
     )
 

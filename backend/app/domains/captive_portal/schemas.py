@@ -78,6 +78,16 @@ class CaptivePortalConfigCreateRequest(BaseModel):
     redirect_url: str | None = Field(default=None, max_length=500)
     otp_sms_enabled: bool = Field(default=True)
     otp_email_enabled: bool = Field(default=False)
+    otp_whatsapp_enabled: bool = Field(
+        default=False,
+        description=(
+            "Third real OTP delivery channel -- see "
+            "app.domains.otp.constants.OtpChannel.WHATSAPP. Defaults off: "
+            "a real send needs a Meta-approved WhatsApp Business template "
+            "configured (Settings.whatsapp_twilio_content_sid), which most "
+            "fresh deployments won't have set up yet."
+        ),
+    )
     voucher_enabled: bool = Field(default=True)
     # Real, functional login method (GuestService.login_via_password /
     # POST /guest/login/password) -- no longer the placeholder this field
@@ -156,6 +166,7 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     redirect_url: str | None = Field(default=None, max_length=500)
     otp_sms_enabled: bool | None = Field(default=None)
     otp_email_enabled: bool | None = Field(default=None)
+    otp_whatsapp_enabled: bool | None = Field(default=None)
     voucher_enabled: bool | None = Field(default=None)
     username_password_enabled: bool | None = Field(default=None)
     social_login_enabled: bool | None = Field(default=None)
@@ -196,6 +207,7 @@ class CaptivePortalConfigResponse(BaseModel):
     redirect_url: str | None
     otp_sms_enabled: bool
     otp_email_enabled: bool
+    otp_whatsapp_enabled: bool
     voucher_enabled: bool
     username_password_enabled: bool
     social_login_enabled: bool

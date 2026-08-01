@@ -14,10 +14,20 @@ from enum import StrEnum
 
 
 class OtpChannel(StrEnum):
-    """How the OTP code is delivered to the guest."""
+    """How the OTP code is delivered to the guest.
+
+    ``WHATSAPP`` is a genuine third delivery channel, additive alongside
+    ``SMS``/``EMAIL`` -- not a variant of either. It shares ``SMS``'s
+    identifier shape (a phone number, validated the same way by
+    ``validators.validate_identifier``) but is dispatched through its own
+    ``WhatsAppProviderProtocol`` in ``service.py``, since WhatsApp Business
+    API delivery is a materially different integration (template-approval
+    requirement, separate sender identity) from a plain SMS send -- see
+    that module's docstring for the full write-up."""
 
     SMS = "sms"
     EMAIL = "email"
+    WHATSAPP = "whatsapp"
 
 
 class OtpPurpose(StrEnum):

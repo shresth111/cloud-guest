@@ -21,14 +21,20 @@ from enum import StrEnum
 class GuestAuthMethod(StrEnum):
     """How a guest authenticated for a given login/session.
 
-    ``OTP_SMS``/``OTP_EMAIL``/``VOUCHER``/``USERNAME_PASSWORD`` mirror
-    ``app.domains.captive_portal.models.CaptivePortalConfig``'s four
+    ``OTP_SMS``/``OTP_EMAIL``/``OTP_WHATSAPP``/``VOUCHER``/
+    ``USERNAME_PASSWORD`` mirror
+    ``app.domains.captive_portal.models.CaptivePortalConfig``'s five
     identically-named enabled-method flags one-for-one, so
     ``GuestService._require_method_enabled`` can check a resolved portal
     config's boolean flag against exactly this enum without any
-    translation table. All four are real, working login methods today
+    translation table. All five are real, working login methods today
     (``GuestService.login_via_otp``/``login_via_voucher``/
-    ``login_via_password``).
+    ``login_via_password``) -- ``OTP_WHATSAPP`` verifies through the exact
+    same ``OtpService.verify_otp`` as ``OTP_SMS``/``OTP_EMAIL`` (verification
+    doesn't care which channel *delivered* the code, only that a valid one
+    was presented), it just gates on a different resolved-config flag and
+    is only reachable when a location has actually turned WhatsApp delivery
+    on.
 
     ``MAC_WHITELIST`` is different: it has no corresponding
     ``CaptivePortalConfig`` flag at all (see
@@ -39,6 +45,7 @@ class GuestAuthMethod(StrEnum):
 
     OTP_SMS = "otp_sms"
     OTP_EMAIL = "otp_email"
+    OTP_WHATSAPP = "otp_whatsapp"
     VOUCHER = "voucher"
     USERNAME_PASSWORD = "username_password"
     MAC_WHITELIST = "mac_whitelist"

@@ -1283,7 +1283,11 @@ class GuestService:
         user_agent: str | None = None,
         accept_language: str | None = None,
     ) -> GuestLoginResult:
-        if auth_method not in (GuestAuthMethod.OTP_SMS, GuestAuthMethod.OTP_EMAIL):
+        if auth_method not in (
+            GuestAuthMethod.OTP_SMS,
+            GuestAuthMethod.OTP_EMAIL,
+            GuestAuthMethod.OTP_WHATSAPP,
+        ):
             raise GuestAuthMethodNotEnabledError(auth_method.value)
 
         identifier = normalize_identifier(identifier)
@@ -1892,7 +1896,11 @@ class GuestService:
             session is not None
             and session.guest_id == guest.id
             and session.auth_method
-            in (GuestAuthMethod.OTP_SMS.value, GuestAuthMethod.OTP_EMAIL.value)
+            in (
+                GuestAuthMethod.OTP_SMS.value,
+                GuestAuthMethod.OTP_EMAIL.value,
+                GuestAuthMethod.OTP_WHATSAPP.value,
+            )
             and session.status == GuestSessionStatus.ACTIVE.value
             and session.started_at >= window_start
         )
@@ -1946,7 +1954,11 @@ class GuestService:
             session is not None
             and session.guest_id == guest.id
             and session.auth_method
-            in (GuestAuthMethod.OTP_SMS.value, GuestAuthMethod.OTP_EMAIL.value)
+            in (
+                GuestAuthMethod.OTP_SMS.value,
+                GuestAuthMethod.OTP_EMAIL.value,
+                GuestAuthMethod.OTP_WHATSAPP.value,
+            )
             and session.status == GuestSessionStatus.ACTIVE.value
             and session.started_at >= window_start
         )
@@ -2692,6 +2704,7 @@ class GuestService:
         enabled_map = {
             GuestAuthMethod.OTP_SMS: config.otp_sms_enabled,
             GuestAuthMethod.OTP_EMAIL: config.otp_email_enabled,
+            GuestAuthMethod.OTP_WHATSAPP: config.otp_whatsapp_enabled,
             GuestAuthMethod.VOUCHER: config.voucher_enabled,
             GuestAuthMethod.USERNAME_PASSWORD: config.username_password_enabled,
         }
@@ -3954,6 +3967,7 @@ class GuestAnalyticsService:
             auth_methods=[
                 GuestAuthMethod.OTP_SMS.value,
                 GuestAuthMethod.OTP_EMAIL.value,
+                GuestAuthMethod.OTP_WHATSAPP.value,
             ],
         )
         rate = (

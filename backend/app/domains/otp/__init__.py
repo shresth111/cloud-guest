@@ -1,6 +1,6 @@
 """OTP domain (BE-010 Part 1): guest-facing one-time-passcode request and
-verification, delivered via SMS or email, used to authenticate guest WiFi
-captive-portal logins.
+verification, delivered via SMS, email, or WhatsApp, used to authenticate
+guest WiFi captive-portal logins.
 
 Self-contained by design: no ``Guest`` model exists yet (a later module in
 this same BE-010 sequence). ``OtpRequest.identifier`` is a plain phone
