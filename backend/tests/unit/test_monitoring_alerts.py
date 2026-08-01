@@ -43,6 +43,7 @@ import httpx
 import pytest
 
 from app.domains.monitoring.constants import (
+    ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_ROUTER,
     AlertSeverity,
     AlertStatus,
@@ -137,6 +138,20 @@ class FakeSnapshot:
 
 
 @dataclass
+class FakeIspLink:
+    """Duck-typed stand-in for ``app.domains.isp.models.IspLink`` -- only
+    the attributes ``AlertService._evaluate_health_status_rule``'s
+    ``ALERT_TARGET_ISP_LINK`` branch actually reads."""
+
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    location_id: uuid.UUID
+    router_id: uuid.UUID
+    provider_name: str
+    health_status: str | None
+
+
+@dataclass
 class FakeRepository:
     """Stand-in for ``MonitoringRepositoryProtocol``'s BE-011 Part 2 surface
     -- covers every method ``AlertService``/``NotificationService``/
@@ -148,6 +163,7 @@ class FakeRepository:
     rule_channels: dict[uuid.UUID, list[uuid.UUID]] = field(default_factory=dict)
     alerts: dict[uuid.UUID, Alert] = field(default_factory=dict)
     routers: list[FakeRouter] = field(default_factory=list)
+    isp_links: list[FakeIspLink] = field(default_factory=list)
     snapshots: dict[uuid.UUID, FakeSnapshot] = field(default_factory=dict)
     service_health_rows: dict[str, ServiceHealth] = field(default_factory=dict)
     platform_events: list[PlatformEvent] = field(default_factory=list)
@@ -258,6 +274,15 @@ class FakeRepository:
         if organization_id is None:
             return list(self.routers)
         return [r for r in self.routers if r.organization_id == organization_id]
+
+    async def list_isp_links(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[FakeIspLink]:
+        if organization_id is None:
+            return list(self.isp_links)
+        return [
+            link for link in self.isp_links if link.organization_id == organization_id
+        ]
 
     async def get_latest_router_health_snapshot(
         self, router_id: uuid.UUID
@@ -638,6 +663,104 @@ async def test_router_health_status_rule_triggers_and_resolves():
     resolved = (await service.evaluate_alert_rules()).resolved
     assert len(resolved) == 1
     assert resolved[0].id == triggered[0].id
+
+
+async def test_isp_link_health_status_rule_triggers_and_resolves():
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    router_id = uuid.uuid4()
+    link = FakeIspLink(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        router_id=router_id,
+        provider_name="Acme Fiber",
+        health_status="unhealthy",
+    )
+    repo.isp_links.append(link)
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ISP_LINK,
+            condition_config={"expected_status": "unhealthy"},
+            organization_id=org_id,
+        )
+    )
+
+    triggered = (await service.evaluate_alert_rules()).triggered
+    assert len(triggered) == 1
+    assert triggered[0].router_id == router_id
+    assert triggered[0].location_id == link.location_id
+    assert "Acme Fiber" in triggered[0].message
+
+    link.health_status = "healthy"
+    resolved = (await service.evaluate_alert_rules()).resolved
+    assert len(resolved) == 1
+    assert resolved[0].id == triggered[0].id
+
+
+async def test_isp_link_and_router_rules_on_same_router_do_not_collide():
+    """Both an ``ALERT_TARGET_ROUTER`` rule and an ``ALERT_TARGET_ISP_LINK``
+    rule can watch the same underlying router (the link's own ``router_id``)
+    without one rule's open alert masking the other's -- ``rule_id`` is
+    always part of the de-duplication key (see ``AlertService``'s own
+    docstring)."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    router = FakeRouter(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name="Router One",
+        health_status="unhealthy",
+    )
+    repo.routers.append(router)
+    repo.isp_links.append(
+        FakeIspLink(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            location_id=router.location_id,
+            router_id=router.id,
+            provider_name="Acme Fiber",
+            health_status="unhealthy",
+        )
+    )
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ROUTER,
+            condition_config={"expected_status": "unhealthy"},
+            organization_id=org_id,
+        )
+    )
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ISP_LINK,
+            condition_config={"expected_status": "unhealthy"},
+            organization_id=org_id,
+        )
+    )
+
+    triggered = (await service.evaluate_alert_rules()).triggered
+    assert len(triggered) == 2
+    assert {a.router_id for a in triggered} == {router.id}
+    assert {a.rule_id for a in triggered} == set(repo.alert_rules.keys())
+
+    # A second evaluation pass must not spam a third/fourth alert -- both
+    # conditions are still true, both already have an open alert.
+    triggered_again = (await service.evaluate_alert_rules()).triggered
+    assert triggered_again == []
+
+
+def test_validate_health_status_change_accepts_isp_link_target():
+    validate_alert_rule_condition_config(
+        AlertTriggerType.HEALTH_STATUS_CHANGE,
+        ALERT_TARGET_ISP_LINK,
+        {"expected_status": "unhealthy"},
+    )
 
 
 # ============================================================================

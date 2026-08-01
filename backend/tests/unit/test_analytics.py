@@ -796,6 +796,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # (zero-touch provisioning) token expiry cleanup sweep -- see
     # app.domains.router.service.RouterService
     # .sweep_expired_provisioning_tokens's own docstring.
+    # Monitoring domain adds a seventeenth Beat entry
+    # ("monitoring-alert-rule-evaluation-sweep") -- the real, periodic
+    # evaluation job behind the previously-dormant Alert Engine -- see
+    # app.domains.monitoring.tasks's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -813,6 +817,7 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "provisioning-engine-router-health-poll-sweep",
         "router-provisioning-token-cleanup-sweep",
         "notification-dispatch-sweep",
+        "monitoring-alert-rule-evaluation-sweep",
     }
 
 

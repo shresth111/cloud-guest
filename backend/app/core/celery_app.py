@@ -136,6 +136,10 @@ from app.domains.isp.constants import (
     ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
 )
+from app.domains.monitoring.constants import (
+    ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_ALERT_RULE_EVALUATION_SWEEP,
+)
 from app.domains.notification.constants import TASK_RUN_NOTIFICATION_DISPATCH_SWEEP
 from app.domains.provisioning_engine.constants import (
     PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
@@ -196,6 +200,7 @@ celery_app = Celery(
         "app.domains.connected_devices.tasks",
         "app.domains.guest.tasks",
         "app.domains.isp.tasks",
+        "app.domains.monitoring.tasks",
         "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
@@ -465,6 +470,27 @@ celery_app.conf.update(
         "router-provisioning-token-cleanup-sweep": {
             "task": TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP,
             "schedule": PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS,
+        },
+        # Monitoring domain: the Alert Engine's evaluation sweep -- the real
+        # background job behind an already-fully-built-but-previously-
+        # dormant capability. ``AlertService.evaluate_alert_rules`` (and
+        # every trigger-type evaluator it dispatches to -- health-status-
+        # change against a platform ``ServiceHealth`` component, a router,
+        # or an ISP link; threshold; event-occurred) has existed since
+        # BE-011 Part 2, reachable only via an operator's on-demand ``POST
+        # /alerts/evaluate`` call -- this entry is what actually runs it on
+        # a cadence, so a configured ``AlertRule`` now really does fire a
+        # real ``Alert`` row. 15 minutes -- slightly longer than the two
+        # device-health sweeps its evaluators read the persisted results of
+        # (``provisioning-engine-router-health-poll-sweep``/
+        # ``isp-health-check-sweep``, both 600 seconds/10 minutes above) --
+        # see ``app.domains.monitoring.constants
+        # .ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS``'s own docstring
+        # and ``app.domains.monitoring.tasks``'s own module docstring for
+        # the full "why no fan-out/lock" write-up.
+        "monitoring-alert-rule-evaluation-sweep": {
+            "task": TASK_RUN_ALERT_RULE_EVALUATION_SWEEP,
+            "schedule": ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

@@ -40,6 +40,7 @@ from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 from app.domains.guest.models import GuestSession, RadiusNasClient
+from app.domains.isp.models import IspLink
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.models import Router
 from app.domains.router_provisioning.constants import ProvisioningJobStatus
@@ -203,6 +204,10 @@ class MonitoringRepositoryProtocol(Protocol):
     async def list_routers(
         self, *, organization_id: uuid.UUID | None
     ) -> list[Router]: ...
+
+    async def list_isp_links(
+        self, *, organization_id: uuid.UUID | None
+    ) -> list[IspLink]: ...
 
     async def get_latest_router_health_snapshot(
         self, router_id: uuid.UUID
@@ -733,6 +738,20 @@ class MonitoringRepository:
         statement = select(Router).where(Router.is_deleted.is_(False))
         if organization_id is not None:
             statement = statement.where(Router.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_isp_links(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[IspLink]:
+        """Read-only composition with ``app.domains.isp`` for
+        ``ALERT_TARGET_ISP_LINK`` rules -- mirrors ``list_routers``'s
+        identical "query another domain's model directly" precedent, not a
+        call into ``IspService`` (whose own ``list_links`` is paginated for
+        a dashboard page, not an "every link in scope" evaluator sweep)."""
+        statement = select(IspLink).where(IspLink.is_deleted.is_(False))
+        if organization_id is not None:
+            statement = statement.where(IspLink.organization_id == organization_id)
         result = await self.session.execute(statement)
         return list(result.scalars().all())
 

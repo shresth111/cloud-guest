@@ -93,6 +93,7 @@ from app.domains.router_provisioning.models import RouterEvent
 
 from .constants import (
     ALERT_EVENT_LOOKBACK_MINUTES,
+    ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_ROUTER,
     AUDIT_LOG_SOURCE_DOMAIN,
     DEFAULT_EVENT_TIMELINE_LIMIT,
@@ -1128,7 +1129,12 @@ class AlertService:
     (``organization_id``/``location_id``/``router_id`` are each ``NULL``
     for a platform-wide ``HEALTH_STATUS_CHANGE`` rule watching a
     ``ServiceHealth`` component, and populated per-router for a
-    per-router ``HEALTH_STATUS_CHANGE``/``THRESHOLD`` rule). See
+    per-router ``HEALTH_STATUS_CHANGE``/``THRESHOLD`` rule -- an
+    ``ALERT_TARGET_ISP_LINK`` rule populates the same tuple from the link's
+    own ``organization_id``/``location_id``/``router_id``, the router that
+    link's WAN uplink terminates on, so it can never collide with a
+    same-router ``ALERT_TARGET_ROUTER`` rule's own open alert -- ``rule_id``
+    is always part of the key too). See
     ``repository.MonitoringRepository.find_active_alert``.
     ``EVENT_OCCURRED`` rules use a different key -- see
     ``_evaluate_event_occurred_rule``'s own docstring -- since each match is
@@ -1388,6 +1394,34 @@ class AlertService:
         triggered: list[Alert] = []
         resolved: list[Alert] = []
         expected_status = rule.condition_config.get("expected_status")
+
+        if rule.target_component == ALERT_TARGET_ISP_LINK:
+            links = await self.repository.list_isp_links(
+                organization_id=rule.organization_id
+            )
+            for link in links:
+                condition_met = link.health_status == expected_status
+                existing = await self.repository.find_active_alert(
+                    rule_id=rule.id,
+                    organization_id=link.organization_id,
+                    location_id=link.location_id,
+                    router_id=link.router_id,
+                )
+                if condition_met and existing is None:
+                    alert = await self._create_alert(
+                        rule,
+                        organization_id=link.organization_id,
+                        location_id=link.location_id,
+                        router_id=link.router_id,
+                        message=(
+                            f"ISP link '{link.provider_name}' health status is "
+                            f"{link.health_status}"
+                        ),
+                    )
+                    triggered.append(alert)
+                elif not condition_met and existing is not None:
+                    resolved.append(await self._auto_resolve(existing))
+            return triggered, resolved
 
         if rule.target_component == ALERT_TARGET_ROUTER:
             routers = await self.repository.list_routers(

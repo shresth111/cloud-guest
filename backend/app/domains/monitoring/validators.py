@@ -24,6 +24,7 @@ from app.domains.router_provisioning.models import (
 
 from .constants import (
     ALERT_STATUS_TRANSITIONS,
+    ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_ROUTER,
     INCIDENT_STATUS_TRANSITIONS,
     ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES,
@@ -95,13 +96,16 @@ def validate_alert_rule_condition_config(
         if not target_component:
             raise InvalidAlertRuleConfigError(
                 "health_status_change rules require target_component "
-                "(a HealthComponent value or 'router')"
+                "(a HealthComponent value, 'router', or 'isp_link')"
             )
-        valid_components = {c.value for c in HealthComponent} | {ALERT_TARGET_ROUTER}
+        valid_components = {c.value for c in HealthComponent} | {
+            ALERT_TARGET_ROUTER,
+            ALERT_TARGET_ISP_LINK,
+        }
         if target_component not in valid_components:
             raise InvalidAlertRuleConfigError(
                 f"target_component '{target_component}' is not a known "
-                "HealthComponent value or 'router'"
+                "HealthComponent value, 'router', or 'isp_link'"
             )
         expected_status = condition_config.get("expected_status")
         if not isinstance(expected_status, str) or not expected_status:

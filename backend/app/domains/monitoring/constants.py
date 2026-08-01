@@ -194,15 +194,17 @@ DEFAULT_LIST_PAGE_SIZE = 25
 class AlertTriggerType(StrEnum):
     """The kind of condition an :class:`~.models.AlertRule` watches for.
 
-    * ``HEALTH_STATUS_CHANGE`` -- e.g. "Database Down"/"Router Offline".
-      ``AlertRule.target_component`` is either a ``HealthComponent`` value
-      (watches the platform-wide ``ServiceHealth`` rollup for that
+    * ``HEALTH_STATUS_CHANGE`` -- e.g. "Database Down"/"Router Offline"/"ISP
+      Link Down". ``AlertRule.target_component`` is a ``HealthComponent``
+      value (watches the platform-wide ``ServiceHealth`` rollup for that
       component -- composes with Part 1's Health Engine, never duplicates
-      it) or the sentinel :data:`ALERT_TARGET_ROUTER` (watches every
-      in-scope ``app.domains.router.models.Router.health_status`` directly
-      -- read-only, composes with BE-008, the same "read another domain's
-      table directly" precedent ``repository.py`` already establishes for
-      ``RadiusNasClient``/``WireGuardPeer``/``RouterEvent``).
+      it), the sentinel :data:`ALERT_TARGET_ROUTER` (watches every in-scope
+      ``app.domains.router.models.Router.health_status`` directly), or the
+      sentinel :data:`ALERT_TARGET_ISP_LINK` (watches every in-scope
+      ``app.domains.isp.models.IspLink.health_status`` directly) -- all
+      three read-only, the same "read another domain's table directly"
+      precedent ``repository.py`` already establishes for
+      ``RadiusNasClient``/``WireGuardPeer``/``RouterEvent``.
       ``condition_config`` shape: ``{"expected_status": <str>}``.
     * ``THRESHOLD`` -- e.g. "CPU High"/"Disk Full". Compares one of
       ``app.domains.router_provisioning.models.RouterHealthSnapshot``'s own
@@ -247,6 +249,27 @@ class AlertTriggerType(StrEnum):
 # this module's own Health Engine checks (see ``HealthComponent``'s
 # docstring), it is a pointer to a *different* domain's own health signal.
 ALERT_TARGET_ROUTER = "router"
+
+# Sentinel ``AlertRule.target_component`` value for a ``HEALTH_STATUS_CHANGE``
+# rule that watches per-ISP-link ``app.domains.isp.models.IspLink
+# .health_status`` -- the identical "pointer to a different domain's own
+# already-tracked health signal" composition ``ALERT_TARGET_ROUTER`` above
+# already establishes, one level down (a router's WAN uplink, not the router
+# itself). ``IspLink.health_status`` uses ``app.domains.isp.constants
+# .HealthStatus``, a separate enum with the exact same string values as this
+# module's own ``HealthStatus`` (``healthy``/``degraded``/``unhealthy``/
+# ``unknown``) -- both stored as plain strings, so an ``expected_status`` of
+# e.g. ``"unhealthy"`` in a rule's ``condition_config`` compares correctly
+# with no coupling between the two enums' Python identities. Kept fresh by
+# ``app.domains.isp.service.run_health_check_sweep``'s own Beat-scheduled
+# sweep. See
+# ``service.AlertService._evaluate_health_status_rule``'s ``ALERT_TARGET_ISP_LINK``
+# branch for the read-only composition with ``repository.list_isp_links``
+# (the same "query another domain's model directly, read-only" precedent
+# ``list_routers`` already establishes, not a call into ``IspService``,
+# which has no "list every link across an optional organization scope,
+# unpaginated" method this evaluator needs).
+ALERT_TARGET_ISP_LINK = "isp_link"
 
 
 class ThresholdMetric(StrEnum):
@@ -313,6 +336,25 @@ ALERT_STATUS_TRANSITIONS: dict[AlertStatus, frozenset[AlertStatus]] = {
 # (de-duplicated by ``related_event_id``, see ``Alert``'s module docstring)
 # without needing a new "last evaluated at" table.
 ALERT_EVENT_LOOKBACK_MINUTES = 15
+
+# Celery Beat cadence for ``app.domains.monitoring.tasks
+# .run_alert_rule_evaluation_sweep`` -- the periodic sweep that turns
+# ``evaluate_alert_rules`` from an on-demand-only action (``POST
+# /alerts/evaluate``) into a real, running background job now that this
+# codebase actually has a Celery deployment (the constraint the comment
+# above this one was written against no longer holds). 15 minutes --
+# slightly longer than the two real device-health sweeps this evaluator is
+# downstream of and re-reads the *results* of, never their own device I/O
+# (``app.domains.provisioning_engine.constants
+# .ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS`` and ``app.domains.isp
+# .constants.ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS``, both 600 seconds/10
+# minutes today) -- there is no value in evaluating alert rules more often
+# than the underlying router/ISP-link state they read can actually change.
+ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS = 900.0
+
+TASK_RUN_ALERT_RULE_EVALUATION_SWEEP = (
+    "app.domains.monitoring.tasks.run_alert_rule_evaluation_sweep"
+)
 
 # ============================================================================
 # Notification Engine (BE-011 Part 2)
@@ -502,12 +544,15 @@ __all__ = [
     "DEFAULT_LIST_PAGE_SIZE",
     "AlertTriggerType",
     "ALERT_TARGET_ROUTER",
+    "ALERT_TARGET_ISP_LINK",
     "ThresholdMetric",
     "ThresholdOperator",
     "AlertSeverity",
     "AlertStatus",
     "ALERT_STATUS_TRANSITIONS",
     "ALERT_EVENT_LOOKBACK_MINUTES",
+    "ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_ALERT_RULE_EVALUATION_SWEEP",
     "NotificationChannelType",
     "NotificationStatus",
     "HTTP_NOTIFICATION_TIMEOUT_SECONDS",
