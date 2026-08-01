@@ -31,3 +31,10 @@ SQLAlchemy==2.0.36
 stripe==15.3.1
 uvicorn[standard]==0.34.0
 
+# Vendor-agnostic device gateway (wyfy-device-gateway PRD section 7, Step
+# 2): editable/local reference for now since there's no package index yet.
+# router/device_adapters.py::list_available_device_interfaces is the first
+# call site delegating to it; the other five call sites in this repo will
+# follow in later PRs per the PRD's migration plan.
+-e /Users/shresth/wyfy-device-gateway
+

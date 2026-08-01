@@ -21,6 +21,23 @@ almost always) is never a sensible place to hand out addresses either.
 ``lo`` (loopback) is never a real choice. All three are filtered out of
 the response entirely rather than merely flagged, since a picker showing
 options that can only fail on submit is worse than not offering them.
+
+## ``list_available_device_interfaces``: now delegates to wyfy-device-gateway
+
+Per the ``wyfy-device-gateway`` PRD (section 7, Step 2 -- the "prove the
+seam works end-to-end with zero risk" migration step), this function's
+*internal implementation* now calls
+``wyfy_device_gateway.registry.get_adapter(DeviceVendor.MIKROTIK)
+.get_interface_list(...)`` instead of opening ``librouteros`` directly --
+that package is a straight port of the ``_list_sync`` logic this function
+used to contain (same filtering rules, same field shapes). This function's
+own public signature and return shape (``list[DeviceInterface]``) are
+unchanged, and ``DeviceInterfaceQueryError`` is still what callers catch --
+this is purely an internal implementation swap, chosen as the
+lowest-risk first call site to migrate because it is read-only and
+already fully isolated to this one small module. ``reboot_device`` below
+is untouched in this step -- it migrates in a later PR per the PRD's
+migration plan.
 """
 
 from __future__ import annotations
@@ -31,6 +48,9 @@ from dataclasses import dataclass
 
 import librouteros
 from librouteros.exceptions import LibRouterosError
+from wyfy_device_gateway.contract import DeviceCredentials, DeviceVendor
+from wyfy_device_gateway.mikrotik_adapter import MikroTikDeviceError
+from wyfy_device_gateway.registry import get_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +78,34 @@ class DeviceInterface:
 async def list_available_device_interfaces(
     *, host: str, username: str, password: str
 ) -> list[DeviceInterface]:
-    return await asyncio.to_thread(_list_sync, host, username, password)
+    """See module docstring's "now delegates to wyfy-device-gateway"
+    section. Builds a vendor-agnostic ``DeviceCredentials`` from this
+    call's already-decrypted plaintext (exactly the lifecycle
+    ``wyfy_device_gateway``'s own contract documents -- built by the
+    caller, used once, discarded), delegates the real RouterOS query to
+    the ported ``MikroTikAdapter``, then maps its vendor-agnostic
+    ``InterfaceInfo`` rows back onto this module's own pre-existing
+    ``DeviceInterface`` shape (identical fields) so every downstream
+    caller (``router.py``'s ``get_device_interfaces`` endpoint,
+    ``DeviceInterfaceResponse``) is unaffected byte-for-byte."""
+    creds = DeviceCredentials(
+        vendor=DeviceVendor.MIKROTIK, host=host, username=username, secret=password
+    )
+    try:
+        interfaces = await get_adapter(DeviceVendor.MIKROTIK).get_interface_list(creds)
+    except MikroTikDeviceError as exc:
+        raise DeviceInterfaceQueryError(host, exc.detail) from exc
+    return [
+        DeviceInterface(
+            name=i.name,
+            type=i.type,
+            running=i.running,
+            disabled=i.disabled,
+            bridge=i.bridge,
+            has_ip_address=i.has_ip_address,
+        )
+        for i in interfaces
+    ]
 
 
 async def reboot_device(*, host: str, username: str, password: str) -> None:
@@ -96,66 +143,6 @@ def _reboot_sync(host: str, username: str, password: str) -> None:
             api.close()
         except (LibRouterosError, OSError, EOFError):
             pass
-
-
-def _list_sync(host: str, username: str, password: str) -> list[DeviceInterface]:
-    try:
-        api = librouteros.connect(
-            host=host,
-            username=username,
-            password=password,
-            port=_DEFAULT_API_PORT,
-            timeout=_DEFAULT_TIMEOUT_SECONDS,
-        )
-    except (LibRouterosError, OSError) as exc:
-        raise DeviceInterfaceQueryError(host, str(exc)) from exc
-
-    try:
-        try:
-            interfaces = list(api.path("interface"))
-            bridge_ports = list(api.path("interface", "bridge", "port"))
-            addresses = list(api.path("ip", "address"))
-            dhcp_servers = list(api.path("ip", "dhcp-server"))
-            dhcp_clients = list(api.path("ip", "dhcp-client"))
-        except LibRouterosError as exc:
-            raise DeviceInterfaceQueryError(host, str(exc)) from exc
-    finally:
-        api.close()
-
-    bridge_of: dict[str, str] = {
-        str(p.get("interface")): str(p.get("bridge"))
-        for p in bridge_ports
-        if p.get("interface") and p.get("bridge")
-    }
-    has_ip: set[str] = {str(a.get("interface")) for a in addresses if a.get("interface")}
-    has_dhcp_server: set[str] = {
-        str(d.get("interface")) for d in dhcp_servers if d.get("interface")
-    }
-    has_dhcp_client: set[str] = {
-        str(d.get("interface")) for d in dhcp_clients if d.get("interface")
-    }
-
-    result: list[DeviceInterface] = []
-    for row in interfaces:
-        name = row.get("name")
-        if not name:
-            continue
-        name = str(name)
-        if name == "lo":
-            continue
-        if name in has_dhcp_server or name in has_dhcp_client:
-            continue
-        result.append(
-            DeviceInterface(
-                name=name,
-                type=str(row.get("type")) if row.get("type") else None,
-                running=bool(row.get("running", False)),
-                disabled=bool(row.get("disabled", False)),
-                bridge=bridge_of.get(name),
-                has_ip_address=name in has_ip,
-            )
-        )
-    return result
 
 
 __all__ = [
