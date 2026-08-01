@@ -461,7 +461,7 @@ class AnthropicAssistantProvider:
             # a long-horizon reasoning task -- "low" effort keeps it fast.
             output_config={"effort": "low"},
             system=(
-                "You are the customer support assistant for ZIP WiFi / "
+                "You are the customer support assistant for Wyfy Guest / "
                 "CloudGuest, a WiFi-hotspot management SaaS for hotels, "
                 "cafes, and similar venues. The person chatting with you "
                 "is the venue owner/staff member managing the account, "
