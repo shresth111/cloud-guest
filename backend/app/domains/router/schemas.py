@@ -231,6 +231,16 @@ class RouterUpdateRequest(BaseModel):
     serial_number: str | None = Field(default=None, min_length=1, max_length=100)
     mac_address: str | None = Field(default=None, min_length=17, max_length=17)
     model: str | None = Field(default=None, min_length=1, max_length=100)
+    vendor: str | None = Field(
+        default=None,
+        max_length=50,
+        description=(
+            "Device vendor -- same field/default RouterCreateRequest already "
+            "exposes at creation time (router/models.py:77). Added here so "
+            "an already-registered router's vendor can be corrected/set from "
+            "the Master console without re-creating the router."
+        ),
+    )
     routeros_version: str | None = Field(default=None, max_length=50)
     management_ip_address: str | None = Field(default=None, max_length=45)
     public_ip_address: str | None = Field(default=None, max_length=45)
