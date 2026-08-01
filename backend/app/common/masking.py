@@ -47,11 +47,6 @@ _EMAIL_LOCAL_MASK = "****"
 
 _MASKED_NAME_LAST_TOKEN_PATTERN = re.compile(r"^[^\s.]\.$")
 
-_MASKED_MAC_PATTERN = re.compile(
-    r"^(?:[Xx]{2}[:-]){4}[0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}$"
-)
-_MAC_SEPARATOR_PATTERN = re.compile(r"[:-]")
-
 
 def mask_mobile(value: str | None) -> str | None:
     """``"+91 98765 98647"`` -> ``"XXXXXXX98647"``. Strips every
@@ -118,24 +113,13 @@ def mask_name(value: str | None) -> str | None:
 
 
 def mask_mac(value: str | None) -> str | None:
-    """``"AA:BB:CC:DD:EE:FF"`` -> ``"XX:XX:XX:XX:EE:FF"`` (last two
-    octets visible). Preserves whichever separator (``:`` or ``-``) the
-    input already used. A value that doesn't look like a real
-    colon/dash-separated 6-octet MAC address is returned unchanged
-    rather than guessed at."""
-    if not value:
-        return value
-    if _MASKED_MAC_PATTERN.match(value):
-        return value
-    separator_match = _MAC_SEPARATOR_PATTERN.search(value)
-    if separator_match is None:
-        return value
-    separator = separator_match.group(0)
-    octets = value.split(separator)
-    if len(octets) != 6:
-        return value
-    masked = ["XX"] * 4 + octets[-2:]
-    return separator.join(masked)
+    """No-op by explicit product decision -- MAC addresses are shown
+    unmasked everywhere (customers need the real address to identify a
+    device for support). Kept as a real function (not deleted) so every
+    ``MaskedMac``-annotated field across the codebase stays wired through
+    one place if masking is ever reintroduced, rather than each call site
+    needing to change."""
+    return value
 
 
 def mask_identifier(value: str | None) -> str | None:
