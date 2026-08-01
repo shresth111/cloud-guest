@@ -18,7 +18,12 @@ class Settings(BaseSettings):
     service_name: str = "cloudguest-backend"
     api_v1_prefix: str = "/api/v1"
     allowed_origins: list[str] = Field(
-        default_factory=lambda: ["http://localhost:3000"]
+        default_factory=lambda: [
+            "http://localhost:3000",
+            "https://wyfyguest.com",
+            "https://www.wyfyguest.com",
+            "https://app.wyfyguest.com",
+        ]
     )
 
     database_url: PostgresDsn = Field(
