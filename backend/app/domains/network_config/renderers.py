@@ -68,7 +68,24 @@ newly-connected, not-yet-authenticated guest to the login page) uses that
 name instead of the hotspot's raw IP in the URL it builds -- confirmed
 against MikroTik's own published ``/ip hotspot profile`` reference. This is
 what turns ``http://10.5.50.1/login`` in a guest's address bar into
-``http://wyfy.portal/login``, the exact UX complaint this addition fixes.
+``http://portal.wyfyguest.com/login``, the exact UX complaint this
+addition fixes.
+
+**A real subdomain of the platform's own registered domain, not a
+pseudo-TLD -- a deliberate, later choice (this constant originally used
+``wyfy.portal``).** ``wyfyguest.com`` is already this platform's own real,
+registered production domain (see ``app/main.py``'s CORS allowlist, which
+already trusts ``wyfyguest.com``/``app.wyfyguest.com`` origins), so this
+platform fully controls what, if anything, ``portal.wyfyguest.com``
+resolves to on the public internet -- there is no third party who could
+ever legitimately hold or contest this exact name the way a truly
+unrelated public domain could. It still never needs a public DNS record
+for this feature to work (see below), and the org should be aware that
+*if* ``portal.wyfyguest.com`` is ever wanted for something else publicly
+in the future, this per-router local override would fully shadow it for
+any guest sitting on that router's own LAN -- worth a one-line note
+wherever this platform's own DNS zone/domain inventory is tracked, not a
+reason to avoid the name.
 
 **``dns-name`` alone is not sufficient -- it changes the redirect URL, it
 does not by itself make that hostname resolve.** MikroTik's own
@@ -82,9 +99,17 @@ address as their DNS server via the ``dns-server=`` option this same
 function's ``/ip dhcp-server network add`` line has always set, and
 ``/ip dns set ... allow-remote-requests=yes`` (already rendered platform-
 wide in the master-console bootstrap script) makes the router answer that
-query -- no real registrable domain or public DNS record is created or
-needed anywhere in this scheme, it is resolved entirely locally, by this
-router, for its own guests.
+query -- no public DNS record is *needed* anywhere in this scheme, it is
+resolved entirely locally, by each router, for its own guests, regardless
+of whatever ``portal.wyfyguest.com`` may or may not publicly resolve to.
+(A public A record for ``portal.wyfyguest.com`` was separately added in
+the platform's own GoDaddy DNS zone as a belt-and-suspenders fallback for
+the rare guest device that bypasses the router's own DNS server entirely
+-- see this section's own "not independently confirmed" paragraph below
+for why that fallback's precedence vs. the router's local answer isn't
+verified, and note a public record cannot itself point at any individual
+router's own private LAN IP, so it is not, and cannot be, a substitute for
+the per-router ``/ip dns static`` line this function renders.)
 
 **Not independently confirmed against a real device this session** (unlike
 most of the rest of this file's decisions, which carry an explicit "live
@@ -110,7 +135,7 @@ by every one of them would leave the router's ``/ip dns static`` table
 with either a name collision (RouterOS rejects a second ``add`` of the
 same ``name=``) or, worse, multiple different addresses silently
 round-robined under one name, sending some fraction of guests on VLAN A's
-hotspot to VLAN B's gateway. ``{tag}.wyfy.portal`` (``tag`` already being
+hotspot to VLAN B's gateway. ``{tag}.portal.wyfyguest.com`` (``tag`` already being
 this function's own real, ``vlan_id``-derived, guaranteed-unique-per-router
 identifier) sidesteps that entirely, the same "derive a real, already-
 unique value rather than fabricate a shared one" discipline
@@ -458,14 +483,17 @@ from .constants import (
 WIREGUARD_INTERFACE_NAME = "wg-cloudguard"
 
 # The base ``dns-name`` used for the captive-portal redirect on every
-# per-VLAN standalone hotspot ``_render_vlan_hotspot`` renders -- see
-# module docstring's "Hotspot dns-name" section for why this is a pseudo-
-# TLD used purely for the router's own local DNS resolution (never a real,
-# registrable public domain), why a bare static DNS record is rendered
-# alongside it rather than relying on ``dns-name`` alone, and why each
-# VLAN's own hotspot gets a ``{tag}.`` prefixed variant of this rather than
-# this exact literal.
-HOTSPOT_DNS_NAME = "wyfy.portal"
+# per-VLAN standalone hotspot ``_render_vlan_hotspot`` renders -- a real
+# subdomain of this platform's own registered ``wyfyguest.com`` (already
+# trusted by app.main's CORS allowlist), not a fabricated pseudo-TLD --
+# see module docstring's "Hotspot dns-name" section for why that's safe
+# (this platform, not a third party, controls the name), why a bare
+# ``/ip dns static`` entry is rendered alongside ``dns-name`` rather than
+# relying on it alone, why a public GoDaddy A record for this exact name
+# is a belt-and-suspenders fallback rather than the thing this feature
+# actually depends on, and why each VLAN's own hotspot gets a ``{tag}.``
+# prefixed variant of this rather than this exact literal.
+HOTSPOT_DNS_NAME = "portal.wyfyguest.com"
 
 
 def _sanitize_identifier(name: str) -> str:
