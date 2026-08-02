@@ -529,6 +529,37 @@ async def create_webfig_session(
     )
 
 
+WEBFIG_PROXY_PREFIX_TEMPLATE = "/api/v1/routers/{router_id}/webfig"
+
+
+def _rewrite_webfig_absolute_paths(body: bytes, content_type: str, router_id: uuid.UUID) -> bytes:
+    """RouterOS's own WebFig assets hardcode a handful of *absolute*
+    (root-relative) paths -- confirmed live in its login script.js:
+    ``window.location.replace(`/webfig/${window.location.hash}`)``. A
+    relative path (``script.js``, what most of WebFig actually uses)
+    naturally resolves against wherever this proxy is mounted and needs no
+    help; an absolute one always resolves against *this app's own*
+    origin root, bypassing the proxy prefix entirely and landing on a
+    path our own SPA doesn't have -- which is exactly the "opens WebFig,
+    logs in, then 404s" bug this rewrite exists to fix. Only applied to
+    text-ish responses (html/javascript/css) -- images and other binary
+    content are returned untouched, both because rewriting them makes no
+    sense and because blindly decoding arbitrary bytes as text would
+    corrupt them."""
+    if not any(t in content_type for t in ("text/html", "javascript", "text/css")):
+        return body
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return body
+    prefix = WEBFIG_PROXY_PREFIX_TEMPLATE.format(router_id=router_id)
+    # Order matters: the longer, slash-terminated form first so it isn't
+    # left partially rewritten by the shorter form's replacement.
+    text = text.replace("/webfig/", f"{prefix}/")
+    text = text.replace('"/webfig"', f'"{prefix}"').replace("'/webfig'", f"'{prefix}'")
+    return text.encode("utf-8")
+
+
 @router.api_route(
     "/routers/{router_id}/webfig/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -595,8 +626,23 @@ async def proxy_webfig(
 
     upstream_url = f"http://{host}/{path}"
     body = await request.body()
-    excluded_headers = {"host", "authorization", "cookie", "content-length"}
+    excluded_headers = {"host", "authorization", "content-length"}
     forward_headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded_headers}
+    # WebFig establishes its own router-side session via a Set-Cookie on a
+    # successful request; that cookie must round-trip (browser -> proxy ->
+    # router, and router -> proxy -> browser) for the router to recognize
+    # the browser as logged in on subsequent requests. Strip only our own
+    # session cookie before forwarding upstream -- the router doesn't need
+    # it and it's an internal proxy-auth detail, not something to leak.
+    cookie_header = request.headers.get("cookie", "")
+    if cookie_header:
+        kept = [
+            part.strip()
+            for part in cookie_header.split(";")
+            if part.strip() and not part.strip().startswith(f"{cookie_name}=")
+        ]
+        if kept:
+            forward_headers["cookie"] = "; ".join(kept)
 
     async with httpx.AsyncClient(
         auth=httpx.BasicAuth(router_row.api_username or "", password or ""),
@@ -624,12 +670,22 @@ async def proxy_webfig(
         for k, v in upstream.headers.items()
         if k.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection", "set-cookie"}
     }
+    content_type = upstream.headers.get("content-type", "")
+    response_body = _rewrite_webfig_absolute_paths(upstream.content, content_type, router_id)
     proxy_response = Response(
-        content=upstream.content,
+        content=response_body,
         status_code=upstream.status_code,
         headers=response_headers,
-        media_type=upstream.headers.get("content-type"),
+        media_type=content_type or None,
     )
+    # RouterOS's own WebFig sets a session cookie on the login response and
+    # relies on the browser sending it back to recognize the browser as
+    # authenticated -- without this, WebFig always looks unauthenticated and
+    # bounces back to its login screen no matter what credentials were
+    # submitted. httpx collapses repeated response headers, so read the raw
+    # Set-Cookie values explicitly (there can be more than one).
+    for router_cookie in upstream.headers.get_list("set-cookie"):
+        proxy_response.headers.append("set-cookie", router_cookie)
     if session:
         proxy_response.set_cookie(
             cookie_name,

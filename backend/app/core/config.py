@@ -778,6 +778,24 @@ class Settings(BaseSettings):
     ses_region: str = Field(default="us-east-1")
     ses_from_address: str = Field(default="")
 
+    # Invoice emails (billing.router's `_send_invoice_email_and_build_response`)
+    # deliberately go out from a separate mailbox from every other
+    # notification (OTP, password reset, ...) -- finance/accounts wants its
+    # own dedicated sending identity regardless of which account the
+    # general `smtp_*` settings above end up using. Empty (the default)
+    # means "no dedicated invoice mailbox configured yet" -- falls back to
+    # the shared `email_delivery_provider`/`smtp_*` config above, so a
+    # fresh checkout with only the general SMTP settings configured keeps
+    # working exactly as before this field existed.
+    invoice_smtp_host: str = Field(
+        default="", description="SMTP server hostname for invoice emails specifically."
+    )
+    invoice_smtp_port: int = Field(default=587, ge=1, le=65_535)
+    invoice_smtp_username: str = Field(default="")
+    invoice_smtp_password: str = Field(default="")
+    invoice_smtp_use_tls: bool = Field(default=True)
+    invoice_smtp_from_address: str = Field(default="")
+
     demo_request_notify_email: str = Field(
         default="",
         description=(

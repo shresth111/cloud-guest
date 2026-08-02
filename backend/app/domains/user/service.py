@@ -36,7 +36,7 @@ from typing import Protocol
 from app.common.exceptions import CloudGuestError
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import User
-from app.domains.auth.password import PasswordManager
+from app.domains.auth.password import PasswordManager, PasswordStrengthError
 from app.domains.auth.service import EmailAlreadyExistsError, UsernameAlreadyExistsError
 from app.domains.notification.constants import (
     NotificationChannelType,
@@ -54,6 +54,7 @@ from .exceptions import (
     InitialRoleRequiresOrganizationError,
     SelfDeactivationNotAllowedError,
     UserNotFoundError,
+    UserPasswordTooWeakError,
 )
 
 logger = logging.getLogger(__name__)
@@ -409,7 +410,10 @@ class UserService:
             )
             raise UsernameAlreadyExistsError(username)
 
-        password_hash = PasswordManager.hash(temporary_password)
+        try:
+            password_hash = PasswordManager.hash(temporary_password)
+        except PasswordStrengthError as exc:
+            raise UserPasswordTooWeakError(str(exc)) from exc
         user = await self.identity_repository.create_user(
             first_name=first_name,
             last_name=last_name,

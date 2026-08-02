@@ -92,3 +92,16 @@ class SelfDeactivationNotAllowedError(UserError):
             f"User {user_id} cannot deactivate their own account",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+
+class UserPasswordTooWeakError(UserError):
+    """Wraps ``app.domains.auth.password.PasswordStrengthError`` (a plain
+    ``Exception``, not a ``CloudGuestError``) into a proper 400 with that
+    validator's own message. Same gap as ``auth.service.PasswordTooWeakError``
+    and ``guest.service.GuestPasswordTooWeakError`` -- confirmed reachable via
+    ``POST /users`` with a `temporary_password` that satisfies the schema's
+    length-only check but is missing a required character class, which
+    otherwise surfaces as a raw "Internal server error" 500."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)

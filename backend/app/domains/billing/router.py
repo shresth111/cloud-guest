@@ -158,7 +158,9 @@ from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
 from app.domains.otp.service import (
     EmailAttachment,
+    EmailProviderProtocol,
     LoggingEmailProvider,
+    SmtpEmailProvider,
     get_configured_email_provider,
 )
 from app.domains.rbac.authorization import AccessValidator
@@ -1962,6 +1964,25 @@ async def create_manual_invoice(
     )
 
 
+def _get_invoice_email_provider(settings: Settings) -> EmailProviderProtocol:
+    """Invoices go out from their own dedicated mailbox (finance/accounts),
+    independent of whichever account ``email_delivery_provider``/`smtp_*`
+    above is configured to use for everything else (OTP, password reset,
+    ...). Falls back to the shared provider when no invoice-specific
+    mailbox has been configured, so this is a no-op until
+    ``invoice_smtp_host`` is actually set."""
+    if not settings.invoice_smtp_host:
+        return get_configured_email_provider(settings)
+    return SmtpEmailProvider(
+        host=settings.invoice_smtp_host,
+        port=settings.invoice_smtp_port,
+        username=settings.invoice_smtp_username,
+        password=settings.invoice_smtp_password,
+        use_tls=settings.invoice_smtp_use_tls,
+        from_address=settings.invoice_smtp_from_address or settings.invoice_smtp_username,
+    )
+
+
 async def _send_invoice_email_and_build_response(
     invoice: Invoice,
     *,
@@ -1998,7 +2019,7 @@ async def _send_invoice_email_and_build_response(
     email_sent = False
     email_error: str | None = None
     try:
-        email_provider = get_configured_email_provider(settings)
+        email_provider = _get_invoice_email_provider(settings)
         if isinstance(email_provider, LoggingEmailProvider):
             email_error = (
                 "No real email delivery provider is configured on this server."
