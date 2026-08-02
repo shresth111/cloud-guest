@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=75.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wyfy-device-gateway"
+version = "0.1.0"
+description = "Vendor-agnostic network device gateway for Wyfy Guest -- one adapter Protocol, one real MikroTik implementation, stubs for the rest."
+requires-python = ">=3.13"
+readme = "README.md"
+authors = [{ name = "Wyfy Guest Engineering" }]
+dependencies = [
+    # Pinned to match cloud-guest-repo/backend's own requirements.txt for
+    # consistency (both repos speak to the same real RouterOS devices).
+    "librouteros==3.2.1",
+    "asyncssh==2.14.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wyfy_device_gateway*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    "ignore::DeprecationWarning:pytest_asyncio.*",
+]
