@@ -30,4 +30,5 @@ reportlab==4.4.4
 SQLAlchemy==2.0.36
 stripe==15.3.1
 uvicorn[standard]==0.34.0
+wyfy-device-gateway @ git+https://github.com/shresth111/wyfy-device-gateway.git@25fbed1145d07d54a31a7956a82d4d355a980379
 
