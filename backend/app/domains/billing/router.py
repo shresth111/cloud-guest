@@ -231,6 +231,7 @@ from .schemas import (
     InvoiceItemResponse,
     InvoiceListResponse,
     InvoiceResponse,
+    ManualInvoiceCreateRequest,
     LicenseAssignRequest,
     LicenseChangeLogResponse,
     LicenseDowngradeRequest,
@@ -1906,6 +1907,80 @@ async def generate_and_send_invoice(
         organization_id, payload.subscription_id
     )
     invoice = await service.generate_invoice_for_subscription(subscription_id)
+    return await _send_invoice_email_and_build_response(
+        invoice,
+        organization_id=organization_id,
+        request=request,
+        user=user,
+        service=service,
+        organization_service=organization_service,
+        settings=settings,
+    )
+
+
+@router.post(
+    "/invoices/manual",
+    response_model=ApiResponse[InvoiceGenerateAndSendResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("invoices.manage"))],
+)
+async def create_manual_invoice(
+    request: Request,
+    payload: ManualInvoiceCreateRequest,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    user: AuthUser = Depends(get_current_user),
+    service: InvoiceService = Depends(get_invoice_service),
+    organization_service: OrganizationService = Depends(get_organization_service),
+    settings: Settings = Depends(get_settings),
+):
+    """The operator-authored counterpart to ``POST /invoices/generate-and-
+    send`` above: instead of pulling a fixed amount off the organization's
+    subscribed plan, the operator types in whatever line items (each a
+    description, quantity, and unit price) this invoice should actually
+    bill for -- a one-off charge, a custom quote, anything that isn't
+    "exactly what the subscription already costs." See
+    ``InvoiceService.create_manual_invoice`` for why this never touches
+    ``Subscription``/``Plan`` at all. Shares the identical PDF-render +
+    email-send + audit tail as the subscription-based endpoint above
+    (``_send_invoice_email_and_build_response``) -- only the invoice
+    *creation* step differs."""
+    invoice = await service.create_manual_invoice(
+        organization_id=organization_id,
+        line_items=[
+            (item.description, item.quantity, item.unit_price)
+            for item in payload.line_items
+        ],
+    )
+    return await _send_invoice_email_and_build_response(
+        invoice,
+        organization_id=organization_id,
+        request=request,
+        user=user,
+        service=service,
+        organization_service=organization_service,
+        settings=settings,
+    )
+
+
+async def _send_invoice_email_and_build_response(
+    invoice: Invoice,
+    *,
+    organization_id: uuid.UUID,
+    request: Request,
+    user: AuthUser,
+    service: InvoiceService,
+    organization_service: OrganizationService,
+    settings: Settings,
+):
+    """Shared PDF-render + email-send + audit tail for both
+    ``generate_and_send_invoice`` (subscription-based) and
+    ``create_manual_invoice`` (operator-typed line items) -- the two
+    endpoints differ only in how the ``Invoice`` itself gets created;
+    everything after that (render its PDF, email it, record the outcome)
+    is identical, so it lives in exactly one place. See
+    ``generate_and_send_invoice``'s own docstring for the full reasoning
+    on reused infra and the "failed send never rolls back the invoice"
+    behavior."""
     items = await service.list_items(invoice.id)
     notes = await service.list_notes(invoice.id)
 

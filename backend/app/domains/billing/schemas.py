@@ -744,6 +744,27 @@ class InvoiceGenerateAndSendRequest(BaseModel):
     subscription_id: uuid.UUID | None = None
 
 
+class ManualInvoiceLineItemRequest(BaseModel):
+    """One operator-typed line on ``POST /invoices/manual`` -- mirrors
+    ``InvoiceItem``'s own three real fields (description, quantity,
+    unit_price); ``amount`` is never accepted from the client, it's always
+    ``quantity * unit_price`` computed server-side (see
+    ``InvoiceService.create_manual_invoice``), the same "never trust a
+    client-supplied computed total" posture ``InvoiceItem.amount``'s own
+    docstring establishes for the automatic path."""
+
+    description: str = Field(..., min_length=1, max_length=500)
+    quantity: Decimal = Field(..., gt=0)
+    unit_price: Decimal = Field(..., ge=0)
+
+
+class ManualInvoiceCreateRequest(BaseModel):
+    """Body for ``POST /invoices/manual`` -- at least one line item is
+    required (an invoice with nothing on it isn't a real invoice)."""
+
+    line_items: list[ManualInvoiceLineItemRequest] = Field(..., min_length=1)
+
+
 class InvoiceGenerateAndSendResponse(BaseModel):
     """Wraps the freshly-generated invoice with the outcome of the email
     dispatch attempt -- kept separate from ``InvoiceResponse`` itself

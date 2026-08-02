@@ -3117,6 +3117,114 @@ class InvoiceService:
             raise SubscriptionNotFoundError(organization_id)
         return subscription.id
 
+    async def create_manual_invoice(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        line_items: list[tuple[str, Decimal, Decimal]],
+    ) -> Invoice:
+        """The operator-authored counterpart to
+        ``generate_invoice_for_subscription``: an ad-hoc invoice for
+        whatever `line_items` (``[(description, quantity, unit_price),
+        ...]``) an operator typed into Master Console's invoice form,
+        rather than a subscription's fixed plan price. Everything else --
+        GST computation, sequential numbering, the frozen billing
+        snapshot, ``InvoiceStatus.ISSUED`` -- is identical to that method
+        and this platform's INR-only billing model (see
+        ``src/lib/billing-schemas.ts``'s ``currency: z.literal("INR")`` on
+        the frontend for the matching decision on the Plan side); this
+        method never touches ``Subscription``/``Plan`` at all, so
+        ``Invoice.subscription_id`` is left ``None`` -- a manual invoice
+        is not tied to, and must not be confused with, a recurring
+        subscription charge.
+
+        Raises the same ``BillingProfileNotFoundError`` as the automatic
+        path -- a real billing address is still a non-negotiable
+        prerequisite for a legal invoice, manual or not."""
+        billing_profile = await self.billing_profile_repository.get_by_organization_id(
+            organization_id
+        )
+        if billing_profile is None:
+            raise BillingProfileNotFoundError(organization_id)
+
+        subtotal = sum(
+            (quantity * unit_price for _description, quantity, unit_price in line_items),
+            start=Decimal("0"),
+        ).quantize(Decimal("0.01"))
+
+        tax_rate: TaxRate | None = None
+        if not billing_profile.tax_exempt:
+            tax_rate = await self.tax_rate_repository.get_active_for_country(
+                billing_profile.billing_country
+            )
+
+        breakdown = compute_tax_breakdown(
+            subtotal=subtotal,
+            tax_type=TaxType(tax_rate.tax_type) if tax_rate is not None else None,
+            rate_percentage=(
+                tax_rate.rate_percentage if tax_rate is not None else Decimal("0")
+            ),
+            tax_exempt=billing_profile.tax_exempt,
+            platform_state=self.platform_gst_state,
+            platform_country=self.platform_gst_country,
+            billing_state=billing_profile.billing_state,
+            billing_country=billing_profile.billing_country,
+        )
+        total_amount = (subtotal + breakdown.tax_amount).quantize(Decimal("0.01"))
+
+        now = datetime.now(UTC)
+        invoice_number = await generate_invoice_number(
+            self.number_counter_repository, at=now
+        )
+        snapshot: dict[str, object] = {
+            "billing_name": billing_profile.billing_name,
+            "billing_address_line1": billing_profile.billing_address_line1,
+            "billing_address_line2": billing_profile.billing_address_line2,
+            "billing_city": billing_profile.billing_city,
+            "billing_state": billing_profile.billing_state,
+            "billing_country": billing_profile.billing_country,
+            "billing_postal_code": billing_profile.billing_postal_code,
+            "gst_identifier": billing_profile.gst_identifier,
+            "tax_exempt": billing_profile.tax_exempt,
+        }
+
+        invoice = await self.repository.create_invoice(
+            organization_id=organization_id,
+            subscription_id=None,
+            payment_id=None,
+            invoice_number=invoice_number,
+            status=InvoiceStatus.ISSUED.value,
+            issue_date=now,
+            due_date=now + timedelta(days=self.invoice_due_days),
+            subtotal=subtotal,
+            cgst_amount=breakdown.cgst_amount,
+            sgst_amount=breakdown.sgst_amount,
+            igst_amount=breakdown.igst_amount,
+            tax_amount=breakdown.tax_amount,
+            tax_rate_percentage=(
+                tax_rate.rate_percentage if tax_rate is not None else Decimal("0")
+            ),
+            total_amount=total_amount,
+            currency="INR",
+            billing_snapshot=snapshot,
+        )
+        for description, quantity, unit_price in line_items:
+            await self.repository.create_invoice_item(
+                invoice_id=invoice.id,
+                description=description,
+                quantity=quantity,
+                unit_price=unit_price,
+                amount=(quantity * unit_price).quantize(Decimal("0.01")),
+            )
+
+        await self._audit(
+            None,
+            AuditAction.INVOICE_GENERATED,
+            invoice,
+            description=f"Invoice {invoice.invoice_number} manually created for organization {organization_id}",
+        )
+        return invoice
+
     async def record_invoice_emailed(
         self,
         *,
