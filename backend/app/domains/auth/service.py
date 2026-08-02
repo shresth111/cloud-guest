@@ -382,7 +382,23 @@ class AuthService:
         ``PasswordChangeRequiredError`` as before (the retry signal); supply
         it and the correct temporary password sets it as the new password
         in the same call, then proceeds to a normal login.
+
+        Real gap closed here: ``email`` is normalized to lowercase up front,
+        before it touches ``AuthSecurity.check_rate_limit`` /
+        ``AuthSecurity.record_login_attempt``. Those two build their Redis
+        key as a literal ``f"{email}:{ip_address}"`` with no normalization
+        of their own (unlike ``AuthRepository.get_user_by_email`` and
+        ``record_login_attempt``, which already lowercase). Since email
+        identity is case-insensitive everywhere else in this domain, an
+        attacker could previously cycle the casing of a single email
+        address (``Admin@x.com``, ``ADMIN@x.com``, ...) to get a fresh
+        Redis rate-limit/lockout counter on every attempt against the
+        *same* account from the *same* IP -- effectively unlimited password
+        guesses against the platform's own super-admin login, the one path
+        this brute-force defense most needs to hold on. Normalizing once,
+        here, fixes both call sites without touching their own signatures.
         """
+        email = email.strip().lower()
         await AuthSecurity.check_rate_limit(self.redis, email, device_info.ip_address)
 
         user = await self.repository.get_user_by_email(email)

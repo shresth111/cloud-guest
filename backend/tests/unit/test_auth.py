@@ -39,7 +39,7 @@ from app.domains.auth.models import (
     UserMfaRecoveryCode,
 )
 from app.domains.auth.password import PasswordManager, PasswordStrengthError
-from app.domains.auth.security import AccountLockedError, AuthSecurity
+from app.domains.auth.security import AccountLockedError, AuthSecurity, RateLimitError
 from app.domains.auth.service import (
     AuthService,
     DeviceInfo,
@@ -795,6 +795,45 @@ class TestAuthServiceLogin:
             await service.login(
                 "wrongpass@example.com", "NotTheRightPass123!@#", make_device_info()
             )
+
+    async def test_login_rate_limit_is_not_bypassable_via_email_casing(self) -> None:
+        """Real gap regression: ``AuthSecurity.check_rate_limit`` /
+        ``record_login_attempt`` build their Redis key from the raw email
+        with no normalization of their own -- unlike
+        ``AuthRepository.get_user_by_email``, which already lowercases.
+        For an email with no matching user (no ``User`` row to fall back on
+        for a DB-level ``failed_login_attempts``/``locked_until`` lock),
+        the Redis-keyed rate limit used to be the *only* defense -- and
+        cycling the email's casing on every attempt minted a brand new
+        counter each time, sidestepping it entirely. ``AuthService.login``
+        now normalizes ``email`` to lowercase before either Redis call, so
+        every casing variant of the same address shares one counter. See
+        ``AuthService.login``'s own docstring for the full incident
+        writeup."""
+        from app.core.config import get_settings
+
+        service, _repository, _redis = make_service()
+        device_info = make_device_info()
+        max_attempts = get_settings().max_login_attempts
+        casings = [
+            "nobody@example.com",
+            "Nobody@Example.com",
+            "NOBODY@EXAMPLE.COM",
+            "NoBoDy@exAMPLE.com",
+            "nobody@EXAMPLE.com",
+            "NOBODY@example.COM",
+            "nObOdY@ExAmPlE.cOm",
+        ]
+        assert len(casings) > max_attempts, "need more casings than the attempt cap"
+
+        for email_variant in casings[:max_attempts]:
+            with pytest.raises(InvalidCredentialsError):
+                await service.login(email_variant, STRONG_PASSWORD, device_info)
+
+        # A fresh casing, never used above, must still be caught by the
+        # shared counter -- not treated as a brand new email/IP pair.
+        with pytest.raises(RateLimitError):
+            await service.login(casings[max_attempts], STRONG_PASSWORD, device_info)
 
 
 class TestAuthServiceMustChangePassword:
