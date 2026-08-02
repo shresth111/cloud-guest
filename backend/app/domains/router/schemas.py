@@ -295,6 +295,16 @@ class DeviceConnectionResponse(BaseModel):
     password: str | None
 
 
+class WebfigSessionResponse(BaseModel):
+    """A short-lived, single-router-scoped opaque capability token -- see
+    ``router.py``'s ``create_webfig_session`` for why this exists instead
+    of just gating the WebFig proxy behind the normal ``Bearer`` auth
+    every other endpoint here uses."""
+
+    session_token: str
+    expires_in: int
+
+
 class DeviceInterfaceResponse(BaseModel):
     """One real, currently-available interface on the physical device --
     see ``device_adapters.list_available_device_interfaces``'s own

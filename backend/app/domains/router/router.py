@@ -63,11 +63,15 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import secrets
 import uuid
 
-from fastapi import APIRouter, Depends, Query, Request, status
+import httpx
+from fastapi import APIRouter, Depends, Query, Request, Response, status
+from redis.asyncio import Redis
 
 from app.common.responses import ApiResponse, build_response
+from app.database.redis import get_redis_client
 from app.domains.auth.models import AuthUser
 from app.domains.guest.dependencies import get_radius_service
 from app.domains.guest.router import deregister_radius_nas_client
@@ -105,6 +109,7 @@ from .schemas import (
     RouterListResponse,
     RouterResponse,
     RouterUpdateRequest,
+    WebfigSessionResponse,
 )
 from .service import RouterService
 
@@ -472,6 +477,169 @@ async def get_device_connection(
         ).model_dump(),
         request_id=_request_id(request),
     )
+
+
+WEBFIG_SESSION_KEY_TEMPLATE = "webfig_session:{token}"
+WEBFIG_SESSION_TTL_SECONDS = 600
+
+
+@router.post(
+    "/routers/{router_id}/webfig-session",
+    response_model=ApiResponse[WebfigSessionResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def create_webfig_session(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    router_service: RouterService = Depends(get_router_service),
+    redis: Redis = Depends(get_redis_client),
+):
+    """Mints a short-lived, single-router-scoped opaque token so Master
+    Console's "Open web console" iframe can reach ``GET .../webfig/...``
+    below *without* a ``Bearer`` header -- a browser navigating an
+    ``<iframe src>`` has no way to attach one, so that endpoint can't sit
+    behind the normal ``CurrentUser``/``RequirePermission`` dependency
+    chain the rest of this domain uses. This endpoint is the actual
+    authorization check (real ``routers.manage`` permission, real tenant
+    scoping via ``reveal_credentials``); the token it returns is a
+    capability, not a credential -- it grants proxy access to exactly this
+    one router's WebFig for ``WEBFIG_SESSION_TTL_SECONDS``, nothing else,
+    and is never the caller's own session/JWT."""
+    await router_service.reveal_credentials(
+        actor_user_id=uuid.UUID(user.id),
+        router_id=router_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    token = secrets.token_urlsafe(32)
+    await redis.set(
+        WEBFIG_SESSION_KEY_TEMPLATE.format(token=token),
+        str(router_id),
+        ex=WEBFIG_SESSION_TTL_SECONDS,
+    )
+    return build_response(
+        success=True,
+        message="WebFig session created",
+        data=WebfigSessionResponse(
+            session_token=token, expires_in=WEBFIG_SESSION_TTL_SECONDS
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.api_route(
+    "/routers/{router_id}/webfig/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+)
+async def proxy_webfig(
+    request: Request,
+    router_id: uuid.UUID,
+    path: str,
+    session: str | None = Query(default=None),
+    router_service: RouterService = Depends(get_router_service),
+    redis: Redis = Depends(get_redis_client),
+):
+    """Reverse-proxies to this router's own RouterOS WebFig (its official
+    browser-based management GUI -- the same real tool a WinBox user would
+    otherwise need the separate native desktop app for) over the same
+    WireGuard tunnel every other real device operation in this domain
+    already uses -- a browser on an operator's own machine has no route to
+    a router's private tunnel IP directly (see ``RouterService.
+    reveal_credentials``'s own docstring on this exact reachability gap),
+    so this backend, which *is* a WireGuard peer, is the one thing that
+    can actually reach it.
+
+    Deliberately NOT behind ``CurrentUser``/``RequirePermission`` -- an
+    ``<iframe src>`` navigation can't carry a ``Bearer`` header, so this
+    validates the short-lived, router-scoped ``session`` token
+    ``create_webfig_session`` above minted instead (real authorization
+    already happened there).
+
+    ## Cookie fallback -- why the query param alone isn't enough
+
+    The *first* request (the iframe's own ``src``) carries ``?session=...``
+    explicitly, but WebFig's own HTML then requests its JS/CSS/image
+    assets and makes its own AJAX calls using *relative* URLs (e.g.
+    ``script.js``) -- which never inherit the original URL's query string.
+    Every one of those follow-up requests would arrive with no ``session``
+    param and 401 for a reason invisible to anyone watching the iframe
+    just render blank. So: on first successful validation via the query
+    param, this sets a ``wf_session_{router_id}`` cookie scoped to this
+    exact proxy path -- the browser then attaches it automatically to
+    every same-path sub-resource request, session-param or not, which is
+    exactly the "stay authenticated across relative-URL asset loads"
+    behavior a query param alone can't provide.
+
+    Injects HTTP Basic Auth using this router's own stored RouterOS
+    credentials so the operator isn't asked to log into WebFig a second
+    time; if WebFig renders its own login screen anyway (its Basic-Auth
+    support varies by RouterOS version), the same credentials from the
+    Remote Access panel's "Reveal" button work there too."""
+    cookie_name = f"wf_session_{router_id}"
+    token = session or request.cookies.get(cookie_name)
+    if token is None:
+        return Response(status_code=status.HTTP_401_UNAUTHORIZED, content="Missing WebFig session")
+
+    session_key = WEBFIG_SESSION_KEY_TEMPLATE.format(token=token)
+    scoped_router_id = await redis.get(session_key)
+    if scoped_router_id is None or scoped_router_id != str(router_id):
+        return Response(status_code=status.HTTP_401_UNAUTHORIZED, content="Invalid or expired WebFig session")
+
+    router_row = await router_service.get_router(router_id)
+    host = router_row.management_ip_address or router_row.public_ip_address
+    if not host:
+        return Response(status_code=status.HTTP_502_BAD_GATEWAY, content="This router has no reachable management address")
+    password = router_service.get_decrypted_api_secret(router_row)
+
+    upstream_url = f"http://{host}/{path}"
+    body = await request.body()
+    excluded_headers = {"host", "authorization", "cookie", "content-length"}
+    forward_headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded_headers}
+
+    async with httpx.AsyncClient(
+        auth=httpx.BasicAuth(router_row.api_username or "", password or ""),
+        timeout=15.0,
+        follow_redirects=False,
+    ) as client:
+        try:
+            upstream_params = {k: v for k, v in request.query_params.items() if k != "session"}
+            upstream = await client.request(
+                request.method,
+                upstream_url,
+                params=upstream_params,
+                headers=forward_headers,
+                content=body,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "router_webfig_proxy_failed",
+                extra={"router_id": str(router_id), "error": str(exc)},
+            )
+            return Response(status_code=status.HTTP_502_BAD_GATEWAY, content=f"Could not reach the router: {exc}")
+
+    response_headers = {
+        k: v
+        for k, v in upstream.headers.items()
+        if k.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection", "set-cookie"}
+    }
+    proxy_response = Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=response_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
+    if session:
+        proxy_response.set_cookie(
+            cookie_name,
+            token,
+            max_age=WEBFIG_SESSION_TTL_SECONDS,
+            path=f"/api/v1/routers/{router_id}/webfig",
+            httponly=True,
+            samesite="lax",
+        )
+    return proxy_response
 
 
 @router.get(
