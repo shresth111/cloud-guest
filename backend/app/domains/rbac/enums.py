@@ -213,6 +213,13 @@ class AuditAction(StrEnum):
     # ``docs/router/ROUTER_ARCHITECTURE.md`` §6.
     ROUTER_CREATED = "router_created"
     ROUTER_UPDATED = "router_updated"
+    # A platform operator decrypted and viewed this router's stored RouterOS
+    # API/WinBox credentials via Master Console's "Remote Access" panel
+    # (app.domains.router.router's GET /routers/{id}/remote-access) --
+    # audited because unlike every other ROUTER_* action here, this one
+    # doesn't change any state, it exposes a secret, so "who saw this and
+    # when" is the whole point of logging it.
+    ROUTER_CREDENTIALS_REVEALED = "router_credentials_revealed"
     ROUTER_DECOMMISSIONED = "router_decommissioned"
     ROUTER_SUSPENDED = "router_suspended"
     ROUTER_REINSTATED = "router_reinstated"

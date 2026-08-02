@@ -600,6 +600,34 @@ class RouterService:
             return None
         return decrypt_secret(router.api_credentials_encrypted)
 
+    async def reveal_credentials(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> Router:
+        """Operator-facing counterpart to `get_decrypted_api_secret` --
+        that method is an internal building block other services call when
+        THEY need to connect to the router (no audit trail needed, it's not
+        a human viewing a secret). This one is called directly from
+        `router.router`'s `/routers/{id}/remote-access` endpoint, i.e. a
+        human clicking "reveal" in Master Console's Remote Access panel --
+        that's a materially different event worth its own audit entry
+        (`AuditAction.ROUTER_CREDENTIALS_REVEALED`), so it's a separate
+        method rather than the router.py endpoint just calling
+        `get_decrypted_api_secret` directly and skipping the audit."""
+        router = await self.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_CREDENTIALS_REVEALED,
+            router=router,
+            description=f"Remote-access credentials revealed for router '{router.name}'",
+        )
+        return router
+
     # -- internal helpers -------------------------------------------------------
 
     def _validate_transition(self, router: Router, new_status: RouterStatus) -> None:

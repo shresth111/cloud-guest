@@ -568,6 +568,32 @@ class UserService:
         )
         return updated
 
+    async def set_own_data_masking(self, *, user_id: uuid.UUID, masked: bool) -> User:
+        """Flip the caller's own ``data_masking_enabled`` after they've
+        completed OTP step-up verification (see
+        ``app.domains.otp.constants.OtpPurpose.ACCOUNT_DATA_MASKING`` and
+        the ``/users/me/data-masking`` endpoints in ``router.py``, which are
+        the only callers of this method -- the OTP verification *is* the
+        authorization for this one field, deliberately bypassing
+        ``SELF_EDITABLE_FIELDS`` rather than adding ``data_masking_enabled``
+        to that set generally (which would let a user flip it with no
+        verification at all, the exact gap this feature exists to close)."""
+        user = await self._get_user_or_raise(user_id)
+        updated = await self.identity_repository.update_user(
+            user, data_masking_enabled=masked
+        )
+        await self._audit(
+            user_id,
+            AuditAction.USER_UPDATED,
+            entity_id=updated.id,
+            description=(
+                f"User '{updated.email}' {'enabled' if masked else 'disabled'} "
+                "their own guest-data masking after OTP verification"
+            ),
+            organization_id=None,
+        )
+        return updated
+
     async def deactivate_user(
         self,
         *,

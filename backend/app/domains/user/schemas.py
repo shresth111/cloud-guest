@@ -307,3 +307,22 @@ class MeUpdateRequest(BaseModel):
     profile_photo: str | None = Field(default=None, max_length=500)
     timezone: str | None = Field(default=None, max_length=50)
     language: str | None = Field(default=None, max_length=10)
+
+
+class DataMaskingOtpRequestResponse(BaseModel):
+    """Response for ``POST /users/me/data-masking/otp`` -- deliberately
+    carries no OTP identifier/id (the guest-facing ``/otp/request`` response
+    does; this self-service endpoint doesn't need the caller to echo
+    anything back on verify, since their identity comes from their own
+    session, not a client-supplied identifier)."""
+
+    message: str
+
+
+class DataMaskingVerifyRequest(BaseModel):
+    """Body for ``POST /users/me/data-masking`` -- completes the OTP step-up
+    started by the request endpoint and sets the caller's own
+    ``data_masking_enabled`` to ``masked`` in the same call."""
+
+    code: str = Field(min_length=4, max_length=10)
+    masked: bool

@@ -33,17 +33,27 @@ class OtpChannel(StrEnum):
 class OtpPurpose(StrEnum):
     """Why an OTP was requested.
 
-    Deliberately minimal today: only ``GUEST_LOGIN`` is needed by this
-    module's own scope (BE-010 Part 1 -- OTP is self-contained and built
-    before the ``guest`` domain that will consume it for guest login). The
-    enum is designed so a future purpose (e.g. re-verifying an existing
-    guest session, or a step in voucher redemption) can be added as a pure
-    additive member with no migration -- mirrors
-    ``app.domains.rbac.enums.PermissionModule``'s own "additive enum,
-    never renumbered" convention.
+    Originally minimal (``GUEST_LOGIN`` only -- BE-010 Part 1, OTP built
+    before the ``guest`` domain that first consumed it). The enum is
+    designed so a future purpose can be added as a pure additive member
+    with no migration -- mirrors ``app.domains.rbac.enums.PermissionModule``'s
+    own "additive enum, never renumbered" convention.
+
+    ``ACCOUNT_DATA_MASKING`` is the first such addition: a step-up
+    verification an already-authenticated account holder completes against
+    their own email before their dashboard's guest-data masking preference
+    (``app.domains.user.schemas``'s ``data_masking_enabled``) is flipped.
+    Unlike ``GUEST_LOGIN``, both the request and verify calls for this
+    purpose are made from authenticated ``/users/me/...`` endpoints
+    (``app.domains.user.router``) with the identifier taken from the
+    caller's own session, never client-supplied -- see that router's
+    docstring for why reusing the guest-facing, unauthenticated
+    ``/otp/request``/``/otp/verify`` endpoints directly would have let any
+    caller "verify" an OTP for an arbitrary email.
     """
 
     GUEST_LOGIN = "guest_login"
+    ACCOUNT_DATA_MASKING = "account_data_masking"
 
 
 # Redis key template for request-rate-limiting (see

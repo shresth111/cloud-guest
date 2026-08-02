@@ -725,7 +725,7 @@ class OtpService:
             location_id=location_id,
         )
 
-        await self._dispatch(otp_request, code=code, channel=channel)
+        await self._dispatch(otp_request, code=code, channel=channel, purpose=purpose)
 
         event = OtpRequested(
             otp_request_id=otp_request.id,
@@ -739,13 +739,27 @@ class OtpService:
         return otp_request
 
     async def _dispatch(
-        self, otp_request: OtpRequest, *, code: str, channel: OtpChannel
+        self,
+        otp_request: OtpRequest,
+        *,
+        code: str,
+        channel: OtpChannel,
+        purpose: OtpPurpose = OtpPurpose.GUEST_LOGIN,
     ) -> None:
         minutes = max(self.expiry_seconds // 60, 1)
-        message = (
-            f"Your CloudGuest guest WiFi verification code is {code}. "
-            f"It expires in {minutes} minute(s)."
-        )
+        if purpose == OtpPurpose.ACCOUNT_DATA_MASKING:
+            subject = "Your Wyfy Guest data-masking verification code"
+            message = (
+                f"Your Wyfy Guest verification code to change your dashboard's "
+                f"guest-data masking setting is {code}. It expires in "
+                f"{minutes} minute(s). Ignore this if you didn't request it."
+            )
+        else:
+            subject = "Your Wyfy Guest verification code"
+            message = (
+                f"Your Wyfy Guest verification code is {code}. "
+                f"It expires in {minutes} minute(s)."
+            )
         if channel == OtpChannel.SMS:
             await self.sms_provider.send(otp_request.identifier, message)
         elif channel == OtpChannel.WHATSAPP:
@@ -753,11 +767,7 @@ class OtpService:
                 otp_request.identifier, code=code, message=message
             )
         else:
-            await self.email_provider.send(
-                otp_request.identifier,
-                "Your CloudGuest guest WiFi verification code",
-                message,
-            )
+            await self.email_provider.send(otp_request.identifier, subject, message)
 
     # ========================================================================
     # Verify

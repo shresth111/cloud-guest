@@ -26,6 +26,9 @@ from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser, User
+from app.domains.otp.constants import OtpChannel, OtpPurpose
+from app.domains.otp.dependencies import get_otp_service
+from app.domains.otp.service import OtpService
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -34,6 +37,8 @@ from app.domains.rbac.dependencies import (
 
 from .dependencies import get_user_service
 from .schemas import (
+    DataMaskingOtpRequestResponse,
+    DataMaskingVerifyRequest,
     InviteUserRequest,
     InviteUserResponse,
     MeUpdateRequest,
@@ -409,6 +414,105 @@ async def update_my_profile(
     return build_response(
         success=True,
         message="Your profile was updated",
+        data=_user_response(updated).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# Self-service data-masking OTP step-up
+#
+# Deliberately NOT built on top of the guest-facing ``POST /otp/request``/
+# ``POST /otp/verify`` endpoints (``app.domains.otp.router``) despite reusing
+# their service underneath: those two endpoints are intentionally
+# unauthenticated (a guest has no account to authenticate with) and take a
+# client-supplied ``identifier`` -- wiring this dashboard control to them
+# directly would let *any* caller, logged in or not, request/verify an OTP
+# against an arbitrary email under this purpose, since neither endpoint
+# checks that the caller "owns" the identifier they're operating on. Both
+# endpoints below are authenticated (``CurrentUser``) and always derive the
+# identifier from the caller's own account via ``_data_masking_otp_target``
+# (their phone via SMS if one is on file, their email otherwise) -- never
+# client-supplied -- so the OTP genuinely proves "this session belongs to
+# that phone/inbox."
+# ============================================================================
+
+
+def _data_masking_otp_target(user: AuthUser) -> tuple[str, OtpChannel]:
+    """SMS-to-phone when a phone is on file, email otherwise. Both the
+    request and verify endpoints below call this with the same `user`
+    (freshly loaded per-request by `CurrentUser`), so they always agree on
+    which identifier the OTP was filed under -- there's no separate state
+    to track which channel a given code was sent on."""
+    if user.phone:
+        return user.phone, OtpChannel.SMS
+    return user.email, OtpChannel.EMAIL
+
+
+def _mask_identifier(identifier: str, channel: OtpChannel) -> str:
+    """Masked for the response message only (never logged/stored unmasked
+    here beyond what OtpService itself already persists) -- e.g.
+    ``+91••••••210`` or ``ad••••@example.com``."""
+    if channel == OtpChannel.SMS:
+        digits = "".join(c for c in identifier if c.isdigit())
+        return identifier if len(digits) <= 4 else f"+{'•' * (len(digits) - 4)}{digits[-4:]}"
+    at = identifier.find("@")
+    if at <= 1:
+        return identifier
+    return f"{identifier[:2]}{'•' * max(3, at - 2)}{identifier[at:]}"
+
+
+@router.post(
+    "/me/data-masking/otp",
+    response_model=ApiResponse[DataMaskingOtpRequestResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def request_data_masking_otp(
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    otp_service: OtpService = Depends(get_otp_service),
+):
+    identifier, channel = _data_masking_otp_target(user)
+    await otp_service.request_otp(
+        identifier=identifier,
+        channel=channel,
+        purpose=OtpPurpose.ACCOUNT_DATA_MASKING,
+        organization_id=None,
+        location_id=None,
+    )
+    message = f"Verification code sent via {channel.value} to {_mask_identifier(identifier, channel)}"
+    return build_response(
+        success=True,
+        message=message,
+        data=DataMaskingOtpRequestResponse(message=message).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/me/data-masking",
+    response_model=ApiResponse[UserResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def verify_data_masking_otp(
+    request: Request,
+    payload: DataMaskingVerifyRequest,
+    user: AuthUser = Depends(CurrentUser),
+    otp_service: OtpService = Depends(get_otp_service),
+    user_service: UserService = Depends(get_user_service),
+):
+    identifier, _channel = _data_masking_otp_target(user)
+    await otp_service.verify_otp(
+        identifier=identifier,
+        code=payload.code,
+        purpose=OtpPurpose.ACCOUNT_DATA_MASKING,
+    )
+    updated = await user_service.set_own_data_masking(
+        user_id=uuid.UUID(user.id), masked=payload.masked
+    )
+    return build_response(
+        success=True,
+        message="Guest data is now masked" if payload.masked else "Guest data is now shown unmasked",
         data=_user_response(updated).model_dump(),
         request_id=_request_id(request),
     )

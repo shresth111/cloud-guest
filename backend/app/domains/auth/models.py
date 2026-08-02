@@ -332,6 +332,11 @@ class AuthUser:
     is_verified: bool = False
     data_masking_enabled: bool = True
     mfa_enabled: bool = False
+    # Added for app.domains.user.router's "/me/data-masking..." OTP step-up
+    # (SMS is preferred there when a phone is on file) -- free to carry
+    # since get_current_user already loads the full User row before
+    # constructing this, no extra query.
+    phone: str | None = None
 
     @classmethod
     def from_model(cls, user: User) -> AuthUser:
@@ -344,6 +349,7 @@ class AuthUser:
             is_verified=user.is_verified,
             data_masking_enabled=user.data_masking_enabled,
             mfa_enabled=user.mfa_enabled,
+            phone=user.phone,
         )
 
 
