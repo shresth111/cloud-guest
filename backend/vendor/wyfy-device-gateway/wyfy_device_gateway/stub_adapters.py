@@ -14,12 +14,18 @@ from __future__ import annotations
 from .contract import (
     ConnectedDevice,
     DeviceCredentials,
+    DeviceDiscoveryResult,
+    DeviceHealthResult,
     DeviceVendor,
     DhcpPoolConfig,
     InterfaceInfo,
+    PingResult,
     PortForwardConfig,
     ProvisionResult,
+    QueueDeviceStatus,
     RadiusClientConfig,
+    RawCommandResult,
+    TracerouteResult,
     VlanConfig,
     WanHealth,
 )
@@ -83,6 +89,156 @@ class _StubAdapter:
     ) -> None:
         raise self._not_implemented()
 
+    async def ping(
+        self, creds: DeviceCredentials, *, target: str, count: int, timeout_seconds: int
+    ) -> PingResult:
+        raise self._not_implemented()
+
+    async def traceroute(
+        self,
+        creds: DeviceCredentials,
+        *,
+        target: str,
+        max_hops: int,
+        timeout_seconds: int,
+    ) -> TracerouteResult:
+        raise self._not_implemented()
+
+    async def get_dynamic_default_gateway(self, creds: DeviceCredentials) -> str | None:
+        raise self._not_implemented()
+
+    async def get_pppoe_interface_status(
+        self, creds: DeviceCredentials, *, interface_name: str
+    ) -> bool:
+        raise self._not_implemented()
+
+    async def get_interface_traffic_counters(
+        self, creds: DeviceCredentials, *, interface_name: str
+    ) -> tuple[int, int] | None:
+        raise self._not_implemented()
+
+    async def create_simple_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        target: str,
+        download_rate_kbps: int,
+        upload_rate_kbps: int,
+        burst_download_kbps: int | None = None,
+        burst_upload_kbps: int | None = None,
+        burst_threshold_kbps: int | None = None,
+        burst_time_seconds: int | None = None,
+        priority: int = 8,
+    ) -> str:
+        raise self._not_implemented()
+
+    async def update_simple_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        device_queue_id: str,
+        download_rate_kbps: int,
+        upload_rate_kbps: int,
+        burst_download_kbps: int | None = None,
+        burst_upload_kbps: int | None = None,
+        burst_threshold_kbps: int | None = None,
+        burst_time_seconds: int | None = None,
+        priority: int = 8,
+    ) -> None:
+        raise self._not_implemented()
+
+    async def delete_simple_queue(
+        self, creds: DeviceCredentials, *, device_queue_id: str
+    ) -> None:
+        raise self._not_implemented()
+
+    async def create_queue_tree(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        parent: str,
+        packet_mark: str | None,
+        max_limit_kbps: int,
+        priority: int = 8,
+        queue_type_name: str | None = None,
+    ) -> str:
+        raise self._not_implemented()
+
+    async def apply_pcq(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        rate_kbps: int,
+        classifier: str = "dst-address",
+    ) -> str:
+        raise self._not_implemented()
+
+    async def set_priority(
+        self,
+        creds: DeviceCredentials,
+        *,
+        device_queue_id: str,
+        priority: int,
+        queue_kind: str = "simple",
+    ) -> None:
+        raise self._not_implemented()
+
+    async def assign_queue_to_target(
+        self, creds: DeviceCredentials, *, device_queue_id: str, target: str
+    ) -> None:
+        raise self._not_implemented()
+
+    async def remove_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        device_queue_id: str,
+        queue_kind: str = "simple",
+    ) -> None:
+        raise self._not_implemented()
+
+    async def read_queue_status(
+        self,
+        creds: DeviceCredentials,
+        *,
+        device_queue_id: str,
+        queue_kind: str = "simple",
+    ) -> QueueDeviceStatus:
+        raise self._not_implemented()
+
+    async def discover(self, creds: DeviceCredentials) -> DeviceDiscoveryResult:
+        raise self._not_implemented()
+
+    async def push_config(self, creds: DeviceCredentials, *, config_content: str) -> None:
+        raise self._not_implemented()
+
+    async def verify_config(
+        self, creds: DeviceCredentials, *, expected_content: str
+    ) -> bool:
+        raise self._not_implemented()
+
+    async def health_check(self, creds: DeviceCredentials) -> DeviceHealthResult:
+        raise self._not_implemented()
+
+    async def backup(self, creds: DeviceCredentials) -> bytes:
+        raise self._not_implemented()
+
+    async def restore(self, creds: DeviceCredentials, *, backup_content: bytes) -> None:
+        raise self._not_implemented()
+
+    async def upload_file(
+        self, creds: DeviceCredentials, *, filename: str, content: bytes
+    ) -> None:
+        raise self._not_implemented()
+
+    async def execute_raw_command(
+        self, creds: DeviceCredentials, *, command: str
+    ) -> RawCommandResult:
+        raise self._not_implemented()
+
     def capabilities(self) -> dict[str, bool]:
         return {
             "get_interface_list": False,
@@ -95,6 +251,28 @@ class _StubAdapter:
             "configure_port_forward": False,
             "set_radius_client_config": False,
             "disconnect_device": False,
+            "ping": False,
+            "traceroute": False,
+            "get_dynamic_default_gateway": False,
+            "get_pppoe_interface_status": False,
+            "get_interface_traffic_counters": False,
+            "create_simple_queue": False,
+            "update_simple_queue": False,
+            "delete_simple_queue": False,
+            "create_queue_tree": False,
+            "apply_pcq": False,
+            "set_priority": False,
+            "assign_queue_to_target": False,
+            "remove_queue": False,
+            "read_queue_status": False,
+            "discover": False,
+            "push_config": False,
+            "verify_config": False,
+            "health_check": False,
+            "backup": False,
+            "restore": False,
+            "upload_file": False,
+            "execute_raw_command": False,
         }
 
 

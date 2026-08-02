@@ -61,22 +61,31 @@ on top if/when it migrates this call site (e.g. via ``creds.extra``).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import logging
 import re
 
+import asyncssh
 import librouteros
 from librouteros.exceptions import LibRouterosError
 
 from .contract import (
     ConnectedDevice,
     DeviceCredentials,
+    DeviceDiscoveryResult,
+    DeviceHealthResult,
     DeviceVendor,
     DhcpPoolConfig,
     InterfaceInfo,
+    PingResult,
     PortForwardConfig,
     ProvisionResult,
+    QueueDeviceStatus,
     RadiusClientConfig,
+    RawCommandResult,
+    TracerouteHop,
+    TracerouteResult,
     VlanConfig,
     WanHealth,
 )
@@ -85,6 +94,12 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_API_PORT = 8728
 _DEFAULT_SSH_PORT = 22
+# ported from provisioning_engine/device_adapters.py's own module-level
+# filename constants -- push_config/verify_config and backup/restore each
+# round-trip through the *same* filename, so they must stay in sync with
+# each other exactly like the original did.
+_PROVISIONING_ENGINE_CONFIG_FILENAME = "cloudguest-config.rsc"
+_PROVISIONING_ENGINE_BACKUP_FILENAME = "cloudguest-backup.backup"
 _MAC_ADDRESS_PATTERN = re.compile(
     r"^([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})"
     r"[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})$"
@@ -116,6 +131,28 @@ class MikroTikDeviceError(Exception):
         self.host = host
         self.detail = detail
         super().__init__(f"MikroTik device error ({host}): {detail}")
+
+
+class MikroTikConnectionError(MikroTikDeviceError):
+    """Raised specifically when *opening* a connection (RouterOS API or
+    SSH) to a real MikroTik device fails -- as opposed to a command/
+    operation failing after a connection was already successfully
+    established (plain :class:`MikroTikDeviceError`, the base class,
+    still covers both cases for ``except MikroTikDeviceError`` callers
+    that don't need the distinction, e.g. ``router/device_adapters.py``'s
+    single-exception-type domain).
+
+    Several of the source domains this package ports from (``isp``,
+    ``network_diagnostics``, ``connected_devices``, ``queue_management``,
+    ``provisioning_engine``) each define their own real, distinct
+    ``XDeviceConnectionError``/``XDeviceOperationError`` pair -- and at
+    least one of them (``provisioning_engine.device_adapters
+    .MikroTikProvisionAdapter.health_check``) genuinely branches on which
+    one occurred (a connection failure is reported as a graceful
+    ``healthy=False`` result; a post-connection *operation* failure is not
+    caught there at all and propagates as a real exception). Callers that
+    need to preserve that distinction should catch this subclass first,
+    then the base class."""
 
 
 def normalize_mac_address(value: object) -> str | None:
@@ -207,12 +244,57 @@ class MikroTikAdapter:
                 timeout=creds.timeout_seconds,
             )
         except (LibRouterosError, OSError) as exc:
-            raise MikroTikDeviceError(creds.host, str(exc)) from exc
+            raise MikroTikConnectionError(creds.host, str(exc)) from exc
 
     def _ssh_port(self, creds: DeviceCredentials) -> int:
         return _safe_int(creds.extra.get("ssh_port"), default=_DEFAULT_SSH_PORT) or (
             _DEFAULT_SSH_PORT
         )
+
+    def _ssh_connect(self, creds: DeviceCredentials):  # noqa: ANN202
+        """Shared SSH-connect helper for the provisioning-engine methods
+        below (``push_config``/``verify_config``/``backup``/``restore``/
+        ``upload_file``/``execute_raw_command``) -- ported from
+        ``provisioning_engine/device_adapters.py::_ssh_connect``. Distinct
+        from ``provision_device``'s own inline ``asyncssh.connect`` call
+        (that one predates this helper and is left untouched)."""
+        return asyncssh.connect(
+            creds.host,
+            port=self._ssh_port(creds),
+            username=creds.username,
+            password=creds.secret,
+            known_hosts=None,
+            connect_timeout=creds.timeout_seconds,
+        )
+
+    async def _run_ssh_command(self, creds: DeviceCredentials, command: str) -> None:
+        """Ported from
+        ``provisioning_engine/device_adapters.py::_run_ssh_command``."""
+        try:
+            async with self._ssh_connect(creds) as conn:
+                result = await conn.run(command, check=False)
+        except (OSError, asyncssh.Error) as exc:
+            raise MikroTikConnectionError(creds.host, str(exc)) from exc
+        if result.exit_status != 0:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"{command}: {result.stderr or f'exit status {result.exit_status}'}",
+            )
+
+    async def _download_file_via_sftp(
+        self, creds: DeviceCredentials, filename: str
+    ) -> bytes:
+        """Ported from
+        ``provisioning_engine/device_adapters.py::_download_file``."""
+        try:
+            async with (
+                self._ssh_connect(creds) as conn,
+                conn.start_sftp_client() as sftp,
+                sftp.open(filename, "rb") as remote_file,
+            ):
+                return await remote_file.read()
+        except (OSError, asyncssh.Error) as exc:
+            raise MikroTikConnectionError(creds.host, str(exc)) from exc
 
     # ------------------------------------------------------------------
     # discovery / telemetry (read-only)
@@ -463,6 +545,196 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(creds.host, f"disconnect_device: {exc}") from exc
         finally:
             api.close()
+
+    # ------------------------------------------------------------------
+    # diagnostics (shared by network_diagnostics + isp call sites)
+    # ------------------------------------------------------------------
+
+    async def ping(
+        self, creds: DeviceCredentials, *, target: str, count: int, timeout_seconds: int
+    ) -> PingResult:
+        """Ported from ``network_diagnostics/device_adapters.py::_ping_sync``
+        and ``isp/device_adapters.py::_ping_sync`` -- both call sites issue
+        the identical real RouterOS command
+        (``api("/tool/ping", address=target, count=str(count))``) and parse
+        the reply identically. ``timeout_seconds`` is accepted for Protocol
+        parity with both originals but, exactly like both originals, is not
+        itself used inside the ping command -- only ``creds.timeout_seconds``
+        (used when opening the connection) matters, an existing, if slightly
+        odd, real behavior preserved verbatim rather than "fixed" here."""
+        return await asyncio.to_thread(self._ping_sync, creds, target, count)
+
+    def _ping_sync(self, creds: DeviceCredentials, target: str, count: int) -> PingResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = list(api("/tool/ping", address=target, count=str(count)))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"ping failed: {exc}") from exc
+        finally:
+            api.close()
+        sent, received, packet_loss, avg_rtt_ms = _parse_ping_rows(
+            rows, requested_count=count
+        )
+        return PingResult(
+            sent=sent,
+            received=received,
+            packet_loss_percentage=packet_loss,
+            avg_rtt_ms=avg_rtt_ms,
+        )
+
+    async def traceroute(
+        self,
+        creds: DeviceCredentials,
+        *,
+        target: str,
+        max_hops: int,
+        timeout_seconds: int,
+    ) -> TracerouteResult:
+        """Ported from
+        ``network_diagnostics/device_adapters.py::_traceroute_sync`` --
+        RouterOS's own ``/tool/traceroute`` streams one reply row per
+        completed probe, updating a given hop's cumulative stats across
+        several rows before moving to the next hop.
+        :func:`_parse_traceroute_rows` collapses consecutive same-
+        ``address`` rows into one hop each, numbering hops by position in
+        the reply stream."""
+        return await asyncio.to_thread(
+            self._traceroute_sync, creds, target, max_hops
+        )
+
+    def _traceroute_sync(
+        self, creds: DeviceCredentials, target: str, max_hops: int
+    ) -> TracerouteResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = list(
+                    api(
+                        "/tool/traceroute",
+                        address=target,
+                        **{"max-hops": str(max_hops)},
+                    )
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"traceroute failed: {exc}") from exc
+        finally:
+            api.close()
+        return TracerouteResult(hops=_parse_traceroute_rows(rows))
+
+    # ------------------------------------------------------------------
+    # isp-specific WAN link telemetry
+    # ------------------------------------------------------------------
+
+    async def get_dynamic_default_gateway(self, creds: DeviceCredentials) -> str | None:
+        """Ported from
+        ``isp/device_adapters.py::_get_dynamic_default_gateway_sync`` --
+        reads ``/ip/route`` and returns the ``gateway`` field of whichever
+        row has ``dst-address == "0.0.0.0/0"`` and ``dynamic == "true"``.
+        Deliberately never filtered by interface name (see that module's
+        own docstring)."""
+        return await asyncio.to_thread(self._get_dynamic_default_gateway_sync, creds)
+
+    def _get_dynamic_default_gateway_sync(self, creds: DeviceCredentials) -> str | None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = list(api.path("ip", "route"))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_dynamic_default_route: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        for row in rows:
+            if (
+                row.get("dst-address") == "0.0.0.0/0"
+                and str(row.get("dynamic", "false")).lower() == "true"
+            ):
+                gateway = row.get("gateway")
+                return str(gateway) if gateway else None
+        return None
+
+    async def get_pppoe_interface_status(
+        self, creds: DeviceCredentials, *, interface_name: str
+    ) -> bool:
+        """Ported from
+        ``isp/device_adapters.py::_get_pppoe_interface_status_sync`` --
+        reads ``/interface/pppoe-client`` and reports whether the named
+        interface is up (``running`` and not ``disabled``). An exact-name
+        miss falls back to the router's own single PPPoE interface when
+        there is exactly one; genuine ambiguity (zero or multiple
+        candidates with no exact match) raises
+        :class:`MikroTikDeviceError` rather than guessing -- exactly the
+        original's behavior."""
+        return await asyncio.to_thread(
+            self._get_pppoe_interface_status_sync, creds, interface_name
+        )
+
+    def _get_pppoe_interface_status_sync(
+        self, creds: DeviceCredentials, interface_name: str
+    ) -> bool:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = list(api.path("interface", "pppoe-client"))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_pppoe_interface_status: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        row = next((r for r in rows if r.get("name") == interface_name), None)
+        if row is None and len(rows) == 1:
+            logger.warning(
+                "mikrotik_pppoe_interface_name_mismatch_fallback",
+                extra={
+                    "requested_interface": interface_name,
+                    "actual_interface": rows[0].get("name"),
+                },
+            )
+            row = rows[0]
+        if row is None:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"read_pppoe_interface_status: no PPPoE client interface named "
+                f"'{interface_name}' found (and {len(rows)} candidates exist, "
+                f"too ambiguous to guess)",
+            )
+        running = str(row.get("running", "false")).lower() == "true"
+        disabled = str(row.get("disabled", "false")).lower() == "true"
+        return running and not disabled
+
+    async def get_interface_traffic_counters(
+        self, creds: DeviceCredentials, *, interface_name: str
+    ) -> tuple[int, int] | None:
+        """Ported from
+        ``isp/device_adapters.py::_get_interface_traffic_counters_sync`` --
+        reads ``/interface``'s own ``rx-byte``/``tx-byte`` fields for the
+        named interface."""
+        return await asyncio.to_thread(
+            self._get_interface_traffic_counters_sync, creds, interface_name
+        )
+
+    def _get_interface_traffic_counters_sync(
+        self, creds: DeviceCredentials, interface_name: str
+    ) -> tuple[int, int] | None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = list(api.path("interface"))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_interface_traffic_counters: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        row = next((r for r in rows if r.get("name") == interface_name), None)
+        if row is None:
+            return None
+        rx_bytes = _safe_int(row.get("rx-byte"), default=0)
+        tx_bytes = _safe_int(row.get("tx-byte"), default=0)
+        return rx_bytes, tx_bytes
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -717,6 +989,423 @@ class MikroTikAdapter:
             api.close()
 
     # ------------------------------------------------------------------
+    # queue management (QoS/bandwidth shaping)
+    # ------------------------------------------------------------------
+    #
+    # Ported from ``queue_management/device_adapters.py``. Every queue
+    # operation is a native RouterOS API command (add/set/remove/print
+    # over ``Path``) -- no SSH transport needed. RouterOS field names
+    # containing a hyphen (``max-limit``, ``burst-limit``, ...) are passed
+    # via ``**{"max-limit": ...}`` since they are not valid Python
+    # keyword-argument identifiers -- identical to the original.
+
+    def _queue_add_sync(
+        self,
+        creds: DeviceCredentials,
+        path_segments: tuple[str, ...],
+        fields: dict[str, str],
+        operation: str,
+    ) -> str:
+        api = self._connect_api(creds)
+        try:
+            try:
+                return api.path(*path_segments).add(**fields)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"{operation}: {exc}") from exc
+        finally:
+            api.close()
+
+    def _queue_update_sync(
+        self,
+        creds: DeviceCredentials,
+        path_segments: tuple[str, ...],
+        fields: dict[str, str],
+        operation: str,
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                api.path(*path_segments).update(**fields)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"{operation}: {exc}") from exc
+        finally:
+            api.close()
+
+    def _queue_remove_sync(
+        self,
+        creds: DeviceCredentials,
+        path_segments: tuple[str, ...],
+        device_queue_id: str,
+        operation: str,
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                api.path(*path_segments).remove(device_queue_id)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"{operation}: {exc}") from exc
+        finally:
+            api.close()
+
+    async def create_simple_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        target: str,
+        download_rate_kbps: int,
+        upload_rate_kbps: int,
+        burst_download_kbps: int | None = None,
+        burst_upload_kbps: int | None = None,
+        burst_threshold_kbps: int | None = None,
+        burst_time_seconds: int | None = None,
+        priority: int = 8,
+    ) -> str:
+        fields = {
+            "name": name,
+            "target": target,
+            **_max_limit_field(upload_rate_kbps, download_rate_kbps),
+            **_burst_fields(
+                burst_upload_kbps,
+                burst_download_kbps,
+                burst_threshold_kbps,
+                burst_time_seconds,
+            ),
+            "priority": str(priority),
+        }
+        return await asyncio.to_thread(
+            self._queue_add_sync,
+            creds,
+            ("queue", "simple"),
+            fields,
+            "create_simple_queue",
+        )
+
+    async def update_simple_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        device_queue_id: str,
+        download_rate_kbps: int,
+        upload_rate_kbps: int,
+        burst_download_kbps: int | None = None,
+        burst_upload_kbps: int | None = None,
+        burst_threshold_kbps: int | None = None,
+        burst_time_seconds: int | None = None,
+        priority: int = 8,
+    ) -> None:
+        fields = {
+            ".id": device_queue_id,
+            **_max_limit_field(upload_rate_kbps, download_rate_kbps),
+            **_burst_fields(
+                burst_upload_kbps,
+                burst_download_kbps,
+                burst_threshold_kbps,
+                burst_time_seconds,
+            ),
+            "priority": str(priority),
+        }
+        await asyncio.to_thread(
+            self._queue_update_sync,
+            creds,
+            ("queue", "simple"),
+            fields,
+            "update_simple_queue",
+        )
+
+    async def delete_simple_queue(
+        self, creds: DeviceCredentials, *, device_queue_id: str
+    ) -> None:
+        await asyncio.to_thread(
+            self._queue_remove_sync,
+            creds,
+            ("queue", "simple"),
+            device_queue_id,
+            "delete_simple_queue",
+        )
+
+    async def create_queue_tree(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        parent: str,
+        packet_mark: str | None,
+        max_limit_kbps: int,
+        priority: int = 8,
+        queue_type_name: str | None = None,
+    ) -> str:
+        fields: dict[str, str] = {
+            "name": name,
+            "parent": parent,
+            "max-limit": f"{max_limit_kbps}k",
+            "priority": str(priority),
+        }
+        if packet_mark is not None:
+            fields["packet-mark"] = packet_mark
+        if queue_type_name is not None:
+            fields["queue"] = queue_type_name
+        return await asyncio.to_thread(
+            self._queue_add_sync, creds, ("queue", "tree"), fields, "create_queue_tree"
+        )
+
+    async def apply_pcq(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        rate_kbps: int,
+        classifier: str = "dst-address",
+    ) -> str:
+        fields = {
+            "name": name,
+            "kind": "pcq",
+            "pcq-rate": f"{rate_kbps}k",
+            "pcq-classifier": classifier,
+        }
+        return await asyncio.to_thread(
+            self._queue_add_sync, creds, ("queue", "type"), fields, "apply_pcq"
+        )
+
+    async def set_priority(
+        self,
+        creds: DeviceCredentials,
+        *,
+        device_queue_id: str,
+        priority: int,
+        queue_kind: str = "simple",
+    ) -> None:
+        fields = {".id": device_queue_id, "priority": str(priority)}
+        await asyncio.to_thread(
+            self._queue_update_sync,
+            creds,
+            ("queue", queue_kind),
+            fields,
+            "set_priority",
+        )
+
+    async def assign_queue_to_target(
+        self, creds: DeviceCredentials, *, device_queue_id: str, target: str
+    ) -> None:
+        fields = {".id": device_queue_id, "target": target}
+        await asyncio.to_thread(
+            self._queue_update_sync,
+            creds,
+            ("queue", "simple"),
+            fields,
+            "assign_queue_to_target",
+        )
+
+    async def remove_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        device_queue_id: str,
+        queue_kind: str = "simple",
+    ) -> None:
+        await asyncio.to_thread(
+            self._queue_remove_sync,
+            creds,
+            ("queue", queue_kind),
+            device_queue_id,
+            "remove_queue",
+        )
+
+    async def read_queue_status(
+        self,
+        creds: DeviceCredentials,
+        *,
+        device_queue_id: str,
+        queue_kind: str = "simple",
+    ) -> QueueDeviceStatus:
+        return await asyncio.to_thread(
+            self._read_queue_status_sync, creds, queue_kind, device_queue_id
+        )
+
+    def _read_queue_status_sync(
+        self, creds: DeviceCredentials, queue_kind: str, device_queue_id: str
+    ) -> QueueDeviceStatus:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = list(api.path("queue", queue_kind))
+                row = next((r for r in rows if r.get(".id") == device_queue_id), {})
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_queue_status: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return QueueDeviceStatus(
+            device_queue_id=device_queue_id,
+            name=row.get("name"),
+            target=row.get("target"),
+            disabled=str(row.get("disabled", "false")).lower() == "true",
+            bytes_uploaded=_split_pair_int(row.get("bytes"), 0),
+            bytes_downloaded=_split_pair_int(row.get("bytes"), 1),
+            packets_uploaded=_split_pair_int(row.get("packets"), 0),
+            packets_downloaded=_split_pair_int(row.get("packets"), 1),
+            queued_bytes=_split_pair_int(row.get("queued-bytes"), 0),
+        )
+
+    # ------------------------------------------------------------------
+    # provisioning engine (discover/push/verify/health/backup/restore)
+    # ------------------------------------------------------------------
+    #
+    # Ported from ``provisioning_engine/device_adapters.py``. Uses both
+    # ``librouteros`` (structured discovery/health-check commands) and
+    # ``asyncssh`` (file transfer + `/import`/`/system/backup/*` console
+    # commands) -- see that module's own "why both librouteros AND
+    # asyncssh" docstring, mirrored by this package's own module
+    # docstring. Distinct from ``provision_device`` above (a different,
+    # earlier-ported, more generic operation with its own filename) --
+    # see ``_ssh_connect``'s own docstring for why these don't share code
+    # with ``provision_device``.
+
+    async def discover(self, creds: DeviceCredentials) -> DeviceDiscoveryResult:
+        resource, routerboard, interfaces = await asyncio.to_thread(
+            self._discover_sync, creds
+        )
+        return DeviceDiscoveryResult(
+            vendor=self.vendor,
+            model=routerboard.get("model"),
+            serial_number=routerboard.get("serial-number"),
+            firmware_version=resource.get("version"),
+            cpu_load_percent=_as_float(resource.get("cpu-load")),
+            free_memory_bytes=_as_int(resource.get("free-memory")),
+            total_memory_bytes=_as_int(resource.get("total-memory")),
+            uptime_seconds=_parse_routeros_uptime(resource.get("uptime")),
+            interfaces=[i.get("name", "") for i in interfaces if i.get("name")],
+            mac_address=interfaces[0].get("mac-address") if interfaces else None,
+        )
+
+    def _discover_sync(
+        self, creds: DeviceCredentials
+    ) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]]]:
+        api = self._connect_api(creds)
+        try:
+            try:
+                resource = next(iter(api("/system/resource/print")), {})
+                routerboard = next(iter(api("/system/routerboard/print")), {})
+                interfaces = list(api("/interface/print"))
+                return resource, routerboard, interfaces
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"discover: {exc}") from exc
+        finally:
+            api.close()
+
+    async def push_config(self, creds: DeviceCredentials, *, config_content: str) -> None:
+        await self.upload_file(
+            creds,
+            filename=_PROVISIONING_ENGINE_CONFIG_FILENAME,
+            content=config_content.encode("utf-8"),
+        )
+        await self._run_ssh_command(
+            creds, f'/import file-name="{_PROVISIONING_ENGINE_CONFIG_FILENAME}"'
+        )
+
+    async def verify_config(
+        self, creds: DeviceCredentials, *, expected_content: str
+    ) -> bool:
+        """Reads the config file back via SFTP and compares its SHA-256
+        against ``expected_content`` -- ported from
+        ``provisioning_engine/device_adapters.py::verify_config``."""
+        uploaded = await self._download_file_via_sftp(
+            creds, _PROVISIONING_ENGINE_CONFIG_FILENAME
+        )
+        expected_digest = hashlib.sha256(expected_content.encode("utf-8")).hexdigest()
+        actual_digest = hashlib.sha256(uploaded).hexdigest()
+        return expected_digest == actual_digest
+
+    async def health_check(self, creds: DeviceCredentials) -> DeviceHealthResult:
+        """Ported from
+        ``provisioning_engine/device_adapters.py::health_check`` --
+        **only** a connection failure is caught and reported as a graceful
+        ``healthy=False`` result; a post-connection command failure
+        (:class:`MikroTikDeviceError`, not the
+        :class:`MikroTikConnectionError` subclass) is deliberately not
+        caught here and propagates, exactly like the original."""
+        try:
+            resource = await asyncio.to_thread(self._health_check_sync, creds)
+        except MikroTikConnectionError as exc:
+            return DeviceHealthResult(
+                healthy=False,
+                cpu_load_percent=None,
+                free_memory_bytes=None,
+                uptime_seconds=None,
+                detail=str(exc),
+            )
+        return DeviceHealthResult(
+            healthy=True,
+            cpu_load_percent=_as_float(resource.get("cpu-load")),
+            free_memory_bytes=_as_int(resource.get("free-memory")),
+            uptime_seconds=_parse_routeros_uptime(resource.get("uptime")),
+        )
+
+    def _health_check_sync(self, creds: DeviceCredentials) -> dict[str, object]:
+        api = self._connect_api(creds)
+        try:
+            try:
+                return next(iter(api("/system/resource/print")), {})
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"health_check: {exc}") from exc
+        finally:
+            api.close()
+
+    async def backup(self, creds: DeviceCredentials) -> bytes:
+        await self._run_ssh_command(
+            creds, f'/system/backup/save name="{_PROVISIONING_ENGINE_BACKUP_FILENAME}"'
+        )
+        return await self._download_file_via_sftp(
+            creds, _PROVISIONING_ENGINE_BACKUP_FILENAME
+        )
+
+    async def restore(self, creds: DeviceCredentials, *, backup_content: bytes) -> None:
+        await self.upload_file(
+            creds,
+            filename=_PROVISIONING_ENGINE_BACKUP_FILENAME,
+            content=backup_content,
+        )
+        await self._run_ssh_command(
+            creds, f'/system/backup/load name="{_PROVISIONING_ENGINE_BACKUP_FILENAME}"'
+        )
+
+    async def upload_file(
+        self, creds: DeviceCredentials, *, filename: str, content: bytes
+    ) -> None:
+        try:
+            async with (
+                self._ssh_connect(creds) as conn,
+                conn.start_sftp_client() as sftp,
+                sftp.open(filename, "wb") as remote_file,
+            ):
+                await remote_file.write(content)
+        except (OSError, asyncssh.Error) as exc:
+            raise MikroTikConnectionError(creds.host, str(exc)) from exc
+
+    async def execute_raw_command(
+        self, creds: DeviceCredentials, *, command: str
+    ) -> RawCommandResult:
+        """Ported from
+        ``provisioning_engine/device_adapters.py::execute_raw_command`` --
+        runs exactly ``command`` over the device's real SSH console
+        connection with no interpretation, whitelisting, or retry. Unlike
+        every other method here, a non-zero ``exit_status`` is not raised
+        as an exception (see :class:`~.contract.RawCommandResult`'s own
+        docstring)."""
+        try:
+            async with self._ssh_connect(creds) as conn:
+                result = await conn.run(command, check=False)
+        except (OSError, asyncssh.Error) as exc:
+            raise MikroTikConnectionError(creds.host, str(exc)) from exc
+        return RawCommandResult(
+            command=command,
+            stdout=str(result.stdout or ""),
+            stderr=str(result.stderr or ""),
+            exit_status=result.exit_status if result.exit_status is not None else -1,
+        )
+
+    # ------------------------------------------------------------------
     # capability introspection
     # ------------------------------------------------------------------
 
@@ -732,6 +1421,28 @@ class MikroTikAdapter:
             "configure_port_forward": True,
             "set_radius_client_config": True,
             "disconnect_device": True,
+            "ping": True,
+            "traceroute": True,
+            "get_dynamic_default_gateway": True,
+            "get_pppoe_interface_status": True,
+            "get_interface_traffic_counters": True,
+            "create_simple_queue": True,
+            "update_simple_queue": True,
+            "delete_simple_queue": True,
+            "create_queue_tree": True,
+            "apply_pcq": True,
+            "set_priority": True,
+            "assign_queue_to_target": True,
+            "remove_queue": True,
+            "read_queue_status": True,
+            "discover": True,
+            "push_config": True,
+            "verify_config": True,
+            "health_check": True,
+            "backup": True,
+            "restore": True,
+            "upload_file": True,
+            "execute_raw_command": True,
         }
 
 
@@ -756,6 +1467,131 @@ def _parse_ping_rows(
         packet_loss = 100.0 * (1 - received / sent) if sent else 100.0
     avg_rtt_ms = _parse_routeros_duration_ms(last.get("avg-rtt"))
     return sent, received, packet_loss, avg_rtt_ms
+
+
+def _parse_traceroute_rows(rows: list[dict[str, object]]) -> list[TracerouteHop]:
+    """Ported verbatim from
+    ``network_diagnostics/device_adapters.py::_parse_traceroute_rows`` --
+    collapses consecutive same-``address`` reply rows into one final
+    :class:`TracerouteHop` each, numbering hops by position in the reply
+    stream (RouterOS's own traceroute does not number hops as an explicit
+    reply field)."""
+    hops: list[TracerouteHop] = []
+    current_address: object = object()  # sentinel matching no real address
+    for row in rows:
+        address = row.get("address") or None
+        if address != current_address or not hops:
+            hops.append(_build_hop(len(hops) + 1, row))
+            current_address = address
+        else:
+            hops[-1] = _build_hop(hops[-1].hop_number, row)
+    return hops
+
+
+def _build_hop(hop_number: int, row: dict[str, object]) -> TracerouteHop:
+    address = row.get("address")
+    loss_default = 100.0 if not address else 0.0
+    return TracerouteHop(
+        hop_number=hop_number,
+        address=str(address) if address else None,
+        packet_loss_percentage=_safe_float(row.get("loss"), default=loss_default)
+        or loss_default,
+        avg_rtt_ms=_parse_routeros_duration_ms(row.get("avg")),
+    )
+
+
+def _max_limit_field(upload_rate_kbps: int, download_rate_kbps: int) -> dict[str, str]:
+    """Ported verbatim from
+    ``queue_management/device_adapters.py::_max_limit_field``."""
+    return {"max-limit": f"{upload_rate_kbps}k/{download_rate_kbps}k"}
+
+
+def _burst_fields(
+    burst_upload_kbps: int | None,
+    burst_download_kbps: int | None,
+    burst_threshold_kbps: int | None,
+    burst_time_seconds: int | None,
+) -> dict[str, str]:
+    """Ported verbatim from
+    ``queue_management/device_adapters.py::_burst_fields`` -- RouterOS
+    only accepts burst-limit/burst-threshold/burst-time as a trio; if
+    neither burst rate value is set, no burst fields are emitted at all."""
+    if burst_upload_kbps is None and burst_download_kbps is None:
+        return {}
+    fields = {
+        "burst-limit": f"{burst_upload_kbps or 0}k/{burst_download_kbps or 0}k",
+    }
+    if burst_threshold_kbps is not None:
+        fields["burst-threshold"] = f"{burst_threshold_kbps}k/{burst_threshold_kbps}k"
+    if burst_time_seconds is not None:
+        fields["burst-time"] = f"{burst_time_seconds}/{burst_time_seconds}"
+    return fields
+
+
+def _split_pair_int(value: object, index: int) -> int | None:
+    """Ported verbatim from
+    ``queue_management/device_adapters.py::_split_pair_int`` -- RouterOS
+    reports several counters (``bytes``, ``packets``, ``queued-bytes``) as
+    an ``"upload/download"``-style pair string."""
+    if not value:
+        return None
+    parts = str(value).split("/")
+    if len(parts) <= index:
+        return None
+    try:
+        return int(parts[index])
+    except ValueError:
+        return None
+
+
+def _as_float(value: object) -> float | None:
+    """Ported verbatim from
+    ``provisioning_engine/device_adapters.py::_as_float`` -- strips a
+    trailing ``%`` (RouterOS's own ``cpu-load`` reply shape), unlike
+    :func:`_safe_float` above (which has no such stripping and is used by
+    the isp/network_diagnostics ping/duration parsing this module also
+    ports)."""
+    if value is None:
+        return None
+    try:
+        return float(str(value).rstrip("%"))
+    except ValueError:
+        return None
+
+
+def _as_int(value: object) -> int | None:
+    """Ported verbatim from
+    ``provisioning_engine/device_adapters.py::_as_int``."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_routeros_uptime(value: object) -> int | None:
+    """Ported verbatim from
+    ``provisioning_engine/device_adapters.py::_parse_routeros_uptime`` --
+    RouterOS reports uptime as e.g. ``"3w2d4h5m6s"``, not a raw number of
+    seconds (distinct format/parser from
+    :func:`_parse_routeros_duration_ms` above, which parses a different
+    real RouterOS string shape used by ping/traceroute reply fields)."""
+    if not value:
+        return None
+    text = str(value)
+    units = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}
+    total_seconds = 0
+    number = ""
+    for char in text:
+        if char.isdigit():
+            number += char
+        elif char in units and number:
+            total_seconds += int(number) * units[char]
+            number = ""
+        else:
+            return None
+    return total_seconds
 
 
 def _row_mac(row: dict[str, object]) -> str | None:
@@ -846,4 +1682,9 @@ def _merge_connected_devices(
     return list(merged.values())
 
 
-__all__ = ["MikroTikAdapter", "MikroTikDeviceError", "normalize_mac_address"]
+__all__ = [
+    "MikroTikAdapter",
+    "MikroTikDeviceError",
+    "MikroTikConnectionError",
+    "normalize_mac_address",
+]

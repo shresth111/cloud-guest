@@ -43,18 +43,42 @@ rows into one :class:`TracerouteHop` each, assigning hop numbers by
 position in the reply stream (RouterOS's own traceroute does not number
 hops as an explicit reply field) -- a defensible, honestly-described
 interpretation of the real reply stream shape, not a fabricated one.
+
+## Now delegates to wyfy-device-gateway
+
+Per the ``wyfy-device-gateway`` PRD (section 7, Step 3, item 1),
+``MikroTikDiagnosticsAdapter.ping``/``traceroute`` now call
+``wyfy_device_gateway.registry.get_adapter(DeviceVendor.MIKROTIK)``'s
+``ping``/``traceroute`` instead of opening ``librouteros`` directly --
+that package is a straight port of this module's own
+``_ping_sync``/``_traceroute_sync`` logic (same RouterOS commands, same
+reply-parsing rules). The module-level parsing helpers below
+(``_parse_ping_rows``, ``_parse_traceroute_rows``, ``_build_hop``,
+``_parse_routeros_duration_ms``, ``_safe_int``, ``_safe_float``) are kept
+even though the adapter class no longer calls them internally -- this
+domain's own tests import and exercise them directly as pure functions,
+and they remain the honest, single source of truth for "what a
+``/tool/ping``/``/tool/traceroute`` reply means" independent of which
+transport parses it. The gateway's own connection-vs-operation exception
+distinction (``MikroTikConnectionError`` vs. the plain
+``MikroTikDeviceError`` base) is translated back into this domain's own
+``DiagnosticsDeviceConnectionError``/``DiagnosticsDeviceOperationError``
+pair so ``service.py``'s existing except clauses need no changes.
+``ping``/``traceroute``'s own public signatures and return shapes are
+unchanged.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
-import librouteros
-from librouteros.exceptions import LibRouterosError
+from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
+from wyfy_device_gateway.contract import DeviceVendor
+from wyfy_device_gateway.mikrotik_adapter import MikroTikConnectionError, MikroTikDeviceError
+from wyfy_device_gateway.registry import get_adapter
 
 from .exceptions import (
     DiagnosticsDeviceConnectionError,
@@ -157,10 +181,22 @@ class BaseDiagnosticsAdapter(Protocol):
 
 
 class MikroTikDiagnosticsAdapter:
-    """See module docstring for the full "real client code, untested
-    end-to-end here" write-up."""
+    """See module docstring for the "now delegates to wyfy-device-gateway"
+    write-up."""
 
     vendor = "mikrotik"
+
+    def _gateway_credentials(
+        self, credentials: DiagnosticsCredentials
+    ) -> _GatewayDeviceCredentials:
+        return _GatewayDeviceCredentials(
+            vendor=DeviceVendor.MIKROTIK,
+            host=credentials.host,
+            username=credentials.username,
+            secret=credentials.password,
+            port=credentials.api_port,
+            timeout_seconds=credentials.timeout_seconds,
+        )
 
     async def ping(
         self,
@@ -170,8 +206,20 @@ class MikroTikDiagnosticsAdapter:
         count: int,
         timeout_seconds: int,
     ) -> PingResult:
-        return await asyncio.to_thread(
-            self._ping_sync, credentials, target, count, timeout_seconds
+        creds = self._gateway_credentials(credentials)
+        try:
+            result = await get_adapter(DeviceVendor.MIKROTIK).ping(
+                creds, target=target, count=count, timeout_seconds=timeout_seconds
+            )
+        except MikroTikConnectionError as exc:
+            raise DiagnosticsDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DiagnosticsDeviceOperationError("ping", exc.detail) from exc
+        return PingResult(
+            sent=result.sent,
+            received=result.received,
+            packet_loss_percentage=result.packet_loss_percentage,
+            avg_rtt_ms=result.avg_rtt_ms,
         )
 
     async def traceroute(
@@ -182,59 +230,26 @@ class MikroTikDiagnosticsAdapter:
         max_hops: int,
         timeout_seconds: int,
     ) -> TracerouteResult:
-        return await asyncio.to_thread(
-            self._traceroute_sync, credentials, target, max_hops, timeout_seconds
-        )
-
-    def _connect_api(self, credentials: DiagnosticsCredentials):  # noqa: ANN202
+        creds = self._gateway_credentials(credentials)
         try:
-            return librouteros.connect(
-                host=credentials.host,
-                username=credentials.username,
-                password=credentials.password,
-                port=credentials.api_port,
-                timeout=credentials.timeout_seconds,
+            result = await get_adapter(DeviceVendor.MIKROTIK).traceroute(
+                creds, target=target, max_hops=max_hops, timeout_seconds=timeout_seconds
             )
-        except (LibRouterosError, OSError) as exc:
-            raise DiagnosticsDeviceConnectionError(credentials.host, str(exc)) from exc
-
-    def _ping_sync(
-        self,
-        credentials: DiagnosticsCredentials,
-        target: str,
-        count: int,
-        timeout_seconds: int,
-    ) -> PingResult:
-        api = self._connect_api(credentials)
-        try:
-            rows = list(api("/tool/ping", address=target, count=str(count)))
-        except LibRouterosError as exc:
-            raise DiagnosticsDeviceOperationError("ping", str(exc)) from exc
-        finally:
-            api.close()
-        return _parse_ping_rows(rows, requested_count=count)
-
-    def _traceroute_sync(
-        self,
-        credentials: DiagnosticsCredentials,
-        target: str,
-        max_hops: int,
-        timeout_seconds: int,
-    ) -> TracerouteResult:
-        api = self._connect_api(credentials)
-        try:
-            rows = list(
-                api(
-                    "/tool/traceroute",
-                    address=target,
-                    **{"max-hops": str(max_hops)},
+        except MikroTikConnectionError as exc:
+            raise DiagnosticsDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DiagnosticsDeviceOperationError("traceroute", exc.detail) from exc
+        return TracerouteResult(
+            hops=[
+                TracerouteHop(
+                    hop_number=h.hop_number,
+                    address=h.address,
+                    packet_loss_percentage=h.packet_loss_percentage,
+                    avg_rtt_ms=h.avg_rtt_ms,
                 )
-            )
-        except LibRouterosError as exc:
-            raise DiagnosticsDeviceOperationError("traceroute", str(exc)) from exc
-        finally:
-            api.close()
-        return TracerouteResult(hops=_parse_traceroute_rows(rows))
+                for h in result.hops
+            ]
+        )
 
 
 def _parse_ping_rows(
