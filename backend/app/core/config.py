@@ -23,6 +23,7 @@ class Settings(BaseSettings):
             "https://wyfyguest.com",
             "https://www.wyfyguest.com",
             "https://app.wyfyguest.com",
+            "https://portal.wyfyguest.com",
         ]
     )
 
