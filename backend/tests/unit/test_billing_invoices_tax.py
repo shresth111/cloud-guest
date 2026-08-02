@@ -44,6 +44,7 @@ from app.domains.billing.exceptions import (
     InvalidInvoiceStatusTransitionError,
     InvalidNoteAmountError,
     InvoiceNotFoundError,
+    SubscriptionNotFoundError,
 )
 from app.domains.billing.invoice_pdf import SellerInfo, render_invoice_pdf
 from app.domains.billing.models import (
@@ -59,6 +60,7 @@ from app.domains.billing.models import (
 from app.domains.billing.number_generator import generate_invoice_number
 from app.domains.billing.service import InvoiceService
 from app.domains.billing.validators import compute_tax_breakdown
+from app.domains.rbac.enums import AuditAction
 
 # ============================================================================
 # Shared helpers (mirrors test_billing_payments_webhooks.py's own identical
@@ -143,6 +145,14 @@ class FakeSubscriptionRepository:
         self, subscription_id: uuid.UUID, *, include_deleted: bool = False
     ) -> Subscription | None:
         return self.subscriptions.get(subscription_id)
+
+    async def get_by_organization_id(
+        self, organization_id: uuid.UUID
+    ) -> Subscription | None:
+        for subscription in self.subscriptions.values():
+            if subscription.organization_id == organization_id:
+                return subscription
+        return None
 
     async def update_subscription(
         self, subscription: Subscription, data: dict[str, object]
@@ -290,6 +300,14 @@ class FakeInvoiceRepository:
         return [i for i in self.items.values() if i.invoice_id == invoice_id]
 
 
+@dataclass
+class FakeAuditWriter:
+    entries: list[dict[str, object]] = field(default_factory=list)
+
+    async def create_audit_log_entry(self, **fields: object) -> None:
+        self.entries.append(fields)
+
+
 def _make_invoice_service(
     *,
     invoice_repository: FakeInvoiceRepository | None = None,
@@ -301,6 +319,7 @@ def _make_invoice_service(
     note_repository: FakeCreditDebitNoteRepository | None = None,
     platform_gst_state: str = "Maharashtra",
     platform_gst_country: str = "IN",
+    audit_writer: FakeAuditWriter | None = None,
 ) -> tuple[
     InvoiceService,
     FakeInvoiceRepository,
@@ -332,6 +351,7 @@ def _make_invoice_service(
         platform_gst_state=platform_gst_state,
         platform_gst_country=platform_gst_country,
         invoice_due_days=15,
+        audit_writer=audit_writer,
     )
     return (
         service,
@@ -1131,3 +1151,167 @@ class TestTenantIsolation:
         assert len(items) == 1
         assert items[0].organization_id == org_a
         assert meta.total_items == 1
+
+
+# ============================================================================
+# Manual "generate & send" support (``POST /invoices/generate-and-send``):
+# subscription resolution and the email-dispatch-outcome audit record. The
+# PDF-render + email-provider-selection + actual send composition itself
+# lives in ``app.domains.billing.router.generate_and_send_invoice`` (a thin
+# router-level composition of already-tested pieces: this module's own
+# ``render_invoice_pdf`` tests above, and ``app.domains.otp.service``'s own
+# ``EmailProviderProtocol`` implementations) -- not re-tested here.
+# ============================================================================
+
+
+class TestResolveSubscriptionForOrganization:
+    async def test_explicit_subscription_id_for_the_right_organization(self) -> None:
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            _billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service()
+        organization_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository, plan_repository, organization_id=organization_id
+        )
+
+        resolved = await service.resolve_subscription_for_organization(
+            organization_id, subscription.id
+        )
+        assert resolved == subscription.id
+
+    async def test_explicit_subscription_id_for_a_different_organization_raises(
+        self,
+    ) -> None:
+        """A cross-tenant subscription id must fail closed as
+        "not found" -- never leak that the subscription exists under a
+        different organization (mirrors ``get_invoice``'s own tenant-
+        isolation convention tested above)."""
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            _billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service()
+        owner_org = uuid.uuid4()
+        other_org = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository, plan_repository, organization_id=owner_org
+        )
+
+        with pytest.raises(SubscriptionNotFoundError):
+            await service.resolve_subscription_for_organization(
+                other_org, subscription.id
+            )
+
+    async def test_defaults_to_the_organization_s_own_subscription(self) -> None:
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            _billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service()
+        organization_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository, plan_repository, organization_id=organization_id
+        )
+
+        resolved = await service.resolve_subscription_for_organization(
+            organization_id, None
+        )
+        assert resolved == subscription.id
+
+    async def test_raises_when_organization_has_no_subscription(self) -> None:
+        (
+            service,
+            _invoice_repository,
+            _subscription_repository,
+            _plan_repository,
+            _billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service()
+
+        with pytest.raises(SubscriptionNotFoundError):
+            await service.resolve_subscription_for_organization(uuid.uuid4(), None)
+
+
+class TestRecordInvoiceEmailed:
+    async def test_successful_send_is_audited_with_recipient(self) -> None:
+        audit_writer = FakeAuditWriter()
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service(audit_writer=audit_writer)
+        organization_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository, plan_repository, organization_id=organization_id
+        )
+        await _make_billing_profile(
+            billing_profile_repository, organization_id=organization_id
+        )
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+
+        await service.record_invoice_emailed(
+            actor_user_id=uuid.uuid4(),
+            invoice=invoice,
+            recipient_email="billing@acme.com",
+            email_sent=True,
+        )
+
+        emailed_entries = [
+            e
+            for e in audit_writer.entries
+            if e["action"] == AuditAction.INVOICE_EMAILED.value
+        ]
+        assert len(emailed_entries) == 1
+        assert emailed_entries[0]["entity_id"] == invoice.id
+        assert "billing@acme.com" in emailed_entries[0]["description"]
+        assert "FAILED" not in emailed_entries[0]["description"]
+
+    async def test_failed_send_is_audited_with_the_error(self) -> None:
+        audit_writer = FakeAuditWriter()
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service(audit_writer=audit_writer)
+        organization_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository, plan_repository, organization_id=organization_id
+        )
+        await _make_billing_profile(
+            billing_profile_repository, organization_id=organization_id
+        )
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+
+        await service.record_invoice_emailed(
+            actor_user_id=uuid.uuid4(),
+            invoice=invoice,
+            recipient_email="billing@acme.com",
+            email_sent=False,
+            email_error="SMTP connection timed out",
+        )
+
+        emailed_entries = [
+            e
+            for e in audit_writer.entries
+            if e["action"] == AuditAction.INVOICE_EMAILED.value
+        ]
+        assert len(emailed_entries) == 1
+        assert "FAILED" in emailed_entries[0]["description"]
+        assert "SMTP connection timed out" in emailed_entries[0]["description"]

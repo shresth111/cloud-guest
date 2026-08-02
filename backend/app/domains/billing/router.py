@@ -144,6 +144,7 @@ All responses use the standard ``ApiResponse``/``build_response`` envelope.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
@@ -153,6 +154,13 @@ from app.core.config import Settings, get_settings
 from app.domains.auth.dependencies import get_current_user
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
+from app.domains.organization.dependencies import get_organization_service
+from app.domains.organization.service import OrganizationService
+from app.domains.otp.service import (
+    EmailAttachment,
+    LoggingEmailProvider,
+    get_configured_email_provider,
+)
 from app.domains.rbac.authorization import AccessValidator
 from app.domains.rbac.context import ScopeContext
 from app.domains.rbac.dependencies import (
@@ -162,6 +170,8 @@ from app.domains.rbac.dependencies import (
     get_access_validator,
 )
 from app.domains.rbac.enums import ScopeType
+
+logger = logging.getLogger(__name__)
 
 from .constants import DiscountType, InvoiceStatus, PaymentStatus, PlanType
 from .dependencies import (
@@ -216,6 +226,8 @@ from .schemas import (
     CustomerBillingSummaryRowResponse,
     DebitNoteIssueRequest,
     FailedPaymentRowResponse,
+    InvoiceGenerateAndSendRequest,
+    InvoiceGenerateAndSendResponse,
     InvoiceItemResponse,
     InvoiceListResponse,
     InvoiceResponse,
@@ -1846,6 +1858,134 @@ async def download_invoice(
                 f'attachment; filename="{invoice.invoice_number}.pdf"'
             )
         },
+    )
+
+
+@router.post(
+    "/invoices/generate-and-send",
+    response_model=ApiResponse[InvoiceGenerateAndSendResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("invoices.manage"))],
+)
+async def generate_and_send_invoice(
+    request: Request,
+    payload: InvoiceGenerateAndSendRequest,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    user: AuthUser = Depends(get_current_user),
+    service: InvoiceService = Depends(get_invoice_service),
+    organization_service: OrganizationService = Depends(get_organization_service),
+    settings: Settings = Depends(get_settings),
+):
+    """Master Console's manual "generate a new invoice right now, and email
+    it to the customer" trigger -- additive to whatever automatic invoice
+    generation the renewal engine already runs on its own schedule (this
+    endpoint never touches that path). Reuses, never reimplements:
+    ``InvoiceService.generate_invoice_for_subscription`` for the real
+    invoice + line-item creation and tax computation; ``render_invoice_pdf``
+    for the identical PDF the existing ``GET /invoices/{id}/download``
+    endpoint above already serves; and ``app.domains.otp.service``'s
+    existing ``EmailProviderProtocol``/``get_configured_email_provider`` for
+    delivery -- the same real, already-configured-in-production (Gmail
+    SMTP) mechanism OTP codes are sent through today, not a second
+    email-sending path.
+
+    Uses ``invoices.manage`` (not a new permission) -- the same "reuse the
+    closest seeded action for a consequential financial write" precedent
+    ``void``/credit-note/debit-note above already establish.
+
+    A failed or unconfigured email send is never a rollback of the invoice
+    itself -- a real, sequentially-numbered financial document already
+    exists by the time delivery is attempted, and discarding that over an
+    email hiccup would be worse than a manual resend. ``email_sent=False``
+    (with ``email_error`` set, and a ``2xx`` still returned) tells the
+    operator plainly that the invoice exists but hasn't reached the
+    customer yet, so they know to resend or hand them the ``/download``
+    link directly.
+    """
+    subscription_id = await service.resolve_subscription_for_organization(
+        organization_id, payload.subscription_id
+    )
+    invoice = await service.generate_invoice_for_subscription(subscription_id)
+    items = await service.list_items(invoice.id)
+    notes = await service.list_notes(invoice.id)
+
+    organization = await organization_service.get_organization(organization_id)
+    recipient_email = organization.contact_email
+
+    seller = SellerInfo(
+        legal_business_name=settings.platform_legal_business_name,
+        gstin=settings.platform_gstin,
+        state=settings.platform_gst_state,
+        country=settings.platform_gst_country,
+    )
+    pdf_bytes = render_invoice_pdf(invoice, items, seller=seller, notes=notes)
+
+    email_sent = False
+    email_error: str | None = None
+    try:
+        email_provider = get_configured_email_provider(settings)
+        if isinstance(email_provider, LoggingEmailProvider):
+            email_error = (
+                "No real email delivery provider is configured on this server."
+            )
+        else:
+            subject = f"Your Wyfy Guest invoice {invoice.invoice_number}"
+            body = (
+                "Hello,\n\n"
+                f"Your invoice {invoice.invoice_number} from Wyfy Guest is "
+                "ready.\n\n"
+                f"Amount due: {invoice.currency} {invoice.total_amount}\n"
+                f"Due date: {invoice.due_date.strftime('%d %b %Y')}\n\n"
+                "The full invoice, including a detailed breakdown of "
+                "charges and applicable taxes, is attached to this email "
+                "as a PDF.\n\n"
+                "If you have any questions about this invoice, please "
+                "reach out to our support team.\n\n"
+                "Thank you for using Wyfy Guest."
+            )
+            await email_provider.send(
+                recipient_email,
+                subject,
+                body,
+                attachment=EmailAttachment(
+                    filename=f"{invoice.invoice_number}.pdf",
+                    content=pdf_bytes,
+                    content_type="application/pdf",
+                ),
+            )
+            email_sent = True
+    except Exception as exc:  # noqa: BLE001 -- a send failure must never roll back a real, already-created invoice
+        logger.warning(
+            "billing_invoice_email_send_failed",
+            extra={"invoice_id": str(invoice.id), "error": str(exc)},
+        )
+        email_error = str(exc)
+
+    await service.record_invoice_emailed(
+        actor_user_id=uuid.UUID(user.id),
+        invoice=invoice,
+        recipient_email=recipient_email,
+        email_sent=email_sent,
+        email_error=email_error,
+    )
+
+    response_payload = InvoiceGenerateAndSendResponse(
+        invoice=_invoice_response(invoice, items, notes),
+        email_sent=email_sent,
+        email_recipient=recipient_email,
+        email_error=email_error,
+    )
+    return build_response(
+        success=True,
+        message=(
+            f"Invoice {invoice.invoice_number} generated and emailed to "
+            f"{recipient_email}"
+            if email_sent
+            else f"Invoice {invoice.invoice_number} generated, but the "
+            "email could not be sent"
+        ),
+        data=response_payload.model_dump(mode="json"),
+        request_id=_request_id(request),
     )
 
 

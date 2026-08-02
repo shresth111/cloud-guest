@@ -510,6 +510,13 @@ class AuditAction(StrEnum):
     INVOICE_MARKED_PAID = "invoice_marked_paid"
     INVOICE_VOIDED = "invoice_voided"
     INVOICE_MARKED_OVERDUE = "invoice_marked_overdue"
+    # A Master Console operator triggered the manual "generate & send"
+    # flow (``POST /invoices/generate-and-send``) -- distinct from
+    # ``INVOICE_GENERATED`` (which every invoice, automatic or manual,
+    # already receives) because this one specifically records the
+    # human-initiated email-dispatch attempt and its outcome (see
+    # ``InvoiceService.record_invoice_emailed``'s own docstring).
+    INVOICE_EMAILED = "invoice_emailed"
     CREDIT_NOTE_ISSUED = "credit_note_issued"
     DEBIT_NOTE_ISSUED = "debit_note_issued"
     TAX_RATE_CREATED = "tax_rate_created"

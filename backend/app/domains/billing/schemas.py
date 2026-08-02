@@ -733,6 +733,32 @@ class InvoiceResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class InvoiceGenerateAndSendRequest(BaseModel):
+    """Body for ``POST /invoices/generate-and-send``. ``subscription_id`` is
+    optional -- this platform's single-subscription-per-organization model
+    (see ``Subscription``'s own module docstring) makes the caller's own
+    ``X-Organization-Id``-scoped subscription an unambiguous default when
+    omitted; pass it explicitly only for an organization with more than one
+    subscription record (e.g. a historical/cancelled one) to disambiguate."""
+
+    subscription_id: uuid.UUID | None = None
+
+
+class InvoiceGenerateAndSendResponse(BaseModel):
+    """Wraps the freshly-generated invoice with the outcome of the email
+    dispatch attempt -- kept separate from ``InvoiceResponse`` itself
+    because a failed/unconfigured send never invalidates the invoice (see
+    ``InvoiceService.record_invoice_emailed``'s docstring); the caller
+    (Master Console) uses ``email_sent``/``email_error`` to decide whether
+    to show a plain success toast or a "generated, but email failed --
+    resend/download manually" partial-failure state."""
+
+    invoice: InvoiceResponse
+    email_sent: bool
+    email_recipient: str
+    email_error: str | None = None
+
+
 class InvoiceListResponse(BaseModel):
     items: list[InvoiceResponse]
     page: int

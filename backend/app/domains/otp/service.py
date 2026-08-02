@@ -181,8 +181,30 @@ class SmsProviderProtocol(Protocol):
     async def send(self, phone_number: str, message: str) -> None: ...
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class EmailAttachment:
+    """A single file attachment for ``EmailProviderProtocol.send`` -- e.g.
+    a generated invoice PDF (``app.domains.billing.router``'s
+    ``generate_and_send_invoice`` endpoint attaches one this way). Optional
+    on every implementation below -- every pre-existing caller (OTP,
+    ``app.domains.notification``, ``app.domains.monitoring``) keeps sending
+    plain text-only mail by simply omitting it; this is a purely additive,
+    backward-compatible parameter."""
+
+    filename: str
+    content: bytes
+    content_type: str = "application/octet-stream"
+
+
 class EmailProviderProtocol(Protocol):
-    async def send(self, email: str, subject: str, body: str) -> None: ...
+    async def send(
+        self,
+        email: str,
+        subject: str,
+        body: str,
+        *,
+        attachment: EmailAttachment | None = None,
+    ) -> None: ...
 
 
 class WhatsAppProviderProtocol(Protocol):
@@ -215,10 +237,22 @@ class LoggingEmailProvider:
     instead of calling a real transactional-email API. See module
     docstring."""
 
-    async def send(self, email: str, subject: str, body: str) -> None:
+    async def send(
+        self,
+        email: str,
+        subject: str,
+        body: str,
+        *,
+        attachment: EmailAttachment | None = None,
+    ) -> None:
         logger.info(
             "otp_email_would_send",
-            extra={"email": email, "subject": subject, "body_length": len(body)},
+            extra={
+                "email": email,
+                "subject": subject,
+                "body_length": len(body),
+                "attachment_filename": attachment.filename if attachment else None,
+            },
         )
 
 
@@ -291,7 +325,14 @@ class SmtpEmailProvider:
         self.use_tls = use_tls
         self.from_address = from_address
 
-    def _send_sync(self, email: str, subject: str, body: str) -> None:
+    def _send_sync(
+        self,
+        email: str,
+        subject: str,
+        body: str,
+        *,
+        attachment: EmailAttachment | None = None,
+    ) -> None:
         import smtplib
         from email.message import EmailMessage
 
@@ -300,6 +341,14 @@ class SmtpEmailProvider:
         message["From"] = self.from_address
         message["To"] = email
         message.set_content(body)
+        if attachment is not None:
+            maintype, _, subtype = attachment.content_type.partition("/")
+            message.add_attachment(
+                attachment.content,
+                maintype=maintype or "application",
+                subtype=subtype or "octet-stream",
+                filename=attachment.filename,
+            )
 
         smtp_class = smtplib.SMTP_SSL if self.port == 465 else smtplib.SMTP
         with smtp_class(self.host, self.port, timeout=10) as smtp:
@@ -309,8 +358,17 @@ class SmtpEmailProvider:
                 smtp.login(self.username, self.password)
             smtp.send_message(message)
 
-    async def send(self, email: str, subject: str, body: str) -> None:
-        await asyncio.to_thread(self._send_sync, email, subject, body)
+    async def send(
+        self,
+        email: str,
+        subject: str,
+        body: str,
+        *,
+        attachment: EmailAttachment | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._send_sync, email, subject, body, attachment=attachment
+        )
 
 
 class SesEmailProvider:
@@ -337,15 +395,60 @@ class SesEmailProvider:
             region_name=region_name,
         )
 
-    def _send_sync(self, email: str, subject: str, body: str) -> None:
-        self._client.send_email(
+    def _send_sync(
+        self,
+        email: str,
+        subject: str,
+        body: str,
+        *,
+        attachment: EmailAttachment | None = None,
+    ) -> None:
+        if attachment is None:
+            self._client.send_email(
+                Source=self.from_address,
+                Destination={"ToAddresses": [email]},
+                Message={
+                    "Subject": {"Data": subject},
+                    "Body": {"Text": {"Data": body}},
+                },
+            )
+            return
+
+        # An attachment needs a real MIME multipart body -- SES's plain
+        # ``send_email`` API has no attachment field at all, so this branch
+        # composes the identical stdlib ``EmailMessage`` :class:`SmtpEmailProvider`
+        # builds above and ships it via SES's raw-message API instead.
+        from email.message import EmailMessage
+
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = self.from_address
+        message["To"] = email
+        message.set_content(body)
+        maintype, _, subtype = attachment.content_type.partition("/")
+        message.add_attachment(
+            attachment.content,
+            maintype=maintype or "application",
+            subtype=subtype or "octet-stream",
+            filename=attachment.filename,
+        )
+        self._client.send_raw_email(
             Source=self.from_address,
-            Destination={"ToAddresses": [email]},
-            Message={"Subject": {"Data": subject}, "Body": {"Text": {"Data": body}}},
+            Destinations=[email],
+            RawMessage={"Data": message.as_bytes()},
         )
 
-    async def send(self, email: str, subject: str, body: str) -> None:
-        await asyncio.to_thread(self._send_sync, email, subject, body)
+    async def send(
+        self,
+        email: str,
+        subject: str,
+        body: str,
+        *,
+        attachment: EmailAttachment | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._send_sync, email, subject, body, attachment=attachment
+        )
 
 
 class TwilioSmsProvider:
@@ -880,6 +983,7 @@ def _event_extra(event: object) -> dict[str, object]:
 __all__ = [
     "OtpService",
     "SmsProviderProtocol",
+    "EmailAttachment",
     "EmailProviderProtocol",
     "WhatsAppProviderProtocol",
     "LoggingSmsProvider",

@@ -3089,6 +3089,66 @@ class InvoiceService:
         )
         return note
 
+    async def resolve_subscription_for_organization(
+        self, organization_id: uuid.UUID, subscription_id: uuid.UUID | None
+    ) -> uuid.UUID:
+        """Resolves the subscription ``POST /invoices/generate-and-send``
+        (the manual, operator-triggered "generate one now" endpoint --
+        distinct from this same class's own automatic
+        ``generate_invoice_for_subscription`` callers, e.g. the renewal
+        engine) should generate against: the explicit ``subscription_id``
+        from the request body when given -- re-validated against the
+        caller's own ``organization_id`` scope, a ``SubscriptionNotFoundError``
+        (never a cross-tenant existence leak) if it actually belongs to a
+        different organization -- or, this platform's single-subscription-
+        per-organization model, the organization's one current subscription
+        otherwise."""
+        if subscription_id is not None:
+            subscription = await self.subscription_repository.get_by_id(
+                subscription_id
+            )
+            if subscription is None or subscription.organization_id != organization_id:
+                raise SubscriptionNotFoundError(subscription_id)
+            return subscription.id
+        subscription = await self.subscription_repository.get_by_organization_id(
+            organization_id
+        )
+        if subscription is None:
+            raise SubscriptionNotFoundError(organization_id)
+        return subscription.id
+
+    async def record_invoice_emailed(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        invoice: Invoice,
+        recipient_email: str,
+        email_sent: bool,
+        email_error: str | None = None,
+    ) -> None:
+        """Audits the outcome of the manual "generate & send" email
+        dispatch (``POST /invoices/generate-and-send``) against an
+        already-created invoice -- called regardless of whether the send
+        actually succeeded. A failed/unconfigured send never rolls back
+        the real, already-issued invoice itself (a genuine financial
+        document is not undone over an email hiccup -- the operator can
+        always resend/download manually via the existing ``/download``
+        endpoint); this audit row is the honest record of "did the email
+        actually go out", distinct from ``AuditAction.INVOICE_GENERATED``
+        which every invoice, automatic or manual, already receives."""
+        if email_sent:
+            outcome = f"emailed to {recipient_email}"
+        elif email_error:
+            outcome = f"email to {recipient_email} FAILED: {email_error}"
+        else:
+            outcome = f"email to {recipient_email} not sent: no provider configured"
+        await self._audit(
+            actor_user_id,
+            AuditAction.INVOICE_EMAILED,
+            invoice,
+            description=f"Invoice {invoice.invoice_number} {outcome}",
+        )
+
     async def _audit(
         self,
         actor_user_id: uuid.UUID | None,
