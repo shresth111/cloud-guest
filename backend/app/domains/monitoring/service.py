@@ -1677,7 +1677,7 @@ class EmailNotifier:
         email = str(config["email"])
         await self.email_provider.send(
             email,
-            f"CloudGuest alert: {alert.severity.upper()}",
+            f"Wyfy Guest alert: {alert.severity.upper()}",
             _format_alert_message(alert),
         )
         return f"queued to {email} via EmailProviderProtocol"
@@ -1773,9 +1773,9 @@ class TeamsNotifier:
         payload = {
             "@type": "MessageCard",
             "@context": "http://schema.org/extensions",
-            "summary": "CloudGuest alert",
+            "summary": "Wyfy Guest alert",
             "themeColor": "FF0000" if alert.severity == "critical" else "FFA500",
-            "title": f"CloudGuest {alert.severity.upper()} alert",
+            "title": f"Wyfy Guest {alert.severity.upper()} alert",
             "text": _format_alert_message(alert),
         }
         response = await _post_json(self.http_client, webhook_url, payload)
