@@ -82,9 +82,11 @@ gateway IP an admin can type in ahead of time:
 ## Now delegates to wyfy-device-gateway
 
 Per the ``wyfy-device-gateway`` PRD (section 7, Step 3, item 2),
-``MikroTikIspHealthAdapter``'s four methods (``ping``,
+``MikroTikIspHealthAdapter``'s methods (``ping``,
 ``get_dynamic_default_gateway``, ``get_pppoe_interface_status``,
-``get_interface_traffic_counters``) now call
+``get_interface_traffic_counters``, and ``run_speed_test`` -- the last
+added later, for the on-demand "Run Speed Test" feature, not part of the
+original migration) now call
 ``wyfy_device_gateway.registry.get_adapter(DeviceVendor.MIKROTIK)``
 instead of opening ``librouteros`` directly -- that package is a straight
 port of this module's own four ``_*_sync`` methods (same RouterOS
@@ -176,6 +178,21 @@ class PingResult:
     avg_rtt_ms: float | None
 
 
+@dataclass(frozen=True, slots=True)
+class SpeedTestResult:
+    """The real, measured result of one on-demand "Run Speed Test" action --
+    see ``wyfy_device_gateway.mikrotik_adapter.MikroTikAdapter
+    .run_speed_test``'s own docstring for exactly how this is measured
+    (RouterOS ``/tool/fetch``) and confirmed against a real device. No
+    ``upload_mbps`` field exists here on purpose -- no genuine method to
+    measure real upload throughput against the public internet from this
+    hardware class was found; a caller must never synthesize one."""
+
+    download_mbps: float
+    downloaded_bytes: int
+    duration_seconds: float
+
+
 class BaseIspHealthAdapter(Protocol):
     """What a vendor implements to plug a real WAN-link health check into
     the ISP Management domain. A new vendor is exactly: implement this
@@ -223,6 +240,16 @@ class BaseIspHealthAdapter(Protocol):
         name exists on the router. A single snapshot, never a rate (the
         caller computes the rate from two successive snapshots -- see
         module docstring)."""
+        ...
+
+    async def run_speed_test(
+        self, credentials: IspCredentials, *, download_url: str
+    ) -> SpeedTestResult:
+        """Issues a real, on-demand download of ``download_url`` *from the
+        router itself* and returns the genuine measured download
+        throughput -- never a simulated/estimated number. See
+        ``service.IspService.run_speed_test`` for the caller-side timeout
+        sizing this genuinely slow, multi-second real action needs."""
         ...
 
 
@@ -313,6 +340,24 @@ class MikroTikIspHealthAdapter:
                 "read_interface_traffic_counters", exc.detail
             ) from exc
 
+    async def run_speed_test(
+        self, credentials: IspCredentials, *, download_url: str
+    ) -> SpeedTestResult:
+        creds = self._gateway_credentials(credentials)
+        try:
+            result = await get_adapter(DeviceVendor.MIKROTIK).run_speed_test(
+                creds, download_url=download_url
+            )
+        except MikroTikConnectionError as exc:
+            raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise IspDeviceOperationError("run_speed_test", exc.detail) from exc
+        return SpeedTestResult(
+            download_mbps=result.download_mbps,
+            downloaded_bytes=result.downloaded_bytes,
+            duration_seconds=result.duration_seconds,
+        )
+
 
 def _parse_ping_rows(
     rows: list[dict[str, object]], *, requested_count: int
@@ -398,6 +443,7 @@ def list_supported_isp_vendors() -> list[str]:
 __all__ = [
     "IspCredentials",
     "PingResult",
+    "SpeedTestResult",
     "BaseIspHealthAdapter",
     "MikroTikIspHealthAdapter",
     "get_isp_health_adapter",

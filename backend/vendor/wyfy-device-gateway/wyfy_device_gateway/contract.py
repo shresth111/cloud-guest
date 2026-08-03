@@ -213,6 +213,26 @@ class DeviceHealthResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SpeedTestResult:
+    """The real, measured result of one on-demand WAN download-speed test --
+    genuine bytes moved over the device's own real uplink in genuine wall-
+    clock time, never an estimate. See ``mikrotik_adapter.py``'s
+    ``run_speed_test`` docstring for exactly how this is measured (RouterOS
+    ``/tool/fetch``) and its one real, documented precision caveat (whole-
+    second duration granularity on this command).
+
+    Upload throughput is deliberately not part of this shape: no vendor
+    adapter in this package has a genuine way to measure real upload speed
+    against the public internet yet (see that same docstring) -- a caller
+    must never synthesize one to fill the gap."""
+
+    download_mbps: float
+    downloaded_bytes: int
+    duration_seconds: float
+    test_url: str
+
+
+@dataclass(frozen=True, slots=True)
 class RawCommandResult:
     """The real, unfiltered outcome of one raw SSH console command --
     ported from
@@ -322,6 +342,24 @@ class DeviceGatewayAdapter(Protocol):
         named interface right now -- ``None`` if no interface with that
         name exists. Ported from
         ``app.domains.isp.device_adapters.get_interface_traffic_counters``."""
+        ...
+
+    async def run_speed_test(
+        self, creds: DeviceCredentials, *, download_url: str
+    ) -> SpeedTestResult:
+        """Issues a real, on-demand download from ``download_url`` *from
+        the device itself* (genuine traffic over its real WAN uplink, not
+        this backend's own network path) and reports the genuine measured
+        download throughput. ``download_url`` is fully caller-specified
+        (which public test-file host and how many bytes to request is an
+        ISP-domain business decision, not something this vendor-neutral
+        contract should hardcode) -- exactly the same division of
+        responsibility as ``ping``'s caller-specified ``target``.
+        ``creds.timeout_seconds`` must be sized by the caller to
+        genuinely accommodate the real download's expected duration (this
+        is a slow, on-demand, multi-second-or-more real action, not a
+        quick health-check read) -- see the MikroTik implementation's own
+        docstring for real, measured timings against real hardware."""
         ...
 
     # -- queue management (QoS/bandwidth shaping) --------------------------
@@ -504,6 +542,7 @@ __all__ = [
     "PortForwardConfig",
     "RadiusClientConfig",
     "ProvisionResult",
+    "SpeedTestResult",
     "PingResult",
     "TracerouteHop",
     "TracerouteResult",

@@ -206,3 +206,27 @@ class IspLinkManualStatusRequest(BaseModel):
 
     health_status: Literal["healthy", "unhealthy"]
     reason: str | None = Field(default=None, max_length=500)
+
+
+# ============================================================================
+# Run Speed Test -- on-demand, real RouterOS /tool/fetch download +
+# /tool/ping. See ``IspService.run_speed_test`` for why this is reported
+# directly rather than folded into IspHealthCheckResponse's own
+# download_mbps/upload_mbps (a distinct, passive-traffic-rate meaning).
+# ============================================================================
+
+
+class IspSpeedTestResponse(BaseModel):
+    isp_link_id: str
+    tested_at: datetime
+    download_mbps: float
+    # Always null today -- no genuine method to measure real upload
+    # throughput against the public internet exists for this hardware
+    # class. Never fabricated to fill the gap; the field exists so the
+    # frontend can render an honest "not available" state rather than the
+    # key being absent entirely.
+    upload_mbps: float | None
+    latency_ms: float | None
+    packet_loss_percentage: float | None
+    downloaded_bytes: int
+    duration_seconds: float

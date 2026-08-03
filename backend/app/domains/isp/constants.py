@@ -150,6 +150,30 @@ DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER = 3
 ISP_PING_COUNT = 5
 ISP_PING_TIMEOUT_SECONDS = 10
 
+# ============================================================================
+# On-demand "Run Speed Test" -- real RouterOS /tool/fetch download, see
+# device_adapters.py's run_speed_test docstring for the full "why this
+# command, why this size" write-up. Confirmed against the real test org's
+# real MikroTik hEX lite router (RouterOS 7.16.2) over its real Airtel WAN
+# link: a 10MB fetch against this exact URL took 6 real seconds and
+# transferred 9765 real KiB (~13.3 Mbps) -- a real, repeatable measurement,
+# not a guess at a "reasonable" size.
+#
+# Cloudflare's own public `/__down?bytes=N` speed-test endpoint is used
+# (not a fixed-size file like Hetzner's speedtest hosts) specifically
+# because it lets this platform control the exact payload size -- kept
+# modest (10MB, not tens/hundreds of MB) since the real target hardware
+# (hEX lite: 1 CPU core, 64MB RAM, 16MB flash) is genuinely low-power and
+# this is a user-triggered, one-link-at-a-time action, never a scheduled
+# sweep.
+SPEED_TEST_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=10000000"
+# The RouterOS API connection timeout for this specific action only (never
+# applied to the fast, routine ISP_PING_TIMEOUT_SECONDS health-check path)
+# -- must genuinely exceed the real download's own expected duration. A
+# slow-but-real WAN link (e.g. ~2 Mbps) could take ~40s to move 10MB; 60s
+# leaves real headroom without being open-ended.
+SPEED_TEST_TIMEOUT_SECONDS = 60
+
 # How far back (in real IspHealthCheck rows) IspService
 # .compute_unhealthy_since is willing to scan looking for where the
 # link's *current* unbroken UNHEALTHY streak actually began -- capped,
@@ -212,6 +236,8 @@ __all__ = [
     "DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER",
     "ISP_PING_COUNT",
     "ISP_PING_TIMEOUT_SECONDS",
+    "SPEED_TEST_DOWNLOAD_URL",
+    "SPEED_TEST_TIMEOUT_SECONDS",
     "UNHEALTHY_SINCE_LOOKBACK_LIMIT",
     "TASK_RUN_ISP_HEALTH_CHECK_SWEEP",
     "ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS",

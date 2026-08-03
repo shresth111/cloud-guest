@@ -656,6 +656,15 @@ class AuditAction(StrEnum):
     # device push). Always audited, the same "moderate-volume, admin-
     # relevant" profile ISP_LINK_UPDATED already carries.
     ISP_LINK_MANUAL_STATUS_SET = "isp_link_manual_status_set"
+    # An operator explicitly triggering a real, on-demand download against
+    # the router's own real WAN uplink to measure genuine throughput (the
+    # "Run Speed Test" action) -- always audited, the same "operator
+    # explicitly triggers something with real side effects" profile
+    # ``RouterService.reveal_credentials``/router reboot actions already
+    # carry elsewhere in this codebase, since this is real traffic
+    # genuinely generated against a real, possibly metered ISP link, not a
+    # passive read.
+    ISP_LINK_SPEED_TEST_RUN = "isp_link_speed_test_run"
 
     # ISP Routing domain events -- written through this same table by
     # ``app.domains.isp_routing.service.IspRoutingService`` via the same

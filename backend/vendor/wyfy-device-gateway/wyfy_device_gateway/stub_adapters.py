@@ -25,6 +25,7 @@ from .contract import (
     QueueDeviceStatus,
     RadiusClientConfig,
     RawCommandResult,
+    SpeedTestResult,
     TracerouteResult,
     VlanConfig,
     WanHealth,
@@ -115,6 +116,11 @@ class _StubAdapter:
     async def get_interface_traffic_counters(
         self, creds: DeviceCredentials, *, interface_name: str
     ) -> tuple[int, int] | None:
+        raise self._not_implemented()
+
+    async def run_speed_test(
+        self, creds: DeviceCredentials, *, download_url: str
+    ) -> SpeedTestResult:
         raise self._not_implemented()
 
     async def create_simple_queue(
@@ -256,6 +262,7 @@ class _StubAdapter:
             "get_dynamic_default_gateway": False,
             "get_pppoe_interface_status": False,
             "get_interface_traffic_counters": False,
+            "run_speed_test": False,
             "create_simple_queue": False,
             "update_simple_queue": False,
             "delete_simple_queue": False,

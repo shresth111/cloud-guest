@@ -65,6 +65,8 @@ from .constants import (
     DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER,
     ISP_PING_COUNT,
     ISP_PING_TIMEOUT_SECONDS,
+    SPEED_TEST_DOWNLOAD_URL,
+    SPEED_TEST_TIMEOUT_SECONDS,
     UNHEALTHY_SINCE_LOOKBACK_LIMIT,
     HealthStatus,
     HealthStatusSource,
@@ -162,6 +164,27 @@ class TrafficCounters:
 
     rx_bytes: int
     tx_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class SpeedTestOutcome:
+    """The real, on-demand result ``IspService.run_speed_test`` returns --
+    combines a fresh real ``/tool/ping`` (latency/packet loss) with a fresh
+    real ``/tool/fetch`` download (throughput) against the link's own
+    router. Deliberately never persisted as an ``IspHealthCheck`` row --
+    see ``run_speed_test``'s own docstring for why. ``upload_mbps`` is
+    always ``None`` -- no genuine method to measure real upload throughput
+    against the public internet exists for this hardware class; never
+    fabricated to fill the gap."""
+
+    isp_link_id: uuid.UUID
+    tested_at: datetime
+    download_mbps: float
+    upload_mbps: float | None
+    latency_ms: float | None
+    packet_loss_percentage: float | None
+    downloaded_bytes: int
+    duration_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +485,110 @@ class IspService:
         return await self.record_health_check_result(
             link, ping_result=ping_result, traffic=traffic
         )
+
+    async def run_speed_test(
+        self,
+        link_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> SpeedTestOutcome:
+        """Admin-triggered, on-demand "Run Speed Test" action -- like
+        ``check_link_health``, but additionally issues a real RouterOS
+        ``/tool/fetch`` download of ``SPEED_TEST_DOWNLOAD_URL`` against the
+        router's own real WAN uplink to measure genuine current download
+        throughput (see ``device_adapters.py``'s ``run_speed_test``
+        docstring for exactly how, and its one real precision caveat).
+        Latency/packet loss reuse ``ping_link``'s existing, connection-
+        mode-aware real ping -- "free" per the founder's own framing, not
+        a second invented metric.
+
+        **Deliberately never written into the ``IspHealthCheck`` table.**
+        That table's own ``download_mbps``/``upload_mbps`` columns already
+        carry a distinct meaning -- ambient traffic-load *rate*, computed
+        from successive interface-counter deltas at each routine health
+        check (see ``record_health_check_result``) -- and folding a
+        synthetic-download-test result into that same series would corrupt
+        the "Traffic Load" graph's own meaning for whichever tick this
+        landed on. This result is reported directly to the caller and
+        recorded only as an audit-log entry
+        (``AuditAction.ISP_LINK_SPEED_TEST_RUN``) -- the same "operator
+        explicitly triggers something with real side effects" posture
+        ``RouterService.reveal_credentials``/router reboot already carry
+        elsewhere in this codebase, since this genuinely generates real
+        traffic against a real, possibly metered ISP link, not a passive
+        read.
+
+        No ``upload_mbps`` is ever returned -- see ``SpeedTestOutcome``'s
+        own docstring."""
+        link = await self.get_link(
+            link_id, requesting_organization_id=requesting_organization_id
+        )
+        if not link.is_enabled:
+            raise IspLinkDisabledError(link.id)
+
+        router = await self.router_lookup.get_router(link.router_id)
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.router_lookup.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            raise IspMissingCredentialsError(router.id)
+        adapter = self._get_device_adapter(router.vendor)
+
+        # Latency/packet loss: the exact same real, connection-mode-aware
+        # ping ping_link already performs for routine health checks.
+        ping_result = await self.ping_link(link)
+
+        # Download throughput: a real, slow, on-demand fetch. Its own
+        # credentials object carries a much larger timeout
+        # (SPEED_TEST_TIMEOUT_SECONDS) than the fast ping above -- a real
+        # multi-megabyte download over a real WAN link genuinely needs
+        # more than ISP_PING_TIMEOUT_SECONDS to complete.
+        speed_credentials = IspCredentials(
+            host=host,
+            username=router.api_username,
+            password=secret,
+            timeout_seconds=SPEED_TEST_TIMEOUT_SECONDS,
+        )
+        speed_result = await adapter.run_speed_test(
+            speed_credentials, download_url=SPEED_TEST_DOWNLOAD_URL
+        )
+
+        outcome = SpeedTestOutcome(
+            isp_link_id=link.id,
+            tested_at=datetime.now(UTC),
+            download_mbps=speed_result.download_mbps,
+            upload_mbps=None,
+            latency_ms=ping_result.avg_rtt_ms,
+            packet_loss_percentage=ping_result.packet_loss_percentage,
+            downloaded_bytes=speed_result.downloaded_bytes,
+            duration_seconds=speed_result.duration_seconds,
+        )
+        logger.info(
+            "isp_link_speed_test_run",
+            extra={
+                "isp_link_id": str(link.id),
+                "download_mbps": outcome.download_mbps,
+                "latency_ms": outcome.latency_ms,
+                "downloaded_bytes": outcome.downloaded_bytes,
+                "duration_seconds": outcome.duration_seconds,
+            },
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.ISP_LINK_SPEED_TEST_RUN,
+            entity_id=link.id,
+            organization_id=link.organization_id,
+            description=(
+                f"Speed test run on ISP link '{link.provider_name}': "
+                f"{outcome.download_mbps} Mbps down"
+                + (
+                    f", {outcome.latency_ms:.1f}ms latency"
+                    if outcome.latency_ms is not None
+                    else ""
+                )
+            ),
+        )
+        return outcome
 
     async def ping_link(self, link: IspLink) -> PingResult:
         """Resolves this link's own real health-check target and executes
@@ -1080,6 +1207,7 @@ __all__ = [
     "AuditLogWriter",
     "HealthCheckSweepSummary",
     "TrafficCounters",
+    "SpeedTestOutcome",
     "IspService",
     "run_health_check_sweep",
 ]

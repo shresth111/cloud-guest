@@ -50,6 +50,7 @@ from .schemas import (
     IspLinkManualStatusRequest,
     IspLinkResponse,
     IspLinkUpdateRequest,
+    IspSpeedTestResponse,
     MessageResponse,
 )
 from .service import IspService
@@ -109,6 +110,19 @@ def _link_response(
         last_checked_at=link.last_checked_at,
         consecutive_unhealthy_count=link.consecutive_unhealthy_count,
         created_at=link.created_at,
+    )
+
+
+def _speed_test_response(outcome) -> IspSpeedTestResponse:  # noqa: ANN001
+    return IspSpeedTestResponse(
+        isp_link_id=str(outcome.isp_link_id),
+        tested_at=outcome.tested_at,
+        download_mbps=outcome.download_mbps,
+        upload_mbps=outcome.upload_mbps,
+        latency_ms=outcome.latency_ms,
+        packet_loss_percentage=outcome.packet_loss_percentage,
+        downloaded_bytes=outcome.downloaded_bytes,
+        duration_seconds=outcome.duration_seconds,
     )
 
 
@@ -308,6 +322,40 @@ async def check_isp_link_health(
         success=True,
         message="ISP link health check completed",
         data=_link_response(link, unhealthy_since=unhealthy_since).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/links/{link_id}/speed-test",
+    response_model=ApiResponse[IspSpeedTestResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("isp.execute"))],
+)
+async def run_isp_link_speed_test(
+    request: Request,
+    link_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: IspService = Depends(get_isp_service),
+):
+    """On-demand "Run Speed Test" -- a real, slow (multi-second) action:
+    issues a genuine RouterOS download against the router's own real WAN
+    uplink, plus a real ping for latency. Gated by ``isp.execute`` (the
+    same permission ``check-health``/failover already require) since this
+    is a real, on-demand device action, not a read. See
+    ``IspService.run_speed_test``'s own docstring for why this is never
+    persisted into the routine health-check history and why no
+    ``upload_mbps`` is ever fabricated."""
+    outcome = await service.run_speed_test(
+        link_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="ISP link speed test completed",
+        data=_speed_test_response(outcome).model_dump(),
         request_id=_request_id(request),
     )
 

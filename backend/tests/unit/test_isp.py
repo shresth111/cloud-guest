@@ -28,12 +28,14 @@ import pytest
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.isp.constants import (
     DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER,
+    SPEED_TEST_DOWNLOAD_URL,
+    SPEED_TEST_TIMEOUT_SECONDS,
     HealthStatus,
     IspConnectionMode,
     IspLinkRole,
     IspLinkType,
 )
-from app.domains.isp.device_adapters import IspCredentials, PingResult
+from app.domains.isp.device_adapters import IspCredentials, PingResult, SpeedTestResult
 from app.domains.isp.exceptions import (
     CrossOrganizationIspLinkAccessError,
     IspDeviceConnectionError,
@@ -49,6 +51,7 @@ from app.domains.isp.router import router as isp_router
 from app.domains.isp.service import (
     HealthCheckSweepSummary,
     IspService,
+    SpeedTestOutcome,
     TrafficCounters,
     run_health_check_sweep,
 )
@@ -345,6 +348,10 @@ class FakeIspHealthAdapter:
     traffic_counters_by_interface: dict[str, tuple[int, int]] = field(
         default_factory=dict
     )
+    # Speed-test fakes -- see IspService.run_speed_test.
+    next_speed_test_result: SpeedTestResult | None = None
+    speed_test_should_raise: Exception | None = None
+    speed_test_calls: list[dict[str, object]] = field(default_factory=list)
 
     async def ping(
         self,
@@ -375,6 +382,18 @@ class FakeIspHealthAdapter:
         self, credentials: IspCredentials, *, interface_name: str
     ) -> tuple[int, int] | None:
         return self.traffic_counters_by_interface.get(interface_name)
+
+    async def run_speed_test(
+        self, credentials: IspCredentials, *, download_url: str
+    ) -> SpeedTestResult:
+        self.speed_test_calls.append(
+            {"download_url": download_url, "timeout_seconds": credentials.timeout_seconds}
+        )
+        if self.speed_test_should_raise is not None:
+            raise self.speed_test_should_raise
+        return self.next_speed_test_result or SpeedTestResult(
+            download_mbps=13.3, downloaded_bytes=10_000_000, duration_seconds=6.0
+        )
 
 
 # ============================================================================
@@ -588,6 +607,148 @@ class TestHealthChecks:
         link = await _create_primary(h, router)
         with pytest.raises(IspMissingCredentialsError):
             await h.service.ping_link(link)
+
+
+# ============================================================================
+# Run Speed Test -- on-demand real /tool/fetch download + /tool/ping.
+# ============================================================================
+
+
+class TestRunSpeedTest:
+    async def test_returns_real_download_and_latency(self) -> None:
+        h = make_harness(
+            health_adapter=FakeIspHealthAdapter(
+                next_result=PingResult(
+                    sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=15.5
+                ),
+                next_speed_test_result=SpeedTestResult(
+                    download_mbps=13.3, downloaded_bytes=9765 * 1024, duration_seconds=6.0
+                ),
+            )
+        )
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+
+        outcome = await h.service.run_speed_test(
+            link.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert isinstance(outcome, SpeedTestOutcome)
+        assert outcome.isp_link_id == link.id
+        assert outcome.download_mbps == 13.3
+        assert outcome.downloaded_bytes == 9765 * 1024
+        assert outcome.duration_seconds == 6.0
+        assert outcome.latency_ms == 15.5
+        assert outcome.packet_loss_percentage == 0.0
+        # Never a fabricated upload figure -- see SpeedTestOutcome's own
+        # docstring.
+        assert outcome.upload_mbps is None
+
+    async def test_uses_a_larger_timeout_than_the_routine_health_check_ping(
+        self,
+    ) -> None:
+        adapter = FakeIspHealthAdapter()
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+
+        await h.service.run_speed_test(
+            link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+        )
+
+        assert len(adapter.speed_test_calls) == 1
+        assert adapter.speed_test_calls[0]["download_url"] == SPEED_TEST_DOWNLOAD_URL
+        assert adapter.speed_test_calls[0]["timeout_seconds"] == SPEED_TEST_TIMEOUT_SECONDS
+
+    async def test_never_writes_an_isp_health_check_row(self) -> None:
+        """See run_speed_test's own docstring: download_mbps/upload_mbps on
+        IspHealthCheck carry a distinct, passive-traffic-rate meaning --
+        a speed test result must never be folded into that series."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+
+        await h.service.run_speed_test(
+            link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+        )
+
+        checks, meta = await h.repository.list_health_checks_for_link(
+            link.id, page=1, page_size=10
+        )
+        assert meta.total_items == 0
+
+    async def test_writes_an_audit_log_entry(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        actor_id = uuid.uuid4()
+
+        await h.service.run_speed_test(
+            link.id, actor_user_id=actor_id, requesting_organization_id=router.organization_id
+        )
+
+        # _create_primary above already wrote its own "isp_link_created"
+        # audit entry -- isolate the speed-test action's own entry rather
+        # than assuming index/position.
+        speed_test_entries = [
+            e for e in h.audit_writer.entries if e["action"] == "isp_link_speed_test_run"
+        ]
+        assert len(speed_test_entries) == 1
+        entry = speed_test_entries[0]
+        assert entry["actor_user_id"] == actor_id
+        assert entry["entity_id"] == link.id
+
+    async def test_disabled_link_raises(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        await h.service.update_link(
+            link.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            is_enabled=False,
+        )
+        with pytest.raises(IspLinkDisabledError):
+            await h.service.run_speed_test(
+                link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+            )
+
+    async def test_missing_credentials_raises(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        h.router_lookup.secrets[router.id] = None
+        link = await _create_primary(h, router)
+        with pytest.raises(IspMissingCredentialsError):
+            await h.service.run_speed_test(
+                link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+            )
+
+    async def test_real_fetch_failure_propagates(self) -> None:
+        h = make_harness(
+            health_adapter=FakeIspHealthAdapter(
+                speed_test_should_raise=IspDeviceConnectionError(
+                    "10.20.0.13", "connection refused"
+                )
+            )
+        )
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        with pytest.raises(IspDeviceConnectionError):
+            await h.service.run_speed_test(
+                link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+            )
+
+    async def test_cross_organization_access_raises(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        other_org = uuid.uuid4()
+        link = await _create_primary(h, router)
+        with pytest.raises(CrossOrganizationIspLinkAccessError):
+            await h.service.run_speed_test(
+                link.id, actor_user_id=None, requesting_organization_id=other_org
+            )
 
 
 # ============================================================================
@@ -1559,8 +1720,10 @@ class TestEveryRouteRequiresPermission:
         # 9 original routes + POST /links/{link_id}/status (manual
         # health-status override, see IspService.set_manual_health_status)
         # + GET /links/{link_id}/health-checks/summary (bucketed uptime
-        # chart, see IspService.get_health_check_summary).
-        assert len(isp_router.routes) == 11
+        # chart, see IspService.get_health_check_summary)
+        # + POST /links/{link_id}/speed-test (on-demand real speed test,
+        # see IspService.run_speed_test).
+        assert len(isp_router.routes) == 12
         for route in isp_router.routes:
             assert (
                 route.dependencies != []
