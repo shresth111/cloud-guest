@@ -184,6 +184,17 @@ class MikroTikConnectedDeviceAdapter:
         mac_address: str,
         interface: str | None,
     ) -> None:
+        """Best-effort wireless kick, then an unconditional DHCP-lease
+        removal -- kept as two independent steps (mirroring
+        ``_discover_sync``/``_safe_query``'s own per-menu isolation) so a
+        wired-only device (hEX lite/hEX/RB750-class, no wireless package
+        at all -- confirmed live this session) doesn't abort the whole
+        operation on the wireless menu simply not existing. Previously
+        both steps shared one try/except, so that exact, common real
+        hardware always failed here with "no such command or directory
+        (wireless)" even though the DHCP-lease removal below -- the part
+        that actually matters for a wired device -- would have succeeded
+        on its own."""
         api = self._connect_api(credentials)
         try:
             try:
@@ -192,6 +203,12 @@ class MikroTikConnectedDeviceAdapter:
                     if _row_mac(row) == mac_address:
                         wireless_menu.remove(row.get(".id"))
                         break
+            except LibRouterosError as exc:
+                logger.info(
+                    "connected_devices_wireless_kick_unavailable",
+                    extra={"mac_address": mac_address, "detail": str(exc)},
+                )
+            try:
                 dhcp_menu = api.path("ip", "dhcp-server", "lease")
                 for row in dhcp_menu:
                     if _row_mac(row) == mac_address:
