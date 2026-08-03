@@ -1413,14 +1413,20 @@ class AlertService:
                         organization_id=link.organization_id,
                         location_id=link.location_id,
                         router_id=link.router_id,
-                        message=(
-                            f"ISP link '{link.provider_name}' health status is "
-                            f"{link.health_status}"
+                        message=_health_status_message(
+                            link.provider_name, link.health_status
                         ),
                     )
                     triggered.append(alert)
                 elif not condition_met and existing is not None:
-                    resolved.append(await self._auto_resolve(existing))
+                    resolved.append(
+                        await self._auto_resolve(
+                            existing,
+                            resolved_message=_health_status_message(
+                                link.provider_name, link.health_status
+                            ),
+                        )
+                    )
             return triggered, resolved
 
         if rule.target_component == ALERT_TARGET_ROUTER:
@@ -1441,14 +1447,20 @@ class AlertService:
                         organization_id=router.organization_id,
                         location_id=router.location_id,
                         router_id=router.id,
-                        message=(
-                            f"Router '{router.name}' health status is "
-                            f"{router.health_status}"
+                        message=_health_status_message(
+                            router.name, router.health_status
                         ),
                     )
                     triggered.append(alert)
                 elif not condition_met and existing is not None:
-                    resolved.append(await self._auto_resolve(existing))
+                    resolved.append(
+                        await self._auto_resolve(
+                            existing,
+                            resolved_message=_health_status_message(
+                                router.name, router.health_status
+                            ),
+                        )
+                    )
             return triggered, resolved
 
         service_health = await self.repository.get_service_health(rule.target_component)
@@ -1466,14 +1478,18 @@ class AlertService:
                 organization_id=rule.organization_id,
                 location_id=None,
                 router_id=None,
-                message=(
-                    f"Component '{rule.target_component}' health status is "
-                    f"{current_status}"
-                ),
+                message=_health_status_message(rule.target_component, current_status),
             )
             triggered.append(alert)
         elif not condition_met and existing is not None:
-            resolved.append(await self._auto_resolve(existing))
+            resolved.append(
+                await self._auto_resolve(
+                    existing,
+                    resolved_message=_health_status_message(
+                        rule.target_component, current_status
+                    ),
+                )
+            )
         return triggered, resolved
 
     async def _evaluate_threshold_rule(
@@ -1600,11 +1616,22 @@ class AlertService:
         )
         return alert
 
-    async def _auto_resolve(self, alert: Alert) -> Alert:
-        resolved = await self.repository.update_alert(
-            alert,
-            {"status": AlertStatus.RESOLVED.value, "resolved_at": datetime.now(UTC)},
-        )
+    async def _auto_resolve(
+        self, alert: Alert, *, resolved_message: str | None = None
+    ) -> Alert:
+        """``resolved_message`` lets a caller replace the alert's own text
+        at resolution time (e.g. "Airtel is down" -> "Airtel is up") --
+        without it, the alert kept its original *triggered* wording even
+        after resolving, which read as self-contradictory once
+        ``_format_alert_message``'s "[RESOLVED]" prefix was added in front
+        of it (a real, confirmed-live "[RESOLVED] Airtel is down" email)."""
+        update_fields: dict[str, object] = {
+            "status": AlertStatus.RESOLVED.value,
+            "resolved_at": datetime.now(UTC),
+        }
+        if resolved_message is not None:
+            update_fields["message"] = resolved_message
+        resolved = await self.repository.update_alert(alert, update_fields)
         event = AlertResolved(alert_id=resolved.id, auto_resolved=True)
         logger.info("alert_auto_resolved", extra=_event_extra(event))
         await _publish_live_message(
@@ -1651,6 +1678,24 @@ class NotificationDeliveryError(Exception):
     rationale: a downstream channel being unreachable (a bad Slack webhook
     URL, a WhatsApp/SMS/email provider outage) must never crash alert
     evaluation, which is what actually protects the platform."""
+
+
+def _health_status_message(name: str, health_status: str | None) -> str:
+    """Plain "X is down"/"X is up" wording for the common
+    healthy-vs-unhealthy case every real ``target_component`` here
+    actually monitors -- confirmed live to read a lot clearer in an email
+    than the previous "health status is unhealthy" phrasing, especially
+    once resolution added a "[RESOLVED]" prefix in front of it (a real
+    "[RESOLVED] ... is unhealthy" email is a contradiction a plain "is up"
+    isn't). Anything other than the two states this domain's real rules
+    actually use (``healthy``/``unhealthy``) falls back to the previous,
+    more literal phrasing rather than guessing a verb for a status this
+    function doesn't know the sense of (e.g. ``degraded``)."""
+    if health_status == "unhealthy":
+        return f"{name} is down"
+    if health_status == "healthy":
+        return f"{name} is up"
+    return f"{name} health status is {health_status}"
 
 
 def _format_alert_message(alert: Alert) -> str:
