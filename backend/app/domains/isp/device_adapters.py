@@ -79,6 +79,24 @@ gateway IP an admin can type in ahead of time:
   ambiguity (zero or multiple candidates with no exact match) still
   raises rather than guessing.
 
+## Now delegates to wyfy-device-gateway
+
+Per the ``wyfy-device-gateway`` PRD (section 7, Step 3, item 2),
+``MikroTikIspHealthAdapter``'s four methods (``ping``,
+``get_dynamic_default_gateway``, ``get_pppoe_interface_status``,
+``get_interface_traffic_counters``) now call
+``wyfy_device_gateway.registry.get_adapter(DeviceVendor.MIKROTIK)``
+instead of opening ``librouteros`` directly -- that package is a straight
+port of this module's own four ``_*_sync`` methods (same RouterOS
+commands, same PPPoE stale-interface-name single-candidate fallback,
+same never-filtered-by-interface dynamic-gateway lookup). ``ping`` is the
+same gateway method ``network_diagnostics/device_adapters.py`` also
+delegates to -- both call sites issue the identical real ``/tool/ping``
+command. Public signatures/return shapes are unchanged; the gateway's
+``MikroTikConnectionError``/``MikroTikDeviceError`` distinction is
+translated back into this domain's own
+``IspDeviceConnectionError``/``IspDeviceOperationError`` pair.
+
 ## Traffic load: raw counters here, rate computed in ``service.py``
 
 ``get_interface_traffic_counters`` reads ``/interface``'s own
@@ -100,14 +118,15 @@ encapsulation overhead and any other traffic sharing that port).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from dataclasses import dataclass
 from typing import Protocol
 
-import librouteros
-from librouteros.exceptions import LibRouterosError
+from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
+from wyfy_device_gateway.contract import DeviceVendor
+from wyfy_device_gateway.mikrotik_adapter import MikroTikConnectionError, MikroTikDeviceError
+from wyfy_device_gateway.registry import get_adapter
 
 from .exceptions import (
     IspDeviceConnectionError,
@@ -208,10 +227,22 @@ class BaseIspHealthAdapter(Protocol):
 
 
 class MikroTikIspHealthAdapter:
-    """See module docstring for the full "real client code, untested
-    end-to-end here" write-up."""
+    """See module docstring for the "now delegates to wyfy-device-gateway"
+    write-up."""
 
     vendor = "mikrotik"
+
+    def _gateway_credentials(
+        self, credentials: IspCredentials
+    ) -> _GatewayDeviceCredentials:
+        return _GatewayDeviceCredentials(
+            vendor=DeviceVendor.MIKROTIK,
+            host=credentials.host,
+            username=credentials.username,
+            secret=credentials.password,
+            port=credentials.api_port,
+            timeout_seconds=credentials.timeout_seconds,
+        )
 
     async def ping(
         self,
@@ -221,150 +252,66 @@ class MikroTikIspHealthAdapter:
         count: int,
         timeout_seconds: int,
     ) -> PingResult:
-        return await asyncio.to_thread(
-            self._ping_sync, credentials, target_ip, count, timeout_seconds
-        )
-
-    def _connect_api(self, credentials: IspCredentials):  # noqa: ANN202
+        creds = self._gateway_credentials(credentials)
         try:
-            return librouteros.connect(
-                host=credentials.host,
-                username=credentials.username,
-                password=credentials.password,
-                port=credentials.api_port,
-                timeout=credentials.timeout_seconds,
+            result = await get_adapter(DeviceVendor.MIKROTIK).ping(
+                creds, target=target_ip, count=count, timeout_seconds=timeout_seconds
             )
-        except (LibRouterosError, OSError) as exc:
-            raise IspDeviceConnectionError(credentials.host, str(exc)) from exc
-
-    def _ping_sync(
-        self,
-        credentials: IspCredentials,
-        target_ip: str,
-        count: int,
-        timeout_seconds: int,
-    ) -> PingResult:
-        api = self._connect_api(credentials)
-        try:
-            rows = list(api("/tool/ping", address=target_ip, count=str(count)))
-        except LibRouterosError as exc:
-            raise IspDeviceOperationError("ping", str(exc)) from exc
-        finally:
-            api.close()
-        return _parse_ping_rows(rows, requested_count=count)
+        except MikroTikConnectionError as exc:
+            raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise IspDeviceOperationError("ping", exc.detail) from exc
+        return PingResult(
+            sent=result.sent,
+            received=result.received,
+            packet_loss_percentage=result.packet_loss_percentage,
+            avg_rtt_ms=result.avg_rtt_ms,
+        )
 
     async def get_dynamic_default_gateway(
         self, credentials: IspCredentials
     ) -> str | None:
-        return await asyncio.to_thread(
-            self._get_dynamic_default_gateway_sync, credentials
-        )
-
-    def _get_dynamic_default_gateway_sync(
-        self, credentials: IspCredentials
-    ) -> str | None:
-        api = self._connect_api(credentials)
+        creds = self._gateway_credentials(credentials)
         try:
-            # `/ip/route` is a real menu (not a one-shot command like
-            # `/tool/ping`), so this uses the same `.path(*segments)` +
-            # client-side filter form `MikroTikQueueAdapter
-            # ._read_status_sync` already establishes -- a router's own
-            # routing table is small, so a full print + filter is a real,
-            # correct, easily-testable-via-fake-transport choice, not a
-            # shortcut. See module docstring for why this is never
-            # filtered by interface.
-            rows = list(api.path("ip", "route"))
-        except LibRouterosError as exc:
+            return await get_adapter(DeviceVendor.MIKROTIK).get_dynamic_default_gateway(
+                creds
+            )
+        except MikroTikConnectionError as exc:
+            raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
             raise IspDeviceOperationError(
-                "read_dynamic_default_route", str(exc)
+                "read_dynamic_default_route", exc.detail
             ) from exc
-        finally:
-            api.close()
-        for row in rows:
-            if (
-                row.get("dst-address") == "0.0.0.0/0"
-                and str(row.get("dynamic", "false")).lower() == "true"
-            ):
-                gateway = row.get("gateway")
-                return str(gateway) if gateway else None
-        return None
 
     async def get_pppoe_interface_status(
         self, credentials: IspCredentials, *, interface_name: str
     ) -> bool:
-        return await asyncio.to_thread(
-            self._get_pppoe_interface_status_sync, credentials, interface_name
-        )
-
-    def _get_pppoe_interface_status_sync(
-        self, credentials: IspCredentials, interface_name: str
-    ) -> bool:
-        api = self._connect_api(credentials)
+        creds = self._gateway_credentials(credentials)
         try:
-            rows = list(api.path("interface", "pppoe-client"))
-        except LibRouterosError as exc:
+            return await get_adapter(DeviceVendor.MIKROTIK).get_pppoe_interface_status(
+                creds, interface_name=interface_name
+            )
+        except MikroTikConnectionError as exc:
+            raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
             raise IspDeviceOperationError(
-                "read_pppoe_interface_status", str(exc)
+                "read_pppoe_interface_status", exc.detail
             ) from exc
-        finally:
-            api.close()
-        row = next((r for r in rows if r.get("name") == interface_name), None)
-        if row is None and len(rows) == 1:
-            # Exact-name miss but exactly one real PPPoE client interface
-            # exists on this router -- almost certainly the same
-            # interface under a name this platform's own stored
-            # `IspLink.interface` hasn't caught up with (renamed directly
-            # on the router). See module docstring: a real, expected
-            # staleness case, not guessed data -- we still read that one
-            # real interface's own live state, never fabricate a result.
-            logger.warning(
-                "isp_pppoe_interface_name_mismatch_fallback",
-                extra={
-                    "requested_interface": interface_name,
-                    "actual_interface": rows[0].get("name"),
-                },
-            )
-            row = rows[0]
-        if row is None:
-            raise IspDeviceOperationError(
-                "read_pppoe_interface_status",
-                f"no PPPoE client interface named '{interface_name}' found "
-                f"(and {len(rows)} candidates exist, too ambiguous to guess)",
-            )
-        running = str(row.get("running", "false")).lower() == "true"
-        disabled = str(row.get("disabled", "false")).lower() == "true"
-        return running and not disabled
 
     async def get_interface_traffic_counters(
         self, credentials: IspCredentials, *, interface_name: str
     ) -> tuple[int, int] | None:
-        return await asyncio.to_thread(
-            self._get_interface_traffic_counters_sync, credentials, interface_name
-        )
-
-    def _get_interface_traffic_counters_sync(
-        self, credentials: IspCredentials, interface_name: str
-    ) -> tuple[int, int] | None:
-        api = self._connect_api(credentials)
+        creds = self._gateway_credentials(credentials)
         try:
-            # `/interface` (real menu, same `.path(*segments)` + client-
-            # side filter form as the two lookups above) -- every real
-            # interface row RouterOS returns already carries its own
-            # cumulative `rx-byte`/`tx-byte` counters, no separate
-            # "stats" mode needed over the API.
-            rows = list(api.path("interface"))
-        except LibRouterosError as exc:
+            return await get_adapter(
+                DeviceVendor.MIKROTIK
+            ).get_interface_traffic_counters(creds, interface_name=interface_name)
+        except MikroTikConnectionError as exc:
+            raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
             raise IspDeviceOperationError(
-                "read_interface_traffic_counters", str(exc)
+                "read_interface_traffic_counters", exc.detail
             ) from exc
-        finally:
-            api.close()
-        row = next((r for r in rows if r.get("name") == interface_name), None)
-        if row is None:
-            return None
-        rx_bytes = _safe_int(row.get("rx-byte"), default=0)
-        tx_bytes = _safe_int(row.get("tx-byte"), default=0)
-        return rx_bytes, tx_bytes
 
 
 def _parse_ping_rows(

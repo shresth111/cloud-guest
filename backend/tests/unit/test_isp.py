@@ -36,6 +36,7 @@ from app.domains.isp.constants import (
 from app.domains.isp.device_adapters import IspCredentials, PingResult
 from app.domains.isp.exceptions import (
     CrossOrganizationIspLinkAccessError,
+    IspDeviceConnectionError,
     IspHealthCheckTargetUnavailableError,
     IspLinkDisabledError,
     IspLinkNotFoundError,
@@ -1271,6 +1272,68 @@ class TestHealthCheckSweep:
         assert summary.errors == 1
         assert summary.skipped == 1
         assert good_link.health_status == HealthStatus.HEALTHY.value
+
+    async def test_sweep_records_unhealthy_when_router_is_genuinely_unreachable(
+        self,
+    ) -> None:
+        """Confirmed live, real bug: a router that goes completely
+        unreachable (e.g. its WAN uplink -- which its own management
+        tunnel also rides -- is pulled) used to fall into the same
+        skip-and-log branch as a missing-credentials config error, so its
+        link's `last_checked_at`/`health_status` froze at its last
+        successful reading *forever*, indistinguishable from a router
+        checked seconds ago and genuinely healthy. A real connection
+        failure must now flow through the same recording pipeline a real
+        failed ping would, landing on `UNHEALTHY` with a real, current
+        `last_checked_at` and an incremented consecutive-failure count --
+        not a silent skip."""
+        repository = FakeIspRepository()
+        router_lookup = FakeRouterLookup()
+        router = router_lookup.add(_make_router())
+
+        link = IspLink(
+            **_base_fields(
+                router_id=router.id,
+                organization_id=router.organization_id,
+                location_id=router.location_id,
+                provider_name="Airtel",
+                link_type=IspLinkType.FIBER.value,
+                connection_mode=IspConnectionMode.STATIC.value,
+                role=IspLinkRole.PRIMARY.value,
+                is_active_uplink=True,
+                auto_failback=True,
+                is_enabled=True,
+                priority=0,
+                interface=None,
+                gateway_ip_address="203.0.113.20",
+                dns_primary=None,
+                dns_secondary=None,
+                download_bandwidth_mbps=None,
+                upload_bandwidth_mbps=None,
+                health_status=HealthStatus.HEALTHY.value,
+                latency_ms=1.2,
+                packet_loss_percentage=0.0,
+                last_checked_at=None,
+                consecutive_unhealthy_count=0,
+            )
+        )
+        repository.links[link.id] = link
+
+        adapter = FakeIspHealthAdapter(
+            should_raise=IspDeviceConnectionError(router.management_ip_address, "no route to host")
+        )
+        summary = await run_health_check_sweep(
+            repository,
+            router_lookup,
+            device_adapter_resolver=lambda vendor: adapter,
+        )
+
+        assert summary.checked == 1
+        assert summary.errors == 0
+        assert summary.skipped == 0
+        assert link.health_status == HealthStatus.UNHEALTHY.value
+        assert link.last_checked_at is not None
+        assert link.consecutive_unhealthy_count == 1
 
 
 # ============================================================================

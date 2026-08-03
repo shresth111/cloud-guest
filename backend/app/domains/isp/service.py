@@ -83,6 +83,8 @@ from .events import (
 )
 from .exceptions import (
     CrossOrganizationIspLinkAccessError,
+    IspDeviceConnectionError,
+    IspDeviceOperationError,
     IspHealthCheckTargetUnavailableError,
     IspLinkDisabledError,
     IspLinkNotFoundError,
@@ -934,7 +936,37 @@ async def run_health_check_sweep(
             skipped += 1
             continue
         try:
-            ping_result = await service.ping_link(link)
+            try:
+                ping_result = await service.ping_link(link)
+            except (
+                IspDeviceConnectionError,
+                IspDeviceOperationError,
+                IspHealthCheckTargetUnavailableError,
+            ) as exc:
+                # A router that has gone genuinely unreachable (the exact
+                # case this sweep exists to catch -- confirmed live: a WAN
+                # uplink pulled on the one real test router left this
+                # link's `last_checked_at`/`health_status` frozen at its
+                # last successful check *forever*, since this branch used
+                # to just log-and-skip like the missing-credentials/
+                # unsupported-vendor config-error case below, never
+                # reaching `record_health_check_result` at all -- a link
+                # whose router is completely gone looked identical to one
+                # checked seconds ago and genuinely healthy) is real
+                # information about this link's own health, not a reason
+                # to skip recording anything. Synthesize the worst-case
+                # `PingResult` `classify_health_status` already treats as
+                # `UNHEALTHY` (see its own docstring: a missing reading is
+                # never silently "fine") and let it flow through the exact
+                # same recording/consecutive-count/failover pipeline a
+                # real failed ping would.
+                logger.warning(
+                    "isp_health_check_link_unreachable",
+                    extra={"isp_link_id": str(link.id), "error": str(exc)},
+                )
+                ping_result = PingResult(
+                    sent=1, received=0, packet_loss_percentage=100.0, avg_rtt_ms=None
+                )
             traffic = await service.safe_sample_link_traffic(link)
             before_active = link.is_active_uplink
             before_role = link.role
@@ -954,7 +986,12 @@ async def run_health_check_sweep(
                 and updated.is_active_uplink
             ):
                 failbacks += 1
-        except Exception as exc:  # noqa: BLE001 -- per-link isolation, see docstring
+        except Exception as exc:  # noqa: BLE001 -- genuine config errors (missing
+            # credentials, unsupported vendor) stay skip-only: there is no
+            # live device state to record a health *reading* against, and
+            # retrying every sweep tick would just repeat the same log line
+            # until an admin fixes the configuration -- see per-link
+            # isolation docstring above.
             errors += 1
             logger.warning(
                 "isp_health_check_sweep_link_failed",
