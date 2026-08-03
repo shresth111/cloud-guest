@@ -477,6 +477,9 @@ async def get_isp_link_health_check_summary(
                 uptime_percentage=b.uptime_percentage,
                 avg_latency_ms=b.avg_latency_ms,
                 avg_packet_loss_percentage=b.avg_packet_loss_percentage,
+                avg_download_mbps=b.avg_download_mbps,
+                avg_upload_mbps=b.avg_upload_mbps,
+                max_download_mbps=b.max_download_mbps,
             )
             for b in buckets
         ],

@@ -280,6 +280,12 @@ class FakeIspRepository:
                 for c in bucket_checks
                 if c.packet_loss_percentage is not None
             ]
+            downloads = [
+                c.download_mbps for c in bucket_checks if c.download_mbps is not None
+            ]
+            uploads = [
+                c.upload_mbps for c in bucket_checks if c.upload_mbps is not None
+            ]
             rows.append(
                 (
                     bucket_start,
@@ -289,6 +295,9 @@ class FakeIspRepository:
                     unhealthy,
                     sum(latencies) / len(latencies) if latencies else None,
                     sum(losses) / len(losses) if losses else None,
+                    sum(downloads) / len(downloads) if downloads else None,
+                    sum(uploads) / len(uploads) if uploads else None,
+                    max(downloads) if downloads else None,
                 )
             )
         return rows
@@ -870,6 +879,96 @@ class TestHealthCheckDateRangeAndSummary:
         assert bucket.healthy_count == 1
         assert bucket.unhealthy_count == 1
         assert bucket.uptime_percentage == 50.0
+
+    async def test_summary_buckets_compute_mbps_aggregates_null_safely(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        base = _now() - timedelta(hours=2)
+        # Two real traffic samples in the same hour bucket -- avg/max
+        # should reflect only these two real numbers.
+        await h.repository.create_health_check(
+            isp_link_id=link.id,
+            checked_at=base,
+            status=HealthStatus.HEALTHY.value,
+            source="automated",
+            latency_ms=10.0,
+            packet_loss_percentage=0.0,
+            error_message=None,
+            download_mbps=20.0,
+            upload_mbps=5.0,
+        )
+        await h.repository.create_health_check(
+            isp_link_id=link.id,
+            checked_at=base + timedelta(minutes=1),
+            status=HealthStatus.HEALTHY.value,
+            source="automated",
+            latency_ms=10.0,
+            packet_loss_percentage=0.0,
+            error_message=None,
+            download_mbps=40.0,
+            upload_mbps=15.0,
+        )
+        # A third check in the same bucket where the health check itself
+        # failed -- no traffic sample was possible, so both are None.
+        # This row must NOT drag the average down toward 0.
+        await h.repository.create_health_check(
+            isp_link_id=link.id,
+            checked_at=base + timedelta(minutes=2),
+            status=HealthStatus.UNHEALTHY.value,
+            source="automated",
+            latency_ms=None,
+            packet_loss_percentage=100.0,
+            error_message="timeout",
+            download_mbps=None,
+            upload_mbps=None,
+        )
+        bucket_unit, buckets = await h.service.get_health_check_summary(
+            link.id,
+            requesting_organization_id=router.organization_id,
+            start=base - timedelta(hours=1),
+            end=_now(),
+        )
+        assert bucket_unit == "hour"
+        matching = [b for b in buckets if b.total_checks > 0]
+        assert len(matching) == 1
+        bucket = matching[0]
+        assert bucket.total_checks == 3
+        # (20 + 40) / 2, never (20 + 40 + 0) / 3.
+        assert bucket.avg_download_mbps == 30.0
+        assert bucket.avg_upload_mbps == 10.0
+        assert bucket.max_download_mbps == 40.0
+
+    async def test_summary_bucket_reports_null_mbps_when_every_check_failed(
+        self,
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        base = _now() - timedelta(hours=2)
+        await h.repository.create_health_check(
+            isp_link_id=link.id,
+            checked_at=base,
+            status=HealthStatus.UNHEALTHY.value,
+            source="automated",
+            latency_ms=None,
+            packet_loss_percentage=100.0,
+            error_message="timeout",
+            download_mbps=None,
+            upload_mbps=None,
+        )
+        bucket_unit, buckets = await h.service.get_health_check_summary(
+            link.id,
+            requesting_organization_id=router.organization_id,
+            start=base - timedelta(hours=1),
+            end=_now(),
+        )
+        matching = [b for b in buckets if b.total_checks > 0]
+        assert len(matching) == 1
+        bucket = matching[0]
+        assert bucket.avg_download_mbps is None
+        assert bucket.avg_upload_mbps is None
+        assert bucket.max_download_mbps is None
 
     async def test_summary_buckets_by_day_beyond_a_week(self) -> None:
         h = make_harness()

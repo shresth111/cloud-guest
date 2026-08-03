@@ -194,7 +194,13 @@ class HealthCheckBucket:
     history dialog's uptime-chart row. ``uptime_percentage`` mirrors
     ``compute_availability_percentage``'s own "HEALTHY or DEGRADED counts
     as up" definition, just computed per bucket instead of over the whole
-    fetched page."""
+    fetched page.
+
+    ``avg_download_mbps``/``avg_upload_mbps``/``max_download_mbps`` are
+    the same bandwidth-history view's Mbps aggregates -- ``None`` for any
+    bucket where every health check in that window failed to produce a
+    traffic sample (never a fabricated ``0``), exactly like
+    ``IspHealthCheck.download_mbps``/``upload_mbps`` themselves."""
 
     bucket_start: datetime
     total_checks: int
@@ -204,6 +210,9 @@ class HealthCheckBucket:
     uptime_percentage: float | None
     avg_latency_ms: float | None
     avg_packet_loss_percentage: float | None
+    avg_download_mbps: float | None
+    avg_upload_mbps: float | None
+    max_download_mbps: float | None
 
 
 # ============================================================================
@@ -458,8 +467,28 @@ class IspService:
                 avg_packet_loss_percentage=(
                     round(avg_loss, 2) if avg_loss is not None else None
                 ),
+                avg_download_mbps=(
+                    round(avg_download, 2) if avg_download is not None else None
+                ),
+                avg_upload_mbps=(
+                    round(avg_upload, 2) if avg_upload is not None else None
+                ),
+                max_download_mbps=(
+                    round(max_download, 2) if max_download is not None else None
+                ),
             )
-            for bucket_start, total, healthy, degraded, unhealthy, avg_latency, avg_loss in rows
+            for (
+                bucket_start,
+                total,
+                healthy,
+                degraded,
+                unhealthy,
+                avg_latency,
+                avg_loss,
+                avg_download,
+                avg_upload,
+                max_download,
+            ) in rows
         ]
         return bucket_unit, buckets
 

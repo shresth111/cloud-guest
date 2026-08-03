@@ -90,7 +90,20 @@ class IspRepositoryProtocol(Protocol):
         start: datetime,
         end: datetime,
         bucket_unit: str,
-    ) -> list[tuple[datetime, int, int, int, int, float | None, float | None]]: ...
+    ) -> list[
+        tuple[
+            datetime,
+            int,
+            int,
+            int,
+            int,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+        ]
+    ]: ...
 
 
 class IspRepository:
@@ -254,15 +267,34 @@ class IspRepository:
         start: datetime,
         end: datetime,
         bucket_unit: str,
-    ) -> list[tuple[datetime, int, int, int, int, float | None, float | None]]:
+    ) -> list[
+        tuple[
+            datetime,
+            int,
+            int,
+            int,
+            int,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+        ]
+    ]:
         """One aggregated ``(bucket_start, total, healthy, degraded,
-        unhealthy, avg_latency_ms, avg_packet_loss_percentage)`` row per
+        unhealthy, avg_latency_ms, avg_packet_loss_percentage,
+        avg_download_mbps, avg_upload_mbps, max_download_mbps)`` row per
         real ``bucket_unit`` ("hour"/"day") time bucket in ``[start,
         end]`` that has at least one health-check row -- the query behind
-        the "Internet Connection" history dialog's uptime chart. SQL does
-        the aggregation so a 30-day window at the sweep's real 60-second
+        the "Internet Connection" history dialog's uptime chart (and, for
+        the new Mbps columns, its bandwidth-history view). SQL does the
+        aggregation so a 30-day window at the sweep's real 60-second
         cadence (tens of thousands of rows) comes back as ~30 rows, never
-        as individual checks."""
+        as individual checks. The Mbps aggregates are computed with plain
+        SQL ``AVG``/``MAX``, which already skip ``NULL`` rows (ticks where
+        the health check itself failed and no traffic sample could be
+        taken) -- a bucket where every check failed reports ``NULL``
+        (surfaced as ``None`` below), never a fabricated ``0``."""
         bucket = func.date_trunc(bucket_unit, IspHealthCheck.checked_at)
         healthy_expr = func.sum(
             case((IspHealthCheck.status == HealthStatus.HEALTHY.value, 1), else_=0)
@@ -282,6 +314,9 @@ class IspRepository:
                 unhealthy_expr.label("unhealthy"),
                 func.avg(IspHealthCheck.latency_ms).label("avg_latency"),
                 func.avg(IspHealthCheck.packet_loss_percentage).label("avg_loss"),
+                func.avg(IspHealthCheck.download_mbps).label("avg_download"),
+                func.avg(IspHealthCheck.upload_mbps).label("avg_upload"),
+                func.max(IspHealthCheck.download_mbps).label("max_download"),
             )
             .where(
                 IspHealthCheck.is_deleted.is_(False),
@@ -302,6 +337,9 @@ class IspRepository:
                 int(row.unhealthy),
                 float(row.avg_latency) if row.avg_latency is not None else None,
                 float(row.avg_loss) if row.avg_loss is not None else None,
+                float(row.avg_download) if row.avg_download is not None else None,
+                float(row.avg_upload) if row.avg_upload is not None else None,
+                float(row.max_download) if row.max_download is not None else None,
             )
             for row in result.all()
         ]

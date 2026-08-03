@@ -172,6 +172,13 @@ class IspHealthCheckBucketResponse(BaseModel):
     uptime_percentage: float | None
     avg_latency_ms: float | None
     avg_packet_loss_percentage: float | None
+    # Real traffic-load aggregates for this same bucket -- AVG/MAX over
+    # IspHealthCheck.download_mbps/upload_mbps, NULL-safe (a bucket where
+    # every check failed reports null, never a fabricated 0). Backs the
+    # history dialog's bandwidth view.
+    avg_download_mbps: float | None
+    avg_upload_mbps: float | None
+    max_download_mbps: float | None
 
 
 class IspHealthCheckSummaryResponse(BaseModel):
