@@ -55,7 +55,7 @@ import dataclasses
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
@@ -162,6 +162,25 @@ class TrafficCounters:
 
     rx_bytes: int
     tx_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class HealthCheckBucket:
+    """One aggregated time bucket from ``IspRepository
+    .bucketed_health_checks_for_link`` -- the "Internet Connection"
+    history dialog's uptime-chart row. ``uptime_percentage`` mirrors
+    ``compute_availability_percentage``'s own "HEALTHY or DEGRADED counts
+    as up" definition, just computed per bucket instead of over the whole
+    fetched page."""
+
+    bucket_start: datetime
+    total_checks: int
+    healthy_count: int
+    degraded_count: int
+    unhealthy_count: int
+    uptime_percentage: float | None
+    avg_latency_ms: float | None
+    avg_packet_loss_percentage: float | None
 
 
 # ============================================================================
@@ -361,15 +380,65 @@ class IspService:
         requesting_organization_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> tuple[list[IspHealthCheck], object]:
         """Verifies tenant ownership of the link first (via ``get_link``),
-        then returns its paginated health-check history."""
+        then returns its paginated health-check history, optionally
+        scoped to ``[start, end]``. Both filters are additive and default
+        to ``None`` (no range restriction) so every existing caller keeps
+        its current "just the most recent page" behavior unchanged."""
         await self.get_link(
             link_id, requesting_organization_id=requesting_organization_id
         )
         return await self.repository.list_health_checks_for_link(
-            link_id, page=page, page_size=page_size
+            link_id, page=page, page_size=page_size, start=start, end=end
         )
+
+    # Hourly buckets stay legible through a full week (<=168 bars);
+    # anything longer than that (up to the history dialog's 30-day cap)
+    # switches to daily buckets (<=31 bars) instead of rendering
+    # 168-720+ bars for a "30 days" selection.
+    _HOURLY_BUCKET_MAX_SPAN = timedelta(days=7)
+
+    async def get_health_check_summary(
+        self,
+        link_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+    ) -> tuple[str, list[HealthCheckBucket]]:
+        """Time-bucketed uptime/latency summary for the history dialog's
+        chart -- real SQL-side aggregation
+        (``IspRepository.bucketed_health_checks_for_link``), never
+        individual rows, so a 30-day window at the sweep's real 60-second
+        cadence (~43k rows per link) comes back as ~30 aggregated rows."""
+        await self.get_link(
+            link_id, requesting_organization_id=requesting_organization_id
+        )
+        bucket_unit = "hour" if (end - start) <= self._HOURLY_BUCKET_MAX_SPAN else "day"
+        rows = await self.repository.bucketed_health_checks_for_link(
+            link_id, start=start, end=end, bucket_unit=bucket_unit
+        )
+        buckets = [
+            HealthCheckBucket(
+                bucket_start=bucket_start,
+                total_checks=total,
+                healthy_count=healthy,
+                degraded_count=degraded,
+                unhealthy_count=unhealthy,
+                uptime_percentage=(
+                    round(100.0 * (total - unhealthy) / total, 2) if total else None
+                ),
+                avg_latency_ms=round(avg_latency, 2) if avg_latency is not None else None,
+                avg_packet_loss_percentage=(
+                    round(avg_loss, 2) if avg_loss is not None else None
+                ),
+            )
+            for bucket_start, total, healthy, degraded, unhealthy, avg_latency, avg_loss in rows
+        ]
+        return bucket_unit, buckets
 
     async def check_link_health(
         self,

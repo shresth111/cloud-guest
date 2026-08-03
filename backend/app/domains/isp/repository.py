@@ -13,15 +13,17 @@ enabled link, across every router/organization" query).
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Protocol
 
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
-from app.database.utils.pagination import PaginationMeta
+from app.database.utils.pagination import PageParams, PaginationMeta
 
-from .constants import IspLinkRole
+from .constants import HealthStatus, IspLinkRole
 from .models import IspHealthCheck, IspLink
 
 
@@ -73,11 +75,22 @@ class IspRepositoryProtocol(Protocol):
         *,
         page: int,
         page_size: int,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> tuple[list[IspHealthCheck], PaginationMeta]: ...
 
     async def list_recent_health_checks_for_link(
         self, link_id: uuid.UUID, *, limit: int
     ) -> list[IspHealthCheck]: ...
+
+    async def bucketed_health_checks_for_link(
+        self,
+        link_id: uuid.UUID,
+        *,
+        start: datetime,
+        end: datetime,
+        bucket_unit: str,
+    ) -> list[tuple[datetime, int, int, int, int, float | None, float | None]]: ...
 
 
 class IspRepository:
@@ -177,14 +190,46 @@ class IspRepository:
         *,
         page: int,
         page_size: int,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> tuple[list[IspHealthCheck], PaginationMeta]:
-        return await self.health_checks.paginate(
-            page=page,
-            page_size=page_size,
-            filters={"isp_link_id": link_id},
-            sort_by="checked_at",
-            sort_order=SortOrder.DESC,
+        if start is None and end is None:
+            return await self.health_checks.paginate(
+                page=page,
+                page_size=page_size,
+                filters={"isp_link_id": link_id},
+                sort_by="checked_at",
+                sort_order=SortOrder.DESC,
+            )
+        # A ``start``/``end`` range needs a ``>=``/``<=`` comparison --
+        # ``GenericRepository.paginate``'s ``filters`` dict only ever
+        # expresses equality/IN (see ``app.database.utils.filters
+        # .apply_filters``), so this one call is hand-rolled directly
+        # against the model, same "small, hand-written escape hatch"
+        # precedent this file's own module docstring already flags for
+        # the sweep's own cross-router query above.
+        conditions = [
+            IspHealthCheck.is_deleted.is_(False),
+            IspHealthCheck.isp_link_id == link_id,
+        ]
+        if start is not None:
+            conditions.append(IspHealthCheck.checked_at >= start)
+        if end is not None:
+            conditions.append(IspHealthCheck.checked_at <= end)
+        params = PageParams(page=page, page_size=page_size)
+        count_statement = select(func.count()).select_from(IspHealthCheck).where(*conditions)
+        total_result = await self.session.execute(count_statement)
+        total_items = int(total_result.scalar_one())
+        statement = (
+            select(IspHealthCheck)
+            .where(*conditions)
+            .order_by(IspHealthCheck.checked_at.desc())
+            .limit(params.page_size)
+            .offset(params.offset)
         )
+        result = await self.session.execute(statement)
+        rows = list(result.scalars().all())
+        return rows, PaginationMeta.from_total(params, total_items)
 
     async def list_recent_health_checks_for_link(
         self, link_id: uuid.UUID, *, limit: int
@@ -201,6 +246,65 @@ class IspRepository:
             sort_order=SortOrder.DESC,
             limit=limit,
         )
+
+    async def bucketed_health_checks_for_link(
+        self,
+        link_id: uuid.UUID,
+        *,
+        start: datetime,
+        end: datetime,
+        bucket_unit: str,
+    ) -> list[tuple[datetime, int, int, int, int, float | None, float | None]]:
+        """One aggregated ``(bucket_start, total, healthy, degraded,
+        unhealthy, avg_latency_ms, avg_packet_loss_percentage)`` row per
+        real ``bucket_unit`` ("hour"/"day") time bucket in ``[start,
+        end]`` that has at least one health-check row -- the query behind
+        the "Internet Connection" history dialog's uptime chart. SQL does
+        the aggregation so a 30-day window at the sweep's real 60-second
+        cadence (tens of thousands of rows) comes back as ~30 rows, never
+        as individual checks."""
+        bucket = func.date_trunc(bucket_unit, IspHealthCheck.checked_at)
+        healthy_expr = func.sum(
+            case((IspHealthCheck.status == HealthStatus.HEALTHY.value, 1), else_=0)
+        )
+        degraded_expr = func.sum(
+            case((IspHealthCheck.status == HealthStatus.DEGRADED.value, 1), else_=0)
+        )
+        unhealthy_expr = func.sum(
+            case((IspHealthCheck.status == HealthStatus.UNHEALTHY.value, 1), else_=0)
+        )
+        statement = (
+            select(
+                bucket.label("bucket_start"),
+                func.count().label("total"),
+                healthy_expr.label("healthy"),
+                degraded_expr.label("degraded"),
+                unhealthy_expr.label("unhealthy"),
+                func.avg(IspHealthCheck.latency_ms).label("avg_latency"),
+                func.avg(IspHealthCheck.packet_loss_percentage).label("avg_loss"),
+            )
+            .where(
+                IspHealthCheck.is_deleted.is_(False),
+                IspHealthCheck.isp_link_id == link_id,
+                IspHealthCheck.checked_at >= start,
+                IspHealthCheck.checked_at <= end,
+            )
+            .group_by(bucket)
+            .order_by(bucket.asc())
+        )
+        result = await self.session.execute(statement)
+        return [
+            (
+                row.bucket_start,
+                int(row.total),
+                int(row.healthy),
+                int(row.degraded),
+                int(row.unhealthy),
+                float(row.avg_latency) if row.avg_latency is not None else None,
+                float(row.avg_loss) if row.avg_loss is not None else None,
+            )
+            for row in result.all()
+        ]
 
 
 __all__ = ["IspRepositoryProtocol", "IspRepository"]

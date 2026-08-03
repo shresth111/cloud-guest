@@ -41,8 +41,10 @@ from .dependencies import get_isp_service
 from .models import IspHealthCheck, IspLink
 from .schemas import (
     IspFailoverRequest,
+    IspHealthCheckBucketResponse,
     IspHealthCheckListResponse,
     IspHealthCheckResponse,
+    IspHealthCheckSummaryResponse,
     IspLinkCreateRequest,
     IspLinkListResponse,
     IspLinkManualStatusRequest,
@@ -356,6 +358,13 @@ async def list_isp_link_health_checks(
     link_id: uuid.UUID,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
+    # Optional date-range filter -- both default to None (no restriction),
+    # matching every existing caller's current "just the most recent
+    # page" behavior exactly. Same param names/semantics as
+    # ``app.domains.monitoring.router``'s own ``start_date``/``end_date``
+    # on ``GET /events``.
+    start_date: datetime | None = Query(default=None),
+    end_date: datetime | None = Query(default=None),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: IspService = Depends(get_isp_service),
 ):
@@ -364,6 +373,8 @@ async def list_isp_link_health_checks(
         requesting_organization_id=requesting_organization_id,
         page=page,
         page_size=page_size,
+        start=start_date,
+        end=end_date,
     )
     availability_percentage = service.compute_availability_percentage(checks)
     payload = IspHealthCheckListResponse(
@@ -374,6 +385,57 @@ async def list_isp_link_health_checks(
     return build_response(
         success=True,
         message="ISP link health checks retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/links/{link_id}/health-checks/summary",
+    response_model=ApiResponse[IspHealthCheckSummaryResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("isp.read"))],
+)
+async def get_isp_link_health_check_summary(
+    request: Request,
+    link_id: uuid.UUID,
+    start_date: datetime = Query(...),
+    end_date: datetime = Query(...),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: IspService = Depends(get_isp_service),
+):
+    """Backs the "Internet Connection" history dialog's uptime chart for
+    its 7-day/30-day ranges -- SQL-side time-bucketed aggregation
+    (``IspService.get_health_check_summary``), never individual rows, so
+    a 30-day window at the sweep's real 60-second cadence (~43k rows per
+    link) comes back as ~30 aggregated rows instead."""
+    bucket_unit, buckets = await service.get_health_check_summary(
+        link_id,
+        requesting_organization_id=requesting_organization_id,
+        start=start_date,
+        end=end_date,
+    )
+    payload = IspHealthCheckSummaryResponse(
+        bucket_unit=bucket_unit,
+        start=start_date,
+        end=end_date,
+        buckets=[
+            IspHealthCheckBucketResponse(
+                bucket_start=b.bucket_start,
+                total_checks=b.total_checks,
+                healthy_count=b.healthy_count,
+                degraded_count=b.degraded_count,
+                unhealthy_count=b.unhealthy_count,
+                uptime_percentage=b.uptime_percentage,
+                avg_latency_ms=b.avg_latency_ms,
+                avg_packet_loss_percentage=b.avg_packet_loss_percentage,
+            )
+            for b in buckets
+        ],
+    )
+    return build_response(
+        success=True,
+        message="ISP link health check summary retrieved",
         data=payload.model_dump(),
         request_id=_request_id(request),
     )

@@ -155,6 +155,33 @@ class IspHealthCheckListResponse(BaseModel):
 
 
 # ============================================================================
+# Health-check history summary -- SQL-side time-bucketed aggregation
+# (IspService.get_health_check_summary) backing the "Internet Connection"
+# history dialog's uptime chart. Never one row per real health check --
+# see that method's own docstring for why (tens of thousands of rows at
+# the sweep's real 60-second cadence over a 30-day window).
+# ============================================================================
+
+
+class IspHealthCheckBucketResponse(BaseModel):
+    bucket_start: datetime
+    total_checks: int
+    healthy_count: int
+    degraded_count: int
+    unhealthy_count: int
+    uptime_percentage: float | None
+    avg_latency_ms: float | None
+    avg_packet_loss_percentage: float | None
+
+
+class IspHealthCheckSummaryResponse(BaseModel):
+    bucket_unit: str
+    start: datetime
+    end: datetime
+    buckets: list[IspHealthCheckBucketResponse]
+
+
+# ============================================================================
 # Failover / failback
 # ============================================================================
 

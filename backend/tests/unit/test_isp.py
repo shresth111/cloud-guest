@@ -211,9 +211,19 @@ class FakeIspRepository:
         return check
 
     async def list_health_checks_for_link(
-        self, link_id: uuid.UUID, *, page: int, page_size: int
+        self,
+        link_id: uuid.UUID,
+        *,
+        page: int,
+        page_size: int,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ):
         values = [c for c in self.health_checks.values() if c.isp_link_id == link_id]
+        if start is not None:
+            values = [c for c in values if c.checked_at >= start]
+        if end is not None:
+            values = [c for c in values if c.checked_at <= end]
         values.sort(key=lambda c: c.checked_at, reverse=True)
         params = PageParams(page=page, page_size=page_size)
         paged = values[params.offset : params.offset + params.page_size]
@@ -225,6 +235,60 @@ class FakeIspRepository:
         values = [c for c in self.health_checks.values() if c.isp_link_id == link_id]
         values.sort(key=lambda c: c.checked_at, reverse=True)
         return values[:limit]
+
+    async def bucketed_health_checks_for_link(
+        self,
+        link_id: uuid.UUID,
+        *,
+        start: datetime,
+        end: datetime,
+        bucket_unit: str,
+    ):
+        values = [
+            c
+            for c in self.health_checks.values()
+            if c.isp_link_id == link_id and start <= c.checked_at <= end
+        ]
+
+        def _bucket_key(checked_at: datetime) -> datetime:
+            truncated = checked_at.replace(minute=0, second=0, microsecond=0)
+            if bucket_unit == "day":
+                truncated = truncated.replace(hour=0)
+            return truncated
+
+        buckets: dict[datetime, list[IspHealthCheck]] = {}
+        for c in values:
+            buckets.setdefault(_bucket_key(c.checked_at), []).append(c)
+
+        rows = []
+        for bucket_start in sorted(buckets):
+            bucket_checks = buckets[bucket_start]
+            total = len(bucket_checks)
+            healthy = sum(1 for c in bucket_checks if c.status == HealthStatus.HEALTHY.value)
+            degraded = sum(
+                1 for c in bucket_checks if c.status == HealthStatus.DEGRADED.value
+            )
+            unhealthy = sum(
+                1 for c in bucket_checks if c.status == HealthStatus.UNHEALTHY.value
+            )
+            latencies = [c.latency_ms for c in bucket_checks if c.latency_ms is not None]
+            losses = [
+                c.packet_loss_percentage
+                for c in bucket_checks
+                if c.packet_loss_percentage is not None
+            ]
+            rows.append(
+                (
+                    bucket_start,
+                    total,
+                    healthy,
+                    degraded,
+                    unhealthy,
+                    sum(latencies) / len(latencies) if latencies else None,
+                    sum(losses) / len(losses) if losses else None,
+                )
+            )
+        return rows
 
 
 @dataclass
@@ -524,6 +588,155 @@ class TestHealthChecks:
         link = await _create_primary(h, router)
         with pytest.raises(IspMissingCredentialsError):
             await h.service.ping_link(link)
+
+
+# ============================================================================
+# Health-check history: date-range filter (list_health_checks) and the
+# bucketed uptime-chart summary (get_health_check_summary) -- both back the
+# "Internet Connection" history dialog's "Last 24 hours / 7 days / 30 days"
+# range picker.
+# ============================================================================
+
+
+class TestHealthCheckDateRangeAndSummary:
+    async def _seed_checks(self, h: Harness, link: IspLink, base: datetime) -> None:
+        # Two checks 3 days apart, well inside a 7-day window, one
+        # healthy and one unhealthy -- enough to prove both the
+        # date-range filter and the bucketed aggregation.
+        await h.repository.create_health_check(
+            isp_link_id=link.id,
+            checked_at=base,
+            status=HealthStatus.HEALTHY.value,
+            source="automated",
+            latency_ms=10.0,
+            packet_loss_percentage=0.0,
+            error_message=None,
+            download_mbps=None,
+            upload_mbps=None,
+        )
+        await h.repository.create_health_check(
+            isp_link_id=link.id,
+            checked_at=base + timedelta(days=3),
+            status=HealthStatus.UNHEALTHY.value,
+            source="automated",
+            latency_ms=None,
+            packet_loss_percentage=100.0,
+            error_message="timeout",
+            download_mbps=None,
+            upload_mbps=None,
+        )
+        # A third check well outside the [base, base+3d] window used
+        # below -- proves the range filter actually excludes it.
+        await h.repository.create_health_check(
+            isp_link_id=link.id,
+            checked_at=base - timedelta(days=10),
+            status=HealthStatus.HEALTHY.value,
+            source="automated",
+            latency_ms=8.0,
+            packet_loss_percentage=0.0,
+            error_message=None,
+            download_mbps=None,
+            upload_mbps=None,
+        )
+
+    async def test_list_health_checks_start_end_filters_are_additive(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        base = _now() - timedelta(days=5)
+        await self._seed_checks(h, link, base)
+
+        # No range -- every existing caller's exact current behavior,
+        # unaffected by the new optional filter.
+        checks, meta = await h.service.list_health_checks(
+            link.id, requesting_organization_id=router.organization_id, page_size=10
+        )
+        assert meta.total_items == 3
+
+        # Range -- only the two checks inside [base, base+3d].
+        ranged, ranged_meta = await h.service.list_health_checks(
+            link.id,
+            requesting_organization_id=router.organization_id,
+            page_size=10,
+            start=base,
+            end=base + timedelta(days=3),
+        )
+        assert ranged_meta.total_items == 2
+        assert {c.status for c in ranged} == {
+            HealthStatus.HEALTHY.value,
+            HealthStatus.UNHEALTHY.value,
+        }
+
+    async def test_summary_buckets_by_hour_for_a_short_span(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        base = _now() - timedelta(hours=2)
+        await h.repository.create_health_check(
+            isp_link_id=link.id,
+            checked_at=base,
+            status=HealthStatus.HEALTHY.value,
+            source="automated",
+            latency_ms=10.0,
+            packet_loss_percentage=0.0,
+            error_message=None,
+            download_mbps=None,
+            upload_mbps=None,
+        )
+        await h.repository.create_health_check(
+            isp_link_id=link.id,
+            checked_at=base + timedelta(minutes=1),
+            status=HealthStatus.UNHEALTHY.value,
+            source="automated",
+            latency_ms=None,
+            packet_loss_percentage=100.0,
+            error_message="timeout",
+            download_mbps=None,
+            upload_mbps=None,
+        )
+        bucket_unit, buckets = await h.service.get_health_check_summary(
+            link.id,
+            requesting_organization_id=router.organization_id,
+            start=base - timedelta(hours=1),
+            end=_now(),
+        )
+        assert bucket_unit == "hour"
+        # Both checks land in the same hour bucket.
+        matching = [b for b in buckets if b.total_checks > 0]
+        assert len(matching) == 1
+        bucket = matching[0]
+        assert bucket.total_checks == 2
+        assert bucket.healthy_count == 1
+        assert bucket.unhealthy_count == 1
+        assert bucket.uptime_percentage == 50.0
+
+    async def test_summary_buckets_by_day_beyond_a_week(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await _create_primary(h, router)
+        base = _now() - timedelta(days=20)
+        await self._seed_checks(h, link, base)
+        bucket_unit, buckets = await h.service.get_health_check_summary(
+            link.id,
+            requesting_organization_id=router.organization_id,
+            start=base - timedelta(days=15),
+            end=_now(),
+        )
+        assert bucket_unit == "day"
+        assert sum(b.total_checks for b in buckets) == 3
+
+    async def test_summary_requires_link_in_requesting_organization(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        other_org_id = uuid.uuid4()
+        link = await _create_primary(h, router)
+        with pytest.raises(CrossOrganizationIspLinkAccessError):
+            await h.service.get_health_check_summary(
+                link.id,
+                requesting_organization_id=other_org_id,
+                start=_now() - timedelta(days=1),
+                end=_now(),
+            )
 
 
 # ============================================================================
@@ -1344,8 +1557,10 @@ class TestHealthCheckSweep:
 class TestEveryRouteRequiresPermission:
     def test_every_isp_route_has_a_permission_dependency(self) -> None:
         # 9 original routes + POST /links/{link_id}/status (manual
-        # health-status override, see IspService.set_manual_health_status).
-        assert len(isp_router.routes) == 10
+        # health-status override, see IspService.set_manual_health_status)
+        # + GET /links/{link_id}/health-checks/summary (bucketed uptime
+        # chart, see IspService.get_health_check_summary).
+        assert len(isp_router.routes) == 11
         for route in isp_router.routes:
             assert (
                 route.dependencies != []
