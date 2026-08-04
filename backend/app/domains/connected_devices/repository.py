@@ -55,6 +55,7 @@ class ConnectedDeviceRepositoryProtocol(Protocol):
         router_id: uuid.UUID | None = None,
         location_id: uuid.UUID | None = None,
         is_active: bool | None = None,
+        guest_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
         sort_by: str = DEFAULT_SORT_FIELD,
@@ -109,6 +110,7 @@ class ConnectedDeviceRepository:
         router_id: uuid.UUID | None = None,
         location_id: uuid.UUID | None = None,
         is_active: bool | None = None,
+        guest_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
         sort_by: str = DEFAULT_SORT_FIELD,
@@ -123,6 +125,8 @@ class ConnectedDeviceRepository:
             filters["location_id"] = location_id
         if is_active is not None:
             filters["is_active"] = is_active
+        if guest_id is not None:
+            filters["guest_id"] = guest_id
         return await self.devices.paginate(
             page=page,
             page_size=page_size,

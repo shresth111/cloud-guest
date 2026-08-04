@@ -204,6 +204,7 @@ class ConnectedDeviceService:
         router_id: uuid.UUID | None = None,
         location_id: uuid.UUID | None = None,
         is_active: bool | None = None,
+        guest_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[ConnectedDevice], object]:
@@ -212,6 +213,7 @@ class ConnectedDeviceService:
             router_id=router_id,
             location_id=location_id,
             is_active=is_active,
+            guest_id=guest_id,
             page=page,
             page_size=page_size,
         )

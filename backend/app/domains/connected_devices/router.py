@@ -99,6 +99,12 @@ async def list_connected_devices(
     router_id: uuid.UUID | None = Query(default=None),
     location_id: uuid.UUID | None = Query(default=None),
     is_active: bool | None = Query(default=None),
+    # Additive, minimal filter -- mirrors the identical guest_id filter
+    # already on GET /guest-sessions (app.domains.guest.router). Lets a
+    # caller resolve "which router-level device(s) belong to this guest"
+    # directly (e.g. the customer Users page's force-disconnect action)
+    # without paging through every device at the location client-side.
+    guest_id: uuid.UUID | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
@@ -109,6 +115,7 @@ async def list_connected_devices(
         router_id=router_id,
         location_id=location_id,
         is_active=is_active,
+        guest_id=guest_id,
         page=page,
         page_size=page_size,
     )
