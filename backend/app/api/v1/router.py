@@ -41,6 +41,7 @@ from app.domains.isp.router import router as isp_router
 from app.domains.isp_routing.router import router as isp_routing_router
 from app.domains.location.router import router as location_router
 from app.domains.mac_authorization.router import router as mac_authorization_router
+from app.domains.monitored_hardware.router import router as monitored_hardware_router
 from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
 from app.domains.network_device.router import router as network_device_router
@@ -110,6 +111,7 @@ api_v1_router.include_router(hotspot_router)
 api_v1_router.include_router(qos_router)
 api_v1_router.include_router(network_diagnostics_router)
 api_v1_router.include_router(network_device_router)
+api_v1_router.include_router(monitored_hardware_router)
 api_v1_router.include_router(campaigns_guest_router)
 api_v1_router.include_router(campaigns_router)
 api_v1_router.include_router(notification_router)

@@ -385,6 +385,12 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.DELETE,
         _A.MANAGE,
     ),
+    # Monitored Hardware: plain register/list/delete for a venue's own
+    # infrastructure inventory (APs, printers, routers, cameras) -- no
+    # UPDATE/MANAGE, since this first pass has no editable field or
+    # admin-driven workflow beyond registration itself (see this domain's
+    # own module docstring).
+    PermissionModule.MONITORED_HARDWARE: (_A.CREATE, _A.READ, _A.DELETE),
     # Support Tickets: deliberately no UPDATE/DELETE -- there is no
     # dedicated "edit ticket text" action (a ticket's own subject/
     # description are immutable after creation) and tickets are closed, not
@@ -449,6 +455,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.QOS: "QoS & VOIP Priority",
     PermissionModule.NETWORK_DIAGNOSTICS: "Network Diagnostics",
     PermissionModule.NETWORK_DEVICE: "Network Device (NAC)",
+    PermissionModule.MONITORED_HARDWARE: "Monitored Hardware",
     PermissionModule.SUPPORT_TICKETS: "Support Tickets",
     PermissionModule.DEMO_REQUESTS: "Demo Requests",
 }
@@ -544,6 +551,7 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # PermissionModule.MAC_AUTHORIZATION's own entry above already
     # documents.
     PermissionModule.NETWORK_DEVICE: ScopeType.LOCATION,
+    PermissionModule.MONITORED_HARDWARE: ScopeType.LOCATION,
     # A support ticket may be org-wide or scoped to one location (see
     # app.domains.support_tickets.models's own module docstring) --
     # ScopeType.LOCATION, the identical "no mandatory location" reasoning

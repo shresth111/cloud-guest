@@ -114,6 +114,7 @@ class PermissionModule(StrEnum):
     QOS = "qos"
     NETWORK_DIAGNOSTICS = "network_diagnostics"
     NETWORK_DEVICE = "network_device"
+    MONITORED_HARDWARE = "monitored_hardware"
     SUPPORT_TICKETS = "support_tickets"
     DEVICE_CONSOLE = "device_console"
     DEMO_REQUESTS = "demo_requests"
@@ -827,6 +828,16 @@ class AuditAction(StrEnum):
         "network_device_compliance_status_changed"
     )
     NETWORK_DEVICE_DELETED = "network_device_deleted"
+
+    # Monitored Hardware domain events -- admin-registered venue hardware
+    # (Access Points, Printers, Routers, Cameras, Other) tracked for
+    # presence, distinct from NETWORK_DEVICE's NAC/compliance registry.
+    # No UPDATED action -- registration fields are immutable after
+    # creation in this first pass (delete + re-register covers edits),
+    # mirroring how narrow some of this codebase's other CRUD domains
+    # deliberately start.
+    MONITORED_HARDWARE_CREATED = "monitored_hardware_created"
+    MONITORED_HARDWARE_DELETED = "monitored_hardware_deleted"
 
     # Support Tickets domain events -- written through this same table by
     # ``app.domains.support_tickets.service.TicketService`` via the same
