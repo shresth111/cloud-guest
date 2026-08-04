@@ -106,7 +106,16 @@ def _process_logo(content: bytes) -> tuple[bytes, str, str] | None:
     try:
         img = Image.open(io.BytesIO(content))
         img.load()
-    except (UnidentifiedImageError, OSError):
+    # Pillow's own decoders raise more than just UnidentifiedImageError/
+    # OSError for a corrupt file -- confirmed live: a malformed PNG chunk
+    # raises a bare SyntaxError ("broken PNG file (chunk ...)"), which
+    # isn't a subclass of either and was propagating uncaught out of this
+    # function, crashing the whole upload request with a 500 instead of
+    # the graceful "fall back to storing the original bytes unchanged"
+    # this function's own docstring already promises. ValueError covers
+    # a couple of other known corrupt-data decode paths (e.g. truncated
+    # palette data) for the same reason.
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError):
         return None
 
     width, height = img.size
