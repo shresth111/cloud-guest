@@ -530,6 +530,19 @@ class MikroTikAdapter:
         await asyncio.to_thread(self._disconnect_device_sync, creds, mac_address)
 
     def _disconnect_device_sync(self, creds: DeviceCredentials, mac_address: str) -> None:
+        """Best-effort wireless kick, then an unconditional DHCP-lease
+        removal -- kept as two independent try/except blocks (mirroring
+        ``_list_connected_devices_sync``/``_safe_query``'s own per-menu
+        isolation) so a wired-only router (hEX lite/hEX/RB750-class, no
+        wireless package at all -- a real, confirmed deployment) doesn't
+        abort the whole operation just because the wireless menu doesn't
+        exist. Previously both steps shared one try/except here, so that
+        exact, common real hardware always failed with "no such command or
+        directory (wireless)" even though the DHCP-lease removal below --
+        the part that actually matters for a wired device -- would have
+        succeeded on its own. See
+        ``connected_devices/device_adapters.py::_disconnect_sync`` for the
+        original fix this ports."""
         api = self._connect_api(creds)
         try:
             try:
@@ -538,6 +551,12 @@ class MikroTikAdapter:
                     if normalize_mac_address(row.get("mac-address")) == mac_address:
                         wireless_menu.remove(row.get(".id"))
                         break
+            except LibRouterosError as exc:
+                logger.info(
+                    "mikrotik_disconnect_wireless_kick_unavailable",
+                    extra={"host": creds.host, "mac_address": mac_address, "detail": str(exc)},
+                )
+            try:
                 dhcp_menu = api.path("ip", "dhcp-server", "lease")
                 for row in dhcp_menu:
                     if normalize_mac_address(row.get("mac-address")) == mac_address:

@@ -1,69 +1,77 @@
 """Real device I/O adapters for the Connected Device Management domain --
 the Strategy/Adapter seam that keeps this domain's own core engine
 (``service.py``) completely vendor-agnostic, mirroring
-``app.domains.isp.device_adapters``'s identical shape (same
-``librouteros`` dependency, same "one vendor registered today" registry,
-same honest-about-being-unexercised-against-a-live-device posture).
-
-## Honest scope: real client code, never exercised end-to-end here
-
-:class:`MikroTikConnectedDeviceAdapter` issues genuine RouterOS API
-queries -- ``/ip/dhcp-server/lease``, ``/ip/arp``, and
-``/interface/wireless/registration-table`` -- via the same
-``librouteros.connect(...)`` connection this codebase's other MikroTik
-adapters already open, using the ``.path(...)`` menu-iteration form every
-other adapter (``queue_management``, ``provisioning_engine``) already
-uses -- unlike ``app.domains.isp.device_adapters``, this module never
-needs the raw ``Api.__call__`` command form, since listing a menu's rows
-is ordinary CRUD-style iteration. There is no live MikroTik device
-anywhere in this sandbox -- if actually invoked, this raises a real
-:class:`~.exceptions.ConnectedDeviceConnectionError` the moment it tries
-to open a real socket, never fabricated device data.
+``app.domains.isp.device_adapters``'s identical shape (same "one vendor
+registered today" registry, same honest-about-being-unexercised-against-
+a-live-device posture).
 
 ## Legacy wireless registration table, not CAPsMAN
 
-This adapter queries ``/interface/wireless/registration-table`` (the
-legacy wireless package). A CAPsMAN-managed deployment's own
+The underlying MikroTik implementation queries
+``/interface/wireless/registration-table`` (the legacy wireless
+package). A CAPsMAN-managed deployment's own
 ``/caps-man/registration-table`` is a real, documented gap -- a genuine
 future seam, not silently assumed equivalent.
 
 ## Merging three menus by MAC address
 
-Each of the three RouterOS menus above answers a different question
-about the same device (DHCP lease -> hostname/IP/active status; ARP ->
-IP/interface for non-DHCP devices; wireless registration table ->
-wireless-only signal/interface data). ``_merge_discovered_devices``
-merges all three by MAC address (case-insensitively, via
-``validators.normalize_mac_address``) into one
-:class:`DiscoveredDevice` per MAC -- a device present in more than one
-source is a single row, never duplicated.
+Each of three RouterOS menus (DHCP lease, ARP, wireless registration
+table) answers a different question about the same device (DHCP lease ->
+hostname/IP/active status; ARP -> IP/interface for non-DHCP devices;
+wireless registration table -> wireless-only signal/interface data) --
+merged by MAC address (case-insensitively) into one
+:class:`DiscoveredDevice` per MAC, a device present in more than one
+source is a single row, never duplicated. See
+``wyfy_device_gateway.mikrotik_adapter.MikroTikAdapter
+.list_connected_devices``/``_merge_connected_devices`` for the real
+merge logic this now delegates to.
 
 ## Disconnect: a real, but partial, action
 
-Removing a device from ``/interface/wireless/registration-table`` is a
-genuine wireless "kick" -- the client must re-associate. There is no
-equivalent forced disconnect for a *wired* client; removing its ARP/DHCP
-lease entry only prevents easy re-association on the same IP, it does
-not sever an existing wired link. This is a real, honest limitation,
+Removing a device from the wireless registration table is a genuine
+wireless "kick" -- the client must re-associate. There is no equivalent
+forced disconnect for a *wired* client; removing its ARP/DHCP lease
+entry only prevents easy re-association on the same IP, it does not
+sever an existing wired link. This is a real, honest limitation,
 documented rather than silently overstated.
+
+## Now delegates to wyfy-device-gateway
+
+Per the ``wyfy-device-gateway`` PRD (section 7, Step 3, item 3),
+``MikroTikConnectedDeviceAdapter``'s methods (``discover_devices``,
+``disconnect_device``) now call
+``wyfy_device_gateway.registry.get_adapter(DeviceVendor.MIKROTIK)``
+instead of opening ``librouteros`` directly -- that package is a
+straight port of this module's own ``_discover_sync``/
+``_merge_discovered_devices``/``_disconnect_sync`` methods, including
+the wired-only-router (no wireless package) isolation fix confirmed live
+this session: the wireless-kick attempt and the DHCP-lease removal are
+two independent try/except blocks in the gateway package too, so a
+wired-only router still successfully falls through to the real
+DHCP-lease removal even when the wireless registration-table menu
+doesn't exist at all. Public signatures/return shapes are unchanged; the
+gateway's ``MikroTikConnectionError``/``MikroTikDeviceError``
+distinction is translated back into this domain's own
+``ConnectedDeviceConnectionError``/``ConnectedDeviceOperationError``
+pair.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Protocol
 
-import librouteros
-from librouteros.exceptions import LibRouterosError
+from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
+from wyfy_device_gateway.contract import DeviceVendor
+from wyfy_device_gateway.mikrotik_adapter import MikroTikConnectionError, MikroTikDeviceError
+from wyfy_device_gateway.registry import get_adapter
 
 from .exceptions import (
     ConnectedDeviceConnectionError,
     ConnectedDeviceOperationError,
     UnsupportedConnectedDeviceVendorError,
 )
-from .validators import normalize_mac_address
 
 logger = logging.getLogger(__name__)
 
@@ -122,194 +130,63 @@ class BaseConnectedDeviceAdapter(Protocol):
 
 
 class MikroTikConnectedDeviceAdapter:
-    """See module docstring for the full "real client code, untested
-    end-to-end here" write-up."""
+    """See module docstring's "now delegates to wyfy-device-gateway"
+    write-up."""
 
     vendor = "mikrotik"
+
+    def _gateway_credentials(
+        self, credentials: DeviceCredentials
+    ) -> _GatewayDeviceCredentials:
+        return _GatewayDeviceCredentials(
+            vendor=DeviceVendor.MIKROTIK,
+            host=credentials.host,
+            username=credentials.username,
+            secret=credentials.password,
+            port=credentials.api_port,
+            timeout_seconds=credentials.timeout_seconds,
+        )
 
     async def discover_devices(
         self, credentials: DeviceCredentials
     ) -> list[DiscoveredDevice]:
-        return await asyncio.to_thread(self._discover_sync, credentials)
+        creds = self._gateway_credentials(credentials)
+        try:
+            results = await get_adapter(DeviceVendor.MIKROTIK).list_connected_devices(
+                creds
+            )
+        except MikroTikConnectionError as exc:
+            raise ConnectedDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ConnectedDeviceOperationError(
+                "discover_devices", exc.detail
+            ) from exc
+        return [
+            DiscoveredDevice(
+                mac_address=device.mac_address,
+                ip_address=device.ip_address,
+                hostname=device.hostname,
+                interface=device.interface,
+                is_wireless=device.is_wireless,
+                signal_strength_dbm=device.signal_strength_dbm,
+            )
+            for device in results
+        ]
 
     async def disconnect_device(
         self, credentials: DeviceCredentials, *, mac_address: str, interface: str | None
     ) -> None:
-        await asyncio.to_thread(
-            self._disconnect_sync, credentials, mac_address, interface
-        )
-
-    def _connect_api(self, credentials: DeviceCredentials):  # noqa: ANN202
+        creds = self._gateway_credentials(credentials)
         try:
-            return librouteros.connect(
-                host=credentials.host,
-                username=credentials.username,
-                password=credentials.password,
-                port=credentials.api_port,
-                timeout=credentials.timeout_seconds,
+            await get_adapter(DeviceVendor.MIKROTIK).disconnect_device(
+                creds, mac_address=mac_address, interface=interface
             )
-        except (LibRouterosError, OSError) as exc:
-            raise ConnectedDeviceConnectionError(credentials.host, str(exc)) from exc
-
-    def _discover_sync(self, credentials: DeviceCredentials) -> list[DiscoveredDevice]:
-        """Each menu is queried independently -- a wired-only device (e.g.
-        a hEX lite/hEX/RB750-class router with no wireless package at all,
-        a common real deployment, confirmed live this session) has no
-        ``interface wireless registration-table`` menu and previously
-        aborted the *entire* discovery with a 500 on that one missing
-        command, even though the DHCP-lease and ARP queries -- which carry
-        every wired device -- would have succeeded fine on their own."""
-        api = self._connect_api(credentials)
-        try:
-            leases = self._safe_query(api, "ip", "dhcp-server", "lease")
-            arp_entries = self._safe_query(api, "ip", "arp")
-            wireless_entries = self._safe_query(api, "interface", "wireless", "registration-table")
-        finally:
-            api.close()
-        return _merge_discovered_devices(leases, arp_entries, wireless_entries)
-
-    def _safe_query(self, api, *path: str) -> list[dict[str, object]]:  # noqa: ANN001
-        try:
-            return list(api.path(*path))
-        except LibRouterosError as exc:
-            logger.info(
-                "connected_devices_menu_unavailable",
-                extra={"menu": "/".join(path), "detail": str(exc)},
-            )
-            return []
-
-    def _disconnect_sync(
-        self,
-        credentials: DeviceCredentials,
-        mac_address: str,
-        interface: str | None,
-    ) -> None:
-        """Best-effort wireless kick, then an unconditional DHCP-lease
-        removal -- kept as two independent steps (mirroring
-        ``_discover_sync``/``_safe_query``'s own per-menu isolation) so a
-        wired-only device (hEX lite/hEX/RB750-class, no wireless package
-        at all -- confirmed live this session) doesn't abort the whole
-        operation on the wireless menu simply not existing. Previously
-        both steps shared one try/except, so that exact, common real
-        hardware always failed here with "no such command or directory
-        (wireless)" even though the DHCP-lease removal below -- the part
-        that actually matters for a wired device -- would have succeeded
-        on its own."""
-        api = self._connect_api(credentials)
-        try:
-            try:
-                wireless_menu = api.path("interface", "wireless", "registration-table")
-                for row in wireless_menu:
-                    if _row_mac(row) == mac_address:
-                        wireless_menu.remove(row.get(".id"))
-                        break
-            except LibRouterosError as exc:
-                logger.info(
-                    "connected_devices_wireless_kick_unavailable",
-                    extra={"mac_address": mac_address, "detail": str(exc)},
-                )
-            try:
-                dhcp_menu = api.path("ip", "dhcp-server", "lease")
-                for row in dhcp_menu:
-                    if _row_mac(row) == mac_address:
-                        dhcp_menu.remove(row.get(".id"))
-                        break
-            except LibRouterosError as exc:
-                raise ConnectedDeviceOperationError(
-                    "disconnect_device", str(exc)
-                ) from exc
-        finally:
-            api.close()
-
-
-def _row_mac(row: dict[str, object]) -> str | None:
-    return normalize_mac_address(row.get("mac-address"))  # type: ignore[arg-type]
-
-
-def _merge_discovered_devices(
-    leases: list[dict[str, object]],
-    arp_entries: list[dict[str, object]],
-    wireless_entries: list[dict[str, object]],
-) -> list[DiscoveredDevice]:
-    """Merges all three RouterOS replies into one :class:`DiscoveredDevice`
-    per MAC address -- see module docstring."""
-    wireless_by_mac: dict[str, dict[str, object]] = {}
-    for row in wireless_entries:
-        mac = _row_mac(row)
-        if mac is not None:
-            wireless_by_mac[mac] = row
-
-    merged: dict[str, DiscoveredDevice] = {}
-
-    for row in arp_entries:
-        mac = _row_mac(row)
-        if mac is None:
-            continue
-        merged[mac] = DiscoveredDevice(
-            mac_address=mac,
-            ip_address=_safe_str(row.get("address")),
-            hostname=None,
-            interface=_safe_str(row.get("interface")),
-            is_wireless=mac in wireless_by_mac,
-            signal_strength_dbm=None,
-        )
-
-    for row in leases:
-        mac = _row_mac(row)
-        if mac is None:
-            continue
-        existing = merged.get(mac)
-        merged[mac] = DiscoveredDevice(
-            mac_address=mac,
-            ip_address=_safe_str(row.get("active-address") or row.get("address"))
-            or (existing.ip_address if existing else None),
-            hostname=_safe_str(row.get("host-name")),
-            interface=_safe_str(row.get("interface"))
-            or (existing.interface if existing else None),
-            is_wireless=mac in wireless_by_mac,
-            signal_strength_dbm=existing.signal_strength_dbm if existing else None,
-        )
-
-    for mac, row in wireless_by_mac.items():
-        existing = merged.get(mac)
-        merged[mac] = DiscoveredDevice(
-            mac_address=mac,
-            ip_address=existing.ip_address if existing else None,
-            hostname=existing.hostname if existing else None,
-            interface=_safe_str(row.get("interface"))
-            or (existing.interface if existing else None),
-            is_wireless=True,
-            signal_strength_dbm=_parse_signal_strength(row.get("signal-strength")),
-        )
-
-    return list(merged.values())
-
-
-def _safe_str(value: object) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _parse_signal_strength(value: object) -> int | None:
-    """RouterOS reports signal strength as e.g. ``"-55dBm@6Mbps"`` or
-    plain ``"-55"`` depending on version -- extracts the leading signed
-    integer, or ``None`` if the field is missing/unparsable (never
-    crashes a sync over one odd field)."""
-    if value is None:
-        return None
-    text = str(value)
-    digits = ""
-    for index, char in enumerate(text):
-        if (char in "+-" and index == 0) or char.isdigit():
-            digits += char
-        else:
-            break
-    try:
-        return int(digits)
-    except ValueError:
-        return None
+        except MikroTikConnectionError as exc:
+            raise ConnectedDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ConnectedDeviceOperationError(
+                "disconnect_device", exc.detail
+            ) from exc
 
 
 _CONNECTED_DEVICE_ADAPTERS: dict[str, BaseConnectedDeviceAdapter] = {
