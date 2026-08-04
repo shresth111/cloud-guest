@@ -1,18 +1,36 @@
 """Unit tests for the Provisioning Engine's real device I/O adapter layer
 (``app.domains.provisioning_engine.device_adapters``).
 
-Per that module's own "real client code, untested end-to-end here" scope
-note, ``MikroTikProvisionAdapter``'s command-construction and response-
-parsing logic is exercised here via hand-rolled fake ``librouteros``/
-``asyncssh`` transports (monkeypatching ``librouteros.connect``/
-``asyncssh.connect``) -- never a real socket. This mirrors how
-``app.domains.guest`` tests its FreeRADIUS ``rlm_rest`` integration and how
-``app.domains.router_agent``'s own HTTP surface is tested, both without a
-live counterpart process. Also covers a genuine, real-network negative
-case: a connection attempt to a guaranteed-unreachable TEST-NET-1 address
-(``192.0.2.1``), which must raise a real ``ProvisionDeviceConnectionError``,
-never a fabricated success -- this is the one test in this suite that
-actually opens a real (failing) socket, bounded by a 1-second timeout.
+Per the ``wyfy-device-gateway`` migration (see that module's own "now
+delegates to wyfy-device-gateway" docstring section), the real RouterOS
+API/SSH transport logic and its command-construction/response-parsing now
+live in ``wyfy_device_gateway.mikrotik_adapter`` -- and are covered by that
+package's own test suite (``wyfy-device-gateway/tests/
+test_mikrotik_provisioning_engine.py``), which this file does not
+duplicate. What remains a genuine backend-owned concern, and what this
+file actually tests:
+
+* the registry (``get_device_adapter``/``list_supported_device_vendors``);
+* ``MikroTikProvisionAdapter``'s own delegation logic -- that it maps this
+  domain's ``DeviceCredentials`` to the gateway's vendor-agnostic
+  ``DeviceCredentials`` correctly (including threading ``ssh_port`` through
+  the gateway's ``extra`` escape hatch -- a real, easy-to-silently-drop
+  detail since the gateway's own contract has no dedicated SSH-port
+  field), calls the right gateway method with the right arguments, and
+  translates the gateway's ``MikroTikConnectionError``/``MikroTikDeviceError``
+  back into this domain's own ``ProvisionDeviceConnectionError``/
+  ``ProvisionDeviceOperationError`` pair;
+* ``health_check``'s one genuinely subtle real behavior: a post-connection
+  operation failure (plain ``MikroTikDeviceError``) must propagate as a
+  real exception, never get silently folded into a graceful
+  ``healthy=False`` result the way a *connection* failure is (that
+  graceful-degradation behavior itself now lives inside the gateway's own
+  ``health_check`` and is tested there);
+* one real, bounded, guaranteed-unreachable-host negative case (a genuine
+  TEST-NET-1 connection attempt, never mocked) -- confirming the full,
+  real delegation path still produces an honest
+  ``ProvisionDeviceConnectionError``, never a fabricated success, end to
+  end through the gateway.
 
 Follows this project's plain-``assert``/native-``async def`` style;
 ``asyncio_mode = "auto"`` runs async tests directly.
@@ -20,17 +38,26 @@ Follows this project's plain-``assert``/native-``async def`` style;
 
 from __future__ import annotations
 
-import asyncssh
-import librouteros
 import pytest
-from librouteros.exceptions import LibRouterosError
+from wyfy_device_gateway.contract import (
+    DeviceCredentials as GatewayDeviceCredentials,
+)
+from wyfy_device_gateway.contract import (
+    DeviceDiscoveryResult as GatewayDeviceDiscoveryResult,
+)
+from wyfy_device_gateway.contract import (
+    DeviceHealthResult as GatewayDeviceHealthResult,
+)
+from wyfy_device_gateway.contract import DeviceVendor
+from wyfy_device_gateway.contract import RawCommandResult as GatewayRawCommandResult
+from wyfy_device_gateway.mikrotik_adapter import (
+    MikroTikConnectionError,
+    MikroTikDeviceError,
+)
 
 from app.domains.provisioning_engine.device_adapters import (
     DeviceCredentials,
     MikroTikProvisionAdapter,
-    _as_float,
-    _as_int,
-    _parse_routeros_uptime,
     get_device_adapter,
     list_supported_device_vendors,
 )
@@ -40,55 +67,7 @@ from app.domains.provisioning_engine.exceptions import (
     UnsupportedDeviceVendorError,
 )
 
-# ============================================================================
-# Module-level parsing helpers
-# ============================================================================
-
-
-class TestParseRouterosUptime:
-    def test_parses_full_format(self) -> None:
-        assert _parse_routeros_uptime("3w2d4h5m6s") == (
-            3 * 604800 + 2 * 86400 + 4 * 3600 + 5 * 60 + 6
-        )
-
-    def test_parses_partial_format(self) -> None:
-        assert _parse_routeros_uptime("4h5m6s") == 4 * 3600 + 5 * 60 + 6
-
-    def test_parses_seconds_only(self) -> None:
-        assert _parse_routeros_uptime("42s") == 42
-
-    def test_none_input_returns_none(self) -> None:
-        assert _parse_routeros_uptime(None) is None
-
-    def test_empty_string_returns_none(self) -> None:
-        assert _parse_routeros_uptime("") is None
-
-    def test_unrecognized_unit_returns_none(self) -> None:
-        assert _parse_routeros_uptime("3x") is None
-
-
-class TestAsFloatAsInt:
-    def test_as_float_plain(self) -> None:
-        assert _as_float("12.5") == 12.5
-
-    def test_as_float_strips_percent(self) -> None:
-        assert _as_float("42%") == 42.0
-
-    def test_as_float_none(self) -> None:
-        assert _as_float(None) is None
-
-    def test_as_float_invalid_returns_none(self) -> None:
-        assert _as_float("not-a-number") is None
-
-    def test_as_int_plain(self) -> None:
-        assert _as_int("1024") == 1024
-
-    def test_as_int_none(self) -> None:
-        assert _as_int(None) is None
-
-    def test_as_int_invalid_returns_none(self) -> None:
-        assert _as_int("not-a-number") is None
-
+CREDENTIALS = DeviceCredentials(host="10.0.0.1", username="admin", password="secret")
 
 # ============================================================================
 # Registry
@@ -110,101 +89,128 @@ class TestDeviceAdapterRegistry:
 
 
 # ============================================================================
-# Fake librouteros / asyncssh transports
+# Fake gateway adapter -- stands in for
+# wyfy_device_gateway.registry.get_adapter(DeviceVendor.MIKROTIK)
 # ============================================================================
 
 
-class FakeRouterosApi:
-    """Stands in for the callable object ``librouteros.connect()`` returns.
-    Each RouterOS "path" (e.g. ``/system/resource/print``) is pre-seeded
-    with the rows it should yield when called."""
+class FakeGatewayAdapter:
+    """Records the gateway ``DeviceCredentials`` each method was called
+    with (so tests can assert the mapping/``ssh_port``-via-``extra``
+    plumbing is correct) and either returns a pre-seeded result or raises a
+    pre-seeded exception -- never opens a real socket."""
 
-    def __init__(self, responses: dict[str, list[dict[str, object]]]) -> None:
-        self.responses = responses
-        self.closed = False
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, GatewayDeviceCredentials, dict[str, object]]] = []
+        self.raise_error: Exception | None = None
+        self.discover_result: GatewayDeviceDiscoveryResult | None = None
+        self.verify_config_result: bool = True
+        self.health_check_result: GatewayDeviceHealthResult | None = None
+        self.backup_result: bytes = b""
+        self.execute_raw_command_result: GatewayRawCommandResult | None = None
 
-    def __call__(self, path: str) -> list[dict[str, object]]:
-        if path not in self.responses:
-            raise LibRouterosError(f"no fake response seeded for {path}")
-        return self.responses[path]
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class FakeRemoteFile:
-    def __init__(self, files: dict[str, bytes], filename: str, mode: str) -> None:
-        self._files = files
-        self._filename = filename
-        self._mode = mode
-
-    async def __aenter__(self) -> FakeRemoteFile:
-        return self
-
-    async def __aexit__(self, *exc_info: object) -> bool:
-        return False
-
-    async def read(self) -> bytes:
-        return self._files[self._filename]
-
-    async def write(self, content: bytes) -> None:
-        self._files[self._filename] = content
-
-
-class FakeSftpClient:
-    def __init__(self, files: dict[str, bytes]) -> None:
-        self._files = files
-
-    async def __aenter__(self) -> FakeSftpClient:
-        return self
-
-    async def __aexit__(self, *exc_info: object) -> bool:
-        return False
-
-    def open(self, filename: str, mode: str) -> FakeRemoteFile:
-        return FakeRemoteFile(self._files, filename, mode)
-
-
-class FakeSshRunResult:
-    def __init__(self, exit_status: int = 0, stderr: str = "") -> None:
-        self.exit_status = exit_status
-        self.stderr = stderr
-
-
-class FakeSshConnection:
-    def __init__(
-        self, files: dict[str, bytes], run_result: FakeSshRunResult | None = None
+    def _record(
+        self, method: str, creds: GatewayDeviceCredentials, **kwargs: object
     ) -> None:
-        self._files = files
-        self.run_result = run_result or FakeSshRunResult()
-        self.commands_run: list[str] = []
+        self.calls.append((method, creds, kwargs))
+        if self.raise_error is not None:
+            raise self.raise_error
 
-    async def __aenter__(self) -> FakeSshConnection:
-        return self
+    async def discover(
+        self, creds: GatewayDeviceCredentials
+    ) -> GatewayDeviceDiscoveryResult:
+        self._record("discover", creds)
+        assert self.discover_result is not None
+        return self.discover_result
 
-    async def __aexit__(self, *exc_info: object) -> bool:
-        return False
+    async def push_config(
+        self, creds: GatewayDeviceCredentials, *, config_content: str
+    ) -> None:
+        self._record("push_config", creds, config_content=config_content)
 
-    async def run(self, command: str, check: bool = False) -> FakeSshRunResult:
-        self.commands_run.append(command)
-        return self.run_result
+    async def verify_config(
+        self, creds: GatewayDeviceCredentials, *, expected_content: str
+    ) -> bool:
+        self._record("verify_config", creds, expected_content=expected_content)
+        return self.verify_config_result
 
-    def start_sftp_client(self) -> FakeSftpClient:
-        return FakeSftpClient(self._files)
+    async def health_check(
+        self, creds: GatewayDeviceCredentials
+    ) -> GatewayDeviceHealthResult:
+        self._record("health_check", creds)
+        assert self.health_check_result is not None
+        return self.health_check_result
+
+    async def backup(self, creds: GatewayDeviceCredentials) -> bytes:
+        self._record("backup", creds)
+        return self.backup_result
+
+    async def restore(
+        self, creds: GatewayDeviceCredentials, *, backup_content: bytes
+    ) -> None:
+        self._record("restore", creds, backup_content=backup_content)
+
+    async def upload_file(
+        self, creds: GatewayDeviceCredentials, *, filename: str, content: bytes
+    ) -> None:
+        self._record("upload_file", creds, filename=filename, content=content)
+
+    async def execute_raw_command(
+        self, creds: GatewayDeviceCredentials, *, command: str
+    ) -> GatewayRawCommandResult:
+        self._record("execute_raw_command", creds, command=command)
+        assert self.execute_raw_command_result is not None
+        return self.execute_raw_command_result
 
 
-class RaisingConnect:
-    """A fake ``connect`` callable that always raises -- simulates a real
-    unreachable host / auth failure without opening any socket."""
+@pytest.fixture
+def fake_gateway_adapter(monkeypatch: pytest.MonkeyPatch) -> FakeGatewayAdapter:
+    fake = FakeGatewayAdapter()
+    monkeypatch.setattr(
+        "app.domains.provisioning_engine.device_adapters.get_adapter",
+        lambda vendor: fake,
+    )
+    return fake
 
-    def __init__(self, exc: Exception) -> None:
-        self.exc = exc
 
-    def __call__(self, *args: object, **kwargs: object) -> None:
-        raise self.exc
+# ============================================================================
+# Credentials mapping (host/username/secret/port/timeout + ssh_port-via-extra)
+# ============================================================================
 
 
-CREDENTIALS = DeviceCredentials(host="10.0.0.1", username="admin", password="secret")
+class TestCredentialsMapping:
+    async def test_maps_fields_and_threads_ssh_port_through_extra(
+        self, fake_gateway_adapter: FakeGatewayAdapter
+    ) -> None:
+        fake_gateway_adapter.discover_result = GatewayDeviceDiscoveryResult(
+            vendor=DeviceVendor.MIKROTIK,
+            model=None,
+            serial_number=None,
+            firmware_version=None,
+            cpu_load_percent=None,
+            free_memory_bytes=None,
+            total_memory_bytes=None,
+            uptime_seconds=None,
+        )
+        credentials = DeviceCredentials(
+            host="192.168.1.1",
+            username="admin",
+            password="hunter2",
+            api_port=8729,
+            ssh_port=2222,
+            timeout_seconds=15,
+        )
+        await MikroTikProvisionAdapter().discover(credentials)
+
+        assert len(fake_gateway_adapter.calls) == 1
+        _, creds, _ = fake_gateway_adapter.calls[0]
+        assert creds.vendor == DeviceVendor.MIKROTIK
+        assert creds.host == "192.168.1.1"
+        assert creds.username == "admin"
+        assert creds.secret == "hunter2"
+        assert creds.port == 8729
+        assert creds.timeout_seconds == 15
+        assert creds.extra == {"ssh_port": "2222"}
 
 
 # ============================================================================
@@ -213,33 +219,22 @@ CREDENTIALS = DeviceCredentials(host="10.0.0.1", username="admin", password="sec
 
 
 class TestDiscover:
-    async def test_parses_real_response_shape(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_maps_gateway_result_shape(
+        self, fake_gateway_adapter: FakeGatewayAdapter
     ) -> None:
-        api = FakeRouterosApi(
-            {
-                "/system/resource/print": [
-                    {
-                        "version": "7.14",
-                        "cpu-load": "5",
-                        "free-memory": "104857600",
-                        "total-memory": "268435456",
-                        "uptime": "1w2d3h4m5s",
-                    }
-                ],
-                "/system/routerboard/print": [
-                    {"model": "RB4011", "serial-number": "ABC123"}
-                ],
-                "/interface/print": [
-                    {"name": "ether1", "mac-address": "AA:BB:CC:DD:EE:FF"},
-                    {"name": "ether2", "mac-address": "11:22:33:44:55:66"},
-                ],
-            }
+        fake_gateway_adapter.discover_result = GatewayDeviceDiscoveryResult(
+            vendor=DeviceVendor.MIKROTIK,
+            model="RB4011",
+            serial_number="ABC123",
+            firmware_version="7.14",
+            cpu_load_percent=5.0,
+            free_memory_bytes=104857600,
+            total_memory_bytes=268435456,
+            uptime_seconds=93845,
+            interfaces=["ether1", "ether2"],
+            mac_address="AA:BB:CC:DD:EE:FF",
         )
-        monkeypatch.setattr(librouteros, "connect", lambda **kw: api)
-
-        adapter = MikroTikProvisionAdapter()
-        result = await adapter.discover(CREDENTIALS)
+        result = await MikroTikProvisionAdapter().discover(CREDENTIALS)
 
         assert result.vendor == "mikrotik"
         assert result.model == "RB4011"
@@ -248,67 +243,25 @@ class TestDiscover:
         assert result.cpu_load_percent == 5.0
         assert result.free_memory_bytes == 104857600
         assert result.total_memory_bytes == 268435456
-        assert result.uptime_seconds == 1 * 604800 + 2 * 86400 + 3 * 3600 + 4 * 60 + 5
+        assert result.uptime_seconds == 93845
         assert result.interfaces == ["ether1", "ether2"]
         assert result.mac_address == "AA:BB:CC:DD:EE:FF"
-        assert api.closed is True
 
-    async def test_connection_failure_raises_connection_error(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_connection_error_translated(
+        self, fake_gateway_adapter: FakeGatewayAdapter
     ) -> None:
-        monkeypatch.setattr(
-            librouteros, "connect", RaisingConnect(OSError("connection refused"))
+        fake_gateway_adapter.raise_error = MikroTikConnectionError(
+            "10.0.0.1", "connection refused"
         )
-        adapter = MikroTikProvisionAdapter()
         with pytest.raises(ProvisionDeviceConnectionError):
-            await adapter.discover(CREDENTIALS)
+            await MikroTikProvisionAdapter().discover(CREDENTIALS)
 
-    async def test_command_failure_raises_operation_error(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_device_error_translated_to_operation_error(
+        self, fake_gateway_adapter: FakeGatewayAdapter
     ) -> None:
-        # An empty response map means every path lookup raises LibRouterosError.
-        api = FakeRouterosApi({})
-        monkeypatch.setattr(librouteros, "connect", lambda **kw: api)
-        adapter = MikroTikProvisionAdapter()
+        fake_gateway_adapter.raise_error = MikroTikDeviceError("10.0.0.1", "boom")
         with pytest.raises(ProvisionDeviceOperationError):
-            await adapter.discover(CREDENTIALS)
-        assert api.closed is True
-
-
-# ============================================================================
-# health_check()
-# ============================================================================
-
-
-class TestHealthCheck:
-    async def test_success_reports_healthy(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        api = FakeRouterosApi(
-            {
-                "/system/resource/print": [
-                    {"cpu-load": "10", "free-memory": "5000", "uptime": "1h"}
-                ]
-            }
-        )
-        monkeypatch.setattr(librouteros, "connect", lambda **kw: api)
-        adapter = MikroTikProvisionAdapter()
-        result = await adapter.health_check(CREDENTIALS)
-        assert result.healthy is True
-        assert result.cpu_load_percent == 10.0
-        assert result.free_memory_bytes == 5000
-        assert result.uptime_seconds == 3600
-
-    async def test_connection_failure_reports_unhealthy_not_raise(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            librouteros, "connect", RaisingConnect(OSError("timed out"))
-        )
-        adapter = MikroTikProvisionAdapter()
-        result = await adapter.health_check(CREDENTIALS)
-        assert result.healthy is False
-        assert result.detail is not None
+            await MikroTikProvisionAdapter().discover(CREDENTIALS)
 
 
 # ============================================================================
@@ -317,58 +270,109 @@ class TestHealthCheck:
 
 
 class TestPushAndVerifyConfig:
-    async def test_push_then_verify_round_trips(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_push_config_delegates(
+        self, fake_gateway_adapter: FakeGatewayAdapter
     ) -> None:
-        files: dict[str, bytes] = {}
-        conn = FakeSshConnection(files)
-        monkeypatch.setattr(asyncssh, "connect", lambda *a, **kw: conn)
+        await MikroTikProvisionAdapter().push_config(
+            CREDENTIALS, config_content="/ip address add ..."
+        )
+        method, _, kwargs = fake_gateway_adapter.calls[0]
+        assert method == "push_config"
+        assert kwargs["config_content"] == "/ip address add ..."
 
-        adapter = MikroTikProvisionAdapter()
-        await adapter.push_config(CREDENTIALS, config_content="/ip address add ...")
-        assert files["cloudguest-config.rsc"] == b"/ip address add ..."
-        assert any("/import" in c for c in conn.commands_run)
+    async def test_push_config_operation_failure_translated(
+        self, fake_gateway_adapter: FakeGatewayAdapter
+    ) -> None:
+        fake_gateway_adapter.raise_error = MikroTikDeviceError("10.0.0.1", "bad script")
+        with pytest.raises(ProvisionDeviceOperationError):
+            await MikroTikProvisionAdapter().push_config(
+                CREDENTIALS, config_content="x"
+            )
 
-        matched = await adapter.verify_config(
+    async def test_verify_config_matched(
+        self, fake_gateway_adapter: FakeGatewayAdapter
+    ) -> None:
+        fake_gateway_adapter.verify_config_result = True
+        matched = await MikroTikProvisionAdapter().verify_config(
             CREDENTIALS, expected_content="/ip address add ..."
         )
         assert matched is True
 
-    async def test_verify_config_mismatch_returns_false(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_verify_config_mismatch(
+        self, fake_gateway_adapter: FakeGatewayAdapter
     ) -> None:
-        files = {"cloudguest-config.rsc": b"actual content on device"}
-        conn = FakeSshConnection(files)
-        monkeypatch.setattr(asyncssh, "connect", lambda *a, **kw: conn)
-
-        adapter = MikroTikProvisionAdapter()
-        matched = await adapter.verify_config(
-            CREDENTIALS, expected_content="different expected content"
+        fake_gateway_adapter.verify_config_result = False
+        matched = await MikroTikProvisionAdapter().verify_config(
+            CREDENTIALS, expected_content="different"
         )
         assert matched is False
 
-    async def test_push_config_run_command_failure_raises_operation_error(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_upload_file_connection_failure_translated(
+        self, fake_gateway_adapter: FakeGatewayAdapter
     ) -> None:
-        files: dict[str, bytes] = {}
-        conn = FakeSshConnection(
-            files, run_result=FakeSshRunResult(exit_status=1, stderr="bad script")
+        fake_gateway_adapter.raise_error = MikroTikConnectionError(
+            "10.0.0.1", "auth failed"
         )
-        monkeypatch.setattr(asyncssh, "connect", lambda *a, **kw: conn)
-
-        adapter = MikroTikProvisionAdapter()
-        with pytest.raises(ProvisionDeviceOperationError):
-            await adapter.push_config(CREDENTIALS, config_content="broken")
-
-    async def test_upload_file_connection_failure_raises_connection_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            asyncssh, "connect", RaisingConnect(asyncssh.Error(0, "auth failed"))
-        )
-        adapter = MikroTikProvisionAdapter()
         with pytest.raises(ProvisionDeviceConnectionError):
-            await adapter.upload_file(CREDENTIALS, filename="x.rsc", content=b"content")
+            await MikroTikProvisionAdapter().upload_file(
+                CREDENTIALS, filename="x.rsc", content=b"content"
+            )
+
+
+# ============================================================================
+# health_check() -- the one genuinely subtle real behavior
+# ============================================================================
+
+
+class TestHealthCheck:
+    async def test_success_maps_result(
+        self, fake_gateway_adapter: FakeGatewayAdapter
+    ) -> None:
+        fake_gateway_adapter.health_check_result = GatewayDeviceHealthResult(
+            healthy=True,
+            cpu_load_percent=10.0,
+            free_memory_bytes=5000,
+            uptime_seconds=3600,
+        )
+        result = await MikroTikProvisionAdapter().health_check(CREDENTIALS)
+        assert result.healthy is True
+        assert result.cpu_load_percent == 10.0
+        assert result.free_memory_bytes == 5000
+        assert result.uptime_seconds == 3600
+
+    async def test_gateway_already_reports_graceful_unhealthy_on_connection_failure(
+        self, fake_gateway_adapter: FakeGatewayAdapter
+    ) -> None:
+        """The gateway's own ``health_check`` catches a connection failure
+        internally -- by the time it reaches this domain's adapter, it is
+        already a normal, non-exceptional ``DeviceHealthResult(healthy=
+        False, ...)``, never a raised ``MikroTikConnectionError``. This
+        test documents that this domain's own ``health_check`` has no
+        ``MikroTikConnectionError`` handler at all -- there is nothing to
+        catch, by design."""
+        fake_gateway_adapter.health_check_result = GatewayDeviceHealthResult(
+            healthy=False,
+            cpu_load_percent=None,
+            free_memory_bytes=None,
+            uptime_seconds=None,
+            detail="Could not connect to device at '10.0.0.1': timed out",
+        )
+        result = await MikroTikProvisionAdapter().health_check(CREDENTIALS)
+        assert result.healthy is False
+        assert result.detail is not None
+
+    async def test_operation_failure_propagates_as_real_exception(
+        self, fake_gateway_adapter: FakeGatewayAdapter
+    ) -> None:
+        """A post-connection operation failure is NOT caught -- it must
+        propagate as a real ``ProvisionDeviceOperationError``, exactly like
+        the original ``provisioning_engine/device_adapters.py::health_check``
+        never caught one either."""
+        fake_gateway_adapter.raise_error = MikroTikDeviceError(
+            "10.0.0.1", "command rejected"
+        )
+        with pytest.raises(ProvisionDeviceOperationError):
+            await MikroTikProvisionAdapter().health_check(CREDENTIALS)
 
 
 # ============================================================================
@@ -377,29 +381,62 @@ class TestPushAndVerifyConfig:
 
 
 class TestBackupRestore:
-    async def test_backup_downloads_saved_file(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_backup_returns_bytes(
+        self, fake_gateway_adapter: FakeGatewayAdapter
     ) -> None:
-        files = {"cloudguest-backup.backup": b"\x00binarybackupbytes"}
-        conn = FakeSshConnection(files)
-        monkeypatch.setattr(asyncssh, "connect", lambda *a, **kw: conn)
-
-        adapter = MikroTikProvisionAdapter()
-        content = await adapter.backup(CREDENTIALS)
+        fake_gateway_adapter.backup_result = b"\x00binarybackupbytes"
+        content = await MikroTikProvisionAdapter().backup(CREDENTIALS)
         assert content == b"\x00binarybackupbytes"
-        assert any("/system/backup/save" in c for c in conn.commands_run)
 
-    async def test_restore_uploads_then_loads(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_restore_delegates(
+        self, fake_gateway_adapter: FakeGatewayAdapter
     ) -> None:
-        files: dict[str, bytes] = {}
-        conn = FakeSshConnection(files)
-        monkeypatch.setattr(asyncssh, "connect", lambda *a, **kw: conn)
+        await MikroTikProvisionAdapter().restore(
+            CREDENTIALS, backup_content=b"restored-bytes"
+        )
+        method, _, kwargs = fake_gateway_adapter.calls[0]
+        assert method == "restore"
+        assert kwargs["backup_content"] == b"restored-bytes"
 
-        adapter = MikroTikProvisionAdapter()
-        await adapter.restore(CREDENTIALS, backup_content=b"restored-bytes")
-        assert files["cloudguest-backup.backup"] == b"restored-bytes"
-        assert any("/system/backup/load" in c for c in conn.commands_run)
+    async def test_backup_connection_failure_translated(
+        self, fake_gateway_adapter: FakeGatewayAdapter
+    ) -> None:
+        fake_gateway_adapter.raise_error = MikroTikConnectionError(
+            "10.0.0.1", "unreachable"
+        )
+        with pytest.raises(ProvisionDeviceConnectionError):
+            await MikroTikProvisionAdapter().backup(CREDENTIALS)
+
+
+# ============================================================================
+# execute_raw_command() -- never raises on non-zero exit status
+# ============================================================================
+
+
+class TestExecuteRawCommand:
+    async def test_returns_real_unfiltered_result_even_on_nonzero_exit(
+        self, fake_gateway_adapter: FakeGatewayAdapter
+    ) -> None:
+        fake_gateway_adapter.execute_raw_command_result = GatewayRawCommandResult(
+            command="/interface print", stdout="", stderr="oops", exit_status=1
+        )
+        result = await MikroTikProvisionAdapter().execute_raw_command(
+            CREDENTIALS, command="/interface print"
+        )
+        assert result.command == "/interface print"
+        assert result.exit_status == 1
+        assert result.stderr == "oops"
+
+    async def test_connection_failure_translated(
+        self, fake_gateway_adapter: FakeGatewayAdapter
+    ) -> None:
+        fake_gateway_adapter.raise_error = MikroTikConnectionError(
+            "10.0.0.1", "auth failed"
+        )
+        with pytest.raises(ProvisionDeviceConnectionError):
+            await MikroTikProvisionAdapter().execute_raw_command(
+                CREDENTIALS, command="/interface print"
+            )
 
 
 # ============================================================================
@@ -414,9 +451,10 @@ class TestRealUnreachableHostNeverFabricatesSuccess:
         """``192.0.2.1`` is a TEST-NET-1 address (RFC 5737) -- reserved for
         documentation/testing, guaranteed never to route anywhere. A real
         connection attempt against it, with a short timeout, must raise a
-        real ``ProvisionDeviceConnectionError`` -- never a fabricated
-        success. This is the one test in this file that opens a real (and
-        always-failing) socket."""
+        real ``ProvisionDeviceConnectionError`` end to end through the real
+        (unmocked) delegation to ``wyfy_device_gateway`` -- never a
+        fabricated success. This is the one test in this file that opens a
+        real (and always-failing) socket."""
         adapter = MikroTikProvisionAdapter()
         credentials = DeviceCredentials(
             host="192.0.2.1",

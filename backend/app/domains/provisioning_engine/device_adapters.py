@@ -8,34 +8,42 @@ connection to anything, by design -- see that module's own docstring).
 device discovery, configuration push/verify, health checks, backup/restore,
 and file upload.
 
-## Honest scope: real client code, never exercised end-to-end here
+## Now delegates to wyfy-device-gateway
 
-:class:`MikroTikProvisionAdapter` uses two real, independent, genuinely
-installed Python libraries (see ``requirements.txt``): ``librouteros`` (the
-RouterOS API protocol, TCP port 8728/8729) for structured command
-execution/discovery/health-checks, and ``asyncssh`` (SSH + SFTP) for file/
-script upload and backup/restore transfer. Both are real libraries this
-extension adds as genuine dependencies -- not stand-ins for something else.
-This module's own command-construction and response-parsing logic is
-exercised in this domain's tests via a fake transport (mirroring how
-``app.domains.guest`` tests its FreeRADIUS ``rlm_rest`` integration without
-a live FreeRADIUS server, and how ``app.domains.router_agent``'s own HTTP
-surface is tested without a live external agent process).
+Per the ``wyfy-device-gateway`` PRD (section 7, Step 3, item 5 -- the
+biggest-blast-radius call site, migrated last, once the pattern had proven
+itself four times over on ``network_diagnostics``/``isp``/
+``connected_devices``/``queue_management``), ``MikroTikProvisionAdapter``'s
+methods (``discover``, ``push_config``, ``verify_config``, ``health_check``,
+``backup``, ``restore``, ``upload_file``, ``execute_raw_command``) now call
+``wyfy_device_gateway.registry.get_adapter(DeviceVendor.MIKROTIK)`` instead
+of opening ``librouteros``/``asyncssh`` directly. That package is a straight
+port of this module's own real logic -- including the exact same
+round-tripped filenames (``cloudguest-config.rsc``/``cloudguest-backup
+.backup``) ``push_config``/``verify_config`` and ``backup``/``restore``
+depend on staying in sync with each other, the same SHA-256
+content-comparison ``verify_config`` uses, ``RawCommandResult``'s own
+"never raises on non-zero exit status" contract, and -- the one genuinely
+subtle behavior in this domain -- ``health_check``'s real distinction
+between a *connection* failure (caught by the gateway's own
+``health_check`` and reported as a graceful ``healthy=False`` result) and a
+post-connection *operation* failure (which the gateway's ``health_check``
+deliberately does NOT catch, so it propagates here and must be translated
+into a real ``ProvisionDeviceOperationError``, never silently swallowed
+into a fake "unhealthy" result). See
+``wyfy_device_gateway.mikrotik_adapter.MikroTikAdapter.health_check``'s own
+docstring for that same distinction, ported faithfully.
 
-**What is not, and cannot honestly be, claimed here:** an actual network
-round-trip against a real, physical MikroTik router. There is no live
-device anywhere in this sandbox. Every method below, if actually invoked in
-this environment, will raise :class:`~.exceptions.ProvisionDeviceConnectionError`
-the moment it tries to open a real socket -- exactly the honest outcome a
-real, unreachable host would also produce, not a fabricated success. This is
-this codebase's own "honest placeholder" discipline (already applied to
-Celery health before a worker existed, FreeRADIUS before a live daemon
-existed, and ``router_agent``'s own dispatch before a real agent process
-existed) applied to a genuinely new class of gap: not a missing feature, but
-an environment that cannot host what would prove the feature real end to
-end.
+Public signatures/return shapes are unchanged; the gateway's
+``MikroTikConnectionError``/``MikroTikDeviceError`` distinction is
+translated back into this domain's own
+``ProvisionDeviceConnectionError``/``ProvisionDeviceOperationError`` pair,
+using the public method name as the operation label -- exactly the
+convention already established by the ``isp``/``connected_devices``
+migrations (e.g. ``"ping"``, ``"disconnect_device"``), not the raw
+RouterOS/SSH command string the original sometimes used.
 
-## Why both librouteros AND asyncssh, not just one
+## Why both librouteros AND asyncssh, not just one (preserved context)
 
 ``librouteros`` speaks RouterOS's own structured API protocol -- the right
 tool for discovery (``/system/resource/print``, ``/system/routerboard
@@ -50,29 +58,40 @@ actual ``/import``/``/system/backup/save``/``/system/backup/load`` command
 itself (RouterOS's SSH CLI accepts the identical slash-command console
 syntax the winbox/telnet console does) -- ``librouteros``'s own API
 protocol is not the right transport for triggering a file-system-level
-operation like ``/import``.
+operation like ``/import``. This reasoning now lives with the real
+transport code in ``wyfy_device_gateway.mikrotik_adapter``; kept here too
+since it explains *why* this domain's real operations are shaped the way
+they are, independent of which package currently holds the socket code.
 
-## ``librouteros`` is a synchronous library
+## SSH port: threaded through via the gateway's ``extra`` escape hatch
 
-Every ``librouteros`` call blocks the calling thread on real socket I/O.
-Every method below that uses it wraps the blocking call in
-``asyncio.to_thread`` -- the same "bridge a sync library into an async
-call site" pattern ``app.core.celery_app``'s own worker tasks already use
-for this codebase's sync/async boundary, just applied here to a library
-call instead of a whole Celery task body.
+The vendor-agnostic ``DeviceCredentials`` contract in ``wyfy_device_gateway``
+has a single ``port`` field (used for the RouterOS API port, default 8728)
+-- it has no dedicated SSH-port field, since not every vendor even has a
+second port/transport the way MikroTik's SSH+SFTP file-transfer path does.
+This domain's own ``DeviceCredentials.ssh_port`` (default 22, historically
+configurable per-router) is threaded through via
+``extra={"ssh_port": str(credentials.ssh_port)}`` -- exactly the escape
+hatch ``DeviceCredentials.extra``'s own docstring in the gateway package
+describes it as being for. Omitting this would silently drop a configured
+non-default SSH port back to the gateway's own hardcoded default (22),
+which would be a real, if narrow, regression for any router actually
+configured with a non-standard SSH port.
 """
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import logging
 from dataclasses import dataclass, field
 from typing import Protocol
 
-import asyncssh
-import librouteros
-from librouteros.exceptions import LibRouterosError
+from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
+from wyfy_device_gateway.contract import DeviceVendor
+from wyfy_device_gateway.mikrotik_adapter import (
+    MikroTikConnectionError,
+    MikroTikDeviceError,
+)
+from wyfy_device_gateway.registry import get_adapter
 
 from .exceptions import (
     ProvisionDeviceConnectionError,
@@ -85,8 +104,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_API_PORT = 8728
 _DEFAULT_SSH_PORT = 22
 _DEFAULT_TIMEOUT_SECONDS = 10
-_BACKUP_FILENAME = "cloudguest-backup.backup"
-_CONFIG_FILENAME = "cloudguest-config.rsc"
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,8 +170,8 @@ class RawCommandResult:
 
 class BaseProvisionAdapter(Protocol):
     """What a vendor implements to plug real device I/O into the
-    Provisioning Engine. See module docstring for the "real code, untested
-    end-to-end here" scope note. A new vendor is exactly: implement this
+    Provisioning Engine. See module docstring for the "now delegates to
+    wyfy-device-gateway" write-up. A new vendor is exactly: implement this
     Protocol, register it (mirrors
     ``app.domains.router_provisioning.adapters``'s own registry pattern)."""
 
@@ -213,226 +230,151 @@ class BaseProvisionAdapter(Protocol):
 
 
 class MikroTikProvisionAdapter:
-    """See module docstring for the full "real client code, untested
-    end-to-end here" write-up."""
+    """See module docstring for the full "now delegates to
+    wyfy-device-gateway" write-up."""
 
     vendor = "mikrotik"
 
-    async def discover(self, credentials: DeviceCredentials) -> DeviceDiscoveryResult:
-        resource, routerboard, interfaces = await asyncio.to_thread(
-            self._discover_sync, credentials
-        )
-        return DeviceDiscoveryResult(
-            vendor=self.vendor,
-            model=routerboard.get("model"),
-            serial_number=routerboard.get("serial-number"),
-            firmware_version=resource.get("version"),
-            cpu_load_percent=_as_float(resource.get("cpu-load")),
-            free_memory_bytes=_as_int(resource.get("free-memory")),
-            total_memory_bytes=_as_int(resource.get("total-memory")),
-            uptime_seconds=_parse_routeros_uptime(resource.get("uptime")),
-            interfaces=[i.get("name", "") for i in interfaces if i.get("name")],
-            mac_address=interfaces[0].get("mac-address") if interfaces else None,
+    def _gateway_credentials(
+        self, credentials: DeviceCredentials
+    ) -> _GatewayDeviceCredentials:
+        return _GatewayDeviceCredentials(
+            vendor=DeviceVendor.MIKROTIK,
+            host=credentials.host,
+            username=credentials.username,
+            secret=credentials.password,
+            port=credentials.api_port,
+            timeout_seconds=credentials.timeout_seconds,
+            extra={"ssh_port": str(credentials.ssh_port)},
         )
 
-    def _discover_sync(
-        self, credentials: DeviceCredentials
-    ) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]]]:
-        api = self._connect_api(credentials)
+    async def discover(self, credentials: DeviceCredentials) -> DeviceDiscoveryResult:
+        creds = self._gateway_credentials(credentials)
         try:
-            resource = next(iter(api("/system/resource/print")), {})
-            routerboard = next(iter(api("/system/routerboard/print")), {})
-            interfaces = list(api("/interface/print"))
-            return resource, routerboard, interfaces
-        except LibRouterosError as exc:
-            raise ProvisionDeviceOperationError("discover", str(exc)) from exc
-        finally:
-            api.close()
+            result = await get_adapter(DeviceVendor.MIKROTIK).discover(creds)
+        except MikroTikConnectionError as exc:
+            raise ProvisionDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ProvisionDeviceOperationError("discover", exc.detail) from exc
+        return DeviceDiscoveryResult(
+            vendor=str(result.vendor),
+            model=result.model,
+            serial_number=result.serial_number,
+            firmware_version=result.firmware_version,
+            cpu_load_percent=result.cpu_load_percent,
+            free_memory_bytes=result.free_memory_bytes,
+            total_memory_bytes=result.total_memory_bytes,
+            uptime_seconds=result.uptime_seconds,
+            interfaces=list(result.interfaces),
+            mac_address=result.mac_address,
+        )
 
     async def push_config(
         self, credentials: DeviceCredentials, *, config_content: str
     ) -> None:
-        await self.upload_file(
-            credentials,
-            filename=_CONFIG_FILENAME,
-            content=config_content.encode("utf-8"),
-        )
-        await self._run_ssh_command(
-            credentials, f'/import file-name="{_CONFIG_FILENAME}"'
-        )
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).push_config(
+                creds, config_content=config_content
+            )
+        except MikroTikConnectionError as exc:
+            raise ProvisionDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ProvisionDeviceOperationError("push_config", exc.detail) from exc
 
     async def verify_config(
         self, credentials: DeviceCredentials, *, expected_content: str
     ) -> bool:
         """Reads the config file back via SFTP and compares its SHA-256
         against ``expected_content`` -- a real, exact-content check, not a
-        best-effort heuristic."""
-        uploaded = await self._download_file(credentials, _CONFIG_FILENAME)
-        expected_digest = hashlib.sha256(expected_content.encode("utf-8")).hexdigest()
-        actual_digest = hashlib.sha256(uploaded).hexdigest()
-        return expected_digest == actual_digest
+        best-effort heuristic. See
+        ``wyfy_device_gateway.mikrotik_adapter.MikroTikAdapter
+        .verify_config``."""
+        creds = self._gateway_credentials(credentials)
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).verify_config(
+                creds, expected_content=expected_content
+            )
+        except MikroTikConnectionError as exc:
+            raise ProvisionDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ProvisionDeviceOperationError("verify_config", exc.detail) from exc
 
     async def health_check(self, credentials: DeviceCredentials) -> DeviceHealthResult:
+        """See module docstring's "the one genuinely subtle behavior in
+        this domain" section: the gateway's own ``health_check`` already
+        catches a *connection* failure internally and returns a graceful
+        ``healthy=False`` result, so only a post-connection *operation*
+        failure (a plain ``MikroTikDeviceError``, not the
+        ``MikroTikConnectionError`` subclass) can ever escape the call
+        below -- and that must propagate as a real
+        ``ProvisionDeviceOperationError``, exactly like the original
+        ``provisioning_engine/device_adapters.py::health_check`` never
+        caught a post-connection failure either."""
+        creds = self._gateway_credentials(credentials)
         try:
-            resource = await asyncio.to_thread(self._health_check_sync, credentials)
-        except ProvisionDeviceConnectionError as exc:
-            return DeviceHealthResult(
-                healthy=False,
-                cpu_load_percent=None,
-                free_memory_bytes=None,
-                uptime_seconds=None,
-                detail=str(exc),
-            )
+            result = await get_adapter(DeviceVendor.MIKROTIK).health_check(creds)
+        except MikroTikDeviceError as exc:
+            raise ProvisionDeviceOperationError("health_check", exc.detail) from exc
         return DeviceHealthResult(
-            healthy=True,
-            cpu_load_percent=_as_float(resource.get("cpu-load")),
-            free_memory_bytes=_as_int(resource.get("free-memory")),
-            uptime_seconds=_parse_routeros_uptime(resource.get("uptime")),
+            healthy=result.healthy,
+            cpu_load_percent=result.cpu_load_percent,
+            free_memory_bytes=result.free_memory_bytes,
+            uptime_seconds=result.uptime_seconds,
+            detail=result.detail,
         )
-
-    def _health_check_sync(self, credentials: DeviceCredentials) -> dict[str, object]:
-        api = self._connect_api(credentials)
-        try:
-            return next(iter(api("/system/resource/print")), {})
-        except LibRouterosError as exc:
-            raise ProvisionDeviceOperationError("health_check", str(exc)) from exc
-        finally:
-            api.close()
 
     async def backup(self, credentials: DeviceCredentials) -> bytes:
-        await self._run_ssh_command(
-            credentials, f'/system/backup/save name="{_BACKUP_FILENAME}"'
-        )
-        return await self._download_file(credentials, _BACKUP_FILENAME)
+        creds = self._gateway_credentials(credentials)
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).backup(creds)
+        except MikroTikConnectionError as exc:
+            raise ProvisionDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ProvisionDeviceOperationError("backup", exc.detail) from exc
 
     async def restore(
         self, credentials: DeviceCredentials, *, backup_content: bytes
     ) -> None:
-        await self.upload_file(
-            credentials, filename=_BACKUP_FILENAME, content=backup_content
-        )
-        await self._run_ssh_command(
-            credentials, f'/system/backup/load name="{_BACKUP_FILENAME}"'
-        )
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).restore(
+                creds, backup_content=backup_content
+            )
+        except MikroTikConnectionError as exc:
+            raise ProvisionDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ProvisionDeviceOperationError("restore", exc.detail) from exc
 
     async def upload_file(
         self, credentials: DeviceCredentials, *, filename: str, content: bytes
     ) -> None:
+        creds = self._gateway_credentials(credentials)
         try:
-            async with (
-                self._ssh_connect(credentials) as conn,
-                conn.start_sftp_client() as sftp,
-                sftp.open(filename, "wb") as remote_file,
-            ):
-                await remote_file.write(content)
-        except (OSError, asyncssh.Error) as exc:
-            raise ProvisionDeviceConnectionError(credentials.host, str(exc)) from exc
+            await get_adapter(DeviceVendor.MIKROTIK).upload_file(
+                creds, filename=filename, content=content
+            )
+        except MikroTikConnectionError as exc:
+            raise ProvisionDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ProvisionDeviceOperationError("upload_file", exc.detail) from exc
 
     async def execute_raw_command(
         self, credentials: DeviceCredentials, *, command: str
     ) -> RawCommandResult:
+        creds = self._gateway_credentials(credentials)
         try:
-            async with self._ssh_connect(credentials) as conn:
-                result = await conn.run(command, check=False)
-        except (OSError, asyncssh.Error) as exc:
-            raise ProvisionDeviceConnectionError(credentials.host, str(exc)) from exc
+            result = await get_adapter(DeviceVendor.MIKROTIK).execute_raw_command(
+                creds, command=command
+            )
+        except MikroTikConnectionError as exc:
+            raise ProvisionDeviceConnectionError(credentials.host, exc.detail) from exc
         return RawCommandResult(
-            command=command,
-            stdout=str(result.stdout or ""),
-            stderr=str(result.stderr or ""),
-            exit_status=result.exit_status if result.exit_status is not None else -1,
+            command=result.command,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            exit_status=result.exit_status,
         )
-
-    # ========================================================================
-    # Internal transport helpers
-    # ========================================================================
-
-    def _connect_api(self, credentials: DeviceCredentials):  # noqa: ANN202
-        try:
-            return librouteros.connect(
-                host=credentials.host,
-                username=credentials.username,
-                password=credentials.password,
-                port=credentials.api_port,
-                timeout=credentials.timeout_seconds,
-            )
-        except (LibRouterosError, OSError) as exc:
-            raise ProvisionDeviceConnectionError(credentials.host, str(exc)) from exc
-
-    def _ssh_connect(self, credentials: DeviceCredentials):  # noqa: ANN202
-        return asyncssh.connect(
-            credentials.host,
-            port=credentials.ssh_port,
-            username=credentials.username,
-            password=credentials.password,
-            known_hosts=None,
-            connect_timeout=credentials.timeout_seconds,
-        )
-
-    async def _run_ssh_command(
-        self, credentials: DeviceCredentials, command: str
-    ) -> None:
-        try:
-            async with self._ssh_connect(credentials) as conn:
-                result = await conn.run(command, check=False)
-        except (OSError, asyncssh.Error) as exc:
-            raise ProvisionDeviceConnectionError(credentials.host, str(exc)) from exc
-        if result.exit_status != 0:
-            raise ProvisionDeviceOperationError(
-                command, result.stderr or f"exit status {result.exit_status}"
-            )
-
-    async def _download_file(
-        self, credentials: DeviceCredentials, filename: str
-    ) -> bytes:
-        try:
-            async with (
-                self._ssh_connect(credentials) as conn,
-                conn.start_sftp_client() as sftp,
-                sftp.open(filename, "rb") as remote_file,
-            ):
-                return await remote_file.read()
-        except (OSError, asyncssh.Error) as exc:
-            raise ProvisionDeviceConnectionError(credentials.host, str(exc)) from exc
-
-
-def _as_float(value: object) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(str(value).rstrip("%"))
-    except ValueError:
-        return None
-
-
-def _as_int(value: object) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _parse_routeros_uptime(value: object) -> int | None:
-    """RouterOS reports uptime as e.g. ``"3w2d4h5m6s"``, not a raw number of
-    seconds. Parses each ``<number><unit>`` segment and sums them -- a real,
-    exact parser, not a placeholder."""
-    if not value:
-        return None
-    text = str(value)
-    units = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}
-    total_seconds = 0
-    number = ""
-    for char in text:
-        if char.isdigit():
-            number += char
-        elif char in units and number:
-            total_seconds += int(number) * units[char]
-            number = ""
-        else:
-            return None
-    return total_seconds
 
 
 # The registry: one entry per real, plugged-in vendor. Adding a new vendor
