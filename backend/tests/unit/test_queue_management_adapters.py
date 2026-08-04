@@ -1,17 +1,33 @@
 """Unit tests for the Queue Management Engine's real device I/O adapter
 layer (``app.domains.queue_management.device_adapters``).
 
-Per that module's own "real client code, untested end-to-end here" scope
-note, ``MikroTikQueueAdapter``'s command-construction and response-parsing
-logic is exercised here via a hand-rolled fake ``librouteros`` transport
-(monkeypatching ``librouteros.connect``) that faithfully mirrors the real
-library's own ``Path.add``/``.update``/``.remove``/iteration contract --
-never a real socket. This mirrors
-``tests/unit/test_provisioning_engine_adapters.py``'s own identical
-discipline. Also covers a genuine, real-network negative case: a
-connection attempt to a guaranteed-unreachable TEST-NET-1 address
-(``192.0.2.1``), bounded by a 1-second timeout, which must raise a real
-``QueueDeviceConnectionError``, never a fabricated success.
+``MikroTikQueueAdapter`` now delegates every operation to
+``wyfy_device_gateway.registry.get_adapter(DeviceVendor.MIKROTIK)`` (see
+device_adapters.py's own "now delegates to wyfy-device-gateway" module
+docstring) -- the real RouterOS command-construction/response-parsing
+logic itself lives in, and is exhaustively unit-tested by,
+``wyfy-device-gateway``'s own ``tests/test_mikrotik_queue.py`` against a
+fake transport there.
+
+What this file verifies is the *delegation chain end-to-end*: these tests
+monkeypatch ``librouteros.connect`` at the shared module-attribute level
+(both this domain's former direct caller and the gateway package's
+``MikroTikAdapter._connect_api`` do a plain ``import librouteros`` and
+call ``librouteros.connect(...)``, so patching the one shared module
+object intercepts the call regardless of which layer makes it) with a
+hand-rolled fake transport that faithfully mirrors the real library's own
+``Path.add``/``.update``/``.remove``/iteration contract -- never a real
+socket. This confirms credential translation
+(``QueueCredentials`` -> ``wyfy_device_gateway.contract.DeviceCredentials``)
+and error translation (``MikroTikConnectionError``/``MikroTikDeviceError``
+-> this domain's own ``QueueDeviceConnectionError``/
+``QueueDeviceOperationError``) are wired correctly, on top of the same
+real RouterOS command shapes the gateway package ports verbatim from this
+module's pre-migration implementation. Also covers a genuine, real-network
+negative case: a connection attempt to a guaranteed-unreachable TEST-NET-1
+address (``192.0.2.1``), bounded by a 1-second timeout, which must raise a
+real ``QueueDeviceConnectionError`` all the way through both layers, never
+a fabricated success.
 
 Follows this project's plain-``assert``/native-``async def`` style;
 ``asyncio_mode = "auto"`` runs async tests directly.

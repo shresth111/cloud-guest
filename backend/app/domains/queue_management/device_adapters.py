@@ -5,57 +5,39 @@ vendor implements to plug in real bandwidth/QoS queue operations; the
 engine itself never imports ``librouteros`` or constructs a single
 RouterOS command directly.
 
-## Honest scope: real client code, never exercised end-to-end here
+## Now delegates to wyfy-device-gateway
 
-:class:`MikroTikQueueAdapter` uses ``librouteros`` (see
-``requirements.txt`` -- already a real, genuine dependency, added for
-``app.domains.provisioning_engine``'s own device adapter) to speak
-RouterOS's real API protocol against ``/queue/simple``, ``/queue/tree``,
-and ``/queue/type`` (PCQ). Unlike ``provisioning_engine.device_adapters``,
-this adapter needs no SSH/SFTP transport at all -- every queue operation
-(add/set/remove/print) is a native RouterOS API command, not a file-system-
-level operation. This module's own command-construction and response-
-parsing logic is exercised in ``test_queue_management_adapters.py`` via a
-hand-rolled fake transport, mirroring
-``app.domains.provisioning_engine.device_adapters``'s own identical
-discipline. There is no live MikroTik device anywhere in this sandbox --
-every method below, if actually invoked here, raises a real
-:class:`~.exceptions.QueueDeviceConnectionError` the moment it tries to
-open a real socket, never a fabricated success.
-
-## The real ``librouteros`` write API: ``Path.add``/``.update``/``.remove``
-
-``librouteros.Api.path(*segments)`` returns a ``Path`` object with real
-``add(**kwargs)`` (RouterOS ``add``, returns the new row's device-side
-``.id``, e.g. ``"*1"``), ``update(**kwargs)`` (RouterOS ``set`` -- must
-include ``.id`` in ``kwargs`` to target which row), and ``remove(*ids)``
-(RouterOS ``remove``) methods -- confirmed directly against the installed
-``librouteros`` package's own source
-(``site-packages/librouteros/api.py``), not guessed from memory. RouterOS
-field names containing a hyphen (``max-limit``, ``burst-limit``,
-``burst-threshold``, ``burst-time``, ``pcq-rate``, ...) are passed via
-``**{"max-limit": ...}`` since they are not valid Python keyword-argument
-identifiers.
-
-## Rate formatting
-
-``QueueProfile`` stores rates in kbps (see that model's own docstring for
-why ``0`` means "unlimited"). RouterOS's own ``max-limit``/``burst-limit``
-fields accept a bare number with a unit suffix (``"512k"``, ``"5M"``) --
-this module always emits the ``k`` suffix (``f"{value}k"``), a real,
-valid RouterOS unit, never converted to ``M`` for readability, keeping the
-formatting logic a single, trivial, always-correct code path.
+Per the ``wyfy-device-gateway`` PRD (section 7, Step 3, item 4),
+``MikroTikQueueAdapter``'s nine methods (``create_simple_queue``,
+``update_simple_queue``, ``delete_simple_queue``, ``create_queue_tree``,
+``apply_pcq``, ``set_priority``, ``assign_queue_to_target``,
+``remove_queue``, ``read_queue_status``) now call
+``wyfy_device_gateway.registry.get_adapter(DeviceVendor.MIKROTIK)``
+instead of opening ``librouteros`` directly -- that package is a straight
+port of this module's own former ``_add_sync``/``_update_sync``/
+``_remove_sync``/``_read_status_sync`` methods, including the identical
+RouterOS command shapes (same ``Path.add``/``.update``/``.remove`` calls),
+the same rate/burst-field formatting (kbps with a ``k`` suffix,
+upload/download pair strings via ``_max_limit_field``/``_burst_fields``),
+and the same counter-pair parsing (``_split_pair_int``). Public
+signatures/return shapes are unchanged; the gateway's
+``MikroTikConnectionError``/``MikroTikDeviceError`` distinction is
+translated back into this domain's own ``QueueDeviceConnectionError``/
+``QueueDeviceOperationError`` pair so ``service.py`` needs no changes,
+mirroring the identical pattern already used for the ``isp``,
+``network_diagnostics``, and ``connected_devices`` call sites.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Protocol
 
-import librouteros
-from librouteros.exceptions import LibRouterosError
+from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
+from wyfy_device_gateway.contract import DeviceVendor
+from wyfy_device_gateway.mikrotik_adapter import MikroTikConnectionError, MikroTikDeviceError
+from wyfy_device_gateway.registry import get_adapter
 
 from .constants import DEFAULT_QUEUE_PRIORITY
 from .exceptions import (
@@ -223,10 +205,22 @@ class BaseQueueAdapter(Protocol):
 
 
 class MikroTikQueueAdapter:
-    """See module docstring for the full "real client code, untested
-    end-to-end here" write-up."""
+    """See module docstring's "now delegates to wyfy-device-gateway"
+    write-up."""
 
     vendor = "mikrotik"
+
+    def _gateway_credentials(
+        self, credentials: QueueCredentials
+    ) -> _GatewayDeviceCredentials:
+        return _GatewayDeviceCredentials(
+            vendor=DeviceVendor.MIKROTIK,
+            host=credentials.host,
+            username=credentials.username,
+            secret=credentials.password,
+            port=credentials.api_port,
+            timeout_seconds=credentials.timeout_seconds,
+        )
 
     async def create_simple_queue(
         self,
@@ -242,25 +236,24 @@ class MikroTikQueueAdapter:
         burst_time_seconds: int | None = None,
         priority: int = DEFAULT_QUEUE_PRIORITY,
     ) -> str:
-        fields = {
-            "name": name,
-            "target": target,
-            **_max_limit_field(upload_rate_kbps, download_rate_kbps),
-            **_burst_fields(
-                burst_upload_kbps,
-                burst_download_kbps,
-                burst_threshold_kbps,
-                burst_time_seconds,
-            ),
-            "priority": str(priority),
-        }
-        return await asyncio.to_thread(
-            self._add_sync,
-            credentials,
-            ("queue", "simple"),
-            fields,
-            "create_simple_queue",
-        )
+        creds = self._gateway_credentials(credentials)
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).create_simple_queue(
+                creds,
+                name=name,
+                target=target,
+                download_rate_kbps=download_rate_kbps,
+                upload_rate_kbps=upload_rate_kbps,
+                burst_download_kbps=burst_download_kbps,
+                burst_upload_kbps=burst_upload_kbps,
+                burst_threshold_kbps=burst_threshold_kbps,
+                burst_time_seconds=burst_time_seconds,
+                priority=priority,
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError("create_simple_queue", exc.detail) from exc
 
     async def update_simple_queue(
         self,
@@ -275,35 +268,36 @@ class MikroTikQueueAdapter:
         burst_time_seconds: int | None = None,
         priority: int = DEFAULT_QUEUE_PRIORITY,
     ) -> None:
-        fields = {
-            ".id": device_queue_id,
-            **_max_limit_field(upload_rate_kbps, download_rate_kbps),
-            **_burst_fields(
-                burst_upload_kbps,
-                burst_download_kbps,
-                burst_threshold_kbps,
-                burst_time_seconds,
-            ),
-            "priority": str(priority),
-        }
-        await asyncio.to_thread(
-            self._update_sync,
-            credentials,
-            ("queue", "simple"),
-            fields,
-            "update_simple_queue",
-        )
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).update_simple_queue(
+                creds,
+                device_queue_id=device_queue_id,
+                download_rate_kbps=download_rate_kbps,
+                upload_rate_kbps=upload_rate_kbps,
+                burst_download_kbps=burst_download_kbps,
+                burst_upload_kbps=burst_upload_kbps,
+                burst_threshold_kbps=burst_threshold_kbps,
+                burst_time_seconds=burst_time_seconds,
+                priority=priority,
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError("update_simple_queue", exc.detail) from exc
 
     async def delete_simple_queue(
         self, credentials: QueueCredentials, *, device_queue_id: str
     ) -> None:
-        await asyncio.to_thread(
-            self._remove_sync,
-            credentials,
-            ("queue", "simple"),
-            device_queue_id,
-            "delete_simple_queue",
-        )
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).delete_simple_queue(
+                creds, device_queue_id=device_queue_id
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError("delete_simple_queue", exc.detail) from exc
 
     async def create_queue_tree(
         self,
@@ -316,19 +310,21 @@ class MikroTikQueueAdapter:
         priority: int = DEFAULT_QUEUE_PRIORITY,
         queue_type_name: str | None = None,
     ) -> str:
-        fields: dict[str, str] = {
-            "name": name,
-            "parent": parent,
-            "max-limit": f"{max_limit_kbps}k",
-            "priority": str(priority),
-        }
-        if packet_mark is not None:
-            fields["packet-mark"] = packet_mark
-        if queue_type_name is not None:
-            fields["queue"] = queue_type_name
-        return await asyncio.to_thread(
-            self._add_sync, credentials, ("queue", "tree"), fields, "create_queue_tree"
-        )
+        creds = self._gateway_credentials(credentials)
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).create_queue_tree(
+                creds,
+                name=name,
+                parent=parent,
+                packet_mark=packet_mark,
+                max_limit_kbps=max_limit_kbps,
+                priority=priority,
+                queue_type_name=queue_type_name,
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError("create_queue_tree", exc.detail) from exc
 
     async def apply_pcq(
         self,
@@ -338,15 +334,15 @@ class MikroTikQueueAdapter:
         rate_kbps: int,
         classifier: str = "dst-address",
     ) -> str:
-        fields = {
-            "name": name,
-            "kind": "pcq",
-            "pcq-rate": f"{rate_kbps}k",
-            "pcq-classifier": classifier,
-        }
-        return await asyncio.to_thread(
-            self._add_sync, credentials, ("queue", "type"), fields, "apply_pcq"
-        )
+        creds = self._gateway_credentials(credentials)
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).apply_pcq(
+                creds, name=name, rate_kbps=rate_kbps, classifier=classifier
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError("apply_pcq", exc.detail) from exc
 
     async def set_priority(
         self,
@@ -356,26 +352,33 @@ class MikroTikQueueAdapter:
         priority: int,
         queue_kind: str = "simple",
     ) -> None:
-        fields = {".id": device_queue_id, "priority": str(priority)}
-        await asyncio.to_thread(
-            self._update_sync,
-            credentials,
-            ("queue", queue_kind),
-            fields,
-            "set_priority",
-        )
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).set_priority(
+                creds,
+                device_queue_id=device_queue_id,
+                priority=priority,
+                queue_kind=queue_kind,
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError("set_priority", exc.detail) from exc
 
     async def assign_queue_to_target(
         self, credentials: QueueCredentials, *, device_queue_id: str, target: str
     ) -> None:
-        fields = {".id": device_queue_id, "target": target}
-        await asyncio.to_thread(
-            self._update_sync,
-            credentials,
-            ("queue", "simple"),
-            fields,
-            "assign_queue_to_target",
-        )
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).assign_queue_to_target(
+                creds, device_queue_id=device_queue_id, target=target
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError(
+                "assign_queue_to_target", exc.detail
+            ) from exc
 
     async def remove_queue(
         self,
@@ -384,13 +387,15 @@ class MikroTikQueueAdapter:
         device_queue_id: str,
         queue_kind: str = "simple",
     ) -> None:
-        await asyncio.to_thread(
-            self._remove_sync,
-            credentials,
-            ("queue", queue_kind),
-            device_queue_id,
-            "remove_queue",
-        )
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).remove_queue(
+                creds, device_queue_id=device_queue_id, queue_kind=queue_kind
+            )
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError("remove_queue", exc.detail) from exc
 
     async def read_queue_status(
         self,
@@ -399,137 +404,26 @@ class MikroTikQueueAdapter:
         device_queue_id: str,
         queue_kind: str = "simple",
     ) -> QueueDeviceStatus:
-        return await asyncio.to_thread(
-            self._read_status_sync, credentials, queue_kind, device_queue_id
-        )
-
-    # ========================================================================
-    # Internal transport helpers
-    # ========================================================================
-
-    def _connect_api(self, credentials: QueueCredentials):  # noqa: ANN202
+        creds = self._gateway_credentials(credentials)
         try:
-            return librouteros.connect(
-                host=credentials.host,
-                username=credentials.username,
-                password=credentials.password,
-                port=credentials.api_port,
-                timeout=credentials.timeout_seconds,
+            result = await get_adapter(DeviceVendor.MIKROTIK).read_queue_status(
+                creds, device_queue_id=device_queue_id, queue_kind=queue_kind
             )
-        except (LibRouterosError, OSError) as exc:
-            raise QueueDeviceConnectionError(credentials.host, str(exc)) from exc
-
-    def _add_sync(
-        self,
-        credentials: QueueCredentials,
-        path_segments: tuple[str, ...],
-        fields: dict[str, str],
-        operation: str,
-    ) -> str:
-        api = self._connect_api(credentials)
-        try:
-            return api.path(*path_segments).add(**fields)
-        except LibRouterosError as exc:
-            raise QueueDeviceOperationError(operation, str(exc)) from exc
-        finally:
-            api.close()
-
-    def _update_sync(
-        self,
-        credentials: QueueCredentials,
-        path_segments: tuple[str, ...],
-        fields: dict[str, str],
-        operation: str,
-    ) -> None:
-        api = self._connect_api(credentials)
-        try:
-            api.path(*path_segments).update(**fields)
-        except LibRouterosError as exc:
-            raise QueueDeviceOperationError(operation, str(exc)) from exc
-        finally:
-            api.close()
-
-    def _remove_sync(
-        self,
-        credentials: QueueCredentials,
-        path_segments: tuple[str, ...],
-        device_queue_id: str,
-        operation: str,
-    ) -> None:
-        api = self._connect_api(credentials)
-        try:
-            api.path(*path_segments).remove(device_queue_id)
-        except LibRouterosError as exc:
-            raise QueueDeviceOperationError(operation, str(exc)) from exc
-        finally:
-            api.close()
-
-    def _read_status_sync(
-        self, credentials: QueueCredentials, queue_kind: str, device_queue_id: str
-    ) -> QueueDeviceStatus:
-        api = self._connect_api(credentials)
-        try:
-            # Client-side filter over the full print result -- a router's
-            # own queue table is small (at most a few hundred rows), so
-            # this is a real, correct, easily-testable-via-fake-transport
-            # implementation choice, not a shortcut.
-            rows = list(api.path("queue", queue_kind))
-            row = next((r for r in rows if r.get(".id") == device_queue_id), {})
-        except LibRouterosError as exc:
-            raise QueueDeviceOperationError("read_queue_status", str(exc)) from exc
-        finally:
-            api.close()
+        except MikroTikConnectionError as exc:
+            raise QueueDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QueueDeviceOperationError("read_queue_status", exc.detail) from exc
         return QueueDeviceStatus(
-            device_queue_id=device_queue_id,
-            name=row.get("name"),
-            target=row.get("target"),
-            disabled=str(row.get("disabled", "false")).lower() == "true",
-            bytes_uploaded=_split_pair_int(row.get("bytes"), 0),
-            bytes_downloaded=_split_pair_int(row.get("bytes"), 1),
-            packets_uploaded=_split_pair_int(row.get("packets"), 0),
-            packets_downloaded=_split_pair_int(row.get("packets"), 1),
-            queued_bytes=_split_pair_int(row.get("queued-bytes"), 0),
+            device_queue_id=result.device_queue_id,
+            name=result.name,
+            target=result.target,
+            disabled=result.disabled,
+            bytes_uploaded=result.bytes_uploaded,
+            bytes_downloaded=result.bytes_downloaded,
+            packets_uploaded=result.packets_uploaded,
+            packets_downloaded=result.packets_downloaded,
+            queued_bytes=result.queued_bytes,
         )
-
-
-def _max_limit_field(upload_rate_kbps: int, download_rate_kbps: int) -> dict[str, str]:
-    return {"max-limit": f"{upload_rate_kbps}k/{download_rate_kbps}k"}
-
-
-def _burst_fields(
-    burst_upload_kbps: int | None,
-    burst_download_kbps: int | None,
-    burst_threshold_kbps: int | None,
-    burst_time_seconds: int | None,
-) -> dict[str, str]:
-    """RouterOS only accepts burst-limit/burst-threshold/burst-time as a
-    trio -- if none of the three burst rate values is set, no burst fields
-    are emitted at all (an unset burst is a real, valid RouterOS queue,
-    not an error)."""
-    if burst_upload_kbps is None and burst_download_kbps is None:
-        return {}
-    fields = {
-        "burst-limit": f"{burst_upload_kbps or 0}k/{burst_download_kbps or 0}k",
-    }
-    if burst_threshold_kbps is not None:
-        fields["burst-threshold"] = f"{burst_threshold_kbps}k/{burst_threshold_kbps}k"
-    if burst_time_seconds is not None:
-        fields["burst-time"] = f"{burst_time_seconds}/{burst_time_seconds}"
-    return fields
-
-
-def _split_pair_int(value: object, index: int) -> int | None:
-    """RouterOS reports several counters (``bytes``, ``packets``,
-    ``queued-bytes``) as an ``"upload/download"``-style pair string."""
-    if not value:
-        return None
-    parts = str(value).split("/")
-    if len(parts) <= index:
-        return None
-    try:
-        return int(parts[index])
-    except ValueError:
-        return None
 
 
 _QUEUE_ADAPTERS: dict[str, BaseQueueAdapter] = {"mikrotik": MikroTikQueueAdapter()}
