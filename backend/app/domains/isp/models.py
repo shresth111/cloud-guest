@@ -284,6 +284,24 @@ class IspHealthCheck(BaseModel):
     __table_args__ = (
         Index("ix_isp_health_checks_isp_link_id", "isp_link_id"),
         Index("ix_isp_health_checks_checked_at", "checked_at"),
+        # The real, dominant access pattern for this table -- both
+        # IspRepository.list_health_checks_for_link's date-range branch and
+        # bucketed_health_checks_for_link (the Bandwidth Utilization/
+        # history-dialog aggregation) filter `isp_link_id == X AND
+        # checked_at BETWEEN start AND end` together, never one alone. The
+        # two single-column indexes above force a bitmap-AND; at real scale
+        # (tens of thousands of rows per link after a few weeks at the
+        # sweep's 60s cadence, per this table's own module docstring) a
+        # single composite index serving that exact predicate directly is
+        # the difference between an index range scan and a much costlier
+        # plan. Column order matters: isp_link_id first (the always-present
+        # equality filter) then checked_at (the range filter), the
+        # standard equality-then-range composite-index ordering.
+        Index(
+            "ix_isp_health_checks_link_id_checked_at",
+            "isp_link_id",
+            "checked_at",
+        ),
     )
 
     def __repr__(self) -> str:

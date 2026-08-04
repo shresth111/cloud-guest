@@ -26,6 +26,7 @@ import logging
 
 from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
+from app.database.redis import redis_client
 from app.database.session import SessionLocal
 from app.domains.location.repository import (
     LocationCodeCounterRepository,
@@ -72,6 +73,14 @@ async def _run_isp_health_check_sweep_async() -> HealthCheckSweepSummary:
                 router_service,
                 audit_writer=audit_writer,
                 device_adapter_resolver=get_isp_health_adapter,
+                # Same real app.database.redis.redis_client singleton the
+                # FastAPI DI path (dependencies.get_isp_service) wires in --
+                # required so this sweep's own record_health_check_result
+                # calls can see run_speed_test's real in-flight marker (see
+                # that method's own docstring) and correctly suppress a
+                # self-induced-congestion reading rather than letting it
+                # advance toward a real failover.
+                redis=redis_client,
             )
             await session.commit()
             return summary

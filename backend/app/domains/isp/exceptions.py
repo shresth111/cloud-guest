@@ -26,6 +26,7 @@ __all__ = [
     "IspDeviceConnectionError",
     "IspDeviceOperationError",
     "UnsupportedIspVendorError",
+    "IspSpeedTestCooldownError",
 ]
 
 
@@ -150,6 +151,26 @@ class IspDeviceOperationError(IspError):
         super().__init__(
             f"ISP device operation '{operation}' failed: {reason}",
             status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class IspSpeedTestCooldownError(IspError):
+    """A speed test genuinely consumes real, possibly-metered customer
+    bandwidth and briefly saturates a low-power router -- ``run_speed_test``
+    enforces a real per-link cooldown (``constants
+    .SPEED_TEST_MIN_INTERVAL_SECONDS``) so this on-demand action can't be
+    hammered back-to-back (accidentally, by two admins racing each other,
+    or maliciously) into a real bandwidth/availability problem for the
+    customer's own network. ``retry_after_seconds`` is the real, live TTL
+    remaining on the Redis cooldown key, not a fixed guess."""
+
+    def __init__(self, link_id: uuid.UUID, retry_after_seconds: int) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(
+            f"A speed test already ran recently on ISP link '{link_id}' -- "
+            f"try again in {retry_after_seconds}s",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            data={"retry_after_seconds": retry_after_seconds},
         )
 
 

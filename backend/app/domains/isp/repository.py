@@ -35,6 +35,8 @@ class IspRepositoryProtocol(Protocol):
         self, link_id: uuid.UUID, *, include_deleted: bool = False
     ) -> IspLink | None: ...
 
+    async def get_link_for_update(self, link_id: uuid.UUID) -> IspLink | None: ...
+
     async def update_link(self, link: IspLink, data: dict[str, object]) -> IspLink: ...
 
     async def soft_delete_link(self, link: IspLink) -> IspLink: ...
@@ -124,6 +126,33 @@ class IspRepository:
         self, link_id: uuid.UUID, *, include_deleted: bool = False
     ) -> IspLink | None:
         return await self.links.get_by_id(link_id, include_deleted=include_deleted)
+
+    async def get_link_for_update(self, link_id: uuid.UUID) -> IspLink | None:
+        """Real row-level lock (``SELECT ... FOR UPDATE``) on this single
+        ``IspLink`` -- used by ``IspService.record_health_check_result``
+        immediately before it computes/writes the traffic-counter delta
+        and ``consecutive_unhealthy_count``, both of which are read-then-
+        incremented against the row's own *previous* value. Without this,
+        a manual "Check health now" racing the automated 60s sweep on the
+        exact same link (two independent DB sessions/transactions, each
+        with its own in-memory snapshot of the link) is a genuine
+        last-write-wins lost-update: whichever request's plain UPDATE
+        commits last silently discards the other's counter/streak state.
+        ``with_for_update()`` makes the second transaction to reach this
+        link block until the first commits, then read that first
+        transaction's *committed* result -- real serialization, not a
+        fixed sleep/retry guess. ``populate_existing=True`` guards the
+        (same-session) case where this link was already loaded earlier in
+        the same request, so this always reflects the row's current
+        committed values rather than a stale identity-mapped object."""
+        statement = (
+            select(IspLink)
+            .where(IspLink.id == link_id, IspLink.is_deleted.is_(False))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
 
     async def update_link(self, link: IspLink, data: dict[str, object]) -> IspLink:
         return await self.links.update(link, data)

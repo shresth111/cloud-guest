@@ -15,8 +15,10 @@ this module at all.
 from __future__ import annotations
 
 from fastapi import Depends
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
@@ -37,11 +39,20 @@ def get_isp_service(
     repository: IspRepositoryProtocol = Depends(get_isp_repository),
     router_service: RouterService = Depends(get_router_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    # Backs run_speed_test's real per-link cooldown/in-flight marker and
+    # record_health_check_result's self-congestion suppression -- see
+    # IspService.__init__'s own docstring for why this is optional at the
+    # type level (tests construct IspService directly with redis=None).
+    # The real app.database.redis.redis_client singleton every other
+    # Redis-backed rate limiter in this codebase (OtpRateLimiter, this
+    # app's own RateLimitMiddleware) already reuses, not a new client.
+    redis: Redis = Depends(get_redis_client),
 ) -> IspService:
     return IspService(
         repository,
         router_service,
         audit_writer=audit_repository,
+        redis=redis,
     )
 
 

@@ -174,6 +174,29 @@ SPEED_TEST_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=10000000"
 # leaves real headroom without being open-ended.
 SPEED_TEST_TIMEOUT_SECONDS = 60
 
+# Real bandwidth-abuse/self-congestion guard: this action genuinely
+# consumes a customer's own (possibly metered) WAN bandwidth and briefly
+# saturates a low-power router -- unlike every other RBAC-gated ISP
+# endpoint, repeating it back-to-back has a real external cost, so it gets
+# a real per-link cooldown, enforced in Redis by IspService.run_speed_test
+# (mirrors app.domains.otp.service.OtpRateLimiter's identical
+# SET-NX-EX-then-check-TTL pattern, keyed by isp_link_id instead of an OTP
+# identifier). Deliberately shorter than SPEED_TEST_TIMEOUT_SECONDS itself
+# would allow back-to-back tests the instant one finishes, so this is its
+# own, separate, slightly-longer-than-worst-case-duration value.
+SPEED_TEST_MIN_INTERVAL_SECONDS = 60
+SPEED_TEST_COOLDOWN_REDIS_KEY_TEMPLATE = "isp:speed_test:cooldown:{link_id}"
+# Set for the real duration of an in-flight speed test (TTL'd well past
+# SPEED_TEST_TIMEOUT_SECONDS as a safety net in case a request dies
+# without reaching the `finally` that clears it) -- checked by
+# IspService.record_health_check_result so the *automated* 60s sweep's own
+# concurrent ping against the same link, if it lands mid-test, never lets
+# a purely self-induced congestion reading advance
+# consecutive_unhealthy_count toward a real failover. See that method's
+# own docstring for the full "why this matters" write-up.
+SPEED_TEST_ACTIVE_REDIS_KEY_TEMPLATE = "isp:speed_test:active:{link_id}"
+SPEED_TEST_ACTIVE_REDIS_TTL_SECONDS = SPEED_TEST_TIMEOUT_SECONDS + 30
+
 # How far back (in real IspHealthCheck rows) IspService
 # .compute_unhealthy_since is willing to scan looking for where the
 # link's *current* unbroken UNHEALTHY streak actually began -- capped,
@@ -238,6 +261,10 @@ __all__ = [
     "ISP_PING_TIMEOUT_SECONDS",
     "SPEED_TEST_DOWNLOAD_URL",
     "SPEED_TEST_TIMEOUT_SECONDS",
+    "SPEED_TEST_MIN_INTERVAL_SECONDS",
+    "SPEED_TEST_COOLDOWN_REDIS_KEY_TEMPLATE",
+    "SPEED_TEST_ACTIVE_REDIS_KEY_TEMPLATE",
+    "SPEED_TEST_ACTIVE_REDIS_TTL_SECONDS",
     "UNHEALTHY_SINCE_LOOKBACK_LIMIT",
     "TASK_RUN_ISP_HEALTH_CHECK_SWEEP",
     "ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS",

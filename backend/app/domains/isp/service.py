@@ -65,7 +65,11 @@ from .constants import (
     DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER,
     ISP_PING_COUNT,
     ISP_PING_TIMEOUT_SECONDS,
+    SPEED_TEST_ACTIVE_REDIS_KEY_TEMPLATE,
+    SPEED_TEST_ACTIVE_REDIS_TTL_SECONDS,
+    SPEED_TEST_COOLDOWN_REDIS_KEY_TEMPLATE,
     SPEED_TEST_DOWNLOAD_URL,
+    SPEED_TEST_MIN_INTERVAL_SECONDS,
     SPEED_TEST_TIMEOUT_SECONDS,
     UNHEALTHY_SINCE_LOOKBACK_LIMIT,
     HealthStatus,
@@ -93,10 +97,26 @@ from .exceptions import (
     IspMissingCredentialsError,
     IspNoBackupLinkAvailableError,
     IspPrimaryLinkAlreadyExistsError,
+    IspSpeedTestCooldownError,
 )
 from .models import IspHealthCheck, IspLink
 from .repository import IspRepositoryProtocol
 from .validators import classify_health_status, is_failover_threshold_reached
+
+
+# Narrow, duck-typed Protocol for the one Redis surface this module needs
+# (a real client -- ``app.database.redis.redis_client`` -- in production,
+# `None` in every test that doesn't care about cooldown/self-congestion
+# suppression). Avoids importing ``redis.asyncio.Redis`` directly just for
+# a type hint, mirroring this module's own existing
+# ``RouterLookupProtocol``/``AuditLogWriter`` "narrow Protocol, not the
+# concrete third-party type" convention.
+class _RedisProtocol(Protocol):
+    async def set(
+        self, name: str, value: object, *, nx: bool = False, ex: int | None = None
+    ) -> object: ...
+    async def ttl(self, name: str) -> int: ...
+    async def delete(self, *names: str) -> object: ...
 
 logger = logging.getLogger(__name__)
 
@@ -230,11 +250,21 @@ class IspService:
         *,
         audit_writer: AuditLogWriter | None = None,
         device_adapter_resolver=get_isp_health_adapter,
+        redis: _RedisProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
         self._get_device_adapter = device_adapter_resolver
+        # Optional: backs run_speed_test's real per-link cooldown/in-flight
+        # marker (see that method's own docstring) and
+        # record_health_check_result's self-congestion suppression. `None`
+        # in any test/construction path that doesn't wire a real Redis
+        # client -- both features degrade to their pre-existing "always
+        # allowed / always counted" behavior rather than erroring, since
+        # neither is a correctness-critical dependency the rest of this
+        # service needs to function.
+        self._redis = redis
 
     # ========================================================================
     # Link CRUD
@@ -549,12 +579,45 @@ class IspService:
         read.
 
         No ``upload_mbps`` is ever returned -- see ``SpeedTestOutcome``'s
-        own docstring."""
+        own docstring.
+
+        **Real per-link cooldown + in-flight marker (both Redis-backed,
+        both no-ops if this service was constructed without a real
+        ``redis`` client).** Unlike every other RBAC-gated action in this
+        domain, this one genuinely consumes real, possibly-metered
+        customer bandwidth and briefly saturates a low-power router each
+        time it runs -- repeating it back-to-back (two admins racing each
+        other, a double-submit, or deliberate abuse by anyone holding
+        ``isp.execute``) has a real external cost plain RBAC gating
+        doesn't address. ``SPEED_TEST_COOLDOWN_REDIS_KEY_TEMPLATE`` (``SET
+        NX EX``, the same atomic pattern ``OtpRateLimiter`` already
+        establishes for OTP requests) rejects a second test on the same
+        link within ``SPEED_TEST_MIN_INTERVAL_SECONDS`` with a real,
+        honest ``IspSpeedTestCooldownError`` carrying the live remaining
+        TTL -- never a silent queue/wait. Separately,
+        ``SPEED_TEST_ACTIVE_REDIS_KEY_TEMPLATE`` is set for the real
+        duration of the on-router fetch below and read by
+        ``record_health_check_result`` -- see that method's own docstring
+        for why the automated sweep's own concurrent ping against this
+        same link must never let a purely self-induced-congestion reading
+        advance this link toward a real failover."""
         link = await self.get_link(
             link_id, requesting_organization_id=requesting_organization_id
         )
         if not link.is_enabled:
             raise IspLinkDisabledError(link.id)
+
+        if self._redis is not None:
+            cooldown_key = SPEED_TEST_COOLDOWN_REDIS_KEY_TEMPLATE.format(link_id=link.id)
+            acquired = await self._redis.set(
+                cooldown_key, "1", nx=True, ex=SPEED_TEST_MIN_INTERVAL_SECONDS
+            )
+            if not acquired:
+                ttl = await self._redis.ttl(cooldown_key)
+                raise IspSpeedTestCooldownError(
+                    link.id,
+                    ttl if ttl and ttl > 0 else SPEED_TEST_MIN_INTERVAL_SECONDS,
+                )
 
         router = await self.router_lookup.get_router(link.router_id)
         host = router.management_ip_address or router.public_ip_address
@@ -578,9 +641,23 @@ class IspService:
             password=secret,
             timeout_seconds=SPEED_TEST_TIMEOUT_SECONDS,
         )
-        speed_result = await adapter.run_speed_test(
-            speed_credentials, download_url=SPEED_TEST_DOWNLOAD_URL
-        )
+        active_key = SPEED_TEST_ACTIVE_REDIS_KEY_TEMPLATE.format(link_id=link.id)
+        if self._redis is not None:
+            await self._redis.set(
+                active_key, "1", ex=SPEED_TEST_ACTIVE_REDIS_TTL_SECONDS
+            )
+        try:
+            speed_result = await adapter.run_speed_test(
+                speed_credentials, download_url=SPEED_TEST_DOWNLOAD_URL
+            )
+        finally:
+            # Cleared the moment the real fetch finishes/fails, well before
+            # the TTL safety net above would expire it on its own -- a
+            # failed/slow test shouldn't keep suppressing the sweep's own
+            # failover evaluation on this link any longer than the real
+            # congestion actually lasted.
+            if self._redis is not None:
+                await self._redis.delete(active_key)
 
         outcome = SpeedTestOutcome(
             isp_link_id=link.id,
@@ -740,16 +817,77 @@ class IspService:
     async def record_health_check_result(
         self, link: IspLink, *, ping_result: PingResult, traffic: TrafficCounters | None = None
     ) -> IspLink:
+        """Records one real health-check reading and advances this link's
+        current state accordingly.
+
+        **Real row lock against a concurrent writer on the exact same
+        link.** ``link`` (the caller's argument) may be a snapshot read
+        *before* the real, possibly slow device I/O in ``ping_link``/
+        ``sample_link_traffic`` completed -- and this method's own writes
+        below (``consecutive_unhealthy_count + 1``, the traffic-counter
+        delta) are read-then-increment against that snapshot's *previous*
+        value. A manual "Check health now" racing the automated 60s sweep
+        on the same link (two independent DB sessions, each with its own
+        in-memory copy) is a genuine last-write-wins lost update without
+        protection -- so this re-fetches the row via ``SELECT ... FOR
+        UPDATE`` (``IspRepository.get_link_for_update``) first, and every
+        read/write below uses that freshly-locked ``current`` row, never
+        the possibly-stale ``link`` argument. The second concurrent caller
+        to reach this point blocks until the first commits, then correctly
+        computes its own delta against the first's *committed* result --
+        real serialization, not a best-effort guess.
+
+        **Self-congestion suppression.** If ``IspService.run_speed_test``
+        has this same link's own real on-router download in flight right
+        now (``constants.SPEED_TEST_ACTIVE_REDIS_KEY_TEMPLATE``), an
+        ``UNHEALTHY`` reading landing in this exact window is at real risk
+        of being purely a side effect of that speed test's own bandwidth
+        saturation, not a genuine outage -- it is still recorded honestly
+        (the real ``IspHealthCheck`` row/status are never suppressed or
+        faked), but it does not advance ``consecutive_unhealthy_count``
+        toward a real failover, so an admin troubleshooting a flaky link
+        with "Run Speed Test" can never *cause* the very failover they're
+        trying to diagnose around. A recovering (``HEALTHY``/``DEGRADED``)
+        reading during that same window is never suppressed -- resetting
+        the streak early is always safe."""
+        current = await self.repository.get_link_for_update(link.id)
+        if current is None:
+            # The link was hard-removed out from under this call between
+            # the caller's own read and this point -- a real (if rare)
+            # race, not a reason to crash a routine health check. Fall
+            # back to the caller's own snapshot so the rest of this method
+            # still runs against a valid, if slightly stale, object.
+            current = link
+
         now = datetime.now(UTC)
         status = classify_health_status(
             latency_ms=ping_result.avg_rtt_ms,
             packet_loss_percentage=ping_result.packet_loss_percentage,
         )
-        new_consecutive_unhealthy = (
-            link.consecutive_unhealthy_count + 1
-            if status == HealthStatus.UNHEALTHY
-            else 0
-        )
+
+        speed_test_active = False
+        if self._redis is not None and status == HealthStatus.UNHEALTHY:
+            # `TTL` alone (no separate `GET`) is enough to test presence --
+            # this key is always written with a real expiry (see
+            # run_speed_test), so a positive remaining TTL means "still
+            # in flight" and -2 (Redis's own "no such key" sentinel) means
+            # "not running" -- matches this module's own narrow
+            # `_RedisProtocol` (set/ttl/delete only, no `get` needed).
+            active_key = SPEED_TEST_ACTIVE_REDIS_KEY_TEMPLATE.format(link_id=current.id)
+            remaining_ttl = await self._redis.ttl(active_key)
+            speed_test_active = remaining_ttl is not None and remaining_ttl > 0
+
+        if status == HealthStatus.UNHEALTHY:
+            if speed_test_active:
+                logger.warning(
+                    "isp_health_check_unhealthy_during_speed_test_suppressed",
+                    extra={"isp_link_id": str(current.id)},
+                )
+                new_consecutive_unhealthy = current.consecutive_unhealthy_count
+            else:
+                new_consecutive_unhealthy = current.consecutive_unhealthy_count + 1
+        else:
+            new_consecutive_unhealthy = 0
 
         # Traffic-load rate: a real delta between this tick's counters and
         # the *previous* reading, over the real elapsed wall-clock time
@@ -761,14 +899,14 @@ class IspService:
         upload_mbps: float | None = None
         if (
             traffic is not None
-            and link.last_rx_bytes is not None
-            and link.last_tx_bytes is not None
-            and link.last_checked_at is not None
+            and current.last_rx_bytes is not None
+            and current.last_tx_bytes is not None
+            and current.last_checked_at is not None
         ):
-            elapsed_seconds = (now - link.last_checked_at).total_seconds()
+            elapsed_seconds = (now - current.last_checked_at).total_seconds()
             if elapsed_seconds > 0:
-                rx_delta = traffic.rx_bytes - link.last_rx_bytes
-                tx_delta = traffic.tx_bytes - link.last_tx_bytes
+                rx_delta = traffic.rx_bytes - current.last_rx_bytes
+                tx_delta = traffic.tx_bytes - current.last_tx_bytes
                 if rx_delta >= 0:
                     download_mbps = round(
                         (rx_delta * 8) / elapsed_seconds / 1_000_000, 3
@@ -779,7 +917,7 @@ class IspService:
                     )
 
         await self.repository.create_health_check(
-            isp_link_id=link.id,
+            isp_link_id=current.id,
             checked_at=now,
             status=status.value,
             source=HealthStatusSource.AUTOMATED.value,
@@ -814,7 +952,7 @@ class IspService:
                 update_fields["current_download_mbps"] = download_mbps
             if upload_mbps is not None:
                 update_fields["current_upload_mbps"] = upload_mbps
-        updated = await self.repository.update_link(link, update_fields)
+        updated = await self.repository.update_link(current, update_fields)
         event = IspHealthCheckRecorded(
             link_id=updated.id,
             status=status.value,
@@ -1118,6 +1256,7 @@ async def run_health_check_sweep(
     *,
     audit_writer: AuditLogWriter | None = None,
     device_adapter_resolver=get_isp_health_adapter,
+    redis: _RedisProtocol | None = None,
 ) -> HealthCheckSweepSummary:
     """The platform-wide health-check sweep ``tasks.run_isp_health_check_sweep``
     (Celery Beat) drives -- pulled out to module scope for the identical
@@ -1136,6 +1275,7 @@ async def run_health_check_sweep(
         router_lookup,
         audit_writer=audit_writer,
         device_adapter_resolver=device_adapter_resolver,
+        redis=redis,
     )
     links = await repository.list_enabled_links_for_sweep()
     checked = 0

@@ -134,6 +134,15 @@ class FakeIspRepository:
             return None
         return link
 
+    async def get_link_for_update(self, link_id: uuid.UUID) -> IspLink | None:
+        # No real row lock to take against an in-memory dict -- same
+        # not-deleted semantics as get_link_by_id(include_deleted=False),
+        # matching the real repository's own WHERE clause.
+        link = self.links.get(link_id)
+        if link is None or link.is_deleted:
+            return None
+        return link
+
     async def update_link(self, link: IspLink, data: dict[str, object]) -> IspLink:
         for key, value in data.items():
             if hasattr(link, key):
