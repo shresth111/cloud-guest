@@ -382,9 +382,14 @@ async def resolve_captive_portal_config(
     # background-image, on its own separate origin (a different port in
     # this platform's actual deployment) -- a bare "/branding/..." path
     # would resolve against the *frontend's* origin, not the API's, and
-    # 404. `request.base_url` is this same request's own scheme+host
-    # (confirmed live against production: this API is reached directly,
-    # not behind a Host-header-rewriting reverse proxy).
+    # 404. `request.base_url` is this same request's own scheme+host --
+    # correctly `https` in production behind the real nginx reverse
+    # proxy this deployment actually runs *only* because uvicorn's own
+    # ProxyHeadersMiddleware is told to trust that proxy's peer IP (see
+    # scripts/run_api.sh's own FORWARDED_ALLOW_IPS comment for the real
+    # incident this fixed: guest phones on the real captive portal
+    # silently never showed the org's logo, because this was quietly
+    # "http" instead and the browser dropped the mixed-content image).
     needs_logo = config_payload["logo_url"] is None
     needs_background = config_payload["background_image_url"] is None
     if needs_logo or needs_background:
