@@ -47,6 +47,7 @@ from app.domains.branding.service import (
     PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE,
     PUBLIC_LOGO_PATH_TEMPLATE,
 )
+from app.domains.location.repository import LocationRepository
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -358,6 +359,28 @@ async def resolve_captive_portal_config(
         organization_id=organization_id, location_id=location_id
     )
     config_payload = _config_response(resolved.config).model_dump()
+
+    # `CaptivePortalConfig.name` is an internal admin label for telling
+    # multiple configs apart (e.g. an org-level default vs. a
+    # location-specific override) -- nothing in the customer-facing
+    # Portal Configuration page ever lets an admin set it, and it isn't
+    # meant to be a guest-facing venue name at all. Every guest-facing
+    # surface (BrandPanel's "courtesy of {name}", the browser tab title,
+    # the "{name} is currently closed" message) was rendering it as if
+    # it were exactly that -- confirmed live: a real config's own
+    # internal label happened to read "Guest WiFi Login" (copied from
+    # its headline at creation time), so the BrandPanel's own generated
+    # sentence read "Fast, secure WiFi, courtesy of Guest WiFi Login,"
+    # directly overlapping/duplicating the sign-in card's own headline.
+    # The real location's own name is what a guest actually recognizes
+    # ("courtesy of Sunset Cafe", not an internal config label) --
+    # substituted here whenever a real location is resolvable, falling
+    # back to the config's own name only when there isn't one (an
+    # org-level default with no location context at all).
+    if location_id is not None:
+        location = await LocationRepository(db).get_by_id(location_id)
+        if location is not None:
+            config_payload["name"] = location.name
 
     # Fall back to the organization's own branding (app.domains.branding)
     # for whichever of logo_url/background_image_url this specific
