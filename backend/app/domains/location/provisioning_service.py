@@ -208,7 +208,21 @@ logger = logging.getLogger(__name__)
 
 _OWNER_ROLE_SLUG = "organization-owner"
 _TEMPORARY_PASSWORD_LENGTH = 16
-_TEMPORARY_PASSWORD_SPECIALS = "!@#$%^&*()-_=+"
+# Excludes look-alike characters (0/O, 1/l/I) and keeps exactly one special
+# character from a small, unambiguous set -- still satisfies
+# PasswordManager.validate_strength's upper/lower/digit/special requirement,
+# but reads and types cleanly when handed to a property owner over chat/phone.
+_TEMPORARY_PASSWORD_AMBIGUOUS = "0O1lI"
+_TEMPORARY_PASSWORD_UPPER = "".join(
+    c for c in string.ascii_uppercase if c not in _TEMPORARY_PASSWORD_AMBIGUOUS
+)
+_TEMPORARY_PASSWORD_LOWER = "".join(
+    c for c in string.ascii_lowercase if c not in _TEMPORARY_PASSWORD_AMBIGUOUS
+)
+_TEMPORARY_PASSWORD_DIGITS = "".join(
+    c for c in string.digits if c not in _TEMPORARY_PASSWORD_AMBIGUOUS
+)
+_TEMPORARY_PASSWORD_SPECIALS = "!@#$"
 _DEFAULT_LOGIN_URL_BASE = "https://app.cloudguest.example"
 """Documented placeholder -- ``app/core/config.py`` is outside this domain's
 directory-rule boundary (not one of the explicitly-permitted narrow
@@ -654,16 +668,16 @@ def _generate_username(email: str) -> str:
 def _generate_temporary_password(length: int = _TEMPORARY_PASSWORD_LENGTH) -> str:
     """A real, cryptographically secure (``secrets``, never ``random``)
     temporary password, guaranteed to contain at least one uppercase,
-    lowercase, digit, and special character."""
-    categories = [
-        string.ascii_uppercase,
-        string.ascii_lowercase,
-        string.digits,
-        _TEMPORARY_PASSWORD_SPECIALS,
+    lowercase, digit, and exactly one special character."""
+    alnum_categories = [
+        _TEMPORARY_PASSWORD_UPPER,
+        _TEMPORARY_PASSWORD_LOWER,
+        _TEMPORARY_PASSWORD_DIGITS,
     ]
-    chars = [secrets.choice(category) for category in categories]
-    all_chars = "".join(categories)
-    chars.extend(secrets.choice(all_chars) for _ in range(length - len(categories)))
+    chars = [secrets.choice(category) for category in alnum_categories]
+    chars.append(secrets.choice(_TEMPORARY_PASSWORD_SPECIALS))
+    all_alnum = "".join(alnum_categories)
+    chars.extend(secrets.choice(all_alnum) for _ in range(length - len(chars)))
     secrets.SystemRandom().shuffle(chars)
     return "".join(chars)
 
