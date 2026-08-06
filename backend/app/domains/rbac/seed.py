@@ -908,6 +908,11 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.MONITORING: _L.READ,
             _M.ALERTS: _L.READ,
             _M.DASHBOARD: _L.READ,
+            # Without this, a location-scoped Network Engineer can't even
+            # list/see the location they're scoped to -- the same
+            # _L.READ every other location-scoped role above/below
+            # already carries.
+            _M.LOCATIONS: _L.READ,
             # Same "raise a ticket about my location" posture as Network
             # Administrator's own override above.
             _M.SUPPORT_TICKETS: _L.OPERATE,
