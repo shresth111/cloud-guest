@@ -64,6 +64,17 @@ RATE_LIMITED_PATH_PREFIXES: tuple[str, ...] = (
     # endpoints, matching every other prefix entry above's own
     # "whole-domain prefix, not method-specific" grain.
     "/api/v1/demo-requests",
+    # Public marketing-site URL-shortener create tool -- anonymous, no
+    # auth (see app.domains.url_shortener.router's own module docstring).
+    # Also protected by that module's own Redis-backed
+    # ShortLinkRateLimiter (a per-source, per-action budget), the same
+    # "defense in depth, not duplication" layering this middleware's own
+    # module docstring documents for voucher/OTP's identical guest-facing
+    # routes above.
+    "/api/v1/public/short-links",
+    # The guest-facing redirect itself -- anonymous, no auth, a real
+    # browser follows this on every single short-link click.
+    "/api/v1/s/",
 )
 
 _RATE_LIMIT_KEY_TEMPLATE = "rate_limit:{client_ip}:{path}"

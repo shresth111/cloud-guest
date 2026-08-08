@@ -2,30 +2,28 @@ from fastapi import APIRouter
 
 from app.api.v1.health.routes import router as health_router
 from app.domains.admin_logs.router import router as admin_logs_router
+from app.domains.agent_permissions.router import router as agent_permissions_router
 from app.domains.analytics.router import router as analytics_router
 from app.domains.api_keys.router import router as api_keys_router
 from app.domains.assistant.router import router as assistant_router
 from app.domains.audit.router import router as audit_router
-from app.domains.dashboard.router import router as dashboard_router
-from app.domains.demo_request.router import router as demo_request_router
-from app.domains.workspace.router import router as workspace_router
-from app.domains.feature_entitlement.router import router as feature_entitlement_router
-from app.domains.agent_permissions.router import router as agent_permissions_router
-from app.domains.live_sessions.router import router as live_sessions_router
-from app.domains.customer_provisioning.router import (
-    router as customer_provisioning_router,
-)
-from app.domains.system.router import router as system_router
 from app.domains.auth.router import router as auth_router
 from app.domains.billing.router import router as billing_router
+from app.domains.branding.router import router as branding_router
 from app.domains.campaigns.router import guest_router as campaigns_guest_router
 from app.domains.campaigns.router import router as campaigns_router
 from app.domains.captive_portal.router import router as captive_portal_router
 from app.domains.connected_devices.router import router as connected_devices_router
 from app.domains.controller_logs.router import router as controller_logs_router
+from app.domains.customer_provisioning.router import (
+    router as customer_provisioning_router,
+)
+from app.domains.dashboard.router import router as dashboard_router
+from app.domains.demo_request.router import router as demo_request_router
 from app.domains.device_sync.router import router as device_sync_router
 from app.domains.dhcp.router import router as dhcp_router
 from app.domains.dns.router import router as dns_router
+from app.domains.feature_entitlement.router import router as feature_entitlement_router
 from app.domains.firewall.router import router as firewall_router
 from app.domains.guest.router import admin_router as guest_admin_router
 from app.domains.guest.router import analytics_router as guest_analytics_router
@@ -39,6 +37,7 @@ from app.domains.guest_teams.router import guest_router as guest_teams_guest_rou
 from app.domains.hotspot.router import router as hotspot_router
 from app.domains.isp.router import router as isp_router
 from app.domains.isp_routing.router import router as isp_routing_router
+from app.domains.live_sessions.router import router as live_sessions_router
 from app.domains.location.router import router as location_router
 from app.domains.mac_authorization.router import router as mac_authorization_router
 from app.domains.monitored_hardware.router import router as monitored_hardware_router
@@ -59,11 +58,22 @@ from app.domains.router.router import router as router_router
 from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.support_tickets.router import router as support_tickets_router
+from app.domains.system.router import router as system_router
+from app.domains.url_shortener.router import (
+    master_router as url_shortener_master_router,
+)
+from app.domains.url_shortener.router import (
+    public_router as url_shortener_public_router,
+)
+from app.domains.url_shortener.router import (
+    redirect_router as url_shortener_redirect_router,
+)
+from app.domains.url_shortener.router import router as url_shortener_router
 from app.domains.user.router import router as user_router
 from app.domains.vlan.router import router as vlan_router
 from app.domains.voucher.router import router as voucher_router
 from app.domains.wireguard.router import router as wireguard_router
-from app.domains.branding.router import router as branding_router
+from app.domains.workspace.router import router as workspace_router
 
 api_v1_router = APIRouter()
 api_v1_router.include_router(health_router, prefix="/health", tags=["Health"])
@@ -128,3 +138,7 @@ api_v1_router.include_router(branding_router)
 api_v1_router.include_router(support_tickets_router)
 api_v1_router.include_router(demo_request_router)
 api_v1_router.include_router(assistant_router)
+api_v1_router.include_router(url_shortener_public_router)
+api_v1_router.include_router(url_shortener_router)
+api_v1_router.include_router(url_shortener_master_router)
+api_v1_router.include_router(url_shortener_redirect_router)
