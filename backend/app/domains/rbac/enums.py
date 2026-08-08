@@ -118,13 +118,6 @@ class PermissionModule(StrEnum):
     SUPPORT_TICKETS = "support_tickets"
     DEVICE_CONSOLE = "device_console"
     DEMO_REQUESTS = "demo_requests"
-    # URL Shortener: a small, org-scoped-or-anonymous "shorten a URL,
-    # redirect on visit" utility (app.domains.url_shortener). Plain CRUD --
-    # no EXECUTE/APPROVE/MANAGE-worthy device-facing or approval-workflow
-    # action of its own in this pass, the same narrow shape
-    # PermissionModule.MAC_AUTHORIZATION/VLAN's own entries already
-    # establish for a plain rules/inventory-style domain.
-    URL_SHORTENER = "url_shortener"
 
 
 class OverrideEffect(StrEnum):
@@ -871,20 +864,3 @@ class AuditAction(StrEnum):
     # platform support agent) -- see
     # app.domains.support_tickets.service.TicketService.add_reply.
     SUPPORT_TICKET_REPLY_ADDED = "support_ticket_reply_added"
-
-    # URL Shortener domain events -- written through this same table by
-    # ``app.domains.url_shortener.service.ShortLinkService`` via the same
-    # narrow ``AuditLogWriter`` protocol shape every other domain's
-    # service uses. ``SHORT_LINK_CREATED`` is only ever written for a
-    # ``customer``/``master``-sourced link, mirroring
-    # ``app.domains.otp.service``'s own documented audit-volume judgment
-    # call: the high-volume, unauthenticated, anonymous
-    # ``public_site``-sourced create has no distinguishable per-call value
-    # and would otherwise flood this table. ``SHORT_LINK_REVOKED``/
-    # ``SHORT_LINK_MODERATED`` are always human-attributable, low-volume
-    # admin actions (a tenant revoking their own link; a platform operator
-    # moderating any org's link for abuse handling), so both are always
-    # audited.
-    SHORT_LINK_CREATED = "short_link_created"
-    SHORT_LINK_REVOKED = "short_link_revoked"
-    SHORT_LINK_MODERATED = "short_link_moderated"

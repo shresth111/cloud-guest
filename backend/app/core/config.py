@@ -664,19 +664,6 @@ class Settings(BaseSettings):
             "deployment -- the default is a placeholder, not a real host."
         ),
     )
-    short_link_base_url: str = Field(
-        default="https://wfy.gg",
-        description=(
-            "The public origin that resolves this backend's own "
-            "GET /api/v1/s/{code} redirect route (typically a short, "
-            "dedicated domain reverse-proxied to this backend, distinct "
-            "from frontend_base_url above) -- used to compose the "
-            "short_url returned by app.domains.url_shortener's create "
-            "endpoints. Override via CLOUDGUEST_SHORT_LINK_BASE_URL in any "
-            "real deployment -- the default is a placeholder, not a real "
-            "host."
-        ),
-    )
     platform_gst_state: str = Field(
         default="Maharashtra",
         description=(

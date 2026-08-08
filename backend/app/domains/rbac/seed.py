@@ -401,12 +401,6 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # roles, and GrantLevel.FULL resolve to (CREATE, READ, MANAGE) for
     # admin roles that triage/resolve tickets -- see expand_grant_level.
     PermissionModule.SUPPORT_TICKETS: (_A.CREATE, _A.READ, _A.MANAGE),
-    # URL Shortener: plain CRUD -- create/read/update/delete, as the module
-    # brief specifies. No APPROVE/EXECUTE/IMPORT/EXPORT -- there is no
-    # approval workflow, device-facing action, or bulk import/export
-    # surface for a short link in this pass, mirroring
-    # PermissionModule.VLAN/ISP_ROUTING's own plain-CRUD-only shape.
-    PermissionModule.URL_SHORTENER: (_A.CREATE, _A.READ, _A.UPDATE, _A.DELETE),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -464,7 +458,6 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.MONITORED_HARDWARE: "Monitored Hardware",
     PermissionModule.SUPPORT_TICKETS: "Support Tickets",
     PermissionModule.DEMO_REQUESTS: "Demo Requests",
-    PermissionModule.URL_SHORTENER: "URL Shortener",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -571,13 +564,6 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # as PermissionModule.SYSTEM_SETTINGS's own entry above: it is
     # meaningful only at the platform (Master console) level.
     PermissionModule.DEMO_REQUESTS: ScopeType.GLOBAL,
-    # A short link has no location concept at all -- ShortLink.organization_id
-    # is its only tenant-scoping column (nullable, meaning anonymous/
-    # platform-wide -- see app.domains.url_shortener.models.ShortLink's own
-    # docstring), same "no mandatory location" reasoning as
-    # PermissionModule.API_KEYS/AUDIT_LOGS's own ScopeType.ORGANIZATION
-    # entries above (both also org-only, non-location, non-router domains).
-    PermissionModule.URL_SHORTENER: ScopeType.ORGANIZATION,
 }
 
 
@@ -707,13 +693,6 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # for this job -- FULL, not just OPERATE like this role's other
             # overrides above.
             _M.SUPPORT_TICKETS: _L.FULL,
-            # Abuse handling is explicitly this module's own stated reason
-            # for the Master-console moderation endpoint
-            # (PATCH /master/short-links/{id}) -- OPERATE (create/read/
-            # update, no delete) lets Platform Support deactivate an
-            # abusive link without needing this role's own READ default
-            # bumped all the way to FULL.
-            _M.URL_SHORTENER: _L.OPERATE,
         },
     ),
     SystemRoleDefinition(

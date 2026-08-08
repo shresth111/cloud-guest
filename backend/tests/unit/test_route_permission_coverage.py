@@ -187,18 +187,6 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/webhooks/razorpay"): (
         "Payment gateway webhook -- verified by Razorpay request signature."
     ),
-    ("POST", "/api/v1/public/short-links"): (
-        "Public marketing-site URL-shortener create tool -- anonymous, no "
-        "platform-user identity; protected by ShortLinkRateLimiter and "
-        "RateLimitMiddleware, not RBAC (see "
-        "app.domains.url_shortener.router's module docstring)."
-    ),
-    ("GET", "/api/v1/s/{code}"): (
-        "Guest-facing short-link redirect -- a real browser follows this "
-        "with no platform-user identity at all, same class of exception "
-        "as GET /captive-portal/resolve; protected by ShortLinkRateLimiter "
-        "and RateLimitMiddleware, not RBAC."
-    ),
 }
 
 # Path *prefixes* that are entirely guest-facing (no platform identity at

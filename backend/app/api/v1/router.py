@@ -59,16 +59,6 @@ from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
-from app.domains.url_shortener.router import (
-    master_router as url_shortener_master_router,
-)
-from app.domains.url_shortener.router import (
-    public_router as url_shortener_public_router,
-)
-from app.domains.url_shortener.router import (
-    redirect_router as url_shortener_redirect_router,
-)
-from app.domains.url_shortener.router import router as url_shortener_router
 from app.domains.user.router import router as user_router
 from app.domains.vlan.router import router as vlan_router
 from app.domains.voucher.router import router as voucher_router
@@ -138,7 +128,3 @@ api_v1_router.include_router(branding_router)
 api_v1_router.include_router(support_tickets_router)
 api_v1_router.include_router(demo_request_router)
 api_v1_router.include_router(assistant_router)
-api_v1_router.include_router(url_shortener_public_router)
-api_v1_router.include_router(url_shortener_router)
-api_v1_router.include_router(url_shortener_master_router)
-api_v1_router.include_router(url_shortener_redirect_router)
