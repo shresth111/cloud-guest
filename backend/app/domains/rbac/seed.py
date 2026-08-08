@@ -926,6 +926,21 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QOS: _L.OPERATE,
             _M.NETWORK_DIAGNOSTICS: _L.OPERATE,
             _M.NETWORK_DEVICE: _L.OPERATE,
+            # Day-to-day network operations plainly includes knowing
+            # whether THIS location's own internet uplink is up (ISP) and
+            # what hardware is registered on its network (MONITORED_
+            # HARDWARE) -- both were missing entirely from this role until
+            # a live-production bug report surfaced it: a real Network
+            # Engineer session with a genuinely online router and a live
+            # ISP link still saw the dashboard's WAN/hardware widgets
+            # render an empty onboarding state, because isp.read and
+            # monitored_hardware.read were never granted to this role at
+            # all (403, not "no data"). OPERATE (not FULL), matching every
+            # other module's level on this role -- excludes ISP's own
+            # DELETE/MANAGE and MONITORED_HARDWARE's own DELETE, leaving
+            # destructive actions to Network Administrator/org admins.
+            _M.ISP: _L.OPERATE,
+            _M.MONITORED_HARDWARE: _L.OPERATE,
             _M.MONITORING: _L.READ,
             _M.ALERTS: _L.READ,
             _M.DASHBOARD: _L.READ,
