@@ -340,6 +340,11 @@ def get_payment_service(
     db: AsyncSession = Depends(get_db_session),
     settings: Settings = Depends(get_settings),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    license_repository: LicenseRepositoryProtocol = Depends(get_license_repository),
+    plan_repository: PlanRepositoryProtocol = Depends(get_plan_repository),
+    subscription_repository: SubscriptionRepositoryProtocol = Depends(
+        get_subscription_repository
+    ),
 ) -> PaymentService:
     payment_repository = PaymentRepository(db)
     payment_method_repository = PaymentMethodRepository(db)
@@ -361,6 +366,15 @@ def get_payment_service(
             PaymentProvider.RAZORPAY.value: razorpay_gateway,
         },
         audit_writer=audit_repository,
+        # Razorpay Checkout (flat-plan self-service payment) wiring -- see
+        # service.PaymentService.create_checkout_order's own docstring. The
+        # SAME razorpay_gateway instance above satisfies
+        # RazorpayCheckoutProtocol too (structural typing, no second
+        # construction needed).
+        license_repository=license_repository,
+        plan_repository=plan_repository,
+        subscription_repository=subscription_repository,
+        razorpay_checkout_gateway=razorpay_gateway,
     )
 
 

@@ -591,6 +591,10 @@ class PaymentRepositoryProtocol(Protocol):
         self, provider_payment_id: str
     ) -> Payment | None: ...
 
+    async def get_by_razorpay_order_id(
+        self, razorpay_order_id: str
+    ) -> Payment | None: ...
+
     async def update_payment(
         self, payment: Payment, data: Mapping[str, object]
     ) -> Payment: ...
@@ -643,6 +647,19 @@ class PaymentRepository:
     ) -> Payment | None:
         results = await self.payments.get_all(
             filters={"provider_payment_id": provider_payment_id}, limit=1
+        )
+        return results[0] if results else None
+
+    async def get_by_razorpay_order_id(
+        self, razorpay_order_id: str
+    ) -> Payment | None:
+        """The read side of the Razorpay Checkout correlation this domain's
+        ``razorpay_order_id`` column exists for -- see ``models.Payment``'s
+        own docstring. Used by ``webhooks.process_razorpay_event`` to
+        resolve a checkout-created PENDING row that has no
+        ``provider_payment_id`` yet."""
+        results = await self.payments.get_all(
+            filters={"razorpay_order_id": razorpay_order_id}, limit=1
         )
         return results[0] if results else None
 

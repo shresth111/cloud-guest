@@ -741,6 +741,28 @@ class Payment(BaseModel):
     refunded_amount: Mapped[Decimal] = mapped_column(
         Numeric(12, 2), default=Decimal("0"), nullable=False
     )
+    # Razorpay Checkout addition (flat-plan self-service payment flow -- see
+    # service.PaymentService.create_checkout_order): ``razorpay_order_id`` is
+    # this row's own correlation key BEFORE any ``provider_payment_id`` is
+    # known -- a Razorpay Order is created server-side and handed to the
+    # frontend's Checkout widget with no charge attempt yet made, so
+    # ``provider_payment_id`` stays NULL until the customer actually
+    # completes payment and Razorpay's webhook reports the resulting
+    # ``payment.entity.id``. ``webhooks.process_razorpay_event`` resolves a
+    # PENDING checkout row by this column when ``provider_payment_id`` isn't
+    # set yet (see that function's own docstring). Nullable: every payment
+    # created via the pre-existing recurring/e-mandate charge path
+    # (``payment_gateways.RazorpayPaymentGateway._attempt_charge``) has no
+    # order-first step and never populates it.
+    razorpay_order_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The verified ``X-Razorpay-Signature`` header value from the webhook
+    # delivery that resolved this payment -- kept as a permanent, auditable
+    # record that this row's SUCCEEDED/FAILED status came from a real,
+    # cryptographically-verified webhook (see webhooks.verify_razorpay_signature),
+    # never from an unverified client-side callback. Nullable for every
+    # payment never resolved via a Razorpay webhook (e.g. a Stripe payment,
+    # or a still-PENDING checkout order).
+    razorpay_signature: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_payments_idempotency_key"),
@@ -750,6 +772,7 @@ class Payment(BaseModel):
         Index("ix_payments_provider", "provider"),
         Index("ix_payments_provider_payment_id", "provider_payment_id"),
         Index("ix_payments_idempotency_key", "idempotency_key", unique=True),
+        Index("ix_payments_razorpay_order_id", "razorpay_order_id"),
     )
 
     def __repr__(self) -> str:

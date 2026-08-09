@@ -66,6 +66,8 @@ __all__ = [
     "PaymentRefundRequest",
     "PaymentResponse",
     "PaymentListResponse",
+    "CheckoutOrderRequest",
+    "CheckoutOrderResponse",
     "PaymentMethodRegisterRequest",
     "PaymentMethodResponse",
     "PaymentMethodListResponse",
@@ -481,6 +483,68 @@ class PaymentInitiateRequest(BaseModel):
                 "currency": "USD",
                 "provider": "stripe",
                 "idempotency_key": "checkout-9f3e2a1b4c5d",
+            }
+        }
+    )
+
+
+class CheckoutOrderRequest(BaseModel):
+    """Body for ``POST /billing/checkout``. Deliberately near-empty: the
+    charged amount is always the caller's own organization's current,
+    real License/Plan price -- never client-supplied (see
+    ``service.PaymentService.create_checkout_order``'s own docstring for
+    why). ``idempotency_key`` is optional -- when omitted, a fresh one is
+    generated server-side (a single "pay now" click from a customer
+    dashboard has no natural caller-supplied key the way a retried API
+    integration call would); pass one explicitly only when the caller
+    itself needs retry-safety across its own request boundary (e.g. a
+    frontend that wants to safely retry a network timeout without risking
+    a second Order)."""
+
+    idempotency_key: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=255,
+        description=(
+            "Optional caller-supplied idempotency key. Omit to have one "
+            "generated server-side."
+        ),
+    )
+
+
+class CheckoutOrderResponse(BaseModel):
+    """Everything the frontend needs to open Razorpay's Checkout widget --
+    and nothing more. ``key_id`` is Razorpay's own PUBLIC key (safe to ship
+    to a browser, exactly like a Stripe publishable key) -- the secret key
+    is never serialized into any API response anywhere in this domain."""
+
+    payment_id: str
+    razorpay_order_id: str
+    razorpay_key_id: str = Field(
+        ..., description="Razorpay's public Key ID -- safe for client-side use."
+    )
+    amount: Decimal = Field(..., description="Charge amount in major currency units.")
+    amount_minor_units: int = Field(
+        ...,
+        description=(
+            "Charge amount in the currency's smallest unit (e.g. paise for "
+            "INR) -- exactly what Razorpay's Checkout widget's own "
+            "`amount` option expects."
+        ),
+    )
+    currency: str
+    status: PaymentStatus
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "payment_id": "11111111-1111-1111-1111-111111111111",
+                "razorpay_order_id": "order_NqJ3d8XyzExample",
+                "razorpay_key_id": "rzp_test_examplekeyid",
+                "amount": "999.00",
+                "amount_minor_units": 99900,
+                "currency": "INR",
+                "status": "pending",
             }
         }
     )

@@ -170,8 +170,10 @@ from app.domains.rbac.dependencies import (
     RequireOrganization,
     RequirePermission,
     get_access_validator,
+    get_rbac_repository,
 )
 from app.domains.rbac.enums import ScopeType
+from app.domains.rbac.repository import RBACRepositoryProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +195,7 @@ from .dependencies import (
     get_usage_service,
     get_webhook_event_dedup,
 )
-from .exceptions import WebhookSignatureInvalidError
+from .exceptions import PaymentGatewayNotConfiguredError, WebhookSignatureInvalidError
 from .invoice_pdf import SellerInfo, render_invoice_pdf
 from .models import (
     BillingProfile,
@@ -215,6 +217,8 @@ from .repository import PaymentRepositoryProtocol
 from .schemas import (
     BillingProfileResponse,
     BillingProfileUpsertRequest,
+    CheckoutOrderRequest,
+    CheckoutOrderResponse,
     ChurnRateResponse,
     CouponCreateRequest,
     CouponListResponse,
@@ -233,13 +237,13 @@ from .schemas import (
     InvoiceItemResponse,
     InvoiceListResponse,
     InvoiceResponse,
-    ManualInvoiceCreateRequest,
     LicenseAssignRequest,
     LicenseChangeLogResponse,
     LicenseDowngradeRequest,
     LicenseResponse,
     LicenseSuspendRequest,
     LicenseUpgradeRequest,
+    ManualInvoiceCreateRequest,
     PaymentInitiateRequest,
     PaymentListResponse,
     PaymentMethodListResponse,
@@ -285,7 +289,7 @@ from .service import (
     UsageService,
     UsageValidationResult,
 )
-from .validators import compute_discount_amount
+from .validators import compute_discount_amount, to_minor_units
 from .webhooks import (
     WebhookEventDedupProtocol,
     log_signature_failure,
@@ -974,6 +978,32 @@ async def create_subscription(
 
 
 @router.get(
+    "/billing/subscription",
+    response_model=ApiResponse[SubscriptionResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("subscriptions.read"))],
+)
+async def get_my_subscription(
+    request: Request,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    service: SubscriptionService = Depends(get_subscription_service),
+):
+    """The customer dashboard's own "my current plan/subscription status"
+    endpoint -- ``organization_id`` is resolved from the caller's own
+    ``X-Organization-Id`` header (``RequireOrganization``), mirroring
+    ``GET /licenses/me``'s identical "me" convenience shape (no path-
+    shadowing concern here: ``/billing/subscription`` and
+    ``/subscriptions/{organization_id}`` share no path prefix)."""
+    subscription = await service.get_subscription_for_organization(organization_id)
+    return build_response(
+        success=True,
+        message="Subscription retrieved",
+        data=_subscription_response(subscription).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
     "/subscriptions/{organization_id}",
     response_model=ApiResponse[SubscriptionResponse],
     status_code=status.HTTP_200_OK,
@@ -1363,6 +1393,79 @@ def _payment_method_response(payment_method: PaymentMethod) -> PaymentMethodResp
 
 
 @router.post(
+    "/billing/checkout",
+    response_model=ApiResponse[CheckoutOrderResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("billing.update"))],
+)
+async def create_checkout_order(
+    request: Request,
+    payload: CheckoutOrderRequest,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    settings: Settings = Depends(get_settings),
+    user: AuthUser = Depends(get_current_user),
+    service: PaymentService = Depends(get_payment_service),
+):
+    """Creates a real Razorpay Order server-side for the caller's own
+    organization to pay for its EXISTING plan online (flat-plan billing --
+    UPI/card/netbanking, all through Razorpay's one Checkout widget) --
+    this is the actual customer self-service "pay online instead of manual
+    invoicing" feature. Returns exactly what the frontend needs to open
+    that widget (``razorpay_order_id``/``amount_minor_units``/``currency``/
+    the PUBLIC ``razorpay_key_id``) -- the Razorpay secret key is never
+    serialized into this or any other response in this domain.
+
+    Gated by ``billing.update`` (not ``billing.manage``): an Organization
+    Owner holds ``billing.update`` at ``ORGANIZATION`` scope by default
+    (see ``app.domains.rbac.seed``'s ``organization-owner`` role), so this
+    is genuinely reachable by an ordinary customer org owner paying for
+    their OWN organization's plan -- ``billing.manage`` is reserved for the
+    more consequential Payments-domain admin actions (refund/retry/manual
+    initiate against ANY organization) that only a platform-level Billing
+    Manager/Super Admin role should hold. Tenant isolation is enforced the
+    same way every other self-service billing read/write in this router is
+    -- ``organization_id`` is resolved from the caller's own
+    ``X-Organization-Id`` header via ``RequireOrganization``, never accepted
+    from the request body.
+
+    If ``RAZORPAY_KEY_ID``/``RAZORPAY_KEY_SECRET`` are not configured in
+    this deployment's environment, this returns a real, honest
+    ``503 Service Unavailable`` (``PaymentGatewayNotConfiguredError`` --
+    see that exception's own docstring) rather than crashing unhelpfully or
+    silently pretending to succeed."""
+    idempotency_key = payload.idempotency_key or f"checkout:{uuid.uuid4().hex}"
+    if not (settings.razorpay_key_id and settings.razorpay_key_secret):
+        # Fails fast with the same honest 503 the gateway's own
+        # _is_configured guard would raise anyway -- checked here too so
+        # the error message is unambiguous about which of this endpoint's
+        # two real prerequisites (env config vs. an active license) is
+        # missing, without paying for a real license lookup first.
+        raise PaymentGatewayNotConfiguredError(
+            organization_id=organization_id, amount="<plan price>", currency="?"
+        )
+    payment = await service.create_checkout_order(
+        actor_user_id=uuid.UUID(user.id),
+        organization_id=organization_id,
+        idempotency_key=idempotency_key,
+    )
+    response = CheckoutOrderResponse(
+        payment_id=str(payment.id),
+        razorpay_order_id=payment.razorpay_order_id or "",
+        razorpay_key_id=settings.razorpay_key_id,
+        amount=payment.amount,
+        amount_minor_units=to_minor_units(payment.amount, payment.currency),
+        currency=payment.currency,
+        status=PaymentStatus(payment.status),
+    )
+    return build_response(
+        success=True,
+        message="Checkout order created",
+        data=response.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
     "/payments",
     response_model=ApiResponse[PaymentResponse],
     status_code=status.HTTP_201_CREATED,
@@ -1597,6 +1700,7 @@ async def stripe_webhook(
     renewal_service: RenewalService = Depends(get_renewal_service),
     dedup: WebhookEventDedupProtocol = Depends(get_webhook_event_dedup),
     invoice_service: InvoiceService = Depends(get_invoice_service),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ):
     payload = await request.body()
     signature_header = request.headers.get("stripe-signature", "")
@@ -1608,7 +1712,7 @@ async def stripe_webhook(
             tolerance_seconds=settings.stripe_webhook_tolerance_seconds,
         )
     except WebhookSignatureInvalidError as exc:
-        log_signature_failure("stripe", str(exc))
+        await log_signature_failure("stripe", str(exc), audit_writer=audit_repository)
         raise
     await process_stripe_event(
         event,
@@ -1616,6 +1720,7 @@ async def stripe_webhook(
         renewal_service=renewal_service,
         dedup=dedup,
         invoice_service=invoice_service,
+        audit_writer=audit_repository,
     )
     return {"received": True}
 
@@ -1628,6 +1733,8 @@ async def razorpay_webhook(
     renewal_service: RenewalService = Depends(get_renewal_service),
     dedup: WebhookEventDedupProtocol = Depends(get_webhook_event_dedup),
     invoice_service: InvoiceService = Depends(get_invoice_service),
+    license_service: LicenseService = Depends(get_license_service),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ):
     payload = await request.body()
     signature = request.headers.get("x-razorpay-signature", "")
@@ -1636,7 +1743,9 @@ async def razorpay_webhook(
             payload, signature=signature, secret=settings.razorpay_webhook_secret
         )
     except WebhookSignatureInvalidError as exc:
-        log_signature_failure("razorpay", str(exc))
+        await log_signature_failure(
+            "razorpay", str(exc), audit_writer=audit_repository
+        )
         raise
     body = json.loads(payload or b"{}")
     body["_event_id"] = request.headers.get("x-razorpay-event-id", "")
@@ -1646,6 +1755,9 @@ async def razorpay_webhook(
         renewal_service=renewal_service,
         dedup=dedup,
         invoice_service=invoice_service,
+        license_activation=license_service,
+        signature=signature,
+        audit_writer=audit_repository,
     )
     return {"received": True}
 

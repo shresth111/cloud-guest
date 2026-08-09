@@ -78,6 +78,7 @@ from .constants import (
     LicenseChangeType,
     LicenseStatus,
     NoteType,
+    PaymentProvider,
     PaymentStatus,
     PlanFeatureKey,
     PlanFeatureType,
@@ -2050,6 +2051,16 @@ class PaymentGatewayAdminProtocol(Protocol):
     async def retry(self, payment: Payment) -> Payment: ...
 
 
+class RazorpayCheckoutProtocol(Protocol):
+    """The narrow, Razorpay-only surface ``PaymentService
+    .create_checkout_order`` needs from ``payment_gateways
+    .RazorpayPaymentGateway`` -- kept as a locally-defined ``Protocol`` for
+    the exact same import-cycle-avoidance reasoning
+    ``PaymentGatewayAdminProtocol`` immediately above already documents."""
+
+    async def create_checkout_order(self, payment: Payment) -> Payment: ...
+
+
 class PaymentService:
     """Payment initiation (real idempotency-key enforcement), refund,
     retry, and "payment history" (see ``models.Payment``'s own "doubles as
@@ -2079,11 +2090,25 @@ class PaymentService:
         *,
         gateways: dict[str, PaymentGatewayAdminProtocol],
         audit_writer: AuditLogWriter | None = None,
+        # Razorpay Checkout (flat-plan self-service payment) additions --
+        # all optional/additive, default None: every existing caller/test
+        # that constructs a PaymentService without these keeps working
+        # unmodified (create_checkout_order is simply unreachable without
+        # them, and raises a clear, honest error if called anyway -- see
+        # that method's own docstring).
+        license_repository: LicenseRepositoryProtocol | None = None,
+        plan_repository: PlanRepositoryProtocol | None = None,
+        subscription_repository: SubscriptionRepositoryProtocol | None = None,
+        razorpay_checkout_gateway: RazorpayCheckoutProtocol | None = None,
     ) -> None:
         self.payment_repository = payment_repository
         self.payment_method_repository = payment_method_repository
         self.gateways = gateways
         self.audit_writer = audit_writer
+        self.license_repository = license_repository
+        self.plan_repository = plan_repository
+        self.subscription_repository = subscription_repository
+        self.razorpay_checkout_gateway = razorpay_checkout_gateway
 
     def _gateway_for(self, provider: str) -> PaymentGatewayAdminProtocol:
         gateway = self.gateways.get(provider)
@@ -2205,6 +2230,124 @@ class PaymentService:
                 description=f"Payment {payment.id} failed: {payment.failure_reason}",
             )
         return payment
+
+    async def create_checkout_order(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        organization_id: uuid.UUID,
+        idempotency_key: str,
+    ) -> Payment:
+        """Real Razorpay Checkout-widget order creation -- the customer
+        self-service "pay for my existing plan online" flow ``router.py``'s
+        ``POST /billing/checkout`` exposes. Deliberately distinct from
+        ``initiate_payment`` (which charges an already-saved, tokenized
+        payment method server-side, e.g. for an automatic renewal): this
+        method creates a Razorpay Order only -- Razorpay's own hosted
+        Checkout widget (UPI/card/netbanking, per this platform's confirmed
+        scope) takes the customer's real payment details directly, and this
+        platform only learns the real, final outcome later, from a
+        signature-verified webhook (see
+        ``webhooks.process_razorpay_event`` and ``models.Payment
+        .razorpay_order_id``'s own docstring for the full correlation
+        write-up) -- never from an unverified client-side callback.
+
+        The amount charged is always this organization's own current, real
+        ``License``'s ``Plan.base_price`` -- **never** a caller-supplied
+        amount. This is the same "never trust a client-supplied computed
+        total for a real charge" discipline this domain's
+        ``InvoiceItem``/``ManualInvoiceLineItemRequest`` already establish,
+        and is exactly what keeps this endpoint scoped to its confirmed
+        purpose (paying for an *existing* plan) rather than becoming a
+        general "charge any amount" endpoint.
+
+        Real idempotency: the identical fast-path-then-DB-constraint-
+        backstop mechanism ``initiate_payment``'s own class docstring
+        documents -- the same ``idempotency_key`` presented twice always
+        resolves to the same ``Payment`` row (and therefore the same
+        already-created Razorpay Order), never a second Order for a
+        retried checkout request.
+        """
+        if (
+            self.license_repository is None
+            or self.plan_repository is None
+            or self.razorpay_checkout_gateway is None
+        ):  # pragma: no cover - defensive; real wiring always supplies these
+            raise RuntimeError(
+                "PaymentService.create_checkout_order requires "
+                "license_repository/plan_repository/razorpay_checkout_gateway "
+                "to be wired -- see dependencies.get_payment_service."
+            )
+
+        existing = await self.payment_repository.get_by_idempotency_key(
+            idempotency_key
+        )
+        if existing is not None:
+            return existing
+
+        license_ = await self.license_repository.get_by_organization_id(
+            organization_id
+        )
+        if license_ is None:
+            raise LicenseNotFoundError(organization_id)
+        if license_.status not in (
+            LicenseStatus.ACTIVE.value,
+            LicenseStatus.PENDING_ACTIVATION.value,
+            LicenseStatus.SUSPENDED.value,
+        ):
+            raise LicenseNotActiveError(
+                organization_id,
+                f"status is '{license_.status}' -- an EXPIRED/CANCELLED "
+                "license cannot be paid for via checkout; contact support "
+                "to have a new plan assigned",
+            )
+        plan = await self.plan_repository.get_by_id(license_.plan_id)
+        if plan is None:
+            raise PlanNotFoundError(license_.plan_id)
+
+        subscription_id: uuid.UUID | None = None
+        if self.subscription_repository is not None:
+            subscription = await self.subscription_repository.get_by_organization_id(
+                organization_id
+            )
+            subscription_id = subscription.id if subscription is not None else None
+
+        try:
+            payment = await self.payment_repository.create_payment(
+                organization_id=organization_id,
+                subscription_id=subscription_id,
+                amount=plan.base_price,
+                currency=plan.currency,
+                status=PaymentStatus.PENDING.value,
+                provider=PaymentProvider.RAZORPAY.value,
+                provider_payment_id=None,
+                idempotency_key=idempotency_key,
+                refunded_amount=Decimal("0"),
+                created_by=actor_user_id,
+            )
+        except DuplicateRecordError:
+            # A concurrent request raced this one and won -- identical
+            # backstop ``initiate_payment`` documents on its own class
+            # docstring.
+            winner = await self.payment_repository.get_by_idempotency_key(
+                idempotency_key
+            )
+            if winner is None:  # pragma: no cover - defensive
+                raise
+            return winner
+
+        await self._audit(
+            actor_user_id,
+            AuditAction.PAYMENT_INITIATED,
+            payment,
+            description=(
+                f"Checkout order requested for organization {organization_id} "
+                f"({payment.amount} {payment.currency} via razorpay, plan "
+                f"'{plan.slug}')"
+            ),
+        )
+
+        return await self.razorpay_checkout_gateway.create_checkout_order(payment)
 
     async def refund_payment(
         self,

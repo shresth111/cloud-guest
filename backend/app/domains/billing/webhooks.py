@@ -97,9 +97,18 @@ import razorpay
 import stripe
 from redis.asyncio import Redis
 
-from .constants import WEBHOOK_EVENT_DEDUP_KEY_PREFIX, PaymentStatus
+from .constants import (
+    AUDIT_ACTION_WEBHOOK_RECEIVED,
+    AUDIT_ACTION_WEBHOOK_REJECTED,
+    WEBHOOK_EVENT_DEDUP_KEY_PREFIX,
+    PaymentStatus,
+)
 from .events import WebhookProcessed, WebhookSignatureInvalid
-from .exceptions import WebhookSignatureInvalidError
+from .exceptions import (
+    InvalidLicenseStatusTransitionError,
+    LicenseNotFoundError,
+    WebhookSignatureInvalidError,
+)
 from .models import Payment
 from .renewal_service import RenewalService
 from .repository import PaymentRepositoryProtocol
@@ -120,6 +129,40 @@ class InvoiceServiceProtocol(Protocol):
     async def mark_invoice_paid_for_payment(
         self, payment: Payment
     ) -> object | None: ...
+
+
+class LicenseActivationProtocol(Protocol):
+    """The narrow surface ``process_razorpay_event`` needs from
+    ``service.LicenseService`` to activate an organization's License on its
+    real *first* successful checkout payment (one with no
+    ``subscription_id`` tracked against it, so
+    ``RenewalService.confirm_renewal_payment_succeeded``'s period-extension
+    composition does not apply -- see that call site's own comment).
+    Satisfied by ``LicenseService`` directly; kept as a locally-defined
+    ``Protocol`` for the same import-cycle-avoidance reasoning
+    ``InvoiceServiceProtocol`` immediately above already documents."""
+
+    async def get_license_for_organization(self, organization_id: Any) -> Any: ...
+
+    async def activate_license(
+        self, *, actor_user_id: Any, license_id: Any
+    ) -> Any: ...
+
+
+class WebhookAuditWriterProtocol(Protocol):
+    """The minimal surface this module needs to write a real, permanent
+    record of every webhook DELIVERY -- verified-and-processed or
+    rejected-for-bad-signature -- into RBAC's shared ``audit_log_entries``
+    table, satisfying this codebase's own established "every domain writes
+    real audit entries for its own state changes" convention (see
+    ``service.AuditLogWriter`` for the identical protocol shape every other
+    write in this domain already uses). A structured ``logger.info``/
+    ``logger.warning`` call alone (this module already had, before this
+    addition) is real-time-debuggable but not queryable/persisted the way
+    ``audit_log_entries`` is -- this protocol adds the latter without
+    replacing the former."""
+
+    async def create_audit_log_entry(self, **fields: object) -> object: ...
 
 
 # ============================================================================
@@ -237,6 +280,7 @@ async def process_stripe_event(
     renewal_service: RenewalService,
     dedup: WebhookEventDedupProtocol,
     invoice_service: InvoiceServiceProtocol | None = None,
+    audit_writer: WebhookAuditWriterProtocol | None = None,
 ) -> bool:
     """Processes one verified Stripe ``Event``. Returns ``True`` if this
     call actually applied the event (``False`` if it was a dedup no-op).
@@ -244,7 +288,9 @@ async def process_stripe_event(
     ``payment_intent.payment_failed``; every other event type is
     acknowledged (the caller returns 2xx either way) and otherwise
     ignored -- real Stripe guidance for a webhook endpoint that only cares
-    about a subset of event types."""
+    about a subset of event types. ``audit_writer``, when supplied, writes
+    a real, permanent ``audit_log_entries`` row for this receipt -- see
+    ``_audit_webhook_received``'s own docstring."""
     is_new = await dedup.mark_processed_if_new("stripe", event.id)
     if not is_new:
         logger.info(
@@ -255,6 +301,7 @@ async def process_stripe_event(
 
     intent = event.data.object
     provider_payment_id = getattr(intent, "id", None)
+    payment: Payment | None = None
 
     if event.type == "payment_intent.succeeded":
         payment = await _resolve_and_update_payment(
@@ -288,11 +335,145 @@ async def process_stripe_event(
             extra={"provider": "stripe", "event_type": event.type},
         )
 
+    await _audit_webhook_received(
+        audit_writer,
+        provider="stripe",
+        event_type=event.type,
+        event_id=event.id,
+        payment=payment,
+    )
+
     logged = WebhookProcessed(
         provider="stripe", event_id=event.id, event_type=event.type
     )
     logger.info("billing_webhook_processed", extra=_event_extra(logged))
     return True
+
+
+async def _resolve_checkout_payment_by_order_id(
+    payment_repository: PaymentRepositoryProtocol,
+    *,
+    order_id: str | None,
+    provider_payment_id: str | None,
+    signature: str,
+    succeeded: bool,
+    failure_reason: str | None,
+) -> Payment | None:
+    """The Razorpay-Checkout-specific resolution path
+    ``process_razorpay_event`` falls back to when
+    ``_resolve_and_update_payment`` (keyed on ``provider_payment_id``) finds
+    nothing -- a PENDING row created by ``service.PaymentService
+    .create_checkout_order`` has no ``provider_payment_id`` yet (it is not
+    known until the customer actually completes the Checkout widget), only
+    ``razorpay_order_id`` (set at Order-creation time). See
+    ``models.Payment.razorpay_order_id``'s own docstring for the full
+    correlation write-up. Stores the now-known ``provider_payment_id`` and
+    the verified webhook's own ``X-Razorpay-Signature`` header value on the
+    row -- real, auditable proof this row's outcome came from a verified
+    webhook, never an unverified client callback."""
+    if not order_id:
+        return None
+    payment = await payment_repository.get_by_razorpay_order_id(order_id)
+    if payment is None:
+        logger.info(
+            "billing_webhook_checkout_order_not_tracked",
+            extra={"razorpay_order_id": order_id},
+        )
+        return None
+    if payment.status in (PaymentStatus.SUCCEEDED.value, PaymentStatus.FAILED.value):
+        # Already resolved (a redelivery that slipped past dedup) --
+        # idempotent no-op, identical guarantee _resolve_and_update_payment
+        # provides for the provider_payment_id-keyed path.
+        return payment
+    if succeeded:
+        return await payment_repository.update_payment(
+            payment,
+            {
+                "status": PaymentStatus.SUCCEEDED.value,
+                "provider_payment_id": provider_payment_id,
+                "razorpay_signature": signature or None,
+                "failure_reason": None,
+            },
+        )
+    return await payment_repository.update_payment(
+        payment,
+        {
+            "status": PaymentStatus.FAILED.value,
+            "provider_payment_id": provider_payment_id,
+            "razorpay_signature": signature or None,
+            "failure_reason": failure_reason or "provider_reported_failure",
+        },
+    )
+
+
+async def _activate_license_if_needed(
+    license_activation: LicenseActivationProtocol, organization_id: Any
+) -> None:
+    """Real activation-on-first-payment for the Razorpay Checkout flow: a
+    successful checkout payment with no ``subscription_id`` attached (this
+    organization has a real ``License``/``Plan`` assigned but no
+    ``Subscription`` row is tracking this particular payment) means this is
+    the payment that should activate the license, not extend an existing
+    subscription's period (that composition -- ``RenewalService
+    .confirm_renewal_payment_succeeded`` -- already runs separately, only
+    when ``payment.subscription_id`` IS set). Idempotent by construction:
+    ``LicenseService.activate_license`` only permits a real, legal
+    ``PENDING_ACTIVATION``/``SUSPENDED`` -> ``ACTIVE`` transition (see
+    ``service._LICENSE_TRANSITIONS``); if the license is already ``ACTIVE``
+    (e.g. a redelivered webhook, or a payment for an org whose license was
+    activated some other way already), the illegal-transition error is
+    caught and swallowed here -- a webhook handler must never fail a real,
+    already-applied payment update over what is, from this platform's own
+    perspective, already the desired end state."""
+    try:
+        license_ = await license_activation.get_license_for_organization(
+            organization_id
+        )
+    except LicenseNotFoundError:  # pragma: no cover - defensive
+        logger.warning(
+            "billing_webhook_checkout_payment_with_no_license",
+            extra={"organization_id": str(organization_id)},
+        )
+        return
+    if license_.status == "active":
+        return
+    try:
+        await license_activation.activate_license(
+            actor_user_id=None, license_id=license_.id
+        )
+    except InvalidLicenseStatusTransitionError:  # pragma: no cover - defensive
+        logger.warning(
+            "billing_webhook_checkout_license_activation_skipped",
+            extra={
+                "organization_id": str(organization_id),
+                "license_status": license_.status,
+            },
+        )
+
+
+async def _audit_webhook_received(
+    audit_writer: WebhookAuditWriterProtocol | None,
+    *,
+    provider: str,
+    event_type: str,
+    event_id: str,
+    payment: Payment | None,
+) -> None:
+    if audit_writer is None:
+        return
+    await audit_writer.create_audit_log_entry(
+        actor_user_id=None,
+        action=AUDIT_ACTION_WEBHOOK_RECEIVED,
+        entity_type="payment" if payment is not None else "webhook_event",
+        entity_id=payment.id if payment is not None else None,
+        description=(
+            f"{provider} webhook received and processed: event_type="
+            f"'{event_type}' event_id='{event_id}'"
+        ),
+        event_metadata={"provider": provider, "event_type": event_type},
+        organization_id=payment.organization_id if payment is not None else None,
+        location_id=None,
+    )
 
 
 async def process_razorpay_event(
@@ -302,6 +483,9 @@ async def process_razorpay_event(
     renewal_service: RenewalService,
     dedup: WebhookEventDedupProtocol,
     invoice_service: InvoiceServiceProtocol | None = None,
+    license_activation: LicenseActivationProtocol | None = None,
+    signature: str = "",
+    audit_writer: WebhookAuditWriterProtocol | None = None,
 ) -> bool:
     """Processes one verified Razorpay webhook payload (already
     signature-verified JSON, parsed into a plain dict). Real event types
@@ -310,7 +494,24 @@ async def process_razorpay_event(
     top-level unique event id the way Stripe's ``Event.id`` is -- Razorpay
     webhooks instead carry an ``x-razorpay-event-id`` HTTP header per its
     real documented delivery format; the caller (``router.py``) passes
-    that header value through as ``event_id``."""
+    that header value through as ``event_id``.
+
+    ## Razorpay Checkout correlation (order_id fallback)
+
+    ``provider_payment_id``-keyed resolution (``_resolve_and_update_payment``,
+    reused unchanged from the pre-existing recurring-charge flow) is tried
+    first. If it finds nothing, and the event payload carries a real
+    ``order_id`` (every Razorpay ``payment.entity`` does), this function
+    falls back to ``_resolve_checkout_payment_by_order_id`` -- the
+    correlation path for a PENDING row created by ``service.PaymentService
+    .create_checkout_order`` (see that column's own docstring on
+    ``models.Payment.razorpay_order_id``). On a real success resolved this
+    way with no ``subscription_id`` tracked, ``_activate_license_if_needed``
+    activates the organization's License for real (see that function's own
+    docstring) -- the "on verified successful payment, activate/extend the
+    organization's subscription for real" requirement this checkout flow
+    exists to satisfy.
+    """
     event_type = payload.get("event", "")
     event_id = payload.get("_event_id", "")
     is_new = await dedup.mark_processed_if_new("razorpay", event_id)
@@ -327,6 +528,8 @@ async def process_razorpay_event(
         else {}
     )
     provider_payment_id = payment_entity.get("id")
+    order_id = payment_entity.get("order_id")
+    payment: Payment | None = None
 
     if event_type == "payment.captured":
         payment = await _resolve_and_update_payment(
@@ -335,9 +538,22 @@ async def process_razorpay_event(
             succeeded=True,
             failure_reason=None,
         )
+        if payment is None:
+            payment = await _resolve_checkout_payment_by_order_id(
+                payment_repository,
+                order_id=order_id,
+                provider_payment_id=provider_payment_id,
+                signature=signature,
+                succeeded=True,
+                failure_reason=None,
+            )
         if payment is not None and payment.subscription_id is not None:
             await renewal_service.confirm_renewal_payment_succeeded(
                 payment.subscription_id
+            )
+        elif payment is not None and license_activation is not None:
+            await _activate_license_if_needed(
+                license_activation, payment.organization_id
             )
         if payment is not None and invoice_service is not None:
             await invoice_service.mark_invoice_paid_for_payment(payment)
@@ -349,6 +565,15 @@ async def process_razorpay_event(
             succeeded=False,
             failure_reason=reason,
         )
+        if payment is None:
+            payment = await _resolve_checkout_payment_by_order_id(
+                payment_repository,
+                order_id=order_id,
+                provider_payment_id=provider_payment_id,
+                signature=signature,
+                succeeded=False,
+                failure_reason=reason,
+            )
         if payment is not None and payment.subscription_id is not None:
             await renewal_service.confirm_renewal_payment_failed(
                 payment.subscription_id, reason=reason or "provider_reported_failure"
@@ -358,6 +583,14 @@ async def process_razorpay_event(
             "billing_webhook_event_type_unhandled",
             extra={"provider": "razorpay", "event_type": event_type},
         )
+
+    await _audit_webhook_received(
+        audit_writer,
+        provider="razorpay",
+        event_type=event_type,
+        event_id=event_id,
+        payment=payment,
+    )
 
     logged = WebhookProcessed(
         provider="razorpay", event_id=event_id, event_type=event_type
@@ -379,9 +612,42 @@ def _event_extra(event: object) -> dict[str, object]:
     }
 
 
-def log_signature_failure(provider: str, reason: str) -> None:
+async def log_signature_failure(
+    provider: str,
+    reason: str,
+    *,
+    audit_writer: WebhookAuditWriterProtocol | None = None,
+) -> None:
+    """Real, structured-log record of a REJECTED webhook delivery -- always
+    happens. When ``audit_writer`` is supplied (the real, wired case -- see
+    ``router.py``'s webhook handlers, which now ``await`` this call), this
+    ALSO writes a real, permanent, queryable ``audit_log_entries`` row
+    (``AUDIT_ACTION_WEBHOOK_REJECTED``) -- the "Log every webhook receipt
+    (verified or rejected) to this domain's own audit trail for real
+    debuggability" requirement this addition satisfies. No ``Payment``/
+    organization is knowable at this point (the payload was never trusted
+    enough to even parse) -- ``entity_id``/``organization_id`` are both
+    left ``None``, an honest "we don't know whose webhook this claimed to
+    be" rather than a fabricated guess. ``async`` (a real, if small,
+    behavior change from before this addition) since a real audit-log
+    write is itself a real, awaitable database call -- every call site
+    updated to ``await`` it."""
     event = WebhookSignatureInvalid(provider=provider, reason=reason)
     logger.warning("billing_webhook_signature_invalid", extra=_event_extra(event))
+    if audit_writer is not None:
+        await audit_writer.create_audit_log_entry(
+            actor_user_id=None,
+            action=AUDIT_ACTION_WEBHOOK_REJECTED,
+            entity_type="webhook_event",
+            entity_id=None,
+            description=(
+                f"{provider} webhook REJECTED: signature verification failed "
+                f"({reason})"
+            ),
+            event_metadata={"provider": provider},
+            organization_id=None,
+            location_id=None,
+        )
 
 
 __all__ = [
@@ -390,6 +656,8 @@ __all__ = [
     "WebhookEventDedupProtocol",
     "RedisWebhookEventDedup",
     "InvoiceServiceProtocol",
+    "LicenseActivationProtocol",
+    "WebhookAuditWriterProtocol",
     "process_stripe_event",
     "process_razorpay_event",
     "log_signature_failure",

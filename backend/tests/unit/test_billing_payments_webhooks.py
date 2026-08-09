@@ -142,6 +142,14 @@ class FakePaymentRepository:
                 return payment
         return None
 
+    async def get_by_razorpay_order_id(
+        self, razorpay_order_id: str
+    ) -> Payment | None:
+        for payment in self.payments.values():
+            if getattr(payment, "razorpay_order_id", None) == razorpay_order_id:
+                return payment
+        return None
+
     async def update_payment(
         self, payment: Payment, data: dict[str, object]
     ) -> Payment:

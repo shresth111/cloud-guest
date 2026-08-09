@@ -674,6 +674,14 @@ AUDIT_ACTION_SUBSCRIPTION_RENEWAL_SETTINGS_UPDATED = (
     "subscription_renewal_settings_updated"
 )
 
+# Real, domain-local audit-trail actions for every webhook DELIVERY this
+# platform receives (verified and processed, or rejected for a bad/missing
+# signature) -- see webhooks.py's own module docstring for the full
+# "Log every webhook receipt" write-up. Same "plain string, not a shared
+# AuditAction enum member" precedent as the dashboard-view actions above.
+AUDIT_ACTION_WEBHOOK_RECEIVED = "billing_webhook_received"
+AUDIT_ACTION_WEBHOOK_REJECTED = "billing_webhook_rejected"
+
 
 __all__ = [
     "PlanType",
@@ -722,4 +730,6 @@ __all__ = [
     "AUDIT_ACTION_DASHBOARD_SUPER_ADMIN_VIEWED",
     "AUDIT_ACTION_DASHBOARD_CUSTOMER_VIEWED",
     "AUDIT_ACTION_SUBSCRIPTION_RENEWAL_SETTINGS_UPDATED",
+    "AUDIT_ACTION_WEBHOOK_RECEIVED",
+    "AUDIT_ACTION_WEBHOOK_REJECTED",
 ]

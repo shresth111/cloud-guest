@@ -154,6 +154,25 @@ class PaymentGatewayAdminProtocol(Protocol):
     async def retry(self, payment: Payment) -> Payment: ...
 
 
+class RazorpayCheckoutProtocol(Protocol):
+    """The narrow, Razorpay-specific surface ``service.PaymentService
+    .create_checkout_order`` needs -- satisfied by ``RazorpayPaymentGateway``
+    alone (never Stripe: this platform's confirmed scope is a Razorpay
+    Checkout widget flow specifically, see ``router.py``'s ``POST
+    /billing/checkout`` docstring). Deliberately separate from
+    ``PaymentGatewayAdminProtocol`` above rather than adding a third method
+    to it: ``charge_via_provider``/``refund``/``retry`` all operate on a
+    payment this platform is charging *itself* (a saved, tokenized payment
+    method already on file -- see this module's own "no separate Customer
+    entity" write-up); ``create_checkout_order`` is the opposite shape --
+    no saved payment method is required or consulted at all, because the
+    whole point of a Checkout-widget order is that the *customer* supplies
+    payment details (UPI/card/netbanking) directly to Razorpay's own hosted
+    widget, never to this platform."""
+
+    async def create_checkout_order(self, payment: Payment) -> Payment: ...
+
+
 class _BaseGateway:
     """Shared not-configured guard + PENDING-row bookkeeping both concrete
     gateways compose with -- see module docstring for the full write-up of
@@ -299,6 +318,27 @@ class _BaseGateway:
             )
         return await self._retry_impl(payment)
 
+    # ========================================================================
+    # RazorpayCheckoutProtocol -- Razorpay-only, see this module's own
+    # RazorpayCheckoutProtocol docstring for why this has no Stripe sibling.
+    # ========================================================================
+
+    async def create_checkout_order(self, payment: Payment) -> Payment:
+        if not self._is_configured():
+            updated = await self.payment_repository.update_payment(
+                payment,
+                {
+                    "status": PaymentStatus.FAILED.value,
+                    "failure_reason": "payment_gateway_not_configured",
+                },
+            )
+            raise PaymentGatewayNotConfiguredError(
+                organization_id=updated.organization_id,
+                amount=updated.amount,
+                currency=updated.currency,
+            )
+        return await self._create_checkout_order_impl(payment)  # type: ignore[attr-defined]
+
     async def _charge_via_provider_impl(
         self, payment: Payment
     ) -> Payment:  # pragma: no cover - overridden
@@ -312,6 +352,13 @@ class _BaseGateway:
     async def _retry_impl(
         self, payment: Payment
     ) -> Payment:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    async def _create_checkout_order_impl(
+        self, payment: Payment
+    ) -> Payment:  # pragma: no cover - overridden; Razorpay-only, see
+        # RazorpayCheckoutProtocol's own docstring for why Stripe never
+        # overrides this.
         raise NotImplementedError
 
 
@@ -465,6 +512,53 @@ class RazorpayPaymentGateway(_BaseGateway):
         # attempt; see module docstring.
         return await self._attempt_charge(payment)
 
+    async def _create_checkout_order_impl(self, payment: Payment) -> Payment:
+        """Creates a real Razorpay Order (``client.order.create``) for an
+        already-persisted PENDING ``payment`` row and stores the resulting
+        ``order.id`` on ``Payment.razorpay_order_id`` -- **no charge attempt
+        is made here**, and (unlike ``_attempt_charge``) no saved default
+        ``PaymentMethod`` is looked up or required: this is the real,
+        documented Razorpay Checkout flow (create an Order server-side, hand
+        its ``id``/``amount``/``currency`` plus the publishable
+        ``key_id`` to the frontend's Checkout widget, the customer supplies
+        UPI/card/netbanking details directly to Razorpay's own hosted
+        widget) -- the entire reason this method exists separately from the
+        server-initiated recurring-charge path above. The row stays
+        ``PENDING``; ``webhooks.process_razorpay_event`` resolves it to
+        SUCCEEDED/FAILED once Razorpay's own signed webhook reports the
+        customer's real payment outcome against this order -- this method
+        itself never learns or waits for that outcome."""
+        client = self._client()
+        minor_amount = to_minor_units(payment.amount, payment.currency)
+        try:
+            order = client.order.create(
+                {
+                    "amount": minor_amount,
+                    "currency": payment.currency.upper(),
+                    "receipt": str(payment.id),
+                    "payment_capture": 1,
+                    "notes": {
+                        "organization_id": str(payment.organization_id),
+                        "payment_id": str(payment.id),
+                    },
+                }
+            )
+        except (
+            razorpay.errors.BadRequestError,
+            razorpay.errors.GatewayError,
+            razorpay.errors.ServerError,
+        ) as exc:
+            logger.exception(
+                "billing_razorpay_checkout_order_provider_error",
+                extra={"payment_id": str(payment.id)},
+            )
+            raise PaymentProviderError(str(exc)) from exc
+
+        order_id = order.get("id") if isinstance(order, dict) else None
+        return await self.payment_repository.update_payment(
+            payment, {"razorpay_order_id": order_id}
+        )
+
     async def _attempt_charge(self, payment: Payment) -> Payment:
         try:
             payment_method_token = await self._default_payment_method_token(
@@ -586,10 +680,12 @@ _: type[PaymentGatewayProtocol] = StripePaymentGateway
 _: type[PaymentGatewayProtocol] = RazorpayPaymentGateway
 _: type[PaymentGatewayAdminProtocol] = StripePaymentGateway
 _: type[PaymentGatewayAdminProtocol] = RazorpayPaymentGateway
+_: type[RazorpayCheckoutProtocol] = RazorpayPaymentGateway
 
 
 __all__ = [
     "PaymentGatewayAdminProtocol",
+    "RazorpayCheckoutProtocol",
     "StripePaymentGateway",
     "RazorpayPaymentGateway",
 ]
