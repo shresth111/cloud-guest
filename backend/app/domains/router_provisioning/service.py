@@ -52,7 +52,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from app.domains.location.models import Location
 from app.domains.rbac.enums import AuditAction
@@ -1477,19 +1477,50 @@ class RouterProvisioningService:
         connected_clients_count: int | None = None,
         routeros_version: str | None = None,
         management_ip_address: str | None = None,
+        interface_traffic_counters: list[dict[str, Any]] | None = None,
+        metrics_source: str | None = None,
+        call_heartbeat: bool = True,
     ) -> tuple[Router, RouterHealthSnapshot]:
         """Supplements (never replaces) BE-008's own heartbeat: calls
         ``RouterService.heartbeat`` first (reusing its existing liveness/
         status-transition logic exactly as-is), then persists a full
         history row with the richer metrics BE-008's own single "current
         snapshot" fields don't retain -- composition, not a second heartbeat
-        endpoint."""
-        router = await self.router_lookup.heartbeat(
-            router_id=router_id,
-            requesting_organization_id=requesting_organization_id,
-            routeros_version=routeros_version,
-            management_ip_address=management_ip_address,
-        )
+        endpoint.
+
+        ``interface_traffic_counters``/``metrics_source`` are the SNMP
+        metrics-polling extension's own additive fields -- see
+        ``RouterHealthSnapshot``'s own updated docstring; both are simply
+        forwarded through to the repository, ``None`` by default so the
+        original RouterOS-API-sourced call sites
+        (``run_router_health_poll_sweep``) are unaffected.
+
+        ``call_heartbeat=False`` (used by
+        ``app.domains.provisioning_engine.service
+        .run_router_snmp_metrics_poll_sweep``) skips the
+        ``RouterService.heartbeat`` call above, looking the router up via
+        plain ``get_router`` instead -- SNMP reachability is a genuinely
+        different liveness signal from "the RouterOS management API
+        answered" (which is what ``heartbeat`` really means -- it flips
+        ``Router.status``/``health_status`` accordingly), and a router
+        with a working SNMP agent but a genuinely down RouterOS API (or
+        vice versa) must never have the wrong channel's success fabricate
+        the other's liveness/health status. The snapshot's own
+        ``health_status`` column still simply echoes the router's
+        *existing*, already-current ``health_status`` either way -- purely
+        descriptive metadata on the row, never itself the thing that sets
+        that status."""
+        if call_heartbeat:
+            router = await self.router_lookup.heartbeat(
+                router_id=router_id,
+                requesting_organization_id=requesting_organization_id,
+                routeros_version=routeros_version,
+                management_ip_address=management_ip_address,
+            )
+        else:
+            router = await self.router_lookup.get_router(
+                router_id, requesting_organization_id=requesting_organization_id
+            )
         now = datetime.now(UTC)
         snapshot = await self.repository.create_health_snapshot(
             router_id=router.id,
@@ -1499,6 +1530,8 @@ class RouterProvisioningService:
             memory_usage_percent=memory_usage_percent,
             uptime_seconds=uptime_seconds,
             connected_clients_count=connected_clients_count,
+            interface_traffic_counters=interface_traffic_counters,
+            metrics_source=metrics_source,
         )
         logger.info(
             "router_health_snapshot_recorded", extra={"router_id": str(router.id)}
@@ -1511,20 +1544,23 @@ class RouterProvisioningService:
         router_id: uuid.UUID,
         requesting_organization_id: uuid.UUID | None,
         detail: str | None = None,
+        metrics_source: str | None = None,
     ) -> RouterHealthSnapshot:
         """The honest counterpart to ``record_health_snapshot`` above, for a
         poll that could not reach the device at all -- used by
         ``app.domains.provisioning_engine.service
         .run_router_health_poll_sweep`` when ``DeviceHealthResult.healthy``
-        is ``False``. Deliberately **never** calls ``RouterService
-        .heartbeat`` (unlike ``record_health_snapshot``): that method
-        unconditionally sets ``Router.status`` to ``ONLINE`` and
-        ``health_status`` to ``"healthy"`` -- calling it here would fabricate
-        a false liveness signal for a device that just failed to answer,
-        exactly what ``device_adapters.MikroTikProvisionAdapter``'s own
-        "honest, never fabricated success" stance forbids. ``Router.status``/
-        ``health_status`` are therefore left untouched by this method; only
-        the point-in-time history row is written, with
+        is ``False``, and by that same module's
+        ``run_router_snmp_metrics_poll_sweep`` (``metrics_source="snmp"``)
+        on a real SNMP timeout/error. Deliberately **never** calls
+        ``RouterService.heartbeat`` (unlike ``record_health_snapshot``):
+        that method unconditionally sets ``Router.status`` to ``ONLINE``
+        and ``health_status`` to ``"healthy"`` -- calling it here would
+        fabricate a false liveness signal for a device that just failed
+        to answer, exactly what ``device_adapters.MikroTikProvisionAdapter``'s
+        own "honest, never fabricated success" stance forbids.
+        ``Router.status``/``health_status`` are therefore left untouched by
+        this method; only the point-in-time history row is written, with
         ``health_status=RouterHealthStatus.UNHEALTHY`` and every metric field
         ``None`` (nothing was actually read from the device)."""
         router = await self.router_lookup.get_router(
@@ -1539,6 +1575,8 @@ class RouterProvisioningService:
             memory_usage_percent=None,
             uptime_seconds=None,
             connected_clients_count=None,
+            interface_traffic_counters=None,
+            metrics_source=metrics_source,
         )
         logger.info(
             "router_health_snapshot_recorded_failed_check",

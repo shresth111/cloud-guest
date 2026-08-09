@@ -157,6 +157,58 @@ class Settings(BaseSettings):
         ),
     )
 
+    snmp_default_community: str = Field(
+        default="",
+        description=(
+            "Platform-wide default SNMP community string -- used by "
+            "app.domains.provisioning_engine.service"
+            ".run_router_snmp_metrics_poll_sweep for a router that has "
+            "snmp_enabled=True but no per-router "
+            "Router.snmp_community_encrypted override configured (mirrors "
+            "stripe_secret_key/razorpay_key_id's own 'empty = "
+            "unconfigured' posture). Empty = unconfigured: a router with "
+            "snmp_enabled and no community anywhere (neither per-router "
+            "nor this default) is honestly skipped by the sweep, never "
+            "guessed at a fabricated default like the well-known "
+            "'public'. Override via CLOUDGUEST_SNMP_DEFAULT_COMMUNITY in "
+            "any real deployment that wants a single shared community "
+            "across its fleet rather than configuring one per router."
+        ),
+    )
+    snmp_default_version: str = Field(
+        default="2c",
+        description=(
+            "Platform-wide default SNMP protocol version (\"1\" or "
+            "\"2c\" -- see wyfy_device_gateway.snmp_poller's own module "
+            "docstring for why SNMPv3 is out of scope), used when a "
+            "router has no per-router Router.snmp_version override."
+        ),
+    )
+    snmp_default_port: int = Field(
+        default=161,
+        ge=1,
+        le=65535,
+        description=(
+            "Platform-wide default SNMP agent UDP port (161 is the real "
+            "IANA-assigned SNMP port), used when a router has no "
+            "per-router Router.snmp_port override."
+        ),
+    )
+    snmp_poll_timeout_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+        description=(
+            "Per-request UDP timeout for "
+            "wyfy_device_gateway.snmp_poller.SnmpPoller -- an SNMP "
+            "request has no TCP connection-level timeout to fall back on "
+            "(it's a connectionless UDP request/reply), so this is the "
+            "one real, honest bound on how long the SNMP metrics-poll "
+            "sweep waits for a single router's reply before treating it "
+            "as unreachable."
+        ),
+    )
+
     otp_code_length: int = Field(
         default=6,
         ge=4,

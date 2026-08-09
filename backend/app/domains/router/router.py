@@ -140,6 +140,10 @@ def _router_response(router_device: Router) -> RouterResponse:
         last_health_check_at=router_device.last_health_check_at,
         health_status=router_device.health_status,
         has_api_credentials=router_device.api_credentials_encrypted is not None,
+        snmp_enabled=router_device.snmp_enabled,
+        has_snmp_community=router_device.snmp_community_encrypted is not None,
+        snmp_version=router_device.snmp_version,
+        snmp_port=router_device.snmp_port,
         settings=router_device.settings,
         created_at=router_device.created_at,
         updated_at=router_device.updated_at,
@@ -219,6 +223,10 @@ async def create_router(
         public_ip_address=payload.public_ip_address,
         api_username=payload.api_username,
         api_secret=payload.api_secret,
+        snmp_enabled=payload.snmp_enabled,
+        snmp_community=payload.snmp_community,
+        snmp_version=payload.snmp_version,
+        snmp_port=payload.snmp_port,
         settings=payload.settings,
     )
     return build_response(

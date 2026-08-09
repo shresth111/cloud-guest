@@ -98,6 +98,7 @@ from app.domains.otp.service import OtpService
 from app.domains.policy.repository import PolicyRepository
 from app.domains.policy.service import PolicyService
 from app.domains.rbac.repository import RBACRepository
+from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.repository import RouterRepository
 from app.domains.router.service import RouterService
 from app.domains.router_provisioning.repository import (
@@ -108,8 +109,6 @@ from app.domains.router_provisioning.service import RouterProvisioningService
 from app.domains.voucher.repository import VoucherRepository
 from app.domains.voucher.service import VoucherService
 
-from app.domains.router.exceptions import RouterNotFoundError
-
 from .constants import (
     PROVISION_ENGINE_QUEUE_REDIS_KEY,
     PROVISION_QUEUE_DRAIN_BATCH_SIZE,
@@ -118,14 +117,22 @@ from .constants import (
     TASK_DRAIN_PROVISION_QUEUE,
     TASK_POLL_SINGLE_ROUTER_HEALTH,
     TASK_RUN_ROUTER_HEALTH_POLL_SWEEP,
+    TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP,
 )
 from .exceptions import ProvisioningEngineError
 from .repository import (
     ProvisioningEngineRepository,
     RedisProvisionEngineQueueDispatcher,
 )
-from .service import HealthPollSweepSummary, ProvisioningEngineService
+from .service import (
+    HealthPollSweepSummary,
+    ProvisioningEngineService,
+    SnmpMetricsPollSweepSummary,
+)
 from .service import run_router_health_poll_sweep as _run_router_health_poll_sweep
+from .service import (
+    run_router_snmp_metrics_poll_sweep as _run_router_snmp_metrics_poll_sweep,
+)
 
 logger = get_logger(__name__)
 
@@ -457,8 +464,68 @@ def poll_single_router_health(router_id: str) -> dict[str, int]:
     return result
 
 
+async def _run_router_snmp_metrics_poll_sweep_async() -> SnmpMetricsPollSweepSummary:
+    """Beat-scheduled, single sequential sweep -- see
+    ``constants.TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP``'s own docstring
+    for why this is deliberately not fanned out the way
+    ``run_router_health_poll_sweep``/``poll_single_router_health`` are (a
+    real, deliberate choice at today's real scale, not an oversight).
+    Reuses ``_build_router_and_provisioning_services`` -- the identical
+    real ``RouterService``/``RouterProvisioningService`` pair the
+    RouterOS-API sweep above already builds by hand, since this sweep
+    needs the exact same two things (per-router SNMP-credential
+    resolution via ``RouterService.get_decrypted_snmp_community``, and
+    ``RouterHealthSnapshot`` persistence via
+    ``RouterProvisioningService.record_health_snapshot``/
+    ``record_failed_health_check``)."""
+    redis = create_redis_client()
+    try:
+        async with SessionLocal() as session:
+            try:
+                router_service, router_provisioning_service = (
+                    _build_router_and_provisioning_services(session, redis)
+                )
+                summary = await _run_router_snmp_metrics_poll_sweep(
+                    ProvisioningEngineRepository(session),
+                    router_service,
+                    router_provisioning_service,
+                )
+                await session.commit()
+                return summary
+            except Exception:
+                await session.rollback()
+                raise
+    finally:
+        await redis.aclose()
+
+
+@celery_app.task(name=TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP)
+def run_router_snmp_metrics_poll_sweep() -> dict[str, int]:
+    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
+    ``beat_schedule`` -- runs every
+    ``constants.ROUTER_SNMP_METRICS_POLL_SWEEP_INTERVAL_SECONDS``). Real,
+    standards-based SNMP polling of every ``Router.snmp_enabled`` router,
+    supplementing (never replacing) ``run_router_health_poll_sweep``'s own
+    RouterOS-API-based sweep above -- see
+    ``service.run_router_snmp_metrics_poll_sweep``'s own docstring for the
+    full "why both sweeps exist" write-up."""
+    summary = run_celery_task(_run_router_snmp_metrics_poll_sweep_async())
+    result = {
+        "checked": summary.checked,
+        "unreachable": summary.unreachable,
+        "skipped": summary.skipped,
+        "errors": summary.errors,
+    }
+    logger.info(
+        "provisioning_engine_task_run_router_snmp_metrics_poll_sweep_completed",
+        extra=result,
+    )
+    return result
+
+
 __all__ = [
     "drain_provision_queue",
     "run_router_health_poll_sweep",
     "poll_single_router_health",
+    "run_router_snmp_metrics_poll_sweep",
 ]

@@ -126,6 +126,8 @@ class ProvisioningEngineRepositoryProtocol(Protocol):
     # -- routers (cross-domain, read-only) -----------------------------------
     async def list_routers_for_health_poll(self) -> list[Router]: ...
 
+    async def list_routers_for_snmp_poll(self) -> list[Router]: ...
+
 
 class ProvisioningEngineRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -248,6 +250,25 @@ class ProvisioningEngineRepository:
         statement = select(Router).where(
             Router.is_deleted.is_(False),
             Router.status.in_([RouterStatus.ONLINE.value, RouterStatus.OFFLINE.value]),
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_routers_for_snmp_poll(self) -> list[Router]:
+        """Every non-deleted, already-provisioned, SNMP-enabled router --
+        for ``service.run_router_snmp_metrics_poll_sweep``. Same
+        ``ONLINE``/``OFFLINE`` scope as ``list_routers_for_health_poll``
+        above (identical reasoning: ``OFFLINE`` is deliberately included
+        so a router the platform currently believes is down keeps getting
+        polled, real evidence it should flip back), additionally filtered
+        to ``Router.snmp_enabled.is_(True)`` -- a router that has never
+        had SNMP configured has nothing for this sweep to poll, and
+        should not show up as a silent per-tick skip for every one of
+        them platform-wide."""
+        statement = select(Router).where(
+            Router.is_deleted.is_(False),
+            Router.status.in_([RouterStatus.ONLINE.value, RouterStatus.OFFLINE.value]),
+            Router.snmp_enabled.is_(True),
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())

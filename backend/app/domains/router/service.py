@@ -218,6 +218,10 @@ class RouterService:
         public_ip_address: str | None = None,
         api_username: str | None = None,
         api_secret: str | None = None,
+        snmp_enabled: bool = False,
+        snmp_community: str | None = None,
+        snmp_version: str | None = None,
+        snmp_port: int | None = None,
         settings: dict[str, Any] | None = None,
     ) -> Router:
         location = await self.location_lookup.get_location(
@@ -248,6 +252,12 @@ class RouterService:
             api_credentials_encrypted=encrypt_secret(api_secret)
             if api_secret
             else None,
+            snmp_enabled=snmp_enabled,
+            snmp_community_encrypted=encrypt_secret(snmp_community)
+            if snmp_community
+            else None,
+            snmp_version=snmp_version,
+            snmp_port=snmp_port,
             settings=settings or {},
             created_by=actor_user_id,
         )
@@ -300,6 +310,15 @@ class RouterService:
         api_secret = update_data.pop("api_secret", None)
         if api_secret:
             update_data["api_credentials_encrypted"] = encrypt_secret(str(api_secret))
+
+        # Mirrors api_secret's own "write-only, encrypt-on-the-way-in"
+        # handling immediately above -- see Router.snmp_community_encrypted's
+        # own docstring for why this gets the same Fernet treatment.
+        snmp_community = update_data.pop("snmp_community", None)
+        if snmp_community:
+            update_data["snmp_community_encrypted"] = encrypt_secret(
+                str(snmp_community)
+            )
 
         updated = await self.repository.update_router(
             router, {**update_data, "updated_by": actor_user_id}
@@ -599,6 +618,23 @@ class RouterService:
         if router.api_credentials_encrypted is None:
             return None
         return decrypt_secret(router.api_credentials_encrypted)
+
+    def get_decrypted_snmp_community(self, router: Router) -> str | None:
+        """Decrypts and returns the router's own stored SNMP community
+        string, or ``None`` if none is configured on this specific router
+        -- mirrors ``get_decrypted_api_secret`` exactly. Callers that also
+        want the real platform-wide fallback
+        (``Settings.snmp_default_community``) apply it themselves, the
+        same "per-router override, platform default fallback" resolution
+        ``run_router_snmp_metrics_poll_sweep`` performs for
+        ``snmp_version``/``snmp_port`` too -- this method only ever
+        reports what this specific router itself has configured, never a
+        blended/fallback value, so callers that need to distinguish "this
+        router has no override" from "the resolved value happens to equal
+        the default" still can."""
+        if router.snmp_community_encrypted is None:
+            return None
+        return decrypt_secret(router.snmp_community_encrypted)
 
     async def reveal_credentials(
         self,

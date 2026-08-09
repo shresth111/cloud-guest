@@ -14,6 +14,12 @@ dependencies = [
     # consistency (both repos speak to the same real RouterOS devices).
     "librouteros==3.2.1",
     "asyncssh==2.14.2",
+    # snmp_poller.py's real dependency -- pure-Python SNMP (v1/v2c), no
+    # net-snmp/C-library system dependency. See that module's own
+    # "Why pysnmp, not easysnmp/net-snmp bindings" docstring section for
+    # why this was chosen over the alternatives. Pulls in only `pyasn1`
+    # (also pure Python) transitively.
+    "pysnmp==7.1.28",
 ]
 
 [project.optional-dependencies]

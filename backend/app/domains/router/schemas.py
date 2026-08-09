@@ -70,6 +70,10 @@ class RouterResponse(BaseModel):
     last_health_check_at: datetime | None = None
     health_status: str | None = None
     has_api_credentials: bool
+    snmp_enabled: bool
+    has_snmp_community: bool
+    snmp_version: str | None = None
+    snmp_port: int | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
@@ -201,6 +205,45 @@ class RouterCreateRequest(BaseModel):
             "never returned by any endpoint once submitted."
         ),
     )
+    snmp_enabled: bool = Field(
+        default=False,
+        description=(
+            "Whether this router should be polled via SNMP for richer "
+            "device metrics (CPU/memory/uptime/per-interface traffic "
+            "counters) in addition to the existing RouterOS-API-based "
+            "health check -- see "
+            "app.domains.provisioning_engine.service"
+            ".run_router_snmp_metrics_poll_sweep. Requires SNMP to "
+            "actually be enabled, with a matching community string, on "
+            "the physical device itself."
+        ),
+    )
+    snmp_community: str | None = Field(
+        default=None,
+        description=(
+            "SNMP community string (SNMPv1/v2c), stored Fernet-encrypted "
+            "-- never returned by any endpoint once submitted. Falls back "
+            "to the platform-wide Settings.snmp_default_community when "
+            "unset and snmp_enabled is true."
+        ),
+    )
+    snmp_version: str | None = Field(
+        default=None,
+        max_length=10,
+        description=(
+            "\"1\" or \"2c\" -- falls back to Settings.snmp_default_version "
+            "when unset. SNMPv3 is not supported."
+        ),
+    )
+    snmp_port: int | None = Field(
+        default=None,
+        ge=1,
+        le=65535,
+        description=(
+            "SNMP agent UDP port -- falls back to "
+            "Settings.snmp_default_port (161) when unset."
+        ),
+    )
     settings: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("mac_address")
@@ -246,6 +289,10 @@ class RouterUpdateRequest(BaseModel):
     public_ip_address: str | None = Field(default=None, max_length=45)
     api_username: str | None = Field(default=None, max_length=100)
     api_secret: str | None = Field(default=None)
+    snmp_enabled: bool | None = Field(default=None)
+    snmp_community: str | None = Field(default=None)
+    snmp_version: str | None = Field(default=None, max_length=10)
+    snmp_port: int | None = Field(default=None, ge=1, le=65535)
     settings: dict[str, Any] | None = None
 
     @field_validator("mac_address")

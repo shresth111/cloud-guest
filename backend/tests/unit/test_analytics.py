@@ -800,6 +800,12 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # ("monitoring-alert-rule-evaluation-sweep") -- the real, periodic
     # evaluation job behind the previously-dormant Alert Engine -- see
     # app.domains.monitoring.tasks's own module docstring.
+    # Provisioning Engine adds an eighteenth Beat entry
+    # ("provisioning-engine-router-snmp-metrics-poll-sweep") -- the real,
+    # standards-based SNMP device-metrics poll sweep, a second, genuinely
+    # independent real-device-I/O path alongside the RouterOS-API-based
+    # sweep above -- see app.domains.provisioning_engine.service
+    # .run_router_snmp_metrics_poll_sweep's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -818,6 +824,7 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "router-provisioning-token-cleanup-sweep",
         "notification-dispatch-sweep",
         "monitoring-alert-rule-evaluation-sweep",
+        "provisioning-engine-router-snmp-metrics-poll-sweep",
     }
 
 

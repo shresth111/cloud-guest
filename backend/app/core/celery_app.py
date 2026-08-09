@@ -144,9 +144,11 @@ from app.domains.notification.constants import TASK_RUN_NOTIFICATION_DISPATCH_SW
 from app.domains.provisioning_engine.constants import (
     PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
     ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS,
+    ROUTER_SNMP_METRICS_POLL_SWEEP_INTERVAL_SECONDS,
     TASK_DRAIN_PROVISION_QUEUE,
     TASK_POLL_SINGLE_ROUTER_HEALTH,
     TASK_RUN_ROUTER_HEALTH_POLL_SWEEP,
+    TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP,
 )
 from app.domains.queue_management.constants import (
     SCHEDULE_SWEEP_INTERVAL_SECONDS,
@@ -257,6 +259,12 @@ celery_app.conf.update(
         TASK_POLL_SINGLE_ROUTER_HEALTH: {"queue": DEVICE_IO_QUEUE_NAME},
         TASK_SYNC_SINGLE_ROUTER_DEVICES: {"queue": DEVICE_IO_QUEUE_NAME},
         TASK_RUN_ISP_HEALTH_CHECK_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # Single sequential sweep issuing real SNMP UDP round trips per
+        # router (like TASK_RUN_ISP_HEALTH_CHECK_SWEEP immediately above,
+        # not yet fanned out -- see constants
+        # .TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP's own docstring), so it
+        # belongs on the real-device-I/O queue for the identical reason.
+        TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
     },
     beat_schedule={
         "analytics-rolling-today": {
@@ -389,6 +397,20 @@ celery_app.conf.update(
         "provisioning-engine-router-health-poll-sweep": {
             "task": TASK_RUN_ROUTER_HEALTH_POLL_SWEEP,
             "schedule": ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS,
+        },
+        # Real, standards-based SNMP metrics polling -- a second,
+        # genuinely independent real-device-I/O path alongside the
+        # RouterOS-API-based sweep immediately above, opt-in per router
+        # (Router.snmp_enabled). See
+        # app.domains.provisioning_engine.service
+        # .run_router_snmp_metrics_poll_sweep's own docstring for the
+        # full "why both sweeps exist" write-up and
+        # app.domains.provisioning_engine.constants
+        # .ROUTER_SNMP_METRICS_POLL_SWEEP_INTERVAL_SECONDS's own for the
+        # cadence reasoning.
+        "provisioning-engine-router-snmp-metrics-poll-sweep": {
+            "task": TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP,
+            "schedule": ROUTER_SNMP_METRICS_POLL_SWEEP_INTERVAL_SECONDS,
         },
         # Queue Management Engine: re-evaluates every ACTIVE/SUSPENDED
         # QueueAssignment scoped to a QueueSchedule and flips its device

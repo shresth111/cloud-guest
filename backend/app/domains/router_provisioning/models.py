@@ -467,7 +467,24 @@ class ProvisioningJob(BaseModel):
 class RouterHealthSnapshot(BaseModel):
     """A point-in-time health/metrics reading for a router -- the
     time-series history BE-008's own single ``Router.last_health_check_at``/
-    ``health_status`` "current snapshot" fields deliberately do not keep."""
+    ``health_status`` "current snapshot" fields deliberately do not keep.
+
+    ``metrics_source``/``interface_traffic_counters`` (SNMP metrics-
+    polling extension) let this same table carry a real SNMP-sourced
+    reading (``app.domains.provisioning_engine.service
+    .run_router_snmp_metrics_poll_sweep``) alongside the original
+    RouterOS-API-sourced one (``run_router_health_poll_sweep``) --
+    deliberately composed onto this existing table rather than a second,
+    disconnected metrics table: both are, structurally, exactly the same
+    fact ("this router's real CPU/memory/uptime at this instant"), merely
+    obtained via two different transports. ``metrics_source`` is ``NULL``
+    for every pre-existing row (all predate this extension and were, by
+    construction, RouterOS-API-sourced; a real, honest backfill would set
+    them to ``"routeros_api"``, not fabricate a value for rows recorded
+    before this column existed) and ``"routeros_api"``/``"snmp"`` for every
+    row recorded after, mirroring ``app.domains.isp.constants
+    .HealthStatusSource``'s own "a source tag on the *existing* vocabulary,
+    never a parallel table" precedent."""
 
     __tablename__ = "router_health_snapshots"
 
@@ -482,6 +499,25 @@ class RouterHealthSnapshot(BaseModel):
     memory_usage_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     uptime_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     connected_clients_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # "routeros_api" | "snmp" | NULL (pre-existing rows -- see docstring).
+    metrics_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Real, per-interface SNMP IF-MIB traffic counters for this reading --
+    # a list of {"if_index", "if_name", "in_octets", "out_octets", "up"}
+    # objects, one per interface the SNMP agent reported (see
+    # wyfy_device_gateway.snmp_poller.SnmpInterfaceCounters, this column's
+    # own source shape). JSONB, not individual columns or a child table:
+    # a router's own interface count/naming varies per model and is not
+    # itself a first-class query dimension anywhere in this domain yet
+    # (mirrors Router.settings/RouterEvent.event_metadata/
+    # ProvisioningJob.payload's own established "structured, per-row-
+    # variable extension data belongs in JSONB, not a bespoke schema"
+    # precedent). Always ``NULL`` (never a fabricated ``[]``) for a
+    # RouterOS-API-sourced snapshot (that transport reports no per-
+    # interface breakdown here) and for any snapshot where the SNMP poll
+    # itself failed before reaching the interface table.
+    interface_traffic_counters: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB, nullable=True
+    )
 
     __table_args__ = (
         Index("ix_router_health_snapshots_router_id", "router_id"),

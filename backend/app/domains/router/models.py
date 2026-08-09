@@ -38,7 +38,16 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -107,6 +116,41 @@ class Router(BaseModel):
     # router in pending_provisioning has no connection credentials yet.
     api_username: Mapped[str | None] = mapped_column(String(100), nullable=True)
     api_credentials_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # SNMP metrics-polling configuration (see
+    # app.domains.provisioning_engine.service.run_router_snmp_metrics_poll_sweep
+    # and vendor/wyfy-device-gateway's own snmp_poller.py). A genuinely
+    # separate credential surface from api_username/api_credentials_encrypted
+    # above -- SNMP is a distinct protocol/port (default UDP 161) from the
+    # RouterOS API (default TCP 8728) this device also speaks, with its own
+    # real failure mode (SNMP disabled/misconfigured on the router does not
+    # imply the RouterOS API is also unreachable, and vice versa) -- so this
+    # gets its own enabled flag and credential, not a reuse of the API
+    # fields. All four nullable: every pre-existing router has SNMP
+    # unconfigured (snmp_enabled defaults False), the identical "opt-in,
+    # never silently assumed configured" posture wireguard_public_key/
+    # api_credentials_encrypted already establish elsewhere on this model.
+    snmp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Fernet-encrypted via the exact same app.domains.router.crypto
+    # encrypt_secret/decrypt_secret helpers api_credentials_encrypted
+    # already uses -- an SNMP community string is a real shared secret
+    # (SNMPv1/v2c's only authentication mechanism), not a public value,
+    # even though it is conventionally short/simple (e.g. "public"/
+    # "private" defaults many devices ship with, which is exactly why a
+    # real deployment should never leave it at a guessable default).
+    snmp_community_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # "1" or "2c" only -- see wyfy_device_gateway.snmp_poller's own module
+    # docstring for why SNMPv3 is honestly out of scope for this pass. NULL
+    # (rather than a hardcoded default here) lets Settings
+    # .snmp_default_version supply the platform-wide fallback -- see that
+    # field's own docstring for the same "per-router override, platform
+    # default fallback" pattern this establishes for community/port too.
+    snmp_version: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # NULL falls back to Settings.snmp_default_port (161, the real IANA-
+    # assigned SNMP agent port) -- not hardcoded as a column default so a
+    # real per-router override (a router behind a NAT/port-forward rule
+    # exposing SNMP on a non-standard port) is still representable.
+    snmp_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Extension point: per-router config that does not warrant its own column
     # (e.g. captive-portal branding overrides, vendor-specific quirks flags).

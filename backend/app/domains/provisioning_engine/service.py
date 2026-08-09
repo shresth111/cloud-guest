@@ -65,6 +65,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from wyfy_device_gateway.snmp_poller import (
+    SnmpConnectionError,
+    SnmpCredentials,
+    SnmpDeviceError,
+    SnmpPoller,
+)
+
+from app.core.config import get_settings
 from app.domains.policy.constants import PolicyType
 from app.domains.policy.service import ResolvedPolicy
 from app.domains.rbac.enums import AuditAction
@@ -158,6 +166,8 @@ class RouterLookupProtocol(Protocol):
 
     def get_decrypted_api_secret(self, router: Router) -> str | None: ...
 
+    def get_decrypted_snmp_community(self, router: Router) -> str | None: ...
+
 
 class RouterProvisioningLookupProtocol(Protocol):
     """The subset of ``RouterProvisioningService``'s real surface this
@@ -244,6 +254,9 @@ class RouterProvisioningLookupProtocol(Protocol):
         connected_clients_count: int | None = None,
         routeros_version: str | None = None,
         management_ip_address: str | None = None,
+        interface_traffic_counters: list[dict[str, Any]] | None = None,
+        metrics_source: str | None = None,
+        call_heartbeat: bool = True,
     ) -> tuple[Router, object]: ...
 
     async def record_failed_health_check(
@@ -252,6 +265,7 @@ class RouterProvisioningLookupProtocol(Protocol):
         router_id: uuid.UUID,
         requesting_organization_id: uuid.UUID | None,
         detail: str | None = None,
+        metrics_source: str | None = None,
     ) -> object: ...
 
 
@@ -318,6 +332,18 @@ class HealthPollSweepSummary:
     ``app.domains.isp.service.HealthCheckSweepSummary``'s/
     ``app.domains.connected_devices.service.DeviceSyncSweepSummary``'s
     identical "plain counts, no per-router detail" shape."""
+
+    checked: int
+    unreachable: int
+    skipped: int
+    errors: int
+
+
+@dataclass(frozen=True, slots=True)
+class SnmpMetricsPollSweepSummary:
+    """Returned by ``run_router_snmp_metrics_poll_sweep`` below -- mirrors
+    ``HealthPollSweepSummary``'s own identical "plain counts, no
+    per-router detail" shape."""
 
     checked: int
     unreachable: int
@@ -1419,6 +1445,155 @@ async def run_router_health_poll_sweep(
     )
 
 
+async def run_router_snmp_metrics_poll_sweep(
+    repository: ProvisioningEngineRepositoryProtocol,
+    router_lookup: RouterLookupProtocol,
+    router_provisioning: RouterProvisioningLookupProtocol,
+    *,
+    snmp_poller: SnmpPoller | None = None,
+    routers: list[Router] | None = None,
+) -> SnmpMetricsPollSweepSummary:
+    """The platform-wide, real, SNMP-based router device-metrics poll
+    sweep ``tasks.run_router_snmp_metrics_poll_sweep`` (Celery Beat)
+    drives -- pulled out to module scope for the identical "Celery task +
+    test suite share one real implementation, no live Postgres needed for
+    the latter" reason ``run_router_health_poll_sweep`` (immediately
+    above) already is.
+
+    ## Why this exists alongside ``run_router_health_poll_sweep``, not
+    instead of it
+
+    ``run_router_health_poll_sweep`` polls every already-provisioned
+    router's real RouterOS API (``/system/resource/print`` over
+    ``librouteros``) -- a real, working TCP connection over the same
+    management channel this platform already uses for every other
+    RouterOS operation (config push, queue management, ...). SNMP is a
+    second, genuinely independent transport: a lightweight, standard,
+    read-only UDP protocol purpose-built for device telemetry, that
+    genuinely reduces load on that shared RouterOS-API/SSH management
+    channel for routers that have it enabled (the real motivation for
+    this sweep existing at all -- see this module's own PR description).
+    It is opt-in per router (``Router.snmp_enabled``) precisely because it
+    needs something the RouterOS-API path does not: SNMP must be
+    separately enabled and configured (community string) on the physical
+    device itself, a real prerequisite this sweep cannot assume.
+
+    ## Real per-router credential resolution: per-router override, then
+    platform default, then honestly skip
+
+    A router qualifies for this sweep only if ``snmp_enabled`` is true
+    *and* a real community string can be resolved -- either this
+    router's own ``get_decrypted_snmp_community`` or, if that is unset,
+    ``Settings.snmp_default_community`` (see that field's own docstring).
+    Neither being set is a real, honest "cannot poll this router",
+    counted as ``skipped`` -- never a guessed community string like the
+    well-known "public"/"private" defaults some devices ship with.
+    ``snmp_version``/``snmp_port`` resolve the identical way against
+    ``Settings.snmp_default_version``/``snmp_default_port``.
+
+    ## Per-router failure isolation
+
+    Mirrors ``run_router_health_poll_sweep``'s identical per-router
+    isolation contract exactly: one router's own SNMP timeout/connection
+    failure (:class:`~wyfy_device_gateway.snmp_poller.SnmpConnectionError`)
+    or device-level SNMP error
+    (:class:`~wyfy_device_gateway.snmp_poller.SnmpDeviceError`) is
+    recorded honestly via ``record_failed_health_check`` and never aborts
+    the sweep for the rest of the fleet. A successful poll records a full
+    ``RouterHealthSnapshot`` via ``record_health_snapshot`` -- tagged
+    ``metrics_source="snmp"`` and carrying real, current per-interface
+    traffic counters (``interface_traffic_counters``) the RouterOS-API
+    path's own ``record_health_snapshot`` calls never populate -- composing
+    onto the exact same table ``run_router_health_poll_sweep`` already
+    writes to, never a second, disconnected metrics table (see
+    ``router_provisioning.models.RouterHealthSnapshot``'s own updated
+    docstring).
+
+    Unlike the RouterOS-API sweep, a successful SNMP poll never calls
+    ``RouterService.heartbeat`` -- SNMP reachability is a genuinely
+    different liveness signal from "the RouterOS management API answered",
+    and conflating the two would let a router with a working SNMP agent
+    but a genuinely down RouterOS API (or vice versa) report a false
+    liveness/health status via the wrong channel.
+
+    ``routers``, when passed explicitly, is polled instead of
+    ``repository.list_routers_for_snmp_poll()``'s own full, platform-wide
+    result -- purely a test-injection seam, mirroring
+    ``run_router_health_poll_sweep``'s identical parameter."""
+    if routers is None:
+        routers = await repository.list_routers_for_snmp_poll()
+    settings = get_settings()
+    poller = snmp_poller or SnmpPoller()
+    checked = 0
+    unreachable = 0
+    skipped = 0
+    errors = 0
+    for router in routers:
+        try:
+            host = router.management_ip_address or router.public_ip_address
+            community = (
+                router_lookup.get_decrypted_snmp_community(router)
+                or settings.snmp_default_community
+                or None
+            )
+            if not host or not community:
+                skipped += 1
+                continue
+            credentials = SnmpCredentials(
+                host=host,
+                community=community,
+                port=router.snmp_port or settings.snmp_default_port,
+                version=router.snmp_version or settings.snmp_default_version,
+                timeout_seconds=settings.snmp_poll_timeout_seconds,
+            )
+            try:
+                metrics = await poller.get_device_metrics(credentials)
+            except (SnmpConnectionError, SnmpDeviceError) as exc:
+                await router_provisioning.record_failed_health_check(
+                    router_id=router.id,
+                    requesting_organization_id=router.organization_id,
+                    detail=str(exc),
+                    metrics_source="snmp",
+                )
+                unreachable += 1
+                logger.warning(
+                    "router_snmp_metrics_poll_sweep_router_unreachable",
+                    extra={"router_id": str(router.id), "detail": str(exc)},
+                )
+                continue
+
+            interface_counters = [
+                {
+                    "if_index": iface.if_index,
+                    "if_name": iface.if_name,
+                    "up": iface.if_oper_status_up,
+                    "in_octets": iface.in_octets,
+                    "out_octets": iface.out_octets,
+                }
+                for iface in metrics.interfaces
+            ] or None
+            await router_provisioning.record_health_snapshot(
+                router_id=router.id,
+                requesting_organization_id=router.organization_id,
+                cpu_usage_percent=metrics.cpu_load_percent,
+                memory_usage_percent=metrics.memory_usage_percent,
+                uptime_seconds=metrics.uptime_seconds,
+                interface_traffic_counters=interface_counters,
+                metrics_source="snmp",
+                call_heartbeat=False,
+            )
+            checked += 1
+        except Exception as exc:  # noqa: BLE001 -- per-router isolation, see docstring
+            errors += 1
+            logger.warning(
+                "router_snmp_metrics_poll_sweep_router_failed",
+                extra={"router_id": str(router.id), "error": str(exc)},
+            )
+    return SnmpMetricsPollSweepSummary(
+        checked=checked, unreachable=unreachable, skipped=skipped, errors=errors
+    )
+
+
 def _validate_job_transition(
     *, current: ProvisionJobStatus, target: ProvisionJobStatus
 ) -> None:
@@ -1454,5 +1629,7 @@ __all__ = [
     "TimelineEntry",
     "ConfigurationPreview",
     "HealthPollSweepSummary",
+    "SnmpMetricsPollSweepSummary",
     "run_router_health_poll_sweep",
+    "run_router_snmp_metrics_poll_sweep",
 ]

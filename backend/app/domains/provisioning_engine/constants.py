@@ -337,6 +337,45 @@ ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY = (
 # can never wedge the sweep off indefinitely.
 ROUTER_HEALTH_POLL_SWEEP_LOCK_TTL_SECONDS = 300
 
+# ============================================================================
+# Router SNMP metrics poll sweep -- pull-based, real SNMP UDP requests (see
+# vendor/wyfy-device-gateway/wyfy_device_gateway/snmp_poller.py), a second,
+# genuinely independent real-device-I/O path alongside
+# ``TASK_RUN_ROUTER_HEALTH_POLL_SWEEP`` above (RouterOS-API-based). See
+# service.run_router_snmp_metrics_poll_sweep's own docstring for the full
+# "why both sweeps exist" write-up.
+#
+# Deliberately a single, sequential, un-fanned-out task -- mirrors
+# ``app.domains.isp.constants.TASK_RUN_ISP_HEALTH_CHECK_SWEEP``'s own
+# "single sequential sweep" shape (that domain's own constants module
+# explicitly flags this as the accepted, not-yet-hit scale limit for a
+# real device-I/O sweep), not
+# ``TASK_RUN_ROUTER_HEALTH_POLL_SWEEP``/``TASK_POLL_SINGLE_ROUTER_HEALTH``'s
+# coordinator+fan-out shape. A real, deliberate choice: SNMP is opt-in per
+# router (``Router.snmp_enabled``) and, being UDP-based, each request/reply
+# round trip is genuinely lighter-weight than a full RouterOS API TCP
+# session -- today's real adoption (a platform-wide handful of
+# organizations, per ``ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS``'s own
+# documented current scale) is nowhere near the point a sequential sweep's
+# own wall-clock runtime risks exceeding this interval. Whoever revisits
+# this once real SNMP-enabled fleet scale changes that calculus should
+# adopt the identical coordinator+fan-out pattern
+# ``TASK_RUN_ROUTER_HEALTH_POLL_SWEEP`` already establishes, not reinvent a
+# third shape.
+TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP = (
+    "app.domains.provisioning_engine.tasks.run_router_snmp_metrics_poll_sweep"
+)
+
+# 5 minutes -- between the RouterOS-API sweep's 10-minute cadence
+# (ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS, a real device-I/O-bound
+# TCP session per router) and the ISP link sweep's 30-second cadence (a
+# single fast /tool/ping); SNMP's own per-request cost sits in between --
+# lighter than a full RouterOS API session, but this sweep still issues
+# several real sequential SNMP round trips per router (system/CPU/memory/
+# interface-table polls -- see SnmpPoller.get_device_metrics's own
+# docstring), so it is not pushed as low as the ISP sweep's own cadence.
+ROUTER_SNMP_METRICS_POLL_SWEEP_INTERVAL_SECONDS = 300.0
+
 __all__ = [
     "ProvisionJobStatus",
     "PROVISION_JOB_STATUS_TRANSITIONS",
@@ -360,4 +399,6 @@ __all__ = [
     "ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS",
     "ROUTER_HEALTH_POLL_SWEEP_LOCK_REDIS_KEY",
     "ROUTER_HEALTH_POLL_SWEEP_LOCK_TTL_SECONDS",
+    "TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP",
+    "ROUTER_SNMP_METRICS_POLL_SWEEP_INTERVAL_SECONDS",
 ]
