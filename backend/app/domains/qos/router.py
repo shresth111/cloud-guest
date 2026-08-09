@@ -1,10 +1,10 @@
 """FastAPI routes for the QoS & VOIP Priority domain: per-router
-traffic-classification rule CRUD.
+traffic-classification rule CRUD, plus a real device-push action.
 
 Responses use the project's standard envelope (``ApiResponse``/
 ``build_response``), matching every other domain's router. Every endpoint
 is gated by RBAC's existing ``RequirePermission`` dependency against a
-brand-new ``qos.*`` permission key (see ``app.domains.rbac.seed`` --
+``qos.*`` permission key (see ``app.domains.rbac.seed`` --
 ``PermissionModule.QOS``) and resolves ``CurrentOrganization``
 (``X-Organization-Id``), passed through to ``QosService`` as
 ``requesting_organization_id`` -- the same tenant-scoping posture every
@@ -13,7 +13,23 @@ other domain's router already enforces.
 **Route ordering matters.** ``GET /qos-rules`` is registered before
 ``GET /qos-rules/{rule_id}`` so Starlette's first-match-wins routing
 resolves the literal path first, mirroring the same discipline
-``app.domains.hotspot.router`` already follows.
+``app.domains.hotspot.router`` already follows. ``POST /{rule_id}/push``
+needs no such ordering care -- it is a distinct HTTP method/path shape
+from every other route here, so registration order does not matter for
+it, but it is placed right after ``POST ""`` (create) so the two
+mutation-then-realize actions read together.
+
+**``POST /{rule_id}/push`` (new)** -- the real device-push endpoint this
+domain gained to close the "marks traffic, never creates the paired
+queue" gap (``docs/qos/FLOW.md`` Section 2,
+``app.domains.qos.service.QosService.push_rule_to_device``'s own
+docstring). Gated by the new ``qos.execute`` permission action (see
+``app.domains.rbac.seed``'s ``PermissionModule.QOS`` entry), not
+``qos.update`` -- this is real device I/O, not a field edit. This is the
+real endpoint a future "Call Priority" frontend push affordance
+(``cloudguest-foundation``'s ``QosManagement.tsx``, currently DB-writes
+only with no push UI at all) should call; wiring that frontend affordance
+is explicitly out of scope for this backend-only fix.
 """
 
 from __future__ import annotations
@@ -73,6 +89,10 @@ def _rule_response(rule: QosTrafficRule) -> QosTrafficRuleResponse:
         dscp_value=rule.dscp_value,
         priority=rule.priority,
         is_enabled=rule.is_enabled,
+        device_queue_id=rule.device_queue_id,
+        device_push_status=rule.device_push_status,
+        device_push_error=rule.device_push_error,
+        device_pushed_at=rule.device_pushed_at,
         created_at=rule.created_at,
     )
 
@@ -105,6 +125,42 @@ async def create_qos_rule(
     return build_response(
         success=True,
         message="QoS traffic rule created",
+        data=_rule_response(rule).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/{rule_id}/push",
+    response_model=ApiResponse[QosTrafficRuleResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("qos.execute"))],
+)
+async def push_qos_rule(
+    request: Request,
+    rule_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: QosService = Depends(get_qos_service),
+):
+    """Real device push: creates/updates this rule's own paired
+    ``/queue tree`` entry on its router, referencing the exact packet-mark
+    identifier ``app.domains.network_config.renderers
+    .render_qos_traffic_rule`` already marks matching traffic with. The
+    real endpoint the customer-facing "Call Priority" feature's own future
+    push affordance should call -- see ``service.py::push_rule_to_device``'s
+    own docstring for the full create-vs-update/failure-handling write-up.
+    Gated by ``qos.execute`` (new -- see ``app.domains.rbac.seed``), not
+    ``qos.update``: this is a real device-facing action, not a plain field
+    edit, mirroring ``network_config.execute``'s identical distinction."""
+    rule = await service.push_rule_to_device(
+        rule_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="QoS traffic rule priority queue pushed to device",
         data=_rule_response(rule).model_dump(),
         request_id=_request_id(request),
     )

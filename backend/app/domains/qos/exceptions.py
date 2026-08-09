@@ -23,6 +23,11 @@ __all__ = [
     "InvalidPortRangeError",
     "AmbiguousTrafficMatchError",
     "NoTrafficMatchError",
+    "QosTrafficRuleNotEnabledError",
+    "QosMissingCredentialsError",
+    "QosDeviceConnectionError",
+    "QosDeviceOperationError",
+    "UnsupportedQosVendorError",
 ]
 
 
@@ -110,4 +115,68 @@ class NoTrafficMatchError(QosError):
         super().__init__(
             "A QoS traffic rule must match by port range or DSCP value",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
+class QosTrafficRuleNotEnabledError(QosError):
+    """Raised by ``push_rule_to_device`` when asked to push a rule whose
+    ``is_enabled`` is ``False`` -- there is nothing correct to push: the
+    mangle mark this rule's identifier would reference is never rendered
+    by ``network_config`` for a disabled rule (see
+    ``NetworkConfigService._gather_enabled_rows``'s own ``is_enabled``
+    filter), so pushing a paired ``/queue tree`` entry anyway would create
+    a queue that references a mark nothing on the device ever sets."""
+
+    def __init__(self, rule_id: uuid.UUID) -> None:
+        super().__init__(
+            f"QoS traffic rule '{rule_id}' is disabled -- enable it before "
+            "pushing its priority queue to the device",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class QosMissingCredentialsError(QosError):
+    """Raised when a rule's own router has no management IP/username/
+    decrypted secret stored -- mirrors ``app.domains.queue_management
+    .exceptions.QueueMissingCredentialsError`` exactly."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router '{router_id}' is missing device connection credentials "
+            "(management IP, API username, or API secret)",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class QosDeviceConnectionError(QosError):
+    """A real connection attempt (RouterOS API) to a device failed -- see
+    ``device_adapters.py``'s own module docstring for the "real client
+    code, untested end-to-end here" scope note."""
+
+    def __init__(self, host: str, detail: str) -> None:
+        super().__init__(
+            f"Could not connect to device at '{host}': {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class QosDeviceOperationError(QosError):
+    """A device priority-queue operation (create/set-priority/remove)
+    failed after a connection was otherwise established."""
+
+    def __init__(self, operation: str, detail: str) -> None:
+        super().__init__(
+            f"QoS priority queue operation '{operation}' failed: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class UnsupportedQosVendorError(QosError):
+    """Raised by ``device_adapters.get_qos_queue_adapter`` when no real
+    adapter implementation is registered for a router's own ``vendor``."""
+
+    def __init__(self, vendor: str) -> None:
+        super().__init__(
+            f"No QoS priority queue adapter registered for vendor '{vendor}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
         )

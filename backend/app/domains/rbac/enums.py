@@ -754,12 +754,13 @@ class AuditAction(StrEnum):
     # QoS & VOIP Priority domain events -- written through this same
     # table by ``app.domains.qos.service.QosService`` via the same narrow
     # ``AuditLogWriter`` protocol shape every other domain's service uses.
-    # A pure rules/inventory domain (no live device push in this pass --
-    # see that module's own docstring), so create/update/delete are its
-    # only lifecycle events.
+    # QOS_TRAFFIC_RULE_PUSHED is the real device-push event (a paired
+    # ``/queue tree`` entry actually applied to the router) -- see
+    # ``service.py::push_rule_to_device``'s own docstring.
     QOS_TRAFFIC_RULE_CREATED = "qos_traffic_rule_created"
     QOS_TRAFFIC_RULE_UPDATED = "qos_traffic_rule_updated"
     QOS_TRAFFIC_RULE_DELETED = "qos_traffic_rule_deleted"
+    QOS_TRAFFIC_RULE_PUSHED = "qos_traffic_rule_pushed"
 
     # Network Diagnostics domain events -- written through this same
     # table by ``app.domains.network_diagnostics.service

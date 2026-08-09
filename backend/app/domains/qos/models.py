@@ -1,12 +1,27 @@
 """SQLAlchemy ORM model for the QoS & VOIP Priority domain.
 
-One table -- ``QosTrafficRule``. A row's own state *is* its current
-state; there is no live device push in this pass to produce a history of
--- realized onto a device later by ``app.domains.network_config``'s own
-provisioning pass, not this domain (mirrors ``app.domains.dhcp``/
+One table -- ``QosTrafficRule``. A row's own ``is_enabled``/match/priority
+state *is* its current desired state, realized onto a device by two
+independent, composed real device pushes (mirrors ``app.domains.dhcp``/
 ``app.domains.vlan``/``app.domains.port_forwarding``/``app.domains
 .hotspot``'s own identical "config resource, realized onto a device
-later" precedent).
+later" precedent for the DB-row-is-desired-state half of that story):
+
+1. The mangle *mark* (``/ip firewall mangle ... action=mark-packet``),
+   rendered by ``app.domains.network_config.renderers
+   .render_qos_traffic_rule`` and pushed through that domain's own real
+   ``ConfigVersion``/``ProvisioningJob`` pipeline
+   (``POST /network-config/routers/{router_id}/push``).
+2. The paired ``/queue tree`` entry that actually makes the mark do
+   anything, pushed directly by this domain's own
+   ``device_adapters.py``/``service.QosService.push_rule_to_device`` (see
+   that method's own docstring). This row's own ``device_queue_id``/
+   ``device_packet_mark``/``device_push_status``/``device_push_error``/
+   ``device_pushed_at`` columns are that second push's real, current
+   device state -- mirrors ``app.domains.queue_management.models
+   .QueueAssignment``'s own ``device_queue_id``/``error_message``/
+   ``applied_at`` columns exactly, just narrower (this domain never
+   creates a ``/queue simple`` entry or a ``QueueProfile``).
 
 Extends ``app.database.base.BaseModel`` (UUID PK, timestamps, soft-delete,
 audit, version columns) for the same reason every other domain does.
@@ -15,33 +30,34 @@ audit, version columns) for the same reason every other domain does.
 
 ``app.domains.queue_management`` already *is* the real, complete
 bandwidth/priority engine -- rate limits, RouterOS priority 1-8, and a
-real device push (``/queue simple``/``/queue tree``). What is missing
-anywhere in this codebase is traffic **classification**: matching
-packets by protocol/port (e.g. SIP signaling on 5060, RTP media on a
-port range) or DSCP value. ``QosTrafficRule`` models exactly that gap --
-a match (port-range-or-DSCP) mapped to a ``priority`` -- and reuses
+real device push (``/queue simple``/``/queue tree``). What this domain
+adds is traffic **classification**: matching packets by protocol/port
+(e.g. SIP signaling on 5060, RTP media on a port range) or DSCP value.
+``QosTrafficRule`` models exactly that -- a match (port-range-or-DSCP)
+mapped to a ``priority`` -- and reuses
 ``app.domains.queue_management.constants.MIN_QUEUE_PRIORITY``/
 ``MAX_QUEUE_PRIORITY`` as this column's own valid range (the same real
 RouterOS 1-8 constraint, not a second, independently-chosen bound).
 
-This domain never creates a ``QueueProfile``/queues itself. See
-``docs/qos/FLOW.md`` for why pairing the packet-mark this domain's own
-``app.domains.network_config`` rendering produces with an actual
-``/queue tree`` entry is a real, separate, currently-manual device-side
-step, not automated in this pass.
+This domain still never creates a ``QueueProfile`` or a ``/queue
+simple`` entry -- see ``docs/qos/FLOW.md`` Section 2 for the full
+history of the packet-mark/queue-tree pairing gap this module's
+``device_queue_id`` et al. now close, and why the fix lives here (a
+direct push) rather than inside ``network_config``'s own renderer.
 """
 
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-from .constants import DEFAULT_PRIORITY
+from .constants import DEFAULT_PRIORITY, QosDevicePushStatus
 
 
 class QosTrafficRule(BaseModel):
@@ -81,6 +97,25 @@ class QosTrafficRule(BaseModel):
         Integer, default=DEFAULT_PRIORITY, nullable=False
     )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # -- Real device push state for the paired /queue tree entry -- see
+    # module docstring's numbered list above. Independent of the mangle
+    # mark's own push state, which network_config's ConfigVersion already
+    # tracks separately.
+    device_queue_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The qos_packet_mark_identifier(self) value in effect when
+    # device_queue_id was created -- lets a later push detect a changed
+    # identifier (e.g. this rule was renamed) and remove-then-recreate
+    # rather than leaving a queue that references a stale mark. See
+    # service.py::push_rule_to_device.
+    device_packet_mark: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    device_push_status: Mapped[str] = mapped_column(
+        String(20), default=QosDevicePushStatus.PENDING.value, nullable=False
+    )
+    device_push_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    device_pushed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_qos_traffic_rules_router_id", "router_id"),

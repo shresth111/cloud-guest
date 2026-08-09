@@ -40,8 +40,21 @@ class QosTrafficRuleDeleted:
     occurred_at: datetime = field(default_factory=_now)
 
 
+@dataclass(frozen=True, slots=True)
+class QosTrafficRulePushed:
+    """A real ``/queue tree`` device push for this rule's own packet mark
+    succeeded -- see ``service.py::push_rule_to_device``'s own
+    docstring."""
+
+    id: uuid.UUID
+    router_id: uuid.UUID
+    device_queue_id: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "QosTrafficRuleCreated",
     "QosTrafficRuleUpdated",
     "QosTrafficRuleDeleted",
+    "QosTrafficRulePushed",
 ]

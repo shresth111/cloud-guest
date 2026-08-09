@@ -60,6 +60,14 @@ class QosTrafficRuleResponse(BaseModel):
     dscp_value: int | None
     priority: int
     is_enabled: bool
+    # Real device-push state for the paired /queue tree entry -- see
+    # app.domains.qos.service.QosService.push_rule_to_device's own
+    # docstring. Independent of the mangle mark's own push state, which
+    # app.domains.network_config's ConfigVersion tracks separately.
+    device_queue_id: str | None
+    device_push_status: str
+    device_push_error: str | None
+    device_pushed_at: datetime | None
     created_at: datetime
 
 

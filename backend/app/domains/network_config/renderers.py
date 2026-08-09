@@ -162,17 +162,31 @@ this function's job" split every other renderer here already follows.
 "omit the parameter, don't fabricate a value RouterOS wouldn't recognize"
 convention ``PortForwardingProtocol.BOTH`` already establishes.
 
-## QoS: marks traffic, never creates the paired queue
+## QoS: marks traffic; the paired queue is now real too, just not rendered here
 
-Mirrors ``app.domains.qos.models.QosTrafficRule``'s own module
-docstring: only RouterOS's ``/ip firewall mangle`` packet-marking half of
-real QoS is rendered here -- a real ``new-packet-mark`` derived from the
-rule's own identifier, matched either by protocol/port range or by DSCP
-value (never both, enforced at that domain's own service layer).
-Pairing this mark with an actual ``/queue tree`` entry (the half that
-would make the mark do anything) is real, separate device-side work,
-deliberately left undone and documented rather than fabricated -- see
-``docs/qos/FLOW.md`` §2.
+Only RouterOS's ``/ip firewall mangle`` packet-marking half of real QoS is
+rendered by this module -- a real ``new-packet-mark`` derived from the
+rule's own identifier (``app.domains.qos.identifiers
+.qos_packet_mark_identifier`` -- the single source of truth this renderer
+and the paired push below both use, see that function's own docstring for
+why it lives in the ``qos`` domain, not here), matched either by
+protocol/port range or by DSCP value (never both, enforced at that
+domain's own service layer).
+
+**Historical note, now resolved**: this section used to say pairing this
+mark with an actual ``/queue tree`` entry was left undone. That gap is now
+closed, but deliberately *not* in this renderer -- ``app.domains.qos.
+device_adapters``/``service.push_rule_to_device`` create and maintain that
+paired ``/queue tree`` entry via a direct device push (mirroring
+``app.domains.queue_management``'s own device-push pattern), composing the
+identical shared identifier this function emits into ``new-packet-mark=``.
+This module's own concern stays exactly what it always was -- full-
+desired-state script rendering for the categories with no urgency around
+push latency -- while the queue-tree pairing, which only matters once a
+rule is meant to actually prioritize live traffic, is pushed directly and
+independently. See ``docs/qos/FLOW.md`` §2 for the full resolution
+write-up and ``app.domains.qos.service.QosService.push_rule_to_device``'s
+own docstring for the device-push mechanics.
 
 ## WireGuard: ``/32`` + ``persistent-keepalive=25s`` are not stylistic
 choices, they are the two ways this exact setup silently breaks
@@ -450,6 +464,7 @@ from app.domains.hotspot.models import HotspotProfile
 from app.domains.mac_authorization.models import MacAuthorizationEntry
 from app.domains.port_forwarding.constants import PortForwardingProtocol
 from app.domains.port_forwarding.models import PortForwardingRule
+from app.domains.qos.identifiers import qos_packet_mark_identifier
 from app.domains.qos.models import QosTrafficRule
 from app.domains.router.crypto import decrypt_secret
 from app.domains.router_agent.constants import AGENT_CREDENTIAL_HEADER
@@ -521,9 +536,16 @@ def _hotspot_identifier(profile: HotspotProfile) -> str:
 
 
 def _qos_identifier(rule: QosTrafficRule) -> str:
-    """``QosTrafficRule.name`` carries no uniqueness constraint -- same
-    reasoning as :func:`_dhcp_identifier`."""
-    return f"{_sanitize_identifier(rule.name)}-{str(rule.id)[:8]}"
+    """Thin alias over ``app.domains.qos.identifiers
+    .qos_packet_mark_identifier`` -- kept as a local name so every other
+    renderer's own ``_*_identifier`` calling convention here doesn't need
+    to change. The real implementation now lives in the ``qos`` domain
+    itself (not here), since ``app.domains.qos.device_adapters`` (the
+    paired ``/queue tree`` push this fix adds) must derive the exact same
+    string independently and cannot import it back out of this module --
+    see that function's own docstring for the full "why here, not there"
+    write-up, including the import-cycle this avoids."""
+    return qos_packet_mark_identifier(rule)
 
 
 def _smallest_enclosing_network(

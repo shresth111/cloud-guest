@@ -357,12 +357,23 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # app.domains.router_provisioning's own ConfigVersion, mirroring
     # DEVICE_SYNC's identical "no CRUD resource of its own" shape.
     PermissionModule.NETWORK_CONFIG: (_A.READ, _A.EXECUTE, _A.MANAGE),
-    # QoS & VOIP Priority: a plain CRUD rules/inventory domain -- no
-    # EXECUTE, since this domain has no device-facing action of its own
-    # (real device push is composed via app.domains.network_config's own
-    # EXECUTE-gated push endpoint instead), mirroring DHCP/VLAN's
-    # identical shape.
-    PermissionModule.QOS: (_A.CREATE, _A.READ, _A.UPDATE, _A.DELETE, _A.MANAGE),
+    # QoS & VOIP Priority: CRUD rules/inventory plus EXECUTE -- the mangle
+    # *mark* half of a rule is still realized via
+    # app.domains.network_config's own EXECUTE-gated push endpoint (no
+    # change there), but this domain now also owns a real, direct device
+    # push of its own (the paired /queue tree entry that actually makes a
+    # mark do anything -- see service.py::push_rule_to_device's own
+    # docstring), so it needs its own EXECUTE action to gate that endpoint,
+    # mirroring CONNECTED_DEVICES/NETWORK_DIAGNOSTICS's identical
+    # "CRUD/read-only base plus a real device-facing EXECUTE" shape.
+    PermissionModule.QOS: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.EXECUTE,
+        _A.MANAGE,
+    ),
     # Network Diagnostics: read-only history plus EXECUTE (run a real
     # ping/traceroute) -- no CREATE/UPDATE/DELETE, since DiagnosticRun
     # rows are immutable and only ever created by running a diagnostic
