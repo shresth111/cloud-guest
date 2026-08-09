@@ -27,9 +27,16 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.core.logging import get_logger
 from app.domains.auth.models import AuthUser
 from app.domains.billing.constants import PlanFeatureKey
 from app.domains.billing.dependencies import RequireFeature
+from app.domains.monitoring.constants import (
+    ALERT_TARGET_MONITORED_HARDWARE,
+    AlertTriggerType,
+)
+from app.domains.monitoring.dependencies import get_alert_service
+from app.domains.monitoring.service import AlertService
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -153,6 +160,7 @@ async def create_organization(
     payload: OrganizationCreateRequest,
     user: AuthUser = Depends(CurrentUser),
     organization_service: OrganizationService = Depends(get_organization_service),
+    alert_service: AlertService = Depends(get_alert_service),
 ):
     organization = await organization_service.create_organization(
         actor_user_id=uuid.UUID(user.id),
@@ -169,6 +177,37 @@ async def create_organization(
         settings=payload.settings,
         subscription_tier=payload.subscription_tier,
     )
+    # Every new organization gets a real, working "hardware down" alert rule
+    # from day one -- previously this had to be created by hand per org
+    # (confirmed live: neither of the two organizations that existed before
+    # this had one until created manually), so a real customer's access
+    # points/printers/cameras going down produced no notification at all
+    # unless someone remembered this separate step. Deliberately kept out
+    # of OrganizationService itself (a foundational domain with no business
+    # knowing about alerting) -- composed here at the router/orchestration
+    # layer instead, the same layer that already composes billing's
+    # RequireFeature for this exact endpoint. Non-fatal: a customer's
+    # organization successfully existing matters more than this default
+    # rule existing, so a failure here is logged, never raised -- the org
+    # creation response is unaffected either way.
+    try:
+        await alert_service.create_alert_rule(
+            name="Network hardware down",
+            description=(
+                "Fires when a registered access point, printer, camera, or "
+                "other monitored device goes from up to down."
+            ),
+            organization_id=organization.id,
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_MONITORED_HARDWARE,
+            condition_config={"expected_status": "down"},
+            severity="warning",
+        )
+    except Exception:
+        get_logger(__name__).exception(
+            "default_hardware_down_alert_rule_creation_failed",
+            extra={"organization_id": str(organization.id)},
+        )
     return build_response(
         success=True,
         message="Organization created",
