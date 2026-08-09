@@ -271,6 +271,24 @@ ALERT_TARGET_ROUTER = "router"
 # unpaginated" method this evaluator needs).
 ALERT_TARGET_ISP_LINK = "isp_link"
 
+# Sentinel ``AlertRule.target_component`` value for a ``HEALTH_STATUS_CHANGE``
+# rule that watches every ``app.domains.monitored_hardware`` device in scope
+# (access points, printers, cameras -- anything a venue registers beyond the
+# router itself) for its derived ``down`` status. Unlike ``ALERT_TARGET_ROUTER``/
+# ``ALERT_TARGET_ISP_LINK``, there is no persisted ``health_status`` column to
+# read directly here -- ``MonitoredHardware``'s status (``up``/``down``/
+# ``unknown``) is honestly derived at read time from a live join against
+# ``connected_devices`` (see that domain's own module docstring), never
+# fabricated or cached. ``service.AlertService._evaluate_health_status_rule``'s
+# ``ALERT_TARGET_MONITORED_HARDWARE`` branch composes with
+# ``MonitoredHardwareService.list_all_devices_with_status`` (a real service
+# call, not a raw table read, because deriving status requires that domain's
+# own join logic) rather than duplicating the derivation here. ``unknown`` is
+# deliberately never alertable (``expected_status`` of ``"down"`` only) --
+# "never observed yet" is an honest gap in data, not a real outage, the same
+# distinction that domain's own module docstring already draws.
+ALERT_TARGET_MONITORED_HARDWARE = "monitored_hardware"
+
 
 class ThresholdMetric(StrEnum):
     """The exact, already-persisted
@@ -545,6 +563,7 @@ __all__ = [
     "AlertTriggerType",
     "ALERT_TARGET_ROUTER",
     "ALERT_TARGET_ISP_LINK",
+    "ALERT_TARGET_MONITORED_HARDWARE",
     "ThresholdMetric",
     "ThresholdOperator",
     "AlertSeverity",

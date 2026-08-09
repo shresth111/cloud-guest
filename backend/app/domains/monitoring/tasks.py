@@ -70,6 +70,18 @@ from app.domains.otp.service import (
     get_configured_sms_provider,
 )
 
+from app.domains.location.repository import (
+    LocationCodeCounterRepository,
+    LocationRepository,
+)
+from app.domains.location.service import LocationService
+from app.domains.monitored_hardware.repository import MonitoredHardwareRepository
+from app.domains.monitored_hardware.service import MonitoredHardwareService
+from app.domains.organization.repository import OrganizationRepository
+from app.domains.organization.service import OrganizationService
+from app.domains.router.repository import RouterRepository
+from app.domains.router.service import RouterService
+
 from .constants import TASK_RUN_ALERT_RULE_EVALUATION_SWEEP
 from .repository import MonitoringRepository
 from .service import AlertEvaluationResult, AlertService, NotificationService
@@ -89,10 +101,31 @@ async def _run_alert_rule_evaluation_sweep_async() -> AlertEvaluationResult:
                 sms_provider=get_configured_sms_provider(settings),
                 email_provider=get_configured_email_provider(settings),
             )
+            # Real composition chain for ALERT_TARGET_MONITORED_HARDWARE
+            # evaluation (access points/printers/cameras down), same
+            # "construct real services here, not fake shortcuts" approach
+            # this task already takes for NotificationService above.
+            # location_lookup/router_lookup are never actually exercised on
+            # the read-only list_all_devices_with_status path this sweep
+            # calls, but MonitoredHardwareService's own constructor requires
+            # real ones, not stand-ins.
+            org_service = OrganizationService(OrganizationRepository(session))
+            location_service = LocationService(
+                LocationRepository(session),
+                org_service,
+                location_code_counter=LocationCodeCounterRepository(session),
+            )
+            router_service = RouterService(
+                RouterRepository(session), location_service, org_service
+            )
+            monitored_hardware_service = MonitoredHardwareService(
+                MonitoredHardwareRepository(session), location_service, router_service
+            )
             alert_service = AlertService(
                 repository,
                 notification_service=notification_service,
                 redis_client=redis,
+                monitored_hardware_service=monitored_hardware_service,
             )
             try:
                 result = await alert_service.evaluate_alert_rules()

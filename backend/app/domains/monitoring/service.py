@@ -86,6 +86,8 @@ from app.domains.otp.service import (
     LoggingSmsProvider,
     SmsProviderProtocol,
 )
+from app.domains.monitored_hardware.constants import HardwareStatus
+from app.domains.monitored_hardware.service import MonitoredHardwareService
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router_provisioning.constants import EnrollmentStatus
@@ -94,6 +96,7 @@ from app.domains.router_provisioning.models import RouterEvent
 from .constants import (
     ALERT_EVENT_LOOKBACK_MINUTES,
     ALERT_TARGET_ISP_LINK,
+    ALERT_TARGET_MONITORED_HARDWARE,
     ALERT_TARGET_ROUTER,
     AUDIT_LOG_SOURCE_DOMAIN,
     DEFAULT_EVENT_TIMELINE_LIMIT,
@@ -1169,6 +1172,7 @@ class AlertService:
         *,
         notification_service: NotificationService | None = None,
         redis_client: Redis | None = None,
+        monitored_hardware_service: MonitoredHardwareService | None = None,
     ) -> None:
         self.repository = repository
         self.notification_service = notification_service
@@ -1178,6 +1182,12 @@ class AlertService:
         # ``AlertService`` without a Redis client already behaves: no
         # publish attempt, no behavior change.
         self.redis_client = redis_client
+        # Same "optional, additive" shape as redis_client above -- a rule
+        # with ALERT_TARGET_MONITORED_HARDWARE simply evaluates to "no
+        # devices" (never an error) for any existing caller/test that
+        # constructs AlertService without this, see
+        # _evaluate_health_status_rule's own branch.
+        self.monitored_hardware_service = monitored_hardware_service
 
     # ------------------------------------------------------------------
     # AlertRule CRUD
@@ -1450,6 +1460,45 @@ class AlertService:
                             resolved_message=_health_status_message(
                                 link.provider_name, link.health_status
                             ),
+                        )
+                    )
+            return triggered, resolved
+
+        if rule.target_component == ALERT_TARGET_MONITORED_HARDWARE:
+            if self.monitored_hardware_service is None or rule.organization_id is None:
+                return triggered, resolved
+            devices = await self.monitored_hardware_service.list_all_devices_with_status(
+                organization_id=rule.organization_id
+            )
+            for item in devices:
+                # HardwareStatus.UNKNOWN ("never observed yet") is
+                # deliberately never alertable -- only a real DOWN
+                # transition triggers, matching this constant's own
+                # docstring. expected_status on the rule is always "down"
+                # in practice, but comparing to the enum's own value (not a
+                # hardcoded string) keeps this consistent with how
+                # ALERT_TARGET_ROUTER/ALERT_TARGET_ISP_LINK compare below.
+                condition_met = item.status == HardwareStatus.DOWN and expected_status == HardwareStatus.DOWN.value
+                existing = await self.repository.find_active_alert(
+                    rule_id=rule.id,
+                    organization_id=item.device.organization_id,
+                    location_id=item.device.location_id,
+                    router_id=item.device.router_id,
+                )
+                if condition_met and existing is None:
+                    alert = await self._create_alert(
+                        rule,
+                        organization_id=item.device.organization_id,
+                        location_id=item.device.location_id,
+                        router_id=item.device.router_id,
+                        message=_health_status_message(item.device.name, item.status.value),
+                    )
+                    triggered.append(alert)
+                elif not condition_met and existing is not None:
+                    resolved.append(
+                        await self._auto_resolve(
+                            existing,
+                            resolved_message=_health_status_message(item.device.name, item.status.value),
                         )
                     )
             return triggered, resolved

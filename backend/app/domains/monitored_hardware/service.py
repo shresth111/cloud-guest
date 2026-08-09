@@ -195,6 +195,28 @@ class MonitoredHardwareService:
         )
         return [await self.with_status(d) for d in devices], meta
 
+    async def list_all_devices_with_status(
+        self, *, organization_id: uuid.UUID
+    ) -> list[HardwareWithStatus]:
+        """Real, unpaginated "every device in this org, with its live
+        derived status" composition for ``app.domains.monitoring``'s
+        ``AlertService`` (its ``ALERT_TARGET_MONITORED_HARDWARE`` rule
+        evaluation, see that module's own docstring) -- the same
+        "read another domain's data for alert-rule evaluation" precedent
+        ``MonitoringRepository.list_routers``/``list_isp_links`` already
+        establish, done through this service (not a raw repository read)
+        because deriving status here genuinely requires this domain's own
+        ``with_status`` join logic, unlike ``Router``/``IspLink``'s already-
+        persisted ``health_status`` column. A large page size stands in for
+        real "no pagination" the same pragmatic way ``list_routers``/
+        ``list_isp_links`` skip pagination entirely -- an organization's
+        real hardware count is small enough that a single page comfortably
+        covers it; revisit if that assumption ever stops holding."""
+        devices, _ = await self.list_devices(
+            requesting_organization_id=organization_id, page=1, page_size=500
+        )
+        return devices
+
     async def delete_device(
         self,
         device_id: uuid.UUID,

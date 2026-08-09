@@ -19,6 +19,8 @@ from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.auth.dependencies import get_auth_repository
 from app.domains.auth.repository import AuthRepositoryProtocol
+from app.domains.monitored_hardware.dependencies import get_monitored_hardware_service
+from app.domains.monitored_hardware.service import MonitoredHardwareService
 from app.domains.otp.service import (
     get_configured_email_provider,
     get_configured_sms_provider,
@@ -89,9 +91,15 @@ def get_alert_service(
     repository: MonitoringRepositoryProtocol = Depends(get_monitoring_repository),
     notification_service: NotificationService = Depends(get_notification_service),
     redis_client: Redis = Depends(get_redis_client),
+    monitored_hardware_service: MonitoredHardwareService = Depends(
+        get_monitored_hardware_service
+    ),
 ) -> AlertService:
     return AlertService(
-        repository, notification_service=notification_service, redis_client=redis_client
+        repository,
+        notification_service=notification_service,
+        redis_client=redis_client,
+        monitored_hardware_service=monitored_hardware_service,
     )
 
 
