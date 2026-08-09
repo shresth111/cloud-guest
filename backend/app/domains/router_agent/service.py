@@ -66,6 +66,20 @@ supplies its own claimed identity facts in the request body before any
 from the *credential* itself, never from client-supplied input -- there is
 nothing for a caller to spoof that this dependency doesn't already derive
 server-side.
+
+**Netwatch: this module *is* the real device-initiated call-in surface
+Option A needed.** Real MikroTik RouterOS Netwatch integration
+(``app.domains.network_config.renderers.render_isp_netwatch_entry``) needs
+a real way for a router to tell this platform the instant its own
+Netwatch entry notices a change -- ``report_netwatch_event`` plus
+``router.py``'s new ``POST /agent/netwatch-event`` reuse this module's
+*existing* ``CurrentAgent``/``X-Agent-Credential`` surface for that,
+deliberately not a second, parallel device-credential scheme. See
+``app.domains.network_config.renderers``'s own "Netwatch" module-docstring
+section for the full design write-up, including the one real, honest gap
+this still carries (the credential embedded in a Netwatch script is only
+as fresh as the last time ``NetworkConfigService.push_isp_netwatch_config``
+rotated and pushed one).
 """
 
 from __future__ import annotations
@@ -94,6 +108,7 @@ from .events import (
     AgentActionsClaimed,
     AgentCredentialIssued,
     AgentHeartbeatReceived,
+    AgentNetwatchEventReceived,
     AgentStatusReported,
 )
 from .exceptions import NoConfigAssignedError
@@ -441,6 +456,47 @@ class RouterAgentService:
         )
         logger.info("agent_action_completed", extra=_event_extra(event))
         return completed
+
+    # ========================================================================
+    # Netwatch (real MikroTik RouterOS Netwatch integration)
+    # ========================================================================
+
+    async def report_netwatch_event(
+        self,
+        *,
+        router_id: uuid.UUID,
+        isp_link_id: uuid.UUID,
+        status: str,
+        host: str | None,
+    ) -> None:
+        """Records that a real RouterOS Netwatch up/down callback landed
+        for ``isp_link_id`` -- called by ``router.py``'s
+        ``agent_netwatch_event`` endpoint *after* it has already advanced
+        the real ISP health-check pipeline
+        (``IspService.record_health_check_result``, composed directly at
+        the endpoint layer, mirroring ``agent_heartbeat``'s own
+        ``MonitoringService`` composition precedent immediately above this
+        module's ``heartbeat`` method). This method's own job is narrower
+        and purely additive: a real, queryable
+        ``app.domains.router_provisioning.models.RouterEvent`` row proving
+        the router-side Netwatch entry actually fired and called home --
+        the same "a genuine, if narrow, composition seam into another
+        domain's existing event log" posture ``issue_credential_for_router``/
+        ``report_status`` already establish for their own events."""
+        await self._record_event(
+            router_id,
+            RouterAgentEventType.NETWATCH_EVENT_RECEIVED,
+            message=f"Netwatch {status} event for host {host or 'unknown'}",
+            metadata={
+                "isp_link_id": str(isp_link_id),
+                "status": status,
+                "host": host,
+            },
+        )
+        event = AgentNetwatchEventReceived(
+            router_id=router_id, isp_link_id=isp_link_id, status=status
+        )
+        logger.info("agent_netwatch_event_received", extra=_event_extra(event))
 
     # ========================================================================
     # Internal helpers

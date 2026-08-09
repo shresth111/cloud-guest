@@ -58,10 +58,19 @@ class AgentActionCompleted:
     occurred_at: datetime = field(default_factory=_now)
 
 
+@dataclass(frozen=True, slots=True)
+class AgentNetwatchEventReceived:
+    router_id: uuid.UUID
+    isp_link_id: uuid.UUID
+    status: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "AgentCredentialIssued",
     "AgentHeartbeatReceived",
     "AgentStatusReported",
     "AgentActionsClaimed",
     "AgentActionCompleted",
+    "AgentNetwatchEventReceived",
 ]

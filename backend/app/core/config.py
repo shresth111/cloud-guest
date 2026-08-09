@@ -664,6 +664,25 @@ class Settings(BaseSettings):
             "deployment -- the default is a placeholder, not a real host."
         ),
     )
+    api_public_base_url: str = Field(
+        default="https://api.wyfyguest.com",
+        description=(
+            "This backend's own public origin, used to render every "
+            "RouterOS script that calls back to this platform over the "
+            "open internet -- app.domains.network_config.renderers"
+            ".render_bootstrap_script/render_agent_heartbeat_scheduler/"
+            "render_isp_netwatch_entry all take an api_base_url parameter "
+            "a real caller should source from here rather than a literal. "
+            "Must be a real https:// origin (RouterOS 7 verifies TLS "
+            "certificates by default -- see _require_https in that "
+            "module). Override via CLOUDGUEST_API_PUBLIC_BASE_URL in any "
+            "real deployment -- the default points at this platform's own "
+            "real, registered production domain (see app/main.py's CORS "
+            "allowlist), not a placeholder, but it still needs to resolve "
+            "to wherever this backend is actually reachable in a given "
+            "deployment."
+        ),
+    )
     platform_gst_state: str = Field(
         default="Maharashtra",
         description=(

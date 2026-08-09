@@ -14,7 +14,7 @@ request_id}`` contract, only the fact(s) it asked for.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,6 +33,8 @@ __all__ = [
     "AgentActionCompleteRequest",
     "AgentActionCompleteResponse",
     "AuthorizedMacsResponse",
+    "AgentNetwatchEventRequest",
+    "AgentNetwatchEventResponse",
 ]
 
 
@@ -158,3 +160,38 @@ class AuthorizedMacsResponse(BaseModel):
     already exist -- see that module) rather than duplicating the query."""
 
     mac_addresses: list[str] = Field(default_factory=list)
+
+
+# ============================================================================
+# Netwatch (real MikroTik RouterOS Netwatch integration)
+# ============================================================================
+
+
+class AgentNetwatchEventRequest(BaseModel):
+    """The real, render-time-literal JSON body
+    ``app.domains.network_config.renderers.render_isp_netwatch_entry``
+    embeds into each ``/tool netwatch`` entry's own ``up-script``/
+    ``down-script`` -- see that function's own docstring for exactly how
+    it is constructed. ``status`` is restricted to ``"up"``/``"down"`` at
+    this schema layer (RouterOS Netwatch itself has no third state) so
+    ``validators.netwatch_status_to_ping_result`` never has to handle
+    anything else."""
+
+    isp_link_id: str
+    status: Literal["up", "down"]
+    host: str | None = Field(
+        default=None,
+        max_length=45,
+        description=(
+            "The IP address Netwatch itself was watching -- informational "
+            "only (never used to resolve the link; isp_link_id already "
+            "does that), recorded alongside the event for operator "
+            "visibility."
+        ),
+    )
+
+
+class AgentNetwatchEventResponse(BaseModel):
+    isp_link_id: str
+    health_status: str
+    recorded_at: datetime | None

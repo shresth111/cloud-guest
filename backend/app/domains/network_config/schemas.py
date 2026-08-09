@@ -8,16 +8,21 @@ Version list/get/diff/apply responses are **not** redefined here --
 (all ``from_attributes=True``, so they validate straight off the real
 ``ConfigVersion``/``ProvisioningJob`` ORM rows this domain's service
 returns). Re-declaring an identical schema here would duplicate the
-exact shape that module already owns and tests. The one schema this
-module does own, ``NetworkConfigPreviewResponse``, has no analog
-anywhere else -- a dry-run rendering that never touches the database.
+exact shape that module already owns and tests. ``NetworkConfigPreviewResponse``
+and ``NetworkConfigNetwatchPushResponse`` are the two schemas this module
+owns directly -- neither has an analog anywhere else.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel
 
-__all__ = ["NetworkConfigPreviewResponse"]
+from app.domains.router_provisioning.schemas import (
+    ConfigVersionResponse,
+    ProvisioningJobResponse,
+)
+
+__all__ = ["NetworkConfigPreviewResponse", "NetworkConfigNetwatchPushResponse"]
 
 
 class NetworkConfigPreviewResponse(BaseModel):
@@ -31,3 +36,18 @@ class NetworkConfigPreviewResponse(BaseModel):
     dns_record_count: int
     firewall_rule_count: int
     mac_authorization_entry_count: int
+
+
+class NetworkConfigNetwatchPushResponse(BaseModel):
+    """``POST /network-config/routers/{router_id}/netwatch/push``'s own
+    response -- the applied ``ConfigVersion``/queued ``ProvisioningJob``
+    (identical shape to the main push's own ``ConfigVersionApplyResponse``)
+    plus ``watched_link_count``, the one Netwatch-specific fact worth
+    surfacing directly (how many of this router's ISP links actually got a
+    real Netwatch entry, vs. silently skipped for being DHCP/PPPOE-mode --
+    see ``NetworkConfigService.push_isp_netwatch_config``'s own
+    docstring)."""
+
+    version: ConfigVersionResponse
+    job: ProvisioningJobResponse
+    watched_link_count: int

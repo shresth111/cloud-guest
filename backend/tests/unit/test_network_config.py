@@ -27,16 +27,23 @@ from app.domains.firewall.constants import (
 )
 from app.domains.firewall.models import FirewallRule
 from app.domains.hotspot.models import HotspotProfile
+from app.domains.isp.constants import IspConnectionMode
+from app.domains.isp.models import IspLink
 from app.domains.network_config.constants import (
     DHCP_SECTION_HEADER,
     DNS_SECTION_HEADER,
     FIREWALL_SECTION_HEADER,
     HOTSPOT_SECTION_HEADER,
+    NETWATCH_SECTION_HEADER,
     PORT_FORWARDING_SECTION_HEADER,
     QOS_SECTION_HEADER,
     VLAN_SECTION_HEADER,
 )
-from app.domains.network_config.exceptions import EmptyNetworkConfigError
+from app.domains.network_config.exceptions import (
+    EmptyNetworkConfigError,
+    NetwatchIntegrationUnavailableError,
+    NoNetwatchTargetsError,
+)
 from app.domains.network_config.renderers import (
     HOTSPOT_DNS_NAME,
     render_agent_heartbeat_scheduler,
@@ -45,6 +52,8 @@ from app.domains.network_config.renderers import (
     render_dns_record,
     render_firewall_rule,
     render_hotspot_profile,
+    render_isp_netwatch_config,
+    render_isp_netwatch_entry,
     render_network_config,
     render_port_forwarding_rule,
     render_qos_traffic_rule,
@@ -57,6 +66,7 @@ from app.domains.port_forwarding.constants import PortForwardingProtocol
 from app.domains.port_forwarding.models import PortForwardingRule
 from app.domains.qos.models import QosTrafficRule
 from app.domains.router.crypto import encrypt_secret
+from app.domains.router.models import Router
 from app.domains.router_provisioning.constants import ConfigVersionStatus
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
 from app.domains.vlan.models import Vlan
@@ -239,6 +249,60 @@ def _make_wireguard_peer(**overrides: object) -> WireGuardPeer:
     }
     fields.update(overrides)
     return WireGuardPeer(**_base_fields(**fields))
+
+
+def _make_isp_link(**overrides: object) -> IspLink:
+    fields = {
+        "router_id": uuid.uuid4(),
+        "organization_id": uuid.uuid4(),
+        "location_id": uuid.uuid4(),
+        "provider_name": "Airtel",
+        "link_type": "fiber",
+        "connection_mode": IspConnectionMode.STATIC.value,
+        "role": "primary",
+        "is_active_uplink": True,
+        "auto_failback": True,
+        "is_enabled": True,
+        "priority": 0,
+        "interface": "ether1",
+        "gateway_ip_address": "203.0.113.1",
+        "dns_primary": None,
+        "dns_secondary": None,
+        "download_bandwidth_mbps": None,
+        "upload_bandwidth_mbps": None,
+        "health_status": "unknown",
+        "health_status_source": "automated",
+        "latency_ms": None,
+        "packet_loss_percentage": None,
+        "last_checked_at": None,
+        "consecutive_unhealthy_count": 0,
+    }
+    fields.update(overrides)
+    return IspLink(**_base_fields(**fields))
+
+
+def _make_router(**overrides: object) -> Router:
+    fields = {
+        "organization_id": uuid.uuid4(),
+        "location_id": uuid.uuid4(),
+        "name": "Front Desk AP",
+        "serial_number": f"SN-{uuid.uuid4().hex[:8]}",
+        "mac_address": "AA:BB:CC:DD:EE:FF",
+        "model": "hAP ac2",
+        "vendor": "mikrotik",
+        "routeros_version": None,
+        "management_ip_address": "10.0.0.1",
+        "public_ip_address": None,
+        "status": "online",
+        "last_seen_at": None,
+        "last_health_check_at": None,
+        "health_status": None,
+        "api_username": "admin",
+        "api_credentials_encrypted": "encrypted-placeholder",
+        "settings": {},
+    }
+    fields.update(overrides)
+    return Router(**_base_fields(**fields))
 
 
 # ============================================================================
@@ -599,6 +663,115 @@ class TestRenderAgentHeartbeatScheduler:
         assert 'comment="CGBOOT-hb"' in script
 
 
+class TestRenderIspNetwatchEntry:
+    def test_rejects_non_https_base_url(self) -> None:
+        with pytest.raises(ValueError, match="https://"):
+            render_isp_netwatch_entry(
+                _make_isp_link(),
+                api_base_url="http://api.cloudguest.example",
+                agent_credential="cred123",
+            )
+
+    def test_renders_a_real_netwatch_entry_for_a_static_link(self) -> None:
+        link = _make_isp_link(gateway_ip_address="203.0.113.1")
+        lines = render_isp_netwatch_entry(
+            link,
+            api_base_url="https://api.cloudguest.example",
+            agent_credential="cred123",
+        )
+        script = "\n".join(lines)
+        tag = f"isp-netwatch-{link.id}"
+        # Explicit remove-then-add, not wrapped by :do {} on-error={} --
+        # see the renderer's own docstring for why.
+        assert f'/tool netwatch remove [find comment="{tag}"]' in lines
+        assert any(line.startswith("/tool netwatch add") for line in lines)
+        assert "host=203.0.113.1" in script
+        assert f'comment="{tag}"' in script
+        # Both scripts hit the real, already-mounted callback endpoint,
+        # authenticated with the real supplied credential, carrying this
+        # link's own real id and the up/down status as a render-time
+        # literal JSON payload.
+        assert (
+            "https://api.cloudguest.example/api/v1/agent/netwatch-event" in script
+        )
+        assert "X-Agent-Credential: cred123" in script
+        assert f'\\"isp_link_id\\":\\"{link.id}\\"' in script
+        assert '\\"status\\":\\"up\\"' in script
+        assert '\\"status\\":\\"down\\"' in script
+        assert "up-script={" in script
+        assert "down-script={" in script
+
+    def test_skips_dhcp_mode_link_with_explanatory_comment(self) -> None:
+        link = _make_isp_link(
+            connection_mode=IspConnectionMode.DHCP.value, gateway_ip_address=None
+        )
+        lines = render_isp_netwatch_entry(
+            link,
+            api_base_url="https://api.cloudguest.example",
+            agent_credential="cred123",
+        )
+        joined = "\n".join(lines)
+        assert "/tool netwatch add" not in joined
+        assert "netwatch needs a STATIC-mode link" in joined
+
+    def test_skips_pppoe_mode_link_with_explanatory_comment(self) -> None:
+        link = _make_isp_link(
+            connection_mode=IspConnectionMode.PPPOE.value, gateway_ip_address=None
+        )
+        lines = render_isp_netwatch_entry(
+            link,
+            api_base_url="https://api.cloudguest.example",
+            agent_credential="cred123",
+        )
+        joined = "\n".join(lines)
+        assert "/tool netwatch add" not in joined
+
+    def test_skips_static_link_missing_a_gateway(self) -> None:
+        link = _make_isp_link(
+            connection_mode=IspConnectionMode.STATIC.value, gateway_ip_address=None
+        )
+        lines = render_isp_netwatch_entry(
+            link,
+            api_base_url="https://api.cloudguest.example",
+            agent_credential="cred123",
+        )
+        joined = "\n".join(lines)
+        assert "/tool netwatch add" not in joined
+
+    def test_two_links_get_distinct_comment_tags(self) -> None:
+        link_a = _make_isp_link()
+        link_b = _make_isp_link()
+        lines_a = render_isp_netwatch_entry(
+            link_a, api_base_url="https://api.cloudguest.example", agent_credential="c"
+        )
+        lines_b = render_isp_netwatch_entry(
+            link_b, api_base_url="https://api.cloudguest.example", agent_credential="c"
+        )
+        assert lines_a[0] != lines_b[0]
+
+
+class TestRenderIspNetwatchConfig:
+    def test_combines_multiple_links_under_one_section_header(self) -> None:
+        links = [_make_isp_link(), _make_isp_link()]
+        rendered = render_isp_netwatch_config(
+            links,
+            api_base_url="https://api.cloudguest.example",
+            agent_credential="cred123",
+        )
+        assert rendered.count(NETWATCH_SECTION_HEADER) == 1
+        assert rendered.count("/tool netwatch add") == 2
+
+    def test_returns_empty_string_for_no_links(self) -> None:
+        assert (
+            render_isp_netwatch_config(
+                [],
+                api_base_url="https://api.cloudguest.example",
+                agent_credential="cred123",
+            )
+            == ""
+        )
+
+
 class TestRenderNetworkConfig:
     def test_combines_all_seven_categories_with_section_headers(self) -> None:
         rendered = render_network_config(
@@ -861,6 +1034,55 @@ class FakeRouterProvisioningLookup:
         return new_version
 
 
+@dataclass
+class FakeIspLinkLookup:
+    links: list[IspLink] = field(default_factory=list)
+
+    async def list_links(
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        router_id: uuid.UUID | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[IspLink], object]:
+        links = [
+            link
+            for link in self.links
+            if router_id is None or link.router_id == router_id
+        ]
+        return links, object()
+
+
+@dataclass
+class FakeAgentCredentialIssuer:
+    issued_for: list[uuid.UUID] = field(default_factory=list)
+    rotation_counts: dict[uuid.UUID, int] = field(default_factory=dict)
+
+    async def issue_credential_for_router(self, router: Router) -> tuple[object, str]:
+        self.issued_for.append(router.id)
+        count = self.rotation_counts.get(router.id, 0) + 1
+        self.rotation_counts[router.id] = count
+        # A fresh, distinct plaintext every call -- mirrors the real
+        # RouterAgentService.issue_credential_for_router's own rotate-in-
+        # place behavior (a new plaintext every issuance, never repeated).
+        return object(), f"plaintext-{router.id}-{count}"
+
+
+@dataclass
+class FakeRouterLookup:
+    routers: dict[uuid.UUID, Router] = field(default_factory=dict)
+
+    async def get_router(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
+    ) -> Router:
+        return self.routers[router_id]
+
+
 def _make_service(
     *,
     pools: list[DhcpPool] | None = None,
@@ -870,6 +1092,9 @@ def _make_service(
     qos_traffic_rules: list[QosTrafficRule] | None = None,
     dns_records: list[DnsRecord] | None = None,
     firewall_rules: list[FirewallRule] | None = None,
+    isp_link_lookup: FakeIspLinkLookup | None = None,
+    agent_credential_issuer: FakeAgentCredentialIssuer | None = None,
+    router_lookup: FakeRouterLookup | None = None,
 ) -> tuple[NetworkConfigService, FakeRouterProvisioningLookup]:
     provisioning_lookup = FakeRouterProvisioningLookup()
     service = NetworkConfigService(
@@ -881,6 +1106,9 @@ def _make_service(
         provisioning_lookup,
         dns_lookup=FakeDnsLookup(dns_records or []),
         firewall_lookup=FakeFirewallLookup(firewall_rules or []),
+        isp_link_lookup=isp_link_lookup,
+        agent_credential_issuer=agent_credential_issuer,
+        router_lookup=router_lookup,
     )
     return service, provisioning_lookup
 
@@ -980,6 +1208,101 @@ class TestPushConfig:
 
 
 # ============================================================================
+# NetworkConfigService.push_isp_netwatch_config
+# ============================================================================
+
+
+_NetwatchServiceFixture = tuple[
+    NetworkConfigService, FakeRouterProvisioningLookup, FakeAgentCredentialIssuer
+]
+
+
+def _make_netwatch_service(
+    *, links: list[IspLink], router: Router
+) -> _NetwatchServiceFixture:
+    credential_issuer = FakeAgentCredentialIssuer()
+    service, provisioning_lookup = _make_service(
+        isp_link_lookup=FakeIspLinkLookup(links),
+        agent_credential_issuer=credential_issuer,
+        router_lookup=FakeRouterLookup({router.id: router}),
+    )
+    return service, provisioning_lookup, credential_issuer
+
+
+class TestPushIspNetwatchConfig:
+    async def test_creates_and_applies_a_version_watching_static_links(self) -> None:
+        router = _make_router()
+        link = _make_isp_link(router_id=router.id)
+        service, provisioning_lookup, credential_issuer = _make_netwatch_service(
+            links=[link], router=router
+        )
+        result = await service.push_isp_netwatch_config(
+            router.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=None,
+            api_base_url="https://api.cloudguest.example",
+        )
+        assert result.watched_link_count == 1
+        assert result.version.status == ConfigVersionStatus.PENDING_APPLY.value
+        assert "/tool netwatch add" in result.version.rendered_content
+        assert NETWATCH_SECTION_HEADER in result.version.rendered_content
+        assert provisioning_lookup.calls == [
+            "create_version_from_content",
+            "apply_version",
+        ]
+        # The router's own agent credential was rotated exactly once, and
+        # the resulting fresh plaintext is what actually got embedded.
+        assert credential_issuer.issued_for == [router.id]
+        assert f"plaintext-{router.id}-1" in result.version.rendered_content
+
+    async def test_only_watches_enabled_static_links_with_a_gateway(self) -> None:
+        router = _make_router()
+        watched = _make_isp_link(router_id=router.id, provider_name="Airtel")
+        disabled = _make_isp_link(
+            router_id=router.id, provider_name="Jio", is_enabled=False
+        )
+        dhcp_mode = _make_isp_link(
+            router_id=router.id,
+            provider_name="ACT",
+            connection_mode=IspConnectionMode.DHCP.value,
+            gateway_ip_address=None,
+        )
+        other_router_link = _make_isp_link(router_id=uuid.uuid4())
+        service, _, _ = _make_netwatch_service(
+            links=[watched, disabled, dhcp_mode, other_router_link], router=router
+        )
+        result = await service.push_isp_netwatch_config(
+            router.id,
+            actor_user_id=None,
+            requesting_organization_id=None,
+            api_base_url="https://api.cloudguest.example",
+        )
+        assert result.watched_link_count == 1
+        assert result.version.rendered_content.count("/tool netwatch add") == 1
+
+    async def test_raises_when_no_qualifying_links(self) -> None:
+        router = _make_router()
+        service, _, _ = _make_netwatch_service(links=[], router=router)
+        with pytest.raises(NoNetwatchTargetsError):
+            await service.push_isp_netwatch_config(
+                router.id,
+                actor_user_id=None,
+                requesting_organization_id=None,
+                api_base_url="https://api.cloudguest.example",
+            )
+
+    async def test_raises_when_integration_not_composed(self) -> None:
+        service, _ = _make_service()
+        with pytest.raises(NetwatchIntegrationUnavailableError):
+            await service.push_isp_netwatch_config(
+                uuid.uuid4(),
+                actor_user_id=None,
+                requesting_organization_id=None,
+                api_base_url="https://api.cloudguest.example",
+            )
+
+
+# ============================================================================
 # NetworkConfigService: version reads + rollback delegate to
 # router_provisioning
 # ============================================================================
@@ -1062,7 +1385,8 @@ class TestRollbackAndApply:
 
 class TestEveryRouteRequiresPermission:
     def test_every_network_config_route_has_a_permission_dependency(self) -> None:
-        assert len(network_config_router.routes) == 6
+        # 6 pre-existing routes + POST /routers/{router_id}/netwatch/push.
+        assert len(network_config_router.routes) == 7
         for route in network_config_router.routes:
             assert (
                 route.dependencies != []

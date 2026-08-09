@@ -29,6 +29,7 @@ __all__ = [
     "AgentCredentialRevokedError",
     "AgentRouterNotEligibleError",
     "NoConfigAssignedError",
+    "NetwatchLinkNotFoundForRouterError",
 ]
 
 
@@ -94,4 +95,25 @@ class NoConfigAssignedError(RouterAgentError):
             f"Router {router_id} has no applied configuration yet -- nothing "
             "to pull",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class NetwatchLinkNotFoundForRouterError(RouterAgentError):
+    """Raised by ``POST /agent/netwatch-event`` when the reported
+    ``isp_link_id`` resolves to a real ``IspLink`` that belongs to a
+    *different* router than the one identified by this call's own
+    ``X-Agent-Credential`` -- the "exists, but not yours" half of the same
+    two-exception shape ``app.domains.router_provisioning.exceptions
+    .ProvisioningJobNotFoundError``/``ProvisioningJobRouterMismatchError``
+    already establishes for ``complete_action``'s identical ownership
+    check (a link that does not exist at all instead raises
+    ``app.domains.isp.exceptions.IspLinkNotFoundError``, reused as-is, one
+    layer down in ``IspService.get_link`` -- never re-wrapped here).
+    Neither this error's message nor that one's reveals which router the
+    link actually belongs to."""
+
+    def __init__(self, isp_link_id: str) -> None:
+        super().__init__(
+            f"ISP link '{isp_link_id}' was not found for this router",
+            status_code=status.HTTP_404_NOT_FOUND,
         )

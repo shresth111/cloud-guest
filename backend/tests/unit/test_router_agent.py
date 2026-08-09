@@ -35,6 +35,11 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.database.utils.pagination import PageParams, PaginationMeta
+from app.domains.isp.constants import HealthStatus as IspHealthStatus
+from app.domains.isp.constants import IspConnectionMode, IspLinkRole
+from app.domains.isp.device_adapters import PingResult
+from app.domains.isp.models import IspHealthCheck, IspLink
+from app.domains.isp.service import IspService
 from app.domains.location.exceptions import (
     CrossOrganizationLocationAccessError,
     LocationNotFoundError,
@@ -57,10 +62,17 @@ from app.domains.router_agent.exceptions import (
     AgentCredentialMissingError,
     AgentCredentialRevokedError,
     AgentRouterNotEligibleError,
+    NetwatchLinkNotFoundForRouterError,
     NoConfigAssignedError,
 )
 from app.domains.router_agent.models import RouterAgentCredential
+from app.domains.router_agent.router import agent_netwatch_event
+from app.domains.router_agent.schemas import AgentNetwatchEventRequest
 from app.domains.router_agent.service import RouterAgentService, hash_credential
+from app.domains.router_agent.validators import (
+    netwatch_status_to_ping_result,
+    validate_netwatch_link_owned_by_router,
+)
 from app.domains.router_provisioning.constants import ProvisioningJobStatus
 from app.domains.router_provisioning.exceptions import (
     ProvisioningJobRouterMismatchError,
@@ -659,6 +671,90 @@ class FakeRouterAgentRepository:
 
 
 # ============================================================================
+# Test doubles: app.domains.isp side -- a minimal fake, only implementing
+# the four IspRepositoryProtocol methods IspService.get_link/
+# record_health_check_result actually exercise (get_link_by_id,
+# get_link_for_update, update_link, create_health_check). Deliberately
+# self-contained (duplicated, not imported from test_isp.py), matching
+# this project's established per-test-file convention noted in this
+# file's own module docstring.
+# ============================================================================
+
+
+@dataclass
+class FakeIspRepositoryForNetwatch:
+    links: dict[uuid.UUID, IspLink] = field(default_factory=dict)
+    health_checks: list[IspHealthCheck] = field(default_factory=list)
+
+    async def get_link_by_id(
+        self, link_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> IspLink | None:
+        return self.links.get(link_id)
+
+    async def get_link_for_update(self, link_id: uuid.UUID) -> IspLink | None:
+        return self.links.get(link_id)
+
+    async def update_link(self, link: IspLink, data: dict[str, object]) -> IspLink:
+        for key, value in data.items():
+            if hasattr(link, key):
+                setattr(link, key, value)
+        return link
+
+    async def create_health_check(self, **fields: object) -> IspHealthCheck:
+        check = IspHealthCheck(**_base_fields(**fields))
+        self.health_checks.append(check)
+        return check
+
+
+class UnusedRouterLookupStub:
+    """A ``RouterLookupProtocol`` stand-in that raises if ever actually
+    called -- ``get_link``/``record_health_check_result`` (the only two
+    ``IspService`` methods the netwatch-event endpoint calls) never touch
+    ``router_lookup`` at all, so this proves that by construction rather
+    than by a fragile "no calls recorded" assertion."""
+
+    async def get_router(self, *args: object, **kwargs: object) -> Router:
+        raise AssertionError("router_lookup should not be called on this path")
+
+    def get_decrypted_api_secret(self, *args: object, **kwargs: object) -> str:
+        raise AssertionError("router_lookup should not be called on this path")
+
+
+def _make_netwatch_isp_link(**overrides: object) -> IspLink:
+    fields: dict[str, object] = {
+        "router_id": uuid.uuid4(),
+        "organization_id": uuid.uuid4(),
+        "location_id": uuid.uuid4(),
+        "provider_name": "Airtel",
+        "link_type": "fiber",
+        "connection_mode": IspConnectionMode.STATIC.value,
+        "role": IspLinkRole.PRIMARY.value,
+        "is_active_uplink": True,
+        "auto_failback": True,
+        "is_enabled": True,
+        "priority": 0,
+        "interface": "ether1",
+        "gateway_ip_address": "203.0.113.1",
+        "dns_primary": None,
+        "dns_secondary": None,
+        "download_bandwidth_mbps": None,
+        "upload_bandwidth_mbps": None,
+        "health_status": IspHealthStatus.UNKNOWN.value,
+        "health_status_source": "automated",
+        "latency_ms": None,
+        "packet_loss_percentage": None,
+        "last_checked_at": None,
+        "last_rx_bytes": None,
+        "last_tx_bytes": None,
+        "current_download_mbps": None,
+        "current_upload_mbps": None,
+        "consecutive_unhealthy_count": 0,
+    }
+    fields.update(overrides)
+    return IspLink(**_base_fields(**fields))
+
+
+# ============================================================================
 # Fixture assembly
 # ============================================================================
 
@@ -1253,3 +1349,161 @@ class TestActionQueue:
             await fx.agent_service.complete_action(
                 router_id=router_b.id, job_id=job.id, success=True
             )
+
+
+# ============================================================================
+# Netwatch (real MikroTik RouterOS Netwatch integration)
+# ============================================================================
+
+
+class TestNetwatchValidators:
+    """Pure, side-effect-free checks -- exercised directly, no IspService/
+    repository fake needed for either (see ``validators.py``'s own updated
+    module docstring)."""
+
+    def test_status_up_synthesizes_a_fully_healthy_ping_result(self) -> None:
+        result = netwatch_status_to_ping_result("up")
+        assert result == PingResult(
+            sent=1, received=1, packet_loss_percentage=0.0, avg_rtt_ms=0.0
+        )
+
+    def test_status_down_synthesizes_a_fully_lost_ping_result(self) -> None:
+        result = netwatch_status_to_ping_result("down")
+        assert result == PingResult(
+            sent=1, received=0, packet_loss_percentage=100.0, avg_rtt_ms=None
+        )
+
+    def test_matching_router_id_passes_silently(self) -> None:
+        router_id = uuid.uuid4()
+        # No exception -- this is the whole assertion.
+        validate_netwatch_link_owned_by_router(
+            router_id, router_id, isp_link_id=uuid.uuid4()
+        )
+
+    def test_mismatched_router_id_raises(self) -> None:
+        link_id = uuid.uuid4()
+        with pytest.raises(NetwatchLinkNotFoundForRouterError):
+            validate_netwatch_link_owned_by_router(
+                uuid.uuid4(), uuid.uuid4(), isp_link_id=link_id
+            )
+
+
+class TestReportNetwatchEvent:
+    async def test_records_a_router_event(self) -> None:
+        fx = make_services()
+        organization = fx.org_lookup.add()
+        router_device = await make_router(fx, organization, status=RouterStatus.ONLINE)
+        isp_link_id = uuid.uuid4()
+
+        await fx.agent_service.report_netwatch_event(
+            router_id=router_device.id,
+            isp_link_id=isp_link_id,
+            status="down",
+            host="203.0.113.1",
+        )
+
+        events = [
+            e
+            for e in fx.provisioning_repo.events.values()
+            if e.router_id == router_device.id
+        ]
+        matching = [
+            e for e in events if e.event_type == "agent_netwatch_event_received"
+        ]
+        assert len(matching) == 1
+        assert matching[0].event_metadata["isp_link_id"] == str(isp_link_id)
+        assert matching[0].event_metadata["status"] == "down"
+        assert matching[0].event_metadata["host"] == "203.0.113.1"
+
+
+class TestAgentNetwatchEventEndpoint:
+    """Exercises ``router.agent_netwatch_event`` directly (a plain
+    ``async def`` -- calling it bypasses only FastAPI's own ``Depends``
+    resolution, not any real business logic), composed against a real
+    ``IspService`` wired to ``FakeIspRepositoryForNetwatch`` -- proving
+    the actual cross-domain wiring (ownership check -> synthesized
+    ``PingResult`` -> ``IspService.record_health_check_result`` -> real
+    ``RouterAgentService.report_netwatch_event``), not just its two
+    already-independently-tested pieces in isolation."""
+
+    async def _setup(self):
+        fx = make_services()
+        organization = fx.org_lookup.add()
+        router_device = await make_router(fx, organization, status=RouterStatus.ONLINE)
+        _credential, plaintext = await fx.agent_service.issue_credential_for_router(
+            router_device
+        )
+        identity = await CurrentAgent(
+            FakeRequest(headers={AGENT_CREDENTIAL_HEADER: plaintext}),
+            agent_repository=fx.agent_repo,
+            router_repository=fx.router_repo,
+        )
+        isp_repository = FakeIspRepositoryForNetwatch()
+        isp_service = IspService(isp_repository, UnusedRouterLookupStub())
+        return fx, identity, isp_repository, isp_service
+
+    async def test_up_event_records_healthy_status_and_router_event(self) -> None:
+        fx, identity, isp_repository, isp_service = await self._setup()
+        link = _make_netwatch_isp_link(
+            router_id=identity.router.id,
+            health_status=IspHealthStatus.UNHEALTHY.value,
+            consecutive_unhealthy_count=3,
+        )
+        isp_repository.links[link.id] = link
+
+        response = await agent_netwatch_event(
+            AgentNetwatchEventRequest(
+                isp_link_id=str(link.id), status="up", host="203.0.113.1"
+            ),
+            identity=identity,
+            service=fx.agent_service,
+            isp_service=isp_service,
+        )
+
+        assert response.isp_link_id == str(link.id)
+        assert response.health_status == IspHealthStatus.HEALTHY.value
+        assert link.consecutive_unhealthy_count == 0
+        assert len(isp_repository.health_checks) == 1
+        assert isp_repository.health_checks[0].source == "automated"
+        router_events = [
+            e
+            for e in fx.provisioning_repo.events.values()
+            if e.event_type == "agent_netwatch_event_received"
+        ]
+        assert len(router_events) == 1
+
+    async def test_down_event_records_unhealthy_status(self) -> None:
+        fx, identity, isp_repository, isp_service = await self._setup()
+        link = _make_netwatch_isp_link(router_id=identity.router.id)
+        isp_repository.links[link.id] = link
+
+        response = await agent_netwatch_event(
+            AgentNetwatchEventRequest(
+                isp_link_id=str(link.id), status="down", host="203.0.113.1"
+            ),
+            identity=identity,
+            service=fx.agent_service,
+            isp_service=isp_service,
+        )
+
+        assert response.health_status == IspHealthStatus.UNHEALTHY.value
+        assert link.consecutive_unhealthy_count == 1
+
+    async def test_link_belonging_to_another_router_is_rejected(self) -> None:
+        fx, identity, isp_repository, isp_service = await self._setup()
+        other_routers_link = _make_netwatch_isp_link(router_id=uuid.uuid4())
+        isp_repository.links[other_routers_link.id] = other_routers_link
+
+        with pytest.raises(NetwatchLinkNotFoundForRouterError):
+            await agent_netwatch_event(
+                AgentNetwatchEventRequest(
+                    isp_link_id=str(other_routers_link.id),
+                    status="up",
+                    host="203.0.113.1",
+                ),
+                identity=identity,
+                service=fx.agent_service,
+                isp_service=isp_service,
+            )
+        # No health check was recorded for a link this router doesn't own.
+        assert isp_repository.health_checks == []

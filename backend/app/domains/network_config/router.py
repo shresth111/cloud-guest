@@ -16,6 +16,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.core.config import Settings, get_settings
 from app.domains.auth.models import AuthUser
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
@@ -33,7 +34,7 @@ from app.domains.router_provisioning.schemas import (
 )
 
 from .dependencies import get_network_config_service
-from .schemas import NetworkConfigPreviewResponse
+from .schemas import NetworkConfigNetwatchPushResponse, NetworkConfigPreviewResponse
 from .service import NetworkConfigService
 
 router = APIRouter(prefix="/network-config", tags=["Network Configuration Management"])
@@ -161,6 +162,47 @@ async def push_network_config(
     return build_response(
         success=True,
         message="Network config rendered and queued for application",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/netwatch/push",
+    response_model=ApiResponse[NetworkConfigNetwatchPushResponse],
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(RequirePermission("network_config.execute"))],
+)
+async def push_isp_netwatch_config(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: NetworkConfigService = Depends(get_network_config_service),
+    settings: Settings = Depends(get_settings),
+):
+    """Configures real RouterOS Netwatch entries -- the faster, router-side
+    complementary detection path alongside ``app.domains.isp``'s existing
+    30-second server-side health-check sweep. Gated by the same
+    ``network_config.execute`` permission ``push``/``rollback`` already
+    require, since this is a real, on-demand device-config push, not a
+    read. See ``NetworkConfigService.push_isp_netwatch_config``'s own
+    docstring for what this actually does, including the real credential-
+    rotation side effect."""
+    result = await service.push_isp_netwatch_config(
+        router_id,
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+        api_base_url=settings.api_public_base_url,
+    )
+    payload = NetworkConfigNetwatchPushResponse(
+        version=_version_response(result.version),
+        job=_job_response(result.job),
+        watched_link_count=result.watched_link_count,
+    )
+    return build_response(
+        success=True,
+        message="ISP Netwatch config rendered and queued for application",
         data=payload.model_dump(),
         request_id=_request_id(request),
     )

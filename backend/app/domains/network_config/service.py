@@ -33,6 +33,19 @@ unlike a DHCP pool or a VLAN, which are always rows some admin explicitly
 created before ever calling this service, a WireGuard tunnel or a NAS
 client can legitimately not exist yet for a router this service is asked
 to render/push a config for.
+
+``isp_link_lookup``/``agent_credential_issuer``/``router_lookup`` are three
+more optional, additive lookups (same "``None`` when not composed" posture
+as ``wireguard_lookup``/``radius_nas_lookup`` above) backing exactly one
+new method, ``push_isp_netwatch_config`` -- see that method's own
+docstring, and ``renderers.py``'s own "Netwatch" module-docstring section,
+for the full real-time-detection design this closes the loop on.
+Deliberately **not** folded into ``_gather_enabled_rows``/
+``render_network_config``'s combined script: unlike DHCP/VLAN/etc., a
+Netwatch push has a real, singular side effect neither of those categories
+carry (rotating the router's own persistent agent credential -- see
+``push_isp_netwatch_config``), which no admin should trigger merely as a
+side effect of an unrelated DHCP/VLAN push.
 """
 
 from __future__ import annotations
@@ -47,16 +60,23 @@ from app.domains.firewall.models import FirewallRule
 from app.domains.guest.constants import NasStatus
 from app.domains.guest.models import RadiusNasClient
 from app.domains.hotspot.models import HotspotProfile
+from app.domains.isp.constants import IspConnectionMode
+from app.domains.isp.models import IspLink
 from app.domains.mac_authorization.models import MacAuthorizationEntry
 from app.domains.port_forwarding.models import PortForwardingRule
 from app.domains.qos.models import QosTrafficRule
+from app.domains.router.models import Router
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
 from app.domains.vlan.models import Vlan
 from app.domains.wireguard.exceptions import WireGuardPeerNotFoundError
 from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
 
-from .exceptions import EmptyNetworkConfigError
-from .renderers import render_network_config
+from .exceptions import (
+    EmptyNetworkConfigError,
+    NetwatchIntegrationUnavailableError,
+    NoNetwatchTargetsError,
+)
+from .renderers import render_isp_netwatch_config, render_network_config
 
 
 class DhcpLookupProtocol(Protocol):
@@ -137,6 +157,52 @@ class RadiusNasLookupProtocol(Protocol):
     ) -> tuple[list[RadiusNasClient], object]: ...
 
 
+class IspLinkLookupProtocol(Protocol):
+    """The subset of ``IspService``'s surface
+    ``push_isp_netwatch_config`` needs to find a router's own enabled
+    ISP links -- the identical ``list_links`` real, tenant-scoped read
+    every ``GET /isp/links`` call already uses, never a second, parallel
+    query."""
+
+    async def list_links(
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        router_id: uuid.UUID | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[IspLink], object]: ...
+
+
+class AgentCredentialIssuerProtocol(Protocol):
+    """The single ``RouterAgentService`` method
+    ``push_isp_netwatch_config`` needs -- reused directly (its own real
+    rotate-in-place-if-one-already-exists behavior), never reimplemented.
+    See that method's own docstring for why rotating this credential is
+    the real mechanism that closes the loop for
+    ``renderers.render_isp_netwatch_entry``'s own embedded plaintext."""
+
+    async def issue_credential_for_router(
+        self, router: Router
+    ) -> tuple[object, str]: ...
+
+
+class RouterLookupProtocol(Protocol):
+    """The single ``RouterService`` method
+    ``push_isp_netwatch_config`` needs to resolve the real ``Router`` row
+    ``AgentCredentialIssuerProtocol.issue_credential_for_router`` requires
+    -- mirrors ``app.domains.isp.service.RouterLookupProtocol``'s own
+    identical single-method subset."""
+
+    async def get_router(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
+    ) -> Router: ...
+
+
 class RouterProvisioningLookupProtocol(Protocol):
     async def create_version_from_content(
         self,
@@ -211,6 +277,20 @@ class NetworkConfigPreview:
     mac_authorization_entry_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class NetwatchPushResult:
+    """The real result of :meth:`NetworkConfigService
+    .push_isp_netwatch_config` -- the applied ``ConfigVersion``/queued
+    ``ProvisioningJob`` (identical shape to :meth:`push_config`'s own
+    return) plus ``watched_link_count``, since a caller genuinely needs to
+    know how many of the router's ISP links actually got a real Netwatch
+    entry (vs. silently skipped for being DHCP/PPPOE-mode)."""
+
+    version: ConfigVersion
+    job: ProvisioningJob
+    watched_link_count: int
+
+
 class NetworkConfigService:
     """Core Network Configuration Management business logic -- see module
     docstring."""
@@ -229,6 +309,9 @@ class NetworkConfigService:
         wireguard_lookup: WireGuardLookupProtocol | None = None,
         radius_nas_lookup: RadiusNasLookupProtocol | None = None,
         mac_authorization_lookup: MacAuthorizationLookupProtocol | None = None,
+        isp_link_lookup: IspLinkLookupProtocol | None = None,
+        agent_credential_issuer: AgentCredentialIssuerProtocol | None = None,
+        router_lookup: RouterLookupProtocol | None = None,
     ) -> None:
         self.dhcp_lookup = dhcp_lookup
         self.vlan_lookup = vlan_lookup
@@ -252,6 +335,16 @@ class NetworkConfigService:
         # effect on the physical device -- see
         # app.domains.mac_authorization.service module docstring).
         self.mac_authorization_lookup = mac_authorization_lookup
+        # Optional, additive, same "None until composed" posture as every
+        # lookup above -- back exactly one method, push_isp_netwatch_config
+        # (see that method's own docstring). All three are required
+        # together for that one method to work at all (raises
+        # NetwatchIntegrationUnavailableError if any is missing); every
+        # *other* method on this service is completely unaffected by
+        # whether they're composed.
+        self.isp_link_lookup = isp_link_lookup
+        self.agent_credential_issuer = agent_credential_issuer
+        self.router_lookup = router_lookup
 
     async def _gather_enabled_rows(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
@@ -455,6 +548,105 @@ class NetworkConfigService:
             requesting_organization_id=requesting_organization_id,
         )
 
+    async def push_isp_netwatch_config(
+        self,
+        router_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        api_base_url: str,
+    ) -> NetwatchPushResult:
+        """Configures real RouterOS Netwatch entries (one per qualifying
+        ``IspLink``) on ``router_id`` -- the faster, router-side,
+        complementary detection path alongside
+        ``app.domains.isp.service.run_health_check_sweep``'s existing
+        30-second server-side poll. See ``renderers.py``'s own "Netwatch"
+        module-docstring section for the full design write-up; this
+        method is that design's one real, stateful step.
+
+        **Rotates the router's own persistent agent credential first,
+        every time.** ``renderers.render_isp_netwatch_entry`` embeds a
+        plaintext ``X-Agent-Credential`` directly into each Netwatch
+        entry's own ``up-script``/``down-script`` -- the only way a
+        RouterOS script triggered independently, at an arbitrary later
+        time, can authenticate its own callback the same way every other
+        device-facing call in this codebase already does. This platform
+        holds no recoverable plaintext copy of an already-issued
+        credential (only its hash -- see
+        ``app.domains.router_agent.models.RouterAgentCredential``'s own
+        docstring), so the only way to have a genuine plaintext in hand at
+        push time is to mint one right now via
+        ``AgentCredentialIssuerProtocol.issue_credential_for_router``,
+        which rotates the existing credential in place if one already
+        exists. **Real, honest side effect worth calling out plainly**:
+        this invalidates whatever credential the router was using a
+        moment before -- harmless for every *documented* use of that
+        credential in this codebase today (heartbeat/config-pull/status/
+        actions all re-authenticate per call, and nothing currently keeps
+        a long-lived, unattended script depending on one specific
+        credential value staying valid forever -- see
+        ``render_agent_heartbeat_scheduler``'s own docstring, which
+        documents that even that renderer is not wired into any live call
+        site yet), but a real fact an operator triggering this action
+        should know, not a silently-absorbed side effect.
+
+        Raises ``NetwatchIntegrationUnavailableError`` if this service was
+        not constructed with all three of ``isp_link_lookup``/
+        ``agent_credential_issuer``/``router_lookup`` composed (every real
+        production wiring always composes all three -- see
+        ``dependencies.py``), and ``NoNetwatchTargetsError`` if the router
+        has no enabled, ``STATIC``-mode ISP link with a known
+        ``gateway_ip_address`` to watch (mirrors
+        ``EmptyNetworkConfigError``'s own "don't push nothing" posture for
+        the main config-push flow)."""
+        if (
+            self.isp_link_lookup is None
+            or self.agent_credential_issuer is None
+            or self.router_lookup is None
+        ):
+            raise NetwatchIntegrationUnavailableError(router_id)
+
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        links, _meta = await self.isp_link_lookup.list_links(
+            requesting_organization_id=requesting_organization_id,
+            router_id=router_id,
+            page=1,
+            page_size=100,
+        )
+        watched_links = [
+            link
+            for link in links
+            if link.is_enabled
+            and link.connection_mode == IspConnectionMode.STATIC.value
+            and link.gateway_ip_address
+        ]
+        if not watched_links:
+            raise NoNetwatchTargetsError(router_id)
+
+        issue_credential = self.agent_credential_issuer.issue_credential_for_router
+        _credential, plaintext = await issue_credential(router)
+        rendered = render_isp_netwatch_config(
+            watched_links, api_base_url=api_base_url, agent_credential=plaintext
+        )
+
+        version = await self.router_provisioning_lookup.create_version_from_content(
+            actor_user_id=actor_user_id,
+            router_id=router_id,
+            rendered_content=rendered,
+            requesting_organization_id=requesting_organization_id,
+        )
+        applied_version, job = await self.router_provisioning_lookup.apply_version(
+            actor_user_id=actor_user_id,
+            router_id=router_id,
+            version_id=version.id,
+            requesting_organization_id=requesting_organization_id,
+        )
+        return NetwatchPushResult(
+            version=applied_version, job=job, watched_link_count=len(watched_links)
+        )
+
     async def get_version(
         self,
         router_id: uuid.UUID,
@@ -531,7 +723,11 @@ __all__ = [
     "WireGuardLookupProtocol",
     "RadiusNasLookupProtocol",
     "MacAuthorizationLookupProtocol",
+    "IspLinkLookupProtocol",
+    "AgentCredentialIssuerProtocol",
+    "RouterLookupProtocol",
     "RouterProvisioningLookupProtocol",
     "NetworkConfigPreview",
+    "NetwatchPushResult",
     "NetworkConfigService",
 ]

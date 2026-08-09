@@ -3,7 +3,8 @@
 Composes ``app.domains.dhcp``/``app.domains.vlan``/``app.domains
 .port_forwarding``/``app.domains.hotspot``/``app.domains.qos``/
 ``app.domains.router_provisioning``/``app.domains.wireguard``/
-``app.domains.guest`` entirely through their own existing, already-wired
+``app.domains.guest``/``app.domains.isp``/``app.domains.router_agent``/
+``app.domains.router`` entirely through their own existing, already-wired
 FastAPI dependency functions -- exactly the same real service graph the
 live API already builds for each of those domains, never a second,
 parallel construction path.
@@ -23,12 +24,18 @@ from app.domains.guest.dependencies import get_radius_service
 from app.domains.guest.service import RadiusService
 from app.domains.hotspot.dependencies import get_hotspot_service
 from app.domains.hotspot.service import HotspotService
+from app.domains.isp.dependencies import get_isp_service
+from app.domains.isp.service import IspService
 from app.domains.mac_authorization.dependencies import get_mac_authorization_service
 from app.domains.mac_authorization.service import MacAuthorizationService
 from app.domains.port_forwarding.dependencies import get_port_forwarding_service
 from app.domains.port_forwarding.service import PortForwardingService
 from app.domains.qos.dependencies import get_qos_service
 from app.domains.qos.service import QosService
+from app.domains.router.dependencies import get_router_service
+from app.domains.router.service import RouterService
+from app.domains.router_agent.dependencies import get_router_agent_service
+from app.domains.router_agent.service import RouterAgentService
 from app.domains.router_provisioning.dependencies import get_router_provisioning_service
 from app.domains.router_provisioning.service import RouterProvisioningService
 from app.domains.vlan.dependencies import get_vlan_service
@@ -57,6 +64,9 @@ def get_network_config_service(
     mac_authorization_service: MacAuthorizationService = Depends(
         get_mac_authorization_service
     ),
+    isp_service: IspService = Depends(get_isp_service),
+    router_agent_service: RouterAgentService = Depends(get_router_agent_service),
+    router_service: RouterService = Depends(get_router_service),
 ) -> NetworkConfigService:
     return NetworkConfigService(
         dhcp_service,
@@ -78,6 +88,14 @@ def get_network_config_service(
         # identical, already-wired MacAuthorizationService every other
         # MAC-authorization endpoint composes, never a second one.
         mac_authorization_lookup=mac_authorization_service,
+        # Real integration point for push_isp_netwatch_config: the
+        # identical, already-wired IspService/RouterAgentService/
+        # RouterService instances every other ISP/agent/router endpoint in
+        # this application already composes, never a second, parallel set
+        # -- see that method's own docstring.
+        isp_link_lookup=isp_service,
+        agent_credential_issuer=router_agent_service,
+        router_lookup=router_service,
     )
 
 

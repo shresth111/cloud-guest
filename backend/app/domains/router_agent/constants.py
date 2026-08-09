@@ -83,6 +83,13 @@ class RouterAgentEventType(StrEnum):
 
     CREDENTIAL_ISSUED = "agent_credential_issued"
     STATUS_REPORTED = "agent_status_reported"
+    # Real MikroTik RouterOS Netwatch integration: a router's own
+    # up-script/down-script (see app.domains.network_config.renderers
+    # .render_isp_netwatch_entry) calls POST /agent/netwatch-event the
+    # instant Netwatch itself detects a change -- this event records that
+    # call landed, complementing (not replacing) app.domains.isp's own
+    # 30-second server-side health-check sweep.
+    NETWATCH_EVENT_RECEIVED = "agent_netwatch_event_received"
 
 
 __all__ = [

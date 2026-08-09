@@ -1,7 +1,11 @@
 """FastAPI routes for the Router Agent domain: the device-facing protocol a
 real MikroTik RouterOS agent uses for its entire ongoing lifecycle after
 zero-touch provisioning -- heartbeat, current-configuration pull, status
-push, and provisioning-action-queue poll/complete.
+push, provisioning-action-queue poll/complete, and a real MikroTik
+RouterOS Netwatch event call-in (``agent_netwatch_event``, this module's
+own real device-initiated surface for
+``app.domains.network_config.renderers.render_isp_netwatch_entry`` --
+see that function's own module-docstring section for the full design).
 
 **Every endpoint here is device-facing, not user-facing.** None of them
 carry RBAC's ``RequirePermission``/``CurrentUser`` dependencies -- a
@@ -31,6 +35,8 @@ from fastapi import APIRouter, Depends, status
 
 from app.domains.guest.dependencies import get_guest_repository
 from app.domains.guest.repository import GuestRepositoryProtocol
+from app.domains.isp.dependencies import get_isp_service
+from app.domains.isp.service import IspService
 from app.domains.monitoring.constants import HeartbeatComponentType
 from app.domains.monitoring.dependencies import get_monitoring_service
 from app.domains.monitoring.service import MonitoringService
@@ -45,11 +51,17 @@ from .schemas import (
     AgentConfigResponse,
     AgentHeartbeatRequest,
     AgentHeartbeatResponse,
+    AgentNetwatchEventRequest,
+    AgentNetwatchEventResponse,
     AgentStatusReportRequest,
     AgentStatusReportResponse,
     AuthorizedMacsResponse,
 )
 from .service import RouterAgentService
+from .validators import (
+    netwatch_status_to_ping_result,
+    validate_netwatch_link_owned_by_router,
+)
 
 router = APIRouter(prefix="/agent", tags=["Router Agent"])
 
@@ -236,6 +248,63 @@ async def agent_authorized_macs(
         if device is not None:
             macs.append(device.mac_address)
     return AuthorizedMacsResponse(mac_addresses=sorted(set(macs)))
+
+
+@router.post(
+    "/netwatch-event",
+    response_model=AgentNetwatchEventResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def agent_netwatch_event(
+    payload: AgentNetwatchEventRequest,
+    identity: AgentIdentity = Depends(CurrentAgent),
+    service: RouterAgentService = Depends(get_router_agent_service),
+    isp_service: IspService = Depends(get_isp_service),
+) -> AgentNetwatchEventResponse:
+    """Real MikroTik RouterOS Netwatch integration's device-initiated
+    call-in: the endpoint a router's own Netwatch ``up-script``/
+    ``down-script`` (``app.domains.network_config.renderers
+    .render_isp_netwatch_entry``) calls the instant RouterOS itself
+    notices the watched target change -- structurally faster than waiting
+    for the next tick of ``app.domains.isp.service
+    .run_health_check_sweep``'s own 30-second server-side poll, since
+    there is no round-trip to a central server involved in the detection
+    itself, only in this report of it.
+
+    Feeds the exact same real pipeline the sweep uses
+    (``IspService.record_health_check_result``), via a synthesized
+    ``PingResult`` (see ``validators.netwatch_status_to_ping_result``) --
+    a Netwatch-detected change advances the same
+    ``consecutive_unhealthy_count``/failover machinery the sweep does, one
+    recording path, not a second, parallel health signal. ``isp_link_id``
+    is resolved with no ``requesting_organization_id`` (this is a device-
+    authenticated call, not a platform-user one -- see module docstring),
+    then explicitly checked against this call's own credential-derived
+    ``identity.router.id`` (``validate_netwatch_link_owned_by_router``) so
+    one router's agent can never advance another router's ISP link.
+
+    ``RouterAgentService.report_netwatch_event`` additionally records a
+    real, queryable ``RouterEvent`` proving this call landed -- see that
+    method's own docstring."""
+    link = await isp_service.get_link(uuid.UUID(payload.isp_link_id))
+    validate_netwatch_link_owned_by_router(
+        link.router_id, identity.router.id, isp_link_id=link.id
+    )
+    ping_result = netwatch_status_to_ping_result(payload.status)
+    updated = await isp_service.record_health_check_result(
+        link, ping_result=ping_result, traffic=None
+    )
+    await service.report_netwatch_event(
+        router_id=identity.router.id,
+        isp_link_id=link.id,
+        status=payload.status,
+        host=payload.host,
+    )
+    return AgentNetwatchEventResponse(
+        isp_link_id=str(link.id),
+        health_status=updated.health_status,
+        recorded_at=updated.last_checked_at,
+    )
 
 
 __all__ = ["router"]

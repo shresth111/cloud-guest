@@ -157,6 +157,11 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/agent/heartbeat"): (
         "Router agent -- CurrentAgent device credential."
     ),
+    ("POST", "/api/v1/agent/netwatch-event"): (
+        "Router agent -- CurrentAgent device credential. Real MikroTik "
+        "RouterOS Netwatch integration's device-initiated call-in (see "
+        "app.domains.network_config.renderers.render_isp_netwatch_entry)."
+    ),
     ("POST", "/api/v1/agent/status"): (
         "Router agent -- CurrentAgent device credential."
     ),

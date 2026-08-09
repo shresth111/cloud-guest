@@ -448,6 +448,92 @@ into ``app.domains.router.router.provisioning_check_in`` and/or
 ``app.domains.router_provisioning``'s initial-config-version creation is
 real, additional cross-domain work outside this addition's declared
 footprint, left undone and reported as a gap rather than guessed at.
+
+## Netwatch: real router-side detection, closed via a rotated agent credential
+
+RouterOS's own ``/tool netwatch`` pings a target *from the router itself*
+and runs a real, local ``up-script``/``down-script`` the instant that
+target's status changes -- structurally faster than any server-initiated
+poll (``app.domains.isp.service.run_health_check_sweep``, a 30-second
+Celery Beat sweep) can be, since there is no round-trip to a central
+server involved in the *detection* itself. :func:`render_isp_netwatch_entry`
+renders one real ``/tool netwatch add host=<gateway> up-script=...
+down-script=...`` entry per ``IspLink``, watching that link's own
+already-known health-check target.
+
+**Scope-limited to ``STATIC``-mode links with a known ``gateway_ip_address``,
+honestly.** ``/tool netwatch``'s ``host=`` parameter needs a literal IP
+address baked in at render/push time -- a ``DHCP``-mode link's target is
+resolved *live*, at check time, by ``IspService.ping_link`` (its dynamic
+default gateway can legitimately change between one push and the next),
+and a ``PPPOE``-mode link has no IP-layer gateway/ping target at all (see
+``app.domains.isp.constants.IspConnectionMode``'s own docstring). Rendering
+a Netwatch entry against either would mean baking in a value already known
+to go stale or fabricating one that was never real -- this function skips
+both modes with an explanatory comment instead, the same "skip, don't
+guess" discipline every other renderer in this file already follows.
+
+**The credential problem this shares with, and solves differently than,
+``render_agent_heartbeat_scheduler`` above.** A Netwatch ``up-script``/
+``down-script`` needs to call back to this platform the instant the
+router itself notices a change, authenticated the same way every other
+device-facing call in this codebase is: ``X-Agent-Credential`` (see
+``app.domains.router_agent.dependencies.CurrentAgent``). That credential's
+plaintext is disclosed exactly once, in ``ProvisioningCheckInResponse``,
+and this platform holds no recoverable copy afterward -- the exact gap
+``render_agent_heartbeat_scheduler``'s own docstring documents and leaves
+open (nothing in this codebase currently calls it). This function does
+**not** inherit that gap silently: its caller,
+``NetworkConfigService.push_isp_netwatch_config``, **rotates** the
+router's agent credential (``RouterAgentService
+.issue_credential_for_router`` already supports re-issuing in place, for
+exactly the factory-reset/re-provision case) immediately before rendering,
+so a real, currently-valid plaintext credential is always in hand at the
+moment this function is called -- see that method's own docstring for the
+full write-up, including the one honest caveat rotation carries.
+
+**What actually gets reported back, and to where.** Each script's
+``http-data`` body is a real, render-time-literal JSON payload
+(``{"isp_link_id": "<uuid>", "status": "up"|"down", "host": "<ip>"}``) --
+the *link id* is baked in, not resolved by the router, since the router
+has no notion of this platform's own primary keys otherwise. It POSTs to
+``POST /agent/netwatch-event``
+(``app.domains.router_agent.router.agent_netwatch_event``), a genuine,
+new, device-authenticated endpoint on that module's own existing
+``CurrentAgent`` surface -- not a second, parallel credential scheme. That
+endpoint feeds the exact same ``IspService.record_health_check_result``
+pipeline the 30-second sweep already uses (a synthesized ``PingResult``,
+0%/100% loss for up/down), so a Netwatch-detected change advances the
+*same* ``consecutive_unhealthy_count``/failover machinery the sweep does,
+rather than a second, parallel health signal.
+
+**Self-idempotent by construction, not via ``_idempotent_lines``.**
+Every other category in this file is wrapped in ``:do {...} on-error={}``
+(``_idempotent_lines``), which silently *keeps* whatever is already on the
+router if an "already have such entry" error is hit -- correct for a DHCP
+pool or a VLAN, wrong here: since a fresh, rotated credential is embedded
+in the script's own text on every push, silently keeping a stale existing
+entry would mean the router goes on reporting with a credential this
+platform already rotated away from (a real, silent breakage, not a
+cosmetic one). :func:`render_isp_netwatch_entry` instead emits an explicit,
+comment-tag-scoped ``/tool netwatch remove [find comment=...]`` immediately
+before its own ``add`` -- the identical remove-then-add idempotency
+convention ``render_bootstrap_script`` already establishes for its own
+tagged entries, chosen deliberately over the wrap-and-suppress convention
+for the reason above.
+
+**Not confirmed against a real device this session** (unlike most of the
+rendering decisions elsewhere in this file, several of which carry an
+explicit "confirmed live" note) -- there was no live MikroTik reachable
+for this addition to exercise ``/tool netwatch add ... up-script=...``
+against. The command shape follows MikroTik's own published ``/tool
+netwatch`` reference (curly-brace script-block syntax for
+``up-script``/``down-script``, the same block-not-quoted-string form
+RouterOS accepts for ``/system scheduler``'s own ``on-event``) plus this
+file's own already-confirmed ``/tool fetch`` conventions
+(``render_bootstrap_script``); still an honest, real gap worth a live
+confirmation pass before this is exercised in production, not a silent
+assumption.
 """
 
 from __future__ import annotations
@@ -461,6 +547,8 @@ from app.domains.firewall.constants import FirewallProtocol
 from app.domains.firewall.models import FirewallRule
 from app.domains.guest.models import RadiusNasClient
 from app.domains.hotspot.models import HotspotProfile
+from app.domains.isp.constants import IspConnectionMode
+from app.domains.isp.models import IspLink
 from app.domains.mac_authorization.models import MacAuthorizationEntry
 from app.domains.port_forwarding.constants import PortForwardingProtocol
 from app.domains.port_forwarding.models import PortForwardingRule
@@ -482,6 +570,7 @@ from .constants import (
     FIREWALL_SECTION_HEADER,
     HOTSPOT_SECTION_HEADER,
     MAC_AUTHORIZATION_SECTION_HEADER,
+    NETWATCH_SECTION_HEADER,
     PORT_FORWARDING_SECTION_HEADER,
     QOS_SECTION_HEADER,
     RADIUS_SECTION_HEADER,
@@ -906,6 +995,142 @@ def render_radius_client(
     ]
 
 
+# ============================================================================
+# Netwatch -- see module docstring's own "Netwatch" section for the full
+# design write-up.
+# ============================================================================
+
+# The real, already-mounted device-facing path
+# app.domains.router_agent.router.agent_netwatch_event lives at -- not
+# invented, mirrors _CHECK_IN_PATH/_AGENT_CONFIG_PATH/_AGENT_HEARTBEAT_PATH
+# above exactly.
+_AGENT_NETWATCH_EVENT_PATH = "/api/v1/agent/netwatch-event"
+
+# RouterOS's own /tool netwatch polling cadence for each entry this
+# function renders -- deliberately well under the 30-second server-side
+# sweep interval (app.domains.isp.constants
+# .ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS) so this is a genuinely faster,
+# complementary detection path, not a cosmetic duplicate of it. A plain
+# module constant, not a per-link tunable -- no real operational need for
+# per-link Netwatch cadence has surfaced yet, the same "single honest
+# default until a real need for tunability appears" posture
+# app.domains.isp.constants documents for its own thresholds.
+NETWATCH_CHECK_INTERVAL = "10s"
+
+
+def _netwatch_payload(link_id: object, *, status: str, host: str) -> str:
+    """The real, render-time-literal JSON body each Netwatch script's own
+    ``/tool fetch http-data=`` carries -- escaped for embedding inside a
+    RouterOS double-quoted string literal (``\\"``), the identical
+    escaping convention :func:`render_agent_heartbeat_scheduler` already
+    established for its own ``on-event`` string above."""
+    return (
+        '{\\"isp_link_id\\":\\"' + str(link_id) + '\\",'
+        '\\"status\\":\\"' + status + '\\",'
+        '\\"host\\":\\"' + host + '\\"}'
+    )
+
+
+def _netwatch_callback_script(
+    *, event_url: str, agent_credential: str, link_id: object, host: str, status: str
+) -> str:
+    """One Netwatch ``up-script``/``down-script`` value -- a RouterOS
+    curly-brace script block (not a quoted string, unlike
+    :func:`render_agent_heartbeat_scheduler`'s own ``on-event`` -- both are
+    real, valid RouterOS forms for this purpose; the block form needs no
+    outer-quote escaping of its own, which keeps this one legible next to
+    the already-escaped JSON body it carries) issuing one real ``/tool
+    fetch`` POST to the real, already-mounted
+    ``POST /agent/netwatch-event`` endpoint, authenticated the same way
+    every other device-facing call in this codebase is
+    (``X-Agent-Credential``, see ``app.domains.router_agent.constants
+    .AGENT_CREDENTIAL_HEADER``)."""
+    payload = _netwatch_payload(link_id, status=status, host=host)
+    return (
+        f'{{/tool fetch url="{event_url}" http-method=post '
+        f'http-header-field="X-Agent-Credential: {agent_credential}" '
+        f'http-data="{payload}" output=none}}'
+    )
+
+
+def render_isp_netwatch_entry(
+    link: IspLink, *, api_base_url: str, agent_credential: str
+) -> list[str]:
+    """Renders one real ``/tool netwatch add host=<gateway> up-script=...
+    down-script=...`` entry watching ``link``'s own already-known
+    health-check target -- see module docstring's own "Netwatch" section
+    for the full design write-up (scope limits, the credential-rotation
+    seam, what gets reported back and to where, and why this is
+    self-idempotent rather than wrapped by :func:`_idempotent_lines`).
+
+    Raises ``ValueError`` if ``api_base_url`` is not ``https://`` -- see
+    :func:`_require_https` (the identical guard
+    :func:`render_bootstrap_script`/:func:`render_agent_heartbeat_scheduler`
+    already enforce for their own calls back to this platform).
+    """
+    tag = f"isp-netwatch-{link.id}"
+    if (
+        link.connection_mode != IspConnectionMode.STATIC.value
+        or not link.gateway_ip_address
+    ):
+        return [
+            f"# {tag}: netwatch needs a STATIC-mode link with a known "
+            "gateway_ip_address -- skipping (a DHCP link's target is "
+            "resolved live at check time, never a fixed value; a PPPOE "
+            "link has no IP-layer gateway/ping target at all -- see "
+            "IspService.ping_link's own docstring)"
+        ]
+    _require_https(api_base_url, caller="render_isp_netwatch_entry")
+    event_url = f"{api_base_url}{_AGENT_NETWATCH_EVENT_PATH}"
+    up_script = _netwatch_callback_script(
+        event_url=event_url,
+        agent_credential=agent_credential,
+        link_id=link.id,
+        host=link.gateway_ip_address,
+        status="up",
+    )
+    down_script = _netwatch_callback_script(
+        event_url=event_url,
+        agent_credential=agent_credential,
+        link_id=link.id,
+        host=link.gateway_ip_address,
+        status="down",
+    )
+    return [
+        f'/tool netwatch remove [find comment="{tag}"]',
+        f"/tool netwatch add host={link.gateway_ip_address} "
+        f"interval={NETWATCH_CHECK_INTERVAL} "
+        f"up-script={up_script} down-script={down_script} "
+        f'comment="{tag}"',
+    ]
+
+
+def render_isp_netwatch_config(
+    links: list[IspLink], *, api_base_url: str, agent_credential: str
+) -> str:
+    """Combines every ``link`` in ``links`` into one standalone Netwatch
+    script -- the pure-function assembler for
+    ``NetworkConfigService.push_isp_netwatch_config``'s own push, mirroring
+    :func:`render_network_config`'s own "combine every row into one script"
+    shape, deliberately kept separate from it (see that method's own
+    docstring for why: folding ISP/agent-credential plumbing into
+    ``render_network_config``'s already-12-parameter signature would
+    entangle a category no other one of its callers needs to know about).
+    Returns an empty string for an empty ``links`` list -- the caller
+    decides whether that is an error or a valid, informational result, the
+    same split ``render_network_config`` itself already establishes."""
+    if not links:
+        return ""
+    sections = [NETWATCH_SECTION_HEADER]
+    for link in links:
+        sections.extend(
+            render_isp_netwatch_entry(
+                link, api_base_url=api_base_url, agent_credential=agent_credential
+            )
+        )
+    return "\n".join(sections)
+
+
 # Comment tag every entry this bootstrap script itself creates is stamped
 # with, so re-running it (e.g. a technician pastes it twice) removes and
 # re-adds rather than duplicating -- see module docstring's Bootstrap
@@ -1173,4 +1398,7 @@ __all__ = [
     "render_bootstrap_script",
     "render_agent_heartbeat_scheduler",
     "render_network_config",
+    "NETWATCH_CHECK_INTERVAL",
+    "render_isp_netwatch_entry",
+    "render_isp_netwatch_config",
 ]

@@ -16,6 +16,11 @@ FIREWALL_SECTION_HEADER = "# --- Firewall Rules (CloudGuest-managed) ---"
 WIREGUARD_SECTION_HEADER = "# --- WireGuard Peer (CloudGuest-managed) ---"
 RADIUS_SECTION_HEADER = "# --- RADIUS Client (CloudGuest-managed) ---"
 MAC_AUTHORIZATION_SECTION_HEADER = "# --- MAC Authorization (CloudGuest-managed) ---"
+# ISP Link Netwatch -- see renderers.py's own "Netwatch" section for the
+# full design write-up. A distinct, standalone push (never folded into
+# render_network_config's own combined script -- see
+# NetworkConfigService.push_isp_netwatch_config's own docstring for why).
+NETWATCH_SECTION_HEADER = "# --- ISP Link Netwatch (CloudGuest-managed) ---"
 
 __all__ = [
     "DHCP_SECTION_HEADER",
@@ -28,4 +33,5 @@ __all__ = [
     "WIREGUARD_SECTION_HEADER",
     "RADIUS_SECTION_HEADER",
     "MAC_AUTHORIZATION_SECTION_HEADER",
+    "NETWATCH_SECTION_HEADER",
 ]
