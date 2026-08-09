@@ -234,16 +234,18 @@ UNHEALTHY_SINCE_LOOKBACK_LIMIT = 200
 # ============================================================================
 
 TASK_RUN_ISP_HEALTH_CHECK_SWEEP = "app.domains.isp.tasks.run_isp_health_check_sweep"
-# Lowered back to the original 60s (from the 600s documented above) for a
-# real-time feel at today's real scale (a handful of links, not 1000+) --
-# confirmed live: a real WAN disconnect on the one live test router sat
-# undetected for 10+ minutes at 600s, which reads as "broken monitoring"
-# to an operator watching it happen. The scale risk documented above still
-# applies once link count grows -- whoever revisits this at real scale
-# should raise it again (or better, build the bounded-concurrency/overlap
-# lock this comment already flags) rather than silently leaving it at 60s
-# forever.
-ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS = 60.0
+# Lowered again, from 60s to 30s -- same "real-time feel at today's real
+# scale" reasoning as the 600s->60s drop directly above, applied a second
+# time: confirmed live, today's real platform-wide link count is a
+# handful (two organizations, one router each), nowhere near the 1000+
+# link scale the sequential-sweep risk above is about, and a customer
+# directly reported the up/down notification email itself arriving too
+# slowly to feel real. The scale risk documented above still applies
+# and gets proportionally worse at 30s, not better -- whoever revisits
+# this once link count actually grows should raise it again (or build the
+# bounded-concurrency/overlap lock already flagged above) rather than
+# silently leaving it here forever.
+ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS = 30.0
 
 
 __all__ = [

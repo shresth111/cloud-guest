@@ -360,15 +360,34 @@ ALERT_EVENT_LOOKBACK_MINUTES = 15
 # ``evaluate_alert_rules`` from an on-demand-only action (``POST
 # /alerts/evaluate``) into a real, running background job now that this
 # codebase actually has a Celery deployment (the constraint the comment
-# above this one was written against no longer holds). 15 minutes --
-# slightly longer than the two real device-health sweeps this evaluator is
-# downstream of and re-reads the *results* of, never their own device I/O
-# (``app.domains.provisioning_engine.constants
-# .ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS`` and ``app.domains.isp
-# .constants.ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS``, both 600 seconds/10
-# minutes today) -- there is no value in evaluating alert rules more often
-# than the underlying router/ISP-link state they read can actually change.
-ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS = 900.0
+# above this one was written against no longer holds).
+#
+# Real bug, found live: this was 900 seconds (15 minutes), justified by a
+# comment claiming it was "slightly longer than the two real device-health
+# sweeps this evaluator is downstream of... both 600 seconds/10 minutes
+# today." That was true when written, but ``app.domains.isp.constants
+# .ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS`` was later sped up to 60
+# seconds without this value being revisited to match -- so a real ISP
+# link going down (or recovering) could sit detected-but-unalerted for up
+# to 15 minutes, a customer-reported "instant down/up email doesn't come,
+# there's a 15 min gap" bug, not a cosmetic one. 90 seconds now:
+# slightly longer than the FASTER of the two underlying sweeps this
+# evaluator reads (ISP health at 60s; ``app.domains.provisioning_engine
+# .constants.ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS`` is still 600s
+# today, unrelated to this specific bug), so a real state change is
+# alertable within about one ISP-health cycle of it actually happening
+# rather than fifteen.
+#
+# Lowered again to 30 seconds after direct feedback that even a ~90s
+# email still didn't feel real-time: ``app.domains.isp.constants
+# .ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS`` itself was also dropped to
+# 30s at the same time (same commit), so this stays matched to it rather
+# than trailing behind it again. Still bounded, not zero-latency -- a real
+# polling sweep, not an event-driven push, so "instant" always means
+# "within about one cycle of the faster underlying sweep," typically
+# under a minute end-to-end (health check catches the change, next
+# evaluation pass alerts + emails on it), never truly immediate.
+ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS = 30.0
 
 TASK_RUN_ALERT_RULE_EVALUATION_SWEEP = (
     "app.domains.monitoring.tasks.run_alert_rule_evaluation_sweep"
