@@ -317,6 +317,62 @@ harmless (``set``, not ``add``: the second application is a no-op, not a
 duplicate), so no special-casing is added for the "already enabled by an
 earlier push" case.
 
+## Content Filtering: DNS sinkhole + address-list/firewall-filter,
+deliberately no Layer7, no web-proxy, no TLS interception
+
+See ``app.domains.content_filtering``'s own module docstring for the full
+scope write-up; this section documents only the rendering half.
+
+``ContentFilterRule.value_type == "domain"`` renders **two**
+``/ip dns static`` lines, not one: an exact-name match and a ``regexp=``
+match for every subdomain. This mirrors ``render_dns_record``'s own real
+RouterOS parameter shape (``address=`` for an A-type static entry) but
+points every one at :data:`CONTENT_FILTER_SINKHOLE_ADDRESS`
+(``127.0.0.1``, this platform's own loopback -- always exists, needs no
+LAN host actually listening on it, and never ARPs a real device) instead
+of a real destination -- a DNS sinkhole, the standard, honest way to make
+a blocked domain simply fail to resolve for a device using this router as
+its DNS server (guest DHCP already hands out this router's own address as
+``dns-server=``, established by ``_render_vlan_hotspot``'s own DHCP
+network line above). Two lines are needed because RouterOS's own
+``/ip dns static`` treats ``name=`` (exact match) and ``regexp=``
+(pattern match) as mutually exclusive per entry -- one entry can block
+``facebook.com`` exactly, a second is needed to also catch
+``www.facebook.com``/``m.facebook.com``/etc.
+
+``ContentFilterRule.value_type == "ip_cidr"`` renders one
+``/ip firewall address-list`` membership line per rule, **plus** one
+shared, aggregate ``/ip firewall filter ... dst-address-list=<list>
+action=drop`` line -- rendered exactly once per push
+(:func:`render_content_filter_rules`), regardless of how many IP/CIDR
+rules exist, since the DROP rule matches the whole address-list, not any
+one member. Populating an address list with nothing that ever actually
+drops traffic against it would be the exact "looks wired up but isn't"
+gap this platform's own ``app.domains.mac_authorization`` module
+docstring already called out and fixed for its own whitelist entries
+before this addition existed -- this renderer does not repeat that gap.
+
+**The one real, honest limitation, stated plainly:** a guest device that
+manually configures a different DNS resolver (a public one, or DNS-over-
+HTTPS/TLS) bypasses the sinkhole entirely -- this is a known, real
+limitation of DNS-based content filtering everywhere it is deployed, not
+unique to this renderer. This renderer deliberately does **not** also
+emit a port-53-lockdown firewall rule to close that gap: forcing every
+guest DNS query through the router is a general-purpose firewall policy
+an admin can already build with ``app.domains.firewall``'s own existing
+rule CRUD (``chain=forward protocol=udp dst-port=53 action=drop``,
+excepting the router's own address) -- this domain does not duplicate a
+capability that domain already fully owns.
+
+Content filtering does not attempt Layer7 protocol matching (real, but
+expensive per-packet regex matching -- not what this platform's actual
+low-power test hardware, a MikroTik hEX lite, should spend its CPU
+budget on for this feature) or a transparent web-proxy (which only sees
+plaintext HTTP -- essentially none of the real sites a guest-WiFi content-
+filtering customer wants blocked run unencrypted today), and never
+attempts TLS interception (HTTPS MITM) under any circumstances -- a hard
+scope boundary, not a judgment call.
+
 ## Bootstrap: the "Step 0" problem, and why this script is thin, not a
 config dump
 
@@ -540,6 +596,12 @@ from __future__ import annotations
 
 import ipaddress
 
+from app.domains.content_filtering.constants import (
+    CONTENT_FILTER_ADDRESS_LIST_NAME,
+    CONTENT_FILTER_SINKHOLE_ADDRESS,
+    ContentFilterValueType,
+)
+from app.domains.content_filtering.models import ContentFilterRule
 from app.domains.dhcp.models import DhcpPool
 from app.domains.dns.constants import DnsRecordType
 from app.domains.dns.models import DnsRecord
@@ -565,6 +627,7 @@ from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
 from app.domains.wireguard.service import EXTERNALLY_MANAGED_KEY_SENTINEL
 
 from .constants import (
+    CONTENT_FILTER_SECTION_HEADER,
     DHCP_SECTION_HEADER,
     DNS_SECTION_HEADER,
     FIREWALL_SECTION_HEADER,
@@ -910,6 +973,56 @@ def render_mac_authorization_entry(entry: MacAuthorizationEntry) -> list[str]:
     return [
         f"/ip hotspot ip-binding add mac-address={entry.mac_address} "
         f'type=bypassed comment="{identifier}"'
+    ]
+
+
+def _domain_subdomain_regex(domain: str) -> str:
+    """The real RouterOS ``/ip dns static ... regexp=`` pattern matching
+    every subdomain of ``domain`` (never ``domain`` itself -- see
+    :func:`render_content_filter_rule`'s own docstring for why both an
+    exact-name entry and this regexp entry are rendered together). A
+    domain contains only alphanumerics/hyphens/dots -- the one character
+    with real regex meaning is ``.``, escaped here; nothing else in a
+    normalized (see ``app.domains.content_filtering.validators
+    .normalize_domain``) hostname needs escaping."""
+    escaped = domain.replace(".", r"\.")
+    return f"^.*\\.{escaped}$"
+
+
+def render_content_filter_rule(rule: ContentFilterRule) -> list[str]:
+    """Renders one enabled ``ContentFilterRule`` row -- see module
+    docstring's "Content Filtering" section for the full real-mechanism
+    write-up. A ``DOMAIN`` rule renders a DNS-sinkhole pair (exact name +
+    subdomain regexp); an ``IP_CIDR`` rule renders one address-list
+    membership line only -- the aggregate DROP filter rule that actually
+    makes IP/CIDR blocking take effect is rendered once per push by
+    :func:`render_content_filter_enforcement`, not repeated here per
+    rule."""
+    label = f"{rule.category or 'custom'}: {rule.name}"
+    if rule.value_type == ContentFilterValueType.IP_CIDR.value:
+        return [
+            f"/ip firewall address-list add list={CONTENT_FILTER_ADDRESS_LIST_NAME} "
+            f'address={rule.value} comment="{label}"'
+        ]
+    domain = rule.value
+    return [
+        f"/ip dns static add name={domain} type=A "
+        f'address={CONTENT_FILTER_SINKHOLE_ADDRESS} comment="{label}"',
+        f'/ip dns static add regexp="{_domain_subdomain_regex(domain)}" type=A '
+        f'address={CONTENT_FILTER_SINKHOLE_ADDRESS} comment="{label} (subdomains)"',
+    ]
+
+
+def render_content_filter_enforcement() -> list[str]:
+    """The one, router-global ``/ip firewall filter`` DROP rule that makes
+    every ``IP_CIDR``-type :class:`ContentFilterRule`'s address-list
+    membership (rendered by :func:`render_content_filter_rule`) actually
+    block traffic -- see module docstring's "Content Filtering" section
+    for why this is rendered exactly once per push, not once per rule."""
+    return [
+        "/ip firewall filter add chain=forward "
+        f"dst-address-list={CONTENT_FILTER_ADDRESS_LIST_NAME} action=drop "
+        'comment="Wyfy Guest content filtering: block listed addresses"'
     ]
 
 
@@ -1283,6 +1396,7 @@ def render_network_config(
     radius_nas_client: RadiusNasClient | None = None,
     radius_server_host: str | None = None,
     mac_authorization_entries: list[MacAuthorizationEntry] | None = None,
+    content_filter_rules: list[ContentFilterRule] | None = None,
 ) -> str:
     """Combines every enabled row across all categories into one
     router-wide RouterOS script -- a full desired-state snapshot, mirroring
@@ -1340,6 +1454,15 @@ def render_network_config(
         sections.append(MAC_AUTHORIZATION_SECTION_HEADER)
         for entry in mac_authorization_entries:
             sections.extend(_idempotent_lines(render_mac_authorization_entry(entry)))
+    if content_filter_rules:
+        sections.append(CONTENT_FILTER_SECTION_HEADER)
+        for rule in content_filter_rules:
+            sections.extend(_idempotent_lines(render_content_filter_rule(rule)))
+        if any(
+            rule.value_type == ContentFilterValueType.IP_CIDR.value
+            for rule in content_filter_rules
+        ):
+            sections.extend(_idempotent_lines(render_content_filter_enforcement()))
     if wireguard_peer is not None and wireguard_server is not None:
         sections.append(WIREGUARD_SECTION_HEADER)
         sections.extend(
@@ -1393,6 +1516,8 @@ __all__ = [
     "render_dns_record",
     "render_firewall_rule",
     "render_mac_authorization_entry",
+    "render_content_filter_rule",
+    "render_content_filter_enforcement",
     "render_wireguard_peer",
     "render_radius_client",
     "render_bootstrap_script",

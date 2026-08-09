@@ -412,6 +412,18 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # roles, and GrantLevel.FULL resolve to (CREATE, READ, MANAGE) for
     # admin roles that triage/resolve tickets -- see expand_grant_level.
     PermissionModule.SUPPORT_TICKETS: (_A.CREATE, _A.READ, _A.MANAGE),
+    # Content Filtering: a plain CRUD rules/inventory domain -- no
+    # EXECUTE, since this domain has no device-facing action of its own
+    # (real device push is composed via app.domains.network_config's own
+    # EXECUTE-gated push endpoint instead), mirroring QOS/DHCP/VLAN's
+    # identical shape.
+    PermissionModule.CONTENT_FILTERING: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.MANAGE,
+    ),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -469,6 +481,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.MONITORED_HARDWARE: "Monitored Hardware",
     PermissionModule.SUPPORT_TICKETS: "Support Tickets",
     PermissionModule.DEMO_REQUESTS: "Demo Requests",
+    PermissionModule.CONTENT_FILTERING: "Content Filtering",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -575,6 +588,10 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # as PermissionModule.SYSTEM_SETTINGS's own entry above: it is
     # meaningful only at the platform (Master console) level.
     PermissionModule.DEMO_REQUESTS: ScopeType.GLOBAL,
+    # A content filter rule is scoped to one router's own DNS/firewall
+    # config -- identical ScopeType.ROUTER reasoning as
+    # PermissionModule.QOS/FIREWALL/DHCP/VLAN above.
+    PermissionModule.CONTENT_FILTERING: ScopeType.ROUTER,
 }
 
 
@@ -875,6 +892,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DEVICE_SYNC: _L.FULL,
             _M.NETWORK_CONFIG: _L.FULL,
             _M.QOS: _L.FULL,
+            _M.CONTENT_FILTERING: _L.FULL,
             _M.NETWORK_DIAGNOSTICS: _L.FULL,
             _M.NETWORK_DEVICE: _L.FULL,
             _M.POLICY: _L.OPERATE,
@@ -914,6 +932,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.CONNECTED_DEVICES: _L.OPERATE,
             _M.NETWORK_CONFIG: _L.OPERATE,
             _M.QOS: _L.OPERATE,
+            _M.CONTENT_FILTERING: _L.OPERATE,
             _M.NETWORK_DIAGNOSTICS: _L.OPERATE,
             _M.NETWORK_DEVICE: _L.OPERATE,
             # Day-to-day network operations plainly includes knowing

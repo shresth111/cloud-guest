@@ -129,6 +129,7 @@ async def preview_network_config(
         dns_record_count=preview.dns_record_count,
         firewall_rule_count=preview.firewall_rule_count,
         mac_authorization_entry_count=preview.mac_authorization_entry_count,
+        content_filter_rule_count=preview.content_filter_rule_count,
     )
     return build_response(
         success=True,

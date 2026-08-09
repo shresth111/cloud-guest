@@ -118,6 +118,11 @@ class PermissionModule(StrEnum):
     SUPPORT_TICKETS = "support_tickets"
     DEVICE_CONSOLE = "device_console"
     DEMO_REQUESTS = "demo_requests"
+    # Content Filtering: per-router DNS-sinkhole/address-list blocking
+    # rules -- see app.domains.content_filtering's own module docstring
+    # for the full, honest RouterOS scope decision this module composes
+    # into the network_config push pipeline.
+    CONTENT_FILTERING = "content_filtering"
 
 
 class OverrideEffect(StrEnum):
@@ -839,6 +844,17 @@ class AuditAction(StrEnum):
     # deliberately start.
     MONITORED_HARDWARE_CREATED = "monitored_hardware_created"
     MONITORED_HARDWARE_DELETED = "monitored_hardware_deleted"
+
+    # Content Filtering domain events -- written through this same table
+    # by ``app.domains.content_filtering.service.ContentFilterService``
+    # via the same narrow ``AuditLogWriter`` protocol shape every other
+    # domain's service uses. A pure rules/inventory domain (no live
+    # device push in this pass -- see that module's own docstring), so
+    # create/update/delete are its only lifecycle events, mirroring
+    # FIREWALL_RULE_CREATED/_UPDATED/_DELETED's identical shape above.
+    CONTENT_FILTER_RULE_CREATED = "content_filter_rule_created"
+    CONTENT_FILTER_RULE_UPDATED = "content_filter_rule_updated"
+    CONTENT_FILTER_RULE_DELETED = "content_filter_rule_deleted"
 
     # Support Tickets domain events -- written through this same table by
     # ``app.domains.support_tickets.service.TicketService`` via the same

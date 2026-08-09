@@ -21,6 +21,7 @@ MAC_AUTHORIZATION_SECTION_HEADER = "# --- MAC Authorization (CloudGuest-managed)
 # render_network_config's own combined script -- see
 # NetworkConfigService.push_isp_netwatch_config's own docstring for why).
 NETWATCH_SECTION_HEADER = "# --- ISP Link Netwatch (CloudGuest-managed) ---"
+CONTENT_FILTER_SECTION_HEADER = "# --- Content Filtering (CloudGuest-managed) ---"
 
 __all__ = [
     "DHCP_SECTION_HEADER",
@@ -34,4 +35,5 @@ __all__ = [
     "RADIUS_SECTION_HEADER",
     "MAC_AUTHORIZATION_SECTION_HEADER",
     "NETWATCH_SECTION_HEADER",
+    "CONTENT_FILTER_SECTION_HEADER",
 ]

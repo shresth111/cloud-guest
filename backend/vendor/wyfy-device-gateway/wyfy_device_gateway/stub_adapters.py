@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from .contract import (
     ConnectedDevice,
+    ContentFilterRuleConfig,
     DeviceCredentials,
     DeviceDiscoveryResult,
     DeviceHealthResult,
@@ -82,6 +83,11 @@ class _StubAdapter:
 
     async def set_radius_client_config(
         self, creds: DeviceCredentials, *, config: RadiusClientConfig
+    ) -> None:
+        raise self._not_implemented()
+
+    async def configure_content_filter_rule(
+        self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig
     ) -> None:
         raise self._not_implemented()
 
@@ -256,6 +262,7 @@ class _StubAdapter:
             "configure_dhcp_pool": False,
             "configure_port_forward": False,
             "set_radius_client_config": False,
+            "configure_content_filter_rule": False,
             "disconnect_device": False,
             "ping": False,
             "traceroute": False,

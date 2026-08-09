@@ -54,6 +54,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Protocol
 
+from app.domains.content_filtering.models import ContentFilterRule
 from app.domains.dhcp.models import DhcpPool
 from app.domains.dns.models import DnsRecord
 from app.domains.firewall.models import FirewallRule
@@ -140,6 +141,15 @@ class MacAuthorizationLookupProtocol(Protocol):
     async def list_active_entries_for_router(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> list[MacAuthorizationEntry]: ...
+
+
+class ContentFilterLookupProtocol(Protocol):
+    """The subset of ``ContentFilterService``'s surface this module needs
+    to render a router's own currently-enabled content-filtering rules."""
+
+    async def list_rules_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[ContentFilterRule]: ...
 
 
 class RadiusNasLookupProtocol(Protocol):
@@ -275,6 +285,7 @@ class NetworkConfigPreview:
     has_wireguard_peer: bool
     has_radius_nas_client: bool
     mac_authorization_entry_count: int
+    content_filter_rule_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +323,7 @@ class NetworkConfigService:
         isp_link_lookup: IspLinkLookupProtocol | None = None,
         agent_credential_issuer: AgentCredentialIssuerProtocol | None = None,
         router_lookup: RouterLookupProtocol | None = None,
+        content_filter_lookup: ContentFilterLookupProtocol | None = None,
     ) -> None:
         self.dhcp_lookup = dhcp_lookup
         self.vlan_lookup = vlan_lookup
@@ -345,6 +357,13 @@ class NetworkConfigService:
         self.isp_link_lookup = isp_link_lookup
         self.agent_credential_issuer = agent_credential_issuer
         self.router_lookup = router_lookup
+        # Optional, additive, identical story to mac_authorization_lookup
+        # above: the real device-config-generation seam for Content
+        # Filtering (see app.domains.content_filtering's own module
+        # docstring for the full DNS-sinkhole/address-list scope this
+        # composes into render_content_filter_rule/
+        # render_content_filter_enforcement).
+        self.content_filter_lookup = content_filter_lookup
 
     async def _gather_enabled_rows(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
@@ -440,6 +459,16 @@ class NetworkConfigService:
             router_id, requesting_organization_id=requesting_organization_id
         )
 
+    async def _gather_content_filter_rules(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[ContentFilterRule]:
+        if self.content_filter_lookup is None:
+            return []
+        rules = await self.content_filter_lookup.list_rules_for_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        return [r for r in rules if r.is_enabled]
+
     async def preview_config(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> NetworkConfigPreview:
@@ -460,6 +489,9 @@ class NetworkConfigService:
         mac_authorization_entries = await self._gather_mac_authorization(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        content_filter_rules = await self._gather_content_filter_rules(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
         rendered = render_network_config(
             dhcp_pools=pools,
             vlans=vlans,
@@ -478,6 +510,7 @@ class NetworkConfigService:
             # instead.
             radius_server_host=server.endpoint_host if server is not None else None,
             mac_authorization_entries=mac_authorization_entries,
+            content_filter_rules=content_filter_rules,
         )
         return NetworkConfigPreview(
             router_id=router_id,
@@ -492,6 +525,7 @@ class NetworkConfigService:
             has_wireguard_peer=peer is not None,
             has_radius_nas_client=nas_client is not None,
             mac_authorization_entry_count=len(mac_authorization_entries),
+            content_filter_rule_count=len(content_filter_rules),
         )
 
     async def push_config(
@@ -518,6 +552,9 @@ class NetworkConfigService:
         mac_authorization_entries = await self._gather_mac_authorization(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        content_filter_rules = await self._gather_content_filter_rules(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
         rendered = render_network_config(
             dhcp_pools=pools,
             vlans=vlans,
@@ -531,6 +568,7 @@ class NetworkConfigService:
             radius_nas_client=nas_client,
             radius_server_host=server.endpoint_host if server is not None else None,
             mac_authorization_entries=mac_authorization_entries,
+            content_filter_rules=content_filter_rules,
         )
         if not rendered:
             raise EmptyNetworkConfigError(router_id)
@@ -723,6 +761,7 @@ __all__ = [
     "WireGuardLookupProtocol",
     "RadiusNasLookupProtocol",
     "MacAuthorizationLookupProtocol",
+    "ContentFilterLookupProtocol",
     "IspLinkLookupProtocol",
     "AgentCredentialIssuerProtocol",
     "RouterLookupProtocol",

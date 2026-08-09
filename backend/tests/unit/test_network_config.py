@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 
 import pytest
 
+from app.domains.content_filtering.constants import ContentFilterValueType
+from app.domains.content_filtering.models import ContentFilterRule
 from app.domains.dhcp.models import DhcpPool
 from app.domains.dns.constants import DnsRecordType
 from app.domains.dns.models import DnsRecord
@@ -30,6 +32,7 @@ from app.domains.hotspot.models import HotspotProfile
 from app.domains.isp.constants import IspConnectionMode
 from app.domains.isp.models import IspLink
 from app.domains.network_config.constants import (
+    CONTENT_FILTER_SECTION_HEADER,
     DHCP_SECTION_HEADER,
     DNS_SECTION_HEADER,
     FIREWALL_SECTION_HEADER,
@@ -48,6 +51,8 @@ from app.domains.network_config.renderers import (
     HOTSPOT_DNS_NAME,
     render_agent_heartbeat_scheduler,
     render_bootstrap_script,
+    render_content_filter_enforcement,
+    render_content_filter_rule,
     render_dhcp_pool,
     render_dns_record,
     render_firewall_rule,
@@ -219,6 +224,22 @@ def _make_firewall_rule(**overrides: object) -> FirewallRule:
     }
     fields.update(overrides)
     return FirewallRule(**_base_fields(**fields))
+
+
+def _make_content_filter_rule(**overrides: object) -> ContentFilterRule:
+    fields = {
+        "router_id": uuid.uuid4(),
+        "organization_id": uuid.uuid4(),
+        "location_id": uuid.uuid4(),
+        "name": "Block Facebook",
+        "category": "social_media",
+        "value_type": ContentFilterValueType.DOMAIN.value,
+        "value": "facebook.com",
+        "comment": None,
+        "is_enabled": True,
+    }
+    fields.update(overrides)
+    return ContentFilterRule(**_base_fields(**fields))
 
 
 def _make_wireguard_server(**overrides: object) -> WireGuardServer:
@@ -552,6 +573,47 @@ class TestRenderFirewallRule:
         assert 'comment="custom note (priority=10)"' in line
 
 
+class TestRenderContentFilterRule:
+    def test_domain_rule_renders_exact_and_subdomain_sinkhole_entries(self) -> None:
+        lines = render_content_filter_rule(_make_content_filter_rule())
+        assert len(lines) == 2
+        assert "/ip dns static add name=facebook.com type=A" in lines[0]
+        assert "address=127.0.0.1" in lines[0]
+        assert 'comment="social_media: Block Facebook"' in lines[0]
+        assert 'regexp="^.*\\.facebook\\.com$"' in lines[1]
+        assert "address=127.0.0.1" in lines[1]
+        assert "(subdomains)" in lines[1]
+
+    def test_ip_cidr_rule_renders_only_address_list_membership(self) -> None:
+        (line,) = render_content_filter_rule(
+            _make_content_filter_rule(
+                name="Block Bad Range",
+                category="gambling",
+                value_type=ContentFilterValueType.IP_CIDR.value,
+                value="203.0.113.0/24",
+            )
+        )
+        assert "/ip firewall address-list add" in line
+        assert "list=wyfyguest-content-filter-blocked" in line
+        assert "address=203.0.113.0/24" in line
+        assert 'comment="gambling: Block Bad Range"' in line
+        assert "/ip firewall filter" not in line
+
+    def test_defaults_category_label_to_custom_when_unset(self) -> None:
+        (line, _regexp_line) = render_content_filter_rule(
+            _make_content_filter_rule(category=None)
+        )
+        assert 'comment="custom: Block Facebook"' in line
+
+
+class TestRenderContentFilterEnforcement:
+    def test_renders_one_shared_drop_rule_matching_the_address_list(self) -> None:
+        (line,) = render_content_filter_enforcement()
+        assert "/ip firewall filter add chain=forward" in line
+        assert "dst-address-list=wyfyguest-content-filter-blocked" in line
+        assert "action=drop" in line
+
+
 class TestRenderWireGuardPeerExternallyManagedKeyGuard:
     """Module 009 Part 3 addition: ``render_wireguard_peer`` must skip the
     ``private-key=`` line for a peer whose key material is device-managed
@@ -823,6 +885,50 @@ class TestRenderNetworkConfig:
         assert DNS_SECTION_HEADER not in rendered
         assert FIREWALL_SECTION_HEADER not in rendered
 
+    def test_includes_content_filter_section_for_domain_rules_only(self) -> None:
+        rendered = render_network_config(
+            dhcp_pools=[],
+            vlans=[],
+            port_forwarding_rules=[],
+            content_filter_rules=[_make_content_filter_rule()],
+        )
+        assert CONTENT_FILTER_SECTION_HEADER in rendered
+        assert "/ip dns static add name=facebook.com" in rendered
+        # No IP/CIDR rule present -- the shared enforcement DROP rule
+        # must not be rendered at all.
+        assert "/ip firewall filter add chain=forward" not in rendered
+
+    def test_includes_enforcement_rule_once_for_ip_cidr_rules(self) -> None:
+        rendered = render_network_config(
+            dhcp_pools=[],
+            vlans=[],
+            port_forwarding_rules=[],
+            content_filter_rules=[
+                _make_content_filter_rule(
+                    name="Block A",
+                    value_type=ContentFilterValueType.IP_CIDR.value,
+                    value="203.0.113.0/24",
+                ),
+                _make_content_filter_rule(
+                    name="Block B",
+                    value_type=ContentFilterValueType.IP_CIDR.value,
+                    value="198.51.100.0/24",
+                ),
+            ],
+        )
+        assert rendered.count("wyfyguest-content-filter-blocked") == 3
+        assert rendered.count("dst-address-list=wyfyguest-content-filter-blocked") == 1
+        assert rendered.count("action=drop") == 1
+        assert rendered.count("/ip firewall filter add chain=forward") == 1
+
+    def test_omits_content_filter_section_without_any_rules(self) -> None:
+        rendered = render_network_config(
+            dhcp_pools=[_make_pool()],
+            vlans=[],
+            port_forwarding_rules=[],
+        )
+        assert CONTENT_FILTER_SECTION_HEADER not in rendered
+
 
 # ============================================================================
 # Fakes
@@ -903,6 +1009,16 @@ class FakeFirewallLookup:
     async def list_rules_for_router(
         self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
     ) -> list[FirewallRule]:
+        return [r for r in self.rules if r.router_id == router_id]
+
+
+@dataclass
+class FakeContentFilterLookup:
+    rules: list[ContentFilterRule] = field(default_factory=list)
+
+    async def list_rules_for_router(
+        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None
+    ) -> list[ContentFilterRule]:
         return [r for r in self.rules if r.router_id == router_id]
 
 
@@ -1092,6 +1208,7 @@ def _make_service(
     qos_traffic_rules: list[QosTrafficRule] | None = None,
     dns_records: list[DnsRecord] | None = None,
     firewall_rules: list[FirewallRule] | None = None,
+    content_filter_rules: list[ContentFilterRule] | None = None,
     isp_link_lookup: FakeIspLinkLookup | None = None,
     agent_credential_issuer: FakeAgentCredentialIssuer | None = None,
     router_lookup: FakeRouterLookup | None = None,
@@ -1106,6 +1223,7 @@ def _make_service(
         provisioning_lookup,
         dns_lookup=FakeDnsLookup(dns_records or []),
         firewall_lookup=FakeFirewallLookup(firewall_rules or []),
+        content_filter_lookup=FakeContentFilterLookup(content_filter_rules or []),
         isp_link_lookup=isp_link_lookup,
         agent_credential_issuer=agent_credential_issuer,
         router_lookup=router_lookup,
@@ -1166,6 +1284,33 @@ class TestPreviewConfig:
         )
         assert preview.rendered_content == ""
         assert preview.dhcp_pool_count == 0
+        assert preview.content_filter_rule_count == 0
+
+    async def test_includes_content_filter_rules_in_preview(self) -> None:
+        router_id = uuid.uuid4()
+        service, _ = _make_service(
+            content_filter_rules=[_make_content_filter_rule(router_id=router_id)]
+        )
+        preview = await service.preview_config(
+            router_id, requesting_organization_id=uuid.uuid4()
+        )
+        assert preview.content_filter_rule_count == 1
+        assert CONTENT_FILTER_SECTION_HEADER in preview.rendered_content
+
+    async def test_excludes_disabled_content_filter_rules(self) -> None:
+        router_id = uuid.uuid4()
+        service, _ = _make_service(
+            content_filter_rules=[
+                _make_content_filter_rule(router_id=router_id, is_enabled=True),
+                _make_content_filter_rule(
+                    router_id=router_id, value="other.com", is_enabled=False
+                ),
+            ]
+        )
+        preview = await service.preview_config(
+            router_id, requesting_organization_id=uuid.uuid4()
+        )
+        assert preview.content_filter_rule_count == 1
 
 
 # ============================================================================

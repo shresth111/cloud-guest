@@ -36,6 +36,7 @@ class NetworkConfigPreviewResponse(BaseModel):
     dns_record_count: int
     firewall_rule_count: int
     mac_authorization_entry_count: int
+    content_filter_rule_count: int
 
 
 class NetworkConfigNetwatchPushResponse(BaseModel):

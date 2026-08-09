@@ -124,6 +124,23 @@ class RadiusClientConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ContentFilterRuleConfig:
+    """One content-filtering rule to realize on the device -- either a
+    domain to DNS-sinkhole or an IP/CIDR to address-list-and-drop. See
+    ``mikrotik_adapter.py``'s ``configure_content_filter_rule`` docstring
+    for the real RouterOS mechanism and its honest limits (DNS-based
+    blocking only, no Layer7, no web-proxy, no TLS interception -- see
+    that docstring's own "Honest scope" section). Ported from
+    ``cloud-guest-repo/backend/app/domains/content_filtering`` (see that
+    domain's own module docstring for the full customer-facing scope
+    write-up this vendor-agnostic shape mirrors)."""
+
+    value_type: str  # "domain" | "ip_cidr"
+    value: str  # a bare domain name ("facebook.com") or an IP/CIDR
+    label: str  # human-readable label, rendered into the device's own comment
+
+
+@dataclass(frozen=True, slots=True)
 class ProvisionResult:
     success: bool
     applied_content_summary: str | None
@@ -288,6 +305,18 @@ class DeviceGatewayAdapter(Protocol):
     async def set_radius_client_config(
         self, creds: DeviceCredentials, *, config: RadiusClientConfig
     ) -> None: ...
+
+    async def configure_content_filter_rule(
+        self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig
+    ) -> None:
+        """Realizes one content-filtering rule on the device -- a real
+        DNS sinkhole (``rule.value_type == "domain"``) or address-list
+        membership plus a shared enforcement DROP rule
+        (``rule.value_type == "ip_cidr"``). See the MikroTik
+        implementation's own docstring for the full, honest scope this
+        deliberately does and does not cover (no Layer7, no web-proxy, no
+        TLS interception -- ever)."""
+        ...
 
     # -- disconnect / kick -------------------------------------------------
     async def disconnect_device(
@@ -541,6 +570,7 @@ __all__ = [
     "DhcpPoolConfig",
     "PortForwardConfig",
     "RadiusClientConfig",
+    "ContentFilterRuleConfig",
     "ProvisionResult",
     "SpeedTestResult",
     "PingResult",

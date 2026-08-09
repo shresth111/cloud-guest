@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from fastapi import Depends
 
+from app.domains.content_filtering.dependencies import get_content_filter_service
+from app.domains.content_filtering.service import ContentFilterService
 from app.domains.dhcp.dependencies import get_dhcp_service
 from app.domains.dhcp.service import DhcpService
 from app.domains.dns.dependencies import get_dns_service
@@ -67,6 +69,9 @@ def get_network_config_service(
     isp_service: IspService = Depends(get_isp_service),
     router_agent_service: RouterAgentService = Depends(get_router_agent_service),
     router_service: RouterService = Depends(get_router_service),
+    content_filter_service: ContentFilterService = Depends(
+        get_content_filter_service
+    ),
 ) -> NetworkConfigService:
     return NetworkConfigService(
         dhcp_service,
@@ -96,6 +101,11 @@ def get_network_config_service(
         isp_link_lookup=isp_service,
         agent_credential_issuer=router_agent_service,
         router_lookup=router_service,
+        # Real integration point for render_content_filter_rule/
+        # render_content_filter_enforcement: the identical, already-wired
+        # ContentFilterService every other content-filtering endpoint
+        # composes, never a second one.
+        content_filter_lookup=content_filter_service,
     )
 
 

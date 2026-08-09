@@ -73,6 +73,7 @@ from librouteros.exceptions import LibRouterosError
 
 from .contract import (
     ConnectedDevice,
+    ContentFilterRuleConfig,
     DeviceCredentials,
     DeviceDiscoveryResult,
     DeviceHealthResult,
@@ -102,6 +103,21 @@ _DEFAULT_SSH_PORT = 22
 # each other exactly like the original did.
 _PROVISIONING_ENGINE_CONFIG_FILENAME = "cloudguest-config.rsc"
 _PROVISIONING_ENGINE_BACKUP_FILENAME = "cloudguest-backup.backup"
+
+# Content filtering: same real, honest DNS-sinkhole + address-list scope
+# as ``cloud-guest-repo/backend/app/domains/network_config/renderers.py``
+# ``render_content_filter_rule``/``render_content_filter_enforcement`` --
+# see ``configure_content_filter_rule``'s own docstring below. These two
+# literal values are independently duplicated (not imported -- this
+# vendor package cannot depend on ``app.domains``, see module docstring)
+# from ``app.domains.content_filtering.constants``; keeping the literal
+# *values* identical across both copies is what keeps them describing the
+# same real device-side objects.
+_CONTENT_FILTER_SINKHOLE_ADDRESS = "127.0.0.1"
+_CONTENT_FILTER_ADDRESS_LIST_NAME = "wyfyguest-content-filter-blocked"
+_CONTENT_FILTER_ENFORCEMENT_COMMENT = (
+    "Wyfy Guest content filtering: block listed addresses"
+)
 _MAC_ADDRESS_PATTERN = re.compile(
     r"^([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})"
     r"[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})$"
@@ -206,6 +222,17 @@ def _safe_str(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _domain_subdomain_regex(domain: str) -> str:
+    """Ported verbatim from
+    ``network_config/renderers.py::_domain_subdomain_regex`` -- the real
+    RouterOS ``/ip dns static ... regexp=`` pattern matching every
+    subdomain of ``domain`` (never ``domain`` itself; a second, exact-name
+    ``/ip dns static`` entry covers that -- see
+    ``configure_content_filter_rule``'s own docstring)."""
+    escaped = domain.replace(".", r"\.")
+    return f"^.*\\.{escaped}$"
 
 
 def _smallest_enclosing_network(
@@ -1146,6 +1173,115 @@ class MikroTikAdapter:
         finally:
             api.close()
 
+    async def configure_content_filter_rule(
+        self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig
+    ) -> None:
+        """Ported from
+        ``network_config/renderers.py::render_content_filter_rule``/
+        ``render_content_filter_enforcement`` -- the same real RouterOS
+        objects, issued directly over the structured API instead of as
+        script text. See that module's own "Content Filtering" docstring
+        section for the full write-up this ports; summarized here for
+        this file's own "honest scope" convention:
+
+        ## Honest scope: DNS sinkhole + address-list/firewall-filter only
+
+        ``rule.value_type == "domain"`` issues two real
+        ``/ip dns static add`` commands -- an exact-name match and a
+        ``regexp=`` match for every subdomain (RouterOS treats ``name=``
+        and ``regexp=`` as mutually exclusive per entry, so one entry
+        cannot cover both) -- each pointing at
+        :data:`_CONTENT_FILTER_SINKHOLE_ADDRESS` (this platform's own
+        loopback, ``127.0.0.1``: always exists, needs no LAN host
+        actually listening on it, never ARPs a real device). This makes a
+        blocked domain simply fail to resolve for a guest device using
+        this router as its DNS server -- the honest, low-overhead
+        mechanism this platform's own low-power test hardware (a
+        MikroTik hEX lite, documented elsewhere in this codebase) can
+        afford, unlike Layer7 regex matching against every packet's
+        payload.
+
+        ``rule.value_type == "ip_cidr"`` issues one real
+        ``/ip firewall address-list add`` command adding ``rule.value``
+        to :data:`_CONTENT_FILTER_ADDRESS_LIST_NAME`, then calls
+        :meth:`_ensure_content_filter_enforcement_rule` -- a real,
+        read-before-write check for an existing ``/ip firewall filter``
+        DROP rule already matching that whole address-list by its own
+        fixed comment, adding it only if genuinely absent. This avoids
+        genuinely duplicating that DROP rule on the device every time a
+        second, third, ... IP/CIDR rule is configured (the DROP rule
+        matches list *membership*, not any one specific address, so it is
+        only ever needed once per router) -- a real correctness
+        requirement, not a cosmetic one: a populated address-list with no
+        DROP rule referencing it is exactly the "looks wired up but
+        isn't" gap this codebase's own
+        ``app.domains.mac_authorization`` module docstring already called
+        out and fixed for its own whitelist entries before this addition
+        existed.
+
+        ## What this deliberately does not do
+
+        No Layer7 protocol matching, no ``/ip proxy`` web-proxy, and --
+        under no circumstances -- TLS interception (HTTPS MITM) to
+        inspect or block encrypted traffic by content. See
+        ``app.domains.content_filtering``'s own module docstring
+        (cloud-guest-repo) for the full customer-facing scope write-up
+        this ports; that same reasoning applies here unchanged."""
+        await asyncio.to_thread(self._configure_content_filter_rule_sync, creds, rule)
+
+    def _configure_content_filter_rule_sync(
+        self, creds: DeviceCredentials, rule: ContentFilterRuleConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if rule.value_type == "ip_cidr":
+                    api.path("ip", "firewall", "address-list").add(
+                        list=_CONTENT_FILTER_ADDRESS_LIST_NAME,
+                        address=rule.value,
+                        comment=rule.label,
+                    )
+                    self._ensure_content_filter_enforcement_rule(api)
+                else:
+                    domain = rule.value
+                    api.path("ip", "dns", "static").add(
+                        name=domain,
+                        type="A",
+                        address=_CONTENT_FILTER_SINKHOLE_ADDRESS,
+                        comment=rule.label,
+                    )
+                    api.path("ip", "dns", "static").add(
+                        regexp=_domain_subdomain_regex(domain),
+                        type="A",
+                        address=_CONTENT_FILTER_SINKHOLE_ADDRESS,
+                        comment=f"{rule.label} (subdomains)",
+                    )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_content_filter_rule: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _ensure_content_filter_enforcement_rule(self, api) -> None:  # noqa: ANN001
+        """Real read-before-write dedup for the one, router-global
+        ``/ip firewall filter`` DROP rule every ``ip_cidr``-type content
+        filter rule relies on -- see
+        ``configure_content_filter_rule``'s own docstring for why this
+        must exist exactly once, not once per rule."""
+        existing_filters = list(api.path("ip", "firewall", "filter"))
+        already_present = any(
+            row.get("comment") == _CONTENT_FILTER_ENFORCEMENT_COMMENT
+            for row in existing_filters
+        )
+        if not already_present:
+            api.path("ip", "firewall", "filter").add(
+                chain="forward",
+                **{"dst-address-list": _CONTENT_FILTER_ADDRESS_LIST_NAME},
+                action="drop",
+                comment=_CONTENT_FILTER_ENFORCEMENT_COMMENT,
+            )
+
     # ------------------------------------------------------------------
     # queue management (QoS/bandwidth shaping)
     # ------------------------------------------------------------------
@@ -1578,6 +1714,7 @@ class MikroTikAdapter:
             "configure_dhcp_pool": True,
             "configure_port_forward": True,
             "set_radius_client_config": True,
+            "configure_content_filter_rule": True,
             "disconnect_device": True,
             "ping": True,
             "traceroute": True,
