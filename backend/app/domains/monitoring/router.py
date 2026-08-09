@@ -445,8 +445,21 @@ def _alert_rule_response(rule: AlertRule) -> AlertRuleResponse:
     return AlertRuleResponse.model_validate(rule)
 
 
-def _alert_response(alert: Alert) -> AlertResponse:
-    return AlertResponse.model_validate(alert)
+def _alert_response(
+    alert: Alert, router_names: dict[uuid.UUID, str] | None = None
+) -> AlertResponse:
+    """``router_names`` is a real ``{Router.id: Router.name}`` lookup (see
+    ``list_alerts`` below) -- never omitted for a customer-facing call.
+    Confirmed live: the customer dashboard's Alerts page was rendering the
+    raw ``router_id`` UUID as visible text (e.g. "Airtel is up" followed
+    directly by "33683903-abce-4be5-94c2-50ba14f2eb51"), because the
+    frontend had nothing else to fall back to -- this field is the actual
+    fix, not a frontend-only display change, since the frontend never had
+    a router name to show in the first place."""
+    response = AlertResponse.model_validate(alert)
+    if alert.router_id is not None and router_names is not None:
+        response.router_name = router_names.get(alert.router_id)
+    return response
 
 
 def _notification_channel_response(
@@ -643,8 +656,11 @@ async def list_alerts(
         page=page,
         page_size=page_size,
     )
+    router_names = await service.get_router_names_for_alerts(
+        items, organization_id=organization_id
+    )
     payload = AlertListResponse(
-        items=[_alert_response(item) for item in items],
+        items=[_alert_response(item, router_names) for item in items],
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,

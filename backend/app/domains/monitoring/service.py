@@ -1300,6 +1300,31 @@ class AlertService:
             page_size=page_size,
         )
 
+    async def get_router_names_for_alerts(
+        self, alerts: list[Alert], *, organization_id: uuid.UUID | None
+    ) -> dict[uuid.UUID, str]:
+        """Real ``{Router.id: Router.name}`` lookup for a page of alerts --
+        the fix for the raw router UUID a customer's Alerts page was
+        rendering as visible text (confirmed live: "Airtel is up" followed
+        by "33683903-abce-4be5-94c2-50ba14f2eb51" on the actual dashboard).
+        Reuses ``list_routers`` (already composed here for alert-rule
+        evaluation) rather than adding a new per-ID query -- an
+        organization's router count is small enough that fetching the
+        whole roster once per page is cheaper and simpler than N lookups,
+        and this endpoint is already organization-scoped in practice (a
+        customer's own X-Organization-Id), so it's the same roster
+        list_alerts itself is implicitly filtered against. Returns {} (not
+        an error) when organization_id is None -- a GLOBAL-scope caller
+        with no single org to resolve a roster against just sees no names,
+        same "honest, not fabricated" posture ``__init__.py`` establishes
+        elsewhere in this domain."""
+        if organization_id is None or not any(
+            a.router_id is not None for a in alerts
+        ):
+            return {}
+        routers = await self.repository.list_routers(organization_id=organization_id)
+        return {r.id: r.name for r in routers}
+
     async def acknowledge_alert(
         self, alert_id: uuid.UUID, *, user_id: uuid.UUID
     ) -> Alert:

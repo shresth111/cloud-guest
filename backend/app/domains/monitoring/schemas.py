@@ -196,6 +196,13 @@ class AlertResponse(BaseModel):
     organization_id: uuid.UUID | None
     location_id: uuid.UUID | None
     router_id: uuid.UUID | None
+    # Populated by the router-layer response builder from a real router-name
+    # lookup (never a raw ID left for the frontend to display) -- see
+    # list_alerts's own docstring for why the raw UUID reaching a customer's
+    # screen was a real bug, not just a formatting nicety. None whenever
+    # router_id is None (an org/location-scoped alert with no specific
+    # router) or the router itself has since been deleted.
+    router_name: str | None = None
     message: str
     related_health_check_id: uuid.UUID | None
     related_event_id: uuid.UUID | None
