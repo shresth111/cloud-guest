@@ -223,19 +223,31 @@ class WhatsAppProviderProtocol(Protocol):
 
 class LoggingSmsProvider:
     """Honest interim SMS provider -- logs the would-be-sent message
-    instead of calling a real carrier/gateway API. See module docstring."""
+    instead of calling a real carrier/gateway API. See module docstring.
+
+    Logs the full ``message`` (which is how a real OTP code actually
+    reaches an operator while no real SMS_DELIVERY_PROVIDER is configured
+    yet -- see ``Settings.sms_delivery_provider``'s own docstring: this
+    provider IS the intended fallback visibility mechanism, not a
+    stand-in that happens to also work for that). Previously logged only
+    ``message_length``, which meant nobody -- not even an operator with
+    full log/DB access -- could ever read a code back once generated (the
+    DB only ever stores ``hash_otp_code(code)``, one-way, same as a
+    password); that made "logging mode" silently unusable as an actual
+    fallback rather than the honest one its own docstring claims to be."""
 
     async def send(self, phone_number: str, message: str) -> None:
         logger.info(
             "otp_sms_would_send",
-            extra={"phone_number": phone_number, "message_length": len(message)},
+            extra={"phone_number": phone_number, "message": message},
         )
 
 
 class LoggingEmailProvider:
     """Honest interim email provider -- logs the would-be-sent message
     instead of calling a real transactional-email API. See module
-    docstring."""
+    docstring, and ``LoggingSmsProvider``'s own docstring for why the full
+    ``body`` (not just its length) is logged."""
 
     async def send(
         self,
@@ -250,7 +262,7 @@ class LoggingEmailProvider:
             extra={
                 "email": email,
                 "subject": subject,
-                "body_length": len(body),
+                "body": body,
                 "attachment_filename": attachment.filename if attachment else None,
             },
         )
@@ -259,14 +271,15 @@ class LoggingEmailProvider:
 class LoggingWhatsAppProvider:
     """Honest interim WhatsApp provider -- logs the would-be-sent message
     instead of calling a real WhatsApp Business API. Same posture as
-    ``LoggingSmsProvider``/``LoggingEmailProvider`` above, and the default
-    for a fresh checkout (``Settings.whatsapp_delivery_provider ==
-    'logging'``)."""
+    ``LoggingSmsProvider``/``LoggingEmailProvider`` above (including
+    logging the full message/code, not just a length -- see
+    ``LoggingSmsProvider``'s own docstring for why), and the default for a
+    fresh checkout (``Settings.whatsapp_delivery_provider == 'logging'``)."""
 
     async def send(self, phone_number: str, *, code: str, message: str) -> None:
         logger.info(
             "otp_whatsapp_would_send",
-            extra={"phone_number": phone_number, "message_length": len(message)},
+            extra={"phone_number": phone_number, "code": code, "message": message},
         )
 
 
