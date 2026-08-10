@@ -1,0 +1,7 @@
+[Unit]
+Description=Sync FreeRADIUS clients.conf from radius_nas_clients table
+After=docker.service freeradius.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/wyfy/sync_radius_clients.sh

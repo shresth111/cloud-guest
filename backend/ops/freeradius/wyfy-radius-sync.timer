@@ -1,0 +1,10 @@
+[Unit]
+Description=Run wyfy-radius-sync every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
