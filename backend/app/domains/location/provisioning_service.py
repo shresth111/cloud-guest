@@ -155,15 +155,19 @@ password. ``_generate_temporary_password`` below reuses the same ``secrets``
 stdlib module (never ``random``) but composes a password guaranteed to
 contain upper/lower/digit/special characters, matching this codebase's own
 ``RegisterRequest.password`` documented complexity expectation
-(``app.domains.auth.schemas``). ``_generate_username`` derives a candidate
-from the owner's email local-part plus a short random suffix (also via
-``secrets``) -- a real, if minimal, generator, not a hardcoded placeholder.
+(``app.domains.auth.schemas``). ``_generate_username`` used to derive a
+``local-part.random-suffix`` candidate from the owner's email -- changed to
+just use the email itself: the product's own policy is now "username is the
+email" (see ``app.domains.auth.schemas.RegisterRequest`` and
+``app.domains.user.schemas``' own matching relaxation), so there is no
+longer a separate identifier to generate here at all. Still a plain
+function (not hardcoded inline) since ``data.owner.username`` can still
+override it explicitly.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import secrets
 import string
 import uuid
@@ -656,13 +660,9 @@ class ProvisionLocationPreview:
 # password generation" section.
 # ============================================================================
 
-_USERNAME_SUFFIX_ALPHABET = string.ascii_lowercase + string.digits
-
 
 def _generate_username(email: str) -> str:
-    local_part = re.sub(r"[^a-z0-9]", "", email.split("@", 1)[0].lower()) or "owner"
-    suffix = "".join(secrets.choice(_USERNAME_SUFFIX_ALPHABET) for _ in range(5))
-    return f"{local_part}.{suffix}"
+    return email.strip().lower()
 
 
 def _generate_temporary_password(length: int = _TEMPORARY_PASSWORD_LENGTH) -> str:

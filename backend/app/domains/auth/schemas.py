@@ -79,9 +79,15 @@ class RegisterRequest(BaseModel):
     @field_validator("username")
     @classmethod
     def validate_username(cls, value: str) -> str:
-        if not all(char.isalnum() or char in "_-" for char in value):
+        # Product policy is now "username is the email" (see
+        # app.domains.location.provisioning_service's own matching change)
+        # -- @ and . are accepted alongside the original letters/digits/
+        # underscore/hyphen set so an email address itself validates,
+        # without dropping support for a non-email username elsewhere.
+        if not all(char.isalnum() or char in "_-@." for char in value):
             raise ValueError(
-                "Username can only contain letters, numbers, underscores, and hyphens"
+                "Username can only contain letters, numbers, underscores, "
+                "hyphens, @, and ."
             )
         return value.lower()
 

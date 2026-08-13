@@ -1424,10 +1424,11 @@ class TestGenerationHelpers:
         passwords = {_generate_temporary_password() for _ in range(25)}
         assert len(passwords) == 25  # vanishingly unlikely to collide
 
-    def test_generated_username_derives_from_email_local_part(self) -> None:
+    def test_generated_username_is_the_normalized_email(self) -> None:
+        # Product policy: username *is* the email, not a derived
+        # local-part.random-suffix -- see this function's own comment.
         username = _generate_username("Priya.Shah+hotel@Example.com")
-        assert username.startswith("priyashahhotel.")
-        assert len(username) > len("priyashahhotel.")
+        assert username == "priya.shah+hotel@example.com"
 
 
 # ============================================================================

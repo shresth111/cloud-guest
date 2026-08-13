@@ -41,9 +41,13 @@ __all__ = [
 
 
 def _validate_username(value: str) -> str:
-    if not all(char.isalnum() or char in "_-" for char in value):
+    # Mirrors app.domains.auth.schemas.RegisterRequest.validate_username's
+    # identical relaxation -- product policy is now "username is the
+    # email", so @ and . are accepted alongside the original set.
+    if not all(char.isalnum() or char in "_-@." for char in value):
         raise ValueError(
-            "Username can only contain letters, numbers, underscores, and hyphens"
+            "Username can only contain letters, numbers, underscores, "
+            "hyphens, @, and ."
         )
     return value.lower()
 
