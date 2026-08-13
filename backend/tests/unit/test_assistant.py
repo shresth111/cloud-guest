@@ -14,22 +14,22 @@ Covers three real gaps that weren't previously exercised by any test:
    domain's self-service-only posture, see ``service.py``'s module
    docstring).
 2. ``dependencies.build_assistant_provider``'s "empty key -> logging,
-   real key -> Anthropic" selection -- the actual config-driven wiring
+   real key -> real provider" selection -- the actual config-driven wiring
    point a real API key gets dropped into later.
-3. ``AnthropicAssistantProvider.reply``'s actual request shape against the
-   ``anthropic`` SDK version genuinely pinned in ``requirements.txt`` --
-   see ``TestAnthropicProviderRequestShape`` below for a real compatibility
-   bug this caught.
+3. ``LiteLLMAssistantProvider.reply``'s actual call shape against the
+   ``litellm`` version genuinely pinned in ``requirements.txt`` --
+   see ``TestLiteLLMProviderRequestShape`` below for what this guards
+   against (previously a real compatibility bug against the ``anthropic``
+   SDK directly, before this domain moved onto ``litellm``).
 """
 
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
-import httpx
 import pytest
 
 from app.core.config import Settings
@@ -42,8 +42,8 @@ from app.domains.assistant.exceptions import (
 )
 from app.domains.assistant.models import AssistantConversation, AssistantMessage
 from app.domains.assistant.service import (
-    AnthropicAssistantProvider,
     AssistantService,
+    LiteLLMAssistantProvider,
     LoggingAssistantProvider,
 )
 
@@ -320,74 +320,64 @@ class TestBuildAssistantProvider:
         provider = build_assistant_provider(settings=settings)
         assert isinstance(provider, LoggingAssistantProvider)
 
-    def test_configured_api_key_selects_anthropic_provider(self) -> None:
+    def test_configured_api_key_selects_litellm_provider(self) -> None:
         settings = Settings(anthropic_api_key="sk-ant-test-key")
         provider = build_assistant_provider(settings=settings)
-        assert isinstance(provider, AnthropicAssistantProvider)
+        assert isinstance(provider, LiteLLMAssistantProvider)
 
 
-class TestAnthropicProviderRequestShape:
-    """Regression test for a real compatibility bug found while verifying
-    this domain's "ready to just work the moment a real key is added"
-    claim: the ``anthropic`` SDK version genuinely pinned in
-    ``requirements.txt`` at the time (``0.75.0`` -- the version actually
-    running in the deployed Docker image) does not accept the
-    ``output_config`` keyword argument ``AnthropicAssistantProvider.reply``
-    passes to ``messages.create``. Calling it would raise
-    ``TypeError: create() got an unexpected keyword argument
-    'output_config'`` the instant ``Settings.anthropic_api_key`` was ever
-    set -- the exact "code is real but doesn't actually work" failure mode
-    this domain's own docstrings claim *not* to have. Fixed by bumping
-    ``anthropic`` to ``0.120.2`` in ``requirements.txt``.
+class TestLiteLLMProviderRequestShape:
+    """Regression test guarding the call shape
+    ``LiteLLMAssistantProvider.reply`` sends to ``litellm.acompletion`` --
+    this domain moved off the ``anthropic`` SDK directly and onto
+    ``litellm`` so any future provider switch/fallback routing is a config
+    change here rather than a rewrite (see ``service.py``'s docstring on
+    the class). ``litellm.acompletion``'s own request-building/transport
+    correctness is litellm's concern, not this domain's -- what this test
+    actually verifies is *our* call site: the right model string (prefixed
+    for the anthropic integration), the system prompt correctly folded
+    into ``messages`` as a leading ``system``-role entry (litellm's
+    OpenAI-shaped ``messages``, not the anthropic SDK's separate ``system=``
+    kwarg), and the final user message appended last.
 
-    This test never needs a real API key or network access: it monkeypatches
-    ``httpx.AsyncClient.send`` (the transport ``anthropic``'s SDK calls
-    internally) to return a synthetic success response, so the *entire* real
-    call path through ``messages.create`` executes -- including Python's own
-    keyword-argument binding, which is exactly where the incompatibility
-    surfaced. A future downgrade/repin that reintroduces the mismatch fails
-    this test immediately, with no network dependency.
+    Monkeypatches ``litellm.acompletion`` directly (not the HTTP
+    transport) -- that's the actual, documented public entry point our
+    code calls, and monkeypatching it here works because
+    ``LiteLLMAssistantProvider.__init__``'s lazy ``import litellm`` binds
+    to the same module object already patched by this test.
     """
 
-    async def test_reply_request_shape_is_accepted_by_installed_sdk(
+    async def test_reply_calls_litellm_acompletion_with_expected_shape(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        import litellm
+
         captured: dict[str, object] = {}
 
-        async def fake_send(
-            self: httpx.AsyncClient, request: httpx.Request, **kwargs: object
-        ) -> httpx.Response:
-            captured["json"] = json.loads(request.content)
-            return httpx.Response(
-                200,
-                request=request,
-                json={
-                    "id": "msg_test",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": "claude-opus-4-8",
-                    "content": [{"type": "text", "text": "test reply"}],
-                    "stop_reason": "end_turn",
-                    "stop_sequence": None,
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                },
-            )
+        async def fake_acompletion(**kwargs: object) -> SimpleNamespace:
+            captured.update(kwargs)
+            message = SimpleNamespace(content="test reply")
+            choice = SimpleNamespace(message=message)
+            return SimpleNamespace(choices=[choice])
 
-        monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
 
-        provider = AnthropicAssistantProvider(api_key="sk-ant-test-key")
+        provider = LiteLLMAssistantProvider(api_key="sk-ant-test-key")
         reply = await provider.reply(
             conversation_history=[{"role": "user", "content": "earlier message"}],
             new_message="How do I create a voucher?",
         )
 
         assert reply == "test reply"
-        sent = captured["json"]
-        assert isinstance(sent, dict)
-        # The exact parameter whose absence in 0.75.0 caused the bug.
-        assert sent["output_config"] == {"effort": "low"}
-        assert sent["model"] == "claude-opus-4-8"
-        assert sent["messages"][-1] == {
+        assert captured["model"] == "anthropic/claude-opus-4-8"
+        assert captured["api_key"] == "sk-ant-test-key"
+        assert captured["max_tokens"] == 1024
+        assert captured["reasoning_effort"] == "low"
+        messages = captured["messages"]
+        assert isinstance(messages, list)
+        assert messages[0]["role"] == "system"
+        assert "Wyfy Guest" in messages[0]["content"]
+        assert messages[-1] == {
             "role": "user",
             "content": "How do I create a voucher?",
         }

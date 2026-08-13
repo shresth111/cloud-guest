@@ -667,7 +667,8 @@ class Settings(BaseSettings):
         default="",
         description=(
             "Anthropic API key (sk-ant-...) used by "
-            "app.domains.assistant.service.AnthropicAssistantProvider. "
+            "app.domains.assistant.service.LiteLLMAssistantProvider "
+            "(routed through litellm, not the anthropic SDK directly). "
             "Empty = unconfigured -- app.domains.assistant.dependencies"
             ".build_assistant_provider falls back to "
             "LoggingAssistantProvider (keyword-matched canned replies, no "

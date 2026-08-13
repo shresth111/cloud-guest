@@ -3,7 +3,7 @@
 ``build_assistant_provider`` mirrors
 ``app.domains.billing.dependencies.build_payment_gateway``'s exact "one
 plain, FastAPI-DI-framework-free function decides real vs. logging"
-pattern: picks :class:`~.service.AnthropicAssistantProvider` when
+pattern: picks :class:`~.service.LiteLLMAssistantProvider` when
 ``Settings.anthropic_api_key`` is actually set, or
 :class:`~.service.LoggingAssistantProvider` (this deployment's real,
 honest default -- see ``service.py``'s module docstring) otherwise.
@@ -19,9 +19,9 @@ from app.database.session import get_db_session
 
 from .repository import AssistantRepository, AssistantRepositoryProtocol
 from .service import (
-    AnthropicAssistantProvider,
     AssistantProviderProtocol,
     AssistantService,
+    LiteLLMAssistantProvider,
     LoggingAssistantProvider,
 )
 
@@ -47,7 +47,7 @@ def build_assistant_provider(*, settings: Settings) -> AssistantProviderProtocol
     "wire it in for real" step; nothing else changes.
     """
     if settings.anthropic_api_key:
-        return AnthropicAssistantProvider(api_key=settings.anthropic_api_key)
+        return LiteLLMAssistantProvider(api_key=settings.anthropic_api_key)
     return LoggingAssistantProvider()
 
 

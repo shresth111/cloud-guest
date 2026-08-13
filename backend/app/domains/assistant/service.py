@@ -50,11 +50,11 @@ version: a generic WiFi keyword ("connect") is a Python substring of
 "disconnect", and a single "voucher" bucket conflated the staff-facing
 creation flow with the guest-facing redemption flow.
 
-``AnthropicAssistantProvider`` is the real provider, using the official
-``anthropic`` Python SDK -- present and correct, but unreachable until
-``Settings.anthropic_api_key`` is actually set (see
-``dependencies.build_assistant_provider``), the identical "code is real,
-credential is the only missing piece" posture
+``LiteLLMAssistantProvider`` is the real provider, routed through
+``litellm`` rather than a provider SDK directly -- present and correct,
+but unreachable until ``Settings.anthropic_api_key`` is actually set
+(see ``dependencies.build_assistant_provider``), the identical "code is
+real, credential is the only missing piece" posture
 ``app.domains.billing.payment_gateways.StripePaymentGateway``/
 ``RazorpayPaymentGateway`` already establish for this codebase's payment
 integrations.
@@ -429,118 +429,132 @@ class LoggingAssistantProvider:
         return _DEFAULT_REPLY
 
 
-class AnthropicAssistantProvider:
-    """Real ``AssistantProviderProtocol`` implementation, using the
-    official ``anthropic`` Python SDK. Only ever constructed by
+_ASSISTANT_SYSTEM_PROMPT = (
+    "You are the customer support assistant for Wyfy Guest / "
+    "CloudGuest, a WiFi-hotspot management SaaS for hotels, "
+    "cafes, and similar venues. The person chatting with you "
+    "is the venue owner/staff member managing the account, "
+    "not a guest using the WiFi -- answer accordingly.\n\n"
+    "Real product features you can accurately explain:\n"
+    "- Vouchers: staff create voucher plans/series in the "
+    "Vouchers section (validity period, data limit, uses per "
+    "voucher) and generate codes from a plan. Guests redeem "
+    "those codes on the WiFi login page; a redeemed code is "
+    "single-use and does not refresh -- staff must issue a "
+    "new one.\n"
+    "- Routers: each router's status (Online/Offline) on the "
+    "Routers page is based on its last heartbeat/last-seen "
+    "time. An offline router usually means a power or "
+    "internet-uplink problem at the router; it reconnects "
+    "automatically once connectivity returns.\n"
+    "- Guests & connected devices: staff can Block a guest or "
+    "device (prevents reconnecting until unblocked) or "
+    "Disconnect one (ends the current session only) from the "
+    "Guests or Connected Devices section.\n"
+    "- Locations: multi-property accounts manage each "
+    "property from the Locations section and switch between "
+    "them via the location selector in the dashboard header.\n"
+    "- Team & roles: staff are invited from the Team section "
+    "and assigned a role (Owner, Admin, or a custom role) "
+    "that controls what they can see and do.\n"
+    "- Billing: invoices, payment methods, and subscription "
+    "status live in the Billing section.\n"
+    "- Captive portal (guest sign-in screen): configured in "
+    "the Portal section -- headline, welcome message, brand "
+    "color, logo, and which sign-in methods guests see "
+    "(Mobile OTP, Email OTP, Voucher, Social Login), with a "
+    "Live Preview before saving.\n"
+    "- IP addresses / DHCP: guests get an IP from a DHCP "
+    "pool (IP Address Pool section) -- each pool belongs to "
+    "exactly one router, with a range start/end, optional "
+    "gateway IP, and DNS servers. An exhausted range is the "
+    "most common cause of a device not getting an IP.\n"
+    "- VLANs: each VLAN belongs to exactly one router for "
+    "its lifetime (802.1Q tag + trunk interface). Creating a "
+    "VLAN only creates the network segment -- a DHCP Pool "
+    "must be created afterward with its Interface set to "
+    "that VLAN for guests on it to actually get an address. "
+    "A VLAN can have its own separate captive portal.\n"
+    "- Port forwarding: each rule belongs to one router, "
+    "with a protocol (TCP/UDP/both), destination port, "
+    "internal address/port, and an Enabled toggle.\n"
+    "- Internet failover: uplinks are added under Internet "
+    "Failover / ISP Uplinks with a role (Primary/Backup) and "
+    "priority; Auto Failback returns traffic to the primary "
+    "automatically once it's healthy again.\n"
+    "- Trusted devices: a specific MAC address can be "
+    "authorized to skip the captive portal entirely (type + "
+    "optional comment) -- the right tool for staff devices, "
+    "printers, or POS terminals.\n"
+    "- Business Hours: controls when the guest sign-in "
+    "screen is available at all -- toggle each day open/"
+    "closed with times; outside those hours guests see a "
+    "configured 'closed' screen instead of sign-in, which is "
+    "a common cause of 'guests can't connect' reports that "
+    "isn't a router problem.\n"
+    "- Bandwidth/QoS: guest traffic shaping is configured "
+    "through QoS rules on the router; also check the actual "
+    "uplink Download/Upload Mbps on the Internet Connection "
+    "page, since a capped ISP link looks identical to a QoS "
+    "limit from a guest's perspective.\n\n"
+    "Be concise and practical, and answer the actual question "
+    "asked -- e.g. a question about *creating* a voucher is "
+    "about the staff-facing plan/generate flow, not the "
+    "guest-facing redemption flow. Never invent a feature, "
+    "menu location, or behavior you're not sure this product "
+    "has -- if you don't know, say so and tell the customer "
+    "a real support ticket can be raised from their "
+    "dashboard."
+)
+
+
+class LiteLLMAssistantProvider:
+    """Real ``AssistantProviderProtocol`` implementation, routed through
+    ``litellm`` rather than calling a provider SDK directly -- one
+    unified call shape regardless of which underlying LLM provider
+    ``model`` actually points at, so switching providers later (or
+    adding fallback/retry routing) is a config change here, not a
+    rewrite. Only ever constructed by
     ``dependencies.build_assistant_provider`` once
     ``Settings.anthropic_api_key`` is actually set -- see that function
     and this module's own docstring for the "unreachable until
     configured" posture."""
 
     def __init__(self, *, api_key: str, model: str = "claude-opus-4-8") -> None:
-        # Imported lazily so the ``anthropic`` package is only ever
+        # Imported lazily so the ``litellm`` package is only ever
         # touched on the real-provider path -- the logging provider (this
         # deployment's actual default) never needs it importable.
-        import anthropic
+        import litellm
 
-        self._client = anthropic.AsyncAnthropic(api_key=api_key)
-        self._model = model
+        self._litellm = litellm
+        self._api_key = api_key
+        # litellm resolves which provider integration to use from the
+        # model name's ``<provider>/`` prefix -- explicit here rather
+        # than relying on its "claude-* implies anthropic" name-sniffing
+        # fallback, so a future non-Claude model string doesn't silently
+        # misroute.
+        self._model = model if "/" in model else f"anthropic/{model}"
 
     async def reply(
         self, *, conversation_history: list[dict[str, str]], new_message: str
     ) -> str:
-        messages = [
+        messages = [{"role": "system", "content": _ASSISTANT_SYSTEM_PROMPT}]
+        messages += [
             {"role": entry["role"], "content": entry["content"]}
             for entry in conversation_history
         ]
         messages.append({"role": "user", "content": new_message})
-        response = await self._client.messages.create(
+        response = await self._litellm.acompletion(
             model=self._model,
+            api_key=self._api_key,
             max_tokens=1024,
             # A support-chat reply is a short, latency-sensitive turn, not
             # a long-horizon reasoning task -- "low" effort keeps it fast.
-            output_config={"effort": "low"},
-            system=(
-                "You are the customer support assistant for Wyfy Guest / "
-                "CloudGuest, a WiFi-hotspot management SaaS for hotels, "
-                "cafes, and similar venues. The person chatting with you "
-                "is the venue owner/staff member managing the account, "
-                "not a guest using the WiFi -- answer accordingly.\n\n"
-                "Real product features you can accurately explain:\n"
-                "- Vouchers: staff create voucher plans/series in the "
-                "Vouchers section (validity period, data limit, uses per "
-                "voucher) and generate codes from a plan. Guests redeem "
-                "those codes on the WiFi login page; a redeemed code is "
-                "single-use and does not refresh -- staff must issue a "
-                "new one.\n"
-                "- Routers: each router's status (Online/Offline) on the "
-                "Routers page is based on its last heartbeat/last-seen "
-                "time. An offline router usually means a power or "
-                "internet-uplink problem at the router; it reconnects "
-                "automatically once connectivity returns.\n"
-                "- Guests & connected devices: staff can Block a guest or "
-                "device (prevents reconnecting until unblocked) or "
-                "Disconnect one (ends the current session only) from the "
-                "Guests or Connected Devices section.\n"
-                "- Locations: multi-property accounts manage each "
-                "property from the Locations section and switch between "
-                "them via the location selector in the dashboard header.\n"
-                "- Team & roles: staff are invited from the Team section "
-                "and assigned a role (Owner, Admin, or a custom role) "
-                "that controls what they can see and do.\n"
-                "- Billing: invoices, payment methods, and subscription "
-                "status live in the Billing section.\n"
-                "- Captive portal (guest sign-in screen): configured in "
-                "the Portal section -- headline, welcome message, brand "
-                "color, logo, and which sign-in methods guests see "
-                "(Mobile OTP, Email OTP, Voucher, Social Login), with a "
-                "Live Preview before saving.\n"
-                "- IP addresses / DHCP: guests get an IP from a DHCP "
-                "pool (IP Address Pool section) -- each pool belongs to "
-                "exactly one router, with a range start/end, optional "
-                "gateway IP, and DNS servers. An exhausted range is the "
-                "most common cause of a device not getting an IP.\n"
-                "- VLANs: each VLAN belongs to exactly one router for "
-                "its lifetime (802.1Q tag + trunk interface). Creating a "
-                "VLAN only creates the network segment -- a DHCP Pool "
-                "must be created afterward with its Interface set to "
-                "that VLAN for guests on it to actually get an address. "
-                "A VLAN can have its own separate captive portal.\n"
-                "- Port forwarding: each rule belongs to one router, "
-                "with a protocol (TCP/UDP/both), destination port, "
-                "internal address/port, and an Enabled toggle.\n"
-                "- Internet failover: uplinks are added under Internet "
-                "Failover / ISP Uplinks with a role (Primary/Backup) and "
-                "priority; Auto Failback returns traffic to the primary "
-                "automatically once it's healthy again.\n"
-                "- Trusted devices: a specific MAC address can be "
-                "authorized to skip the captive portal entirely (type + "
-                "optional comment) -- the right tool for staff devices, "
-                "printers, or POS terminals.\n"
-                "- Business Hours: controls when the guest sign-in "
-                "screen is available at all -- toggle each day open/"
-                "closed with times; outside those hours guests see a "
-                "configured 'closed' screen instead of sign-in, which is "
-                "a common cause of 'guests can't connect' reports that "
-                "isn't a router problem.\n"
-                "- Bandwidth/QoS: guest traffic shaping is configured "
-                "through QoS rules on the router; also check the actual "
-                "uplink Download/Upload Mbps on the Internet Connection "
-                "page, since a capped ISP link looks identical to a QoS "
-                "limit from a guest's perspective.\n\n"
-                "Be concise and practical, and answer the actual question "
-                "asked -- e.g. a question about *creating* a voucher is "
-                "about the staff-facing plan/generate flow, not the "
-                "guest-facing redemption flow. Never invent a feature, "
-                "menu location, or behavior you're not sure this product "
-                "has -- if you don't know, say so and tell the customer "
-                "a real support ticket can be raised from their "
-                "dashboard."
-            ),
+            reasoning_effort="low",
             messages=messages,
         )
-        text_blocks = [block.text for block in response.content if block.type == "text"]
-        return "".join(text_blocks).strip() or _DEFAULT_REPLY
+        text = response.choices[0].message.content
+        return (text or "").strip() or _DEFAULT_REPLY
 
 
 # ============================================================================
@@ -742,7 +756,7 @@ def _derive_title(initial_message: str | None) -> str | None:
 __all__ = [
     "AssistantProviderProtocol",
     "LoggingAssistantProvider",
-    "AnthropicAssistantProvider",
+    "LiteLLMAssistantProvider",
     "AssistantService",
     "ConversationListResult",
 ]
