@@ -50,6 +50,16 @@ class AgentHeartbeatRequest(BaseModel):
 
     routeros_version: str | None = Field(default=None, max_length=50)
     management_ip_address: str | None = Field(default=None, max_length=45)
+    # The router's own primary WAN (WAN1) address -- reported by
+    # `buildRouterSetupScriptChunks`'s Heartbeat chunk (frontend) once it
+    # started actually addressing WAN interfaces (static IP or a bound
+    # DHCP lease) instead of leaving that a manual on-site step. Distinct
+    # from management_ip_address (the WireGuard tunnel address this
+    # platform dials back into) -- this is the outward-facing address,
+    # already read elsewhere as a fallback management target (see
+    # app.domains.isp.service._resolve_credentials's own
+    # `router.management_ip_address or router.public_ip_address`).
+    public_ip_address: str | None = Field(default=None, max_length=45)
 
 
 class AgentHeartbeatResponse(BaseModel):

@@ -423,6 +423,7 @@ class RouterService:
         requesting_organization_id: uuid.UUID | None = None,
         routeros_version: str | None = None,
         management_ip_address: str | None = None,
+        public_ip_address: str | None = None,
     ) -> Router:
         """Records a liveness signal from (or on behalf of) a router.
 
@@ -455,6 +456,18 @@ class RouterService:
             update_data["routeros_version"] = routeros_version
         if management_ip_address is not None:
             update_data["management_ip_address"] = management_ip_address
+        # The primary WAN's own live address -- reported by the setup
+        # script's heartbeat scheduler (see network_config/renderers-style
+        # `buildRouterSetupScriptChunks`'s "Heartbeat" chunk on the frontend)
+        # alongside management_ip_address, same "device tells us, we just
+        # record it" posture. Distinct from management_ip_address: that one
+        # is the WireGuard tunnel address this platform dials back into;
+        # this is the router's own outward-facing WAN1 IP, already read
+        # elsewhere as a fallback management target
+        # (see app.domains.isp.service._resolve_credentials-style
+        # `router.management_ip_address or router.public_ip_address`).
+        if public_ip_address is not None:
+            update_data["public_ip_address"] = public_ip_address
 
         updated = await self.repository.update_router(router, update_data)
         logger.info(

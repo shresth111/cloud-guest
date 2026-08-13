@@ -140,6 +140,7 @@ class RouterLookupProtocol(Protocol):
         requesting_organization_id: uuid.UUID | None = None,
         routeros_version: str | None = None,
         management_ip_address: str | None = None,
+        public_ip_address: str | None = None,
     ) -> Router: ...
 
     async def update_router(
@@ -307,6 +308,7 @@ class RouterAgentService:
         router: Router,
         routeros_version: str | None = None,
         management_ip_address: str | None = None,
+        public_ip_address: str | None = None,
     ) -> Router:
         """Composes with ``RouterService.heartbeat`` directly -- the real
         device-authenticated counterpart to BE-008's admin-testing
@@ -322,6 +324,7 @@ class RouterAgentService:
             requesting_organization_id=None,
             routeros_version=routeros_version,
             management_ip_address=management_ip_address,
+            public_ip_address=public_ip_address,
         )
         event = AgentHeartbeatReceived(
             router_id=router.id, previous_status=previous_status

@@ -1130,6 +1130,52 @@ class TestAgentHeartbeat:
         )
         assert updated.routeros_version == "7.15"
 
+    async def test_heartbeat_records_public_ip_address(self) -> None:
+        """Mirrors test_heartbeat_refreshes_routeros_version -- the WAN1
+        address `buildRouterSetupScriptChunks`'s Heartbeat chunk now
+        resolves live and reports alongside management_ip_address."""
+        fx = make_services()
+        organization = fx.org_lookup.add()
+        router_device = await make_router(fx, organization, status=RouterStatus.ONLINE)
+        _credential, plaintext = await fx.agent_service.issue_credential_for_router(
+            router_device
+        )
+        identity = await CurrentAgent(
+            FakeRequest(headers={AGENT_CREDENTIAL_HEADER: plaintext}),
+            agent_repository=fx.agent_repo,
+            router_repository=fx.router_repo,
+        )
+
+        updated = await fx.agent_service.heartbeat(
+            router=identity.router, public_ip_address="203.0.113.5"
+        )
+        assert updated.public_ip_address == "203.0.113.5"
+
+    async def test_heartbeat_omitted_public_ip_address_leaves_existing_value(
+        self,
+    ) -> None:
+        """The DHCP-WAN1 case: the recurring scheduled heartbeat omits this
+        key entirely (see the frontend chunk's own comment) rather than
+        send an empty string -- must not blank out a value a previous,
+        live-resolved heartbeat already recorded."""
+        fx = make_services()
+        organization = fx.org_lookup.add()
+        router_device = await make_router(fx, organization, status=RouterStatus.ONLINE)
+        _credential, plaintext = await fx.agent_service.issue_credential_for_router(
+            router_device
+        )
+        identity = await CurrentAgent(
+            FakeRequest(headers={AGENT_CREDENTIAL_HEADER: plaintext}),
+            agent_repository=fx.agent_repo,
+            router_repository=fx.router_repo,
+        )
+        first = await fx.agent_service.heartbeat(
+            router=identity.router, public_ip_address="203.0.113.5"
+        )
+
+        second = await fx.agent_service.heartbeat(router=first)
+        assert second.public_ip_address == "203.0.113.5"
+
 
 # ============================================================================
 # Config pull

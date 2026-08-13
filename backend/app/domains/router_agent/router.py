@@ -97,6 +97,7 @@ async def agent_heartbeat(
         router=identity.router,
         routeros_version=payload.routeros_version,
         management_ip_address=payload.management_ip_address,
+        public_ip_address=payload.public_ip_address,
     )
     await monitoring_service.record_heartbeat(
         component_type=HeartbeatComponentType.ROUTER,
@@ -104,6 +105,7 @@ async def agent_heartbeat(
         payload={
             "routeros_version": payload.routeros_version,
             "management_ip_address": payload.management_ip_address,
+            "public_ip_address": payload.public_ip_address,
             "status": updated.status,
         },
     )
