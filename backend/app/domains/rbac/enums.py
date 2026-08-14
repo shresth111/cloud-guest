@@ -123,6 +123,11 @@ class PermissionModule(StrEnum):
     # for the full, honest RouterOS scope decision this module composes
     # into the network_config push pipeline.
     CONTENT_FILTERING = "content_filtering"
+    # Sales quotations: a branded PDF quotation an operator generates and
+    # emails to a prospective/existing client -- see
+    # app.domains.quotation's own module docstring. GLOBAL-only, same
+    # "belongs to no organization" profile as DEMO_REQUESTS above.
+    QUOTATIONS = "quotations"
 
 
 class OverrideEffect(StrEnum):
