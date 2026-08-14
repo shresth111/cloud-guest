@@ -424,6 +424,13 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.DELETE,
         _A.MANAGE,
     ),
+    # Quotations: CREATE covers the one-shot "generate the PDF + email it"
+    # action (there is no separate draft-then-send step), READ covers
+    # list/get/PDF-download, MANAGE is the catch-all for any future
+    # void/resend action -- mirrors DEMO_REQUESTS's own simple shape, plus
+    # CREATE since (unlike a demo request) a quotation is always
+    # operator-initiated, never a public submission.
+    PermissionModule.QUOTATIONS: (_A.CREATE, _A.READ, _A.MANAGE),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -482,6 +489,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.SUPPORT_TICKETS: "Support Tickets",
     PermissionModule.DEMO_REQUESTS: "Demo Requests",
     PermissionModule.CONTENT_FILTERING: "Content Filtering",
+    PermissionModule.QUOTATIONS: "Quotations",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -592,6 +600,12 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # config -- identical ScopeType.ROUTER reasoning as
     # PermissionModule.QOS/FIREWALL/DHCP/VLAN above.
     PermissionModule.CONTENT_FILTERING: ScopeType.ROUTER,
+    # A quotation belongs to no organization/location/router at all -- its
+    # client is very often a prospect who is not yet a platform user or
+    # member of any organization (see app.domains.quotation.models's own
+    # module docstring) -- identical ScopeType.GLOBAL reasoning as
+    # PermissionModule.DEMO_REQUESTS's own entry above.
+    PermissionModule.QUOTATIONS: ScopeType.GLOBAL,
 }
 
 
@@ -772,6 +786,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # permissions, same reasoning as this role's own
             # SYSTEM_SETTINGS: NONE override above.
             _M.DEMO_REQUESTS: _L.NONE,
+            # QUOTATIONS is GLOBAL-only -- identical reasoning.
+            _M.QUOTATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -796,6 +812,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # DEMO_REQUESTS is GLOBAL-only -- see MSP Owner's own identical
             # override above.
             _M.DEMO_REQUESTS: _L.NONE,
+            # QUOTATIONS is GLOBAL-only -- identical reasoning.
+            _M.QUOTATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -834,6 +852,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # DEMO_REQUESTS is GLOBAL-only -- see MSP Owner's own identical
             # override above.
             _M.DEMO_REQUESTS: _L.NONE,
+            # QUOTATIONS is GLOBAL-only -- identical reasoning.
+            _M.QUOTATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -860,6 +880,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # DEMO_REQUESTS is GLOBAL-only -- see MSP Owner's own identical
             # override above.
             _M.DEMO_REQUESTS: _L.NONE,
+            # QUOTATIONS is GLOBAL-only -- identical reasoning.
+            _M.QUOTATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1072,8 +1094,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         default_level=_L.READ,
         # SYSTEM_SETTINGS is GLOBAL-only (see MODULE_NARROWEST_SCOPE) -- an
         # ORGANIZATION-scoped role can never hold any of its permissions.
-        # DEMO_REQUESTS is the identical case (also GLOBAL-only).
-        overrides={_M.SYSTEM_SETTINGS: _L.NONE, _M.DEMO_REQUESTS: _L.NONE},
+        # DEMO_REQUESTS/QUOTATIONS are the identical case (also GLOBAL-only).
+        overrides={
+            _M.SYSTEM_SETTINGS: _L.NONE,
+            _M.DEMO_REQUESTS: _L.NONE,
+            _M.QUOTATIONS: _L.NONE,
+        },
     ),
     SystemRoleDefinition(
         name="Auditor",
@@ -1090,6 +1116,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # DEMO_REQUESTS is GLOBAL-only -- see Read Only's own identical
             # override above.
             _M.DEMO_REQUESTS: _L.NONE,
+            # QUOTATIONS is GLOBAL-only -- identical reasoning.
+            _M.QUOTATIONS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
