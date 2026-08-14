@@ -368,18 +368,23 @@ class VoucherRepository:
         return int(result.rowcount or 0)
 
     # -- redemption analytics (Phase 1 BhaiFi-parity) -----------------------------
-    # ``Voucher`` itself carries no ``organization_id``/``location_id`` of its
-    # own (only ``VoucherBatch`` does -- see models.py) -- every query below
-    # joins through ``VoucherBatch`` for tenant scoping, real server-side SQL
-    # rather than a Python-side scan, mirroring ``get_batch_status_counts``'s
-    # identical "hand-written statement for what GenericRepository can't
-    # express" precedent. Composed by
-    # ``app.domains.analytics.voucher_analytics`` via
-    # ``VoucherRepositoryProtocol`` directly (not through ``VoucherService``):
-    # these are pure, read-only aggregate counts with no business rule to
-    # apply first, unlike every other analytics-composed domain (which reads
-    # through that domain's own service to get its authorization/business
-    # logic for free).
+    # ``Voucher.organization_id`` is denormalized from ``VoucherBatch
+    # .organization_id`` at voucher-creation time (see models.py) -- lets
+    # organization scoping below hit the real ``(organization_id,
+    # redeemed_at)``/``(organization_id, use_count)`` composite indexes
+    # directly instead of only being expressible through a join.
+    # ``location_id`` is not denormalized (a batch's location rarely changes
+    # what's being asked here), so it still filters through the same
+    # ``VoucherBatch`` join every query below already needs anyway (for
+    # ``batch_name``/``plan_name`` in the row-level listing, or simply
+    # because ``GenericRepository`` can't express these hand-written
+    # aggregates -- mirrors ``get_batch_status_counts``'s identical
+    # precedent). Composed by ``app.domains.analytics.voucher_analytics``
+    # via ``VoucherRepositoryProtocol`` directly (not through
+    # ``VoucherService``): these are pure, read-only aggregate counts with
+    # no business rule to apply first, unlike every other analytics-composed
+    # domain (which reads through that domain's own service to get its
+    # authorization/business logic for free).
 
     def _tenant_scoped_conditions(
         self,
@@ -387,7 +392,7 @@ class VoucherRepository:
         organization_id: uuid.UUID,
         location_id: uuid.UUID | None,
     ) -> list[object]:
-        conditions: list[object] = [VoucherBatch.organization_id == organization_id]
+        conditions: list[object] = [Voucher.organization_id == organization_id]
         if location_id is not None:
             conditions.append(VoucherBatch.location_id == location_id)
         return conditions
@@ -506,10 +511,15 @@ class VoucherRepository:
         )
         total_items = int((await self.session.execute(count_statement)).scalar_one())
 
+        # ``Voucher.id`` is a final tiebreak on both branches -- two rows
+        # sharing the same use_count/redeemed_at (even down to the
+        # microsecond) would otherwise have unstable relative order across
+        # pages, since offset/limit pagination over an unstable sort can
+        # return the same row twice or skip one entirely between requests.
         order_clause = (
-            (Voucher.use_count.desc(), Voucher.redeemed_at.desc())
+            (Voucher.use_count.desc(), Voucher.redeemed_at.desc(), Voucher.id)
             if order_by_use_count
-            else (Voucher.redeemed_at.desc(),)
+            else (Voucher.redeemed_at.desc(), Voucher.id)
         )
         statement = (
             select(
