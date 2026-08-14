@@ -121,7 +121,10 @@ from .schemas import (
 )
 from .service import AnalyticsService
 from .validators import validate_date_range
-from .voucher_analytics_schemas import VoucherRedemptionAnalyticsResponse
+from .voucher_analytics_schemas import (
+    VoucherRedemptionAnalyticsResponse,
+    VoucherRedemptionListResponse,
+)
 from .voucher_analytics_service import VoucherAnalyticsService
 
 router = APIRouter(tags=["Analytics"])
@@ -129,6 +132,24 @@ router = APIRouter(tags=["Analytics"])
 
 def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """A caller-supplied query-param ``datetime`` with no UTC offset (e.g.
+    ``2026-08-14T00:00:00``, no trailing ``Z``/``+00:00``) parses as
+    *naive*, not "midnight UTC" -- comparing it against ``start > end``
+    would still work (naive-vs-naive), but binding it as a query parameter
+    against a ``timestamptz`` column (every ``redeemed_at``/``started_at``/
+    etc. this router filters on) silently reinterprets it in the DB
+    session's own timezone instead of UTC, which is a real, if subtle,
+    off-by-however-many-hours bug for any caller that omits the offset.
+    Treating a naive value as UTC (rather than raising) matches how every
+    other UTC boundary in this module -- ``datetime.now(UTC)`` below,
+    ``validators.day_bounds_utc`` -- already assumes UTC as the implicit
+    timezone throughout this domain."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
 
 
 def _resolve_window(
@@ -140,6 +161,7 @@ def _resolve_window(
     ``DEFAULT_ANALYTICS_WINDOW_DAYS``-day window ending now (mirrors this
     domain's own ``validators.day_bounds_utc``'s "sane default when the
     caller supplies nothing" posture)."""
+    start_date, end_date = _as_utc(start_date), _as_utc(end_date)
     validate_date_range(start_date, end_date)
     end = end_date or datetime.now(UTC)
     start = start_date or (end - timedelta(days=DEFAULT_ANALYTICS_WINDOW_DAYS))
@@ -552,6 +574,61 @@ async def get_voucher_redemption_analytics(
     return build_response(
         success=True,
         message="Voucher redemption analytics retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/analytics/voucher-redemptions/log",
+    response_model=ApiResponse[VoucherRedemptionListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("analytics.read", scope=ScopeType.ORGANIZATION))
+    ],
+)
+async def list_voucher_redemptions(
+    request: Request,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    location_id: uuid.UUID | None = Query(default=None),
+    start_date: datetime | None = Query(default=None),
+    end_date: datetime | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    sort: str = Query(
+        default="recent",
+        pattern="^(recent|most_used)$",
+        description=(
+            "'recent' -- every redemption in the window, most recent first "
+            "(Voucher Redemption Log). 'most_used' -- ranked by use_count "
+            "descending (Most Redeemed Vouchers); pair with a small "
+            "page_size and start_date/end_date bounding the current month "
+            "to get a top-N-this-month list."
+        ),
+    ),
+    service: VoucherAnalyticsService = Depends(get_voucher_analytics_service),
+):
+    """Row-level counterpart to ``GET /analytics/voucher-redemptions``
+    above -- one row per redeemed voucher rather than an aggregate count,
+    for cloudguest-foundation's "Voucher Redemption Log"/"Most Redeemed
+    Vouchers" reports (``UserReports.tsx``'s own ``UNAVAILABLE_REASON``
+    documented both as not-yet-backed by a real endpoint -- this is that
+    endpoint). Same ``[start, end]`` window resolution as every other
+    analytics endpoint in this router (a trailing default window when
+    unspecified, not an unbounded "every voucher ever" scan)."""
+    start, end = _resolve_window(start_date, end_date)
+    payload = await service.list_voucher_redemptions(
+        organization_id=organization_id,
+        location_id=location_id,
+        start=start,
+        end=end,
+        page=page,
+        page_size=page_size,
+        order_by_use_count=sort == "most_used",
+    )
+    return build_response(
+        success=True,
+        message="Voucher redemptions retrieved",
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )

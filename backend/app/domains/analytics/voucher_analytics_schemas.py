@@ -28,4 +28,39 @@ class VoucherRedemptionAnalyticsResponse(BaseModel):
     by_plan: list[VoucherRedemptionByPlanResponse]
 
 
-__all__ = ["VoucherRedemptionByPlanResponse", "VoucherRedemptionAnalyticsResponse"]
+class VoucherRedemptionEntryResponse(BaseModel):
+    """One row of ``GET /analytics/voucher-redemptions/log`` -- the
+    row-level counterpart to ``VoucherRedemptionByPlanResponse`` above
+    (which only ever carries a plan_id, never a human-readable name,
+    since a per-plan *count* has no single voucher/batch to name). Powers
+    cloudguest-foundation's "Voucher Redemption Log"/"Most Redeemed
+    Vouchers" reports (``UserReports.tsx``)."""
+
+    id: uuid.UUID
+    code: str
+    batch_id: uuid.UUID
+    batch_name: str
+    plan_id: uuid.UUID | None
+    plan_name: str | None
+    use_count: int
+    redeemed_at: str
+    last_used_at: str | None
+    redeemed_identifier: str | None
+
+
+class VoucherRedemptionListResponse(BaseModel):
+    items: list[VoucherRedemptionEntryResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+
+
+__all__ = [
+    "VoucherRedemptionByPlanResponse",
+    "VoucherRedemptionAnalyticsResponse",
+    "VoucherRedemptionEntryResponse",
+    "VoucherRedemptionListResponse",
+]

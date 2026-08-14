@@ -423,6 +423,7 @@ class VoucherService:
             rows = [
                 {
                     "batch_id": batch.id,
+                    "organization_id": batch.organization_id,
                     "plan_id": batch.plan_id,
                     "code": code,
                     "status": VoucherStatus.UNUSED.value,
@@ -1170,6 +1171,7 @@ class VoucherService:
             rows = [
                 {
                     "batch_id": batch.id,
+                    "organization_id": batch.organization_id,
                     "plan_id": batch.plan_id,
                     "code": code,
                     "status": VoucherStatus.UNUSED.value,

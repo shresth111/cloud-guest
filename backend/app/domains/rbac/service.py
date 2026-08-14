@@ -113,12 +113,29 @@ class RBACService:
         scope_type: ScopeType | None = None,
         is_active: bool | None = None,
     ) -> list[Role]:
-        return await self.repository.list_roles(
+        roles = await self.repository.list_roles(
             organization_id=requesting_organization_id,
             include_global=True,
             scope_type=scope_type,
             is_active=is_active,
         )
+        if requesting_organization_id is not None:
+            # A caller operating inside a tenant's own organization context
+            # (e.g. a customer dashboard's Staff Access "invite" flow) must
+            # never be offered platform-wide roles (Super Admin, Platform
+            # Admin, Platform Support, ...) to hand out to an invited staff
+            # member -- those are seeded at ScopeType.GLOBAL (see
+            # app.domains.rbac.seed's own scope-assignment table) precisely
+            # because they're platform-operator-only, never tenant-
+            # assignable. `_assert_no_role_escalation` already stops the
+            # *assignment* itself from succeeding, but listing them here at
+            # all is its own bug: it invites a confused customer to pick a
+            # role that (at best) errors out, or (at worst) reads as if this
+            # platform lets any Organization Owner request Super Admin.
+            # Callers with no organization context (the master/platform
+            # console managing the full role catalog) are unaffected.
+            roles = [role for role in roles if role.scope_type != ScopeType.GLOBAL]
+        return roles
 
     async def get_role(
         self, role_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None

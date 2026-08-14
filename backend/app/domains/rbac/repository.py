@@ -24,7 +24,7 @@ from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 
-from .enums import ScopeType
+from .enums import CUSTOMER_HIDDEN_AUDIT_ACTIONS, ScopeType
 from .models import (
     AuditLogEntry,
     LocationRole,
@@ -615,6 +615,17 @@ class RBACRepository:
         conditions = [AuditLogEntry.is_deleted.is_(False)]
         if organization_id is not None:
             conditions.append(AuditLogEntry.organization_id == organization_id)
+            # Organization-scoped callers are the customer dashboard's own
+            # Admin Logs page -- never show platform-infrastructure events
+            # (WireGuard tunnel lifecycle, ...) a small business owner has
+            # no other UI for and no reason to see. Unconditional (not an
+            # opt-in flag like ``exclude_view_events`` below) because this
+            # is a hard "never customer-facing" product rule, not a noise
+            # preference. A platform-level caller (``organization_id is
+            # None``) is unaffected and still sees everything.
+            conditions.append(
+                AuditLogEntry.action.notin_(CUSTOMER_HIDDEN_AUDIT_ACTIONS)
+            )
         if actor_user_id is not None:
             conditions.append(AuditLogEntry.actor_user_id == actor_user_id)
         if action is not None:

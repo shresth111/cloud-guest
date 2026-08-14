@@ -1246,14 +1246,47 @@ class TestCrossTenantIsolation:
         await make_role(
             repo, "Org B Role", scope_type=ScopeType.ORGANIZATION, organization_id=org_b
         )
-        await make_role(repo, "Global Role", scope_type=ScopeType.GLOBAL)
+        # An org-assignable *template* role -- organization_id is NULL (like
+        # every seeded role a tenant can actually use: Reception Staff,
+        # Location Manager, ...) but its scope_type is ORGANIZATION/LOCATION,
+        # not GLOBAL, so it must still be visible to every org.
+        await make_role(
+            repo, "Template Role", scope_type=ScopeType.LOCATION, organization_id=None
+        )
 
         roles = await service.list_roles(requesting_organization_id=org_a)
 
         names = {r.name for r in roles}
         assert "Org A Role" in names
-        assert "Global Role" in names
+        assert "Template Role" in names
         assert "Org B Role" not in names
+
+    async def test_list_roles_excludes_platform_global_roles_for_org_caller(
+        self,
+    ) -> None:
+        """A caller listing roles from within an organization context (e.g.
+        a customer dashboard's Staff Access "invite" flow) must never be
+        offered platform-only roles like Super Admin/Platform Admin/Platform
+        Support -- those are seeded at ScopeType.GLOBAL specifically because
+        they're platform-operator-only. Assigning one would already be
+        blocked server-side by ``_assert_no_role_escalation``, but *listing*
+        it here is its own bug: it invites a confused Organization Owner to
+        pick a role that, at best, errors out on assignment."""
+        service, repo, _cache = make_service()
+        org_a = uuid.uuid4()
+        await make_role(
+            repo, "Org A Role", scope_type=ScopeType.ORGANIZATION, organization_id=org_a
+        )
+        await make_role(repo, "Super Admin", scope_type=ScopeType.GLOBAL)
+
+        org_scoped_roles = await service.list_roles(requesting_organization_id=org_a)
+        platform_roles = await service.list_roles(requesting_organization_id=None)
+
+        assert "Super Admin" not in {r.name for r in org_scoped_roles}
+        assert "Org A Role" in {r.name for r in org_scoped_roles}
+        # A caller with no organization context (the master/platform
+        # console) is unaffected and still sees the full role catalog.
+        assert "Super Admin" in {r.name for r in platform_roles}
 
     async def test_global_role_is_visible_to_every_organization(self) -> None:
         service, repo, _cache = make_service()

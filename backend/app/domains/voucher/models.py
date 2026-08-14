@@ -290,6 +290,21 @@ class Voucher(BaseModel):
         ForeignKey("voucher_batches.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # Denormalized from VoucherBatch.organization_id at voucher-creation
+    # time -- mirrors app.domains.guest.models.GuestSession.organization_id's
+    # identical rationale (see that column's own docstring): every
+    # analytics query in this domain (VoucherRepository's redemption
+    # aggregate/listing methods) is tenant-scoped by organization_id on
+    # every call, and without this column that scoping can only be
+    # expressed by joining through VoucherBatch, which also means no
+    # composite (organization_id, redeemed_at)/(organization_id, use_count)
+    # index is possible for those queries' ORDER BY -- see the indexes
+    # below. Immutable after creation, like GuestSession's own copy.
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
     # Denormalized from VoucherBatch.plan_id at voucher-creation time (see
     # VoucherBatch.plan_id's own docstring) -- lets a redeeming caller
     # (GuestService._assign_voucher_queue) resolve this voucher's own
@@ -323,6 +338,15 @@ class Voucher(BaseModel):
         Index("ix_vouchers_plan_id", "plan_id"),
         Index("ix_vouchers_code", "code", unique=True),
         Index("ix_vouchers_status", "status"),
+        Index("ix_vouchers_organization_id", "organization_id"),
+        # Support VoucherRepository.list_redeemed_vouchers's two sort modes
+        # (backend/app/domains/analytics's "Voucher Redemption Log"/"Most
+        # Redeemed Vouchers" reports) without a full sort of the org's
+        # entire redeemed-voucher history on every page.
+        Index(
+            "ix_vouchers_org_redeemed_at", "organization_id", "redeemed_at"
+        ),
+        Index("ix_vouchers_org_use_count", "organization_id", "use_count"),
     )
 
     def is_post_redemption_expired(self, *, now: datetime) -> bool:

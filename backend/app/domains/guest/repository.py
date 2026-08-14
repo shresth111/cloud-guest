@@ -157,6 +157,17 @@ class GuestRepositoryProtocol(Protocol):
         sort_order: SortOrder = SortOrder.DESC,
     ) -> tuple[list[GuestSession], PaginationMeta]: ...
 
+    async def list_sessions_in_range(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[GuestSession], PaginationMeta]: ...
+
     async def list_sessions_for_guest(
         self, guest_id: uuid.UUID, *, limit: int | None = None
     ) -> list[GuestSession]: ...
@@ -436,6 +447,57 @@ class GuestRepository:
             sort_by=sort_by,
             sort_order=sort_order,
         )
+
+    async def list_sessions_in_range(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[GuestSession], PaginationMeta]:
+        """Real server-side ``[start, end)`` filtering on ``started_at`` --
+        ``list_sessions``/``GenericRepository.paginate`` above can't express
+        a range (``apply_filters`` only ever emits ``column == value``/
+        ``column.in_(...)``, see ``app.database.utils.filters
+        .apply_filters``), which previously forced callers needing a real
+        date-bounded session listing (``cloudguest-foundation``'s Bandwidth
+        & Cost / Bandwidth by Location reports) to over-fetch the most
+        recent N sessions and filter client-side -- silently truncating any
+        older-but-in-range day once a location's session volume exceeded
+        that client-side page cap. A hand-written statement instead, the
+        same "``GenericRepository`` can't express this" precedent
+        ``app.domains.voucher.repository.VoucherRepository
+        .list_redeemed_vouchers`` already established for its own
+        domain."""
+        conditions = [
+            GuestSession.organization_id == organization_id,
+            GuestSession.started_at >= start,
+            GuestSession.started_at < end,
+            GuestSession.is_deleted.is_(False),
+        ]
+        if location_id is not None:
+            conditions.append(GuestSession.location_id == location_id)
+
+        count_statement = (
+            select(func.count()).select_from(GuestSession).where(*conditions)
+        )
+        total_items = int((await self.session.execute(count_statement)).scalar_one())
+
+        statement = (
+            select(GuestSession)
+            .where(*conditions)
+            .order_by(GuestSession.started_at.desc(), GuestSession.id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        result = await self.session.execute(statement)
+        rows = list(result.scalars().all())
+        params = PageParams(page=page, page_size=page_size)
+        meta = PaginationMeta.from_total(params, total_items)
+        return rows, meta
 
     async def list_sessions_for_guest(
         self, guest_id: uuid.UUID, *, limit: int | None = None

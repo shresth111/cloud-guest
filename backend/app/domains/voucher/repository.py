@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
@@ -24,10 +25,37 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
-from app.database.utils.pagination import PaginationMeta
+from app.database.utils.pagination import PageParams, PaginationMeta
 
 from .constants import VoucherStatus
 from .models import Voucher, VoucherBatch, VoucherPlan, VoucherSeries
+
+
+@dataclass(frozen=True, slots=True)
+class VoucherRedemptionRow:
+    """One redeemed voucher, denormalized with its batch/plan *names* --
+    the org-wide, date-ranged listing this module's ``count_vouchers_
+    redeemed``/``get_redemption_counts_by_plan`` (aggregate-only) can't
+    answer: "every individual redemption, who redeemed it, when, from
+    which batch/plan" (the real gap
+    ``cloudguest-foundation``'s ``UserReports.tsx`` UNAVAILABLE_REASON
+    documented for "Voucher Redemption Log"/"Most Redeemed Vouchers").
+    Selected as plain columns (not a full ``Voucher`` ORM row) so the one
+    query below can pull the batch/plan names via a join instead of a
+    second per-row lookup -- ``plan_name`` is ``None`` for a voucher whose
+    ``plan_id`` is ``NULL`` (see ``Voucher.plan_id``'s own docstring: not
+    every voucher was generated under a named plan)."""
+
+    id: uuid.UUID
+    code: str
+    batch_id: uuid.UUID
+    batch_name: str
+    plan_id: uuid.UUID | None
+    plan_name: str | None
+    use_count: int
+    redeemed_at: datetime
+    last_used_at: datetime | None
+    redeemed_identifier: str | None
 
 
 class VoucherRepositoryProtocol(Protocol):
@@ -144,6 +172,18 @@ class VoucherRepositoryProtocol(Protocol):
         start: datetime,
         end: datetime,
     ) -> list[tuple[uuid.UUID | None, int]]: ...
+
+    async def list_redeemed_vouchers(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        page: int,
+        page_size: int,
+        order_by_use_count: bool = False,
+    ) -> tuple[list[VoucherRedemptionRow], PaginationMeta]: ...
 
 
 class VoucherRepository:
@@ -328,18 +368,23 @@ class VoucherRepository:
         return int(result.rowcount or 0)
 
     # -- redemption analytics (Phase 1 BhaiFi-parity) -----------------------------
-    # ``Voucher`` itself carries no ``organization_id``/``location_id`` of its
-    # own (only ``VoucherBatch`` does -- see models.py) -- every query below
-    # joins through ``VoucherBatch`` for tenant scoping, real server-side SQL
-    # rather than a Python-side scan, mirroring ``get_batch_status_counts``'s
-    # identical "hand-written statement for what GenericRepository can't
-    # express" precedent. Composed by
-    # ``app.domains.analytics.voucher_analytics`` via
-    # ``VoucherRepositoryProtocol`` directly (not through ``VoucherService``):
-    # these are pure, read-only aggregate counts with no business rule to
-    # apply first, unlike every other analytics-composed domain (which reads
-    # through that domain's own service to get its authorization/business
-    # logic for free).
+    # ``Voucher.organization_id`` is denormalized from ``VoucherBatch
+    # .organization_id`` at voucher-creation time (see models.py) -- lets
+    # organization scoping below hit the real ``(organization_id,
+    # redeemed_at)``/``(organization_id, use_count)`` composite indexes
+    # directly instead of only being expressible through a join.
+    # ``location_id`` is not denormalized (a batch's location rarely changes
+    # what's being asked here), so it still filters through the same
+    # ``VoucherBatch`` join every query below already needs anyway (for
+    # ``batch_name``/``plan_name`` in the row-level listing, or simply
+    # because ``GenericRepository`` can't express these hand-written
+    # aggregates -- mirrors ``get_batch_status_counts``'s identical
+    # precedent). Composed by ``app.domains.analytics.voucher_analytics``
+    # via ``VoucherRepositoryProtocol`` directly (not through
+    # ``VoucherService``): these are pure, read-only aggregate counts with
+    # no business rule to apply first, unlike every other analytics-composed
+    # domain (which reads through that domain's own service to get its
+    # authorization/business logic for free).
 
     def _tenant_scoped_conditions(
         self,
@@ -347,7 +392,7 @@ class VoucherRepository:
         organization_id: uuid.UUID,
         location_id: uuid.UUID | None,
     ) -> list[object]:
-        conditions: list[object] = [VoucherBatch.organization_id == organization_id]
+        conditions: list[object] = [Voucher.organization_id == organization_id]
         if location_id is not None:
             conditions.append(VoucherBatch.location_id == location_id)
         return conditions
@@ -427,5 +472,80 @@ class VoucherRepository:
         result = await self.session.execute(statement)
         return [(plan_id, count) for plan_id, count in result.all()]
 
+    async def list_redeemed_vouchers(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        page: int,
+        page_size: int,
+        order_by_use_count: bool = False,
+    ) -> tuple[list[VoucherRedemptionRow], PaginationMeta]:
+        """Powers ``VoucherAnalyticsService.list_voucher_redemptions`` --
+        the row-level counterpart to ``count_vouchers_redeemed``/
+        ``get_redemption_counts_by_plan`` above (same join/tenant-scoping/
+        date-range conditions, real rows instead of a count).
+        ``order_by_use_count=True`` is "Most Redeemed Vouchers": ranked by
+        how many times each voucher has been used (``Voucher.use_count`` --
+        real for a ``max_uses_per_voucher > 1`` reusable code, not just
+        0-or-1), falling back to ``redeemed_at`` descending as a tiebreak
+        either way so the ordering is always fully deterministic (no
+        "different page 2 on a re-run" surprise from two rows sharing a
+        use_count)."""
+        conditions = [
+            *self._tenant_scoped_conditions(
+                organization_id=organization_id, location_id=location_id
+            ),
+            Voucher.redeemed_at.isnot(None),
+            Voucher.redeemed_at >= start,
+            Voucher.redeemed_at < end,
+            Voucher.is_deleted.is_(False),
+        ]
+        count_statement = (
+            select(func.count())
+            .select_from(Voucher)
+            .join(VoucherBatch, Voucher.batch_id == VoucherBatch.id)
+            .where(*conditions)
+        )
+        total_items = int((await self.session.execute(count_statement)).scalar_one())
 
-__all__ = ["VoucherRepositoryProtocol", "VoucherRepository"]
+        # ``Voucher.id`` is a final tiebreak on both branches -- two rows
+        # sharing the same use_count/redeemed_at (even down to the
+        # microsecond) would otherwise have unstable relative order across
+        # pages, since offset/limit pagination over an unstable sort can
+        # return the same row twice or skip one entirely between requests.
+        order_clause = (
+            (Voucher.use_count.desc(), Voucher.redeemed_at.desc(), Voucher.id)
+            if order_by_use_count
+            else (Voucher.redeemed_at.desc(), Voucher.id)
+        )
+        statement = (
+            select(
+                Voucher.id,
+                Voucher.code,
+                Voucher.batch_id,
+                VoucherBatch.name.label("batch_name"),
+                Voucher.plan_id,
+                VoucherPlan.name.label("plan_name"),
+                Voucher.use_count,
+                Voucher.redeemed_at,
+                Voucher.last_used_at,
+                Voucher.redeemed_identifier,
+            )
+            .join(VoucherBatch, Voucher.batch_id == VoucherBatch.id)
+            .outerjoin(VoucherPlan, Voucher.plan_id == VoucherPlan.id)
+            .where(*conditions)
+            .order_by(*order_clause)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        result = await self.session.execute(statement)
+        rows = [VoucherRedemptionRow(**row._mapping) for row in result.all()]
+        params = PageParams(page=page, page_size=page_size)
+        meta = PaginationMeta.from_total(params, total_items)
+        return rows, meta
+
+
+__all__ = ["VoucherRepositoryProtocol", "VoucherRepository", "VoucherRedemptionRow"]

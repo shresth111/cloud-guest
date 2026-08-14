@@ -881,3 +881,30 @@ class AuditAction(StrEnum):
     # platform support agent) -- see
     # app.domains.support_tickets.service.TicketService.add_reply.
     SUPPORT_TICKET_REPLY_ADDED = "support_ticket_reply_added"
+
+
+# Actions that must never surface on an organization-scoped audit query --
+# concretely, the customer dashboard's own Admin Logs -> "Account Activity"
+# section (``app.domains.audit.router.search_audit_log_entries``, the only
+# org-scoped caller of ``RBACRepository.search_audit_log_entries``).
+#
+# WireGuard tunnel lifecycle events are platform/backend infrastructure --
+# the tunnel between this platform and a router -- never a concept the
+# product exposes to a customer anywhere else in the dashboard (there is no
+# "WireGuard"/"tunnel" UI on the customer side at all, by design). Surfacing
+# raw entries like "WireGuard tunnel created for router 'X'" in a small
+# business owner's own activity log is both meaningless jargon to that
+# audience and a leak of backend implementation detail the rest of the
+# product deliberately keeps master-console-only.
+#
+# A platform-level caller (``organization_id is None``, the master console
+# reviewing the full cross-tenant trail) is unaffected -- this constant is
+# only consulted when an organization scope is present, see
+# ``RBACRepository.search_audit_log_entries``.
+CUSTOMER_HIDDEN_AUDIT_ACTIONS: frozenset[str] = frozenset(
+    {
+        AuditAction.WIREGUARD_TUNNEL_CREATED,
+        AuditAction.WIREGUARD_TUNNEL_ROTATED,
+        AuditAction.WIREGUARD_TUNNEL_REVOKED,
+    }
+)

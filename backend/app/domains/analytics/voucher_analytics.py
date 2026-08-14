@@ -28,9 +28,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from app.database.utils.pagination import PaginationMeta
+from app.domains.voucher.repository import VoucherRedemptionRow
+
 
 class VoucherRedemptionLookupProtocol(Protocol):
-    """The three read-only aggregate methods this module needs from the
+    """The read-only aggregate/listing methods this module needs from the
     real ``VoucherRepository`` -- reused directly, never reimplemented."""
 
     async def count_vouchers_issued(
@@ -59,6 +62,18 @@ class VoucherRedemptionLookupProtocol(Protocol):
         start: datetime,
         end: datetime,
     ) -> list[tuple[uuid.UUID | None, int]]: ...
+
+    async def list_redeemed_vouchers(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        page: int,
+        page_size: int,
+        order_by_use_count: bool = False,
+    ) -> tuple[list[VoucherRedemptionRow], PaginationMeta]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,10 +129,44 @@ async def compute_voucher_redemption_analytics(
     )
 
 
+async def list_voucher_redemptions(
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID | None,
+    start: datetime,
+    end: datetime,
+    page: int,
+    page_size: int,
+    order_by_use_count: bool,
+    voucher_lookup: VoucherRedemptionLookupProtocol,
+) -> tuple[list[VoucherRedemptionRow], PaginationMeta]:
+    """Row-level counterpart to :func:`compute_voucher_redemption_analytics`
+    above -- "Voucher Redemption Log" (``order_by_use_count=False``, every
+    redemption in the window, most recent first) and "Most Redeemed
+    Vouchers" (``order_by_use_count=True``) are the same underlying query,
+    just a different sort -- see ``VoucherRedemptionRow.list_redeemed_
+    vouchers``'s own docstring for why both share one repository method
+    rather than two near-identical ones. A thin passthrough (the real work
+    is one SQL query in ``VoucherRepository.list_redeemed_vouchers``), kept
+    as its own function anyway to match this module's "every capability
+    goes through a plain function, not the service calling the protocol
+    directly" shape."""
+    return await voucher_lookup.list_redeemed_vouchers(
+        organization_id=organization_id,
+        location_id=location_id,
+        start=start,
+        end=end,
+        page=page,
+        page_size=page_size,
+        order_by_use_count=order_by_use_count,
+    )
+
+
 __all__ = [
     "VoucherRedemptionLookupProtocol",
     "VoucherRedemptionByPlan",
     "VoucherRedemptionAnalytics",
     "compute_redemption_rate",
     "compute_voucher_redemption_analytics",
+    "list_voucher_redemptions",
 ]
