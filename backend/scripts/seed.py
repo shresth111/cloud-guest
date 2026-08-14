@@ -53,10 +53,24 @@ from app.database.session import SessionLocal
 from app.domains.auth.models import User
 from app.domains.auth.password import PasswordManager
 from app.domains.auth.repository import AuthRepository, AuthRepositoryProtocol
+
+# Location/Organization/Router are never referenced by name below -- imported
+# solely so their model classes get mapped into SQLAlchemy's shared
+# declarative registry before UserRole's own string ForeignKey("locations.id")/
+# ForeignKey("organizations.id")/ForeignKey("routers.id") columns (see
+# app.domains.rbac.models.UserRole) try to resolve at flush time. The real
+# app always has all three loaded transitively (every domain's router module
+# gets imported by app.main), so this only ever surfaced here, a script that
+# imports a deliberately narrow slice of the app -- see run_seed's own
+# "Foreign key ... could not find table" crash on user-role assignment
+# without this.
+from app.domains.location.models import Location  # noqa: F401
+from app.domains.organization.models import Organization  # noqa: F401
 from app.domains.rbac.enums import ScopeType
 from app.domains.rbac.models import UserRole
 from app.domains.rbac.repository import RBACRepository, RBACRepositoryProtocol
 from app.domains.rbac.seed import SeedSummary, seed_rbac
+from app.domains.router.models import Router  # noqa: F401
 from app.domains.router_provisioning.models import ConfigTemplate
 from app.domains.router_provisioning.repository import (
     RouterProvisioningRepository,
