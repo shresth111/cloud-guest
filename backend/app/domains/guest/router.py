@@ -685,18 +685,44 @@ async def list_guest_sessions(
     router_id: uuid.UUID | None = Query(default=None),
     guest_id: uuid.UUID | None = Query(default=None),
     status_filter: GuestSessionStatus | None = Query(default=None, alias="status"),
+    start_date: datetime | None = Query(
+        default=None,
+        description=(
+            "Real server-side [start_date, end_date) filter on started_at, "
+            "for a caller needing a real date-bounded listing (e.g. "
+            "cloudguest-foundation's Bandwidth & Cost / Bandwidth by "
+            "Location reports) instead of over-fetching the most recent N "
+            "sessions and filtering client-side. Requires an organization "
+            "context (start_date/end_date are ignored for a platform-level "
+            "caller with no organization_id) and, when given, takes the "
+            "router_id/guest_id/status filters out of scope -- pass only "
+            "location_id alongside it."
+        ),
+    ),
+    end_date: datetime | None = Query(default=None),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: GuestService = Depends(get_guest_service),
 ):
-    sessions, meta = await service.list_sessions(
-        requesting_organization_id=requesting_organization_id,
-        location_id=location_id,
-        router_id=router_id,
-        guest_id=guest_id,
-        status=status_filter,
-        page=page,
-        page_size=page_size,
-    )
+    has_real_range = start_date is not None and end_date is not None
+    if has_real_range and requesting_organization_id is not None:
+        sessions, meta = await service.list_sessions_in_range(
+            organization_id=requesting_organization_id,
+            location_id=location_id,
+            start=start_date,
+            end=end_date,
+            page=page,
+            page_size=page_size,
+        )
+    else:
+        sessions, meta = await service.list_sessions(
+            requesting_organization_id=requesting_organization_id,
+            location_id=location_id,
+            router_id=router_id,
+            guest_id=guest_id,
+            status=status_filter,
+            page=page,
+            page_size=page_size,
+        )
     payload = GuestSessionListResponse(
         items=[_session_response(s) for s in sessions],
         page=meta.page,

@@ -2270,6 +2270,29 @@ class GuestService:
             page=page, page_size=page_size, filters=filters or None
         )
 
+    async def list_sessions_in_range(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[GuestSession], object]:
+        """Real ``[start, end)`` session listing -- see
+        ``GuestRepository.list_sessions_in_range``'s own docstring for why
+        this exists alongside ``list_sessions`` above rather than extending
+        it."""
+        return await self.repository.list_sessions_in_range(
+            organization_id=organization_id,
+            location_id=location_id,
+            start=start,
+            end=end,
+            page=page,
+            page_size=page_size,
+        )
+
     async def disconnect_session(
         self,
         *,
