@@ -54,6 +54,11 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 88
 target-version = "py313"
+# vendor/ is a third-party package's source, vendored verbatim into the
+# Docker build context (see the commit that added vendor/wyfy-device-gateway)
+# -- lint this team's own code against these rules, not an upstream
+# package's own style.
+exclude = ["vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
