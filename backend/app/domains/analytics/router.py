@@ -134,6 +134,24 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    """A caller-supplied query-param ``datetime`` with no UTC offset (e.g.
+    ``2026-08-14T00:00:00``, no trailing ``Z``/``+00:00``) parses as
+    *naive*, not "midnight UTC" -- comparing it against ``start > end``
+    would still work (naive-vs-naive), but binding it as a query parameter
+    against a ``timestamptz`` column (every ``redeemed_at``/``started_at``/
+    etc. this router filters on) silently reinterprets it in the DB
+    session's own timezone instead of UTC, which is a real, if subtle,
+    off-by-however-many-hours bug for any caller that omits the offset.
+    Treating a naive value as UTC (rather than raising) matches how every
+    other UTC boundary in this module -- ``datetime.now(UTC)`` below,
+    ``validators.day_bounds_utc`` -- already assumes UTC as the implicit
+    timezone throughout this domain."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
+
+
 def _resolve_window(
     start_date: datetime | None, end_date: datetime | None
 ) -> tuple[datetime, datetime]:
@@ -143,6 +161,7 @@ def _resolve_window(
     ``DEFAULT_ANALYTICS_WINDOW_DAYS``-day window ending now (mirrors this
     domain's own ``validators.day_bounds_utc``'s "sane default when the
     caller supplies nothing" posture)."""
+    start_date, end_date = _as_utc(start_date), _as_utc(end_date)
     validate_date_range(start_date, end_date)
     end = end_date or datetime.now(UTC)
     start = start_date or (end - timedelta(days=DEFAULT_ANALYTICS_WINDOW_DAYS))
