@@ -879,6 +879,61 @@ async def generate_provisioning_token(
     )
 
 
+@router.post(
+    "/routers/{router_id}/agent-credential/regenerate",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def regenerate_agent_credential(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    router_service: RouterService = Depends(get_router_service),
+    agent_service: RouterAgentService = Depends(get_router_agent_service),
+):
+    """Re-issues this router's persistent ``app.domains.router_agent``
+    credential in place -- ``RouterAgentService.issue_credential_for_router``
+    (see its own docstring: rotates an existing row, new hash/expiry/
+    rotation_count, un-revoked; ``router_id`` is unique so there is never a
+    second row) already supports this for *any* router status, unlike
+    ``generate_provisioning_token``/``provisioning_check_in`` above, which
+    are deliberately gated to ``PENDING_PROVISIONING``/``PROVISIONING``
+    only (a fresh *device enrollment*, not a config refresh).
+
+    Exists for the Master Console's "regenerate setup script" flow
+    (``buildRouterSetupScriptChunks``, cloudguest-foundation): re-running
+    the script generator against an already-``ONLINE`` router (to add a
+    WAN, change load-balancing/failover config, etc.) needs a plaintext
+    agent credential to embed, but that plaintext is disclosed exactly
+    once at issuance and never retrievable again (see
+    ``app.domains.network_config.renderers`` module docstring's own
+    "Netwatch" section for the identical problem it already solved the
+    same way, by rotating rather than trying to recover the old one).
+    Going through the full provisioning-token/check-in dance instead would
+    additionally require first rewinding the router to
+    ``PENDING_PROVISIONING`` -- the real, purpose-built path for that is
+    ``RouterService.reset_to_pending_provisioning``, but that method is
+    only ever invoked as a *factory-reset* completion step (see its own
+    docstring) and fires a ``ROUTER_FACTORY_RESET`` audit entry -- wrong
+    semantics for "the device is fine, just refreshing its script."
+    Router status is left completely untouched here."""
+    router_device = await router_service.get_router(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    _credential, plaintext = await agent_service.issue_credential_for_router(
+        router_device
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Agent credential regenerated -- store it now, it will not be "
+            "shown again"
+        ),
+        data={"agent_credential": plaintext},
+        request_id=_request_id(request),
+    )
+
+
 # ============================================================================
 # Device-facing zero-touch provisioning endpoint
 # ============================================================================
