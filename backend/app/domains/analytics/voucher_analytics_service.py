@@ -30,9 +30,12 @@ from .voucher_analytics import (
     VoucherRedemptionLookupProtocol,
     compute_voucher_redemption_analytics,
 )
+from .voucher_analytics import list_voucher_redemptions as _list_voucher_redemptions
 from .voucher_analytics_schemas import (
     VoucherRedemptionAnalyticsResponse,
     VoucherRedemptionByPlanResponse,
+    VoucherRedemptionEntryResponse,
+    VoucherRedemptionListResponse,
 )
 
 
@@ -70,6 +73,53 @@ class VoucherAnalyticsService:
                 )
                 for row in analytics.by_plan
             ],
+        )
+
+    async def list_voucher_redemptions(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        page: int,
+        page_size: int,
+        order_by_use_count: bool,
+    ) -> VoucherRedemptionListResponse:
+        rows, meta = await _list_voucher_redemptions(
+            organization_id=organization_id,
+            location_id=location_id,
+            start=start,
+            end=end,
+            page=page,
+            page_size=page_size,
+            order_by_use_count=order_by_use_count,
+            voucher_lookup=self.voucher_lookup,
+        )
+        return VoucherRedemptionListResponse(
+            items=[
+                VoucherRedemptionEntryResponse(
+                    id=row.id,
+                    code=row.code,
+                    batch_id=row.batch_id,
+                    batch_name=row.batch_name,
+                    plan_id=row.plan_id,
+                    plan_name=row.plan_name,
+                    use_count=row.use_count,
+                    redeemed_at=row.redeemed_at.isoformat(),
+                    last_used_at=(
+                        row.last_used_at.isoformat() if row.last_used_at else None
+                    ),
+                    redeemed_identifier=row.redeemed_identifier,
+                )
+                for row in rows
+            ],
+            page=meta.page,
+            page_size=meta.page_size,
+            total_items=meta.total_items,
+            total_pages=meta.total_pages,
+            has_next=meta.has_next,
+            has_previous=meta.has_previous,
         )
 
 
