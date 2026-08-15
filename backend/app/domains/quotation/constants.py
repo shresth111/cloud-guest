@@ -32,6 +32,10 @@ from enum import StrEnum
 
 QUOTATION_COMPANY_LEGAL_NAME = "Infovertias Technologies Pvt Ltd"
 QUOTATION_PRODUCT_NAME = "WyfyGuest"
+# Corporate Identification Number -- India's MCA-issued registration number
+# for QUOTATION_COMPANY_LEGAL_NAME, same "exact, non-negotiable legal copy"
+# reasoning as the two constants above (see module docstring).
+QUOTATION_COMPANY_CIN = "U58201DL2024PTC437197"
 
 # Prefix for the human-readable quotation_number shown on the PDF/UI --
 # derived from the row's own UUID id (see models.py), never a separate
@@ -55,6 +59,7 @@ class QuotationStatus(StrEnum):
 __all__ = [
     "QUOTATION_COMPANY_LEGAL_NAME",
     "QUOTATION_PRODUCT_NAME",
+    "QUOTATION_COMPANY_CIN",
     "QUOTATION_NUMBER_PREFIX",
     "QuotationStatus",
 ]
