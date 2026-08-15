@@ -17,33 +17,36 @@ page-geometry constants, and the same ``getSampleStyleSheet()`` base styles
 composition of those same primitives, never a copy-paste of either existing
 renderer.
 
-## No embedded logo image
+## Embedded logo image
 
-Every PDF renderer already in this codebase (``invoice_pdf.py``,
+Every *other* PDF renderer in this codebase (``invoice_pdf.py``,
 ``voucher_pdf.py``, ``analytics.export``) is text-only -- none embeds a
-raster/vector logo image. The frontend's own real logo assets
-(``cloudguest-foundation/public/brand/*.svg``) are SVG-only; ``reportlab``
-cannot render SVG natively without adding ``svglib`` as a brand-new
-dependency, and no PNG/raster export of the logo exists anywhere in either
-repo. Rather than inventing a new logo asset or adding a new PDF-adjacent
-dependency for this one feature, this renderer follows the exact
-established convention: a bold, prominent **text** header carrying the
-required branding verbatim (``constants.QUOTATION_PRODUCT_NAME``/
-``constants.QUOTATION_COMPANY_LEGAL_NAME``), styled as the document's
-title -- consistent with how every other PDF in this codebase presents its
-own issuer identity.
+raster/vector logo image, because the frontend's own real logo assets
+(``cloudguest-foundation/public/brand/*.svg``) are SVG-only and
+``reportlab`` cannot render SVG natively without ``svglib``, a dependency
+this codebase has never needed until now. Rather than adding that
+dependency (and paying its SVG-parsing cost on every single PDF render),
+``assets/wyfy-guest-logo.png`` is a one-time, build-time raster export
+(via ``rsvg-convert``) of the exact same current, live brand asset
+(``cloudguest-foundation/public/brand/lockup-horizontal.svg`` -- the
+purple/indigo shield-and-wifi mark next to the "Wyfy Guest" wordmark,
+the same one rendered in the product's own UI) -- never regenerated at
+request time, just a static file shipped in this domain's own package
+and drawn once per PDF via ``reportlab.platypus.Image``.
 """
 
 from __future__ import annotations
 
 import io
 from decimal import Decimal
+from pathlib import Path
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import (
+    Image,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -51,8 +54,20 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from .constants import QUOTATION_COMPANY_LEGAL_NAME, QUOTATION_PRODUCT_NAME
+from .constants import (
+    QUOTATION_COMPANY_CIN,
+    QUOTATION_COMPANY_LEGAL_NAME,
+    QUOTATION_PRODUCT_NAME,
+)
 from .models import Quotation, QuotationLineItem
+
+# Real pixel dimensions of assets/wyfy-guest-logo.png (1496x238, rendered
+# from the live brand SVG at 8x its base 187x29.75 viewBox scale for print-
+# quality sharpness) -- LOGO_WIDTH/LOGO_HEIGHT below preserve that exact
+# aspect ratio at a print-reasonable on-page size, not an arbitrary guess.
+_LOGO_PATH = Path(__file__).parent / "assets" / "wyfy-guest-logo.png"
+_LOGO_WIDTH = 6.5 * cm
+_LOGO_HEIGHT = _LOGO_WIDTH * (238 / 1496)
 
 
 def _amount(value: Decimal) -> str:
@@ -75,11 +90,6 @@ def render_quotation_pdf(
         bottomMargin=1.5 * cm,
     )
     styles = getSampleStyleSheet()
-    brand_style = ParagraphStyle(
-        "QuotationBrand",
-        parent=styles["Title"],
-        textColor=colors.HexColor("#2C3E50"),
-    )
 
     table_style = TableStyle(
         [
@@ -101,8 +111,10 @@ def render_quotation_pdf(
     )
 
     story = [
-        Paragraph(QUOTATION_PRODUCT_NAME, brand_style),
+        Image(str(_LOGO_PATH), width=_LOGO_WIDTH, height=_LOGO_HEIGHT, hAlign="LEFT"),
+        Spacer(1, 0.2 * cm),
         Paragraph(QUOTATION_COMPANY_LEGAL_NAME, styles["Normal"]),
+        Paragraph(f"CIN: {QUOTATION_COMPANY_CIN}", styles["Normal"]),
         Spacer(1, 0.3 * cm),
         Paragraph("QUOTATION", styles["Heading1"]),
         Spacer(1, 0.1 * cm),
