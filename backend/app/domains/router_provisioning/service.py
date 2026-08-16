@@ -55,6 +55,15 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from app.domains.location.models import Location
+from app.domains.provisioning_engine.device_adapters import (
+    DeviceCredentials,
+    get_device_adapter,
+)
+from app.domains.provisioning_engine.exceptions import (
+    ProvisionDeviceConnectionError,
+    ProvisionDeviceOperationError,
+    ProvisionMissingCredentialsError,
+)
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router.enums import RouterHealthStatus, RouterStatus
@@ -137,6 +146,8 @@ class RouterLookupProtocol(Protocol):
     async def get_by_serial_number(self, serial_number: str) -> Router: ...
 
     async def get_by_mac_address(self, mac_address: str) -> Router: ...
+
+    def get_decrypted_api_secret(self, router: Router) -> str | None: ...
 
     async def create_router(
         self,
@@ -264,12 +275,20 @@ class RouterProvisioningService:
         *,
         queue_dispatcher: QueueDispatcherProtocol,
         audit_writer: AuditLogWriter | None = None,
+        # Same injectable-resolver shape
+        # `provisioning_engine.ProvisioningEngineService` already uses for
+        # its own real device calls -- lets a test substitute a fake
+        # adapter instead of hitting the real MikroTik/SSH code path (or
+        # `ProvisionMissingCredentialsError`, for a router with no
+        # credentials on file) every time `apply_version` is exercised.
+        device_adapter_resolver=get_device_adapter,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.location_lookup = location_lookup
         self.queue_dispatcher = queue_dispatcher
         self.audit_writer = audit_writer
+        self._get_device_adapter = device_adapter_resolver
 
     # ========================================================================
     # Config templates
@@ -792,7 +811,19 @@ class RouterProvisioningService:
             ),
             metadata={"target_version_id": str(target.id)},
         )
-        return new_version
+        # Immediately apply the draft -- callers (Master Console's "Roll
+        # back" button) present rollback as one action, not a two-step
+        # "draft, then separately remember to apply it" flow, and
+        # apply_version is now what actually closes the real device-push
+        # loop (see that method's own comment). Reuses apply_version
+        # directly rather than duplicating its push/complete logic here.
+        applied_version, _job = await self.apply_version(
+            actor_user_id=actor_user_id,
+            router_id=router.id,
+            version_id=new_version.id,
+            requesting_organization_id=requesting_organization_id,
+        )
+        return applied_version
 
     async def apply_version(
         self,
@@ -835,7 +866,103 @@ class RouterProvisioningService:
                 "updated_by": actor_user_id,
             },
         )
-        return updated_version, job
+
+        # Close the real seam this module's own docstring flagged as
+        # waiting for a caller: previously nothing ever transitioned this
+        # job past "queued" -- Postgres said "pending apply" forever while
+        # the real router never received anything. Performed inline
+        # (synchronous with the request) rather than via a background
+        # worker, matching the same real-adapter-in-the-request-path
+        # pattern this codebase's own `POST /console` (provisioning_engine)
+        # already uses for a raw device command. A push failure still
+        # leaves a clean, correctly-FAILED job/version (never a silently
+        # stuck "queued"/"pending_apply" pair) -- see
+        # `_push_version_and_complete`'s own docstring.
+        final_job = await self._push_version_and_complete(
+            router, job, updated_version
+        )
+        final_version = await self.repository.get_version(updated_version.id)
+        return (final_version or updated_version), final_job
+
+    async def _push_version_and_complete(
+        self,
+        router: Router,
+        job: ProvisioningJob,
+        version: ConfigVersion,
+    ) -> ProvisioningJob:
+        """Performs the real device push for a CONFIG_PUSH/INITIAL_CONFIG
+        job and reports the outcome back through `complete_provisioning_job`
+        -- the exact seam this module's docstring already described,
+        closed here with the same real MikroTik adapter
+        `app.domains.provisioning_engine` already uses for its own,
+        working config-push pipeline (imported directly, not re-implemented
+        -- see that module's `device_adapters.py`). Never raises: a
+        credential/connection/device failure here always resolves to a
+        cleanly FAILED job (via `complete_provisioning_job(success=False)`)
+        rather than an unhandled exception that would leave the caller's
+        `apply_version`/`rollback_to_version` response looking successful
+        while the job/version are actually stuck mid-flight."""
+        started = await self.start_provisioning_job(job.id)
+        try:
+            credentials = self._resolve_device_credentials(router)
+            adapter = self._get_device_adapter(router.vendor)
+            await adapter.push_config(
+                credentials, config_content=version.rendered_content
+            )
+        except (
+            ProvisionMissingCredentialsError,
+            ProvisionDeviceConnectionError,
+            ProvisionDeviceOperationError,
+        ) as exc:
+            logger.warning(
+                "provisioning_job_device_push_failed",
+                extra={
+                    "job_id": str(job.id),
+                    "router_id": str(router.id),
+                    "error": str(exc),
+                },
+            )
+            return await self.complete_provisioning_job(
+                started.id, success=False, error_message=str(exc)
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never let
+            # an unexpected error leave the job stuck instead of FAILED.
+            logger.exception(
+                "provisioning_job_device_push_unexpected_error",
+                extra={"job_id": str(job.id), "router_id": str(router.id)},
+            )
+            return await self.complete_provisioning_job(
+                started.id, success=False, error_message=str(exc)
+            )
+        return await self.complete_provisioning_job(started.id, success=True)
+
+    async def _complete_job_immediately(
+        self, job: ProvisioningJob
+    ) -> ProvisioningJob:
+        """For job types whose real work (per `_complete_job_success`) is
+        entirely a platform-side database change -- BACKUP, RESTORE,
+        FACTORY_RESET, none of which involve a real device call by this
+        module's own existing design -- there is no device I/O to wait on,
+        so `queued -> running -> succeeded` can happen synchronously,
+        in-process, right here. This is what actually closes the "job sits
+        queued forever" gap for these three job types."""
+        started = await self.start_provisioning_job(job.id)
+        return await self.complete_provisioning_job(started.id, success=True)
+
+    def _resolve_device_credentials(self, router: Router) -> DeviceCredentials:
+        """Same resolution `provisioning_engine.ProvisioningEngineService`
+        already uses for its own real device calls -- kept here as a thin,
+        duplicate-but-tiny wrapper (rather than importing that service's
+        private method) so this module's only real dependency on
+        `provisioning_engine` is its already-public `device_adapters`
+        module, not an internal method of its service class."""
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.router_lookup.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            raise ProvisionMissingCredentialsError(router.id)
+        return DeviceCredentials(
+            host=host, username=router.api_username, password=secret
+        )
 
     # ========================================================================
     # Provisioning queue
@@ -1138,12 +1265,18 @@ class RouterProvisioningService:
         source_version = await self.repository.get_latest_applied_version(router.id)
         if source_version is None:
             raise NoAppliedConfigToBackupError(router.id)
-        return await self._enqueue_job(
+        job = await self._enqueue_job(
             router=router,
             job_type=ProvisioningJobType.BACKUP,
             payload={"source_version_id": str(source_version.id)},
             requested_by_user_id=actor_user_id,
         )
+        # Unlike CONFIG_PUSH, a backup is a snapshot of the platform's own
+        # already-stored `rendered_content` (see `_complete_job_success`'s
+        # BACKUP branch) -- no real device I/O is involved by this job
+        # type's own design, so completing it immediately, in-process, is
+        # both correct and safe (no adapter/credentials needed at all).
+        return await self._complete_job_immediately(job)
 
     async def restore_backup(
         self,
@@ -1167,12 +1300,23 @@ class RouterProvisioningService:
             RouterEventType.RESTORE_QUEUED,
             message=f"Restore from backup version {backup.version_number} queued",
         )
-        return await self._enqueue_job(
+        job = await self._enqueue_job(
             router=router,
             job_type=ProvisioningJobType.RESTORE,
             payload={"backup_version_id": str(backup.id)},
             requested_by_user_id=actor_user_id,
         )
+        # As designed today, RESTORE only makes the backup's stored content
+        # the router's new *current version of record* (see
+        # `_complete_job_success`'s RESTORE branch) -- it does not itself
+        # re-push that content to the physical device. Completing
+        # immediately is correct for that existing scope; actually
+        # re-pushing the restored config to the device is a real, separate
+        # follow-up (call `apply_version` on the resulting version, the
+        # same way `rollback_to_version` now does) if "Restore" is meant to
+        # mean "make the device match this old config again," not just
+        # "make our records point at it."
+        return await self._complete_job_immediately(job)
 
     async def factory_reset(
         self,
@@ -1188,12 +1332,22 @@ class RouterProvisioningService:
         await self._record_event(
             router, RouterEventType.FACTORY_RESET_QUEUED, message="Factory reset queued"
         )
-        return await self._enqueue_job(
+        job = await self._enqueue_job(
             router=router,
             job_type=ProvisioningJobType.FACTORY_RESET,
             payload={},
             requested_by_user_id=actor_user_id,
         )
+        # As designed today, "factory reset" here means the *platform's*
+        # own tracking of this router flips back to pending_provisioning
+        # (see `_complete_job_success`'s FACTORY_RESET branch, which calls
+        # `RouterService.reset_to_pending_provisioning`) -- it does not
+        # itself send a real reset-configuration command to the device (no
+        # adapter method for that exists yet anywhere in this codebase).
+        # Completing immediately is correct for that existing scope; a
+        # real device-side factory reset is separate, new work, not part
+        # of closing this queue-consumer gap.
+        return await self._complete_job_immediately(job)
 
     async def rotate_secret(
         self,
