@@ -37,6 +37,7 @@ from app.domains.location.models import Location
 from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
+from app.domains.provisioning_engine.exceptions import ProvisionDeviceConnectionError
 from app.domains.router.crypto import decrypt_secret
 from app.domains.router.enums import RouterHealthStatus, RouterStatus
 from app.domains.router.exceptions import (
@@ -644,12 +645,32 @@ class FakeRouterProvisioningRepository:
 # ============================================================================
 
 
-def make_services():
+class FakeDeviceAdapter:
+    """Stands in for the real MikroTik/SSH adapter
+    ``RouterProvisioningService._push_version_and_complete`` now calls --
+    ``push_config`` just records the call and returns, so
+    ``apply_version``'s real device-push step succeeds by default in every
+    test that doesn't specifically care about push failure (see
+    ``push_failure_adapter`` below for that case)."""
+
+    def __init__(self, *, fail_with: Exception | None = None) -> None:
+        self.fail_with = fail_with
+        self.pushed: list[str] = []
+
+    async def push_config(self, credentials, *, config_content: str) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.pushed.append(config_content)
+
+
+def make_services(*, device_adapter: FakeDeviceAdapter | None = None):
     """Builds a real ``RouterService`` (wired against small in-memory fakes,
     mirroring ``test_router.py``'s own ``make_service``) plus a
     ``RouterProvisioningService`` composed against it -- the same
     composition wiring ``app.domains.router_provisioning.dependencies``
-    uses in production."""
+    uses in production. ``device_adapter`` defaults to a
+    ``FakeDeviceAdapter`` that always succeeds -- pass one built with
+    ``fail_with=...`` to exercise the push-failure path instead."""
     org_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup(organization_lookup=org_lookup)
     router_repo = FakeRouterRepository()
@@ -663,6 +684,7 @@ def make_services():
         provisioning_token_ttl_hours=24,
     )
 
+    fake_adapter = device_adapter if device_adapter is not None else FakeDeviceAdapter()
     provisioning_repo = FakeRouterProvisioningRepository()
     queue_dispatcher = FakeQueueDispatcher()
     provisioning_service = RouterProvisioningService(
@@ -671,6 +693,7 @@ def make_services():
         location_lookup,
         queue_dispatcher=queue_dispatcher,
         audit_writer=shared_audit,
+        device_adapter_resolver=lambda _vendor: fake_adapter,
     )
     return (
         provisioning_service,
@@ -703,6 +726,14 @@ async def make_router(
         location_id=location.id,
         requesting_organization_id=None,
         name="Front Desk AP",
+        # Device connection credentials -- needed since apply_version now
+        # actually resolves and pushes through them (see
+        # RouterProvisioningService._resolve_device_credentials); a router
+        # with none of these raises ProvisionMissingCredentialsError, which
+        # most tests here aren't specifically exercising.
+        management_ip_address="10.0.0.1",
+        api_username="test-api",
+        api_secret="test-secret",
         serial_number=f"SN-{uuid.uuid4()}",
         mac_address=_unique_mac(),
         model="hAP ac2",
@@ -1146,7 +1177,10 @@ class TestConfigProfileAndVersions:
             )
 
     async def _setup_draft_version(
-        self, *, router_status: RouterStatus = RouterStatus.ONLINE
+        self,
+        *,
+        router_status: RouterStatus = RouterStatus.ONLINE,
+        device_adapter: FakeDeviceAdapter | None = None,
     ):
         (
             service,
@@ -1157,7 +1191,7 @@ class TestConfigProfileAndVersions:
             org_lookup,
             queue_dispatcher,
             audit,
-        ) = make_services()
+        ) = make_services(device_adapter=device_adapter)
         organization = org_lookup.add()
         router_device = await make_router(
             router_service, location_lookup, organization, status=router_status
@@ -1193,8 +1227,14 @@ class TestConfigProfileAndVersions:
             version_id=version.id,
             requesting_organization_id=None,
         )
-        assert updated_version.status == ConfigVersionStatus.PENDING_APPLY.value
-        assert job.status == ProvisioningJobStatus.QUEUED.value
+        # apply_version now performs the real device push and reports the
+        # outcome synchronously (see RouterProvisioningService's own
+        # "single seam" comment) -- with the default, always-succeeding
+        # FakeDeviceAdapter, the version/job land straight on their final
+        # APPLIED/SUCCEEDED state rather than sitting PENDING_APPLY/QUEUED
+        # forever, which used to be this module's real, confirmed bug.
+        assert updated_version.status == ConfigVersionStatus.APPLIED.value
+        assert job.status == ProvisioningJobStatus.SUCCEEDED.value
         assert job.job_type == ProvisioningJobType.INITIAL_CONFIG.value
         assert job.id in queue_dispatcher.enqueued
 
@@ -1230,16 +1270,18 @@ class TestConfigProfileAndVersions:
             _qd,
             audit,
         ) = await self._setup_draft_version()
+        # apply_version now performs start_provisioning_job +
+        # complete_provisioning_job(success=True) itself, right after a
+        # successful device push -- calling either again here would raise
+        # (the job is no longer in a state either transition accepts).
         _updated, job = await service.apply_version(
             actor_user_id=uuid.uuid4(),
             router_id=router_device.id,
             version_id=version.id,
             requesting_organization_id=None,
         )
-        await service.start_provisioning_job(job.id)
-        completed_job = await service.complete_provisioning_job(job.id, success=True)
 
-        assert completed_job.status == ProvisioningJobStatus.SUCCEEDED.value
+        assert job.status == ProvisioningJobStatus.SUCCEEDED.value
         applied_version = repo.versions[version.id]
         assert applied_version.status == ConfigVersionStatus.APPLIED.value
         assert applied_version.applied_at is not None
@@ -1255,17 +1297,25 @@ class TestConfigProfileAndVersions:
             version,
             _qd,
             _audit,
-        ) = await self._setup_draft_version()
+        ) = await self._setup_draft_version(
+            # A real device-push failure (bad credentials, unreachable
+            # host, adapter error) is exactly what used to leave a job
+            # "queued" forever -- apply_version now resolves this itself
+            # via complete_provisioning_job(success=False), so simulating
+            # it just means giving this router a failing adapter.
+            device_adapter=FakeDeviceAdapter(
+                fail_with=ProvisionDeviceConnectionError(
+                    host="10.0.0.1", detail="device unreachable"
+                )
+            ),
+        )
         _updated, job = await service.apply_version(
             actor_user_id=uuid.uuid4(),
             router_id=router_device.id,
             version_id=version.id,
             requesting_organization_id=None,
         )
-        await service.start_provisioning_job(job.id)
-        await service.complete_provisioning_job(
-            job.id, success=False, error_message="device unreachable"
-        )
+        assert job.status == ProvisioningJobStatus.FAILED.value
         failed_version = repo.versions[version.id]
         assert failed_version.status == ConfigVersionStatus.FAILED.value
 
@@ -1284,8 +1334,7 @@ class TestConfigProfileAndVersions:
             version_id=version.id,
             requesting_organization_id=None,
         )
-        await service.start_provisioning_job(job.id)
-        await service.complete_provisioning_job(job.id, success=True)
+        assert job.status == ProvisioningJobStatus.SUCCEEDED.value
 
         template = await service.create_template(
             actor_user_id=uuid.uuid4(),
@@ -1308,7 +1357,9 @@ class TestConfigProfileAndVersions:
         )
         assert job_2.job_type == ProvisioningJobType.CONFIG_PUSH.value
 
-    async def test_rollback_creates_new_draft_tagged_with_target(self) -> None:
+    async def test_rollback_creates_and_applies_new_version_tagged_with_target(
+        self,
+    ) -> None:
         (
             service,
             repo,
@@ -1323,16 +1374,20 @@ class TestConfigProfileAndVersions:
             version_id=version.id,
             requesting_organization_id=None,
         )
-        await service.start_provisioning_job(job.id)
-        await service.complete_provisioning_job(job.id, success=True)
+        assert job.status == ProvisioningJobStatus.SUCCEEDED.value
 
+        # rollback_to_version now applies the draft it creates immediately
+        # (see that method's own comment) -- Master Console's "Roll back"
+        # button is one action, not "create a draft, then separately
+        # remember to apply it," so the version this returns is already
+        # APPLIED, not left DRAFT for a caller to push later.
         rollback_version = await service.rollback_to_version(
             actor_user_id=uuid.uuid4(),
             router_id=router_device.id,
             target_version_id=version.id,
             requesting_organization_id=None,
         )
-        assert rollback_version.status == ConfigVersionStatus.DRAFT.value
+        assert rollback_version.status == ConfigVersionStatus.APPLIED.value
         assert rollback_version.rollback_of_version_id == version.id
         assert rollback_version.rendered_content == version.rendered_content
         assert rollback_version.version_number == 2
@@ -1352,23 +1407,18 @@ class TestConfigProfileAndVersions:
             version_id=version.id,
             requesting_organization_id=None,
         )
-        await service.start_provisioning_job(job.id)
-        await service.complete_provisioning_job(job.id, success=True)
+        assert job.status == ProvisioningJobStatus.SUCCEEDED.value
 
-        rollback_version = await service.rollback_to_version(
+        # One call now -- rollback_to_version both creates and applies the
+        # rollback version itself (see that method's own comment); no
+        # separate apply_version/start_provisioning_job/
+        # complete_provisioning_job dance needed here anymore.
+        await service.rollback_to_version(
             actor_user_id=uuid.uuid4(),
             router_id=router_device.id,
             target_version_id=version.id,
             requesting_organization_id=None,
         )
-        _updated_rb, rollback_job = await service.apply_version(
-            actor_user_id=uuid.uuid4(),
-            router_id=router_device.id,
-            version_id=rollback_version.id,
-            requesting_organization_id=None,
-        )
-        await service.start_provisioning_job(rollback_job.id)
-        await service.complete_provisioning_job(rollback_job.id, success=True)
 
         original = repo.versions[version.id]
         assert original.status == ConfigVersionStatus.ROLLED_BACK.value
@@ -1605,7 +1655,8 @@ class TestCreateVersionFromContent:
             version_id=version.id,
             requesting_organization_id=None,
         )
-        assert applied_version.status == ConfigVersionStatus.PENDING_APPLY.value
+        assert applied_version.status == ConfigVersionStatus.APPLIED.value
+        assert job.status == ProvisioningJobStatus.SUCCEEDED.value
         assert job.payload["config_version_id"] == str(version.id)
 
 
@@ -1647,14 +1698,16 @@ class TestBackupRestore:
             template_id=template.id,
             requesting_organization_id=None,
         )
+        # apply_version now performs the device push + completion itself
+        # (see RouterProvisioningService's own comment) -- no manual
+        # start_provisioning_job/complete_provisioning_job needed anymore.
         _updated, job = await service.apply_version(
             actor_user_id=uuid.uuid4(),
             router_id=router_device.id,
             version_id=version.id,
             requesting_organization_id=None,
         )
-        await service.start_provisioning_job(job.id)
-        await service.complete_provisioning_job(job.id, success=True)
+        assert job.status == ProvisioningJobStatus.SUCCEEDED.value
         return version
 
     async def test_create_backup_enqueues_job_and_completion_creates_backup_version(
@@ -1676,6 +1729,10 @@ class TestBackupRestore:
         )
         await self._apply_first_version(service, router_device)
 
+        # create_backup now completes immediately (a backup is a pure
+        # snapshot of already-stored content -- see that method's own
+        # comment -- so there's no device push to wait on, unlike
+        # apply_version).
         job = await service.create_backup(
             actor_user_id=uuid.uuid4(),
             router_id=router_device.id,
@@ -1683,9 +1740,7 @@ class TestBackupRestore:
         )
         assert job.job_type == ProvisioningJobType.BACKUP.value
         assert job.id in queue_dispatcher.enqueued
-
-        await service.start_provisioning_job(job.id)
-        await service.complete_provisioning_job(job.id, success=True)
+        assert job.status == ProvisioningJobStatus.SUCCEEDED.value
 
         backup_versions = [v for v in repo.versions.values() if v.is_backup]
         assert len(backup_versions) == 1
@@ -1737,10 +1792,13 @@ class TestBackupRestore:
             router_id=router_device.id,
             requesting_organization_id=None,
         )
-        await service.start_provisioning_job(backup_job.id)
-        await service.complete_provisioning_job(backup_job.id, success=True)
+        assert backup_job.status == ProvisioningJobStatus.SUCCEEDED.value
         backup_version = next(v for v in repo.versions.values() if v.is_backup)
 
+        # restore_backup also completes immediately now -- as designed
+        # today, it only updates which stored version is "current," it
+        # doesn't itself re-push anything to a device (see that method's
+        # own comment), so there's nothing to wait on here either.
         restore_job = await service.restore_backup(
             actor_user_id=uuid.uuid4(),
             router_id=router_device.id,
@@ -1748,8 +1806,7 @@ class TestBackupRestore:
             requesting_organization_id=None,
         )
         assert restore_job.job_type == ProvisioningJobType.RESTORE.value
-        await service.start_provisioning_job(restore_job.id)
-        await service.complete_provisioning_job(restore_job.id, success=True)
+        assert restore_job.status == ProvisioningJobStatus.SUCCEEDED.value
 
         current = await repo.get_latest_applied_version(router_device.id)
         assert current is not None
@@ -1819,13 +1876,17 @@ class TestFactoryReset:
         router_device = await make_router(
             router_service, location_lookup, organization, status=RouterStatus.ONLINE
         )
+        # factory_reset now completes immediately -- as designed today it
+        # only flips the platform's own router status back to
+        # pending_provisioning (see that method's own comment), no real
+        # device-side reset command is sent, so there's no device I/O to
+        # wait on here either.
         job = await service.factory_reset(
             actor_user_id=uuid.uuid4(),
             router_id=router_device.id,
             requesting_organization_id=None,
         )
-        await service.start_provisioning_job(job.id)
-        await service.complete_provisioning_job(job.id, success=True)
+        assert job.status == ProvisioningJobStatus.SUCCEEDED.value
 
         reset_router = router_repo.routers[router_device.id]
         assert reset_router.status == RouterStatus.PENDING_PROVISIONING.value
@@ -2099,10 +2160,16 @@ class TestProvisioningJobLifecycle:
         router_device = await make_router(
             router_service, location_lookup, organization, status=RouterStatus.ONLINE
         )
-        job = await service.factory_reset(
-            actor_user_id=uuid.uuid4(),
-            router_id=router_device.id,
-            requesting_organization_id=None,
+        # Uses _enqueue_job directly (not e.g. factory_reset, which now
+        # completes itself immediately -- see that method's own comment)
+        # to exercise the generic queued -> running -> succeeded primitive
+        # in isolation, independent of any specific job type's own
+        # higher-level completion wiring.
+        job = await service._enqueue_job(
+            router=router_device,
+            job_type=ProvisioningJobType.FACTORY_RESET,
+            payload={},
+            requested_by_user_id=uuid.uuid4(),
         )
         assert job.status == ProvisioningJobStatus.QUEUED.value
         assert job.attempts == 0
@@ -2129,10 +2196,11 @@ class TestProvisioningJobLifecycle:
         router_device = await make_router(
             router_service, location_lookup, organization, status=RouterStatus.ONLINE
         )
-        job = await service.factory_reset(
-            actor_user_id=uuid.uuid4(),
-            router_id=router_device.id,
-            requesting_organization_id=None,
+        job = await service._enqueue_job(
+            router=router_device,
+            job_type=ProvisioningJobType.FACTORY_RESET,
+            payload={},
+            requested_by_user_id=uuid.uuid4(),
         )
 
         with pytest.raises(InvalidProvisioningJobStatusTransitionError):
@@ -2166,11 +2234,25 @@ class TestProvisioningJobLifecycle:
             template_id=template.id,
             requesting_organization_id=None,
         )
-        _updated, job = await service.apply_version(
+        # apply_version now completes synchronously (see that method's own
+        # comment), so its own job is no longer "active" by the time this
+        # checks -- exactly the fix this test's own name is really about
+        # (a router with a real applied version, not one stuck mid-job).
+        # A second, separately-enqueued (never started) job is used to
+        # confirm active_jobs still correctly surfaces a genuinely-pending
+        # one at the same time.
+        _updated, applied_job = await service.apply_version(
             actor_user_id=uuid.uuid4(),
             router_id=router_device.id,
             version_id=version.id,
             requesting_organization_id=None,
+        )
+        assert applied_job.status == ProvisioningJobStatus.SUCCEEDED.value
+        pending_job = await service._enqueue_job(
+            router=router_device,
+            job_type=ProvisioningJobType.BACKUP,
+            payload={},
+            requested_by_user_id=uuid.uuid4(),
         )
 
         result = await service.get_provisioning_status(
@@ -2178,7 +2260,8 @@ class TestProvisioningJobLifecycle:
         )
         assert result.router.id == router_device.id
         assert result.latest_version.id == version.id
-        assert any(j.id == job.id for j in result.active_jobs)
+        assert not any(j.id == applied_job.id for j in result.active_jobs)
+        assert any(j.id == pending_job.id for j in result.active_jobs)
 
 
 # ============================================================================

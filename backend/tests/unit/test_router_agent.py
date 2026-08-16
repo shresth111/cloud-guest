@@ -73,7 +73,10 @@ from app.domains.router_agent.validators import (
     netwatch_status_to_ping_result,
     validate_netwatch_link_owned_by_router,
 )
-from app.domains.router_provisioning.constants import ProvisioningJobStatus
+from app.domains.router_provisioning.constants import (
+    ProvisioningJobStatus,
+    ProvisioningJobType,
+)
 from app.domains.router_provisioning.exceptions import (
     ProvisioningJobRouterMismatchError,
 )
@@ -772,6 +775,16 @@ class Fixture:
     audit: FakeAuditLogWriter
 
 
+class FakeDeviceAdapter:
+    """Stands in for the real MikroTik/SSH adapter
+    ``RouterProvisioningService._push_version_and_complete`` now calls --
+    mirrors ``test_router_provisioning.py``'s own identical fake. Always
+    succeeds; no test in this file exercises the push-failure path."""
+
+    async def push_config(self, credentials, *, config_content: str) -> None:
+        return None
+
+
 def make_services() -> Fixture:
     """Builds real ``RouterService``/``RouterProvisioningService`` instances
     (themselves wired against small in-memory fakes, mirroring
@@ -802,6 +815,7 @@ def make_services() -> Fixture:
         location_lookup,
         queue_dispatcher=queue_dispatcher,
         audit_writer=shared_audit,
+        device_adapter_resolver=lambda _vendor: FakeDeviceAdapter(),
     )
 
     agent_repo = FakeRouterAgentRepository()
@@ -843,6 +857,13 @@ async def make_router(
         location_id=location.id,
         requesting_organization_id=None,
         name="Front Desk AP",
+        # Device connection credentials -- needed since apply_version now
+        # actually resolves and pushes through them (see
+        # RouterProvisioningService._resolve_device_credentials); mirrors
+        # test_router_provisioning.py's own make_router.
+        management_ip_address="10.0.0.1",
+        api_username="test-api",
+        api_secret="test-secret",
         serial_number=f"SN-{uuid.uuid4()}",
         mac_address=_unique_mac(),
         model="hAP ac2",
@@ -1207,14 +1228,16 @@ class TestConfigPull:
             template_id=template.id,
             requesting_organization_id=None,
         )
+        # apply_version now performs the device push + completion itself
+        # (see RouterProvisioningService's own comment) -- no manual
+        # start_provisioning_job/complete_provisioning_job needed anymore.
         _updated, job = await fx.provisioning_service.apply_version(
             actor_user_id=uuid.uuid4(),
             router_id=router_device.id,
             version_id=version.id,
             requesting_organization_id=None,
         )
-        await fx.provisioning_service.start_provisioning_job(job.id)
-        await fx.provisioning_service.complete_provisioning_job(job.id, success=True)
+        assert job.status == ProvisioningJobStatus.SUCCEEDED.value
 
         pulled = await fx.agent_service.get_current_config(router_id=router_device.id)
         assert pulled.id == version.id
@@ -1304,10 +1327,15 @@ class TestActionQueue:
         fx = make_services()
         organization = fx.org_lookup.add()
         router_device = await make_router(fx, organization, status=RouterStatus.ONLINE)
-        job = await fx.provisioning_service.factory_reset(
-            actor_user_id=uuid.uuid4(),
-            router_id=router_device.id,
-            requesting_organization_id=None,
+        # Uses _enqueue_job directly (not factory_reset, which now
+        # completes itself immediately -- see that method's own comment)
+        # to get a genuinely QUEUED job for testing router_agent's own
+        # poll/complete mechanics in isolation.
+        job = await fx.provisioning_service._enqueue_job(
+            router=router_device,
+            job_type=ProvisioningJobType.FACTORY_RESET,
+            payload={},
+            requested_by_user_id=uuid.uuid4(),
         )
         assert job.status == ProvisioningJobStatus.QUEUED.value
 
@@ -1322,10 +1350,15 @@ class TestActionQueue:
         fx = make_services()
         organization = fx.org_lookup.add()
         router_device = await make_router(fx, organization, status=RouterStatus.ONLINE)
-        job = await fx.provisioning_service.factory_reset(
-            actor_user_id=uuid.uuid4(),
-            router_id=router_device.id,
-            requesting_organization_id=None,
+        # Uses _enqueue_job directly (not factory_reset, which now
+        # completes itself immediately -- see that method's own comment)
+        # to get a genuinely QUEUED job for testing router_agent's own
+        # poll/complete mechanics in isolation.
+        job = await fx.provisioning_service._enqueue_job(
+            router=router_device,
+            job_type=ProvisioningJobType.FACTORY_RESET,
+            payload={},
+            requested_by_user_id=uuid.uuid4(),
         )
         started = await fx.provisioning_service.start_provisioning_job(job.id)
         assert started.attempts == 1
@@ -1341,10 +1374,15 @@ class TestActionQueue:
         fx = make_services()
         organization = fx.org_lookup.add()
         router_device = await make_router(fx, organization, status=RouterStatus.ONLINE)
-        job = await fx.provisioning_service.factory_reset(
-            actor_user_id=uuid.uuid4(),
-            router_id=router_device.id,
-            requesting_organization_id=None,
+        # Uses _enqueue_job directly (not factory_reset, which now
+        # completes itself immediately -- see that method's own comment)
+        # to get a genuinely QUEUED job for testing router_agent's own
+        # poll/complete mechanics in isolation.
+        job = await fx.provisioning_service._enqueue_job(
+            router=router_device,
+            job_type=ProvisioningJobType.FACTORY_RESET,
+            payload={},
+            requested_by_user_id=uuid.uuid4(),
         )
         await fx.agent_service.poll_actions(router_id=router_device.id)
 
@@ -1364,10 +1402,15 @@ class TestActionQueue:
         fx = make_services()
         organization = fx.org_lookup.add()
         router_device = await make_router(fx, organization, status=RouterStatus.ONLINE)
-        job = await fx.provisioning_service.factory_reset(
-            actor_user_id=uuid.uuid4(),
-            router_id=router_device.id,
-            requesting_organization_id=None,
+        # Uses _enqueue_job directly (not factory_reset, which now
+        # completes itself immediately -- see that method's own comment)
+        # to get a genuinely QUEUED job for testing router_agent's own
+        # poll/complete mechanics in isolation.
+        job = await fx.provisioning_service._enqueue_job(
+            router=router_device,
+            job_type=ProvisioningJobType.FACTORY_RESET,
+            payload={},
+            requested_by_user_id=uuid.uuid4(),
         )
         await fx.agent_service.poll_actions(router_id=router_device.id)
 
