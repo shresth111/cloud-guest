@@ -152,6 +152,18 @@ class Router(BaseModel):
     # exposing SNMP on a non-standard port) is still representable.
     snmp_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # How this router's own RouterOS setup script combines 2+ enabled
+    # app.domains.isp.IspLink rows -- see
+    # app.domains.isp.constants.WanRoutingMode's own docstring for why this
+    # is a real mode, not a weight of zero on one link. Defaults to
+    # "load_balance", the *only* behavior this platform has ever generated
+    # for a multi-WAN router -- every pre-existing router keeps its current
+    # real behavior unchanged on migration. Meaningless (and ignored by the
+    # generator) for a router with exactly one enabled WAN link.
+    wan_routing_mode: Mapped[str] = mapped_column(
+        String(20), default="load_balance", nullable=False
+    )
+
     # Extension point: per-router config that does not warrant its own column
     # (e.g. captive-portal branding overrides, vendor-specific quirks flags).
     # Deliberately not modeled as individual columns -- same boundary

@@ -34,6 +34,7 @@ from app.domains.isp.constants import (
     IspConnectionMode,
     IspLinkRole,
     IspLinkType,
+    WanRoutingMode,
 )
 from app.domains.isp.device_adapters import IspCredentials, PingResult, SpeedTestResult
 from app.domains.isp.exceptions import (
@@ -45,6 +46,7 @@ from app.domains.isp.exceptions import (
     IspMissingCredentialsError,
     IspNoBackupLinkAvailableError,
     IspPrimaryLinkAlreadyExistsError,
+    MixedWanRoutingWeightsError,
 )
 from app.domains.isp.models import IspHealthCheck, IspLink
 from app.domains.isp.router import router as isp_router
@@ -55,6 +57,7 @@ from app.domains.isp.service import (
     TrafficCounters,
     run_health_check_sweep,
 )
+from app.domains.isp.validators import validate_wan_routing_weights
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 
@@ -107,6 +110,7 @@ def _make_router(
             api_username="admin",
             api_credentials_encrypted="encrypted-placeholder",
             settings={},
+            wan_routing_mode="load_balance",
         )
     )
 
@@ -350,6 +354,22 @@ class FakeRouterLookup:
 
     def get_decrypted_api_secret(self, router: Router) -> str | None:
         return self.secrets.get(router.id)
+
+    async def update_router(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        data: dict[str, object],
+    ) -> Router:
+        router = await self.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        for key, value in data.items():
+            if hasattr(router, key):
+                setattr(router, key, value)
+        return router
 
 
 @dataclass
@@ -1830,9 +1850,236 @@ class TestEveryRouteRequiresPermission:
         # + GET /links/{link_id}/health-checks/summary (bucketed uptime
         # chart, see IspService.get_health_check_summary)
         # + POST /links/{link_id}/speed-test (on-demand real speed test,
-        # see IspService.run_speed_test).
-        assert len(isp_router.routes) == 12
+        # see IspService.run_speed_test)
+        # + PUT /routers/{router_id}/wan-routing-mode (see
+        # IspService.set_wan_routing_mode).
+        assert len(isp_router.routes) == 13
         for route in isp_router.routes:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+# ============================================================================
+# WAN routing mode + load-balance weight
+# ============================================================================
+
+
+class TestValidateWanRoutingWeights:
+    """Pure validator -- no service/harness needed."""
+
+    def test_noop_in_failover_only_mode_regardless_of_weights(self) -> None:
+        # Weights are simply unused in failover-only, not an error --
+        # see WanRoutingMode's own docstring on why they're left alone
+        # (not cleared) for a possible switch back to load-balance later.
+        validate_wan_routing_weights(
+            router_id=uuid.uuid4(),
+            mode=WanRoutingMode.FAILOVER_ONLY,
+            enabled_link_weights=[5, None, 3],
+        )
+
+    def test_noop_with_fewer_than_two_enabled_links(self) -> None:
+        validate_wan_routing_weights(
+            router_id=uuid.uuid4(),
+            mode=WanRoutingMode.LOAD_BALANCE,
+            enabled_link_weights=[5],
+        )
+
+    def test_noop_when_no_link_is_weighted(self) -> None:
+        # The existing, unweighted even-split behavior -- every
+        # pre-existing router's real, current state.
+        validate_wan_routing_weights(
+            router_id=uuid.uuid4(),
+            mode=WanRoutingMode.LOAD_BALANCE,
+            enabled_link_weights=[None, None],
+        )
+
+    def test_noop_when_every_enabled_link_is_weighted(self) -> None:
+        validate_wan_routing_weights(
+            router_id=uuid.uuid4(),
+            mode=WanRoutingMode.LOAD_BALANCE,
+            enabled_link_weights=[7, 3],
+        )
+
+    def test_raises_on_partial_weighting(self) -> None:
+        with pytest.raises(MixedWanRoutingWeightsError):
+            validate_wan_routing_weights(
+                router_id=uuid.uuid4(),
+                mode=WanRoutingMode.LOAD_BALANCE,
+                enabled_link_weights=[7, None],
+            )
+
+    def test_raises_on_non_positive_weight(self) -> None:
+        with pytest.raises(ValueError):
+            validate_wan_routing_weights(
+                router_id=uuid.uuid4(),
+                mode=WanRoutingMode.LOAD_BALANCE,
+                enabled_link_weights=[0, 5],
+            )
+
+
+class TestSetWanRoutingMode:
+    async def test_sets_mode_and_records_audit_event(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        updated = await h.service.set_wan_routing_mode(
+            router.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            mode=WanRoutingMode.FAILOVER_ONLY,
+        )
+        assert updated.wan_routing_mode == WanRoutingMode.FAILOVER_ONLY.value
+        assert any(
+            e["action"] == "router_wan_routing_mode_changed"
+            and e["entity_type"] == "router"
+            for e in h.audit_writer.entries
+        )
+
+    async def test_switching_to_load_balance_rejects_partial_weighting(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        primary = await _create_primary(h, router)
+        await _create_backup(h, router)
+        await h.service.update_link(
+            primary.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            load_balance_weight=7,
+        )
+
+        with pytest.raises(MixedWanRoutingWeightsError):
+            await h.service.set_wan_routing_mode(
+                router.id,
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=router.organization_id,
+                mode=WanRoutingMode.LOAD_BALANCE,
+            )
+
+    async def test_switching_to_failover_only_never_validates_weights(self) -> None:
+        # A partial weighting is only a real problem in LOAD_BALANCE mode
+        # (see WanRoutingMode's own docstring) -- switching *to*
+        # FAILOVER_ONLY must always succeed regardless of whatever weights
+        # happen to already be on file.
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        primary = await _create_primary(h, router)
+        await _create_backup(h, router)
+        await h.service.update_link(
+            primary.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            load_balance_weight=7,
+        )
+
+        updated = await h.service.set_wan_routing_mode(
+            router.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            mode=WanRoutingMode.FAILOVER_ONLY,
+        )
+        assert updated.wan_routing_mode == WanRoutingMode.FAILOVER_ONLY.value
+
+    async def test_disabled_links_excluded_when_confirming_load_balance(self) -> None:
+        # A disabled link never carries traffic -- its own missing weight
+        # must not block confirming load-balance mode once every *enabled*
+        # link is weighted. Three links total; the second backup is
+        # disabled and left unweighted throughout.
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        primary = await _create_primary(h, router)
+        backup_1 = await _create_backup(h, router, priority=0)
+        backup_2 = await _create_backup(h, router, priority=1)
+        await h.service.update_link(
+            backup_2.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            is_enabled=False,
+        )
+        await h.service.update_link(
+            primary.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            load_balance_weight=7,
+        )
+        await h.service.update_link(
+            backup_1.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            load_balance_weight=3,
+        )
+
+        updated = await h.service.set_wan_routing_mode(
+            router.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            mode=WanRoutingMode.LOAD_BALANCE,
+        )
+        assert updated.wan_routing_mode == WanRoutingMode.LOAD_BALANCE.value
+
+
+class TestUpdateLinkWeight:
+    async def test_can_weight_every_enabled_link_together(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        primary = await _create_primary(h, router)
+        backup = await _create_backup(h, router)
+
+        updated_primary = await h.service.update_link(
+            primary.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            load_balance_weight=7,
+        )
+        updated_backup = await h.service.update_link(
+            backup.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            load_balance_weight=3,
+        )
+        assert updated_primary.load_balance_weight == 7
+        assert updated_backup.load_balance_weight == 3
+
+    async def test_partial_weighting_is_allowed_transiently(self) -> None:
+        # update_link deliberately does NOT cross-validate against sibling
+        # links (see that method's own comment) -- an admin sets one
+        # link's weight per call, so the first weighted link must not
+        # conflict with its still-unweighted siblings. The "every enabled
+        # link or none" rule is enforced later, at set_wan_routing_mode
+        # (see TestSetWanRoutingMode.
+        # test_switching_to_load_balance_rejects_partial_weighting).
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        primary = await _create_primary(h, router)
+        await _create_backup(h, router)
+
+        updated_primary = await h.service.update_link(
+            primary.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            load_balance_weight=7,
+        )
+        assert updated_primary.load_balance_weight == 7
+
+    async def test_disabled_link_can_be_weighted_independently(self) -> None:
+        # A disabled link's own weight is simply unused (see
+        # IspLink.load_balance_weight's own docstring) -- update_link
+        # doesn't special-case it, so setting one is a plain no-op write,
+        # not an error.
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        backup = await _create_backup(h, router)
+        await h.service.update_link(
+            backup.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            is_enabled=False,
+        )
+
+        updated = await h.service.update_link(
+            backup.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            load_balance_weight=3,
+        )
+        assert updated.load_balance_weight == 3

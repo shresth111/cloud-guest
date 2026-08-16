@@ -166,6 +166,26 @@ class IspLink(BaseModel):
     dns_secondary: Mapped[str | None] = mapped_column(String(45), nullable=True)
     download_bandwidth_mbps: Mapped[int | None] = mapped_column(Integer, nullable=True)
     upload_bandwidth_mbps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Only meaningful when the owning Router.wan_routing_mode is
+    # "load_balance" (see app.domains.isp.constants.WanRoutingMode's own
+    # docstring) and this link is enabled -- a positive integer, relative
+    # to every other enabled link's own weight (e.g. 5 on a 100mbps link
+    # paired with 1 on a 20mbps backup splits traffic roughly 5:1, not an
+    # absolute percentage). NULL is the default for every pre-existing row
+    # and any link an admin hasn't explicitly weighted yet -- validated
+    # (see validators.validate_wan_routing_weights) to mean "every enabled
+    # link splits evenly," the platform's only-ever-generated behavior
+    # before this field existed, never "this specific link gets zero
+    # traffic." Deliberately not derived automatically from
+    # download_bandwidth_mbps above -- an admin-entered value only, the
+    # same "no fake opinion before a human states one" posture
+    # HealthStatus.UNKNOWN's own docstring already establishes elsewhere
+    # in this file (a UI may *suggest* a starting ratio from the bandwidth
+    # fields, but never silently substitutes one here). The actual
+    # PCC-rule-count arithmetic (GCD reduction, one mangle rule per
+    # reduced share) is the RouterOS script generator's own concern, not
+    # this column's.
+    load_balance_weight: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # NULL/UNKNOWN until the first real health check ever runs -- see
     # constants.HealthStatus's own docstring for why this is never
     # defaulted to HEALTHY.

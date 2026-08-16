@@ -261,6 +261,7 @@ class AuditAction(StrEnum):
     ROUTER_CONFIG_VERSION_ROLLED_BACK = "router_config_version_rolled_back"
     ROUTER_BACKUP_CREATED = "router_backup_created"
     ROUTER_RESTORE_COMPLETED = "router_restore_completed"
+    ROUTER_WAN_ROUTING_MODE_CHANGED = "router_wan_routing_mode_changed"
 
     # WireGuard domain events (Module 009 Part 3) -- written through this
     # same table by ``app.domains.wireguard.service.WireGuardService`` via

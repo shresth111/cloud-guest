@@ -27,6 +27,7 @@ __all__ = [
     "IspDeviceOperationError",
     "UnsupportedIspVendorError",
     "IspSpeedTestCooldownError",
+    "MixedWanRoutingWeightsError",
 ]
 
 
@@ -183,4 +184,20 @@ class UnsupportedIspVendorError(IspError):
         super().__init__(
             f"No ISP health-check adapter registered for vendor '{vendor}'",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class MixedWanRoutingWeightsError(IspError):
+    """Raised by ``validators.validate_wan_routing_weights`` when a router
+    in ``WanRoutingMode.LOAD_BALANCE`` has *some* but not *all* of its
+    enabled links weighted -- see that function's own docstring for why a
+    partial weighting is rejected outright rather than silently defaulting
+    the unweighted links to an even split among themselves."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router '{router_id}' has a load-balance weight set on some "
+            "but not all of its enabled WAN links -- weight either every "
+            "enabled link or none of them",
+            status_code=status.HTTP_409_CONFLICT,
         )

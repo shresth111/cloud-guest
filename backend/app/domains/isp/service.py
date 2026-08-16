@@ -76,6 +76,7 @@ from .constants import (
     HealthStatusSource,
     IspConnectionMode,
     IspLinkRole,
+    WanRoutingMode,
 )
 from .device_adapters import IspCredentials, PingResult, get_isp_health_adapter
 from .events import (
@@ -101,7 +102,11 @@ from .exceptions import (
 )
 from .models import IspHealthCheck, IspLink
 from .repository import IspRepositoryProtocol
-from .validators import classify_health_status, is_failover_threshold_reached
+from .validators import (
+    classify_health_status,
+    is_failover_threshold_reached,
+    validate_wan_routing_weights,
+)
 
 
 # Narrow, duck-typed Protocol for the one Redis surface this module needs
@@ -153,6 +158,15 @@ class RouterLookupProtocol(Protocol):
     ) -> Router: ...
 
     def get_decrypted_api_secret(self, router: Router) -> str | None: ...
+
+    async def update_router(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        data: dict[str, object],
+    ) -> Router: ...
 
 
 class AuditLogWriter(Protocol):
@@ -395,6 +409,20 @@ class IspService:
             )
             if existing_primary is not None and existing_primary.id != link.id:
                 raise IspPrimaryLinkAlreadyExistsError(link.router_id)
+        # Deliberately NOT cross-link-validated here (unlike
+        # set_wan_routing_mode, which does enforce "every enabled link or
+        # none" via validate_wan_routing_weights): an admin sets one
+        # link's weight per call, the same one-link-per-PUT shape this
+        # whole endpoint already has, so validating "every other enabled
+        # link is *also* weighted" on the very first call would make it
+        # impossible to ever weight links one at a time -- the first
+        # weighted link would always conflict with its still-unweighted
+        # siblings. A transient partial-weighting is harmless: the script
+        # generator only ever applies weights once every enabled link
+        # has one, silently falling back to the existing even split
+        # otherwise (see IspLink.load_balance_weight's own docstring) --
+        # set_wan_routing_mode is the real "commit" point this gets
+        # validated at.
         updated = await self.repository.update_link(
             link, {**fields, "updated_by": actor_user_id}
         )
@@ -407,6 +435,59 @@ class IspService:
             organization_id=updated.organization_id,
             description=f"ISP link '{updated.provider_name}' updated",
         )
+        return updated
+
+    async def set_wan_routing_mode(
+        self,
+        router_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        mode: WanRoutingMode,
+    ) -> Router:
+        """Sets a router's own ``wan_routing_mode`` -- the RouterOS script
+        generator (frontend) reads this (alongside every enabled link's
+        ``load_balance_weight``) to decide between the plain
+        distance-ordered failover-only routes and the GCD-reduced weighted
+        PCC mangle rules; see ``WanRoutingMode``'s own docstring for why
+        these are structurally different code paths, not one path with a
+        parameter. Switching *to* ``FAILOVER_ONLY`` never validates or
+        touches existing weights (see that enum's own docstring on why
+        they're left alone, not cleared, for a possible switch back)."""
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        if mode is WanRoutingMode.LOAD_BALANCE:
+            siblings = await self.repository.list_links_for_router(router_id)
+            validate_wan_routing_weights(
+                router_id=router_id,
+                mode=mode,
+                enabled_link_weights=[
+                    s.load_balance_weight for s in siblings if s.is_enabled
+                ],
+            )
+        updated = await self.router_lookup.update_router(
+            actor_user_id=actor_user_id,
+            router_id=router_id,
+            requesting_organization_id=requesting_organization_id,
+            data={"wan_routing_mode": mode.value},
+        )
+        # Not this module's own `_audit` helper -- that one hardcodes
+        # `entity_type="isp_link"` (correct for every other audit call in
+        # this file, all genuine isp_link mutations); this one is a
+        # router-level change, so it writes directly with the correct
+        # entity_type instead of mislabeling it.
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=actor_user_id,
+                action=AuditAction.ROUTER_WAN_ROUTING_MODE_CHANGED.value,
+                entity_type="router",
+                entity_id=router_id,
+                description=(
+                    f"Router '{updated.name}' WAN routing mode set to '{mode.value}'"
+                ),
+                organization_id=updated.organization_id,
+            )
         return updated
 
     async def delete_link(
