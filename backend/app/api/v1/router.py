@@ -56,6 +56,7 @@ from app.domains.qos.router import router as qos_router
 from app.domains.queue_management.router import router as queue_management_router
 from app.domains.quotation.router import router as quotation_router
 from app.domains.rbac.router import router as rbac_router
+from app.domains.readiness.router import router as readiness_router
 from app.domains.router.router import router as router_router
 from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
@@ -132,3 +133,4 @@ api_v1_router.include_router(support_tickets_router)
 api_v1_router.include_router(demo_request_router)
 api_v1_router.include_router(quotation_router)
 api_v1_router.include_router(assistant_router)
+api_v1_router.include_router(readiness_router)

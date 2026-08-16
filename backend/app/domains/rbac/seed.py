@@ -431,6 +431,15 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # CREATE since (unlike a demo request) a quotation is always
     # operator-initiated, never a public submission.
     PermissionModule.QUOTATIONS: (_A.CREATE, _A.READ, _A.MANAGE),
+    # Router Readiness Checklist: READ covers the checklist itself
+    # (auto-detected items are recomputed live on every read, no separate
+    # EXECUTE step needed), MANAGE covers confirming/overriding an item by
+    # hand -- a real, significant decision distinct from a plain field
+    # edit, the same "override gets the stronger action tier" precedent
+    # PermissionModule.NETWORK_DEVICE's own entry above documents. No
+    # CREATE/UPDATE/DELETE -- RouterChecklistItem rows are never directly
+    # authored, only computed or confirmed.
+    PermissionModule.READINESS: (_A.READ, _A.MANAGE),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -490,6 +499,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.DEMO_REQUESTS: "Demo Requests",
     PermissionModule.CONTENT_FILTERING: "Content Filtering",
     PermissionModule.QUOTATIONS: "Quotations",
+    PermissionModule.READINESS: "Router Readiness Checklist",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -576,6 +586,10 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # A diagnostic run targets one router at a time -- identical
     # ScopeType.ROUTER reasoning as PermissionModule.DEVICE_SYNC above.
     PermissionModule.NETWORK_DIAGNOSTICS: ScopeType.ROUTER,
+    # A readiness checklist is one router's own state -- identical
+    # ScopeType.ROUTER reasoning as PermissionModule.NETWORK_DIAGNOSTICS
+    # above.
+    PermissionModule.READINESS: ScopeType.ROUTER,
     # A network device's own router_id is nullable (a device can be
     # pre-registered before ever being seen on one specific router, or
     # roam across routers at one location) -- ScopeType.LOCATION, the
@@ -916,6 +930,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QOS: _L.FULL,
             _M.CONTENT_FILTERING: _L.FULL,
             _M.NETWORK_DIAGNOSTICS: _L.FULL,
+            _M.READINESS: _L.FULL,
             _M.NETWORK_DEVICE: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
@@ -956,6 +971,7 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QOS: _L.OPERATE,
             _M.CONTENT_FILTERING: _L.OPERATE,
             _M.NETWORK_DIAGNOSTICS: _L.OPERATE,
+            _M.READINESS: _L.OPERATE,
             _M.NETWORK_DEVICE: _L.OPERATE,
             # Day-to-day network operations plainly includes knowing
             # whether THIS location's own internet uplink is up (ISP) and

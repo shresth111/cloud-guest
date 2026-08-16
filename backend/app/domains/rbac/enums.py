@@ -128,6 +128,12 @@ class PermissionModule(StrEnum):
     # app.domains.quotation's own module docstring. GLOBAL-only, same
     # "belongs to no organization" profile as DEMO_REQUESTS above.
     QUOTATIONS = "quotations"
+    # Router Readiness Checklist: per-router "is this ready to hand to a
+    # customer" checklist -- see app.domains.readiness's own module
+    # docstring. Read-only auto-detected items plus a manual-confirm
+    # write path, mirroring NETWORK_DIAGNOSTICS's own "read + a real
+    # device-facing action" shape.
+    READINESS = "readiness"
 
 
 class OverrideEffect(StrEnum):

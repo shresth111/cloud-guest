@@ -237,6 +237,18 @@ class RouterAgentService:
     # Credential issuance
     # ========================================================================
 
+    async def get_credential_for_router(
+        self, router_id: uuid.UUID
+    ) -> RouterAgentCredential | None:
+        """A small, additive read wrapper around
+        ``self.repository.get_by_router_id`` -- exists so sibling domains
+        (``app.domains.readiness``'s own "SaaS provisioning" checklist
+        item) can compose against this domain's *service* rather than
+        reaching into its repository directly, matching every other
+        cross-domain read in this codebase (e.g. ``app.domains.wireguard
+        .service.WireGuardService.get_peer``)."""
+        return await self.repository.get_by_router_id(router_id)
+
     async def issue_credential_for_router(
         self, router: Router
     ) -> tuple[RouterAgentCredential, str]:
