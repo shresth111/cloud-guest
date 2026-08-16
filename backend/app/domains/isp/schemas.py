@@ -27,6 +27,8 @@ __all__ = [
     "IspHealthCheckListResponse",
     "IspFailoverRequest",
     "IspLinkManualStatusRequest",
+    "WanRoutingModeRequest",
+    "WanRoutingModeResponse",
 ]
 
 
@@ -53,6 +55,12 @@ class IspLinkCreateRequest(BaseModel):
     download_bandwidth_mbps: int | None = Field(default=None, ge=0)
     upload_bandwidth_mbps: int | None = Field(default=None, ge=0)
     auto_failback: bool = True
+    # Only meaningful once the owning router's wan_routing_mode is
+    # "load_balance" and this link is enabled -- see
+    # models.IspLink.load_balance_weight's own docstring. Every enabled
+    # link on the router must be weighted together, or none of them
+    # (enforced server-side by validate_wan_routing_weights).
+    load_balance_weight: int | None = Field(default=None, gt=0)
 
 
 class IspLinkUpdateRequest(BaseModel):
@@ -69,6 +77,7 @@ class IspLinkUpdateRequest(BaseModel):
     upload_bandwidth_mbps: int | None = Field(default=None, ge=0)
     auto_failback: bool | None = None
     is_enabled: bool | None = None
+    load_balance_weight: int | None = Field(default=None, gt=0)
 
 
 class IspLinkResponse(BaseModel):
@@ -90,6 +99,7 @@ class IspLinkResponse(BaseModel):
     dns_secondary: str | None
     download_bandwidth_mbps: int | None
     upload_bandwidth_mbps: int | None
+    load_balance_weight: int | None
     health_status: str
     health_status_source: str
     # "Down since" -- a computed read-model (IspService
@@ -108,6 +118,19 @@ class IspLinkResponse(BaseModel):
     last_checked_at: datetime | None
     consecutive_unhealthy_count: int
     created_at: datetime
+
+
+class WanRoutingModeRequest(BaseModel):
+    # Plain str, not the WanRoutingMode enum directly -- same "pydantic
+    # validates the literal value, the service layer parses it into the
+    # real enum" split every other domain's own string-backed enum request
+    # schema in this file already uses.
+    mode: Literal["load_balance", "failover_only"]
+
+
+class WanRoutingModeResponse(BaseModel):
+    router_id: str
+    wan_routing_mode: str
 
 
 class IspLinkListResponse(BaseModel):

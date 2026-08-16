@@ -36,7 +36,7 @@ from app.domains.rbac.dependencies import (
     RequirePermission,
 )
 
-from .constants import HealthStatus, IspLinkRole
+from .constants import HealthStatus, IspLinkRole, WanRoutingMode
 from .dependencies import get_isp_service
 from .models import IspHealthCheck, IspLink
 from .schemas import (
@@ -52,6 +52,8 @@ from .schemas import (
     IspLinkUpdateRequest,
     IspSpeedTestResponse,
     MessageResponse,
+    WanRoutingModeRequest,
+    WanRoutingModeResponse,
 )
 from .service import IspService
 
@@ -100,6 +102,7 @@ def _link_response(
         dns_secondary=link.dns_secondary,
         download_bandwidth_mbps=link.download_bandwidth_mbps,
         upload_bandwidth_mbps=link.upload_bandwidth_mbps,
+        load_balance_weight=link.load_balance_weight,
         health_status=link.health_status,
         health_status_source=link.health_status_source,
         unhealthy_since=unhealthy_since,
@@ -293,6 +296,37 @@ async def delete_isp_link(
         success=True,
         message="ISP link deleted",
         data=MessageResponse(message="ISP link deleted").model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.put(
+    "/routers/{router_id}/wan-routing-mode",
+    response_model=ApiResponse[WanRoutingModeResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("isp.update"))],
+)
+async def set_wan_routing_mode(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: WanRoutingModeRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: IspService = Depends(get_isp_service),
+):
+    updated_router = await service.set_wan_routing_mode(
+        router_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+        mode=WanRoutingMode(payload.mode),
+    )
+    return build_response(
+        success=True,
+        message="WAN routing mode updated",
+        data=WanRoutingModeResponse(
+            router_id=str(updated_router.id),
+            wan_routing_mode=updated_router.wan_routing_mode,
+        ).model_dump(),
         request_id=_request_id(request),
     )
 

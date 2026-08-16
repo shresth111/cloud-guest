@@ -89,6 +89,30 @@ class IspLinkRole(StrEnum):
     BACKUP = "backup"
 
 
+class WanRoutingMode(StrEnum):
+    """Router-wide: how 2+ *enabled* :class:`IspLink` rows are combined
+    on-device by the generated RouterOS setup script. Meaningless (and
+    ignored by the script generator) for a router with exactly one enabled
+    link -- the same ``wans.length > 1`` guard that already gates the
+    generator's PCC mangle chunk today.
+
+    ``LOAD_BALANCE`` is the default -- it is the *only* behavior this
+    platform has ever generated for a multi-WAN router, so defaulting
+    every existing row to it on migration is a genuine zero-behavior-
+    change default, not merely a convenient one.
+
+    Deliberately not "how do we split traffic" alone -- ``FAILOVER_ONLY``
+    is a real, structurally simpler alternative on the RouterOS side (a
+    router in this mode gets plain ``distance``-ordered
+    ``check-gateway=ping`` routes and *zero* PCC/mangle rules at all, not
+    a degenerate "100/0 weighted load balance" -- a 100/0 split is not
+    even expressible in RouterOS's own PCC syntax), so this is its own
+    mode, not a weight value of zero on one link."""
+
+    LOAD_BALANCE = "load_balance"
+    FAILOVER_ONLY = "failover_only"
+
+
 class HealthStatus(StrEnum):
     """The result of the most recent real health check
     (``device_adapters.BaseIspHealthAdapter.ping``) against a link's own
