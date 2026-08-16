@@ -1530,8 +1530,9 @@ class TestRollbackAndApply:
 
 class TestEveryRouteRequiresPermission:
     def test_every_network_config_route_has_a_permission_dependency(self) -> None:
-        # 6 pre-existing routes + POST /routers/{router_id}/netwatch/push.
-        assert len(network_config_router.routes) == 7
+        # 6 pre-existing routes + POST /routers/{router_id}/netwatch/push
+        # + POST /routers/{router_id}/versions/{version_id}/apply-live.
+        assert len(network_config_router.routes) == 8
         for route in network_config_router.routes:
             assert (
                 route.dependencies != []

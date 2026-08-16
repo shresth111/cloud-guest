@@ -22,7 +22,11 @@ from app.domains.router_provisioning.schemas import (
     ProvisioningJobResponse,
 )
 
-__all__ = ["NetworkConfigPreviewResponse", "NetworkConfigNetwatchPushResponse"]
+__all__ = [
+    "NetworkConfigPreviewResponse",
+    "NetworkConfigNetwatchPushResponse",
+    "NetworkConfigApplyLiveResponse",
+]
 
 
 class NetworkConfigPreviewResponse(BaseModel):
@@ -52,3 +56,16 @@ class NetworkConfigNetwatchPushResponse(BaseModel):
     version: ConfigVersionResponse
     job: ProvisioningJobResponse
     watched_link_count: int
+
+
+class NetworkConfigApplyLiveResponse(BaseModel):
+    """``POST /network-config/routers/{router_id}/versions/{version_id}
+    /apply-live``'s own response -- whether the real device push (over
+    the same SSH-capable config-agent bridge Master Console's browser
+    used to call directly) actually succeeded, plus whatever detail the
+    bridge itself returned."""
+
+    router_id: str
+    version_id: str
+    applied: bool
+    detail: str | None = None
