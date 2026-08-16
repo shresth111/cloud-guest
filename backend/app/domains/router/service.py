@@ -61,6 +61,10 @@ from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 
 from .crypto import decrypt_secret, encrypt_secret
+from .device_credential_rotator import (
+    DeviceCredentialRotationError,
+    DeviceCredentialRotatorProtocol,
+)
 from .enums import ROUTER_STATUS_TRANSITIONS, RouterStatus
 from .exceptions import (
     CrossOrganizationRouterAccessError,
@@ -73,6 +77,7 @@ from .exceptions import (
     ProvisioningTokenNotFoundError,
     ProvisioningTokenRouterStateError,
     RouterDecommissionedError,
+    RouterLiveCredentialRotationFailedError,
     RouterNotFoundError,
 )
 from .models import Router, RouterProvisioningToken
@@ -142,12 +147,17 @@ class RouterService:
         *,
         audit_writer: AuditLogWriter | None = None,
         provisioning_token_ttl_hours: int = 24,
+        credential_rotator: DeviceCredentialRotatorProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.location_lookup = location_lookup
         self.organization_lookup = organization_lookup
         self.audit_writer = audit_writer
         self.provisioning_token_ttl_hours = provisioning_token_ttl_hours
+        # None in most test harnesses (no live device to push to) -- see
+        # ``_rotate_live_api_secret_if_needed``'s own docstring for exactly
+        # what happens when this is unset vs. configured.
+        self.credential_rotator = credential_rotator
 
     # -- reads -----------------------------------------------------------------
 
@@ -309,6 +319,9 @@ class RouterService:
 
         api_secret = update_data.pop("api_secret", None)
         if api_secret:
+            await self._rotate_live_api_secret_if_needed(
+                router, update_data=update_data, new_secret=str(api_secret)
+            )
             update_data["api_credentials_encrypted"] = encrypt_secret(str(api_secret))
 
         # Mirrors api_secret's own "write-only, encrypt-on-the-way-in"
@@ -330,6 +343,89 @@ class RouterService:
             description=f"Router '{updated.name}' updated",
         )
         return updated
+
+    async def _rotate_live_api_secret_if_needed(
+        self,
+        router: Router,
+        *,
+        update_data: dict[str, object],
+        new_secret: str,
+    ) -> None:
+        """Pushes ``new_secret`` to the live device *before*
+        ``update_router`` persists it, whenever this is a genuine
+        rotation of an already-working credential -- closes the gap
+        documented on ``RouterLiveCredentialRotationFailedError`` (the
+        production "Permission denied for user cloudguest-api" incident:
+        Master Console's Setup Script panel regenerates and persists a
+        new ``api_secret`` on every run against an already-provisioned
+        router, whether or not the resulting script chunk is ever
+        actually re-applied on the physical device).
+
+        Deliberately a no-op (falls through to the old "just persist it"
+        behavior) in three cases, each for a different reason:
+
+        * ``self.credential_rotator`` is unset -- most test harnesses and
+          any caller that hasn't opted into live-push wiring. Production
+          DI (``app.domains.router.dependencies.get_router_service``)
+          always configures a real rotator, so this only matters for
+          call sites that intentionally haven't (e.g. this test suite's
+          own ``make_service``, which passes no rotator by default so
+          existing update-router tests keep passing unchanged).
+        * The router has no existing ``management_ip_address``/
+          ``public_ip_address``, ``api_username``, or
+          ``api_credentials_encrypted`` on file yet -- this *is* the
+          first-time issuance case (a fresh device enrollment via
+          ``onGenerate``'s ``pending_provisioning``/``provisioning``
+          branch), where there is no old device password to
+          authenticate a live push with and nothing has drifted out of
+          sync yet -- the device gets its first real password from the
+          "API Access" script chunk the admin is about to run, same as
+          today.
+        * ``update_data`` is simultaneously changing
+          ``management_ip_address``/``public_ip_address``/
+          ``api_username`` in the same call -- too ambiguous to safely
+          guess which host/username the *old* secret was ever valid
+          against; out of scope for this fix (this combination is not
+          how Master Console's own Setup Script panel calls this
+          endpoint -- it only ever sends ``api_username``/``api_secret``
+          together, and always the same fixed ``API_ACCESS_USERNAME``).
+
+        Otherwise, attempts the real push and raises
+        :class:`RouterLiveCredentialRotationFailedError` -- and, because
+        this runs before ``update_data["api_credentials_encrypted"]`` is
+        ever set, the caller's transaction never reaches
+        ``repository.update_router`` at all -- on failure. Either the
+        device confirms the new password before the DB ever learns
+        about it, or the DB keeps the old (still-device-matching) secret
+        and the caller's ``PUT`` fails loudly instead of silently
+        drifting out of sync."""
+        if self.credential_rotator is None:
+            return
+        if (
+            "management_ip_address" in update_data
+            or "public_ip_address" in update_data
+            or "api_username" in update_data
+        ):
+            return
+
+        host = router.management_ip_address or router.public_ip_address
+        username = router.api_username
+        old_secret = self.get_decrypted_api_secret(router)
+        if not host or not username or not old_secret:
+            # First-time issuance -- nothing on the device to rotate yet.
+            return
+
+        try:
+            await self.credential_rotator.rotate_password(
+                host=host,
+                username=username,
+                old_password=old_secret,
+                new_password=new_secret,
+            )
+        except DeviceCredentialRotationError as exc:
+            raise RouterLiveCredentialRotationFailedError(
+                router.id, str(exc)
+            ) from exc
 
     async def decommission_router(
         self,
