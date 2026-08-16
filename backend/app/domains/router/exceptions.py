@@ -28,6 +28,7 @@ __all__ = [
     "ProvisioningTokenAlreadyUsedError",
     "ProvisioningTokenRouterStateError",
     "ProvisioningTokenGenerationNotAllowedError",
+    "RouterLiveCredentialRotationFailedError",
 ]
 
 
@@ -151,4 +152,41 @@ class ProvisioningTokenGenerationNotAllowedError(RouterError):
             f"status '{current_status}' -- only allowed while "
             "pending_provisioning",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class RouterLiveCredentialRotationFailedError(RouterError):
+    """Raised by ``RouterService.update_router`` when an ``api_secret``
+    change is being applied to a router that already has a *working*
+    RouterOS API credential on file (a real host/username/secret already
+    stored -- i.e. this is a *rotation*, not first-time issuance), and the
+    live push of the new password to the physical device (via
+    ``DeviceCredentialRotatorProtocol``) did not succeed.
+
+    This exists specifically to close the gap that caused the
+    "Permission denied for user cloudguest-api" production incident:
+    Master Console's Setup Script panel regenerates and immediately
+    persists a brand-new random ``api_secret`` to the DB every time an
+    admin re-runs it against an already-provisioned router, but the
+    physical device's RouterOS user password is only ever updated if the
+    admin separately re-pastes the resulting "API Access" script chunk in
+    WinBox. Any router that had its credential regenerated without that
+    manual re-paste step is left with a DB secret that no longer matches
+    the device -- silently, until the platform next tries to use it.
+
+    Raising here (instead of persisting the new secret regardless)
+    guarantees the DB and the device can never drift out of sync through
+    this endpoint: either the live push succeeds and both are updated
+    together, or neither is -- the old secret keeps working until the
+    device is reachable again. The caller (Master Console's Setup Script
+    generator) already treats a failed ``PUT /routers/{id}`` as
+    non-fatal -- it shows an error toast and omits the "API Access" chunk
+    from the generated script rather than handing out a script chunk the
+    platform can't actually use."""
+
+    def __init__(self, router_id: uuid.UUID, detail: str) -> None:
+        super().__init__(
+            f"Could not rotate the live API credential on router {router_id}'s "
+            f"device -- the stored secret was left unchanged: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
         )

@@ -45,6 +45,7 @@ from app.domains.router.exceptions import (
     ProvisioningTokenNotFoundError,
     ProvisioningTokenRouterStateError,
     RouterDecommissionedError,
+    RouterLiveCredentialRotationFailedError,
     RouterNotFoundError,
 )
 from app.domains.router.models import Router, RouterProvisioningToken
@@ -321,6 +322,7 @@ def make_service(
     repo: FakeRouterRepository | None = None,
     location_lookup: FakeLocationLookup | None = None,
     org_lookup: FakeOrganizationLookup | None = None,
+    credential_rotator: object | None = None,
 ) -> tuple[
     RouterService,
     FakeRouterRepository,
@@ -340,6 +342,7 @@ def make_service(
         organization_lookup,
         audit_writer=audit_writer,
         provisioning_token_ttl_hours=24,
+        credential_rotator=credential_rotator,
     )
     return service, repository, location_lookup, organization_lookup, audit_writer
 
@@ -1025,6 +1028,178 @@ class TestRouterCredentialEncryption:
         )
 
         assert service.get_decrypted_api_secret(router_device) is None
+
+
+# ============================================================================
+# Live credential rotation -- see RouterLiveCredentialRotationFailedError's
+# own docstring for the "Permission denied for user cloudguest-api"
+# production incident this closes.
+# ============================================================================
+
+
+@dataclass
+class FakeCredentialRotator:
+    """In-memory stand-in for ``DeviceCredentialRotatorProtocol``. Records
+    every call it receives; ``should_fail`` controls whether
+    ``rotate_password`` raises ``DeviceCredentialRotationError``, mirroring
+    a real device that's unreachable or rejects the old password."""
+
+    should_fail: bool = False
+    calls: list[dict[str, str]] = field(default_factory=list)
+
+    async def rotate_password(
+        self, *, host: str, username: str, old_password: str, new_password: str
+    ) -> None:
+        self.calls.append(
+            {
+                "host": host,
+                "username": username,
+                "old_password": old_password,
+                "new_password": new_password,
+            }
+        )
+        if self.should_fail:
+            from app.domains.router.device_credential_rotator import (
+                DeviceCredentialRotationError,
+            )
+
+            raise DeviceCredentialRotationError("device unreachable")
+
+
+class TestRouterLiveCredentialRotation:
+    async def _make_provisioned_router(
+        self, repo: FakeRouterRepository, org_lookup: FakeOrganizationLookup
+    ) -> Router:
+        organization = org_lookup.add()
+        router_device = await make_router(
+            repo,
+            location_id=uuid.uuid4(),
+            organization_id=organization.id,
+            status=RouterStatus.ONLINE,
+        )
+        # Simulate a router that already went through Setup Script once --
+        # a real host/username/secret already on file, exactly the state
+        # that makes a second api_secret change a *rotation*, not
+        # first-time issuance.
+        return await repo.update_router(
+            router_device,
+            {
+                "management_ip_address": "10.20.0.41",
+                "api_username": "cloudguest-api",
+                "api_credentials_encrypted": encrypt_secret("old-secret-123"),
+            },
+        )
+
+    async def test_rotation_pushes_old_and_new_secret_to_device(self) -> None:
+        rotator = FakeCredentialRotator()
+        service, repo, _location_lookup, org_lookup, _audit = make_service(
+            credential_rotator=rotator
+        )
+        router_device = await self._make_provisioned_router(repo, org_lookup)
+
+        updated = await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"api_secret": "new-secret-456"},
+        )
+
+        assert len(rotator.calls) == 1
+        assert rotator.calls[0] == {
+            "host": "10.20.0.41",
+            "username": "cloudguest-api",
+            "old_password": "old-secret-123",
+            "new_password": "new-secret-456",
+        }
+        assert service.get_decrypted_api_secret(updated) == "new-secret-456"
+
+    async def test_failed_rotation_raises_and_leaves_stored_secret_unchanged(
+        self,
+    ) -> None:
+        rotator = FakeCredentialRotator(should_fail=True)
+        service, repo, _location_lookup, org_lookup, _audit = make_service(
+            credential_rotator=rotator
+        )
+        router_device = await self._make_provisioned_router(repo, org_lookup)
+
+        with pytest.raises(RouterLiveCredentialRotationFailedError):
+            await service.update_router(
+                actor_user_id=uuid.uuid4(),
+                router_id=router_device.id,
+                requesting_organization_id=None,
+                data={"api_secret": "new-secret-456"},
+            )
+
+        assert len(rotator.calls) == 1
+        # The stored secret still matches the device -- the DB never
+        # learned about the new one since the live push failed.
+        reloaded = await repo.get_by_id(router_device.id)
+        assert reloaded is not None
+        assert service.get_decrypted_api_secret(reloaded) == "old-secret-123"
+
+    async def test_first_time_issuance_skips_rotation(self) -> None:
+        """A freshly-created router has no management_ip/api_username/
+        api_credentials_encrypted yet -- its very first api_secret is
+        issuance, not rotation, so the rotator must never be called (and
+        would fail this test if it were, since ``should_fail=True``)."""
+        rotator = FakeCredentialRotator(should_fail=True)
+        service, repo, _location_lookup, org_lookup, _audit = make_service(
+            credential_rotator=rotator
+        )
+        organization = org_lookup.add()
+        router_device = await make_router(
+            repo, location_id=uuid.uuid4(), organization_id=organization.id
+        )
+
+        updated = await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"api_username": "cloudguest-api", "api_secret": "first-secret"},
+        )
+
+        assert rotator.calls == []
+        assert service.get_decrypted_api_secret(updated) == "first-secret"
+
+    async def test_no_rotator_configured_falls_back_to_direct_persist(self) -> None:
+        """Backward-compatible default -- ``make_service()`` with no
+        rotator (every other test in this module) keeps today's
+        behavior unchanged."""
+        service, repo, _location_lookup, org_lookup, _audit = make_service()
+        router_device = await self._make_provisioned_router(repo, org_lookup)
+
+        updated = await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={"api_secret": "new-secret-456"},
+        )
+
+        assert service.get_decrypted_api_secret(updated) == "new-secret-456"
+
+    async def test_simultaneous_host_change_skips_rotation(self) -> None:
+        """Changing management_ip_address in the same call is out of
+        scope (too ambiguous which host the old secret was ever valid
+        against) -- falls back to direct persist rather than pushing
+        against a possibly-wrong host."""
+        rotator = FakeCredentialRotator(should_fail=True)
+        service, repo, _location_lookup, org_lookup, _audit = make_service(
+            credential_rotator=rotator
+        )
+        router_device = await self._make_provisioned_router(repo, org_lookup)
+
+        updated = await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            data={
+                "management_ip_address": "10.20.0.99",
+                "api_secret": "new-secret-456",
+            },
+        )
+
+        assert rotator.calls == []
+        assert service.get_decrypted_api_secret(updated) == "new-secret-456"
 
 
 # ============================================================================

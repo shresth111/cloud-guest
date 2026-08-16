@@ -28,8 +28,14 @@ from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
+from .device_credential_rotator import ConfigAgentBridgeCredentialRotator
 from .repository import RouterRepository, RouterRepositoryProtocol
 from .service import RouterService
+
+# Module-level singleton -- stateless (see ConfigAgentBridgeCredentialRotator's
+# own docstring), so there is no reason to build a fresh one per request the
+# way the DB-backed dependencies below need to.
+_credential_rotator = ConfigAgentBridgeCredentialRotator()
 
 
 def get_router_repository(
@@ -51,4 +57,10 @@ def get_router_service(
         organization_service,
         audit_writer=audit_repository,
         provisioning_token_ttl_hours=settings.router_provisioning_token_expire_hours,
+        # Closes the "Permission denied for user cloudguest-api" gap --
+        # see RouterLiveCredentialRotationFailedError's own docstring:
+        # without this, PUT /routers/{id} would happily persist a new
+        # api_secret with no guarantee the physical device was ever told
+        # about it.
+        credential_rotator=_credential_rotator,
     )
