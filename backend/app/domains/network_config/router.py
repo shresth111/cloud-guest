@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Query, Request, status
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import Settings, get_settings
@@ -23,6 +24,9 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.router.dependencies import get_router_service
+from app.domains.router.service import RouterService
+from app.domains.router_provisioning.dependencies import get_router_provisioning_service
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
 from app.domains.router_provisioning.schemas import (
     ConfigVersionApplyResponse,
@@ -32,12 +36,31 @@ from app.domains.router_provisioning.schemas import (
     ConfigVersionSummary,
     ProvisioningJobResponse,
 )
+from app.domains.router_provisioning.service import RouterProvisioningService
 
 from .dependencies import get_network_config_service
-from .schemas import NetworkConfigNetwatchPushResponse, NetworkConfigPreviewResponse
+from .schemas import (
+    NetworkConfigApplyLiveResponse,
+    NetworkConfigNetwatchPushResponse,
+    NetworkConfigPreviewResponse,
+)
 from .service import NetworkConfigService
 
 router = APIRouter(prefix="/network-config", tags=["Network Configuration Management"])
+
+# The dashboard's SSH-capable config-push bridge -- same small agent
+# (running alongside the WireGuard hub) that already backs
+# app.domains.wireguard.router's own _WG_AGENT_URL/_WG_AGENT_SECRET,
+# mirrored here with the identical naming/module-level-constant
+# convention. Previously called directly from the browser
+# (RouterDetailTabs.tsx's ConfigTab.handlePush) -- a plain http:// URL
+# with the secret shipped in the JS bundle, silently blocked as mixed
+# content once the app moved to HTTPS. Calling it from here instead
+# sidesteps that (a server has no browser mixed-content policy) and
+# keeps the secret out of client code entirely, mirroring exactly how
+# the WireGuard/RADIUS bridges already avoid a direct browser call.
+_CONFIG_AGENT_URL = "http://20.219.72.235:9093/config/apply"
+_CONFIG_AGENT_SECRET = "configagent-55952aac79cbbf5ac9dc404c228ed5b7"
 
 
 def _request_id(request: Request) -> str:
@@ -163,6 +186,100 @@ async def push_network_config(
     return build_response(
         success=True,
         message="Network config rendered and queued for application",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/versions/{version_id}/apply-live",
+    response_model=ApiResponse[NetworkConfigApplyLiveResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("network_config.execute"))],
+)
+async def apply_network_config_live(
+    request: Request,
+    router_id: uuid.UUID,
+    version_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    provisioning_service: RouterProvisioningService = Depends(
+        get_router_provisioning_service
+    ),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Server-side equivalent of what ``ConfigTab.handlePush`` (frontend)
+    previously did itself in two direct browser calls: fetch this
+    router's real connection info, then hand the already-rendered
+    ``ConfigVersion.rendered_content`` to the SSH-capable config-agent
+    bridge. Moving both steps here fixes two real problems at once --
+    the bridge is a plain ``http://`` endpoint with no CORS support,
+    silently blocked as mixed content once called from an HTTPS page
+    (confirmed live), and the frontend previously had to ship
+    ``_CONFIG_AGENT_SECRET`` in its own JS bundle just to make the call
+    at all. See ``get_device_connection``'s own docstring for why
+    ``reveal_credentials`` (not a lower-tier read) is the right gate here
+    too -- this is the same real, high-trust device operation, exposing
+    the same decrypted secret, just consumed server-side instead of
+    handed back to the browser."""
+    version = await provisioning_service.get_version(
+        router_id=router_id,
+        version_id=version_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    router_row = await router_service.reveal_credentials(
+        actor_user_id=uuid.UUID(user.id),
+        router_id=router_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    host = router_row.management_ip_address or router_row.public_ip_address
+    username = router_row.api_username
+    password = router_service.get_decrypted_api_secret(router_row)
+    if not host or not username or not password:
+        payload = NetworkConfigApplyLiveResponse(
+            router_id=str(router_id),
+            version_id=str(version_id),
+            applied=False,
+            detail="Router has no stored connection details -- can't apply live.",
+        )
+        return build_response(
+            success=True,
+            message="Router has no stored connection details",
+            data=payload.model_dump(),
+            request_id=_request_id(request),
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                _CONFIG_AGENT_URL,
+                headers={"X-Agent-Secret": _CONFIG_AGENT_SECRET},
+                json={
+                    "tunnel_ip": host,
+                    "username": username,
+                    "password": password,
+                    "script": version.rendered_content,
+                },
+            )
+            resp.raise_for_status()
+            result = resp.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail="Could not reach the config-agent bridge"
+        ) from exc
+
+    payload = NetworkConfigApplyLiveResponse(
+        router_id=str(router_id),
+        version_id=str(version_id),
+        applied=bool(result.get("applied")),
+        detail=result.get("detail") or result.get("error"),
+    )
+    message = (
+        "Config applied to the live device" if payload.applied else "Live apply failed"
+    )
+    return build_response(
+        success=True,
+        message=message,
         data=payload.model_dump(),
         request_id=_request_id(request),
     )
