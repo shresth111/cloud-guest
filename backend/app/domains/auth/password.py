@@ -104,6 +104,23 @@ class PasswordManager:
             raise PasswordError(f"Failed to hash password: {exc}") from exc
 
     @staticmethod
+    def hash_raw(value: str) -> str:
+        """Hash ``value`` with the exact same Argon2id parameters
+        ``hash`` uses, skipping ``validate_strength``'s password-
+        composition policy (minimum length, upper/lower/digit/special) --
+        for secrets that could never satisfy that policy by construction,
+        e.g. ``app.domains.guest.service.GuestService.set_guest_pin``'s
+        fixed-length numeric PIN (6 digits, always shorter than
+        ``MIN_LENGTH`` and never containing a letter). Callers are
+        responsible for whatever strength policy actually fits their own
+        secret type -- guest PINs use
+        ``app.domains.guest.validators.is_weak_pin`` instead."""
+        try:
+            return PasswordManager._hasher.hash(value)
+        except HashingError as exc:
+            raise PasswordError(f"Failed to hash value: {exc}") from exc
+
+    @staticmethod
     def verify(password: str, hashed_password: str) -> bool:
         """Return ``True`` if ``password`` matches ``hashed_password``."""
         try:

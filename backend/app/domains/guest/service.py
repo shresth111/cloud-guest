@@ -243,6 +243,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
+from redis.asyncio import Redis
+
 from app.common.exceptions import CloudGuestError
 from app.database.constants import SortOrder
 from app.domains.auth.password import (
@@ -279,6 +281,10 @@ from .constants import (
     DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
     NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
+    PIN_LENGTH,
+    PIN_LOCKOUT_MINUTES,
+    PIN_MAX_ATTEMPTS,
+    PIN_STALE_AFTER_DAYS,
     RECONNECT_GRACE_MINUTES,
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
@@ -319,6 +325,10 @@ from .exceptions import (
     GuestPasswordLoginFailedError,
     GuestPasswordSetupNotAuthorizedError,
     GuestPasswordTooWeakError,
+    GuestPinLockedError,
+    GuestPinLoginFailedError,
+    GuestPinSetupNotAuthorizedError,
+    GuestPinTooWeakError,
     GuestProfileUpdateNotAuthorizedError,
     GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
@@ -364,6 +374,7 @@ from .validators import (
     is_fup_usage_exceeded,
     is_quota_exceeded,
     is_session_timed_out,
+    is_weak_pin,
     normalize_identifier,
     normalize_mac_address,
     validate_date_range,
@@ -385,6 +396,94 @@ logger = logging.getLogger(__name__)
 # message is deliberately generic -- see ``GuestService
 # ._verify_guest_password``.
 _DUMMY_PASSWORD_HASH = PasswordManager.hash("Dummy-Guest-Password-000!")
+
+# The identical dummy-hash trick above, sized for a PIN instead of a
+# password -- see ``GuestService._verify_guest_pin``. Hashed via
+# ``PasswordManager.hash_raw``, not ``PasswordManager.hash``: a 6-digit
+# value could never pass ``validate_strength`` (see that method's own
+# docstring for why ``set_guest_pin`` hashes real guest PINs the same way).
+_DUMMY_PIN_HASH = PasswordManager.hash_raw("047183")
+
+# Redis key template for GuestPinSecurity's brute-force lockout counter --
+# scoped by (organization_id, identifier), mirroring
+# app.domains.auth.security.AuthSecurity's own ``_RATE_LIMIT_KEY``
+# (email+ip_address) and app.domains.otp.service
+# .OTP_REQUEST_RATE_LIMIT_KEY_TEMPLATE (identifier alone)'s identical
+# per-module key-namespacing convention.
+_PIN_LOCKOUT_KEY_TEMPLATE = "guest_pin:lockout:{organization_id}:{identifier}"
+
+
+class GuestPinSecurity:
+    """Static facade over Redis for ``GuestService.login_via_pin``'s
+    brute-force lockout -- mirrors ``app.domains.auth.security
+    .AuthSecurity.check_rate_limit``/``record_login_attempt``'s and
+    ``app.domains.otp.service.OtpRateLimiter``'s identical INCR+EXPIRE+TTL
+    convention, reusing the existing Redis client
+    (``app.database.redis``) rather than introducing a new cache
+    abstraction.
+
+    **Why this exists at all, when ``login_via_password`` has no
+    equivalent:** a real password is drawn from a keyspace large enough
+    that online brute-forcing it is impractical even with zero lockout --
+    a genuine, confirmed gap in ``login_via_password`` today, but not one
+    this class fixes (out of scope for Portal PIN). A ``constants
+    .PIN_LENGTH``-digit numeric PIN is a completely different story: its
+    entire keyspace is ``10 ** PIN_LENGTH`` values, small enough that an
+    unthrottled attacker could realistically exhaust it. This class is
+    what makes that impractical instead: ``PIN_MAX_ATTEMPTS`` failures
+    against one ``(organization_id, identifier)`` pair lock it out for
+    ``PIN_LOCKOUT_MINUTES``, raising ``GuestPinLockedError`` (423) on
+    every further attempt until the window expires -- without ever
+    touching the presented PIN or paying a real Argon2id verify cost,
+    the identical "reject before doing the expensive/sensitive part"
+    discipline ``_verify_guest_password``'s own dummy-hash trick
+    establishes for *timing*, applied here to *attempt volume*.
+
+    Scoped by ``(organization_id, identifier)``, not ``identifier``
+    alone -- the same tenant-scoping every other guest-identity lookup in
+    this module already applies (mirrors ``Guest``'s own
+    ``uq_guests_organization_id_identifier`` uniqueness: the same phone
+    number reused across two different organizations' guest lists is two
+    different ``Guest`` rows, and must be two different lockout
+    counters)."""
+
+    @staticmethod
+    def _key(organization_id: uuid.UUID, identifier: str) -> str:
+        return _PIN_LOCKOUT_KEY_TEMPLATE.format(
+            organization_id=organization_id, identifier=identifier
+        )
+
+    @staticmethod
+    async def check_lockout(
+        redis: Redis, *, organization_id: uuid.UUID, identifier: str
+    ) -> None:
+        """Raises ``GuestPinLockedError`` if this ``(organization_id,
+        identifier)`` pair already has ``constants.PIN_MAX_ATTEMPTS`` (or
+        more) recorded failures within the current lockout window."""
+        key = GuestPinSecurity._key(organization_id, identifier)
+        attempts = await redis.get(key)
+        if attempts and int(attempts) >= PIN_MAX_ATTEMPTS:
+            ttl = await redis.ttl(key)
+            locked_until = datetime.now(UTC) + timedelta(
+                seconds=ttl if ttl and ttl > 0 else PIN_LOCKOUT_MINUTES * 60
+            )
+            raise GuestPinLockedError(locked_until)
+
+    @staticmethod
+    async def record_attempt(
+        redis: Redis, *, organization_id: uuid.UUID, identifier: str, success: bool
+    ) -> None:
+        """Clears the failure counter entirely on a successful login, or
+        increments it (starting a fresh ``constants.PIN_LOCKOUT_MINUTES``
+        window on the very first failure) -- mirrors ``AuthSecurity
+        .record_login_attempt``'s identical shape."""
+        key = GuestPinSecurity._key(organization_id, identifier)
+        if success:
+            await redis.delete(key)
+            return
+        current = await redis.incr(key)
+        if current == 1:
+            await redis.expire(key, PIN_LOCKOUT_MINUTES * 60)
 
 
 def _event_extra(event: object) -> dict[str, object]:
@@ -1089,6 +1188,28 @@ class GuestService:
     that entire method always reject (see its own docstring): this hook
     gates a whole login path, not an auxiliary effect of one of the other
     three.
+
+    ``redis`` (Portal PIN) is a sixth, independently optional,
+    ``None``-by-default constructor parameter -- the one exception to
+    every parameter above being a narrow, duck-typed ``Protocol`` wrapping
+    another domain's real service. ``login_via_pin``'s brute-force
+    lockout (``GuestPinSecurity``, a static facade, not a stateful
+    collaborator) needs nothing from another domain's service, only the
+    same raw ``redis.asyncio.Redis`` client ``app.domains.otp.service
+    .OtpService``/``app.domains.auth.security.AuthSecurity`` already use
+    directly for their own rate limiting -- wrapping it in a Protocol
+    would add an indirection with no real collaborator behind it. Additive
+    for the identical reason every hook above is: defaults to ``None``, so
+    every existing caller/test that constructs ``GuestService`` without it
+    (this module's entire pre-Portal-PIN test suite included) is
+    unaffected, and when unset, ``login_via_pin`` simply skips the
+    ``GuestPinSecurity`` lockout check/record entirely -- a deployment
+    that forgets to wire this loses brute-force protection, not the
+    ability to log in, mirroring every other optional hook's own
+    fail-open-to-"feature simply off" posture rather than fail-closed. The
+    real running application always wires it (see
+    ``dependencies.get_guest_service``) -- this default only matters for
+    tests and any other caller that has no real Redis available.
     """
 
     def __init__(
@@ -1105,6 +1226,7 @@ class GuestService:
         queue_assignment_hook: QueueAssignmentProtocol | None = None,
         policy_lookup: PolicyLookupProtocol | None = None,
         mac_authorization_hook: MacAuthorizationLookupProtocol | None = None,
+        redis: Redis | None = None,
     ) -> None:
         self.repository = repository
         self.otp_service = otp_service
@@ -1117,6 +1239,7 @@ class GuestService:
         self.queue_assignment_hook = queue_assignment_hook
         self.policy_lookup = policy_lookup
         self.mac_authorization_hook = mac_authorization_hook
+        self.redis = redis
 
     async def _broadcast_guest_session_started(
         self,
@@ -1689,6 +1812,274 @@ class GuestService:
             guest=guest, session=session, device=device, is_new_guest=False
         )
 
+    def _verify_guest_pin(self, guest: Guest | None, pin: str) -> bool:
+        """Constant-effort PIN check for ``login_via_pin`` -- mirrors
+        ``_verify_guest_password``'s identical "a real Argon2id ``verify``
+        always runs, even with no real ``hashed_pin`` to compare against"
+        discipline; see ``_DUMMY_PIN_HASH``'s own module-level docstring
+        for why."""
+        hashed = guest.hashed_pin if guest and guest.hashed_pin else None
+        try:
+            verified = PasswordManager.verify(pin, hashed or _DUMMY_PIN_HASH)
+        except PasswordVerificationError:
+            verified = False
+        return verified if hashed is not None else False
+
+    def _is_guest_pin_stale(self, guest: Guest, *, now: datetime) -> bool:
+        """Whether ``guest``'s PIN has gone unused (never freshly set,
+        never successfully logged in with) for longer than
+        ``constants.PIN_STALE_AFTER_DAYS`` -- see that constant's own
+        docstring for why the reference point is "more recent of
+        ``pin_set_at``/``pin_last_used_at``", not just one or the other.
+        Only meaningful when ``guest.hashed_pin`` is actually set; callers
+        combine this with ``_verify_guest_pin`` rather than relying on it
+        alone (a guest with no PIN at all already fails
+        ``_verify_guest_pin``, regardless of what this returns)."""
+        reference = guest.pin_last_used_at or guest.pin_set_at
+        if reference is None:
+            return True
+        return now - reference > timedelta(days=PIN_STALE_AFTER_DAYS)
+
+    async def _record_pin_attempt(
+        self,
+        *,
+        guest: Guest | None,
+        organization_id: uuid.UUID,
+        identifier: str,
+        success: bool,
+        now: datetime,
+    ) -> None:
+        """Records one ``login_via_pin`` attempt in both places that need
+        to know about it: ``GuestPinSecurity`` (Redis, the real,
+        authoritative gate the *next* attempt is checked against -- see
+        that class's own docstring), and ``Guest.pin_failed_attempts``/
+        ``pin_locked_until``/``pin_last_used_at`` (a best-effort, durable,
+        admin-visible mirror of that same state -- see
+        ``Guest.pin_failed_attempts``'s own docstring for why this is
+        never read back to make a real decision). A no-op on the Redis
+        side when no ``redis`` client was wired (see ``GuestService``'s
+        own docstring); a no-op on the ``Guest`` side entirely when
+        ``guest`` is ``None`` (nothing to mirror onto yet -- an unknown
+        identifier's failed attempts still count against
+        ``GuestPinSecurity``'s own per-identifier counter above, just not
+        onto any row)."""
+        if self.redis is not None:
+            await GuestPinSecurity.record_attempt(
+                self.redis,
+                organization_id=organization_id,
+                identifier=identifier,
+                success=success,
+            )
+        if guest is None:
+            return
+        if success:
+            await self.repository.update_guest(
+                guest,
+                {
+                    "pin_failed_attempts": 0,
+                    "pin_locked_until": None,
+                    "pin_last_used_at": now,
+                },
+            )
+            return
+        failed_attempts = (guest.pin_failed_attempts or 0) + 1
+        update_data: dict[str, object] = {"pin_failed_attempts": failed_attempts}
+        if failed_attempts >= PIN_MAX_ATTEMPTS:
+            update_data["pin_locked_until"] = now + timedelta(
+                minutes=PIN_LOCKOUT_MINUTES
+            )
+        await self.repository.update_guest(guest, update_data)
+
+    async def login_via_pin(
+        self,
+        *,
+        identifier: str,
+        pin: str,
+        device_mac: str | None,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID,
+        router_id: uuid.UUID,
+        device_name: str | None = None,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+        accept_language: str | None = None,
+    ) -> GuestLoginResult:
+        """Portal PIN: device-scoped quick-login via a guest's own,
+        previously-set PIN -- the ``pin`` counterpart to
+        ``login_via_password``, structurally mirroring that method's exact
+        "reject before touching anything with a side effect" gate ordering
+        (``_require_method_enabled`` -> blocked-guest/access-control ->
+        concurrent-session/device-limit/FUP-quota, all before any real
+        credential verification) with two deliberate differences:
+
+        **Device-scoped.** Unlike password login, a successful PIN login
+        also requires ``device_mac`` to match a real ``GuestDevice`` that
+        already belongs to the resolved guest -- i.e. only a device that
+        has previously completed a real OTP login for this guest may ever
+        use PIN login at all. Deliberately never creates or reassigns a
+        ``GuestDevice`` the way ``_maybe_get_or_create_device`` does for
+        every other login method: a PIN login that doesn't already have a
+        matching device has nothing legitimate to attach a session to, and
+        must fail exactly like a wrong PIN, not silently register a new
+        device. A missing/unrecognized ``device_mac`` collapses into the
+        exact same generic ``GuestPinLoginFailedError`` as a wrong PIN or
+        an unknown identifier (see that exception's own docstring) --
+        never a distinct error that would let a caller learn "this
+        identifier exists but I have the wrong device" from the response
+        alone.
+
+        **Brute-force lockout.** ``login_via_password`` has no
+        per-identifier lockout at all today -- a real, confirmed gap this
+        method does not inherit (see ``GuestPinSecurity``'s own docstring
+        for why a PIN's small keyspace makes one necessary here
+        specifically). ``GuestPinSecurity.check_lockout`` runs first,
+        immediately after resolving which organization this login belongs
+        to and before any of this method's own verification work --
+        a locked-out ``(organization_id, identifier)`` pair raises
+        ``GuestPinLockedError`` (423) without ever looking up the guest,
+        the device, or touching ``pin``.
+
+        A PIN that verifies correctly but has gone unused for longer than
+        ``constants.PIN_STALE_AFTER_DAYS`` is treated exactly like a wrong
+        PIN -- ``_is_guest_pin_stale``'s own docstring covers the full
+        reasoning; the guest's remedy is the same either way, a fresh OTP
+        login (which is also the only way to set a new PIN)."""
+        identifier = normalize_identifier(identifier)
+        resolved = await self._require_method_enabled(
+            organization_id=organization_id,
+            location_id=location_id,
+            auth_method=GuestAuthMethod.PIN,
+        )
+        resolved_org_id = resolved.config.organization_id
+
+        if self.redis is not None:
+            await GuestPinSecurity.check_lockout(
+                self.redis, organization_id=resolved_org_id, identifier=identifier
+            )
+
+        existing_guest = await self.repository.get_guest_by_identifier(
+            resolved_org_id, identifier
+        )
+        self._reject_if_blocked(existing_guest)
+        await self._enforce_access_control(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=device_mac,
+        )
+        if existing_guest is not None:
+            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_device_limit(
+                guest_id=existing_guest.id,
+                mac_address=device_mac,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
+            await self._enforce_fup_quota(
+                guest_id=existing_guest.id, organization_id=resolved_org_id
+            )
+
+        router = await self._get_eligible_router(router_id)
+
+        normalized_mac = normalize_mac_address(device_mac) if device_mac else None
+        device = (
+            await self.repository.get_device_by_mac(normalized_mac)
+            if normalized_mac
+            else None
+        )
+        device_matches = (
+            existing_guest is not None
+            and device is not None
+            and device.guest_id == existing_guest.id
+        )
+        pin_matches = self._verify_guest_pin(existing_guest, pin)
+        now = datetime.now(UTC)
+        is_stale = existing_guest is not None and self._is_guest_pin_stale(
+            existing_guest, now=now
+        )
+        authenticated = device_matches and pin_matches and not is_stale
+
+        await self._record_pin_attempt(
+            guest=existing_guest,
+            organization_id=resolved_org_id,
+            identifier=identifier,
+            success=authenticated,
+            now=now,
+        )
+        if not authenticated:
+            await self._record_login_failure(
+                guest=existing_guest,
+                identifier=identifier,
+                auth_method=GuestAuthMethod.PIN,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+                reason="GuestPinLoginFailedError",
+                ip_address=ip_address,
+            )
+            raise GuestPinLoginFailedError()
+
+        guest = existing_guest
+        assert guest is not None  # narrowed by `authenticated` above
+        assert device is not None  # narrowed by `device_matches` above
+        # Bump last_seen_at (and device_name, if the caller supplied a
+        # fresher one) on the already-matched device -- the same "returning
+        # device" update ``get_or_create_device`` applies for every other
+        # login method, minus the create-or-reassign branch that method
+        # also handles (impossible here: device_matches already proved this
+        # exact device belongs to this exact guest).
+        device_update: dict[str, object] = {"last_seen_at": now}
+        if device_name is not None:
+            device_update["device_name"] = device_name
+        device = await self.repository.update_device(device, device_update)
+        session = await self._create_session(
+            guest=guest,
+            device=device,
+            router=router,
+            location_id=location_id,
+            auth_method=GuestAuthMethod.PIN,
+            voucher_id=None,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            accept_language=accept_language,
+            data_limit_mb=None,
+            session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
+        )
+        await self._broadcast_guest_session_started(
+            session=session,
+            guest=guest,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+            auth_method=GuestAuthMethod.PIN.value,
+            is_new_guest=False,
+        )
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+        await self._bump_guest_visit(guest)
+        await self._record_login_success(
+            guest=guest,
+            identifier=identifier,
+            auth_method=GuestAuthMethod.PIN,
+            location_id=location_id,
+            ip_address=ip_address,
+        )
+
+        event = GuestLoggedIn(
+            guest_id=guest.id,
+            identifier=identifier,
+            auth_method=GuestAuthMethod.PIN.value,
+            session_id=session.id,
+            is_new_guest=False,
+        )
+        logger.info("guest_logged_in", extra=_event_extra(event))
+        return GuestLoginResult(
+            guest=guest, session=session, device=device, is_new_guest=False
+        )
+
     async def login_via_mac_whitelist(
         self,
         *,
@@ -1917,6 +2308,77 @@ class GuestService:
             "guest_password_set",
             extra={"event_guest_id": str(updated.id)},
         )
+        return updated
+
+    async def set_guest_pin(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        session_id: uuid.UUID,
+        pin: str,
+    ) -> Guest:
+        """Lets a guest opt in to Portal PIN login, right after a real OTP
+        verification -- the ``pin`` counterpart to ``set_guest_password``,
+        requiring the exact same proof of a just-completed, still-
+        ``ACTIVE`` OTP-authenticated ``GuestSession`` that method's own
+        docstring documents in full (session belongs to ``guest_id``, its
+        ``auth_method`` is ``otp_sms``/``otp_email``/``otp_whatsapp``, it
+        is still ``ACTIVE``, and it started within
+        ``constants.SET_PASSWORD_SESSION_WINDOW_MINUTES`` of now) --
+        reusing that identical window constant rather than inventing a
+        separate one for an equivalent "prove you just logged in"
+        guarantee. Any failed leg raises
+        ``GuestPinSetupNotAuthorizedError`` (one generic message, for the
+        identical reason ``GuestPasswordSetupNotAuthorizedError`` gives).
+
+        ``pin`` must be exactly ``constants.PIN_LENGTH`` digits and must
+        not be trivially guessable (``validators.is_weak_pin`` -- see that
+        function's own docstring for exactly which two shapes are
+        rejected); either failure raises ``GuestPinTooWeakError``. Hashed
+        via ``PasswordManager.hash_raw`` -- the same Argon2id cost
+        parameters ``set_guest_password`` gets from ``PasswordManager
+        .hash``, without that method's password-composition strength
+        policy (minimum length, upper/lower/digit/special), which a
+        fixed-length numeric PIN could never satisfy; ``is_weak_pin``
+        above is this method's own, PIN-appropriate strength check
+        instead. Clears ``pin_failed_attempts``/``pin_locked_until`` (a
+        guest setting a brand-new PIN gets a clean slate, not a lockout
+        carried over from whatever PIN -- if any -- they had before)."""
+        guest = await self._require_guest(guest_id)
+        session = await self.repository.get_session_by_id(session_id)
+        now = datetime.now(UTC)
+        window_start = now - timedelta(minutes=SET_PASSWORD_SESSION_WINDOW_MINUTES)
+        eligible = (
+            session is not None
+            and session.guest_id == guest.id
+            and session.auth_method
+            in (
+                GuestAuthMethod.OTP_SMS.value,
+                GuestAuthMethod.OTP_EMAIL.value,
+                GuestAuthMethod.OTP_WHATSAPP.value,
+            )
+            and session.status == GuestSessionStatus.ACTIVE.value
+            and session.started_at >= window_start
+        )
+        if not eligible:
+            raise GuestPinSetupNotAuthorizedError()
+
+        if len(pin) != PIN_LENGTH or not pin.isdigit():
+            raise GuestPinTooWeakError(f"PIN must be exactly {PIN_LENGTH} digits")
+        if is_weak_pin(pin):
+            raise GuestPinTooWeakError()
+
+        hashed = PasswordManager.hash_raw(pin)
+        updated = await self.repository.update_guest(
+            guest,
+            {
+                "hashed_pin": hashed,
+                "pin_set_at": now,
+                "pin_failed_attempts": 0,
+                "pin_locked_until": None,
+            },
+        )
+        logger.info("guest_pin_set", extra={"event_guest_id": str(updated.id)})
         return updated
 
     async def update_guest_profile(
@@ -2730,6 +3192,7 @@ class GuestService:
             GuestAuthMethod.OTP_WHATSAPP: config.otp_whatsapp_enabled,
             GuestAuthMethod.VOUCHER: config.voucher_enabled,
             GuestAuthMethod.USERNAME_PASSWORD: config.username_password_enabled,
+            GuestAuthMethod.PIN: config.pin_login_enabled,
         }
         if not enabled_map[auth_method]:
             raise GuestAuthMethodNotEnabledError(auth_method.value)

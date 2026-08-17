@@ -34,6 +34,9 @@ from app.domains.guest.constants import (
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
+    PIN_LOCKOUT_MINUTES,
+    PIN_MAX_ATTEMPTS,
+    PIN_STALE_AFTER_DAYS,
     RECONNECT_GRACE_MINUTES,
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
@@ -53,6 +56,10 @@ from app.domains.guest.exceptions import (
     GuestPasswordLoginFailedError,
     GuestPasswordSetupNotAuthorizedError,
     GuestPasswordTooWeakError,
+    GuestPinLockedError,
+    GuestPinLoginFailedError,
+    GuestPinSetupNotAuthorizedError,
+    GuestPinTooWeakError,
     GuestProfileUpdateNotAuthorizedError,
     GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
@@ -145,6 +152,44 @@ class FakeAuditLogWriter:
     async def create_audit_log_entry(self, **fields: object) -> dict[str, object]:
         self.entries.append(fields)
         return fields
+
+
+class FakeRedis:
+    """Minimal async in-memory stand-in for ``redis.asyncio.Redis`` --
+    mirrors ``tests/unit/test_auth.py``'s own ``FakeRedis`` (a single,
+    unified ``_store`` shared by ``get``/``incr``, the same keyspace a
+    real Redis ``INCR``/``GET`` share), not ``tests/unit/test_otp.py``'s
+    (whose ``incr`` writes a separate ``_counts`` dict ``get`` never
+    reads -- harmless there only because ``OtpRateLimiter`` never calls
+    ``get`` at all, always incrementing-then-checking in one step;
+    ``GuestPinSecurity.check_lockout`` genuinely needs a standalone
+    ``get`` to see counts a *previous* call's ``incr`` already wrote)."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, str] = {}
+        self._ttls: dict[str, int] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self._store.get(key)
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        self._store[key] = str(value)
+
+    async def delete(self, key: str) -> None:
+        self._store.pop(key, None)
+        self._ttls.pop(key, None)
+
+    async def incr(self, key: str) -> int:
+        current = int(self._store.get(key, "0")) + 1
+        self._store[key] = str(current)
+        return current
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        self._ttls[key] = seconds
+        return True
+
+    async def ttl(self, key: str) -> int:
+        return self._ttls.get(key, -1)
 
 
 @dataclass
@@ -243,6 +288,7 @@ class FakeCaptivePortalService:
         otp_whatsapp_enabled: bool = False,
         voucher_enabled: bool = True,
         username_password_enabled: bool = False,
+        pin_login_enabled: bool = False,
     ) -> CaptivePortalConfig:
         config = CaptivePortalConfig(
             **_base_fields(
@@ -272,6 +318,7 @@ class FakeCaptivePortalService:
                 otp_whatsapp_enabled=otp_whatsapp_enabled,
                 voucher_enabled=voucher_enabled,
                 username_password_enabled=username_password_enabled,
+                pin_login_enabled=pin_login_enabled,
                 social_login_enabled=False,
                 social_login_providers=[],
             )
@@ -1139,6 +1186,7 @@ class Fixture:
     location_lookup: FakeLocationLookup
     nas_code_counter_repository: FakeNasCodeCounterRepository
     audit_writer: FakeAuditLogWriter
+    redis: FakeRedis
     guest_service: GuestService
     radius_service: RadiusService
     analytics_service: GuestAnalyticsService
@@ -1153,12 +1201,14 @@ def make_fixture(
     otp_whatsapp_enabled: bool = False,
     voucher_enabled: bool = True,
     username_password_enabled: bool = True,
+    pin_login_enabled: bool = True,
     router_status: str = RouterStatus.ONLINE.value,
     access_control_hook: object | None = None,
     queue_lookup: object | None = None,
     policy_lookup: object | None = None,
     queue_assignment_hook: object | None = None,
     mac_authorization_hook: object | None = None,
+    redis: FakeRedis | None = None,
 ) -> Fixture:
     repository = FakeGuestRepository()
     otp_service = FakeOtpService()
@@ -1168,6 +1218,7 @@ def make_fixture(
     location_lookup = FakeLocationLookup()
     nas_code_counter_repository = FakeNasCodeCounterRepository()
     audit_writer = FakeAuditLogWriter()
+    redis = redis if redis is not None else FakeRedis()
 
     organization_id = uuid.uuid4()
     location_id = uuid.uuid4()
@@ -1177,6 +1228,7 @@ def make_fixture(
         otp_whatsapp_enabled=otp_whatsapp_enabled,
         voucher_enabled=voucher_enabled,
         username_password_enabled=username_password_enabled,
+        pin_login_enabled=pin_login_enabled,
     )
     captive_portal_service.add_location(location_id, organization_id)
     router = router_service.add(organization_id=organization_id, status=router_status)
@@ -1192,6 +1244,7 @@ def make_fixture(
         policy_lookup=policy_lookup,
         queue_assignment_hook=queue_assignment_hook,
         mac_authorization_hook=mac_authorization_hook,
+        redis=redis,
     )
     radius_service = RadiusService(
         repository,
@@ -1213,6 +1266,7 @@ def make_fixture(
         location_lookup=location_lookup,
         nas_code_counter_repository=nas_code_counter_repository,
         audit_writer=audit_writer,
+        redis=redis,
         guest_service=guest_service,
         radius_service=radius_service,
         analytics_service=analytics_service,
@@ -1699,6 +1753,431 @@ class TestSetGuestPassword:
                 password="short",
             )
         assert fx.repository.guests[otp_result.guest.id].hashed_password is None
+
+
+class TestPinLogin:
+    """Portal PIN: device-scoped quick-login -- see
+    GuestService.login_via_pin's own docstring."""
+
+    async def _otp_login(
+        self, fx: Fixture, mac: str = "aa:bb:cc:dd:ee:ff"
+    ) -> GuestLoginResult:
+        return await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac=mac,
+        )
+
+    async def test_disabled_method_for_location_rejected(self) -> None:
+        fx = make_fixture(pin_login_enabled=False)
+        with pytest.raises(GuestAuthMethodNotEnabledError):
+            await fx.guest_service.login_via_pin(
+                identifier="+15551234567",
+                pin="048213",
+                device_mac="aa:bb:cc:dd:ee:ff",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_happy_path_with_matching_device(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        result = await fx.guest_service.login_via_pin(
+            identifier="+15551234567",
+            pin="048213",
+            device_mac="aa:bb:cc:dd:ee:ff",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.guest.id == otp_result.guest.id
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+        assert result.session.auth_method == GuestAuthMethod.PIN.value
+        assert result.device is not None
+        assert result.device.mac_address == "AA:BB:CC:DD:EE:FF"
+        successes = [h for h in fx.repository.login_history if h.success is True]
+        assert len(successes) == 2  # the original OTP login + this PIN login
+        assert fx.repository.guests[otp_result.guest.id].pin_last_used_at is not None
+
+    async def test_no_such_guest_fails_generically(self) -> None:
+        fx = make_fixture()
+        with pytest.raises(GuestPinLoginFailedError):
+            await fx.guest_service.login_via_pin(
+                identifier="+15559999999",
+                pin="048213",
+                device_mac="aa:bb:cc:dd:ee:ff",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_guest_with_no_pin_set_fails_with_the_same_generic_error(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        with pytest.raises(GuestPinLoginFailedError):
+            await fx.guest_service.login_via_pin(
+                identifier="+15551234567",
+                pin="048213",
+                device_mac="aa:bb:cc:dd:ee:ff",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        failures = [h for h in fx.repository.login_history if h.success is False]
+        assert len(failures) == 1
+        assert failures[0].guest_id == otp_result.guest.id
+
+    async def test_wrong_pin_fails_generically(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        with pytest.raises(GuestPinLoginFailedError):
+            await fx.guest_service.login_via_pin(
+                identifier="+15551234567",
+                pin="999999",
+                device_mac="aa:bb:cc:dd:ee:ff",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_unrecognized_device_fails_even_with_correct_pin(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        with pytest.raises(GuestPinLoginFailedError):
+            await fx.guest_service.login_via_pin(
+                identifier="+15551234567",
+                pin="048213",
+                # A real MAC, but never seen for this guest -- not a device
+                # that ever completed an OTP login for them.
+                device_mac="11:22:33:44:55:66",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_missing_device_mac_fails_generically(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        with pytest.raises(GuestPinLoginFailedError):
+            await fx.guest_service.login_via_pin(
+                identifier="+15551234567",
+                pin="048213",
+                device_mac=None,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_blocked_guest_rejected_before_pin_check(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        await fx.guest_service.block_guest(
+            actor_user_id=uuid.uuid4(),
+            guest_id=otp_result.guest.id,
+            requesting_organization_id=fx.organization_id,
+            reason="abuse",
+        )
+        with pytest.raises(GuestBlockedError):
+            await fx.guest_service.login_via_pin(
+                identifier="+15551234567",
+                pin="048213",
+                device_mac="aa:bb:cc:dd:ee:ff",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_stale_pin_fails_login(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        stored_guest = fx.repository.guests[otp_result.guest.id]
+        stored_guest.pin_set_at = _now() - timedelta(days=PIN_STALE_AFTER_DAYS + 1)
+        with pytest.raises(GuestPinLoginFailedError):
+            await fx.guest_service.login_via_pin(
+                identifier="+15551234567",
+                pin="048213",
+                device_mac="aa:bb:cc:dd:ee:ff",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_recently_used_pin_is_not_stale_even_if_set_long_ago(self) -> None:
+        """PIN_STALE_AFTER_DAYS measures from whichever of pin_set_at/
+        pin_last_used_at is more recent -- a PIN set long ago but used
+        recently must not be treated as stale."""
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        stored_guest = fx.repository.guests[otp_result.guest.id]
+        stored_guest.pin_set_at = _now() - timedelta(days=PIN_STALE_AFTER_DAYS + 30)
+        stored_guest.pin_last_used_at = _now() - timedelta(days=1)
+        result = await fx.guest_service.login_via_pin(
+            identifier="+15551234567",
+            pin="048213",
+            device_mac="aa:bb:cc:dd:ee:ff",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.guest.id == otp_result.guest.id
+
+    async def test_lockout_after_max_attempts_returns_locked_error(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        for _ in range(PIN_MAX_ATTEMPTS):
+            with pytest.raises(GuestPinLoginFailedError):
+                await fx.guest_service.login_via_pin(
+                    identifier="+15551234567",
+                    pin="999999",
+                    device_mac="aa:bb:cc:dd:ee:ff",
+                    organization_id=None,
+                    location_id=fx.location_id,
+                    router_id=fx.router.id,
+                )
+        # Locked out now -- even the *correct* PIN is rejected, with a
+        # distinct 423 exception, never reaching real verification.
+        with pytest.raises(GuestPinLockedError) as exc_info:
+            await fx.guest_service.login_via_pin(
+                identifier="+15551234567",
+                pin="048213",
+                device_mac="aa:bb:cc:dd:ee:ff",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert exc_info.value.status_code == 423
+        # No new failure was recorded for the locked-out attempt itself --
+        # it never reached _record_login_failure/_record_pin_attempt.
+        failures = [h for h in fx.repository.login_history if h.success is False]
+        assert len(failures) == PIN_MAX_ATTEMPTS
+        # The DB-mirror reflects the lockout too (best-effort, not the
+        # real gate -- see Guest.pin_locked_until's own docstring).
+        assert fx.repository.guests[otp_result.guest.id].pin_locked_until is not None
+
+    async def test_successful_login_resets_the_failure_counter(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        for _ in range(PIN_MAX_ATTEMPTS - 1):
+            with pytest.raises(GuestPinLoginFailedError):
+                await fx.guest_service.login_via_pin(
+                    identifier="+15551234567",
+                    pin="999999",
+                    device_mac="aa:bb:cc:dd:ee:ff",
+                    organization_id=None,
+                    location_id=fx.location_id,
+                    router_id=fx.router.id,
+                )
+        result = await fx.guest_service.login_via_pin(
+            identifier="+15551234567",
+            pin="048213",
+            device_mac="aa:bb:cc:dd:ee:ff",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.guest.id == otp_result.guest.id
+        assert fx.repository.guests[otp_result.guest.id].pin_failed_attempts == 0
+        # One more failed attempt after the reset must not immediately
+        # lock the guest out again.
+        with pytest.raises(GuestPinLoginFailedError):
+            await fx.guest_service.login_via_pin(
+                identifier="+15551234567",
+                pin="999999",
+                device_mac="aa:bb:cc:dd:ee:ff",
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+
+class TestSetGuestPin:
+    async def _otp_login(self, fx: Fixture) -> GuestLoginResult:
+        return await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+
+    async def test_happy_path_sets_a_verifiable_pin(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        updated = await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        assert updated.hashed_pin is not None
+        # never stored in plaintext
+        assert updated.hashed_pin != "048213"
+        assert updated.pin_set_at is not None
+
+    async def test_rejects_a_session_belonging_to_a_different_guest(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        other_guest = await fx.repository.create_guest(
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+15550000000",
+            display_name=None,
+            first_seen_at=_now(),
+            last_seen_at=_now(),
+            total_visit_count=0,
+            is_blocked=False,
+            blocked_reason=None,
+        )
+        with pytest.raises(GuestPinSetupNotAuthorizedError):
+            await fx.guest_service.set_guest_pin(
+                guest_id=other_guest.id,
+                session_id=otp_result.session.id,
+                pin="048213",
+            )
+
+    async def test_rejects_a_voucher_authenticated_session(self) -> None:
+        fx = make_fixture()
+        fx.voucher_service.register("VOUCHER1", data_limit_mb=500, validity_minutes=120)
+        voucher_result = await fx.guest_service.login_via_voucher(
+            code="VOUCHER1",
+            identifier="+15551234567",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        with pytest.raises(GuestPinSetupNotAuthorizedError):
+            await fx.guest_service.set_guest_pin(
+                guest_id=voucher_result.guest.id,
+                session_id=voucher_result.session.id,
+                pin="048213",
+            )
+
+    async def test_rejects_a_no_longer_active_session(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.disconnect_session(
+            session_id=otp_result.session.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+            reason="guest left",
+        )
+        with pytest.raises(GuestPinSetupNotAuthorizedError):
+            await fx.guest_service.set_guest_pin(
+                guest_id=otp_result.guest.id,
+                session_id=otp_result.session.id,
+                pin="048213",
+            )
+
+    async def test_rejects_a_session_outside_the_eligibility_window(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        stored_session = fx.repository.sessions[otp_result.session.id]
+        stored_session.started_at = _now() - timedelta(
+            minutes=SET_PASSWORD_SESSION_WINDOW_MINUTES + 1
+        )
+        with pytest.raises(GuestPinSetupNotAuthorizedError):
+            await fx.guest_service.set_guest_pin(
+                guest_id=otp_result.guest.id,
+                session_id=otp_result.session.id,
+                pin="048213",
+            )
+
+    @pytest.mark.parametrize(
+        "weak_pin", ["000000", "111111", "999999", "123456", "654321"]
+    )
+    async def test_trivial_pin_rejected_with_no_state_change(
+        self, weak_pin: str
+    ) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        with pytest.raises(GuestPinTooWeakError):
+            await fx.guest_service.set_guest_pin(
+                guest_id=otp_result.guest.id,
+                session_id=otp_result.session.id,
+                pin=weak_pin,
+            )
+        assert fx.repository.guests[otp_result.guest.id].hashed_pin is None
+
+    async def test_wrong_length_pin_rejected(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        with pytest.raises(GuestPinTooWeakError):
+            await fx.guest_service.set_guest_pin(
+                guest_id=otp_result.guest.id,
+                session_id=otp_result.session.id,
+                pin="12345",
+            )
+
+    async def test_setting_a_new_pin_clears_a_prior_lockout(self) -> None:
+        fx = make_fixture()
+        otp_result = await self._otp_login(fx)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        stored_guest = fx.repository.guests[otp_result.guest.id]
+        stored_guest.pin_failed_attempts = PIN_MAX_ATTEMPTS
+        stored_guest.pin_locked_until = _now() + timedelta(minutes=PIN_LOCKOUT_MINUTES)
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="583920",
+        )
+        assert stored_guest.pin_failed_attempts == 0
+        assert stored_guest.pin_locked_until is None
 
 
 class TestUpdateGuestProfile:

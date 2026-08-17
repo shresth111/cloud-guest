@@ -84,11 +84,14 @@ from .schemas import (
     GuestLoginResponse,
     GuestOtpLoginRequest,
     GuestPasswordLoginRequest,
+    GuestPinLoginRequest,
     GuestResponse,
     GuestSessionListResponse,
     GuestSessionResponse,
     GuestSetPasswordRequest,
     GuestSetPasswordResponse,
+    GuestSetPinRequest,
+    GuestSetPinResponse,
     GuestUpdateProfileRequest,
     GuestUpdateProfileResponse,
     GuestVoucherLoginRequest,
@@ -287,6 +290,7 @@ def _login_response(result: GuestLoginResult) -> GuestLoginResponse:
         identifier=result.guest.identifier,
         is_new_guest=result.is_new_guest,
         has_password=bool(result.guest.hashed_password),
+        has_pin=bool(result.guest.hashed_pin),
         session=_session_response(result.session),
         device=_device_response(result.device) if result.device else None,
     )
@@ -403,6 +407,39 @@ async def guest_login_via_password(
     )
 
 
+@guest_router.post(
+    "/login/pin",
+    response_model=ApiResponse[GuestLoginResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_login_via_pin(
+    request: Request,
+    payload: GuestPinLoginRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    ip_address = payload.ip_address or (request.client.host if request.client else None)
+    user_agent = request.headers.get("user-agent")
+    accept_language = request.headers.get("accept-language")
+    result = await service.login_via_pin(
+        identifier=payload.identifier,
+        pin=payload.pin,
+        device_mac=payload.device_mac,
+        organization_id=payload.organization_id,
+        location_id=payload.location_id,
+        router_id=payload.router_id,
+        device_name=payload.device_name,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        accept_language=accept_language,
+    )
+    return build_response(
+        success=True,
+        message="Guest logged in",
+        data=_login_response(result).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
 @guest_router.get(
     "/session/active",
     response_model=ApiResponse[GuestLoginResponse],
@@ -451,6 +488,29 @@ async def guest_set_password(
         data=GuestSetPasswordResponse(
             guest_id=str(guest.id), password_set=True
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/set-pin",
+    response_model=ApiResponse[GuestSetPinResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_set_pin(
+    request: Request,
+    payload: GuestSetPinRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    guest = await service.set_guest_pin(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+        pin=payload.pin,
+    )
+    return build_response(
+        success=True,
+        message="PIN set",
+        data=GuestSetPinResponse(guest_id=str(guest.id), pin_set=True).model_dump(),
         request_id=_request_id(request),
     )
 
