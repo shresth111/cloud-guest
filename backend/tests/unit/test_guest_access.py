@@ -23,6 +23,7 @@ from app.domains.guest_access.constants import AccessRuleType
 from app.domains.guest_access.exceptions import (
     AccessRuleNotFoundError,
     CrossOrganizationAccessRuleError,
+    InvalidGuestIdentifierError,
     InvalidRuleExpiryError,
     TemporaryRuleRequiresExpiryError,
 )
@@ -32,7 +33,11 @@ from app.domains.guest_access.service import (
     AccessDecisionResolver,
     GuestAccessService,
 )
-from app.domains.guest_access.validators import is_rule_expired, validate_rule_expiry
+from app.domains.guest_access.validators import (
+    is_rule_expired,
+    validate_identifier_shape,
+    validate_rule_expiry,
+)
 
 # ============================================================================
 # Test doubles
@@ -268,6 +273,37 @@ class TestValidators:
         assert is_rule_expired(now - timedelta(minutes=1), now=now) is True
         assert is_rule_expired(now + timedelta(minutes=1), now=now) is False
 
+    @pytest.mark.parametrize(
+        "identifier",
+        [
+            "guest@example.com",
+            "a@b.co",
+            "+919876543210",
+            "919876543210",
+            "14155552671",
+        ],
+    )
+    def test_validate_identifier_shape_accepts_phone_or_email(
+        self, identifier: str
+    ) -> None:
+        validate_identifier_shape(identifier)  # does not raise
+
+    @pytest.mark.parametrize(
+        "identifier",
+        [
+            "",
+            "not-an-identifier",
+            "guest@",
+            "@example.com",
+            "guest@example",
+            "12345",  # too short to be a plausible phone number
+            "AA:BB:CC:DD:EE:FF",  # a MAC belongs on DeviceAccessRule, not here
+        ],
+    )
+    def test_validate_identifier_shape_rejects_garbage(self, identifier: str) -> None:
+        with pytest.raises(InvalidGuestIdentifierError):
+            validate_identifier_shape(identifier)
+
 
 # ============================================================================
 # AccessDecisionResolver: pure precedence
@@ -404,6 +440,39 @@ class TestGuestRuleCrud:
         assert fetched.id == rule.id
         assert len(fx.audit_writer.entries) == 1
         assert fx.audit_writer.entries[0]["action"] == "guest_access_rule_created"
+
+    async def test_create_guest_rule_accepts_phone_identifier(self) -> None:
+        # The customer dashboard's Block User dialog can submit either a
+        # mobile number or an email address -- both are valid
+        # GuestAccessRule.identifier shapes (see validators
+        # .validate_identifier_shape's docstring).
+        fx = make_fixture()
+        rule = await fx.service.create_guest_rule(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+919876543210",
+            rule_type=AccessRuleType.BLOCKLIST,
+            reason="spam",
+            expires_at=None,
+            actor_user_id=fx.actor_user_id,
+        )
+        assert rule.identifier == "+919876543210"
+        assert rule.rule_type == AccessRuleType.BLOCKLIST.value
+
+    async def test_create_guest_rule_rejects_malformed_identifier(self) -> None:
+        fx = make_fixture()
+        with pytest.raises(InvalidGuestIdentifierError):
+            await fx.service.create_guest_rule(
+                organization_id=fx.organization_id,
+                requesting_organization_id=fx.organization_id,
+                location_id=fx.location_id,
+                identifier="not-a-phone-or-email",
+                rule_type=AccessRuleType.BLOCKLIST,
+                reason=None,
+                expires_at=None,
+                actor_user_id=fx.actor_user_id,
+            )
 
     async def test_create_temporary_rule_without_expiry_rejected(self) -> None:
         fx = make_fixture()

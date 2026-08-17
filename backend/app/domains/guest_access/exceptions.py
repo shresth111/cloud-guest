@@ -19,6 +19,7 @@ __all__ = [
     "CrossOrganizationAccessRuleError",
     "TemporaryRuleRequiresExpiryError",
     "InvalidRuleExpiryError",
+    "InvalidGuestIdentifierError",
     "GuestAccessDeniedError",
 ]
 
@@ -67,6 +68,20 @@ class InvalidRuleExpiryError(GuestAccessError):
     def __init__(self) -> None:
         super().__init__(
             "expires_at must be in the future", status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+
+class InvalidGuestIdentifierError(GuestAccessError):
+    """A guest-rule ``identifier`` is neither phone-shaped nor
+    email-shaped -- see ``validators.validate_identifier_shape`` for the
+    two accepted shapes. Device (MAC-keyed) rules never raise this; only
+    ``GuestAccessService.create_guest_rule`` calls the validator that
+    raises it."""
+
+    def __init__(self, identifier: str) -> None:
+        super().__init__(
+            f"'{identifier}' is not a valid phone number or email address",
+            status_code=status.HTTP_400_BAD_REQUEST,
         )
 
 

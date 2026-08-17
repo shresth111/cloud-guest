@@ -57,6 +57,7 @@ from .repository import GuestAccessRepositoryProtocol
 from .validators import (
     normalize_identifier,
     normalize_mac_address,
+    validate_identifier_shape,
     validate_rule_expiry,
 )
 
@@ -197,6 +198,7 @@ class GuestAccessService:
     ) -> GuestAccessRule:
         self._enforce_tenant_scope(organization_id, requesting_organization_id)
         identifier = normalize_identifier(identifier)
+        validate_identifier_shape(identifier)
         now = datetime.now(UTC)
         validate_rule_expiry(rule_type=rule_type, expires_at=expires_at, now=now)
         rule = await self.repository.create_guest_rule(
