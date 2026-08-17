@@ -177,6 +177,14 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from app.common.exceptions import CloudGuestError
+from app.core.email_layout import (
+    button,
+    esc,
+    heading,
+    info_box,
+    paragraph,
+    render_email,
+)
 from app.domains.billing.constants import (
     FEATURE_KEY_TYPE,
     PlanFeatureKey,
@@ -1263,33 +1271,52 @@ class LocationProvisioningService:
         temporary_password: str | None,
         login_url: str,
     ) -> None:
-        subject = f"Welcome to CloudGuest - {location.name}"
+        subject = f"Welcome to Wyfy Guest - {location.name}"
         if temporary_password is not None:
-            body = (
-                f"Hello {owner.first_name},\n\n"
-                f"Your CloudGuest account for '{location.name}' is ready.\n\n"
-                f"Login URL: {login_url}\n"
-                f"Username: {username}\n"
-                f"Temporary password: {temporary_password}\n\n"
-                "You will be required to change this password the first time "
-                "you log in."
+            content = (
+                heading(f"Welcome to Wyfy Guest, {esc(owner.first_name)}!")
+                + paragraph(
+                    f"Your Wyfy Guest account for "
+                    f"<strong>{esc(location.name)}</strong> is ready. Here's "
+                    "everything you need to log in for the first time."
+                )
+                + info_box(
+                    [
+                        ("Username", esc(username)),
+                        ("Temporary password", esc(temporary_password)),
+                    ],
+                    mono_values=True,
+                )
+                + button("Log In to Wyfy Guest", login_url)
+                + paragraph(
+                    "You'll be asked to set a new password the first time you "
+                    "log in.",
+                    muted=True,
+                )
             )
+            preheader = f"Your Wyfy Guest account for {location.name} is ready."
         else:
-            body = (
-                f"Hello {owner.first_name},\n\n"
-                f"This is a reminder of your CloudGuest account for "
-                f"'{location.name}'.\n\n"
-                f"Login URL: {login_url}\n"
-                f"Username: {username}\n\n"
-                "If you no longer have your temporary password, use "
-                "'Forgot password' on the login page to set a new one."
+            content = (
+                heading(f"Your Wyfy Guest account, {esc(owner.first_name)}")
+                + paragraph(
+                    "This is a reminder of your Wyfy Guest account for "
+                    f"<strong>{esc(location.name)}</strong>."
+                )
+                + info_box([("Username", esc(username))])
+                + button("Log In to Wyfy Guest", login_url)
+                + paragraph(
+                    "If you no longer have your temporary password, use "
+                    "‘Forgot password’ on the login page to set a new one.",
+                    muted=True,
+                )
             )
+            preheader = f"A reminder of your Wyfy Guest account for {location.name}."
         await self.notification_service.enqueue(
             event_type=NotificationEventType.LOCATION_WELCOME_EMAIL,
             channel=NotificationChannelType.EMAIL,
             recipient=owner.email,
             subject=subject,
-            body=body,
+            body=render_email(preheader=preheader, content_html=content),
             organization_id=location.organization_id,
         )
 

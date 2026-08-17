@@ -125,6 +125,7 @@ from typing import Protocol
 
 from redis.asyncio import Redis
 
+from app.core.email_layout import esc, heading, paragraph, render_email
 from app.core.storage import ObjectStorageProtocol
 from app.database.constants import MAX_BULK_CREATE_SIZE
 from app.domains.location.models import Location
@@ -1104,14 +1105,18 @@ class VoucherService:
         await self.object_storage.upload(
             key=storage_key, content=pdf_bytes, content_type="application/pdf"
         )
+        content = heading("Your voucher batch export") + paragraph(
+            "The voucher batch export you requested is attached to this "
+            f"email as a PDF (batch <code>{esc(batch_id)}</code>)."
+        )
         return await self.notification_service.enqueue(
             event_type=NotificationEventType.VOUCHER_BATCH_EXPORT,
             channel=NotificationChannelType.EMAIL,
             recipient=recipient_email,
-            subject="Your CloudGuest voucher batch export",
-            body=(
-                "The voucher batch export you requested is attached to "
-                "this email."
+            subject="Your Wyfy Guest voucher batch export",
+            body=render_email(
+                preheader="Your voucher batch export is attached.",
+                content_html=content,
             ),
             organization_id=requesting_organization_id,
             attachment_storage_key=storage_key,

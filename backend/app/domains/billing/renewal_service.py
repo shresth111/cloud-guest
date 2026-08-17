@@ -78,6 +78,14 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
+from app.core.email_layout import (
+    callout,
+    esc,
+    heading,
+    info_box,
+    paragraph,
+    render_email,
+)
 from app.domains.notification.constants import (
     NotificationChannelType,
     NotificationEventType,
@@ -590,13 +598,35 @@ class RenewalService:
             )
             if already_reminded_this_period:
                 continue
+            plan = await self.plan_repository.get_by_id(subscription.plan_id)
+            renewal_date = subscription.current_period_end.strftime("%d %b %Y")
+            content = (
+                heading("Your subscription renews soon")
+                + paragraph(
+                    "Your Wyfy Guest subscription is scheduled to renew "
+                    f"automatically on <strong>{esc(renewal_date)}</strong>."
+                )
+                + info_box(
+                    [
+                        ("Plan", esc(plan.name)),
+                        ("Amount", esc(f"{plan.currency} {plan.base_price}")),
+                        ("Renews on", esc(renewal_date)),
+                    ]
+                )
+                + paragraph(
+                    "No action is needed if your payment details are up to "
+                    "date. You can review or update your subscription anytime "
+                    "from your Wyfy Guest dashboard.",
+                    muted=True,
+                )
+            )
             await self._send_reminder_email(
                 subscription,
                 event_type=NotificationEventType.SUBSCRIPTION_RENEWAL_REMINDER,
-                subject="Your CloudGuest subscription renews soon",
-                body=(
-                    f"Your subscription is scheduled to renew on "
-                    f"{subscription.current_period_end.isoformat()}."
+                subject="Your Wyfy Guest subscription renews soon",
+                body=render_email(
+                    preheader=f"Your subscription renews on {renewal_date}.",
+                    content_html=content,
                 ),
             )
             await self.repository.update_subscription(
@@ -637,13 +667,38 @@ class RenewalService:
             )
             if already_reminded_this_episode:
                 continue
+            plan = await self.plan_repository.get_by_id(subscription.plan_id)
+            expiry_date = grace_deadline.strftime("%d %b %Y")
+            content = (
+                heading("Action needed: your license will expire soon")
+                + paragraph(
+                    "Your most recent renewal attempt failed. Unless resolved, "
+                    f"your Wyfy Guest license will expire on "
+                    f"<strong>{esc(expiry_date)}</strong>."
+                )
+                + info_box(
+                    [
+                        ("Plan", esc(plan.name)),
+                        ("Amount due", esc(f"{plan.currency} {plan.base_price}")),
+                        ("Expires on", esc(expiry_date)),
+                    ]
+                )
+                + callout(
+                    "Please update your payment details before this date to "
+                    "avoid any interruption to your service.",
+                    tone="danger",
+                )
+            )
             await self._send_reminder_email(
                 subscription,
                 event_type=NotificationEventType.SUBSCRIPTION_EXPIRY_REMINDER,
-                subject="Action needed: your CloudGuest license will expire soon",
-                body=(
-                    "Your most recent renewal attempt failed. Unless resolved, "
-                    f"your license will expire on {grace_deadline.isoformat()}."
+                subject="Action needed: your Wyfy Guest license will expire soon",
+                body=render_email(
+                    preheader=(
+                        f"Your license will expire on {expiry_date} unless resolved."
+                    ),
+                    content_html=content,
+                    accent="#dc2626",
                 ),
             )
             await self.repository.update_subscription(

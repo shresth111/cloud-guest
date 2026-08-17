@@ -151,6 +151,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import Settings, get_settings
+from app.core.email_layout import esc, heading, info_box, paragraph, render_email
 from app.domains.auth.dependencies import get_current_user
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
@@ -2138,18 +2139,40 @@ async def _send_invoice_email_and_build_response(
             )
         else:
             subject = f"Your Wyfy Guest invoice {invoice.invoice_number}"
-            body = (
-                "Hello,\n\n"
-                f"Your invoice {invoice.invoice_number} from Wyfy Guest is "
-                "ready.\n\n"
-                f"Amount due: {invoice.currency} {invoice.total_amount}\n"
-                f"Due date: {invoice.due_date.strftime('%d %b %Y')}\n\n"
-                "The full invoice, including a detailed breakdown of "
-                "charges and applicable taxes, is attached to this email "
-                "as a PDF.\n\n"
-                "If you have any questions about this invoice, please "
-                "reach out to our support team.\n\n"
-                "Thank you for using Wyfy Guest."
+            due_date = invoice.due_date.strftime("%d %b %Y")
+            content = (
+                heading("Your invoice is ready")
+                + paragraph(
+                    f"Your invoice <strong>{esc(invoice.invoice_number)}</strong> "
+                    "from Wyfy Guest is ready."
+                )
+                + info_box(
+                    [
+                        ("Invoice number", esc(invoice.invoice_number)),
+                        (
+                            "Amount due",
+                            esc(f"{invoice.currency} {invoice.total_amount}"),
+                        ),
+                        ("Due date", esc(due_date)),
+                    ]
+                )
+                + paragraph(
+                    "The full invoice, including a detailed breakdown of "
+                    "charges and applicable taxes, is attached to this "
+                    "email as a PDF."
+                )
+                + paragraph(
+                    "If you have any questions about this invoice, please "
+                    "reach out to our support team.",
+                    muted=True,
+                )
+            )
+            body = render_email(
+                preheader=(
+                    f"Invoice {invoice.invoice_number}: "
+                    f"{invoice.currency} {invoice.total_amount} due {due_date}."
+                ),
+                content_html=content,
             )
             await email_provider.send(
                 recipient_email,

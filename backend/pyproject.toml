@@ -59,3 +59,11 @@ target-version = "py313"
 select = ["E", "F", "I", "B", "UP", "SIM"]
 ignore = ["B008"]
 
+[tool.ruff.lint.per-file-ignores]
+# Literal HTML/CSS email markup -- wrapping a `style="..."` attribute or a
+# `<td>`/`<table>` tag across the 88-col limit hurts readability far more
+# than it helps (splitting one inline-style string across lines is not how
+# HTML is normally formatted, and every other line here is already a
+# genuine template line, not prose to reflow).
+"app/core/email_layout.py" = ["E501"]
+

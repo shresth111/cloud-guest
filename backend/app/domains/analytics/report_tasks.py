@@ -65,6 +65,7 @@ from typing import Protocol
 from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
+from app.core.email_layout import esc, heading, paragraph, render_email
 from app.core.logging import get_logger
 from app.core.storage import ObjectStorageProtocol, get_object_storage
 from app.database.redis import create_redis_client
@@ -200,10 +201,13 @@ async def _run_one_scheduled_report(
     )
 
     subject = f"{payload.title} - {now.date().isoformat()}"
-    body = (
-        f"Your scheduled {payload.report_type} report has been generated "
-        f"({rendered.content_type}, {len(rendered.content)} bytes) and is "
-        f"attached to this email."
+    content = heading(esc(payload.title)) + paragraph(
+        f"Your scheduled {esc(payload.report_type)} report has been "
+        "generated and is attached to this email."
+    )
+    body = render_email(
+        preheader=f"Your scheduled {payload.report_type} report is ready.",
+        content_html=content,
     )
     for recipient in schedule.recipient_emails:
         await notification_service.enqueue(

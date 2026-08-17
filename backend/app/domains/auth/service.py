@@ -22,6 +22,15 @@ from redis.asyncio import Redis
 
 from app.common.exceptions import CloudGuestError
 from app.core.config import get_settings
+from app.core.email_layout import (
+    button,
+    callout,
+    esc,
+    heading,
+    link_fallback,
+    paragraph,
+    render_email,
+)
 from app.database.redis import redis_client as _default_redis_client
 from app.domains.notification.constants import (
     NotificationChannelType,
@@ -38,6 +47,64 @@ from .repository import AuthRepositoryProtocol
 from .security import AuthSecurity
 
 logger = logging.getLogger(__name__)
+
+
+def _verify_email_url(token: str) -> str:
+    """Builds the frontend's ``/verify-email?token=...`` link (mirrors
+    ``initiate_password_reset``'s own ``reset_url`` construction below, and
+    the same route ``cloudguest-foundation``'s
+    ``src/services/auth.service.ts#verifyEmail`` already posts ``token``
+    to). Filling in a genuine gap: before this, ``register``/
+    ``resend_verification`` emailed the bare opaque token with no link at
+    all, even though the frontend route and ``Settings.frontend_base_url``
+    both already existed -- this doesn't add any new backend behavior,
+    just uses what was already there."""
+    return f"{get_settings().frontend_base_url.rstrip('/')}/verify-email?token={token}"
+
+
+def _render_verify_email(*, first_name: str, verify_url: str, warm: bool) -> str:
+    """Shared by ``register`` (warm, first-touch onboarding copy) and
+    ``resend_verification`` (terser, since the account already exists)."""
+    intro = (
+        f"Welcome to Wyfy Guest, {esc(first_name)}. Confirm your email address "
+        "to activate your account and get started."
+        if warm
+        else f"Hi {esc(first_name)}, confirm your email address to verify your "
+        "Wyfy Guest account."
+    )
+    content = (
+        heading("Verify your email address")
+        + paragraph(intro)
+        + button("Verify Email Address", verify_url)
+        + link_fallback(verify_url)
+        + callout("This link expires in 24 hours.", tone="info")
+    )
+    return render_email(
+        preheader="Confirm your email address to activate your Wyfy Guest account.",
+        content_html=content,
+    )
+
+
+def _render_password_reset_email(*, first_name: str, reset_url: str) -> str:
+    content = (
+        heading("Reset your password")
+        + paragraph(
+            f"Hi {esc(first_name)}, we received a request to reset your "
+            "Wyfy Guest password. Click the button below to choose a new one."
+        )
+        + button("Reset Password", reset_url)
+        + link_fallback(reset_url)
+        + callout(
+            "This link expires in 1 hour and can only be used once. If you "
+            "didn't request this, you can safely ignore this email &mdash; "
+            "your password will not be changed.",
+            tone="warning",
+        )
+    )
+    return render_email(
+        preheader="Reset your Wyfy Guest password. This link expires in 1 hour.",
+        content_html=content,
+    )
 
 
 def _hash_token(plaintext_token: str) -> str:
@@ -336,10 +403,11 @@ class AuthService:
             event_type=NotificationEventType.EMAIL_VERIFICATION,
             channel=NotificationChannelType.EMAIL,
             recipient=user.email,
-            subject="Verify your CloudGuest account",
-            body=(
-                f"Welcome to CloudGuest, {user.first_name}. Use this code to "
-                f"verify your account: {verification_token}"
+            subject="Verify your Wyfy Guest account",
+            body=_render_verify_email(
+                first_name=user.first_name,
+                verify_url=_verify_email_url(verification_token),
+                warm=True,
             ),
             organization_id=None,
         )
@@ -610,15 +678,9 @@ class AuthService:
                 event_type=NotificationEventType.PASSWORD_RESET,
                 channel=NotificationChannelType.EMAIL,
                 recipient=user.email,
-                subject="Reset your CloudGuest password",
-                body=(
-                    f"Hello {user.first_name},\n\n"
-                    "We received a request to reset your CloudGuest password. "
-                    "Click the link below to choose a new one:\n\n"
-                    f"{reset_url}\n\n"
-                    "This link expires in 1 hour and can only be used once. "
-                    "If you didn't request this, you can safely ignore this "
-                    "email -- your password will not be changed."
+                subject="Reset your Wyfy Guest password",
+                body=_render_password_reset_email(
+                    first_name=user.first_name, reset_url=reset_url
                 ),
                 organization_id=None,
             )
@@ -681,8 +743,12 @@ class AuthService:
                 event_type=NotificationEventType.EMAIL_VERIFICATION,
                 channel=NotificationChannelType.EMAIL,
                 recipient=user.email,
-                subject="Verify your CloudGuest account",
-                body=("Use this code to verify your account: " f"{verification_token}"),
+                subject="Verify your Wyfy Guest account",
+                body=_render_verify_email(
+                    first_name=user.first_name,
+                    verify_url=_verify_email_url(verification_token),
+                    warm=False,
+                ),
                 organization_id=None,
             )
 

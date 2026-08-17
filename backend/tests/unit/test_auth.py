@@ -16,6 +16,7 @@ meaningful, which is out of scope here.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -648,9 +649,16 @@ class TestAuthServicePasswordResetRoundTrip:
 
     @staticmethod
     def _extract_token(body: object) -> str:
+        """Pulls the reset token back out of the rendered HTML email body.
+        Stops at the first whitespace *or* HTML/attribute delimiter (``"``,
+        ``'``, ``<``) rather than whitespace alone -- the redesigned HTML
+        body embeds the URL inside an ``href="..."`` attribute with no
+        surrounding whitespace (``app.core.email_layout.button``), unlike
+        the old plain-text body this helper was originally written against."""
         text = str(body)
         assert "/reset-password?token=" in text
-        return text.split("token=", 1)[1].split()[0].strip()
+        after = text.split("token=", 1)[1]
+        return re.split(r'[\s"\'<]', after, maxsplit=1)[0].strip()
 
     async def test_reset_link_points_at_configured_frontend_base_url(self) -> None:
         from app.core.config import get_settings
