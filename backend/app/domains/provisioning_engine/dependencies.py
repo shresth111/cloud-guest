@@ -34,6 +34,8 @@ from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 from app.domains.router_provisioning.dependencies import get_router_provisioning_service
 from app.domains.router_provisioning.service import RouterProvisioningService
+from app.domains.wireguard.dependencies import get_wireguard_service
+from app.domains.wireguard.service import WireGuardService
 
 from .repository import (
     ProvisioningEngineRepository,
@@ -70,6 +72,11 @@ def get_provisioning_engine_service(
         get_provisioning_engine_queue_dispatcher
     ),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    # Only used to enrich a connection-failure error message with a
+    # WireGuard-tunnel-state explanation (see
+    # `ProvisioningEngineService._enrich_connection_error`) -- not a hard
+    # dependency of anything else this service does.
+    wireguard_service: WireGuardService = Depends(get_wireguard_service),
 ) -> ProvisioningEngineService:
     return ProvisioningEngineService(
         repository,
@@ -79,6 +86,7 @@ def get_provisioning_engine_service(
         radius_service,
         queue_dispatcher=queue_dispatcher,
         audit_writer=audit_repository,
+        wireguard_lookup=wireguard_service,
     )
 
 

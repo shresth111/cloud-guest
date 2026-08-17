@@ -82,6 +82,10 @@ from app.domains.router_provisioning.constants import ConfigVariableScope
 from app.domains.router_provisioning.exceptions import DuplicateConfigVariableError
 from app.domains.router_provisioning.models import ConfigTemplate, ConfigVersion
 from app.domains.router_provisioning.service import render_template
+from app.domains.wireguard.connection_diagnostics import (
+    WireGuardTunnelLookupProtocol,
+    diagnose_router_connection_failure,
+)
 
 from .constants import (
     PROVISION_JOB_STATUS_TRANSITIONS,
@@ -371,6 +375,7 @@ class ProvisioningEngineService:
         queue_dispatcher: QueueDispatcherProtocol,
         audit_writer: AuditLogWriter | None = None,
         device_adapter_resolver=get_device_adapter,
+        wireguard_lookup: WireGuardTunnelLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
@@ -380,6 +385,12 @@ class ProvisioningEngineService:
         self.queue_dispatcher = queue_dispatcher
         self.audit_writer = audit_writer
         self._get_device_adapter = device_adapter_resolver
+        # Optional -- see `_enrich_connection_error`'s own docstring. `None`
+        # (the default) just skips enrichment, so every existing caller that
+        # constructs this service without knowing about WireGuard keeps
+        # working unchanged; only `dependencies.py`'s real wiring needs to
+        # supply it.
+        self.wireguard_lookup = wireguard_lookup
 
     # ========================================================================
     # Job lifecycle: create / start / cancel
@@ -777,6 +788,47 @@ class ProvisioningEngineService:
         )
         return result
 
+    async def _enrich_connection_error(
+        self,
+        exc: ProvisionDeviceConnectionError,
+        *,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> ProvisionDeviceConnectionError:
+        """Appends a WireGuard-tunnel-state explanation to a connection
+        error's own detail when the failed connection was attempted over
+        the router's tunnel IP and the tunnel is not in a healthy,
+        recently-handshaked state -- see
+        ``app.domains.wireguard.connection_diagnostics`` for the real
+        classification logic and the production incident that motivated
+        it. Returns ``exc`` completely unchanged (same object) whenever
+        ``self.wireguard_lookup`` isn't wired up, the router has no
+        WireGuard peer at all, the failed connection wasn't even attempted
+        over the tunnel's own IP, or the tunnel turns out to be healthy --
+        in every one of those cases blaming WireGuard would be a
+        misdiagnosis, not a fix, so the original message is left exactly as
+        the adapter produced it. Never lets a diagnostic-lookup failure of
+        its own mask or replace the real error being enriched -- if the
+        lookup itself raises, this logs nothing extra and returns the
+        original exception unchanged, since a broken diagnostic is still
+        better than a broken error path."""
+        if self.wireguard_lookup is None:
+            return exc
+        try:
+            _state, message = await diagnose_router_connection_failure(
+                self.wireguard_lookup,
+                router_id=router_id,
+                requesting_organization_id=requesting_organization_id,
+                attempted_host=exc.host,
+            )
+        except Exception:  # noqa: BLE001 -- diagnostics must never break the real error path
+            return exc
+        if message is None:
+            return exc
+        enriched = ProvisionDeviceConnectionError(exc.host, f"{exc.detail} -- {message}")
+        enriched.__cause__ = exc.__cause__
+        return enriched
+
     async def execute_console_command(
         self,
         *,
@@ -800,6 +852,19 @@ class ProvisioningEngineService:
         adapter = self._get_device_adapter(router.vendor)
         try:
             result = await adapter.execute_raw_command(credentials, command=command)
+        except ProvisionDeviceConnectionError as exc:
+            exc = await self._enrich_connection_error(
+                exc,
+                router_id=router_id,
+                requesting_organization_id=requesting_organization_id,
+            )
+            await self._audit_console_command(
+                actor_user_id,
+                router=router,
+                command=command,
+                description=f"Device console command failed to run: {exc}",
+            )
+            raise exc
         except ProvisioningEngineError as exc:
             await self._audit_console_command(
                 actor_user_id,
