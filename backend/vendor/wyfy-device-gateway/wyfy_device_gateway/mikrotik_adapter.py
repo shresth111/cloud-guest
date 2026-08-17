@@ -224,6 +224,35 @@ def _safe_str(value: object) -> str | None:
     return text or None
 
 
+def _describe_exception(exc: BaseException) -> str:
+    """Returns a human-readable, never-empty description of a caught
+    low-level exception for use as a ``MikroTikConnectionError``/
+    ``MikroTikDeviceError`` ``detail``.
+
+    ``str(exc)`` is empty for a real, common failure mode here: the
+    connect-timeout every ``_ssh_connect``/``_connect_api`` caller waits on
+    via ``asyncio.wait_for(..., timeout=...)`` raises a bare
+    ``TimeoutError()`` with no message when it expires (``str(TimeoutError())
+    == ""``) -- and ``TimeoutError`` is a subclass of ``OSError``, so it is
+    caught by every ``except (OSError, asyncssh.Error)``/
+    ``except (LibRouterosError, OSError)`` clause in this module right
+    alongside genuine connection-refused/DNS-failure errors that do carry a
+    message. Without this fallback, an operator sees a connection error
+    that ends in an empty string after its own colon (e.g. "Could not
+    connect to device at '10.20.0.45': ") with zero indication of what
+    actually happened -- confirmed live in production for a router whose
+    WireGuard tunnel had never handshaked: the SSH connect attempt over the
+    tunnel IP simply timed out, and that timeout's own exception carried no
+    text to surface.
+    """
+    text = str(exc).strip()
+    if text:
+        return text
+    if isinstance(exc, TimeoutError):
+        return "connection attempt timed out"
+    return type(exc).__name__
+
+
 def _domain_subdomain_regex(domain: str) -> str:
     """Ported verbatim from
     ``network_config/renderers.py::_domain_subdomain_regex`` -- the real
@@ -273,7 +302,7 @@ class MikroTikAdapter:
                 timeout=creds.timeout_seconds,
             )
         except (LibRouterosError, OSError) as exc:
-            raise MikroTikConnectionError(creds.host, str(exc)) from exc
+            raise MikroTikConnectionError(creds.host, _describe_exception(exc)) from exc
 
     def _ssh_port(self, creds: DeviceCredentials) -> int:
         return _safe_int(creds.extra.get("ssh_port"), default=_DEFAULT_SSH_PORT) or (
@@ -303,7 +332,7 @@ class MikroTikAdapter:
             async with self._ssh_connect(creds) as conn:
                 result = await conn.run(command, check=False)
         except (OSError, asyncssh.Error) as exc:
-            raise MikroTikConnectionError(creds.host, str(exc)) from exc
+            raise MikroTikConnectionError(creds.host, _describe_exception(exc)) from exc
         if result.exit_status != 0:
             raise MikroTikDeviceError(
                 creds.host,
@@ -323,7 +352,7 @@ class MikroTikAdapter:
             ):
                 return await remote_file.read()
         except (OSError, asyncssh.Error) as exc:
-            raise MikroTikConnectionError(creds.host, str(exc)) from exc
+            raise MikroTikConnectionError(creds.host, _describe_exception(exc)) from exc
 
     # ------------------------------------------------------------------
     # discovery / telemetry (read-only)
@@ -347,7 +376,7 @@ class MikroTikAdapter:
                 dhcp_servers = list(api.path("ip", "dhcp-server"))
                 dhcp_clients = list(api.path("ip", "dhcp-client"))
             except LibRouterosError as exc:
-                raise MikroTikDeviceError(creds.host, str(exc)) from exc
+                raise MikroTikDeviceError(creds.host, _describe_exception(exc)) from exc
         finally:
             api.close()
 
@@ -998,7 +1027,7 @@ class MikroTikAdapter:
             return ProvisionResult(
                 success=False,
                 applied_content_summary=None,
-                error_message=str(exc),
+                error_message=_describe_exception(exc),
             )
 
         if result.exit_status not in (0, None):
@@ -1675,7 +1704,7 @@ class MikroTikAdapter:
             ):
                 await remote_file.write(content)
         except (OSError, asyncssh.Error) as exc:
-            raise MikroTikConnectionError(creds.host, str(exc)) from exc
+            raise MikroTikConnectionError(creds.host, _describe_exception(exc)) from exc
 
     async def execute_raw_command(
         self, creds: DeviceCredentials, *, command: str
@@ -1691,7 +1720,7 @@ class MikroTikAdapter:
             async with self._ssh_connect(creds) as conn:
                 result = await conn.run(command, check=False)
         except (OSError, asyncssh.Error) as exc:
-            raise MikroTikConnectionError(creds.host, str(exc)) from exc
+            raise MikroTikConnectionError(creds.host, _describe_exception(exc)) from exc
         return RawCommandResult(
             command=command,
             stdout=str(result.stdout or ""),

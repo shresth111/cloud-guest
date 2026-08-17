@@ -56,9 +56,21 @@ class ProvisionDeviceConnectionError(ProvisioningEngineError):
     """A real connection attempt (RouterOS API or SSH) to a device failed --
     covers both a genuine network failure and, in this sandbox, every
     single invocation (there is no live device anywhere in this environment
-    to connect to). See ``device_adapters.py``'s own module docstring."""
+    to connect to). See ``device_adapters.py``'s own module docstring.
+
+    ``host``/``detail`` are kept as their own attributes (not just folded
+    into the built message string) so a caller can enrich the detail after
+    the fact -- see ``ProvisioningEngineService._enrich_connection_error``,
+    which appends a WireGuard-tunnel-state explanation when the connection
+    that failed was attempted over a router's own tunnel IP. Confirmed live
+    in production (2026-08-16): an operator saw "Could not connect to
+    device at '10.20.0.45': " with an empty reason and no indication
+    WireGuard was even involved, when the real cause was a tunnel that had
+    never handshaked."""
 
     def __init__(self, host: str, detail: str) -> None:
+        self.host = host
+        self.detail = detail
         super().__init__(
             f"Could not connect to device at '{host}': {detail}",
             status_code=status.HTTP_502_BAD_GATEWAY,
