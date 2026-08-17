@@ -214,6 +214,17 @@ class CaptivePortalService:
         username_password_enabled: bool,
         social_login_enabled: bool,
         social_login_providers: list[str],
+        # Defaults False (unlike every other keyword-only parameter above,
+        # which the schema layer always supplies explicitly) so this
+        # method's other pre-existing caller --
+        # app.domains.location.provisioning_service
+        # .LocationProvisioningService's smart-location provisioning flow
+        # -- and this domain's own test suite keep working unchanged,
+        # getting the same "off by default" behavior
+        # CaptivePortalConfig.pin_login_enabled's own DB column default
+        # already establishes, without either needing to know this
+        # parameter exists at all.
+        pin_login_enabled: bool = False,
     ) -> CaptivePortalConfig:
         validate_hex_color(primary_color, field_name="primary_color")
         validate_hex_color(secondary_color, field_name="secondary_color")
@@ -268,6 +279,7 @@ class CaptivePortalService:
             otp_whatsapp_enabled=otp_whatsapp_enabled,
             voucher_enabled=voucher_enabled,
             username_password_enabled=username_password_enabled,
+            pin_login_enabled=pin_login_enabled,
             social_login_enabled=social_login_enabled,
             social_login_providers=list(social_login_providers),
             created_by=actor_user_id,

@@ -325,6 +325,7 @@ async def _create_config(
     # docstring) mirrors this helper's own otp_sms_enabled/voucher_enabled
     # defaults being the actually-enabled-by-default methods.
     username_password_enabled: bool = True,
+    pin_login_enabled: bool = False,
     requesting_organization_id: uuid.UUID | None = None,
     organization_id: uuid.UUID | None = None,
 ) -> CaptivePortalConfig:
@@ -363,6 +364,7 @@ async def _create_config(
         otp_whatsapp_enabled=False,
         voucher_enabled=True,
         username_password_enabled=username_password_enabled,
+        pin_login_enabled=pin_login_enabled,
         social_login_enabled=social_login_enabled,
         social_login_providers=social_login_providers or [],
     )

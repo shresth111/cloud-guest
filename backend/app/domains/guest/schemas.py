@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 from app.common.masking import MaskedIdentifier, MaskedMac, MaskedName
 
 from .constants import (
+    PIN_LENGTH,
     RADIUS_ACCT_STATUS_INTERIM_UPDATE,
     RADIUS_ACCT_STATUS_START,
     RADIUS_ACCT_STATUS_STOP,
@@ -36,6 +37,9 @@ __all__ = [
     "GuestPasswordLoginRequest",
     "GuestSetPasswordRequest",
     "GuestSetPasswordResponse",
+    "GuestPinLoginRequest",
+    "GuestSetPinRequest",
+    "GuestSetPinResponse",
     "GuestUpdateProfileRequest",
     "GuestUpdateProfileResponse",
     "GuestConsentRequest",
@@ -157,6 +161,51 @@ class GuestSetPasswordRequest(BaseModel):
 class GuestSetPasswordResponse(BaseModel):
     guest_id: str
     password_set: bool
+
+
+class GuestPinLoginRequest(BaseModel):
+    """Portal PIN: device-scoped quick-login via a guest's own,
+    previously-set PIN -- the ``pin`` counterpart to
+    ``GuestPasswordLoginRequest``. Only succeeds for a guest that has
+    already called ``POST /guest/set-pin`` once *and* is presenting a
+    ``device_mac`` that already belongs to that same guest (see
+    ``service.GuestService.login_via_pin``'s docstring). Unlike every
+    other login request schema's ``device_mac``, this one is required,
+    not optional -- a PIN login has nothing to verify without one."""
+
+    identifier: str = Field(..., min_length=3, max_length=255)
+    pin: str = Field(
+        ..., min_length=PIN_LENGTH, max_length=PIN_LENGTH, pattern=r"^\d+$"
+    )
+    device_mac: str = Field(..., max_length=17)
+    organization_id: uuid.UUID | None = Field(default=None)
+    location_id: uuid.UUID = Field(...)
+    router_id: uuid.UUID = Field(
+        ..., description="The NAS (router) this guest's session will be on."
+    )
+    device_name: str | None = Field(default=None, max_length=200)
+    ip_address: str | None = Field(default=None, max_length=45)
+
+
+class GuestSetPinRequest(BaseModel):
+    """Lets a guest opt in to Portal PIN login right after a real OTP
+    verification -- ``session_id`` is the ``GuestSession.id`` that same
+    OTP login just returned (see ``GuestLoginResponse.session.id``), and
+    is the *only* thing authenticating this call, the identical shape
+    ``GuestSetPasswordRequest`` already establishes (see
+    ``service.GuestService.set_guest_pin``'s docstring for the full
+    proof-of-recent-OTP-login write-up)."""
+
+    guest_id: uuid.UUID
+    session_id: uuid.UUID
+    pin: str = Field(
+        ..., min_length=PIN_LENGTH, max_length=PIN_LENGTH, pattern=r"^\d+$"
+    )
+
+
+class GuestSetPinResponse(BaseModel):
+    guest_id: str
+    pin_set: bool
 
 
 class GuestUpdateProfileRequest(BaseModel):
@@ -303,6 +352,12 @@ class GuestLoginResponse(BaseModel):
     # ``service.GuestService.login_via_password``, which only ever succeeds
     # for a guest that already has one).
     has_password: bool
+    # The identical "let the frontend decide whether to show a set-it-up
+    # prompt" signal, for Portal PIN -- see
+    # ``service.GuestService.login_via_pin``, which only ever succeeds for
+    # a guest that already has one *and* is on an already-recognized
+    # device.
+    has_pin: bool
     session: GuestSessionResponse
     device: GuestDeviceResponse | None
 

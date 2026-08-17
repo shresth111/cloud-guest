@@ -99,6 +99,15 @@ class CaptivePortalConfigCreateRequest(BaseModel):
     # location. An admin can still explicitly turn it off per location
     # (e.g. an SMS-OTP-only kiosk) via CaptivePortalConfigUpdateRequest.
     username_password_enabled: bool = Field(default=True)
+    pin_login_enabled: bool = Field(
+        default=False,
+        description=(
+            "Real, functional login method (GuestService.login_via_pin / "
+            "POST /guest/login/pin) -- defaults off, unlike "
+            "username_password_enabled: a PIN is a materially weaker "
+            "secret, so an operator opts in per location deliberately."
+        ),
+    )
     social_login_enabled: bool = Field(
         default=False,
         description=(
@@ -169,6 +178,7 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     otp_whatsapp_enabled: bool | None = Field(default=None)
     voucher_enabled: bool | None = Field(default=None)
     username_password_enabled: bool | None = Field(default=None)
+    pin_login_enabled: bool | None = Field(default=None)
     social_login_enabled: bool | None = Field(default=None)
     social_login_providers: list[str] | None = Field(default=None)
     business_hours_enabled: bool | None = Field(default=None)
@@ -210,6 +220,7 @@ class CaptivePortalConfigResponse(BaseModel):
     otp_whatsapp_enabled: bool
     voucher_enabled: bool
     username_password_enabled: bool
+    pin_login_enabled: bool
     social_login_enabled: bool
     social_login_providers: list[str]
     business_hours_enabled: bool

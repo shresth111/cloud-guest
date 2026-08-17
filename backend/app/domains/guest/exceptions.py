@@ -17,6 +17,7 @@ tenant isolation, and the RADIUS/NAS authentication boundary.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from fastapi import status
 
@@ -49,6 +50,10 @@ __all__ = [
     "GuestPasswordTooWeakError",
     "GuestSelfDisconnectNotAuthorizedError",
     "MacAddressNotAuthorizedError",
+    "GuestPinLoginFailedError",
+    "GuestPinSetupNotAuthorizedError",
+    "GuestPinTooWeakError",
+    "GuestPinLockedError",
 ]
 
 
@@ -487,4 +492,96 @@ class MacAddressNotAuthorizedError(GuestError):
         super().__init__(
             f"MAC address not authorized: {mac_address}",
             status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class GuestPinLoginFailedError(GuestError):
+    """Raised by ``GuestService.login_via_pin`` for *every* way a PIN
+    login can fail: no ``Guest`` row exists for this identifier at all,
+    one exists but has never called ``set_guest_pin``
+    (``hashed_pin IS NULL``), one exists with a PIN that simply didn't
+    match, the presented ``device_mac`` is missing or doesn't belong to
+    this guest's own ``GuestDevice`` history, or a real PIN match came
+    back against a PIN that is now stale (older than
+    ``constants.PIN_STALE_AFTER_DAYS`` -- see that constant's own
+    docstring). All five collapse to this one, deliberately generic
+    message -- the exact same "don't leak identifier existence, or which
+    of these five reasons applies, via a login failure" posture
+    ``GuestPasswordLoginFailedError`` already establishes for password
+    login, extended here to also cover device recognition and staleness."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Invalid PIN, or this device isn't recognized. Please sign in "
+            "with a one-time code instead.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+
+class GuestPinSetupNotAuthorizedError(GuestError):
+    """``GuestService.set_guest_pin`` requires the exact same proof of a
+    just-completed, still-``ACTIVE`` OTP-authenticated ``GuestSession``
+    that ``GuestPasswordSetupNotAuthorizedError`` documents for
+    ``set_guest_password`` (reusing that same
+    ``constants.SET_PASSWORD_SESSION_WINDOW_MINUTES`` window) -- raised
+    when the presented ``session_id`` doesn't satisfy every leg of that
+    proof. One generic message across every distinct reason it can fail,
+    for the identical reason ``GuestPasswordSetupNotAuthorizedError``
+    gives: the caller's only correct remedy is the same regardless of
+    which leg failed."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This session isn't eligible to set a PIN -- please sign in "
+            "again with a one-time code and try again right after.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class GuestPinTooWeakError(GuestError):
+    """``GuestService.set_guest_pin`` rejects a PIN that isn't exactly
+    ``constants.PIN_LENGTH`` all-digit characters, or that is (see
+    ``validators.is_weak_pin``'s own docstring for exactly which two
+    shapes) trivially guessable -- this domain's own PIN-appropriate
+    equivalent of ``GuestPasswordTooWeakError``/
+    ``PasswordManager.validate_strength``, which a fixed-length numeric
+    PIN could never satisfy in the first place (see
+    ``app.domains.auth.password.PasswordManager.hash_raw``'s own
+    docstring)."""
+
+    def __init__(
+        self,
+        reason: str = (
+            "This PIN is too easy to guess -- please choose a different one."
+        ),
+    ) -> None:
+        super().__init__(reason, status_code=status.HTTP_400_BAD_REQUEST)
+
+
+class GuestPinLockedError(GuestError):
+    """``GuestService.login_via_pin``'s brute-force lockout -- raised by
+    ``GuestPinSecurity.check_lockout`` (see that class's own docstring)
+    once a ``(organization_id, identifier)`` pair has accumulated
+    ``constants.PIN_MAX_ATTEMPTS`` (or more) failed PIN attempts within
+    the current ``constants.PIN_LOCKOUT_MINUTES`` window. Mirrors
+    ``app.domains.auth.security.AccountLockedError``'s identical shape
+    and status code (423 Locked, ``locked_until`` carried on the
+    exception instance) -- reused as a *pattern*, not literally
+    subclassed or imported, since this domain's exception hierarchy is
+    entirely rooted in ``GuestError`` (see ``GuestPasswordTooWeakError``'s
+    docstring for why every guest-facing exception lives here, not in
+    ``app.domains.auth``). Deliberately a distinct exception from
+    ``GuestPinLoginFailedError`` -- unlike a routine wrong PIN, a lockout
+    is not itself proof of anything about ``identifier`` (the caller was
+    already told they hold the identifier, however wrongly, by the mere
+    fact that this many attempts were made against it), so the
+    guest-facing frontend is meant to render this differently: "try again
+    in N minutes" rather than a plain "wrong PIN"."""
+
+    def __init__(self, locked_until: datetime) -> None:
+        self.locked_until = locked_until
+        super().__init__(
+            "Too many incorrect PIN attempts. Please try again later, or "
+            "sign in with a one-time code instead.",
+            status_code=status.HTTP_423_LOCKED,
         )

@@ -181,9 +181,33 @@ def is_fup_usage_exceeded(*, used: int, limit: int) -> bool:
     return used >= limit
 
 
+_SEQUENTIAL_ASCENDING_DIGITS = "0123456789"
+_SEQUENTIAL_DESCENDING_DIGITS = "9876543210"
+
+
+def is_weak_pin(pin: str) -> bool:
+    """True for a Portal PIN that is trivially guessable: every digit
+    identical (``"000000"``, ``"111111"``, ...) or a straight ascending/
+    descending run (``"123456"``, ``"654321"``, ...) -- the two shapes any
+    real-world "don't pick this PIN" guide lists first, and the two an
+    attacker would try before anything else. A small, explicit structural
+    check rather than a comprehensive weak-PIN policy engine, mirroring
+    ``PasswordManager.validate_strength``'s own ``_COMMON_PASSWORDS``
+    blocklist in spirit (a short, targeted rejection list) without
+    reimplementing that module's letter/digit/special-character rules,
+    which a fixed-length numeric PIN could never satisfy in the first
+    place. Called by ``GuestService.set_guest_pin`` -- never assumes
+    ``pin`` is a particular length; a run/all-same-digit check is
+    meaningful at any length ``constants.PIN_LENGTH`` might ever be."""
+    if len(set(pin)) == 1:
+        return True
+    return pin in _SEQUENTIAL_ASCENDING_DIGITS or pin in _SEQUENTIAL_DESCENDING_DIGITS
+
+
 __all__ = [
     "normalize_mac_address",
     "normalize_identifier",
+    "is_weak_pin",
     "validate_session_status_transition",
     "validate_nas_status_transition",
     "is_session_timed_out",

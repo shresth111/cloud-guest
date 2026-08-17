@@ -416,6 +416,17 @@ class TestPasswordManager:
 
         assert weak < medium < strong
 
+    def test_hash_raw_skips_strength_validation(self) -> None:
+        """A 6-digit guest PIN could never satisfy ``validate_strength``
+        (too short, no letters/special chars) -- ``hash_raw`` is the
+        escape hatch ``app.domains.guest.service.GuestService
+        .set_guest_pin`` relies on for exactly that reason."""
+        hashed = PasswordManager.hash_raw("048213")
+
+        assert hashed != "048213"
+        assert PasswordManager.verify("048213", hashed) is True
+        assert PasswordManager.verify("999999", hashed) is False
+
 
 # ============================================================================
 # JWT handling

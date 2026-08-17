@@ -49,6 +49,15 @@ class GuestAuthMethod(StrEnum):
     VOUCHER = "voucher"
     USERNAME_PASSWORD = "username_password"
     MAC_WHITELIST = "mac_whitelist"
+    # Portal PIN: device-scoped quick-login, gated by
+    # app.domains.captive_portal.models.CaptivePortalConfig
+    # .pin_login_enabled -- mirrors USERNAME_PASSWORD's own
+    # enabled-flag-per-login-method shape exactly, one-for-one, the same
+    # way every other member of this enum already does. See
+    # GuestService.login_via_pin's own docstring for why this method,
+    # unlike USERNAME_PASSWORD, is also scoped to a specific
+    # already-known GuestDevice, not just an identifier + credential.
+    PIN = "pin"
 
 
 class GuestSessionStatus(StrEnum):
@@ -172,6 +181,42 @@ BYTES_PER_MB = 1024 * 1024
 # ``RECONNECT_GRACE_MINUTES`` above are each a narrow, single-purpose
 # window rather than a broad session lifetime.
 SET_PASSWORD_SESSION_WINDOW_MINUTES = 15
+
+# ============================================================================
+# Portal PIN -- device-scoped quick-login (Phase 1 BhaiFi-parity follow-on).
+# ============================================================================
+
+# Fixed, not operator-configurable -- confirmed product decision, unlike
+# e.g. app.domains.otp's OtpService(code_length=...) constructor parameter.
+# A single, platform-wide length keeps GuestSetPinRequest/GuestPinLoginRequest's
+# schema-level validation simple (an exact-length, all-digit field) and
+# avoids a whole class of "which location's PIN policy applies here" bugs a
+# per-organization/location override would invite for zero real benefit --
+# a 6-digit PIN is already the realistic ceiling for something guests are
+# expected to type on a phone keyboard at a captive portal.
+PIN_LENGTH = 6
+
+# How many consecutive failed PIN attempts for one (organization_id,
+# identifier) pair GuestPinSecurity.check_lockout tolerates before
+# GuestService.login_via_pin starts raising GuestPinLockedError instead of
+# ever comparing the presented PIN against a real hash -- see that class's
+# own docstring for the full "why login_via_pin needs a lockout
+# login_via_password still doesn't" write-up.
+PIN_MAX_ATTEMPTS = 5
+
+# How long a (organization_id, identifier) pair stays locked out once
+# PIN_MAX_ATTEMPTS is reached -- mirrors
+# app.core.config.Settings.account_lockout_minutes' role for platform
+# AuthUser accounts, scoped to this domain's own guest identifiers instead.
+PIN_LOCKOUT_MINUTES = 30
+
+# A PIN unused (never successfully logged in with, and never freshly set)
+# for longer than this is treated by GuestService.login_via_pin as though
+# it were simply wrong -- see that method's own docstring for why this
+# collapses into the exact same generic failure rather than a distinct
+# "expired" message, and why the reference point is "more recent of
+# Guest.pin_set_at/Guest.pin_last_used_at", not just one or the other.
+PIN_STALE_AFTER_DAYS = 90
 
 # ============================================================================
 # Concurrent session limit -- Guest Session Engine (Phase 1).

@@ -231,6 +231,18 @@ class CaptivePortalConfig(BaseModel):
     username_password_enabled: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False
     )
+    # Real, working login-method gate for Portal PIN
+    # (app.domains.guest.service.GuestService.login_via_pin /
+    # POST /guest/login/pin) -- mirrors username_password_enabled's
+    # identical shape one column above, checked the exact same way via
+    # GuestService._require_method_enabled. Defaults off (unlike
+    # username_password_enabled): a PIN is a materially weaker secret
+    # (constants.PIN_LENGTH digits vs. a real password), so this is an
+    # opt-in an operator turns on deliberately per location, not a
+    # baseline every fresh deployment gets for free.
+    pin_login_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     # Schema-only placeholder -- see module docstring. No real OAuth/
     # social-login integration exists anywhere in this codebase.
     social_login_enabled: Mapped[bool] = mapped_column(

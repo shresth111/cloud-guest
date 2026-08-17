@@ -102,6 +102,7 @@ def _config_response(config: CaptivePortalConfig) -> CaptivePortalConfigResponse
         otp_whatsapp_enabled=config.otp_whatsapp_enabled,
         voucher_enabled=config.voucher_enabled,
         username_password_enabled=config.username_password_enabled,
+        pin_login_enabled=config.pin_login_enabled,
         social_login_enabled=config.social_login_enabled,
         social_login_providers=list(config.social_login_providers),
         business_hours_enabled=config.business_hours_enabled,
@@ -160,6 +161,7 @@ async def create_captive_portal_config(
         otp_whatsapp_enabled=payload.otp_whatsapp_enabled,
         voucher_enabled=payload.voucher_enabled,
         username_password_enabled=payload.username_password_enabled,
+        pin_login_enabled=payload.pin_login_enabled,
         social_login_enabled=payload.social_login_enabled,
         social_login_providers=payload.social_login_providers,
     )

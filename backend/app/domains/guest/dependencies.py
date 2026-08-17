@@ -19,8 +19,10 @@ via a custom header" posture ``app.domains.router_agent.dependencies
 from __future__ import annotations
 
 from fastapi import Depends, Request
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
@@ -79,6 +81,7 @@ def get_guest_service(
     mac_authorization_service: MacAuthorizationService = Depends(
         get_mac_authorization_service
     ),
+    redis: Redis = Depends(get_redis_client),
 ) -> GuestService:
     """BE-011 Part 3 addition: wires ``MonitoringService`` in as
     ``GuestService``'s optional ``monitoring_hook`` (see that class's own
@@ -117,7 +120,16 @@ def get_guest_service(
     ``GuestService``'s optional ``mac_authorization_hook`` -- the one
     DI-wiring edit required for ``login_via_mac_whitelist`` to actually
     check a device against a real, admin-created whitelist entry in the
-    running application, rather than always rejecting."""
+    running application, rather than always rejecting.
+
+    Portal PIN addition: wires the shared Redis client in as
+    ``GuestService``'s optional ``redis`` -- the one DI-wiring edit
+    required for ``login_via_pin``'s brute-force lockout
+    (``GuestPinSecurity``) to actually gate real requests in the running
+    application, rather than this being dead code no request path ever
+    exercises (see ``GuestService``'s own docstring for the full write-up
+    of why this is a raw Redis client, not a duck-typed hook, unlike
+    every other parameter here)."""
     return GuestService(
         repository,
         otp_service,
@@ -130,6 +142,7 @@ def get_guest_service(
         queue_assignment_hook=queue_management_service,
         policy_lookup=policy_service,
         mac_authorization_hook=mac_authorization_service,
+        redis=redis,
     )
 
 

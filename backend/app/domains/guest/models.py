@@ -179,6 +179,50 @@ class Guest(BaseModel):
     # to authenticate against") -- ``GuestService.login_via_password`` is
     # what finally makes that flag do real work.
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Returning-guest PIN login (Portal PIN): the device-scoped counterpart
+    # to hashed_password above -- see GuestService.login_via_pin's own
+    # docstring for the "only a device that already completed a real OTP
+    # login for this guest may use this" scoping. Nullable for the same
+    # "opt-in, never required" reason hashed_password is. Hashed with
+    # PasswordManager.hash_raw (Argon2id, same cost parameters
+    # hashed_password uses), not PasswordManager.hash -- a fixed 6-digit
+    # PIN could never satisfy validate_strength's password-composition
+    # policy, so this column's own strength check is
+    # validators.is_weak_pin instead. Only ever written by
+    # GuestService.set_guest_pin (same just-completed-OTP-session proof
+    # set_guest_password requires).
+    hashed_pin: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # When set_guest_pin last (re)wrote hashed_pin -- together with
+    # pin_last_used_at below, the reference point login_via_pin's own
+    # constants.PIN_STALE_AFTER_DAYS staleness check measures from
+    # (whichever is more recent), so a guest who set a PIN and never used
+    # it is held to the same staleness bar as one who used it once, long
+    # ago.
+    pin_set_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Bumped by GuestService.login_via_pin on every *successful* PIN
+    # login -- see pin_set_at's own docstring for the staleness check this
+    # feeds.
+    pin_last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Durable, admin-visible mirror of GuestPinSecurity's own Redis-backed
+    # failure counter -- Redis (keyed by (organization_id, identifier), not
+    # guest_id, since a not-yet-existing guest can still accumulate failed
+    # attempts) is the real, authoritative gate login_via_pin checks on
+    # every request; these two columns are best-effort, written alongside
+    # that check but never read back to decide whether to lock a login
+    # out. Reset to 0 on every successful PIN login or a fresh
+    # set_guest_pin call.
+    pin_failed_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Set once pin_failed_attempts reaches constants.PIN_MAX_ATTEMPTS --
+    # see pin_failed_attempts' own docstring for why this is a mirror, not
+    # the real gate. Cleared on a successful PIN login or a fresh
+    # set_guest_pin call.
+    pin_locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_guests_organization_id", "organization_id"),
