@@ -137,6 +137,40 @@ def _parse_uuid_header(request: Request, header_name: str) -> uuid.UUID | None:
         raise InvalidScopeHeaderError(header_name) from exc
 
 
+def _parse_uuid_path_param(request: Request, param_name: str) -> uuid.UUID | None:
+    """Best-effort UUID parse of a URL path parameter (e.g. ``organization_id``
+    in ``/organizations/{organization_id}/locations``), used only as a
+    *fallback* source of scope for ``_current_scope_context`` -- see that
+    function's docstring for why this fallback exists.
+
+    Unlike ``_parse_uuid_header``, a malformed/missing value here is not
+    this dependency's problem to raise on: it just means the fallback has
+    nothing to contribute, so header-only resolution (or ``GLOBAL``, if
+    nothing at all was present) proceeds exactly as before. A path
+    parameter that is genuinely required and malformed is already
+    independently caught by FastAPI's own validation of the endpoint's
+    typed signature (e.g. ``organization_id: uuid.UUID``), which 422s the
+    request regardless of what this dependency resolves.
+    """
+    # ``getattr`` rather than ``request.path_params`` directly: a handful of
+    # unit tests construct a minimal fake ``Request``-like double that only
+    # stubs the ``headers`` attribute this module previously ever touched
+    # (see e.g. ``test_billing_plans_licenses_usage.py``'s
+    # ``TestPlanCatalogRbacGate``) -- a real Starlette ``Request`` always
+    # has ``path_params``, so this only ever falls back to ``{}`` for such
+    # a double, never in production.
+    path_params = getattr(request, "path_params", None) or {}
+    raw = path_params.get(param_name)
+    if raw is None:
+        return None
+    if isinstance(raw, uuid.UUID):
+        return raw
+    try:
+        return uuid.UUID(str(raw))
+    except (ValueError, TypeError):
+        return None
+
+
 async def CurrentOrganization(
     request: Request,
     user: AuthUser = Depends(CurrentUser),
@@ -239,10 +273,51 @@ async def CurrentRouter(request: Request) -> uuid.UUID | None:
 
 
 async def _current_scope_context(request: Request) -> ScopeContext:
+    """The scope this request is acting within.
+
+    Resolved from the ``X-*-Id`` scope headers first and, for any of the
+    three that header didn't supply, falls back to the identically-named
+    URL path parameter (``organization_id``/``location_id``/``router_id``)
+    on the route actually matched for this request.
+
+    ## Why the path-parameter fallback exists
+
+    A route like ``GET /organizations/{organization_id}/locations``
+    already unambiguously names the organization it acts on in its own
+    URL -- FastAPI has bound ``organization_id`` from that same path
+    segment onto the endpoint's own parameter by the time this dependency
+    runs. Before this fallback, a caller that (for whatever reason -- a
+    thin client, a script, a proxy that drops custom headers) didn't *also*
+    separately repeat that id as ``X-Organization-Id`` fell all the way
+    through to :func:`_infer_scope_type`'s ``GLOBAL`` default, so
+    ``RequirePermission`` (called with no explicit ``scope=``) demanded a
+    GLOBAL-scope grant for a request that was, by construction, already
+    scoped to one specific organization -- rejecting real org-scoped
+    callers (e.g. an Organization Owner) who correctly hold the permission
+    at ORGANIZATION scope, not GLOBAL. This is a strict widening of what
+    is *accepted* as a scope source, not a new *requirement*: a route with
+    none of these path parameters (most of them) is completely unaffected,
+    and the header -- when present -- still wins, preserving today's
+    behavior for every existing header-based caller.
+
+    This only changes how the *scope context* passed to
+    ``AccessValidator.check`` is derived -- the permission-grant lookup
+    itself is untouched, so this cannot grant access a caller's actual
+    role assignments don't otherwise justify at that scope.
+    """
     return ScopeContext(
-        organization_id=_parse_uuid_header(request, _ORG_HEADER),
-        location_id=_parse_uuid_header(request, _LOCATION_HEADER),
-        router_id=_parse_uuid_header(request, _ROUTER_HEADER),
+        organization_id=(
+            _parse_uuid_header(request, _ORG_HEADER)
+            or _parse_uuid_path_param(request, "organization_id")
+        ),
+        location_id=(
+            _parse_uuid_header(request, _LOCATION_HEADER)
+            or _parse_uuid_path_param(request, "location_id")
+        ),
+        router_id=(
+            _parse_uuid_header(request, _ROUTER_HEADER)
+            or _parse_uuid_path_param(request, "router_id")
+        ),
     )
 
 

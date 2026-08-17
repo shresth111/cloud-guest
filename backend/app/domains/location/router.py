@@ -120,7 +120,16 @@ def _location_response(location: Location) -> LocationResponse:
     "/organizations/{organization_id}/locations",
     response_model=ApiResponse[LocationListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("locations.read"))],
+    # Explicit scope=ORGANIZATION: this is the confirmed production bug
+    # (demo-owner@wyfyguest.com, an Organization Owner, 403ing on their own
+    # org's locations). ``organization_id`` is already unambiguous from the
+    # URL path -- RequirePermission's own header/path-param inference (see
+    # app.domains.rbac.dependencies._current_scope_context) now covers this
+    # too, but it's spelled out explicitly here anyway since this is the
+    # exact route the bug report named, not left to rely on inference alone.
+    dependencies=[
+        Depends(RequirePermission("locations.read", scope=ScopeType.ORGANIZATION))
+    ],
 )
 async def list_locations(
     request: Request,
@@ -161,7 +170,11 @@ async def list_locations(
     "/organizations/{organization_id}/locations",
     response_model=ApiResponse[LocationResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("locations.create"))],
+    # Explicit scope=ORGANIZATION -- same reasoning as list_locations above:
+    # organization_id is already unambiguous from the URL path.
+    dependencies=[
+        Depends(RequirePermission("locations.create", scope=ScopeType.ORGANIZATION))
+    ],
 )
 async def create_location(
     request: Request,
