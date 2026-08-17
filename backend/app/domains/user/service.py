@@ -34,6 +34,15 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from app.common.exceptions import CloudGuestError
+from app.core.config import get_settings
+from app.core.email_layout import (
+    button,
+    esc,
+    heading,
+    info_box,
+    paragraph,
+    render_email,
+)
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import User
 from app.domains.auth.password import PasswordManager, PasswordStrengthError
@@ -531,15 +540,31 @@ class UserService:
         user = await self.identity_repository.update_user(
             user, must_change_password=True
         )
+        login_url = f"{get_settings().frontend_base_url.rstrip('/')}/login"
+        content = (
+            heading("You've been invited to Wyfy Guest")
+            + paragraph(
+                f"Hi {esc(user.first_name)}, an account has been created for "
+                "you. Use the credentials below to sign in -- you'll be asked "
+                "to set a new password the first time you log in."
+            )
+            + info_box(
+                [
+                    ("Username", esc(username)),
+                    ("Temporary password", esc(temporary_password)),
+                ],
+                mono_values=True,
+            )
+            + button("Log In to Wyfy Guest", login_url)
+        )
         await self.notification_service.enqueue(
             event_type=NotificationEventType.USER_INVITED,
             channel=NotificationChannelType.EMAIL,
             recipient=user.email,
-            subject="You've been invited to CloudGuest",
-            body=(
-                f"Hi {user.first_name}, an account has been created for you. "
-                f"Username: {username}. Temporary password: {temporary_password}. "
-                "You will be asked to set a new password when you first sign in."
+            subject="You've been invited to Wyfy Guest",
+            body=render_email(
+                preheader="An account has been created for you on Wyfy Guest.",
+                content_html=content,
             ),
             organization_id=organization_id,
         )

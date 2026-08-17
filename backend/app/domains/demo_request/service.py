@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Protocol
 
+from app.core.email_layout import esc, heading, info_box, paragraph, render_email
 from app.database.utils.pagination import PaginationMeta
 
 from .exceptions import DemoRequestNotFoundError
@@ -100,17 +101,35 @@ class DemoRequestService:
                 NotificationEventType,
             )
 
+            content = (
+                heading("New demo request")
+                + paragraph(
+                    f"<strong>{esc(demo_request.full_name)}</strong> "
+                    f"({esc(demo_request.email)}) from "
+                    f"<strong>{esc(demo_request.company_name)}</strong> "
+                    "requested a demo."
+                )
+                + info_box(
+                    [
+                        ("Phone", esc(demo_request.phone or "—")),
+                        ("Message", esc(demo_request.message or "—")),
+                    ]
+                )
+                + paragraph(
+                    "View it on the Master console under Demo Requests.",
+                    muted=True,
+                )
+            )
             await self.notification_service.enqueue(
                 event_type=NotificationEventType.DEMO_REQUEST_RECEIVED,
                 channel=NotificationChannelType.EMAIL,
                 recipient=self.notify_email,
                 subject=f"New demo request: {demo_request.company_name}",
-                body=(
-                    f"{demo_request.full_name} ({demo_request.email}) from "
-                    f"{demo_request.company_name} requested a demo.\n\n"
-                    f"Phone: {demo_request.phone or '—'}\n"
-                    f"Message: {demo_request.message or '—'}\n\n"
-                    "View it on the Master console under Demo Requests."
+                body=render_email(
+                    preheader=f"{demo_request.full_name} from "
+                    f"{demo_request.company_name} requested a demo.",
+                    content_html=content,
+                    accent="#6366f1",
                 ),
                 organization_id=None,
             )

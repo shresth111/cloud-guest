@@ -126,6 +126,15 @@ from typing import Protocol
 from redis.asyncio import Redis
 
 from app.core.config import Settings
+from app.core.email_layout import (
+    callout,
+    code_block,
+    esc,
+    heading,
+    html_to_plain_text,
+    paragraph,
+    render_email,
+)
 from app.domains.rbac.enums import AuditAction
 
 from .constants import OTP_REQUEST_RATE_LIMIT_KEY_TEMPLATE, OtpChannel, OtpPurpose
@@ -169,6 +178,29 @@ def hash_otp_code(code: str) -> str:
     Argon2id, is the right hash for a short-lived, expiry- and attempt-
     capped OTP code."""
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _render_otp_email(*, intro: str, code: str, minutes: int) -> str:
+    """The one-purpose OTP email: deliberately terse and urgent -- no
+    onboarding warmth, no secondary content, just the code, what it's for,
+    and how long it's valid. See ``app.core.email_layout``'s module
+    docstring for the shared shell this composes into."""
+    plural = "s" if minutes != 1 else ""
+    content = (
+        heading("Your verification code")
+        + paragraph(esc(intro))
+        + code_block(code)
+        + callout(
+            f"This code expires in <strong>{minutes} minute{plural}</strong>. "
+            "Never share it with anyone -- Wyfy Guest will never ask you for it.",
+            tone="warning",
+        )
+    )
+    return render_email(
+        preheader=f"Your Wyfy Guest verification code is {code}.",
+        content_html=content,
+        accent="#d97706",
+    )
 
 
 # ============================================================================
@@ -319,7 +351,15 @@ class SmtpEmailProvider:
     interface, or a plain relay) using stdlib ``smtplib``/``email`` --
     zero new dependencies. ``smtplib`` is synchronous; ``send`` bridges it
     through ``asyncio.to_thread``, the same sync-in-async bridge
-    ``app.core.storage.S3ObjectStorage`` uses for boto3."""
+    ``app.core.storage.S3ObjectStorage`` uses for boto3.
+
+    ``body`` is expected to be the real, branded HTML every caller now
+    builds via ``app.core.email_layout.render_email`` (see that module's
+    docstring). ``set_content``/``add_alternative`` below composes a real
+    ``multipart/alternative`` message -- a derived plain-text part (via
+    ``html_to_plain_text``) plus the HTML part -- so a client that prefers
+    or requires plain text (and any scanner/preview that strips HTML)
+    still gets a readable message, not a raw tag soup."""
 
     def __init__(
         self,
@@ -353,7 +393,8 @@ class SmtpEmailProvider:
         message["Subject"] = subject
         message["From"] = self.from_address
         message["To"] = email
-        message.set_content(body)
+        message.set_content(html_to_plain_text(body))
+        message.add_alternative(body, subtype="html")
         if attachment is not None:
             maintype, _, subtype = attachment.content_type.partition("/")
             message.add_attachment(
@@ -422,7 +463,10 @@ class SesEmailProvider:
                 Destination={"ToAddresses": [email]},
                 Message={
                     "Subject": {"Data": subject},
-                    "Body": {"Text": {"Data": body}},
+                    "Body": {
+                        "Html": {"Data": body},
+                        "Text": {"Data": html_to_plain_text(body)},
+                    },
                 },
             )
             return
@@ -430,14 +474,17 @@ class SesEmailProvider:
         # An attachment needs a real MIME multipart body -- SES's plain
         # ``send_email`` API has no attachment field at all, so this branch
         # composes the identical stdlib ``EmailMessage`` :class:`SmtpEmailProvider`
-        # builds above and ships it via SES's raw-message API instead.
+        # builds above (including its own HTML + derived-plain-text
+        # ``multipart/alternative`` pair) and ships it via SES's raw-message
+        # API instead.
         from email.message import EmailMessage
 
         message = EmailMessage()
         message["Subject"] = subject
         message["From"] = self.from_address
         message["To"] = email
-        message.set_content(body)
+        message.set_content(html_to_plain_text(body))
+        message.add_alternative(body, subtype="html")
         maintype, _, subtype = attachment.content_type.partition("/")
         message.add_attachment(
             attachment.content,
@@ -870,12 +917,17 @@ class OtpService:
                 f"guest-data masking setting is {code}. It expires in "
                 f"{minutes} minute(s). Ignore this if you didn't request it."
             )
+            intro = (
+                "Use this code to change your dashboard's guest-data masking "
+                "setting. Ignore this message if you didn't request it."
+            )
         else:
             subject = "Your Wyfy Guest verification code"
             message = (
                 f"Your Wyfy Guest verification code is {code}. "
                 f"It expires in {minutes} minute(s)."
             )
+            intro = "Use this code to finish signing in."
         if channel == OtpChannel.SMS:
             await self.sms_provider.send(otp_request.identifier, message)
         elif channel == OtpChannel.WHATSAPP:
@@ -883,7 +935,12 @@ class OtpService:
                 otp_request.identifier, code=code, message=message
             )
         else:
-            await self.email_provider.send(otp_request.identifier, subject, message)
+            email_html = _render_otp_email(
+                intro=intro, code=code, minutes=minutes
+            )
+            await self.email_provider.send(
+                otp_request.identifier, subject, email_html
+            )
 
     # ========================================================================
     # Verify

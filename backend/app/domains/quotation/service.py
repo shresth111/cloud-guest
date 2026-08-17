@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from app.core.email_layout import esc, heading, info_box, paragraph, render_email
 from app.database.utils.pagination import PaginationMeta
 from app.domains.otp.service import (
     EmailAttachment,
@@ -204,14 +205,39 @@ class QuotationService:
                 f"Your {QUOTATION_PRODUCT_NAME} quotation "
                 f"{quotation.quotation_number}"
             )
-            body = (
-                f"Hello {quotation.client_name},\n\n"
-                f"Please find attached your {QUOTATION_PRODUCT_NAME} quotation "
-                f"{quotation.quotation_number} for {quotation.client_company_name}.\n\n"
-                f"Total: {quotation.currency} {quotation.total_amount}\n"
-                f"Valid until: {quotation.valid_until.strftime('%d %b %Y')}\n\n"
-                "If you have any questions, just reply to this email.\n\n"
-                f"Thank you for considering {QUOTATION_PRODUCT_NAME}."
+            valid_until = quotation.valid_until.strftime("%d %b %Y")
+            content = (
+                heading(f"Your {esc(QUOTATION_PRODUCT_NAME)} quotation")
+                + paragraph(
+                    f"Hello {esc(quotation.client_name)}, please find attached "
+                    f"your {esc(QUOTATION_PRODUCT_NAME)} quotation for "
+                    f"<strong>{esc(quotation.client_company_name)}</strong>."
+                )
+                + info_box(
+                    [
+                        ("Quotation number", esc(quotation.quotation_number)),
+                        (
+                            "Total",
+                            esc(f"{quotation.currency} {quotation.total_amount}"),
+                        ),
+                        ("Valid until", esc(valid_until)),
+                    ]
+                )
+                + paragraph(
+                    "If you have any questions, just reply to this email.",
+                    muted=True,
+                )
+                + paragraph(
+                    f"Thank you for considering {esc(QUOTATION_PRODUCT_NAME)}.",
+                    muted=True,
+                )
+            )
+            body = render_email(
+                preheader=(
+                    f"Your {QUOTATION_PRODUCT_NAME} quotation "
+                    f"{quotation.quotation_number}, valid until {valid_until}."
+                ),
+                content_html=content,
             )
             await self.email_provider.send(
                 quotation.client_email,

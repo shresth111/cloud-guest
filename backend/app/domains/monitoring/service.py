@@ -78,16 +78,25 @@ from redis.asyncio import Redis
 
 from app.core.celery_app import CELERY_HEALTH_CHECK_TIMEOUT_SECONDS, ping_celery_workers
 from app.core.config import Settings
+from app.core.email_layout import (
+    DANGER,
+    SUCCESS,
+    WARNING,
+    esc,
+    heading,
+    paragraph,
+    render_email,
+)
 from app.core.logging import get_logger
 from app.database.utils.pagination import PaginationMeta
+from app.domains.monitored_hardware.constants import HardwareStatus
+from app.domains.monitored_hardware.service import MonitoredHardwareService
 from app.domains.otp.service import (
     EmailProviderProtocol,
     LoggingEmailProvider,
     LoggingSmsProvider,
     SmsProviderProtocol,
 )
-from app.domains.monitored_hardware.constants import HardwareStatus
-from app.domains.monitored_hardware.service import MonitoredHardwareService
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router_provisioning.constants import EnrollmentStatus
@@ -1794,11 +1803,23 @@ class EmailNotifier:
 
     async def send(self, *, alert: Alert, config: dict[str, object]) -> str:
         email = str(config["email"])
-        await self.email_provider.send(
-            email,
-            f"Wyfy Guest alert: {alert.severity.upper()}",
-            _format_alert_message(alert),
+        resolved = alert.status == "resolved"
+        subject_label = "RESOLVED" if resolved else alert.severity.upper()
+        subject = f"Wyfy Guest alert: {subject_label}"
+        accent = (
+            SUCCESS
+            if resolved
+            else (DANGER if alert.severity == "critical" else WARNING)
         )
+        content = heading(
+            "Alert resolved" if resolved else f"{esc(alert.severity.upper())} alert"
+        ) + paragraph(esc(alert.message))
+        body = render_email(
+            preheader=_format_alert_message(alert),
+            content_html=content,
+            accent=accent,
+        )
+        await self.email_provider.send(email, subject, body)
         return f"queued to {email} via EmailProviderProtocol"
 
 
