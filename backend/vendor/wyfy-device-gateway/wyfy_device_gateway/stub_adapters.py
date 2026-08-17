@@ -111,7 +111,7 @@ class _StubAdapter:
     ) -> TracerouteResult:
         raise self._not_implemented()
 
-    async def get_dynamic_default_gateway(self, creds: DeviceCredentials) -> str | None:
+    async def get_active_default_gateway(self, creds: DeviceCredentials) -> str | None:
         raise self._not_implemented()
 
     async def get_pppoe_interface_status(
@@ -266,7 +266,7 @@ class _StubAdapter:
             "disconnect_device": False,
             "ping": False,
             "traceroute": False,
-            "get_dynamic_default_gateway": False,
+            "get_active_default_gateway": False,
             "get_pppoe_interface_status": False,
             "get_interface_traffic_counters": False,
             "run_speed_test": False,

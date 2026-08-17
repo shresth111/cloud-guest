@@ -101,8 +101,11 @@ class IspLinkDisabledError(IspError):
 class IspHealthCheckTargetUnavailableError(IspError):
     """Raised by ``IspService.ping_link`` when a DHCP/PPPOE-mode link's
     own real target can't be resolved right now -- a DHCP link with no
-    dynamic default route currently present on the router, or a PPPOE
-    link with no ``interface`` configured at all. Distinct from
+    *active* default route (dynamic or static -- see
+    ``device_adapters.BaseIspHealthAdapter.get_active_default_gateway``'s
+    own docstring for why a static fallback is checked too) currently
+    present on the router, or a PPPOE link with no ``interface``
+    configured at all. Distinct from
     ``IspMissingCredentialsError`` (that one is about the router's own
     API connection details being absent; this one is about the *link's*
     own connection-mode-specific target, reachable router or not). The

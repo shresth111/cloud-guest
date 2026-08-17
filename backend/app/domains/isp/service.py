@@ -788,10 +788,19 @@ class IspService:
         * ``STATIC`` -- pings ``gateway_ip_address`` (the historical,
           only-ever-supported behavior, unchanged).
         * ``DHCP`` -- never trusts a manually-typed value (there isn't
-          one); resolves the router's own *live* dynamic default gateway
-          via ``get_dynamic_default_gateway`` at check time, then pings
-          that, so a mid-lease ISP-side gateway change is always
-          reflected on the very next check, never stale.
+          one); resolves the router's own *live* default gateway via
+          ``get_active_default_gateway`` at check time, then pings that,
+          so a mid-lease ISP-side gateway change is always reflected on
+          the very next check, never stale. That lookup prefers a
+          genuinely dynamic default route but falls back to an active
+          static one -- required because this platform's own Setup
+          Script generator deliberately provisions a *static* default
+          route (not a dynamic one) for every dhcp-client it creates, to
+          avoid it fighting the routing-mark/failover mangle rules (see
+          ``device_adapters.py``'s own module docstring for the full,
+          fleet-wide-production-bug write-up); a route that exists but
+          is currently inactive (a real ``check-gateway`` failure) is
+          still correctly treated as "no usable target."
         * ``PPPOE`` -- no gateway/ping involved at all; the link's own
           ``interface`` PPPoE client's real up/down state *is* the health
           signal, synthesized into a ``PingResult`` shape (0%
@@ -829,12 +838,12 @@ class IspService:
             )
 
         if link.connection_mode == IspConnectionMode.DHCP.value:
-            target_ip = await adapter.get_dynamic_default_gateway(credentials)
+            target_ip = await adapter.get_active_default_gateway(credentials)
             if not target_ip:
                 raise IspHealthCheckTargetUnavailableError(
                     link.id,
-                    "DHCP mode but no dynamic default route currently present "
-                    "on the router",
+                    "DHCP mode but no active default route (dynamic or "
+                    "static) currently present on the router",
                 )
         else:
             target_ip = link.gateway_ip_address or host

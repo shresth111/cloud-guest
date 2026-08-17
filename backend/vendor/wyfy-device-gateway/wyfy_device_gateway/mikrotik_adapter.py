@@ -422,10 +422,13 @@ class MikroTikAdapter:
 
         * ``ping`` (``/tool/ping``) -> ``reachable``/``latency_ms``/
           ``packet_loss_percent``.
-        * ``get_dynamic_default_gateway`` (``/ip/route``, never filtered by
-          interface name -- see that module's own docstring) ->
-          ``dynamic_gateway``, and incidentally the WAN-facing interface
-          name RouterOS itself associates with that route.
+        * ``get_active_default_gateway`` (``/ip/route``, never filtered by
+          interface name -- see that method's own docstring, including its
+          dynamic-route-or-active-static-route fallback) ->
+          ``dynamic_gateway`` (name unchanged for shape stability, though
+          the value may now come from a static route -- see
+          :func:`_select_default_route`), and incidentally the WAN-facing
+          interface name RouterOS itself associates with that route.
         * ``get_pppoe_interface_status``/traffic counters, resolved against
           that same interface name when the router reports one, with the
           original's single-candidate stale-name fallback preserved when
@@ -473,18 +476,7 @@ class MikroTikAdapter:
             ping_rows, requested_count=4
         )
 
-        dynamic_gateway: str | None = None
-        wan_interface: str | None = None
-        for row in route_rows:
-            if (
-                row.get("dst-address") == "0.0.0.0/0"
-                and str(row.get("dynamic", "false")).lower() == "true"
-            ):
-                gateway = row.get("gateway")
-                dynamic_gateway = str(gateway) if gateway else None
-                iface = row.get("interface")
-                wan_interface = str(iface) if iface else None
-                break
+        dynamic_gateway, wan_interface = _select_default_route(route_rows)
 
         ppp_status: bool | None = None
         pppoe_interface_name = wan_interface
@@ -703,34 +695,35 @@ class MikroTikAdapter:
     # isp-specific WAN link telemetry
     # ------------------------------------------------------------------
 
-    async def get_dynamic_default_gateway(self, creds: DeviceCredentials) -> str | None:
+    async def get_active_default_gateway(self, creds: DeviceCredentials) -> str | None:
         """Ported from
-        ``isp/device_adapters.py::_get_dynamic_default_gateway_sync`` --
-        reads ``/ip/route`` and returns the ``gateway`` field of whichever
-        row has ``dst-address == "0.0.0.0/0"`` and ``dynamic == "true"``.
-        Deliberately never filtered by interface name (see that module's
-        own docstring)."""
-        return await asyncio.to_thread(self._get_dynamic_default_gateway_sync, creds)
+        ``isp/device_adapters.py::_get_active_default_gateway_sync``
+        (renamed 2026-08-17 from ``get_dynamic_default_gateway`` -- see
+        below) -- reads ``/ip/route`` and returns the router's own
+        currently-usable ``0.0.0.0/0`` gateway. Prefers a genuinely
+        *dynamic* default route (RouterOS's own live DHCP-negotiated
+        gateway) when one exists; otherwise falls back to any other
+        default route that is currently *active* (RouterOS's real,
+        live "actually forwarding traffic right now" flag, which goes
+        false the instant a ``check-gateway`` probe fails) and not
+        administratively disabled -- see :func:`_select_default_gateway`
+        for the full two-tier rule and the fleet-wide production incident
+        (2026-08-17) that motivated the fallback tier. Deliberately never
+        filtered by interface name (see module docstring)."""
+        return await asyncio.to_thread(self._get_active_default_gateway_sync, creds)
 
-    def _get_dynamic_default_gateway_sync(self, creds: DeviceCredentials) -> str | None:
+    def _get_active_default_gateway_sync(self, creds: DeviceCredentials) -> str | None:
         api = self._connect_api(creds)
         try:
             try:
                 rows = list(api.path("ip", "route"))
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
-                    creds.host, f"read_dynamic_default_route: {exc}"
+                    creds.host, f"read_active_default_route: {exc}"
                 ) from exc
         finally:
             api.close()
-        for row in rows:
-            if (
-                row.get("dst-address") == "0.0.0.0/0"
-                and str(row.get("dynamic", "false")).lower() == "true"
-            ):
-                gateway = row.get("gateway")
-                return str(gateway) if gateway else None
-        return None
+        return _select_default_gateway(rows)
 
     async def get_pppoe_interface_status(
         self, creds: DeviceCredentials, *, interface_name: str
@@ -1747,7 +1740,7 @@ class MikroTikAdapter:
             "disconnect_device": True,
             "ping": True,
             "traceroute": True,
-            "get_dynamic_default_gateway": True,
+            "get_active_default_gateway": True,
             "get_pppoe_interface_status": True,
             "get_interface_traffic_counters": True,
             "run_speed_test": True,
@@ -1769,6 +1762,93 @@ class MikroTikAdapter:
             "upload_file": True,
             "execute_raw_command": True,
         }
+
+
+def _select_default_gateway(rows: list[dict[str, object]]) -> str | None:
+    """Resolves the router's own currently-usable ``0.0.0.0/0`` gateway
+    from a raw ``/ip/route`` reply -- shared by
+    ``get_active_default_gateway``/``_get_active_default_gateway_sync``
+    and ``_get_wan_health_sync`` so both read the exact same rule.
+
+    Two-tier, in priority order:
+
+    1. A genuinely *dynamic* default route (``dst-address == "0.0.0.0/0"``
+       and ``dynamic == "true"``) -- RouterOS's own live, DHCP-negotiated
+       gateway. This is the original, only-ever-implemented behavior,
+       unchanged: if such a row exists it wins outright, on its own
+       ``gateway`` field (even if that field is somehow empty -- an
+       existing dynamic row is always authoritative over any fallback).
+
+    2. Falls back to any other ``0.0.0.0/0`` route that is currently
+       *active* and not administratively disabled -- static or otherwise.
+       Required because this platform's own Setup Script generator
+       (``buildRouterSetupScriptChunks`` in cloudguest-foundation's
+       ``RouterDetailTabs.tsx``) deliberately sets
+       ``add-default-route=no`` on every ``dhcp-client`` it creates and
+       instead provisions a *static* ``0.0.0.0/0`` route with
+       ``check-gateway=ping`` -- on purpose, to stop RouterOS's own
+       dhcp-client-created dynamic route from silently fighting this
+       platform's routing-mark/failover mangle rules. A router set up
+       exactly as this platform's own generator intends therefore
+       legitimately never has a ``dynamic=="true"`` default route at all,
+       and tier 1 alone incorrectly reports every such DHCP-mode link as
+       having no usable gateway (confirmed fleet-wide in production,
+       2026-08-17, router "gurugram": a since-fixed, unrelated bug had
+       been leaving a stray leftover ``dhcp-client`` on some routers that
+       happened to create an accidental dynamic route, silently masking
+       this pre-existing one everywhere it occurred -- removing that
+       stray client surfaced the underlying bug immediately).
+
+       ``active`` -- not ``disabled`` alone -- is RouterOS's own real,
+       live "is this route actually the one currently forwarding matching
+       traffic" flag: it goes false the instant a ``check-gateway`` probe
+       on that route fails, independent of the ``disabled`` admin flag.
+       Requiring ``active == "true"`` here (rather than merely "this row
+       exists") is what keeps a real outage -- a static default route
+       whose gateway has genuinely stopped responding to ``check-gateway``
+       -- correctly reported as unavailable rather than masked by this
+       fallback.
+
+    Deliberately never filtered by interface name in either tier -- see
+    ``get_active_default_gateway``'s own docstring for why."""
+    gateway, _interface = _select_default_route(rows)
+    return gateway
+
+
+def _select_default_route(
+    rows: list[dict[str, object]],
+) -> tuple[str | None, str | None]:
+    """Same two-tier rule as :func:`_select_default_gateway`, additionally
+    returning the RouterOS ``interface`` field of whichever row the
+    gateway came from (``None`` if no usable default route was found, or
+    the winning row simply has no ``interface`` field) -- used by
+    ``_get_wan_health_sync``, which also needs to know *which* interface
+    the default route rides on to resolve PPPoE status/traffic counters
+    against it."""
+    dynamic_row: dict[str, object] | None = None
+    active_fallback_row: dict[str, object] | None = None
+    for row in rows:
+        if row.get("dst-address") != "0.0.0.0/0":
+            continue
+        is_dynamic = str(row.get("dynamic", "false")).lower() == "true"
+        if is_dynamic:
+            dynamic_row = row
+            break
+        if active_fallback_row is not None:
+            continue
+        is_active = str(row.get("active", "false")).lower() == "true"
+        is_disabled = str(row.get("disabled", "false")).lower() == "true"
+        if is_active and not is_disabled and row.get("gateway"):
+            active_fallback_row = row
+    winning_row = dynamic_row if dynamic_row is not None else active_fallback_row
+    if winning_row is None:
+        return None, None
+    gateway = winning_row.get("gateway")
+    interface = winning_row.get("interface")
+    return (
+        str(gateway) if gateway else None,
+        str(interface) if interface else None,
+    )
 
 
 def _parse_ping_rows(

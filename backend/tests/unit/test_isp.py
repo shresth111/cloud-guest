@@ -406,7 +406,7 @@ class FakeIspHealthAdapter:
             sent=count, received=count, packet_loss_percentage=0.0, avg_rtt_ms=10.0
         )
 
-    async def get_dynamic_default_gateway(
+    async def get_active_default_gateway(
         self, credentials: IspCredentials
     ) -> str | None:
         return self.dynamic_gateway
@@ -1145,6 +1145,69 @@ class TestConnectionModeHealthChecks:
         assert adapter.calls[-1]["target_ip"] == "198.51.100.7"
 
     async def test_dhcp_with_no_dynamic_route_raises_target_unavailable(self) -> None:
+        adapter = FakeIspHealthAdapter(dynamic_gateway=None)
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="DHCP ISP",
+            link_type=IspLinkType.FIBER.value,
+            connection_mode=IspConnectionMode.DHCP.value,
+            role=IspLinkRole.PRIMARY,
+            gateway_ip_address=None,
+        )
+        with pytest.raises(IspHealthCheckTargetUnavailableError):
+            await h.service.ping_link(link)
+
+    async def test_dhcp_resolves_active_static_fallback_gateway_and_pings_it(
+        self,
+    ) -> None:
+        """The fix for a confirmed fleet-wide production bug (2026-08-17):
+        this platform's own Setup Script generator deliberately sets
+        ``add-default-route=no`` on every dhcp-client it provisions and
+        creates a *static* default route instead (to avoid it fighting
+        the routing-mark/failover mangle rules) -- so a router
+        provisioned exactly as intended never has a dynamic default
+        route at all. ``get_active_default_gateway`` now falls back to a
+        genuinely active static default route in that case; from
+        ``ping_link``'s own perspective this is indistinguishable from
+        the adapter resolving *any* usable gateway -- see
+        ``test_isp_device_adapters.TestGetActiveDefaultGateway`` for the
+        real RouterOS-route-selection-level coverage of the fallback
+        rule itself (including the "genuinely active" requirement)."""
+        adapter = FakeIspHealthAdapter(dynamic_gateway="203.0.113.1")
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="DHCP ISP",
+            link_type=IspLinkType.FIBER.value,
+            connection_mode=IspConnectionMode.DHCP.value,
+            role=IspLinkRole.PRIMARY,
+            gateway_ip_address=None,
+        )
+        result = await h.service.ping_link(link)
+        assert result.packet_loss_percentage == 0.0
+        assert adapter.calls[-1]["target_ip"] == "203.0.113.1"
+
+    async def test_dhcp_static_route_inactive_still_raises_target_unavailable(
+        self,
+    ) -> None:
+        """The other half of the same fix: a static default route that
+        exists but is currently *inactive* (RouterOS clears its own
+        ``active`` flag the instant a ``check-gateway`` probe fails -- a
+        real outage) must never be masked by the new fallback.
+        ``get_active_default_gateway`` returns ``None`` in that case
+        exactly like "no route at all" -- see
+        ``test_isp_device_adapters
+        .TestGetActiveDefaultGateway.test_static_route_present_but_inactive_returns_none``
+        for the real RouterOS-parsing-level assertion that an inactive
+        row is excluded; this confirms ``ping_link`` still correctly
+        raises on that ``None``, not a fabricated success."""
         adapter = FakeIspHealthAdapter(dynamic_gateway=None)
         h = make_harness(health_adapter=adapter)
         router = h.router_lookup.add(_make_router())
