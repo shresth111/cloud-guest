@@ -71,6 +71,12 @@ class InterfaceInfo:
 @dataclass(frozen=True, slots=True)
 class WanHealth:
     reachable: bool
+    # Name kept for shape stability even though the value is no longer
+    # necessarily a *dynamic* route's gateway -- see
+    # ``DeviceGatewayAdapter.get_active_default_gateway``'s own docstring:
+    # falls back to an active *static* default route's gateway when no
+    # dynamic one exists (the common case for a router provisioned by
+    # this platform's own Setup Script generator).
     dynamic_gateway: str | None
     ppp_status: bool | None
     rx_bytes: int | None
@@ -348,11 +354,23 @@ class DeviceGatewayAdapter(Protocol):
         ...
 
     # -- isp-specific WAN link telemetry -----------------------------------
-    async def get_dynamic_default_gateway(self, creds: DeviceCredentials) -> str | None:
-        """Real, live lookup of the router's own current DHCP-negotiated
-        default gateway -- ``None`` if no dynamic default route currently
-        exists. Ported from
-        ``app.domains.isp.device_adapters.get_dynamic_default_gateway``."""
+    async def get_active_default_gateway(self, creds: DeviceCredentials) -> str | None:
+        """Real, live lookup of the router's own currently-usable
+        ``0.0.0.0/0`` gateway for a DHCP-mode WAN link. Prefers a genuinely
+        *dynamic* default route (RouterOS's own live DHCP-negotiated
+        gateway); when none exists, falls back to any other default route
+        that is currently *active* (not merely present -- RouterOS clears
+        this the instant a ``check-gateway`` probe fails) and not
+        disabled. ``None`` only if no usable default route exists at all
+        either way. Renamed 2026-08-17 from ``get_dynamic_default_gateway``
+        (dynamic-only, no fallback) after a confirmed fleet-wide production
+        bug: this platform's own Setup Script generator deliberately
+        provisions a *static* default route (``add-default-route=no`` on
+        the dhcp-client, to avoid it fighting the routing-mark/failover
+        mangle rules), so a router set up exactly as intended never has a
+        dynamic default route to find, and every DHCP-mode link on it was
+        permanently misreported as unavailable. Ported from
+        ``app.domains.isp.device_adapters.get_active_default_gateway``."""
         ...
 
     async def get_pppoe_interface_status(

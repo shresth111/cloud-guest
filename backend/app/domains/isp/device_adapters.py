@@ -53,7 +53,7 @@ A real WAN uplink is one of three connection modes (see
 ``constants.IspConnectionMode``), and only ``STATIC`` ever has a fixed
 gateway IP an admin can type in ahead of time:
 
-* ``get_dynamic_default_gateway`` -- for ``DHCP`` links. Reads
+* ``get_active_default_gateway`` -- for ``DHCP`` links. Reads
   ``/ip/route`` (a stable RouterOS *menu*, so the established
   ``.path(*segments)`` + client-side filter form is used here, exactly
   like ``MikroTikQueueAdapter._read_status_sync``'s own precedent --
@@ -67,6 +67,28 @@ gateway IP an admin can type in ahead of time:
   interfaces get renamed on the router independently of this platform)
   ``interface`` field would only add a real failure mode for no real
   benefit.
+
+  **Static-route fallback (added 2026-08-17, fleet-wide production
+  bug):** this platform's own Setup Script generator
+  (``buildRouterSetupScriptChunks`` in cloudguest-foundation's
+  ``RouterDetailTabs.tsx``) deliberately sets ``add-default-route=no``
+  on every ``dhcp-client`` it creates and instead provisions a *static*
+  ``0.0.0.0/0`` route with ``check-gateway=ping`` -- on purpose, to keep
+  RouterOS's own dhcp-client-created dynamic route from fighting this
+  platform's own routing-mark/failover mangle rules. That means a router
+  provisioned exactly as this platform's own generator intends
+  legitimately never has a ``dynamic=="true"`` default route, so
+  ``dynamic=="true"``-only used to make every DHCP-mode link on every
+  such router permanently, incorrectly report unavailable (confirmed
+  fleet-wide in production, router "gurugram" -- see this method's own
+  docstring, and ``wyfy_device_gateway.mikrotik_adapter
+  ._select_default_gateway``, for the full incident writeup). When no
+  dynamic default route exists, this now falls back to any other
+  ``0.0.0.0/0`` route that is currently RouterOS-``active`` (not merely
+  present -- ``active`` goes false the instant a ``check-gateway`` probe
+  fails, so a genuinely down static gateway still correctly reports
+  unavailable) and not administratively disabled. Still never filtered
+  by interface name, for the identical reason above.
 * ``get_pppoe_interface_status`` -- for ``PPPOE`` links. Reads
   ``/interface/pppoe-client`` the same way and reports whether the named
   interface is up (``running == "true"`` and ``disabled != "true"``).
@@ -83,7 +105,7 @@ gateway IP an admin can type in ahead of time:
 
 Per the ``wyfy-device-gateway`` PRD (section 7, Step 3, item 2),
 ``MikroTikIspHealthAdapter``'s methods (``ping``,
-``get_dynamic_default_gateway``, ``get_pppoe_interface_status``,
+``get_active_default_gateway``, ``get_pppoe_interface_status``,
 ``get_interface_traffic_counters``, and ``run_speed_test`` -- the last
 added later, for the on-demand "Run Speed Test" feature, not part of the
 original migration) now call
@@ -91,7 +113,8 @@ original migration) now call
 instead of opening ``librouteros`` directly -- that package is a straight
 port of this module's own four ``_*_sync`` methods (same RouterOS
 commands, same PPPoE stale-interface-name single-candidate fallback,
-same never-filtered-by-interface dynamic-gateway lookup). ``ping`` is the
+same never-filtered-by-interface default-gateway lookup, including its
+dynamic-route-or-active-static-route fallback). ``ping`` is the
 same gateway method ``network_diagnostics/device_adapters.py`` also
 delegates to -- both call sites issue the identical real ``/tool/ping``
 command. Public signatures/return shapes are unchanged; the gateway's
@@ -215,13 +238,21 @@ class BaseIspHealthAdapter(Protocol):
         cumulative result."""
         ...
 
-    async def get_dynamic_default_gateway(
+    async def get_active_default_gateway(
         self, credentials: IspCredentials
     ) -> str | None:
-        """Real, live lookup of the router's own current DHCP-negotiated
-        default gateway -- ``None`` if no dynamic default route currently
-        exists (e.g. the DHCP client hasn't leased yet). See module
-        docstring."""
+        """Real, live lookup of the router's own currently-usable
+        ``0.0.0.0/0`` gateway for a DHCP-mode link. Prefers a genuinely
+        *dynamic* default route (RouterOS's own live DHCP-negotiated
+        gateway); falls back to any other default route that is currently
+        RouterOS-``active`` (not merely present -- a route whose
+        ``check-gateway`` probe has failed is not ``active``, so a real
+        outage still correctly resolves to unavailable) and not
+        administratively disabled -- e.g. the static default route this
+        platform's own Setup Script generator provisions in place of a
+        dhcp-client's own dynamic route (see module docstring). ``None``
+        only if no usable default route exists either way (e.g. the DHCP
+        client hasn't leased yet and no static fallback exists)."""
         ...
 
     async def get_pppoe_interface_status(
@@ -295,19 +326,19 @@ class MikroTikIspHealthAdapter:
             avg_rtt_ms=result.avg_rtt_ms,
         )
 
-    async def get_dynamic_default_gateway(
+    async def get_active_default_gateway(
         self, credentials: IspCredentials
     ) -> str | None:
         creds = self._gateway_credentials(credentials)
         try:
-            return await get_adapter(DeviceVendor.MIKROTIK).get_dynamic_default_gateway(
+            return await get_adapter(DeviceVendor.MIKROTIK).get_active_default_gateway(
                 creds
             )
         except MikroTikConnectionError as exc:
             raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
         except MikroTikDeviceError as exc:
             raise IspDeviceOperationError(
-                "read_dynamic_default_route", exc.detail
+                "read_active_default_route", exc.detail
             ) from exc
 
     async def get_pppoe_interface_status(

@@ -4,9 +4,9 @@ Adds ``isp_links.connection_mode`` (``constants.IspConnectionMode``:
 ``static``/``dhcp``/``pppoe``) -- a real-world gap: a WAN link's gateway
 IP is only ever a fixed, admin-known value for a *static* connection. A
 DHCP-client link's gateway is assigned dynamically by the ISP and can
-change at any time (resolved live from the router's own current dynamic
+change at any time (resolved live from the router's own current active
 default route at health-check time -- see ``device_adapters
-.get_dynamic_default_gateway``); a PPPoE link has no gateway-IP concept
+.get_active_default_gateway``); a PPPoE link has no gateway-IP concept
 at all (health is the PPPoE client interface's own up/down state -- see
 ``device_adapters.get_pppoe_interface_status``). This field drives which
 of the three real health-check target-resolution strategies
