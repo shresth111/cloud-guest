@@ -136,6 +136,13 @@ class GuestRepositoryProtocol(Protocol):
 
     async def count_devices_for_guest(self, guest_id: uuid.UUID) -> int: ...
 
+    async def list_devices_by_ids(
+        self,
+        *,
+        device_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]: ...
+
     # -- sessions ------------------------------------------------------------------
     async def create_session(self, **fields: object) -> GuestSession: ...
 
@@ -317,6 +324,17 @@ class GuestRepositoryProtocol(Protocol):
         page_size: int,
     ) -> tuple[list[GuestLoginHistory], PaginationMeta]: ...
 
+    async def list_login_history_in_range(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[GuestLoginHistory], PaginationMeta]: ...
+
 
 class GuestRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -413,6 +431,42 @@ class GuestRepository:
         plain equality-filtered count, mirroring
         ``count_active_sessions_for_guest``'s identical shape."""
         return await self.devices.count(filters={"guest_id": guest_id})
+
+    async def list_devices_by_ids(
+        self,
+        *,
+        device_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]:
+        """Bulk-resolve ``device_ids`` (e.g. a page of ``GuestSession
+        .device_id`` values) to their :class:`~.models.GuestDevice` rows in
+        one query -- see ``constants.MAX_BULK_DEVICE_LOOKUP_IDS``'s own
+        docstring for why this exists. ``GuestDevice`` carries no
+        ``organization_id`` of its own (see ``models.GuestDevice``'s
+        docstring: a device is owned by a ``Guest``, reassignable across
+        guests), so tenant scoping for an organization-scoped caller
+        requires an explicit join through ``Guest`` -- exactly the same
+        "``GenericRepository`` can't express this" precedent
+        ``list_sessions_in_range`` above already established for its own
+        domain. A platform-level caller (``organization_id is None``, the
+        same convention every other method in this repository uses)
+        deliberately skips the join and the tenant filter."""
+        if not device_ids:
+            return []
+        conditions = [
+            GuestDevice.id.in_(device_ids),
+            GuestDevice.is_deleted.is_(False),
+        ]
+        if organization_id is not None:
+            statement = (
+                select(GuestDevice)
+                .join(Guest, Guest.id == GuestDevice.guest_id)
+                .where(*conditions, Guest.organization_id == organization_id)
+            )
+        else:
+            statement = select(GuestDevice).where(*conditions)
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     # -- sessions ------------------------------------------------------------------
 
@@ -949,6 +1003,48 @@ class GuestRepository:
             sort_by="attempted_at",
             sort_order=SortOrder.DESC,
         )
+
+    async def list_login_history_in_range(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[GuestLoginHistory], PaginationMeta]:
+        """Real, server-side ``[start, end)`` filtering on ``attempted_at``
+        for the Login/Access Attempt Log report -- mirrors
+        ``list_sessions_in_range``'s identical "``GenericRepository`` can't
+        express a range" reasoning, applied to ``GuestLoginHistory``
+        instead of ``GuestSession``."""
+        conditions = [
+            GuestLoginHistory.organization_id == organization_id,
+            GuestLoginHistory.attempted_at >= start,
+            GuestLoginHistory.attempted_at < end,
+            GuestLoginHistory.is_deleted.is_(False),
+        ]
+        if location_id is not None:
+            conditions.append(GuestLoginHistory.location_id == location_id)
+
+        count_statement = (
+            select(func.count()).select_from(GuestLoginHistory).where(*conditions)
+        )
+        total_items = int((await self.session.execute(count_statement)).scalar_one())
+
+        statement = (
+            select(GuestLoginHistory)
+            .where(*conditions)
+            .order_by(GuestLoginHistory.attempted_at.desc(), GuestLoginHistory.id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        result = await self.session.execute(statement)
+        rows = list(result.scalars().all())
+        params = PageParams(page=page, page_size=page_size)
+        meta = PaginationMeta.from_total(params, total_items)
+        return rows, meta
 
     async def get_session_auth_method_aggregate(
         self,

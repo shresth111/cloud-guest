@@ -41,6 +41,7 @@ __all__ = [
     "CrossOrganizationNasAccessError",
     "InvalidNasStatusTransitionError",
     "InvalidAnalyticsDateRangeError",
+    "TooManyDeviceIdsError",
     "ConcurrentSessionLimitExceededError",
     "GuestDeviceLimitExceededError",
     "FairUsagePolicyExceededError",
@@ -254,6 +255,24 @@ class InvalidAnalyticsDateRangeError(GuestError):
         super().__init__(
             "start_date must be before or equal to end_date",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class TooManyDeviceIdsError(GuestError):
+    """Raised by ``GET /guest-devices`` (bulk MAC-address resolution, see
+    ``constants.MAX_BULK_DEVICE_LOOKUP_IDS``'s own docstring) when a caller
+    passes more ``device_ids`` than this endpoint accepts in one request --
+    a real, documented bound rather than a silent truncation to the first
+    ``limit`` ids, which would otherwise leave a report's later rows
+    resolved to no MAC address at all with no indication why."""
+
+    def __init__(self, *, requested: int, limit: int) -> None:
+        self.limit = limit
+        super().__init__(
+            f"Requested {requested} device_ids, which exceeds the maximum "
+            f"of {limit} allowed per request",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={"max_device_ids": limit},
         )
 
 

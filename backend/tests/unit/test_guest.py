@@ -34,6 +34,7 @@ from app.domains.guest.constants import (
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
+    MAX_BULK_DEVICE_LOOKUP_IDS,
     PIN_LOCKOUT_MINUTES,
     PIN_MAX_ATTEMPTS,
     PIN_STALE_AFTER_DAYS,
@@ -73,6 +74,7 @@ from app.domains.guest.exceptions import (
     RadiusNasNotFoundError,
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
+    TooManyDeviceIdsError,
 )
 from app.domains.guest.models import (
     Guest,
@@ -730,6 +732,22 @@ class FakeGuestRepository:
     async def count_devices_for_guest(self, guest_id: uuid.UUID) -> int:
         return sum(1 for d in self.devices.values() if d.guest_id == guest_id)
 
+    async def list_devices_by_ids(
+        self,
+        *,
+        device_ids,
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]:
+        items = [d for d in self.devices.values() if d.id in set(device_ids)]
+        if organization_id is not None:
+            items = [
+                d
+                for d in items
+                if d.guest_id in self.guests
+                and self.guests[d.guest_id].organization_id == organization_id
+            ]
+        return items
+
     async def update_device(
         self, device: GuestDevice, data: dict[str, object]
     ) -> GuestDevice:
@@ -1145,6 +1163,28 @@ class FakeGuestRepository:
             values = [v for v in values if v.location_id == location_id]
         if guest_id is not None:
             values = [v for v in values if v.guest_id == guest_id]
+        values.sort(key=lambda v: v.attempted_at, reverse=True)
+        params = PageParams(page=page, page_size=page_size)
+        paged = values[params.offset : params.offset + params.page_size]
+        return paged, PaginationMeta.from_total(params, len(values))
+
+    async def list_login_history_in_range(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        start: datetime,
+        end: datetime,
+        page: int,
+        page_size: int,
+    ):
+        values = [
+            v
+            for v in self.login_history
+            if v.organization_id == organization_id and start <= v.attempted_at < end
+        ]
+        if location_id is not None:
+            values = [v for v in values if v.location_id == location_id]
         values.sort(key=lambda v: v.attempted_at, reverse=True)
         params = PageParams(page=page, page_size=page_size)
         paged = values[params.offset : params.offset + params.page_size]
@@ -2758,6 +2798,103 @@ class TestDeviceHandling:
         )
         assert result.device is None
         assert result.session.device_id is None
+
+
+# ============================================================================
+# Bulk device lookup (Network Activity Log v1) -- GET /guest-devices's own
+# data source, resolving GuestSession.device_id to a MAC address in bulk.
+# ============================================================================
+
+
+class TestBulkDeviceLookup:
+    async def _login(self, fx: Fixture, *, identifier: str, device_mac: str):
+        return await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac=device_mac,
+        )
+
+    async def test_resolves_multiple_devices_by_id_in_one_call(self) -> None:
+        fx = make_fixture()
+        first = await self._login(
+            fx, identifier="+15559990001", device_mac="AA:AA:AA:AA:AA:01"
+        )
+        second = await self._login(
+            fx, identifier="+15559990002", device_mac="AA:AA:AA:AA:AA:02"
+        )
+
+        devices = await fx.guest_service.list_devices_by_ids(
+            device_ids=[first.device.id, second.device.id],
+            requesting_organization_id=fx.organization_id,
+        )
+
+        assert {d.id for d in devices} == {first.device.id, second.device.id}
+        assert {d.mac_address for d in devices} == {
+            "AA:AA:AA:AA:AA:01",
+            "AA:AA:AA:AA:AA:02",
+        }
+
+    async def test_unknown_id_is_silently_absent_not_an_error(self) -> None:
+        fx = make_fixture()
+        result = await self._login(
+            fx, identifier="+15559990003", device_mac="AA:AA:AA:AA:AA:03"
+        )
+
+        devices = await fx.guest_service.list_devices_by_ids(
+            device_ids=[result.device.id, uuid.uuid4()],
+            requesting_organization_id=fx.organization_id,
+        )
+
+        assert [d.id for d in devices] == [result.device.id]
+
+    async def test_scopes_to_requesting_organization(self) -> None:
+        """A device belonging to a guest in a different organization must
+        never resolve for a caller scoped to this organization -- the same
+        tenant-isolation discipline every other list endpoint in this
+        module enforces."""
+        fx = make_fixture()
+        result = await self._login(
+            fx, identifier="+15559990004", device_mac="AA:AA:AA:AA:AA:04"
+        )
+        other_org = uuid.uuid4()
+
+        devices = await fx.guest_service.list_devices_by_ids(
+            device_ids=[result.device.id],
+            requesting_organization_id=other_org,
+        )
+        assert devices == []
+
+    async def test_platform_level_caller_sees_across_organizations(self) -> None:
+        fx = make_fixture()
+        result = await self._login(
+            fx, identifier="+15559990005", device_mac="AA:AA:AA:AA:AA:05"
+        )
+
+        devices = await fx.guest_service.list_devices_by_ids(
+            device_ids=[result.device.id],
+            requesting_organization_id=None,
+        )
+        assert [d.id for d in devices] == [result.device.id]
+
+    async def test_exceeding_max_ids_raises(self) -> None:
+        fx = make_fixture()
+        too_many = [uuid.uuid4() for _ in range(MAX_BULK_DEVICE_LOOKUP_IDS + 1)]
+        with pytest.raises(TooManyDeviceIdsError):
+            await fx.guest_service.list_devices_by_ids(
+                device_ids=too_many, requesting_organization_id=fx.organization_id
+            )
+
+    async def test_exactly_max_ids_does_not_raise(self) -> None:
+        fx = make_fixture()
+        exactly_max = [uuid.uuid4() for _ in range(MAX_BULK_DEVICE_LOOKUP_IDS)]
+        devices = await fx.guest_service.list_devices_by_ids(
+            device_ids=exactly_max, requesting_organization_id=fx.organization_id
+        )
+        assert devices == []
 
 
 # ============================================================================
@@ -5675,6 +5812,202 @@ class TestAnalytics:
         assert summary.returning_guests == 0
         assert summary.average_session_duration_seconds is None
         assert summary.total_bandwidth_bytes == 0
+
+
+# ============================================================================
+# GuestLoginHistory listing (Network Activity Log v1) -- GET
+# /guest-login-history's own data source, backing the Login/Access Attempt
+# Log report.
+# ============================================================================
+
+
+def _login_history_entry(
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID | None = None,
+    guest_id: uuid.UUID | None = None,
+    identifier: str = "+15550000000",
+    auth_method: str = GuestAuthMethod.OTP_SMS.value,
+    success: bool = True,
+    failure_reason: str | None = None,
+    attempted_at: datetime | None = None,
+    ip_address: str | None = "10.0.0.1",
+) -> GuestLoginHistory:
+    return GuestLoginHistory(
+        **_base_fields(
+            organization_id=organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+            identifier=identifier,
+            auth_method=auth_method,
+            success=success,
+            failure_reason=failure_reason,
+            attempted_at=attempted_at or _now(),
+            ip_address=ip_address,
+        )
+    )
+
+
+class TestGuestLoginHistoryListing:
+    async def test_paginates_newest_first(self) -> None:
+        fx = make_fixture()
+        base = _now()
+        for i in range(5):
+            fx.repository.login_history.append(
+                _login_history_entry(
+                    organization_id=fx.organization_id,
+                    identifier=f"+1555000{i:04d}",
+                    attempted_at=base - timedelta(minutes=i),
+                )
+            )
+
+        page1, meta1 = await fx.guest_service.list_login_history(
+            requesting_organization_id=fx.organization_id, page=1, page_size=2
+        )
+        page2, meta2 = await fx.guest_service.list_login_history(
+            requesting_organization_id=fx.organization_id, page=2, page_size=2
+        )
+
+        assert meta1.total_items == 5
+        assert meta1.total_pages == 3
+        assert len(page1) == 2
+        # newest (smallest offset from `base`) first
+        assert page1[0].attempted_at > page1[1].attempted_at
+        assert page1[0].attempted_at > page2[0].attempted_at
+
+    async def test_filters_by_location(self) -> None:
+        fx = make_fixture()
+        other_location = uuid.uuid4()
+        fx.repository.login_history.extend(
+            [
+                _login_history_entry(
+                    organization_id=fx.organization_id, location_id=fx.location_id
+                ),
+                _login_history_entry(
+                    organization_id=fx.organization_id, location_id=other_location
+                ),
+            ]
+        )
+
+        items, meta = await fx.guest_service.list_login_history(
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+        )
+        assert meta.total_items == 1
+        assert items[0].location_id == fx.location_id
+
+    async def test_filters_by_guest_id(self) -> None:
+        fx = make_fixture()
+        guest_id = uuid.uuid4()
+        fx.repository.login_history.extend(
+            [
+                _login_history_entry(
+                    organization_id=fx.organization_id, guest_id=guest_id
+                ),
+                _login_history_entry(
+                    organization_id=fx.organization_id, guest_id=uuid.uuid4()
+                ),
+            ]
+        )
+
+        items, meta = await fx.guest_service.list_login_history(
+            requesting_organization_id=fx.organization_id, guest_id=guest_id
+        )
+        assert meta.total_items == 1
+        assert items[0].guest_id == guest_id
+
+    async def test_scoped_to_requesting_organization(self) -> None:
+        fx = make_fixture()
+        other_org = uuid.uuid4()
+        fx.repository.login_history.extend(
+            [
+                _login_history_entry(organization_id=fx.organization_id),
+                _login_history_entry(organization_id=other_org),
+            ]
+        )
+
+        items, meta = await fx.guest_service.list_login_history(
+            requesting_organization_id=fx.organization_id
+        )
+        assert meta.total_items == 1
+        assert items[0].organization_id == fx.organization_id
+
+    async def test_platform_level_caller_sees_every_organization(self) -> None:
+        fx = make_fixture()
+        other_org = uuid.uuid4()
+        fx.repository.login_history.extend(
+            [
+                _login_history_entry(organization_id=fx.organization_id),
+                _login_history_entry(organization_id=other_org),
+            ]
+        )
+
+        items, meta = await fx.guest_service.list_login_history(
+            requesting_organization_id=None
+        )
+        assert meta.total_items == 2
+
+    async def test_in_range_excludes_entries_outside_start_end(self) -> None:
+        fx = make_fixture()
+        now = _now()
+        before = _login_history_entry(
+            organization_id=fx.organization_id, attempted_at=now - timedelta(days=2)
+        )
+        inside = _login_history_entry(
+            organization_id=fx.organization_id, attempted_at=now - timedelta(hours=1)
+        )
+        after = _login_history_entry(
+            organization_id=fx.organization_id, attempted_at=now + timedelta(days=1)
+        )
+        fx.repository.login_history.extend([before, inside, after])
+
+        items, meta = await fx.guest_service.list_login_history_in_range(
+            organization_id=fx.organization_id,
+            start=now - timedelta(days=1),
+            end=now,
+        )
+        assert meta.total_items == 1
+        assert items[0].id == inside.id
+
+    async def test_in_range_end_is_exclusive(self) -> None:
+        fx = make_fixture()
+        now = _now()
+        boundary = _login_history_entry(
+            organization_id=fx.organization_id, attempted_at=now
+        )
+        fx.repository.login_history.append(boundary)
+
+        items, meta = await fx.guest_service.list_login_history_in_range(
+            organization_id=fx.organization_id,
+            start=now - timedelta(hours=1),
+            end=now,
+        )
+        assert meta.total_items == 0
+
+    async def test_in_range_filters_by_location(self) -> None:
+        fx = make_fixture()
+        now = _now()
+        other_location = uuid.uuid4()
+        matching = _login_history_entry(
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            attempted_at=now,
+        )
+        other = _login_history_entry(
+            organization_id=fx.organization_id,
+            location_id=other_location,
+            attempted_at=now,
+        )
+        fx.repository.login_history.extend([matching, other])
+
+        items, meta = await fx.guest_service.list_login_history_in_range(
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            start=now - timedelta(hours=1),
+            end=now + timedelta(hours=1),
+        )
+        assert meta.total_items == 1
+        assert items[0].id == matching.id
 
 
 # ============================================================================
