@@ -1,8 +1,5 @@
 from fastapi import APIRouter
 
-# TEMP DIAGNOSTIC — remove after incident resolved (see
-# app/api/v1/diagnostics/routes.py's own module docstring).
-from app.api.v1.diagnostics.routes import router as diagnostics_router
 from app.api.v1.health.routes import router as health_router
 from app.domains.admin_logs.router import router as admin_logs_router
 from app.domains.agent_permissions.router import router as agent_permissions_router
@@ -73,8 +70,6 @@ from app.domains.workspace.router import router as workspace_router
 
 api_v1_router = APIRouter()
 api_v1_router.include_router(health_router, prefix="/health", tags=["Health"])
-# TEMP DIAGNOSTIC — remove after incident resolved.
-api_v1_router.include_router(diagnostics_router)
 api_v1_router.include_router(auth_router)
 api_v1_router.include_router(rbac_router)
 api_v1_router.include_router(organization_router)
