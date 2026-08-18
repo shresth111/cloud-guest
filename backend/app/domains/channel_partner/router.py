@@ -153,4 +153,36 @@ async def get_channel_partner(
     )
 
 
+@router.post(
+    "/{channel_partner_id}/revoke",
+    response_model=ApiResponse[ChannelPartnerResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("channel_partners.manage"))],
+)
+async def revoke_channel_partner(
+    request: Request,
+    channel_partner_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    service: ChannelPartnerService = Depends(get_channel_partner_service),
+):
+    """Deactivates a channel partner -- ``POST .../revoke`` matches this
+    codebase's own established status-transition shape
+    (``app.domains.organization.router``'s ``.../suspend``/``.../activate``,
+    ``app.domains.voucher.router``'s ``.../revoke``), gated behind
+    ``channel_partners.manage`` (a mutation, not the ``.read`` permission
+    listing/viewing a partner only requires). Idempotent -- see
+    ``ChannelPartnerService.revoke_partner``'s own docstring -- so revoking
+    an already-inactive partner is a ``200`` no-op, never an error."""
+    partner = await service.revoke_partner(
+        channel_partner_id, actor_user_id=uuid.UUID(user.id)
+    )
+    response_payload = _build_partner_response(partner)
+    return build_response(
+        success=True,
+        message=f"Channel partner '{partner.name}' revoked",
+        data=response_payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
 __all__ = ["router"]

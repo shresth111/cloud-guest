@@ -29,6 +29,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 
 from app.core.email_layout import (
     esc,
@@ -46,6 +47,7 @@ from app.domains.otp.service import (
     LoggingSmsProvider,
     SmsProviderProtocol,
 )
+from app.domains.rbac.enums import AuditAction
 
 from .constants import CHANNEL_PARTNER_PRODUCT_NAME, ChannelPartnerStatus
 from .exceptions import ChannelPartnerNotFoundError, DuplicateGstNumberError
@@ -62,6 +64,17 @@ WELCOME_SMS_TEMPLATE = (
 )
 
 
+class AuditLogWriter(Protocol):
+    """The minimal surface this service needs to write into RBAC's shared
+    ``audit_log_entries`` table, without depending on the rest of
+    ``RBACRepositoryProtocol`` -- mirrors
+    ``app.domains.organization.service.AuditLogWriter``/
+    ``app.domains.voucher.service.AuditLogWriter``'s identical narrow
+    protocol shape exactly."""
+
+    async def create_audit_log_entry(self, **fields: object) -> object: ...
+
+
 @dataclass
 class ChannelPartnerListResult:
     items: list[ChannelPartner]
@@ -75,10 +88,12 @@ class ChannelPartnerService:
         *,
         sms_provider: SmsProviderProtocol | None = None,
         email_provider: EmailProviderProtocol | None = None,
+        audit_writer: AuditLogWriter | None = None,
     ) -> None:
         self.repository = repository
         self.sms_provider = sms_provider
         self.email_provider = email_provider
+        self.audit_writer = audit_writer
 
     # -- onboard (create + send) ---------------------------------------------
 
@@ -244,10 +259,69 @@ class ChannelPartnerService:
         )
         return ChannelPartnerListResult(items=items, meta=meta)
 
+    # -- revoke (Master console) ----------------------------------------------
+
+    async def revoke_partner(
+        self, channel_partner_id: uuid.UUID, *, actor_user_id: uuid.UUID | None
+    ) -> ChannelPartner:
+        """Transitions an ``ACTIVE`` partner to ``INACTIVE``.
+
+        Deliberately idempotent: revoking a partner that is already
+        ``INACTIVE`` is a true no-op -- returns the row unchanged, with no
+        second repository write and no duplicate audit entry -- rather than
+        raising the way ``VoucherService.revoke_batch``'s multi-state
+        workflow does for a repeat transition. A channel partner's status is
+        a plain two-state toggle (see ``models.py``'s own module
+        docstring), not a workflow with distinct terminal states to
+        protect, so a repeat "revoke" from an operator (e.g. a retried
+        click) should read as "yes, it's off" rather than an error."""
+        partner = await self.get_partner(channel_partner_id)
+        if partner.status == ChannelPartnerStatus.INACTIVE.value:
+            return partner
+
+        updated = await self.repository.update_partner(
+            partner,
+            {
+                "status": ChannelPartnerStatus.INACTIVE.value,
+                "updated_by": actor_user_id,
+            },
+        )
+        logger.info(
+            "channel_partner_revoked", extra={"channel_partner_id": str(updated.id)}
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.CHANNEL_PARTNER_REVOKED,
+            updated,
+            f"Channel partner '{updated.name}' revoked",
+        )
+        return updated
+
+    async def _audit(
+        self,
+        actor_user_id: uuid.UUID | None,
+        action: AuditAction,
+        partner: ChannelPartner,
+        description: str,
+    ) -> None:
+        if self.audit_writer is None:
+            return
+        await self.audit_writer.create_audit_log_entry(
+            actor_user_id=actor_user_id,
+            action=action.value,
+            entity_type="channel_partner",
+            entity_id=partner.id,
+            description=description,
+            event_metadata={},
+            organization_id=None,
+            location_id=None,
+        )
+
 
 __all__ = [
     "ChannelPartnerService",
     "ChannelPartnerListResult",
+    "AuditLogWriter",
     "SmsProviderProtocol",
     "EmailProviderProtocol",
 ]

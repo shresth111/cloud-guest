@@ -901,6 +901,18 @@ class AuditAction(StrEnum):
     # app.domains.support_tickets.service.TicketService.add_reply.
     SUPPORT_TICKET_REPLY_ADDED = "support_ticket_reply_added"
 
+    # Channel Partner domain events -- written through this same table by
+    # ``app.domains.channel_partner.service.ChannelPartnerService`` via the
+    # same narrow ``AuditLogWriter`` protocol shape
+    # ``OrganizationService``/``VoucherService`` use (see
+    # ``AuditLogEntry``'s "other domains could plausibly reuse it" design).
+    # Onboarding itself is not audited (mirrors ``QuotationService``'s own
+    # "creation is reconstructable from the row's own created_at/created_by"
+    # judgment call) -- only the later, destructive-ish status transition
+    # is, the same "the mutation an operator can undo/needs a trail for" bar
+    # ``ORGANIZATION_SUSPENDED``/``VOUCHER_BATCH_REVOKED`` are held to.
+    CHANNEL_PARTNER_REVOKED = "channel_partner_revoked"
+
 
 # Actions that must never surface on an organization-scoped audit query --
 # concretely, the customer dashboard's own Admin Logs -> "Account Activity"

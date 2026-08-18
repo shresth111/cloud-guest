@@ -20,6 +20,8 @@ from app.domains.otp.service import (
     get_configured_email_provider,
     get_configured_sms_provider,
 )
+from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .repository import ChannelPartnerRepository, ChannelPartnerRepositoryProtocol
 from .service import ChannelPartnerService
@@ -60,11 +62,13 @@ def get_channel_partner_service(
         get_channel_partner_repository
     ),
     settings: Settings = Depends(get_settings),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ) -> ChannelPartnerService:
     return ChannelPartnerService(
         repository,
         sms_provider=_resolve_sms_provider(settings),
         email_provider=_resolve_email_provider(settings),
+        audit_writer=audit_repository,
     )
 
 
