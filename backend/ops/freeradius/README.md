@@ -68,10 +68,12 @@ directly on the VM (not containerized, since they need `docker exec` into
 `deploy-api-1` for the Fernet key + DB session the app already has):
 
 - `gen_clients_conf.py` → run inside `deploy-api-1`, queries every
-  `is_deleted=false, status='active'` `radius_nas_clients` row and prints a
-  `client { ... }` block per NAS, `nas_identifier` as `shortname`. Currently
-  scopes every client to `ipaddr = 0.0.0.0/0` (there is exactly one real NAS
-  in production as of this writing -- see the honest caveat below).
+  `is_deleted=false, status='active'` `radius_nas_clients` row (LEFT JOINed
+  against `wireguard_peers` by `router_id`) and prints a `client { ... }`
+  block per NAS, `nas_identifier` as `shortname`, `ipaddr` scoped to that
+  router's real WireGuard tunnel IP as a `/32` (falls back to `0.0.0.0/0`
+  only if the NAS has no tunnel peer row yet -- logged to stderr as a
+  fallback count).
 - `sync_radius_clients.sh` (installed at `/opt/wyfy/sync_radius_clients.sh`
   on the VM) → runs the above via `docker cp` + `docker exec`, diffs the
   result against the live `clients.wyfy.conf`, and only overwrites +
@@ -81,16 +83,26 @@ directly on the VM (not containerized, since they need `docker exec` into
   registered or rotated NAS client is picked up within a minute with zero
   manual `clients.conf` edits, ever.
 
-**Known, honest scaling gap**: every client block currently accepts from
-`0.0.0.0/0` rather than scoping to that NAS's actual router IP -- fine with
-one real NAS (the shared secret itself is still the real auth boundary),
-but wrong once there are two+ NAS clients that could otherwise
-authenticate against each other's secrets from an unexpected source. Real
-fix: track each router's real source IP (WireGuard tunnel address or
-public IP, whichever this NAS's RADIUS traffic actually originates from)
-on `RadiusNasClient` and emit `ipaddr = <that>` instead of `0.0.0.0/0`
-per-client in `gen_clients_conf.py` -- not done here for lack of that
-column existing yet on the model.
+**2026-08-18 incident, fixed**: every client block used to be emitted with
+a blanket `ipaddr = 0.0.0.0/0`, called out here on 2026-08-10 as "fine with
+one real NAS... wrong once there are two+." That became a real outage once
+the fleet grew past one NAS (2026-08-15): FreeRADIUS indexes clients by
+IP/CIDR, so only the first-parsed `0.0.0.0/0` stanza in a given
+`clients.wyfy.conf` run ever loads -- every other NAS, regardless of its
+own shortname, was rejected as `Failed to add duplicate client` (visible in
+`journalctl -u freeradius`, e.g. `cg-5d3a509e`, `cg-549153bd`,
+`cg-c61ae7af`, `cg-856aa5ca`). Those routers had zero working RADIUS auth
+the entire time. Root cause was purely in this generator, **not** a
+duplicate-row bug: `radius_nas_clients.router_id`/`nas_identifier` have
+had partial-unique DB indexes since
+`0061_fix_radius_nas_soft_delete_uniqueness`, and
+`RadiusService.register_nas` independently raises
+`RadiusNasAlreadyRegisteredError` on a second registration attempt for the
+same router -- confirmed live on cloudguest-vm's actual DB while
+investigating: no router ever had more than one non-deleted
+`radius_nas_clients` row. Fixed by scoping each client's `ipaddr` to that
+router's own `wireguard_peers.tunnel_ip_address` (`/32`) instead of the
+shared catch-all -- see `gen_clients_conf.py`'s module docstring.
 
 ## Manual verification commands (matches what was actually run 2026-08-10)
 

@@ -68,6 +68,7 @@ from app.domains.guest.exceptions import (
     InvalidSessionStatusTransitionError,
     MacAddressNotAuthorizedError,
     NoReconnectableSessionError,
+    RadiusNasAlreadyRegisteredError,
     RadiusNasAuthenticationError,
     RadiusNasNotFoundError,
     RouterNotEligibleForGuestSessionError,
@@ -917,16 +918,24 @@ class FakeGuestRepository:
     async def get_nas_client_by_identifier(
         self, nas_identifier: str
     ) -> RadiusNasClient | None:
+        # Mirrors the real GenericRepository.get_all's include_deleted=False
+        # default (app.database.repositories.generic.GenericRepository
+        # .get_all) -- a soft-deleted row must not shadow this lookup, the
+        # same "correctly is_deleted-scoped" behavior RadiusService
+        # .delete_nas's own docstring documents relying on for re-issuing a
+        # NAS identity after deletion.
         for client in self.nas_clients.values():
-            if client.nas_identifier == nas_identifier:
+            if client.nas_identifier == nas_identifier and not client.is_deleted:
                 return client
         return None
 
     async def get_nas_client_by_router(
         self, router_id: uuid.UUID
     ) -> RadiusNasClient | None:
+        # See get_nas_client_by_identifier's identical is_deleted-scoping
+        # comment just above.
         for client in self.nas_clients.values():
-            if client.router_id == router_id:
+            if client.router_id == router_id and not client.is_deleted:
                 return client
         return None
 
@@ -5185,6 +5194,62 @@ class TestNasLifecycle:
             result.nas_client.id, requesting_organization_id=fx.organization_id
         )
         assert fetched.id == result.nas_client.id
+
+    async def test_reregistering_same_router_raises_not_a_new_row(self) -> None:
+        """Regression test for the 2026-08-18 ``clients.wyfy.conf``
+        "Failed to add duplicate client" incident's originally-suspected
+        (and ruled-out) cause: a router re-provisioning -- e.g. after its
+        WireGuard tunnel IP changes -- must never be able to silently
+        create a *second* ``RadiusNasClient`` row for the same
+        ``router_id``. Live investigation on cloudguest-vm confirmed this
+        guard already holds in production (no router ever had more than
+        one non-deleted NAS row; the real bug was
+        ``gen_clients_conf.py``'s ``ipaddr`` scoping -- see
+        ``ops/freeradius/gen_clients_conf.py``'s module docstring and
+        ``TestGenClientsConf`` in this file's own sibling test). This test
+        pins that guard so it can never silently regress: calling
+        ``register_nas`` a second time for a router that already has an
+        active NAS client -- without first deleting it -- must raise
+        ``RadiusNasAlreadyRegisteredError`` and must not create a second
+        row (only one row should ever exist for this router afterward)."""
+        fx = make_fixture()
+        first = await self._register(fx, nas_identifier="cg-first")
+        with pytest.raises(RadiusNasAlreadyRegisteredError):
+            await self._register(fx, nas_identifier="cg-second")
+
+        all_for_router, _ = await fx.radius_service.list_nas_clients(
+            requesting_organization_id=fx.organization_id, router_id=fx.router.id
+        )
+        assert len(all_for_router) == 1
+        assert all_for_router[0].id == first.nas_client.id
+        assert all_for_router[0].nas_identifier == "cg-first"
+
+    async def test_reregistering_after_delete_updates_not_duplicates(self) -> None:
+        """The one legitimate way to get a *new* NAS row for the same
+        router -- deleting the old one first (e.g. an admin decommissioning
+        and re-issuing a NAS identity) -- must still leave exactly one
+        *active* row behind, never two rows both eligible for
+        ``gen_clients_conf.py``'s ``is_deleted=false AND status='active'``
+        query at once (that's exactly the shape of duplicate that would
+        make FreeRADIUS's ``client { }`` loader collide, if it ever
+        happened)."""
+        fx = make_fixture()
+        first = await self._register(fx, nas_identifier="cg-first")
+        await fx.radius_service.delete_nas(
+            nas_id=first.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+        second = await self._register(fx, nas_identifier="cg-second")
+        assert second.nas_client.id != first.nas_client.id
+
+        active, _ = await fx.radius_service.list_nas_clients(
+            requesting_organization_id=fx.organization_id,
+            router_id=fx.router.id,
+            status=NasStatus.ACTIVE,
+        )
+        assert len(active) == 1
+        assert active[0].id == second.nas_client.id
 
     async def test_get_unknown_nas_raises(self) -> None:
         fx = make_fixture()
