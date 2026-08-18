@@ -13,6 +13,7 @@ from app.domains.branding.router import router as branding_router
 from app.domains.campaigns.router import guest_router as campaigns_guest_router
 from app.domains.campaigns.router import router as campaigns_router
 from app.domains.captive_portal.router import router as captive_portal_router
+from app.domains.channel_partner.router import router as channel_partner_router
 from app.domains.connected_devices.router import router as connected_devices_router
 from app.domains.content_filtering.router import router as content_filtering_router
 from app.domains.controller_logs.router import router as controller_logs_router
@@ -134,3 +135,4 @@ api_v1_router.include_router(demo_request_router)
 api_v1_router.include_router(quotation_router)
 api_v1_router.include_router(assistant_router)
 api_v1_router.include_router(readiness_router)
+api_v1_router.include_router(channel_partner_router)

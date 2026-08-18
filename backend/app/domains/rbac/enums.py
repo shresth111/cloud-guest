@@ -134,6 +134,13 @@ class PermissionModule(StrEnum):
     # write path, mirroring NETWORK_DIAGNOSTICS's own "read + a real
     # device-facing action" shape.
     READINESS = "readiness"
+    # Channel Partner onboarding: a Master console operator onboards a new
+    # channel/reseller partner (name/phone/address/city/GSTIN) and the
+    # system sends them a real welcome message in the same action. GLOBAL-
+    # only, identical "belongs to no organization" profile as QUOTATIONS/
+    # DEMO_REQUESTS above -- a channel partner is Wyfy Guest's own business
+    # relationship, never scoped to a customer Organization.
+    CHANNEL_PARTNERS = "channel_partners"
 
 
 class OverrideEffect(StrEnum):

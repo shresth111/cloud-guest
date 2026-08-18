@@ -440,6 +440,12 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # CREATE/UPDATE/DELETE -- RouterChecklistItem rows are never directly
     # authored, only computed or confirmed.
     PermissionModule.READINESS: (_A.READ, _A.MANAGE),
+    # Channel Partners: CREATE covers the one-shot "onboard + send welcome
+    # message" action (no separate draft step, same reasoning QUOTATIONS'
+    # own comment gives), READ covers list/get, MANAGE is the catch-all for
+    # the future deactivate/reactivate action (see models.py's `status`
+    # column comment -- no API surface for it yet).
+    PermissionModule.CHANNEL_PARTNERS: (_A.CREATE, _A.READ, _A.MANAGE),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -500,6 +506,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.CONTENT_FILTERING: "Content Filtering",
     PermissionModule.QUOTATIONS: "Quotations",
     PermissionModule.READINESS: "Router Readiness Checklist",
+    PermissionModule.CHANNEL_PARTNERS: "Channel Partners",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -620,6 +627,10 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # module docstring) -- identical ScopeType.GLOBAL reasoning as
     # PermissionModule.DEMO_REQUESTS's own entry above.
     PermissionModule.QUOTATIONS: ScopeType.GLOBAL,
+    # A channel partner belongs to no organization/location/router at all --
+    # identical ScopeType.GLOBAL reasoning as PermissionModule.QUOTATIONS'
+    # own entry above.
+    PermissionModule.CHANNEL_PARTNERS: ScopeType.GLOBAL,
 }
 
 
@@ -802,6 +813,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DEMO_REQUESTS: _L.NONE,
             # QUOTATIONS is GLOBAL-only -- identical reasoning.
             _M.QUOTATIONS: _L.NONE,
+            # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
+            _M.CHANNEL_PARTNERS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -828,6 +841,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DEMO_REQUESTS: _L.NONE,
             # QUOTATIONS is GLOBAL-only -- identical reasoning.
             _M.QUOTATIONS: _L.NONE,
+            # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
+            _M.CHANNEL_PARTNERS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -868,6 +883,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DEMO_REQUESTS: _L.NONE,
             # QUOTATIONS is GLOBAL-only -- identical reasoning.
             _M.QUOTATIONS: _L.NONE,
+            # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
+            _M.CHANNEL_PARTNERS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -896,6 +913,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DEMO_REQUESTS: _L.NONE,
             # QUOTATIONS is GLOBAL-only -- identical reasoning.
             _M.QUOTATIONS: _L.NONE,
+            # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
+            _M.CHANNEL_PARTNERS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1110,11 +1129,13 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         default_level=_L.READ,
         # SYSTEM_SETTINGS is GLOBAL-only (see MODULE_NARROWEST_SCOPE) -- an
         # ORGANIZATION-scoped role can never hold any of its permissions.
-        # DEMO_REQUESTS/QUOTATIONS are the identical case (also GLOBAL-only).
+        # DEMO_REQUESTS/QUOTATIONS/CHANNEL_PARTNERS are the identical case
+        # (also GLOBAL-only).
         overrides={
             _M.SYSTEM_SETTINGS: _L.NONE,
             _M.DEMO_REQUESTS: _L.NONE,
             _M.QUOTATIONS: _L.NONE,
+            _M.CHANNEL_PARTNERS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1134,6 +1155,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.DEMO_REQUESTS: _L.NONE,
             # QUOTATIONS is GLOBAL-only -- identical reasoning.
             _M.QUOTATIONS: _L.NONE,
+            # CHANNEL_PARTNERS is GLOBAL-only -- identical reasoning.
+            _M.CHANNEL_PARTNERS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
