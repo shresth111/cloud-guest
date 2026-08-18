@@ -80,6 +80,18 @@ disconnect event history analytics/audit needs to reconstruct. This mirrors
 convention and ``OtpRequest.is_consumed``'s one-way state -- see
 ``constants.GUEST_SESSION_STATUS_TRANSITIONS``.
 
+**Not the same thing as deduplicating a still-``ACTIVE`` row.** Every guest
+self-service login method (``login_via_otp``/``_voucher``/``_password``/
+``_pin``/``_mac_whitelist``) calls ``GuestService._reuse_or_create_session``,
+which returns an already-``ACTIVE`` session for the same guest+router+device
+in place of inserting a new one -- see that method's own docstring for the
+real production incident (18 rows for one guest across ~6.5 hours) this
+closes. That is not "reusing a row across two connection intervals": the
+interval never closed in the first place (``status`` never left
+``ACTIVE``), so there is only ever one real interval being described,
+whether one login touched it or five. A session that *has* moved to a
+terminal status is still never revived by this or any other path.
+
 ## ``GuestLoginHistory.guest_id`` nullability
 
 A failed login attempt (wrong OTP code, expired/revoked voucher, blocked

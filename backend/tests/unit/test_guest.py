@@ -1307,6 +1307,11 @@ class TestOtpLogin:
         assert fx.audit_writer.entries == []
 
     async def test_returning_guest_bumps_visit_count(self) -> None:
+        """A genuinely new visit -- the prior session has already ended --
+        bumps ``total_visit_count`` and creates its own new session row.
+        See ``test_relogin_while_still_active_reuses_the_session`` for the
+        (much more common in practice) case where the prior session is
+        still ``ACTIVE``."""
         fx = make_fixture()
         first = await fx.guest_service.login_via_otp(
             identifier="+15551234567",
@@ -1317,6 +1322,7 @@ class TestOtpLogin:
             router_id=fx.router.id,
         )
         assert first.is_new_guest is True
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
         second = await fx.guest_service.login_via_otp(
             identifier="+15551234567",
             code="GOOD",
@@ -1328,6 +1334,71 @@ class TestOtpLogin:
         assert second.is_new_guest is False
         assert second.guest.id == first.guest.id
         assert second.guest.total_visit_count == 2
+        assert second.session.id != first.session.id
+
+    async def test_relogin_while_still_active_reuses_the_session(self) -> None:
+        """Real production gap this closes (see
+        ``_find_reusable_active_session``'s own docstring): a second
+        ``login_via_otp`` for the same guest+router+device while the first
+        session is still ``ACTIVE`` -- a remounting captive-portal tab
+        re-POSTing, two open tabs, a guest double-tapping "Verify" -- must
+        reuse that same row instead of inserting a fully redundant
+        duplicate ``ACTIVE`` ``GuestSession``. Requires a real device_mac
+        on both calls -- see that method's own "requires a real device_id
+        match" write-up for why an unfingerprinted login never reuses."""
+        fx = make_fixture()
+        first = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:FF",
+        )
+        second = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:FF",
+        )
+        assert second.session.id == first.session.id
+        assert second.session.status == GuestSessionStatus.ACTIVE.value
+        # No duplicate row, and no double-counted visit.
+        assert len(fx.repository.sessions) == 1
+        assert second.guest.total_visit_count == 1
+
+    async def test_relogin_from_a_second_device_creates_its_own_session(self) -> None:
+        """A guest with two concurrent devices on the same router (a phone
+        already connected, now also logging a laptop in) must get two real,
+        independent sessions -- the device-scoped reuse check must never
+        collapse genuinely distinct devices into one row."""
+        fx = make_fixture()
+        phone = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:01",
+        )
+        laptop = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:02",
+        )
+        assert laptop.session.id != phone.session.id
+        assert len(fx.repository.sessions) == 2
+        assert phone.session.status == GuestSessionStatus.ACTIVE.value
+        assert laptop.session.status == GuestSessionStatus.ACTIVE.value
 
     async def test_disabled_method_for_location_rejected(self) -> None:
         fx = make_fixture(otp_sms_enabled=False)
