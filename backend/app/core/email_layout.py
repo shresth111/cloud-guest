@@ -270,6 +270,36 @@ def divider() -> str:
     return f'<hr style="border:none;border-top:1px solid {BORDER};margin:24px 0;">'
 
 
+def welcome_header_illustration() -> str:
+    """A small branded header image for the channel-partner welcome email
+    -- a hosted PNG (2x/retina export), never an inline SVG or ``data:``
+    URI (see module docstring's Outlook constraint: Outlook's Word
+    rendering engine doesn't support ``data:`` image URIs at all, which is
+    exactly why this shell's own logotype is HTML/CSS, never an image --
+    a normal ``<img src="https://...">`` pointing at a real hosted URL is
+    unaffected by that constraint and renders fine everywhere). Degrades to
+    nothing (not a broken-image icon) if the client blocks remote images --
+    ``alt`` text carries the meaning, and the wordmark immediately above
+    still renders regardless.
+
+    ``url`` points at a placeholder path documented in
+    ``docs/channel-partner-onboarding-spec.md`` Section 7 -- the real
+    illustration is a separate, bounded design deliverable (a custom SVG in
+    ``wyfy-guest-website``'s existing illustration style, exported to a
+    fixed 2x PNG and hosted at this exact path) that ships independently of
+    this backend change; until it lands, this ``<img>`` simply 404s and the
+    email degrades to its ``alt`` text per the paragraph above -- never a
+    blocker for shipping the rest of this feature."""
+    url = "https://wyfyguest.com/brand/email/welcome-partner-header.png"
+    return f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 16px 0;">
+        <tr>
+          <td align="center">
+            <img src="{url}" width="240" height="120" alt="Welcome to Wyfy Guest" style="display:block;max-width:240px;width:100%;height:auto;border:0;">
+          </td>
+        </tr>
+      </table>"""
+
+
 # ============================================================================
 # Plain-text fallback (multipart/alternative)
 # ============================================================================
@@ -322,5 +352,6 @@ __all__ = [
     "info_box",
     "callout",
     "divider",
+    "welcome_header_illustration",
     "html_to_plain_text",
 ]
