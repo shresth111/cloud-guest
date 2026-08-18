@@ -42,6 +42,9 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
+from app.domains.isp.constants import HealthStatus as IspHealthStatus
+from app.domains.isp.constants import IspLinkRole, IspLinkType
+from app.domains.isp.device_adapters import PingResult
 from app.domains.monitoring.constants import (
     ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_ROUTER,
@@ -89,6 +92,7 @@ from app.domains.monitoring.validators import (
     validate_sla_target_config,
 )
 from app.domains.router.crypto import decrypt_secret
+from tests.unit.test_isp import FakeIspHealthAdapter, _make_router, make_harness
 
 # ============================================================================
 # Shared test doubles
@@ -753,6 +757,108 @@ async def test_isp_link_and_router_rules_on_same_router_do_not_collide():
     # conditions are still true, both already have an open alert.
     triggered_again = (await service.evaluate_alert_rules()).triggered
     assert triggered_again == []
+
+
+async def test_isp_link_alert_fires_end_to_end_from_a_real_health_check():
+    """Bandwidth-monitoring rollout spec, BE track #4: the two tests above
+    (and every other ``ALERT_TARGET_ISP_LINK`` test in this file) drive the
+    rule off a hand-built ``FakeIspLink`` with ``health_status`` set
+    directly -- real, but never proof the branch survives contact with a
+    *real* ``app.domains.isp.service.IspService`` health check, and never
+    proof a notification actually gets dispatched for this target type
+    specifically (``test_alert_evaluation_dispatches_to_configured_channels``
+    covers dispatch, but only for a platform ``ServiceHealth`` component).
+    This test closes both gaps in one pass: a real ``IspLink`` row, pushed
+    to ``unhealthy`` by a real ``IspService.check_link_health`` call (real
+    ping -> real ``classify_health_status`` -> real
+    ``record_health_check_result``, exactly the automated sweep's own
+    path -- see ``app.domains.isp.service``), is then handed to a real
+    ``AlertService.evaluate_alert_rules()`` and asserted to both create an
+    ``Alert`` row and actually POST a (faked-transport) notification."""
+    isp = make_harness(
+        health_adapter=FakeIspHealthAdapter(
+            next_result=PingResult(
+                sent=5, received=0, packet_loss_percentage=100.0, avg_rtt_ms=None
+            )
+        )
+    )
+    router = isp.router_lookup.add(_make_router())
+    link = await isp.service.create_link(
+        actor_user_id=uuid.uuid4(),
+        requesting_organization_id=router.organization_id,
+        router_id=router.id,
+        provider_name="Acme Fiber",
+        link_type=IspLinkType.FIBER.value,
+        role=IspLinkRole.PRIMARY,
+        gateway_ip_address="203.0.113.1",
+    )
+    # Sanity: not pre-faked into "unhealthy" -- a brand new link starts
+    # UNKNOWN until its first real check.
+    assert link.health_status == IspHealthStatus.UNKNOWN.value
+
+    link = await isp.service.check_link_health(
+        link.id, requesting_organization_id=router.organization_id
+    )
+    assert link.health_status == IspHealthStatus.UNHEALTHY.value
+
+    captured: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    repo = FakeRepository()
+    notification_service = NotificationService(repo, _mock_http_client(handler))
+    alert_service = AlertService(repo, notification_service=notification_service)
+    # The real IspLink from the isp domain above, handed directly to the
+    # monitoring domain's own repository fake -- exactly the read-only
+    # cross-domain composition IspRepository.list_isp_links documents in
+    # the real (non-test) code.
+    repo.isp_links.append(link)
+
+    channel = await _channel(
+        repo,
+        NotificationChannelType.SLACK,
+        {"webhook_url": "https://hooks.slack.com/services/T/B/X"},
+    )
+    rule = await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ISP_LINK,
+            condition_config={"expected_status": "unhealthy"},
+            organization_id=router.organization_id,
+        )
+    )
+    await repo.replace_alert_rule_notification_channels(rule.id, [channel.id])
+
+    result = await alert_service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert result.triggered[0].router_id == router.id
+    assert result.triggered[0].location_id == link.location_id
+    assert "Acme Fiber" in result.triggered[0].message
+    assert len(repo.alerts) == 1
+    # The real proof this end-to-end path works: a notification was
+    # actually dispatched, not just an Alert row silently created.
+    assert len(captured) == 1
+    assert len(repo.notification_logs) == 1
+    assert repo.notification_logs[0].status == NotificationStatus.SENT.value
+
+    # And the recovery half of the same real path: a subsequent healthy
+    # real ping auto-resolves the same alert.
+    isp.health_adapter.next_result = PingResult(
+        sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=15.0
+    )
+    link = await isp.service.check_link_health(
+        link.id, requesting_organization_id=router.organization_id
+    )
+    assert link.health_status == IspHealthStatus.HEALTHY.value
+    repo.isp_links[0] = link
+
+    resolved = (await alert_service.evaluate_alert_rules()).resolved
+    assert len(resolved) == 1
+    assert resolved[0].id == result.triggered[0].id
+    assert resolved[0].status == AlertStatus.RESOLVED.value
 
 
 def test_validate_health_status_change_accepts_isp_link_target():

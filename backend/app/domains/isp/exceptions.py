@@ -28,6 +28,7 @@ __all__ = [
     "UnsupportedIspVendorError",
     "IspSpeedTestCooldownError",
     "MixedWanRoutingWeightsError",
+    "IspLinkInterfaceRequiredError",
 ]
 
 
@@ -186,6 +187,23 @@ class UnsupportedIspVendorError(IspError):
     def __init__(self, vendor: str) -> None:
         super().__init__(
             f"No ISP health-check adapter registered for vendor '{vendor}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class IspLinkInterfaceRequiredError(IspError):
+    """Raised by ``IspService.get_or_create_link_for_interface`` -- unlike
+    plain ``create_link`` (where ``interface`` is optional -- an admin can
+    add a link before wiring the physical/PPPoE interface), this method's
+    entire dedupe key *is* ``(router_id, interface)``. A caller with no
+    interface to key off has nothing to be idempotent against and should
+    call ``create_link`` directly instead."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"An interface is required to get-or-create an ISP link for "
+            f"router '{router_id}' -- call create_link directly if the "
+            "interface is genuinely unknown",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 

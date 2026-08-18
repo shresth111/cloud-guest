@@ -22,6 +22,7 @@ __all__ = [
     "IspLinkCreateRequest",
     "IspLinkUpdateRequest",
     "IspLinkResponse",
+    "IspLinkGetOrCreateResponse",
     "IspLinkListResponse",
     "IspHealthCheckResponse",
     "IspHealthCheckListResponse",
@@ -131,6 +132,17 @@ class WanRoutingModeRequest(BaseModel):
 class WanRoutingModeResponse(BaseModel):
     router_id: str
     wan_routing_mode: str
+
+
+class IspLinkGetOrCreateResponse(BaseModel):
+    link: IspLinkResponse
+    # False when an existing link on this (router, interface) was found and
+    # returned as-is rather than a new row being created -- see
+    # IspService.get_or_create_link_for_interface's own docstring. Lets an
+    # automated caller (router provisioning) tell a real "N ISP links
+    # registered" confirmation apart from "already registered, nothing to
+    # do" across a re-run.
+    created: bool
 
 
 class IspLinkListResponse(BaseModel):
