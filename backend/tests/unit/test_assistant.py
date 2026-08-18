@@ -160,7 +160,9 @@ def service(
 
 
 class TestStartConversation:
-    async def test_requires_organization_context(self, service: AssistantService) -> None:
+    async def test_requires_organization_context(
+        self, service: AssistantService
+    ) -> None:
         with pytest.raises(OrganizationContextRequiredError):
             await service.start_conversation(
                 requesting_organization_id=None,
