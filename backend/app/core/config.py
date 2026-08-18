@@ -663,6 +663,28 @@ class Settings(BaseSettings):
     # Assistant domain: AI customer-support chatbot
     # ========================================================================
 
+    assistant_provider: str = Field(
+        default="logging",
+        description=(
+            "Which real LLM provider app.domains.assistant.dependencies"
+            ".build_assistant_provider routes 'sarvam' selection through -- "
+            "'logging' (default) or 'sarvam'. Mirrors email_delivery_"
+            "provider/sms_delivery_provider/whatsapp_delivery_provider's "
+            "identical selector pattern (app.domains.otp.service"
+            ".get_configured_email_provider et al.): 'sarvam' with "
+            "sarvam_api_key still empty falls back to LoggingAssistant"
+            "Provider rather than making a network call with no "
+            "credential. Deliberately does *not* gate the Anthropic path -- "
+            "that one still activates purely off anthropic_api_key being "
+            "non-empty (see that field's own docstring), the original "
+            "single-provider behavior this codebase shipped with before "
+            "Sarvam existed as an option, preserved unchanged so existing "
+            "deployments that already set only CLOUDGUEST_ANTHROPIC_API_KEY "
+            "keep working with zero migration. Override via "
+            "CLOUDGUEST_ASSISTANT_PROVIDER in any real deployment that "
+            "wants Sarvam instead."
+        ),
+    )
     anthropic_api_key: str = Field(
         default="",
         description=(
@@ -677,7 +699,25 @@ class Settings(BaseSettings):
             "stripe_secret_key/razorpay_key_id already establish for "
             "payments. Override via CLOUDGUEST_ANTHROPIC_API_KEY in any "
             "real deployment -- the default is a placeholder, not a real "
-            "key."
+            "key. See sarvam_api_key/assistant_provider for the other "
+            "supported provider."
+        ),
+    )
+    sarvam_api_key: str = Field(
+        default="",
+        description=(
+            "Sarvam AI API key used by app.domains.assistant.service"
+            ".LiteLLMAssistantProvider when assistant_provider='sarvam' "
+            "(routed through litellm's 'sarvam/<model>' provider prefix, "
+            "the same generic litellm.acompletion wrapper the Anthropic "
+            "path already uses -- not a Sarvam SDK). Empty = unconfigured "
+            "-- build_assistant_provider falls back to "
+            "LoggingAssistantProvider even when assistant_provider='sarvam' "
+            "is set, the identical 'empty key = honest logging default' "
+            "posture anthropic_api_key/stripe_secret_key/razorpay_key_id "
+            "already establish. Override via CLOUDGUEST_SARVAM_API_KEY in "
+            "any real deployment -- the default is a placeholder, not a "
+            "real key."
         ),
     )
     payment_webhook_event_dedup_ttl_seconds: int = Field(
