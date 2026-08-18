@@ -54,6 +54,7 @@ from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
 from .constants import (
+    MAX_BULK_DEVICE_LOOKUP_IDS,
     RADIUS_ACCT_STATUS_ACCOUNTING_OFF,
     RADIUS_ACCT_STATUS_ACCOUNTING_ON,
     RADIUS_ACCT_STATUS_INTERIM_UPDATE,
@@ -72,15 +73,19 @@ from .exceptions import (
     RadiusAccountingUnsupportedStatusTypeError,
     RadiusNasNotFoundError,
 )
-from .models import Guest, GuestDevice, GuestSession, RadiusNasClient
+from .models import Guest, GuestDevice, GuestLoginHistory, GuestSession, RadiusNasClient
 from .schemas import (
     GuestAnalyticsSummaryResponse,
     GuestBlockRequest,
     GuestConsentRequest,
     GuestConsentResponse,
     GuestDetailResponse,
+    GuestDeviceListResponse,
+    GuestDeviceResponse,
     GuestDisconnectRequest,
     GuestListResponse,
+    GuestLoginHistoryListResponse,
+    GuestLoginHistoryResponse,
     GuestLoginResponse,
     GuestOtpLoginRequest,
     GuestPasswordLoginRequest,
@@ -281,6 +286,29 @@ def _guest_response(guest: Guest) -> GuestResponse:
         blocked_reason=guest.blocked_reason,
         created_at=guest.created_at,
         updated_at=guest.updated_at,
+    )
+
+
+def _guest_device_response(device: GuestDevice) -> GuestDeviceResponse:
+    """Same field set as ``_device_response`` above, wrapped as the real
+    ``GuestDeviceResponse`` schema (rather than a bare dict) for ``GET
+    /guest-devices``'s own top-level list response."""
+    return GuestDeviceResponse(**_device_response(device))
+
+
+def _login_history_response(entry: GuestLoginHistory) -> GuestLoginHistoryResponse:
+    return GuestLoginHistoryResponse(
+        id=str(entry.id),
+        guest_id=str(entry.guest_id) if entry.guest_id else None,
+        organization_id=str(entry.organization_id) if entry.organization_id else None,
+        location_id=str(entry.location_id) if entry.location_id else None,
+        identifier=entry.identifier,
+        auth_method=entry.auth_method,
+        success=entry.success,
+        failure_reason=entry.failure_reason,
+        attempted_at=entry.attempted_at,
+        ip_address=entry.ip_address,
+        created_at=entry.created_at,
     )
 
 
@@ -795,6 +823,108 @@ async def list_guest_sessions(
     return build_response(
         success=True,
         message="Guest sessions retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.get(
+    "/guest-devices",
+    response_model=ApiResponse[GuestDeviceListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_sessions.read"))],
+)
+async def list_guest_devices(
+    request: Request,
+    device_ids: list[uuid.UUID] = Query(
+        ...,
+        description=(
+            "Bulk-resolve up to "
+            f"{MAX_BULK_DEVICE_LOOKUP_IDS} device IDs (e.g. a page of "
+            "GuestSession.device_id values from a Guest Session Log report) "
+            "to their MAC addresses in one call -- avoids the N+1 that "
+            "would otherwise result from resolving each session's device "
+            "one at a time. An id with no matching device, or one outside "
+            "the caller's own organization, is simply absent from the "
+            "response rather than an error."
+        ),
+    ),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestService = Depends(get_guest_service),
+):
+    devices = await service.list_devices_by_ids(
+        device_ids=device_ids,
+        requesting_organization_id=requesting_organization_id,
+    )
+    payload = GuestDeviceListResponse(
+        items=[_guest_device_response(d) for d in devices]
+    )
+    return build_response(
+        success=True,
+        message="Guest devices retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.get(
+    "/guest-login-history",
+    response_model=ApiResponse[GuestLoginHistoryListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_sessions.read"))],
+)
+async def list_guest_login_history(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    location_id: uuid.UUID | None = Query(default=None),
+    guest_id: uuid.UUID | None = Query(default=None),
+    start_date: datetime | None = Query(
+        default=None,
+        description=(
+            "Real server-side [start_date, end_date) filter on "
+            "attempted_at -- the exact same contract as GET "
+            "/guest-sessions's own start_date/end_date, for the Login/"
+            "Access Attempt Log report. Requires an organization context "
+            "(ignored for a platform-level caller with no "
+            "organization_id) and, when given, takes the guest_id filter "
+            "out of scope -- pass only location_id alongside it."
+        ),
+    ),
+    end_date: datetime | None = Query(default=None),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestService = Depends(get_guest_service),
+):
+    has_real_range = start_date is not None and end_date is not None
+    if has_real_range and requesting_organization_id is not None:
+        entries, meta = await service.list_login_history_in_range(
+            organization_id=requesting_organization_id,
+            location_id=location_id,
+            start=start_date,
+            end=end_date,
+            page=page,
+            page_size=page_size,
+        )
+    else:
+        entries, meta = await service.list_login_history(
+            requesting_organization_id=requesting_organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+            page=page,
+            page_size=page_size,
+        )
+    payload = GuestLoginHistoryListResponse(
+        items=[_login_history_response(e) for e in entries],
+        page=meta.page,
+        page_size=meta.page_size,
+        total_items=meta.total_items,
+        total_pages=meta.total_pages,
+        has_next=meta.has_next,
+        has_previous=meta.has_previous,
+    )
+    return build_response(
+        success=True,
+        message="Guest login history retrieved",
         data=payload.model_dump(),
         request_id=_request_id(request),
     )

@@ -282,6 +282,21 @@ DEFAULT_MAX_DEVICES_PER_GUEST = 3
 
 TASK_RUN_SESSION_TIMEOUT_SWEEP = "app.domains.guest.tasks.run_session_timeout_sweep"
 
+# ============================================================================
+# Bulk device lookup (Network Activity Log v1 -- see
+# GuestService.list_devices_by_ids's own docstring). ``GuestSessionResponse
+# .device_id`` is a bare FK with no denormalized MAC address, so a caller
+# building a per-session report (e.g. the Guest Session Log report) needs
+# to resolve many device IDs to MAC addresses in one round trip instead of
+# one ``GET /guests/{id}`` -equivalent lookup per session (an N+1 that would
+# otherwise scale with the report's own row count). This bound keeps a
+# single bulk lookup request to a sane page-sized batch -- the same
+# magnitude as every other list endpoint's own ``page_size<=100`` cap in
+# this module -- rather than accepting an unbounded ``IN (...)`` list.
+# ============================================================================
+
+MAX_BULK_DEVICE_LOOKUP_IDS = 100
+
 # Every 5 minutes -- shorter than analytics' 15-minute rolling aggregation
 # cadence (``SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS``-adjacent), because an
 # expired-but-not-yet-flipped session is guest-facing/operationally visible
@@ -498,4 +513,5 @@ __all__ = [
     "NAS_CODE_PREFIX",
     "NAS_CODE_SEQUENCE_DIGITS",
     "NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES",
+    "MAX_BULK_DEVICE_LOOKUP_IDS",
 ]

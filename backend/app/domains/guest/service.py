@@ -280,6 +280,7 @@ from .constants import (
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
+    MAX_BULK_DEVICE_LOOKUP_IDS,
     NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
     PIN_LENGTH,
     PIN_LOCKOUT_MINUTES,
@@ -340,11 +341,13 @@ from .exceptions import (
     RadiusNasNotFoundError,
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
+    TooManyDeviceIdsError,
 )
 from .models import (
     Guest,
     GuestConsent,
     GuestDevice,
+    GuestLoginHistory,
     GuestQuotaUsage,
     GuestSession,
     RadiusNasClient,
@@ -2624,6 +2627,31 @@ class GuestService:
         )
         return updated
 
+    async def list_devices_by_ids(
+        self,
+        *,
+        device_ids: list[uuid.UUID],
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[GuestDevice]:
+        """Bulk-resolve ``device_ids`` to their :class:`~.models.GuestDevice`
+        rows (MAC address included) in one round trip -- backs ``GET
+        /guest-devices``, the Network Activity Log v1 report's fix for
+        ``GuestSessionResponse.device_id`` being a bare FK with no
+        denormalized MAC address (see ``constants
+        .MAX_BULK_DEVICE_LOOKUP_IDS``'s own docstring for the full
+        "avoids an N+1 per-session device lookup" reasoning). Raises
+        ``TooManyDeviceIdsError`` rather than silently truncating the
+        list -- the same "a real, documented bound, never a silent
+        truncation" discipline ``app.domains.controller_logs``'s own
+        ``MAX_EXPORT_ROWS`` establishes for CSV export."""
+        if len(device_ids) > MAX_BULK_DEVICE_LOOKUP_IDS:
+            raise TooManyDeviceIdsError(
+                requested=len(device_ids), limit=MAX_BULK_DEVICE_LOOKUP_IDS
+            )
+        return await self.repository.list_devices_by_ids(
+            device_ids=device_ids, organization_id=requesting_organization_id
+        )
+
     async def get_or_create_device(
         self,
         *,
@@ -2757,6 +2785,55 @@ class GuestService:
         this exists alongside ``list_sessions`` above rather than extending
         it."""
         return await self.repository.list_sessions_in_range(
+            organization_id=organization_id,
+            location_id=location_id,
+            start=start,
+            end=end,
+            page=page,
+            page_size=page_size,
+        )
+
+    async def list_login_history(
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
+        guest_id: uuid.UUID | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[GuestLoginHistory], object]:
+        """Backs ``GET /guest-login-history``'s default (no real date
+        range) mode -- the Login/Access Attempt Log report's data source,
+        mirroring ``list_sessions``'s identical "org-scoped caller vs.
+        platform-level caller sees everything" convention. Composes the
+        repository read ``app.domains.controller_logs`` already uses for
+        its own, differently-audienced "Authentication Logs" admin-log
+        category (see that domain's module docstring) -- the same
+        underlying table, read through this module's own tenant-scoped
+        entry point instead."""
+        return await self.repository.list_login_history(
+            organization_id=requesting_organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+            page=page,
+            page_size=page_size,
+        )
+
+    async def list_login_history_in_range(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
+        start: datetime,
+        end: datetime,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[GuestLoginHistory], object]:
+        """Real ``[start, end)`` login-history listing -- see
+        ``GuestRepository.list_login_history_in_range``'s own docstring,
+        the exact same shape as ``list_sessions_in_range`` above applied to
+        ``GuestLoginHistory``."""
+        return await self.repository.list_login_history_in_range(
             organization_id=organization_id,
             location_id=location_id,
             start=start,

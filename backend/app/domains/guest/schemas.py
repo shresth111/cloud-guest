@@ -50,6 +50,9 @@ __all__ = [
     "SessionExtendRequest",
     "SessionReconnectRequest",
     "GuestDeviceResponse",
+    "GuestDeviceListResponse",
+    "GuestLoginHistoryResponse",
+    "GuestLoginHistoryListResponse",
     "GuestSessionResponse",
     "GuestSessionListResponse",
     "GuestLoginResponse",
@@ -294,6 +297,51 @@ class GuestDeviceResponse(BaseModel):
     last_seen_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class GuestDeviceListResponse(BaseModel):
+    """Bulk MAC-address resolution result for ``GET /guest-devices`` -- see
+    ``constants.MAX_BULK_DEVICE_LOOKUP_IDS``'s own docstring. Deliberately
+    has no ``page``/``page_size``/``total_items`` pagination envelope
+    (unlike ``GuestSessionListResponse``): this endpoint is a bounded batch
+    lookup keyed by the caller's own ``device_ids`` list, not an
+    open-ended listing -- ``items`` may be shorter than the request's own
+    ``device_ids`` (an id with no matching device, or one outside the
+    caller's organization scope, is simply absent, not an error)."""
+
+    items: list[GuestDeviceResponse]
+
+
+class GuestLoginHistoryResponse(BaseModel):
+    """One ``GuestLoginHistory`` row -- the Login/Access Attempt Log
+    report's per-row shape (see ``docs/ipdr-logs-syslog-spec.md``'s v1
+    recommendation). ``identifier`` reuses ``GuestResponse.identifier``'s
+    own ``MaskedIdentifier`` annotation -- the same phone/email value,
+    masked the same way regardless of which endpoint returns it."""
+
+    id: str
+    guest_id: str | None
+    organization_id: str | None
+    location_id: str | None
+    identifier: MaskedIdentifier
+    auth_method: str
+    success: bool
+    failure_reason: str | None
+    attempted_at: datetime
+    ip_address: str | None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GuestLoginHistoryListResponse(BaseModel):
+    items: list[GuestLoginHistoryResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
 
 
 class GuestSessionResponse(BaseModel):
