@@ -136,7 +136,7 @@ class FakeLocationLookup:
             raise CrossOrganizationLocationAccessError()
         return location
 
-    def add(self, *, organization_id: uuid.UUID) -> Location:
+    def add(self, *, organization_id: uuid.UUID, country: str = "US") -> Location:
         location = Location(
             **_base_fields(
                 organization_id=organization_id,
@@ -148,7 +148,7 @@ class FakeLocationLookup:
                 city="Austin",
                 state_province="TX",
                 postal_code="78701",
-                country="US",
+                country=country,
                 timezone="UTC",
                 latitude=None,
                 longitude=None,
@@ -661,6 +661,44 @@ class TestResolution:
             await fx.service.resolve_portal_config(
                 organization_id=fx.organization.id, location_id=foreign_location.id
             )
+
+    async def test_location_country_populated_via_location_override(self) -> None:
+        fx = make_service()
+        location = fx.location_lookup.add(
+            organization_id=fx.organization.id, country="IN"
+        )
+        await _create_config(fx, name="Location override", location_id=location.id)
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=None, location_id=location.id
+        )
+        assert resolved.location_country == "IN"
+
+    async def test_location_country_populated_via_org_default_fallback(self) -> None:
+        """A location_id is supplied but has no override config of its own
+        -- resolution falls back to the org default, but the *location's*
+        own country should still come through (a guest hitting this exact
+        location's portal link should get that location's real country,
+        not None, even though the config itself is the org-wide default)."""
+        fx = make_service()
+        location = fx.location_lookup.add(
+            organization_id=fx.organization.id, country="IN"
+        )
+        await _create_config(fx, name="Org default", is_default=True)
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=None, location_id=location.id
+        )
+        assert resolved.resolved_via_location_override is False
+        assert resolved.location_country == "IN"
+
+    async def test_location_country_is_none_when_resolved_by_organization_only(
+        self,
+    ) -> None:
+        fx = make_service()
+        await _create_config(fx, name="Org default", is_default=True)
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert resolved.location_country is None
 
 
 # ============================================================================
