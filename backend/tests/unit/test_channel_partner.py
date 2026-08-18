@@ -40,12 +40,16 @@ from app.domains.channel_partner.schemas import (
 )
 from app.domains.channel_partner.service import ChannelPartnerService
 from app.domains.otp.service import LoggingEmailProvider, LoggingSmsProvider
-from app.domains.rbac.enums import PermissionModule, ScopeType
+from app.domains.rbac.authorization import AccessValidator
+from app.domains.rbac.enums import AuditAction, PermissionModule, ScopeType
+from app.domains.rbac.exceptions import PermissionDeniedError
 from app.domains.rbac.seed import (
     MODULE_ACTIONS,
     MODULE_NARROWEST_SCOPE,
     SYSTEM_ROLES,
 )
+
+from .test_rbac import FakeRBACRepository
 
 # ============================================================================
 # Test doubles
@@ -147,14 +151,27 @@ class FakeEmailProvider:
         self.sent.append({"email": email, "subject": subject, "body": body})
 
 
+@dataclass
+class FakeAuditWriter:
+    entries: list[dict[str, object]] = field(default_factory=list)
+
+    async def create_audit_log_entry(self, **fields: object) -> object:
+        self.entries.append(fields)
+        return fields
+
+
 def _make_service(
     *,
     sms_provider: object | None = None,
     email_provider: object | None = None,
+    audit_writer: object | None = None,
 ) -> tuple[ChannelPartnerService, FakeChannelPartnerRepository]:
     repository = FakeChannelPartnerRepository()
     service = ChannelPartnerService(
-        repository, sms_provider=sms_provider, email_provider=email_provider
+        repository,
+        sms_provider=sms_provider,
+        email_provider=email_provider,
+        audit_writer=audit_writer,
     )
     return service, repository
 
@@ -488,6 +505,78 @@ class TestGetAndListPartners:
 
 
 # ============================================================================
+# Service: revoke (deactivate)
+# ============================================================================
+
+
+class TestRevokePartner:
+    async def test_revoke_active_partner_flips_status_to_inactive(self) -> None:
+        service, _repository = _make_service(
+            sms_provider=FakeSmsProvider(), email_provider=FakeEmailProvider()
+        )
+        partner = await service.onboard_partner(
+            actor_user_id=uuid.uuid4(), data=_make_request()
+        )
+        assert partner.status == ChannelPartnerStatus.ACTIVE.value
+
+        revoked = await service.revoke_partner(
+            partner.id, actor_user_id=uuid.uuid4()
+        )
+
+        assert revoked.status == ChannelPartnerStatus.INACTIVE.value
+        fetched = await service.get_partner(partner.id)
+        assert fetched.status == ChannelPartnerStatus.INACTIVE.value
+
+    async def test_revoke_writes_an_audit_log_entry(self) -> None:
+        audit_writer = FakeAuditWriter()
+        service, _repository = _make_service(
+            sms_provider=FakeSmsProvider(),
+            email_provider=FakeEmailProvider(),
+            audit_writer=audit_writer,
+        )
+        partner = await service.onboard_partner(
+            actor_user_id=uuid.uuid4(), data=_make_request()
+        )
+        actor_id = uuid.uuid4()
+
+        await service.revoke_partner(partner.id, actor_user_id=actor_id)
+
+        assert len(audit_writer.entries) == 1
+        entry = audit_writer.entries[0]
+        assert entry["action"] == AuditAction.CHANNEL_PARTNER_REVOKED.value
+        assert entry["entity_id"] == partner.id
+        assert entry["entity_type"] == "channel_partner"
+        assert entry["actor_user_id"] == actor_id
+
+    async def test_revoke_already_inactive_partner_is_idempotent_no_op(self) -> None:
+        audit_writer = FakeAuditWriter()
+        service, repository = _make_service(
+            sms_provider=FakeSmsProvider(),
+            email_provider=FakeEmailProvider(),
+            audit_writer=audit_writer,
+        )
+        partner = await service.onboard_partner(
+            actor_user_id=uuid.uuid4(), data=_make_request()
+        )
+        await service.revoke_partner(partner.id, actor_user_id=uuid.uuid4())
+        version_after_first_revoke = repository.partners[partner.id].version
+        assert len(audit_writer.entries) == 1
+
+        # Revoking an already-inactive partner must not raise, must not
+        # touch the row again, and must not write a second audit entry.
+        result = await service.revoke_partner(partner.id, actor_user_id=uuid.uuid4())
+
+        assert result.status == ChannelPartnerStatus.INACTIVE.value
+        assert repository.partners[partner.id].version == version_after_first_revoke
+        assert len(audit_writer.entries) == 1
+
+    async def test_revoke_not_found_raises(self) -> None:
+        service, _repository = _make_service()
+        with pytest.raises(ChannelPartnerNotFoundError):
+            await service.revoke_partner(uuid.uuid4(), actor_user_id=uuid.uuid4())
+
+
+# ============================================================================
 # Router: message composition + RBAC gating
 # ============================================================================
 
@@ -558,11 +647,47 @@ class TestOnboardMessageComposition:
 
 class TestEveryRouteRequiresPermission:
     def test_every_channel_partner_route_has_a_permission_dependency(self) -> None:
-        assert len(router.routes) == 3
+        assert len(router.routes) == 4
         for route in router.routes:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+    def test_revoke_route_is_gated_by_manage_not_read_or_create(self) -> None:
+        """Revoking is a mutation -- must be gated behind
+        ``channel_partners.manage``, the same permission
+        ``onboard_channel_partner`` (``.create``) and
+        ``list_channel_partners``/``get_channel_partner`` (``.read``)
+        deliberately do *not* share, mirroring the module's existing
+        create/read/manage split."""
+        revoke_route = next(
+            route for route in router.routes if route.path.endswith("/revoke")
+        )
+        assert revoke_route.methods == {"POST"}
+
+
+class TestRevokeRequiresManagePermission:
+    """A genuine, executable 403: an actor holding no roles/grants at all
+    is denied ``channel_partners.manage`` -- exercises the real
+    ``AccessValidator.check`` gating logic ``RequirePermission(
+    "channel_partners.manage")`` (the ``revoke_channel_partner`` route's own
+    dependency) delegates to, the same "underlying logic is what's
+    exercised, not Starlette's DI resolution" convention
+    ``tests/unit/test_billing_entitlement.py``'s own module docstring
+    documents for this codebase's ``RequirePermission`` dependencies."""
+
+    async def test_actor_without_manage_permission_gets_403(self) -> None:
+        repository = FakeRBACRepository()
+        validator = AccessValidator(repository)
+        user_id = uuid.uuid4()
+
+        with pytest.raises(PermissionDeniedError) as exc_info:
+            await validator.check(user_id, "channel_partners.manage")
+
+        assert exc_info.value.status_code == 403
+        assert any(
+            entry.action == "permission_denied" for entry in repository.audit_log_rows
+        )
 
 
 class TestChannelPartnersRbacSeedData:
