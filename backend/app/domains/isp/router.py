@@ -256,7 +256,9 @@ async def list_isp_links(
         page_size=page_size,
     )
     items = [
-        _link_response(link, unhealthy_since=await service.compute_unhealthy_since(link))
+        _link_response(
+            link, unhealthy_since=await service.compute_unhealthy_since(link)
+        )
         for link in links
     ]
     payload = IspLinkListResponse(items=items, **_pagination_fields(meta))

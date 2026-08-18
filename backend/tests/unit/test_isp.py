@@ -281,14 +281,18 @@ class FakeIspRepository:
         for bucket_start in sorted(buckets):
             bucket_checks = buckets[bucket_start]
             total = len(bucket_checks)
-            healthy = sum(1 for c in bucket_checks if c.status == HealthStatus.HEALTHY.value)
+            healthy = sum(
+                1 for c in bucket_checks if c.status == HealthStatus.HEALTHY.value
+            )
             degraded = sum(
                 1 for c in bucket_checks if c.status == HealthStatus.DEGRADED.value
             )
             unhealthy = sum(
                 1 for c in bucket_checks if c.status == HealthStatus.UNHEALTHY.value
             )
-            latencies = [c.latency_ms for c in bucket_checks if c.latency_ms is not None]
+            latencies = [
+                c.latency_ms for c in bucket_checks if c.latency_ms is not None
+            ]
             losses = [
                 c.packet_loss_percentage
                 for c in bucket_checks
@@ -426,7 +430,10 @@ class FakeIspHealthAdapter:
         self, credentials: IspCredentials, *, download_url: str
     ) -> SpeedTestResult:
         self.speed_test_calls.append(
-            {"download_url": download_url, "timeout_seconds": credentials.timeout_seconds}
+            {
+                "download_url": download_url,
+                "timeout_seconds": credentials.timeout_seconds,
+            }
         )
         if self.speed_test_should_raise is not None:
             raise self.speed_test_should_raise
@@ -858,7 +865,9 @@ class TestRunSpeedTest:
                     sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=15.5
                 ),
                 next_speed_test_result=SpeedTestResult(
-                    download_mbps=13.3, downloaded_bytes=9765 * 1024, duration_seconds=6.0
+                    download_mbps=13.3,
+                    downloaded_bytes=9765 * 1024,
+                    duration_seconds=6.0,
                 ),
             )
         )
@@ -891,12 +900,17 @@ class TestRunSpeedTest:
         link = await _create_primary(h, router)
 
         await h.service.run_speed_test(
-            link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+            link.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
         )
 
         assert len(adapter.speed_test_calls) == 1
         assert adapter.speed_test_calls[0]["download_url"] == SPEED_TEST_DOWNLOAD_URL
-        assert adapter.speed_test_calls[0]["timeout_seconds"] == SPEED_TEST_TIMEOUT_SECONDS
+        assert (
+            adapter.speed_test_calls[0]["timeout_seconds"]
+            == SPEED_TEST_TIMEOUT_SECONDS
+        )
 
     async def test_never_writes_an_isp_health_check_row(self) -> None:
         """See run_speed_test's own docstring: download_mbps/upload_mbps on
@@ -907,7 +921,9 @@ class TestRunSpeedTest:
         link = await _create_primary(h, router)
 
         await h.service.run_speed_test(
-            link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+            link.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
         )
 
         checks, meta = await h.repository.list_health_checks_for_link(
@@ -922,14 +938,18 @@ class TestRunSpeedTest:
         actor_id = uuid.uuid4()
 
         await h.service.run_speed_test(
-            link.id, actor_user_id=actor_id, requesting_organization_id=router.organization_id
+            link.id,
+            actor_user_id=actor_id,
+            requesting_organization_id=router.organization_id,
         )
 
         # _create_primary above already wrote its own "isp_link_created"
         # audit entry -- isolate the speed-test action's own entry rather
         # than assuming index/position.
         speed_test_entries = [
-            e for e in h.audit_writer.entries if e["action"] == "isp_link_speed_test_run"
+            e
+            for e in h.audit_writer.entries
+            if e["action"] == "isp_link_speed_test_run"
         ]
         assert len(speed_test_entries) == 1
         entry = speed_test_entries[0]
@@ -948,7 +968,9 @@ class TestRunSpeedTest:
         )
         with pytest.raises(IspLinkDisabledError):
             await h.service.run_speed_test(
-                link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+                link.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
             )
 
     async def test_missing_credentials_raises(self) -> None:
@@ -958,7 +980,9 @@ class TestRunSpeedTest:
         link = await _create_primary(h, router)
         with pytest.raises(IspMissingCredentialsError):
             await h.service.run_speed_test(
-                link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+                link.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
             )
 
     async def test_real_fetch_failure_propagates(self) -> None:
@@ -973,7 +997,9 @@ class TestRunSpeedTest:
         link = await _create_primary(h, router)
         with pytest.raises(IspDeviceConnectionError):
             await h.service.run_speed_test(
-                link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+                link.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
             )
 
     async def test_cross_organization_access_raises(self) -> None:
@@ -2083,7 +2109,9 @@ class TestHealthCheckSweep:
         repository.links[link.id] = link
 
         adapter = FakeIspHealthAdapter(
-            should_raise=IspDeviceConnectionError(router.management_ip_address, "no route to host")
+            should_raise=IspDeviceConnectionError(
+                router.management_ip_address, "no route to host"
+            )
         )
         summary = await run_health_check_sweep(
             repository,

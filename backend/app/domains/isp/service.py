@@ -548,7 +548,9 @@ class IspService:
         parameter. Switching *to* ``FAILOVER_ONLY`` never validates or
         touches existing weights (see that enum's own docstring on why
         they're left alone, not cleared, for a possible switch back)."""
-        router = await self.router_lookup.get_router(
+        # Existence/org-access check only -- the returned Router isn't
+        # otherwise needed in this method.
+        await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
         if mode is WanRoutingMode.LOAD_BALANCE:
@@ -668,7 +670,9 @@ class IspService:
                 uptime_percentage=(
                     round(100.0 * (total - unhealthy) / total, 2) if total else None
                 ),
-                avg_latency_ms=round(avg_latency, 2) if avg_latency is not None else None,
+                avg_latency_ms=(
+                    round(avg_latency, 2) if avg_latency is not None else None
+                ),
                 avg_packet_loss_percentage=(
                     round(avg_loss, 2) if avg_loss is not None else None
                 ),
@@ -783,7 +787,9 @@ class IspService:
             raise IspLinkDisabledError(link.id)
 
         if self._redis is not None:
-            cooldown_key = SPEED_TEST_COOLDOWN_REDIS_KEY_TEMPLATE.format(link_id=link.id)
+            cooldown_key = SPEED_TEST_COOLDOWN_REDIS_KEY_TEMPLATE.format(
+                link_id=link.id
+            )
             acquired = await self._redis.set(
                 cooldown_key, "1", nx=True, ex=SPEED_TEST_MIN_INTERVAL_SECONDS
             )
@@ -999,7 +1005,11 @@ class IspService:
             return None
 
     async def record_health_check_result(
-        self, link: IspLink, *, ping_result: PingResult, traffic: TrafficCounters | None = None
+        self,
+        link: IspLink,
+        *,
+        ping_result: PingResult,
+        traffic: TrafficCounters | None = None,
     ) -> IspLink:
         """Records one real health-check reading and advances this link's
         current state accordingly.
