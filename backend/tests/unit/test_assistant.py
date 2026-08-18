@@ -34,7 +34,10 @@ import pytest
 
 from app.core.config import Settings
 from app.database.utils.pagination import PageParams, PaginationMeta
-from app.domains.assistant.dependencies import build_assistant_provider
+from app.domains.assistant.dependencies import (
+    _SARVAM_DEFAULT_MODEL,
+    build_assistant_provider,
+)
 from app.domains.assistant.exceptions import (
     ConversationNotFoundError,
     CrossOrganizationConversationAccessError,
@@ -157,7 +160,9 @@ def service(
 
 
 class TestStartConversation:
-    async def test_requires_organization_context(self, service: AssistantService) -> None:
+    async def test_requires_organization_context(
+        self, service: AssistantService
+    ) -> None:
         with pytest.raises(OrganizationContextRequiredError):
             await service.start_conversation(
                 requesting_organization_id=None,
@@ -325,6 +330,33 @@ class TestBuildAssistantProvider:
         provider = build_assistant_provider(settings=settings)
         assert isinstance(provider, LiteLLMAssistantProvider)
 
+    def test_sarvam_provider_without_key_falls_back_to_logging(self) -> None:
+        """Selecting 'sarvam' with sarvam_api_key still empty must fall
+        back to Logging, not silently reuse a configured Anthropic key --
+        see build_assistant_provider's own docstring."""
+        settings = Settings(
+            assistant_provider="sarvam",
+            sarvam_api_key="",
+            anthropic_api_key="sk-ant-test-key",
+        )
+        provider = build_assistant_provider(settings=settings)
+        assert isinstance(provider, LoggingAssistantProvider)
+
+    def test_sarvam_api_key_without_provider_selection_stays_logging(self) -> None:
+        """A configured sarvam_api_key alone (assistant_provider left at
+        its 'logging' default) must not activate Sarvam -- explicit
+        selection is required, mirroring email_delivery_provider et al."""
+        settings = Settings(sarvam_api_key="sarvam-test-key")
+        provider = build_assistant_provider(settings=settings)
+        assert isinstance(provider, LoggingAssistantProvider)
+
+    def test_sarvam_provider_with_key_selects_litellm_provider(self) -> None:
+        settings = Settings(
+            assistant_provider="sarvam", sarvam_api_key="sarvam-test-key"
+        )
+        provider = build_assistant_provider(settings=settings)
+        assert isinstance(provider, LiteLLMAssistantProvider)
+
 
 class TestLiteLLMProviderRequestShape:
     """Regression test guarding the call shape
@@ -381,3 +413,39 @@ class TestLiteLLMProviderRequestShape:
             "role": "user",
             "content": "How do I create a voucher?",
         }
+
+    async def test_reply_calls_litellm_acompletion_for_sarvam(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same call-shape guard as the Anthropic test above, for the
+        Sarvam branch build_assistant_provider wires up -- confirms the
+        'sarvam/<model>' prefix and sarvam_api_key actually reach
+        litellm.acompletion untouched (LiteLLMAssistantProvider.__init__
+        leaves any model string already containing '/' as-is rather than
+        applying its 'anthropic/' default-prefix fallback)."""
+        import litellm
+
+        captured: dict[str, object] = {}
+
+        async def fake_acompletion(**kwargs: object) -> SimpleNamespace:
+            captured.update(kwargs)
+            message = SimpleNamespace(content="namaste reply")
+            choice = SimpleNamespace(message=message)
+            return SimpleNamespace(choices=[choice])
+
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+        settings = Settings(
+            assistant_provider="sarvam", sarvam_api_key="sarvam-test-key"
+        )
+        provider = build_assistant_provider(settings=settings)
+        assert isinstance(provider, LiteLLMAssistantProvider)
+
+        reply = await provider.reply(
+            conversation_history=[], new_message="Mera router offline hai"
+        )
+
+        assert reply == "namaste reply"
+        assert captured["model"] == _SARVAM_DEFAULT_MODEL
+        assert captured["model"] == "sarvam/sarvam-105b"
+        assert captured["api_key"] == "sarvam-test-key"
