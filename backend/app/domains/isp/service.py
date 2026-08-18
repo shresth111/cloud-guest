@@ -94,6 +94,7 @@ from .exceptions import (
     IspDeviceOperationError,
     IspHealthCheckTargetUnavailableError,
     IspLinkDisabledError,
+    IspLinkInterfaceRequiredError,
     IspLinkNotFoundError,
     IspMissingCredentialsError,
     IspNoBackupLinkAvailableError,
@@ -359,6 +360,99 @@ class IspService:
         )
         return link
 
+    async def get_or_create_link_for_interface(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        provider_name: str,
+        link_type: str,
+        connection_mode: str = IspConnectionMode.STATIC.value,
+        role: IspLinkRole,
+        priority: int = 0,
+        interface: str | None,
+        gateway_ip_address: str | None = None,
+        dns_primary: str | None = None,
+        dns_secondary: str | None = None,
+        download_bandwidth_mbps: int | None = None,
+        upload_bandwidth_mbps: int | None = None,
+        auto_failback: bool = True,
+    ) -> tuple[IspLink, bool]:
+        """Idempotent front door for automated callers (router provisioning
+        first among them) that may legitimately run the same "register this
+        WAN as an ISP link" step more than once -- an admin regenerating an
+        already-provisioned router's setup script, a retried request after a
+        dropped connection, etc. Plain ``create_link`` has no such guard
+        (see its own docstring reference in ``exceptions
+        .IspPrimaryLinkAlreadyExistsError`` -- it only ever rejected a
+        second *primary*), so calling it directly from an automated,
+        possibly-repeated flow risks a real duplicate ``BACKUP`` row per
+        re-run, each with its own health-check history and dashboard tile.
+
+        Dedupes purely by ``(router_id, interface)`` -- deliberately not by
+        ``provider_name`` (a placeholder like "WAN 1" the caller may not
+        even set consistently) or by ``role`` (a re-run might legitimately
+        want to promote what it thinks is the same physical uplink). A
+        RouterOS interface name is the one field that genuinely, stably
+        identifies "the same real WAN uplink" across repeated calls -- it is
+        also the exact field every caller of this method already has
+        (``WanEntry.iface`` on the FE side), which is why
+        ``IspLinkInterfaceRequiredError`` is raised rather than silently
+        falling back to an always-create path when it's missing: a caller
+        with no interface has nothing to be idempotent against and should
+        use ``create_link`` directly instead (matching today's one caller of
+        that method, the manual "Add ISP Link" dialog, where a human can
+        freely leave the interface blank until it's wired).
+
+        Returns ``(link, created)`` -- ``created`` is ``False`` when an
+        existing link on this interface was found and returned as-is
+        (deliberately never updated in place; a link a human has since
+        customized -- renamed, re-prioritized -- should not be silently
+        overwritten by a stale re-run of the original provisioning
+        payload). Callers that want a real update path already have
+        ``update_link`` for that.
+        """
+        if not interface:
+            raise IspLinkInterfaceRequiredError(router_id)
+
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        existing_links = await self.repository.list_links_for_router(router.id)
+        existing = next(
+            (link for link in existing_links if link.interface == interface), None
+        )
+        if existing is not None:
+            logger.info(
+                "isp_link_get_or_create_idempotent_skip",
+                extra={
+                    "link_id": str(existing.id),
+                    "router_id": str(router.id),
+                    "interface": interface,
+                },
+            )
+            return existing, False
+
+        link = await self.create_link(
+            actor_user_id=actor_user_id,
+            requesting_organization_id=requesting_organization_id,
+            router_id=router.id,
+            provider_name=provider_name,
+            link_type=link_type,
+            connection_mode=connection_mode,
+            role=role,
+            priority=priority,
+            interface=interface,
+            gateway_ip_address=gateway_ip_address,
+            dns_primary=dns_primary,
+            dns_secondary=dns_secondary,
+            download_bandwidth_mbps=download_bandwidth_mbps,
+            upload_bandwidth_mbps=upload_bandwidth_mbps,
+            auto_failback=auto_failback,
+        )
+        return link, True
+
     async def get_link(
         self,
         link_id: uuid.UUID,
@@ -454,7 +548,9 @@ class IspService:
         parameter. Switching *to* ``FAILOVER_ONLY`` never validates or
         touches existing weights (see that enum's own docstring on why
         they're left alone, not cleared, for a possible switch back)."""
-        router = await self.router_lookup.get_router(
+        # Existence/org-access check only -- the returned Router isn't
+        # otherwise needed in this method.
+        await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
         if mode is WanRoutingMode.LOAD_BALANCE:
@@ -574,7 +670,9 @@ class IspService:
                 uptime_percentage=(
                     round(100.0 * (total - unhealthy) / total, 2) if total else None
                 ),
-                avg_latency_ms=round(avg_latency, 2) if avg_latency is not None else None,
+                avg_latency_ms=(
+                    round(avg_latency, 2) if avg_latency is not None else None
+                ),
                 avg_packet_loss_percentage=(
                     round(avg_loss, 2) if avg_loss is not None else None
                 ),
@@ -689,7 +787,9 @@ class IspService:
             raise IspLinkDisabledError(link.id)
 
         if self._redis is not None:
-            cooldown_key = SPEED_TEST_COOLDOWN_REDIS_KEY_TEMPLATE.format(link_id=link.id)
+            cooldown_key = SPEED_TEST_COOLDOWN_REDIS_KEY_TEMPLATE.format(
+                link_id=link.id
+            )
             acquired = await self._redis.set(
                 cooldown_key, "1", nx=True, ex=SPEED_TEST_MIN_INTERVAL_SECONDS
             )
@@ -905,7 +1005,11 @@ class IspService:
             return None
 
     async def record_health_check_result(
-        self, link: IspLink, *, ping_result: PingResult, traffic: TrafficCounters | None = None
+        self,
+        link: IspLink,
+        *,
+        ping_result: PingResult,
+        traffic: TrafficCounters | None = None,
     ) -> IspLink:
         """Records one real health-check reading and advances this link's
         current state accordingly.

@@ -42,6 +42,7 @@ from app.domains.isp.exceptions import (
     IspDeviceConnectionError,
     IspHealthCheckTargetUnavailableError,
     IspLinkDisabledError,
+    IspLinkInterfaceRequiredError,
     IspLinkNotFoundError,
     IspMissingCredentialsError,
     IspNoBackupLinkAvailableError,
@@ -280,14 +281,18 @@ class FakeIspRepository:
         for bucket_start in sorted(buckets):
             bucket_checks = buckets[bucket_start]
             total = len(bucket_checks)
-            healthy = sum(1 for c in bucket_checks if c.status == HealthStatus.HEALTHY.value)
+            healthy = sum(
+                1 for c in bucket_checks if c.status == HealthStatus.HEALTHY.value
+            )
             degraded = sum(
                 1 for c in bucket_checks if c.status == HealthStatus.DEGRADED.value
             )
             unhealthy = sum(
                 1 for c in bucket_checks if c.status == HealthStatus.UNHEALTHY.value
             )
-            latencies = [c.latency_ms for c in bucket_checks if c.latency_ms is not None]
+            latencies = [
+                c.latency_ms for c in bucket_checks if c.latency_ms is not None
+            ]
             losses = [
                 c.packet_loss_percentage
                 for c in bucket_checks
@@ -425,7 +430,10 @@ class FakeIspHealthAdapter:
         self, credentials: IspCredentials, *, download_url: str
     ) -> SpeedTestResult:
         self.speed_test_calls.append(
-            {"download_url": download_url, "timeout_seconds": credentials.timeout_seconds}
+            {
+                "download_url": download_url,
+                "timeout_seconds": credentials.timeout_seconds,
+            }
         )
         if self.speed_test_should_raise is not None:
             raise self.speed_test_should_raise
@@ -581,6 +589,203 @@ class TestIspLinkCrud:
 
 
 # ============================================================================
+# Idempotent provisioning-time registration (bandwidth-monitoring rollout
+# spec, BE track #1): a router's provisioning flow may call this once per
+# WanEntry, and may legitimately do so more than once for the exact same
+# entry (an admin regenerating an already-provisioned router's setup
+# script, a retried request, ...) -- this must never produce a duplicate
+# IspLink for the same real WAN uplink.
+# ============================================================================
+
+
+class TestGetOrCreateLinkForInterface:
+    async def test_creates_a_real_link_when_none_exists_for_the_interface(
+        self,
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link, created = await h.service.get_or_create_link_for_interface(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="WAN 1",
+            link_type=IspLinkType.OTHER.value,
+            role=IspLinkRole.PRIMARY,
+            interface="ether1",
+            gateway_ip_address="203.0.113.1",
+        )
+        assert created is True
+        assert link.interface == "ether1"
+        assert link.router_id == router.id
+        # The real point of Gap 1: this router now has a real row in
+        # isp_links, not zero.
+        stored = await h.repository.list_links_for_router(router.id)
+        assert len(stored) == 1
+        assert stored[0].id == link.id
+
+    async def test_provisioning_a_dual_wan_router_creates_one_link_per_wan_entry(
+        self,
+    ) -> None:
+        """End-to-end simulation of the actual provisioning flow this
+        method exists for: two ``WanEntry``-shaped calls (primary + backup,
+        exactly what ``buildRouterSetupScriptChunks`` already provisions
+        on-device) against a brand new router produce two real IspLink
+        rows -- the router goes live with monitoring from day one instead
+        of the pre-fix behavior of zero."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        wan_entries = [
+            {"iface": "ether1", "mode": "static", "gateway": "203.0.113.1"},
+            {"iface": "ether2", "mode": "dhcp", "gateway": None},
+        ]
+        for idx, wan in enumerate(wan_entries):
+            link, created = await h.service.get_or_create_link_for_interface(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=router.organization_id,
+                router_id=router.id,
+                provider_name=f"WAN {idx + 1}",
+                link_type=IspLinkType.OTHER.value,
+                connection_mode=wan["mode"],
+                role=IspLinkRole.PRIMARY if idx == 0 else IspLinkRole.BACKUP,
+                interface=wan["iface"],
+                gateway_ip_address=wan["gateway"],
+            )
+            assert created is True
+
+        stored = await h.repository.list_links_for_router(router.id)
+        assert len(stored) == 2
+        assert {link.interface for link in stored} == {"ether1", "ether2"}
+        assert {link.role for link in stored} == {
+            IspLinkRole.PRIMARY.value,
+            IspLinkRole.BACKUP.value,
+        }
+        # The first link provisioned is immediately the active uplink --
+        # same "nothing else to fail over from yet" rule create_link
+        # already establishes for a router's very first link.
+        active = [link for link in stored if link.is_active_uplink]
+        assert len(active) == 1
+        assert active[0].interface == "ether1"
+
+    async def test_rerunning_the_same_wan_entry_is_a_true_no_op(self) -> None:
+        """The actual Gap 1 failure mode this guards against: an admin
+        regenerates an already-provisioned router's setup script (or a
+        retried request after a dropped connection resubmits the same
+        payload) -- the second call for the same interface must return the
+        *existing* row, not a duplicate ``BACKUP``."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        first, first_created = await h.service.get_or_create_link_for_interface(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="WAN 1",
+            link_type=IspLinkType.OTHER.value,
+            role=IspLinkRole.PRIMARY,
+            interface="ether1",
+            gateway_ip_address="203.0.113.1",
+        )
+        assert first_created is True
+
+        second, second_created = await h.service.get_or_create_link_for_interface(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="WAN 1",
+            link_type=IspLinkType.OTHER.value,
+            role=IspLinkRole.PRIMARY,
+            interface="ether1",
+            gateway_ip_address="203.0.113.1",
+        )
+        assert second_created is False
+        assert second.id == first.id
+
+        stored = await h.repository.list_links_for_router(router.id)
+        assert len(stored) == 1
+
+    async def test_rerun_never_mutates_a_since_customized_link(self) -> None:
+        """``created=False`` means "found, returned as-is" -- never "found,
+        overwritten with this call's payload." An admin who has since
+        renamed the placeholder "WAN 1" to a real ISP name must not have
+        that silently reverted by a stale re-run of the original
+        provisioning payload."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link, _ = await h.service.get_or_create_link_for_interface(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="WAN 1",
+            link_type=IspLinkType.OTHER.value,
+            role=IspLinkRole.PRIMARY,
+            interface="ether1",
+        )
+        await h.service.update_link(
+            link.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            provider_name="Airtel Fiber",
+        )
+
+        again, created = await h.service.get_or_create_link_for_interface(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="WAN 1",
+            link_type=IspLinkType.OTHER.value,
+            role=IspLinkRole.PRIMARY,
+            interface="ether1",
+        )
+        assert created is False
+        assert again.provider_name == "Airtel Fiber"
+
+    async def test_missing_interface_raises(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        with pytest.raises(IspLinkInterfaceRequiredError):
+            await h.service.get_or_create_link_for_interface(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=router.organization_id,
+                router_id=router.id,
+                provider_name="WAN 1",
+                link_type=IspLinkType.OTHER.value,
+                role=IspLinkRole.PRIMARY,
+                interface=None,
+            )
+        stored = await h.repository.list_links_for_router(router.id)
+        assert stored == []
+
+    async def test_a_genuine_second_primary_on_a_different_interface_still_raises(
+        self,
+    ) -> None:
+        """The interface-dedupe short-circuit only fires for a re-run of
+        the *same* interface -- a real conflicting request (a second,
+        different WAN entry also claiming ``role=primary``) still hits
+        ``create_link``'s own existing-primary guard exactly as it does
+        today."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await h.service.get_or_create_link_for_interface(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="WAN 1",
+            link_type=IspLinkType.OTHER.value,
+            role=IspLinkRole.PRIMARY,
+            interface="ether1",
+        )
+        with pytest.raises(IspPrimaryLinkAlreadyExistsError):
+            await h.service.get_or_create_link_for_interface(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=router.organization_id,
+                router_id=router.id,
+                provider_name="WAN 2",
+                link_type=IspLinkType.OTHER.value,
+                role=IspLinkRole.PRIMARY,
+                interface="ether2",
+            )
+
+
+# ============================================================================
 # Health checks
 # ============================================================================
 
@@ -660,7 +865,9 @@ class TestRunSpeedTest:
                     sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=15.5
                 ),
                 next_speed_test_result=SpeedTestResult(
-                    download_mbps=13.3, downloaded_bytes=9765 * 1024, duration_seconds=6.0
+                    download_mbps=13.3,
+                    downloaded_bytes=9765 * 1024,
+                    duration_seconds=6.0,
                 ),
             )
         )
@@ -693,12 +900,17 @@ class TestRunSpeedTest:
         link = await _create_primary(h, router)
 
         await h.service.run_speed_test(
-            link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+            link.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
         )
 
         assert len(adapter.speed_test_calls) == 1
         assert adapter.speed_test_calls[0]["download_url"] == SPEED_TEST_DOWNLOAD_URL
-        assert adapter.speed_test_calls[0]["timeout_seconds"] == SPEED_TEST_TIMEOUT_SECONDS
+        assert (
+            adapter.speed_test_calls[0]["timeout_seconds"]
+            == SPEED_TEST_TIMEOUT_SECONDS
+        )
 
     async def test_never_writes_an_isp_health_check_row(self) -> None:
         """See run_speed_test's own docstring: download_mbps/upload_mbps on
@@ -709,7 +921,9 @@ class TestRunSpeedTest:
         link = await _create_primary(h, router)
 
         await h.service.run_speed_test(
-            link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+            link.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
         )
 
         checks, meta = await h.repository.list_health_checks_for_link(
@@ -724,14 +938,18 @@ class TestRunSpeedTest:
         actor_id = uuid.uuid4()
 
         await h.service.run_speed_test(
-            link.id, actor_user_id=actor_id, requesting_organization_id=router.organization_id
+            link.id,
+            actor_user_id=actor_id,
+            requesting_organization_id=router.organization_id,
         )
 
         # _create_primary above already wrote its own "isp_link_created"
         # audit entry -- isolate the speed-test action's own entry rather
         # than assuming index/position.
         speed_test_entries = [
-            e for e in h.audit_writer.entries if e["action"] == "isp_link_speed_test_run"
+            e
+            for e in h.audit_writer.entries
+            if e["action"] == "isp_link_speed_test_run"
         ]
         assert len(speed_test_entries) == 1
         entry = speed_test_entries[0]
@@ -750,7 +968,9 @@ class TestRunSpeedTest:
         )
         with pytest.raises(IspLinkDisabledError):
             await h.service.run_speed_test(
-                link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+                link.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
             )
 
     async def test_missing_credentials_raises(self) -> None:
@@ -760,7 +980,9 @@ class TestRunSpeedTest:
         link = await _create_primary(h, router)
         with pytest.raises(IspMissingCredentialsError):
             await h.service.run_speed_test(
-                link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+                link.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
             )
 
     async def test_real_fetch_failure_propagates(self) -> None:
@@ -775,7 +997,9 @@ class TestRunSpeedTest:
         link = await _create_primary(h, router)
         with pytest.raises(IspDeviceConnectionError):
             await h.service.run_speed_test(
-                link.id, actor_user_id=None, requesting_organization_id=router.organization_id
+                link.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
             )
 
     async def test_cross_organization_access_raises(self) -> None:
@@ -1885,7 +2109,9 @@ class TestHealthCheckSweep:
         repository.links[link.id] = link
 
         adapter = FakeIspHealthAdapter(
-            should_raise=IspDeviceConnectionError(router.management_ip_address, "no route to host")
+            should_raise=IspDeviceConnectionError(
+                router.management_ip_address, "no route to host"
+            )
         )
         summary = await run_health_check_sweep(
             repository,
@@ -1915,8 +2141,10 @@ class TestEveryRouteRequiresPermission:
         # + POST /links/{link_id}/speed-test (on-demand real speed test,
         # see IspService.run_speed_test)
         # + PUT /routers/{router_id}/wan-routing-mode (see
-        # IspService.set_wan_routing_mode).
-        assert len(isp_router.routes) == 13
+        # IspService.set_wan_routing_mode)
+        # + POST /links/get-or-create (idempotent provisioning-time
+        # registration, see IspService.get_or_create_link_for_interface).
+        assert len(isp_router.routes) == 14
         for route in isp_router.routes:
             assert (
                 route.dependencies != []

@@ -46,6 +46,7 @@ from .schemas import (
     IspHealthCheckResponse,
     IspHealthCheckSummaryResponse,
     IspLinkCreateRequest,
+    IspLinkGetOrCreateResponse,
     IspLinkListResponse,
     IspLinkManualStatusRequest,
     IspLinkResponse,
@@ -187,6 +188,53 @@ async def create_isp_link(
     )
 
 
+@router.post(
+    "/links/get-or-create",
+    response_model=ApiResponse[IspLinkGetOrCreateResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("isp.create"))],
+)
+async def get_or_create_isp_link(
+    request: Request,
+    payload: IspLinkCreateRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: IspService = Depends(get_isp_service),
+):
+    """Idempotent registration by ``(router_id, interface)`` -- the real
+    entry point for automated callers (router provisioning first among
+    them) that may legitimately run the same "register this WAN as an ISP
+    link" step more than once. See ``IspService
+    .get_or_create_link_for_interface``'s own docstring for the full
+    dedupe contract. Always returns ``200`` (not ``201``) -- a repeat call
+    that finds an existing link is a success, not a creation."""
+    link, created = await service.get_or_create_link_for_interface(
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+        router_id=uuid.UUID(payload.router_id),
+        provider_name=payload.provider_name,
+        link_type=payload.link_type,
+        connection_mode=payload.connection_mode,
+        role=IspLinkRole(payload.role),
+        priority=payload.priority,
+        interface=payload.interface,
+        gateway_ip_address=payload.gateway_ip_address,
+        dns_primary=payload.dns_primary,
+        dns_secondary=payload.dns_secondary,
+        download_bandwidth_mbps=payload.download_bandwidth_mbps,
+        upload_bandwidth_mbps=payload.upload_bandwidth_mbps,
+        auto_failback=payload.auto_failback,
+    )
+    return build_response(
+        success=True,
+        message="ISP link registered" if created else "ISP link already registered",
+        data=IspLinkGetOrCreateResponse(
+            link=_link_response(link), created=created
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
 @router.get(
     "/links",
     response_model=ApiResponse[IspLinkListResponse],
@@ -208,7 +256,9 @@ async def list_isp_links(
         page_size=page_size,
     )
     items = [
-        _link_response(link, unhealthy_since=await service.compute_unhealthy_since(link))
+        _link_response(
+            link, unhealthy_since=await service.compute_unhealthy_since(link)
+        )
         for link in links
     ]
     payload = IspLinkListResponse(items=items, **_pagination_fields(meta))
