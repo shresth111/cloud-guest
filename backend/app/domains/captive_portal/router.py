@@ -449,6 +449,7 @@ async def resolve_captive_portal_config(
             timezone=resolved.config.business_hours_timezone,
             schedule=resolved.config.business_hours_schedule,
         ),
+        location_country=resolved.location_country,
     )
     return build_response(
         success=True,

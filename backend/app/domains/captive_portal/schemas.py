@@ -254,3 +254,20 @@ class ResolvedCaptivePortalConfigResponse(CaptivePortalConfigResponse):
     # Computed live at resolve time (validators.is_open_now), never a
     # stored column -- see that function's own docstring.
     is_open_now: bool
+    location_country: str | None = Field(
+        default=None,
+        description=(
+            "The resolved location's own ISO 3166-1 alpha-2 country "
+            "(app.domains.location.models.Location.country), e.g. 'IN' or "
+            "'US' -- NOT a phone dialing/calling code. None when this "
+            "config was resolved by organization_id alone (no location "
+            "context to source a country from). A real, admin-entered "
+            "physical-address field, strictly more reliable than "
+            "default_language for defaulting a guest-facing OTP phone "
+            "field's country-calling-code prefix (e.g. 'IN' -> +91) -- "
+            "see v4 captive-portal design spec §6.3. The frontend owns "
+            "the alpha-2 -> dialing-code mapping; this field intentionally "
+            "returns the raw ISO country, not a pre-computed '+91' string, "
+            "so the mapping stays a presentation concern."
+        ),
+    )

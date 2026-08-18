@@ -150,10 +150,24 @@ class ResolvedPortalConfig:
     """Wraps the resolved config together with which tier answered the
     lookup -- useful for the guest-facing response/tests to assert
     resolution actually preferred the location override when both exist,
-    without re-deriving it from the raw row."""
+    without re-deriving it from the raw row.
+
+    ``location_country`` is the resolved location's own ``Location.country``
+    (ISO 3166-1 alpha-2, e.g. ``"IN"``/``"US"``) -- **not** a phone dialing
+    code -- piggybacked off the exact same ``location_lookup.get_location``
+    call ``resolve_portal_config`` already makes to derive
+    ``organization_id`` from a location, so this costs no extra query.
+    ``None`` whenever the caller resolved by ``organization_id`` alone (no
+    location context exists to source a country from) -- see v4 captive-
+    portal design spec §6.3: this is the real signal a guest-facing OTP
+    phone field should derive its default calling code from, a materially
+    better source than the config's own ``default_language`` (a language,
+    not a country -- ambiguous for e.g. English-speaking deployments
+    outside the US)."""
 
     config: CaptivePortalConfig
     resolved_via_location_override: bool
+    location_country: str | None = None
 
 
 # ============================================================================
@@ -497,17 +511,21 @@ class CaptivePortalService:
             raise MissingPortalResolutionParamsError()
 
         resolved_organization_id = organization_id
+        location_country: str | None = None
         if location_id is not None:
             location = await self.location_lookup.get_location(
                 location_id, requesting_organization_id=organization_id
             )
             resolved_organization_id = location.organization_id
+            location_country = location.country
             location_config = await self.repository.find_active_for_location(
                 resolved_organization_id, location_id
             )
             if location_config is not None:
                 return ResolvedPortalConfig(
-                    config=location_config, resolved_via_location_override=True
+                    config=location_config,
+                    resolved_via_location_override=True,
+                    location_country=location_country,
                 )
         else:
             # organization_id is guaranteed non-None here by the guard
@@ -520,7 +538,9 @@ class CaptivePortalService:
         )
         if org_default is not None:
             return ResolvedPortalConfig(
-                config=org_default, resolved_via_location_override=False
+                config=org_default,
+                resolved_via_location_override=False,
+                location_country=location_country,
             )
         raise CaptivePortalConfigNotConfiguredError(resolved_organization_id)
 
