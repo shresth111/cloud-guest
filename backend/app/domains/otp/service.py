@@ -266,12 +266,21 @@ class LoggingSmsProvider:
     full log/DB access -- could ever read a code back once generated (the
     DB only ever stores ``hash_otp_code(code)``, one-way, same as a
     password); that made "logging mode" silently unusable as an actual
-    fallback rather than the honest one its own docstring claims to be."""
+    fallback rather than the honest one its own docstring claims to be.
+
+    The logged field is named ``sms_message``, not ``message`` --
+    ``logging.Logger.makeRecord`` hard-rejects an ``extra`` key literally
+    named ``message`` (and ``asctime``) with a ``KeyError``, since
+    ``LogRecord`` assigns its own ``message`` attribute during formatting;
+    passing that key crashed this call (and therefore every ``send``,
+    i.e. every SMS OTP dispatch through this provider) the moment the
+    root logger's level actually let an INFO record through, which is
+    exactly production's configured level."""
 
     async def send(self, phone_number: str, message: str) -> None:
         logger.info(
             "otp_sms_would_send",
-            extra={"phone_number": phone_number, "message": message},
+            extra={"phone_number": phone_number, "sms_message": message},
         )
 
 
@@ -306,12 +315,21 @@ class LoggingWhatsAppProvider:
     ``LoggingSmsProvider``/``LoggingEmailProvider`` above (including
     logging the full message/code, not just a length -- see
     ``LoggingSmsProvider``'s own docstring for why), and the default for a
-    fresh checkout (``Settings.whatsapp_delivery_provider == 'logging'``)."""
+    fresh checkout (``Settings.whatsapp_delivery_provider == 'logging'``).
+
+    The logged field is named ``whatsapp_message``, not ``message`` --
+    see ``LoggingSmsProvider``'s own docstring for why the bare key
+    ``message`` in ``extra`` crashes ``logging.Logger.makeRecord`` with a
+    ``KeyError`` (this provider had the identical bug)."""
 
     async def send(self, phone_number: str, *, code: str, message: str) -> None:
         logger.info(
             "otp_whatsapp_would_send",
-            extra={"phone_number": phone_number, "code": code, "message": message},
+            extra={
+                "phone_number": phone_number,
+                "code": code,
+                "whatsapp_message": message,
+            },
         )
 
 
