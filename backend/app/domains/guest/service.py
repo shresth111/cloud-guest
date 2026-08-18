@@ -1479,7 +1479,7 @@ class GuestService:
         device = await self._maybe_get_or_create_device(
             guest_id=guest.id, mac_address=device_mac, device_name=device_name
         )
-        session = await self._create_session(
+        session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
             router=router,
@@ -1492,25 +1492,27 @@ class GuestService:
             data_limit_mb=None,
             session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
         )
-        # BE-011 Part 3: additive, best-effort real-time broadcast -- see
-        # GuestService's own docstring. Fires only after the real session
-        # row above already exists.
-        await self._broadcast_guest_session_started(
-            session=session,
-            guest=guest,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-            auth_method=auth_method.value,
-            is_new_guest=is_new,
-        )
-        await self._assign_guest_queue(
-            session=session,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-        )
-        await self._bump_guest_visit(guest)
+        if created:
+            # BE-011 Part 3: additive, best-effort real-time broadcast --
+            # see GuestService's own docstring. Fires only after the real
+            # session row above already exists. Skipped on a reused
+            # session -- see _reuse_or_create_session's own docstring.
+            await self._broadcast_guest_session_started(
+                session=session,
+                guest=guest,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+                auth_method=auth_method.value,
+                is_new_guest=is_new,
+            )
+            await self._assign_guest_queue(
+                session=session,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+            )
+            await self._bump_guest_visit(guest)
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -1609,7 +1611,7 @@ class GuestService:
             guest_id=guest.id, mac_address=device_mac, device_name=device_name
         )
         # Copied, not referenced -- see module docstring.
-        session = await self._create_session(
+        session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
             router=router,
@@ -1622,34 +1624,37 @@ class GuestService:
             data_limit_mb=batch.data_limit_mb,
             session_timeout_minutes=batch.validity_minutes,
         )
-        # BE-011 Part 3: additive, best-effort real-time broadcast -- see
-        # GuestService's own docstring. Fires only after the real session
-        # row above already exists.
-        await self._broadcast_guest_session_started(
-            session=session,
-            guest=guest,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-            auth_method=GuestAuthMethod.VOUCHER.value,
-            is_new_guest=is_new,
-        )
-        await self._assign_guest_queue(
-            session=session,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-        )
-        # Phase 1 BhaiFi-parity: additive, best-effort speed-linked voucher
-        # assignment -- see _assign_voucher_queue's own docstring.
-        await self._assign_voucher_queue(
-            voucher=voucher,
-            session=session,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-        )
-        await self._bump_guest_visit(guest)
+        if created:
+            # BE-011 Part 3: additive, best-effort real-time broadcast --
+            # see GuestService's own docstring. Fires only after the real
+            # session row above already exists. Skipped on a reused
+            # session -- see _reuse_or_create_session's own docstring.
+            await self._broadcast_guest_session_started(
+                session=session,
+                guest=guest,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+                auth_method=GuestAuthMethod.VOUCHER.value,
+                is_new_guest=is_new,
+            )
+            await self._assign_guest_queue(
+                session=session,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+            )
+            # Phase 1 BhaiFi-parity: additive, best-effort speed-linked
+            # voucher assignment -- see _assign_voucher_queue's own
+            # docstring.
+            await self._assign_voucher_queue(
+                voucher=voucher,
+                session=session,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+            )
+            await self._bump_guest_visit(guest)
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -1763,7 +1768,7 @@ class GuestService:
         device = await self._maybe_get_or_create_device(
             guest_id=guest.id, mac_address=device_mac, device_name=device_name
         )
-        session = await self._create_session(
+        session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
             router=router,
@@ -1776,22 +1781,23 @@ class GuestService:
             data_limit_mb=None,
             session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
         )
-        await self._broadcast_guest_session_started(
-            session=session,
-            guest=guest,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-            auth_method=GuestAuthMethod.USERNAME_PASSWORD.value,
-            is_new_guest=False,
-        )
-        await self._assign_guest_queue(
-            session=session,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-        )
-        await self._bump_guest_visit(guest)
+        if created:
+            await self._broadcast_guest_session_started(
+                session=session,
+                guest=guest,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+                auth_method=GuestAuthMethod.USERNAME_PASSWORD.value,
+                is_new_guest=False,
+            )
+            await self._assign_guest_queue(
+                session=session,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+            )
+            await self._bump_guest_visit(guest)
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -2031,7 +2037,7 @@ class GuestService:
         if device_name is not None:
             device_update["device_name"] = device_name
         device = await self.repository.update_device(device, device_update)
-        session = await self._create_session(
+        session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
             router=router,
@@ -2044,22 +2050,23 @@ class GuestService:
             data_limit_mb=None,
             session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
         )
-        await self._broadcast_guest_session_started(
-            session=session,
-            guest=guest,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-            auth_method=GuestAuthMethod.PIN.value,
-            is_new_guest=False,
-        )
-        await self._assign_guest_queue(
-            session=session,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-        )
-        await self._bump_guest_visit(guest)
+        if created:
+            await self._broadcast_guest_session_started(
+                session=session,
+                guest=guest,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+                auth_method=GuestAuthMethod.PIN.value,
+                is_new_guest=False,
+            )
+            await self._assign_guest_queue(
+                session=session,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+            )
+            await self._bump_guest_visit(guest)
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -2185,7 +2192,7 @@ class GuestService:
             mac_address=normalized_mac,
             device_name="Whitelisted device",
         )
-        session = await self._create_session(
+        session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
             router=router,
@@ -2198,22 +2205,23 @@ class GuestService:
             data_limit_mb=None,
             session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
         )
-        await self._broadcast_guest_session_started(
-            session=session,
-            guest=guest,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-            auth_method=GuestAuthMethod.MAC_WHITELIST.value,
-            is_new_guest=is_new,
-        )
-        await self._assign_guest_queue(
-            session=session,
-            router=router,
-            location_id=location_id,
-            organization_id=resolved_org_id,
-        )
-        await self._bump_guest_visit(guest)
+        if created:
+            await self._broadcast_guest_session_started(
+                session=session,
+                guest=guest,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+                auth_method=GuestAuthMethod.MAC_WHITELIST.value,
+                is_new_guest=is_new,
+            )
+            await self._assign_guest_queue(
+                session=session,
+                router=router,
+                location_id=location_id,
+                organization_id=resolved_org_id,
+            )
+            await self._bump_guest_visit(guest)
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -2666,7 +2674,9 @@ class GuestService:
         ``ProvisioningCheckInRequest.wireguard_public_key``'s docstring).
         Returns ``None`` -- not an error -- when no device/active session
         matches, exactly like a normal first-time visit."""
-        device = await self.repository.get_device_by_mac(normalize_mac_address(device_mac))
+        device = await self.repository.get_device_by_mac(
+            normalize_mac_address(device_mac)
+        )
         if device is None:
             return None
         sessions, _ = await self.repository.list_sessions(
@@ -3554,6 +3564,147 @@ class GuestService:
         )
         logger.info("guest_session_created", extra=_event_extra(event))
         return session
+
+    async def _find_reusable_active_session(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        router_id: uuid.UUID,
+        device_id: uuid.UUID | None,
+    ) -> GuestSession | None:
+        """Whether ``guest_id`` already holds a currently-``ACTIVE`` session
+        for ``device_id`` on ``router_id`` -- checked by every guest
+        self-service login method (``login_via_otp``/``_voucher``/
+        ``_password``/``_pin``/``_mac_whitelist``, via
+        ``_reuse_or_create_session`` below) immediately before it would
+        otherwise insert a new row. Mirrors the exact "an already-connected
+        identity re-authenticating is a no-op, not a new row" precedent
+        this module already establishes in two other places:
+        ``RadiusService._find_active_session_for_identifier`` (which every
+        RADIUS Authorize reauth is checked against) and
+        ``GuestService.reconnect``'s own "idempotent -- already connected,
+        no duplicate session" early return.
+
+        Real production gap this closes: unlike those two call sites, none
+        of the five login methods ever checked this before -- confirmed
+        live against a real guest+router (18 ``GuestSession`` rows for one
+        guest across ~6.5 hours, several only 7-13 minutes long). A
+        duplicate/near-simultaneous login submission -- a captive-portal
+        tab remounting and re-POSTing before its own client-side cooldown
+        window, two open tabs, a guest double-tapping "Verify", RouterOS
+        reissuing a fresh hotspot redirect while the prior one is still
+        mid-flight -- always inserted a second, fully redundant ``ACTIVE``
+        row for a guest who, by every measure this platform already
+        tracks (``GuestSession.status``), never actually disconnected.
+
+        **Requires a real ``device_id`` match, deliberately not just
+        ``guest_id``+``router_id``.** A guest legitimately holds more than
+        one concurrent device on the very same router at once (a phone
+        *and* a laptop both connected right now -- exactly what
+        ``DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` exists to bound, not
+        forbid); collapsing every login for that guest+router down to
+        whichever single session happened to be "latest" would wrongly
+        merge two genuinely distinct devices' histories into one row, or
+        silently reattach an existing session to the wrong device. No
+        ``device_id`` at all (a login that never presented a MAC) always
+        creates a new row, exactly as before this change -- there is no
+        safe way to disambiguate concurrent devices without one.
+
+        Deliberately narrow in one more way: only ever returns an
+        already-``ACTIVE`` session, never one that has already moved to a
+        terminal status (``DISCONNECTED``/``TERMINATED``/``EXPIRED``) --
+        this does **not** touch this module's append-only design (see
+        ``models.py``'s "Sessions are append-only" write-up). A
+        genuinely-ended session, even one that ended moments ago, still
+        gets a new row on the next login -- exactly as today -- because
+        collapsing *that* case would mean silently resurrecting or
+        backdating a closed accounting interval, which is a real
+        correctness (not just a noise) problem for anything downstream
+        that trusts a session's own started_at/ended_at/bytes_* as one
+        true, closed connection interval (FUP accrual, Bandwidth & Cost
+        reporting, voucher redemption history). That class of
+        fragmentation -- many short but genuinely sequential,
+        non-overlapping disconnect/reconnect cycles -- is a display
+        concern, handled by the Connected Guests table grouping sessions
+        with a short gap between them, not by this method."""
+        if device_id is None:
+            return None
+        active_sessions = await self.repository.list_active_sessions_for_guest(guest_id)
+        for candidate in active_sessions:
+            if candidate.router_id == router_id and candidate.device_id == device_id:
+                return candidate
+        return None
+
+    async def _reuse_or_create_session(
+        self,
+        *,
+        guest: Guest,
+        device: GuestDevice | None,
+        router: Router,
+        location_id: uuid.UUID,
+        auth_method: GuestAuthMethod,
+        voucher_id: uuid.UUID | None,
+        ip_address: str | None,
+        user_agent: str | None,
+        accept_language: str | None,
+        data_limit_mb: int | None,
+        session_timeout_minutes: int | None,
+    ) -> tuple[GuestSession, bool]:
+        """Shared by every guest self-service login method: returns
+        ``(session, created)``, where ``created`` is ``False`` when an
+        already-``ACTIVE`` session for this exact ``guest``+``router``+
+        ``device`` (see ``_find_reusable_active_session``) was reused in
+        place of inserting a duplicate row. A reused session's
+        ``last_activity_at`` is bumped to now (the same freshness signal a
+        real RADIUS Interim-Update would give it), its ``ip_address`` is
+        refreshed when this login presented a different one (e.g. a new
+        DHCP lease on the same physical device), and its ``auth_method``/
+        ``data_limit_mb``/``session_timeout_minutes``/``voucher_id`` are
+        refreshed to whatever *this* login just granted -- e.g. a guest
+        who sets up Portal PIN login and later re-authenticates via PIN
+        while their original OTP session is still technically active
+        should see that session's own auth_method reflect the login they
+        actually just did, and a guest who redeems a fresh, more generous
+        voucher while an old session from an earlier OTP login is still
+        active should get that voucher's real entitlement applied, not
+        have it silently discarded because a row already existed. Callers
+        must skip their own "new session"
+        side effects (real-time broadcast, queue assignment, visit-count
+        bump) when ``created`` is ``False`` -- those already ran for this
+        same still-open session."""
+        reusable = await self._find_reusable_active_session(
+            guest_id=guest.id,
+            router_id=router.id,
+            device_id=device.id if device is not None else None,
+        )
+        if reusable is not None:
+            update_data: dict[str, object] = {
+                "last_activity_at": datetime.now(UTC),
+                "data_limit_mb": data_limit_mb,
+                "session_timeout_minutes": session_timeout_minutes,
+            }
+            if reusable.auth_method != auth_method.value:
+                update_data["auth_method"] = auth_method.value
+            if ip_address is not None and reusable.ip_address != ip_address:
+                update_data["ip_address"] = ip_address
+            if voucher_id is not None and reusable.voucher_id != voucher_id:
+                update_data["voucher_id"] = voucher_id
+            reused = await self.repository.update_session(reusable, update_data)
+            return reused, False
+        session = await self._create_session(
+            guest=guest,
+            device=device,
+            router=router,
+            location_id=location_id,
+            auth_method=auth_method,
+            voucher_id=voucher_id,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            accept_language=accept_language,
+            data_limit_mb=data_limit_mb,
+            session_timeout_minutes=session_timeout_minutes,
+        )
+        return session, True
 
     async def _bump_guest_visit(self, guest: Guest) -> Guest:
         now = datetime.now(UTC)
