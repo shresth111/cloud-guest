@@ -105,15 +105,46 @@ for entry in "${ROUTERS[@]}"; do
   # that must land atomically lives in one remote script string:
   #   1. clear any stale intermediate/root artifacts from a PRIOR renewal
   #      (they keep the ephemeral "<file>_1"/"<file>_2" names every import
-  #      of the same filename reuses, so they'd collide otherwise)
-  #   2. import the fresh fullchain (leaf+intermediate+root, 3 objects) +
-  #      privkey
+  #      of the same filename reuses, so they'd collide otherwise), AND any
+  #      stale stable "<name>-chain-N" objects from a prior round (step 7)
+  #   2. import the fresh fullchain (leaf+intermediate(s), 2-3+ objects,
+  #      depending on how many CAs are in Let's Encrypt's current chain --
+  #      do not assume exactly 3) + privkey
   #   3. rename+trust the new leaf under a NOT-yet-bound temp name, so the
   #      currently-live cert is never deleted while still referenced
   #   4. rebind hsprof1 to the new leaf (ssl-certificate + login-by together)
   #   5. only now remove the old leaf (safe: nothing references it anymore)
   #   6. rename the new leaf onto the stable name for next round
+  #   7. rename EVERY remaining fullchain.pem_N object (the intermediate(s)
+  #      -- whatever RouterOS didn't already dedupe against an existing
+  #      identical object) onto a stable "<name>-chain-N" name and mark
+  #      trusted=yes. This step is the fix for a real incident (2026-08-18):
+  #      an earlier version of this script deleted these via the SAME
+  #      broad "remove [find name~...fullchain.pem]" sweep now used only in
+  #      step 1, but run a second time at the very end -- which, by then,
+  #      only matched the still-ephemerally-named intermediate/root objects
+  #      (the leaf had already been renamed away in step 3) and deleted
+  #      them right after importing them. RouterOS's hotspot TLS server
+  #      builds the served chain dynamically from whatever trusted
+  #      certificate objects are present in the store and issuer-link
+  #      (skid/akid) to the bound leaf -- it does NOT require an explicit
+  #      `ca=` field, but it very much requires the intermediate object to
+  #      still exist. Losing it meant the router kept serving the leaf
+  #      alone: genuinely Let's-Encrypt-issued, chain-of-trust verifiable
+  #      offline, but incomplete on the wire -- exactly the shape of gap
+  #      strict/embedded TLS clients (no AIA fetching) reject outright while
+  #      full desktop browsers often paper over. Confirmed via
+  #      `/certificate print detail` (only one object for the new cert, no
+  #      matching intermediate, orphaned `akid`) and fixed live by
+  #      re-importing just the missing chain certs (RouterOS deduped the
+  #      already-present leaf automatically) without ever touching the
+  #      already-bound, already-working leaf/hsprof1 binding.
+  #   8. final sweep of the ephemeral fullchain.pem_* pattern -- by this
+  #      point everything wanted has already been renamed off that pattern
+  #      in steps 3 and 7, so this is a true no-op safety net, not a
+  #      deletion mechanism (unlike the bug this replaces).
   REMOTE_SCRIPT="/certificate remove [find name~\"${RCERTNAME}.fullchain.pem\"];
+/certificate remove [find name~\"${RCERTNAME}-chain-\"];
 /certificate import file-name=${UP_FULLCHAIN} passphrase=\"\";
 /certificate import file-name=${UP_PRIVKEY} passphrase=\"\";
 :delay 1s;
@@ -122,6 +153,7 @@ for entry in "${ROUTERS[@]}"; do
 :delay 1s;
 /certificate remove [find name=\"${RCERTNAME}\"];
 /certificate set [find name=\"${RCERTNAME}-new\"] name=\"${RCERTNAME}\";
+:local chainIdx 1; :foreach chainCert in=[/certificate find name~\"${RCERTNAME}.fullchain.pem\"] do={ :local newName (\"${RCERTNAME}-chain-\" . \$chainIdx); /certificate set \$chainCert name=\$newName trusted=yes; :set chainIdx (\$chainIdx + 1); }
 /certificate remove [find name~\"${RCERTNAME}.fullchain.pem\"]"
 
   if ! SSHPASS="$ROUTER_SSH_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=accept-new \
