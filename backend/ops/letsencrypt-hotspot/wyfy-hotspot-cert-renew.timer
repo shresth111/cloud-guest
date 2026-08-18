@@ -1,0 +1,11 @@
+[Unit]
+Description=Run wyfy-hotspot-cert-renew twice daily (mirrors this VM's own certbot.timer cadence)
+
+[Timer]
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=30m
+Persistent=true
+AccuracySec=5m
+
+[Install]
+WantedBy=timers.target

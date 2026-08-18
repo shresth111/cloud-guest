@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew wyfy-hotspot-fleet Let's Encrypt cert (DNS-01/GoDaddy) and push to router fleet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/wyfy/renew-hotspot-certs.sh
