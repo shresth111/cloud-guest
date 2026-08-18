@@ -19,6 +19,7 @@ provider protocols.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -42,6 +43,8 @@ from app.domains.otp.exceptions import (
 )
 from app.domains.otp.models import OtpRequest
 from app.domains.otp.service import (
+    LoggingEmailProvider,
+    LoggingSmsProvider,
     LoggingWhatsAppProvider,
     OtpRateLimiter,
     OtpService,
@@ -688,12 +691,6 @@ class TestProviderInvocation:
         the honest LoggingSmsProvider/LoggingEmailProvider/
         LoggingWhatsAppProvider default -- see service.py's module
         docstring for why no real provider exists."""
-        from app.domains.otp.service import (
-            LoggingEmailProvider,
-            LoggingSmsProvider,
-            LoggingWhatsAppProvider,
-        )
-
         service = OtpService(FakeOtpRepository(), FakeRedis())
         assert isinstance(service.sms_provider, LoggingSmsProvider)
         assert isinstance(service.email_provider, LoggingEmailProvider)
@@ -706,6 +703,119 @@ class TestProviderInvocation:
         await service.whatsapp_provider.send(
             "+15551234567", code="042817", message="hello"
         )
+
+
+# ============================================================================
+# Logging-provider `extra=` LogRecord-collision regression
+#
+# `logging.Logger.makeRecord` hard-rejects an `extra` key literally named
+# `message` (or `asctime`) with a `KeyError` -- `LogRecord` assigns its own
+# `message` attribute during formatting, so a caller-supplied `extra` key of
+# the same name collides. `LoggingSmsProvider.send`/`LoggingWhatsAppProvider
+# .send` both passed `extra={..., "message": message}` and crashed on every
+# call once the root logger's effective level actually let an INFO record
+# through -- exactly production's configured `CLOUDGUEST_LOG_LEVEL=INFO`.
+#
+# The collision is invisible unless the logger's effective level enables
+# INFO (a disabled `logger.info()` call short-circuits before touching
+# `makeRecord` at all -- see `Logger.isEnabledFor`), which is why the
+# existing `test_default_providers_are_the_logging_providers` test above
+# didn't catch this: pytest's default logger level is WARNING. Every test
+# below pins the level to INFO via `caplog.set_level` specifically so the
+# crash path is actually exercised, not accidentally skipped.
+# ============================================================================
+
+
+class TestLoggingProviderLogRecordSafety:
+    async def test_logging_sms_provider_send_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="app.domains.otp.service")
+        provider = LoggingSmsProvider()
+
+        await provider.send("+15551234567", "Your Wyfy Guest code is 042817.")
+
+        [record] = [r for r in caplog.records if r.message == "otp_sms_would_send"]
+        assert record.phone_number == "+15551234567"
+        assert record.sms_message == "Your Wyfy Guest code is 042817."
+
+    async def test_logging_whatsapp_provider_send_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="app.domains.otp.service")
+        provider = LoggingWhatsAppProvider()
+
+        await provider.send(
+            "+15551234567",
+            code="042817",
+            message="Your Wyfy Guest code is 042817.",
+        )
+
+        [record] = [r for r in caplog.records if r.message == "otp_whatsapp_would_send"]
+        assert record.phone_number == "+15551234567"
+        assert record.code == "042817"
+        assert record.whatsapp_message == "Your Wyfy Guest code is 042817."
+
+    async def test_logging_email_provider_send_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """LoggingEmailProvider never used the colliding `message` key --
+        this is a same-shape regression guard, not evidence of a second
+        bug, so a future edit to its `extra=` block can't reintroduce one
+        without this test catching it."""
+        caplog.set_level(logging.INFO, logger="app.domains.otp.service")
+        provider = LoggingEmailProvider()
+
+        await provider.send("guest@example.com", "Your code", "<p>042817</p>")
+
+        [record] = [r for r in caplog.records if r.message == "otp_email_would_send"]
+        assert record.email == "guest@example.com"
+        assert record.subject == "Your code"
+        assert record.body == "<p>042817</p>"
+
+    async def test_otp_request_via_sms_does_not_raise_end_to_end(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The actual guest-facing path this bug broke in production:
+        `OtpService.request_otp` over the SMS channel with the real
+        default `LoggingSmsProvider` (no override) -- reproduces
+        production's `CLOUDGUEST_SMS_DELIVERY_PROVIDER=logging` /
+        `CLOUDGUEST_LOG_LEVEL=INFO` configuration end-to-end rather than
+        only unit-testing the provider in isolation."""
+        caplog.set_level(logging.INFO, logger="app.domains.otp.service")
+        service = OtpService(FakeOtpRepository(), FakeRedis())
+        assert isinstance(service.sms_provider, LoggingSmsProvider)
+
+        otp_request = await service.request_otp(
+            identifier="+15551234567",
+            channel=OtpChannel.SMS,
+            purpose=OtpPurpose.GUEST_LOGIN,
+            organization_id=None,
+            location_id=None,
+        )
+
+        assert otp_request is not None
+        assert any(r.message == "otp_sms_would_send" for r in caplog.records)
+
+    async def test_otp_request_via_whatsapp_does_not_raise_end_to_end(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Same as above, for the WhatsApp channel's real default
+        `LoggingWhatsAppProvider`."""
+        caplog.set_level(logging.INFO, logger="app.domains.otp.service")
+        service = OtpService(FakeOtpRepository(), FakeRedis())
+        assert isinstance(service.whatsapp_provider, LoggingWhatsAppProvider)
+
+        otp_request = await service.request_otp(
+            identifier="+15551234567",
+            channel=OtpChannel.WHATSAPP,
+            purpose=OtpPurpose.GUEST_LOGIN,
+            organization_id=None,
+            location_id=None,
+        )
+
+        assert otp_request is not None
+        assert any(r.message == "otp_whatsapp_would_send" for r in caplog.records)
 
 
 # ============================================================================
