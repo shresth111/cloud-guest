@@ -36,8 +36,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0087_add_guest_font_choice_and_overlay_strength"
-down_revision = "0086_create_channel_partners_table"
+revision = "0088_add_guest_font_choice_and_overlay_strength"
+down_revision = "0087_add_lead_qualification_fields_to_demo_requests"
 branch_labels = None
 depends_on = None
 
