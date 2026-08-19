@@ -7,12 +7,10 @@ not a new data store.
 
 from __future__ import annotations
 
-import uuid
 import logging
-from typing import Any
+import uuid
 
 from app.domains.guest.service import GuestService
-from app.domains.guest.repository import GuestRepositoryProtocol
 from app.domains.rbac.service import RBACService
 
 from .schemas import LiveSession, LiveSessionListResponse, SessionActionResponse

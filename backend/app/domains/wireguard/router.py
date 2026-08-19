@@ -165,7 +165,9 @@ async def get_wireguard_peer(
     response_model=ApiResponse[WireGuardTunnelCreateResponse],
     status_code=status.HTTP_201_CREATED,
     # See get_wireguard_peer's own comment -- GLOBAL scope only.
-    dependencies=[Depends(RequirePermission("wireguard.create", scope=ScopeType.GLOBAL))],
+    dependencies=[
+        Depends(RequirePermission("wireguard.create", scope=ScopeType.GLOBAL))
+    ],
 )
 async def create_wireguard_peer(
     request: Request,
@@ -199,7 +201,9 @@ async def create_wireguard_peer(
     response_model=ApiResponse[WireGuardPeerResponse],
     status_code=status.HTTP_201_CREATED,
     # See get_wireguard_peer's own comment -- GLOBAL scope only.
-    dependencies=[Depends(RequirePermission("wireguard.create", scope=ScopeType.GLOBAL))],
+    dependencies=[
+        Depends(RequirePermission("wireguard.create", scope=ScopeType.GLOBAL))
+    ],
 )
 async def register_external_wireguard_peer(
     request: Request,
@@ -235,7 +239,9 @@ async def register_external_wireguard_peer(
     response_model=ApiResponse[WireGuardTunnelCreateResponse],
     status_code=status.HTTP_201_CREATED,
     # See get_wireguard_peer's own comment -- GLOBAL scope only.
-    dependencies=[Depends(RequirePermission("wireguard.create", scope=ScopeType.GLOBAL))],
+    dependencies=[
+        Depends(RequirePermission("wireguard.create", scope=ScopeType.GLOBAL))
+    ],
 )
 async def allocate_external_wireguard_peer(
     request: Request,
@@ -298,7 +304,9 @@ async def allocate_external_wireguard_peer(
     response_model=ApiResponse[MessageResponse],
     status_code=status.HTTP_200_OK,
     # See get_wireguard_peer's own comment -- GLOBAL scope only.
-    dependencies=[Depends(RequirePermission("wireguard.delete", scope=ScopeType.GLOBAL))],
+    dependencies=[
+        Depends(RequirePermission("wireguard.delete", scope=ScopeType.GLOBAL))
+    ],
 )
 async def revoke_wireguard_peer(
     request: Request,
@@ -325,7 +333,9 @@ async def revoke_wireguard_peer(
     response_model=ApiResponse[WireGuardTunnelRotateResponse],
     status_code=status.HTTP_200_OK,
     # See get_wireguard_peer's own comment -- GLOBAL scope only.
-    dependencies=[Depends(RequirePermission("wireguard.execute", scope=ScopeType.GLOBAL))],
+    dependencies=[
+        Depends(RequirePermission("wireguard.execute", scope=ScopeType.GLOBAL))
+    ],
 )
 async def rotate_wireguard_peer(
     request: Request,

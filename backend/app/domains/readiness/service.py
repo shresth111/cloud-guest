@@ -74,7 +74,9 @@ class WireGuardLookupProtocol(Protocol):
         self, *, router_id: uuid.UUID, requesting_organization_id: uuid.UUID | None
     ) -> Any: ...
 
-    def compute_health_status(self, peer: Any, *, now: datetime | None = None) -> Any: ...
+    def compute_health_status(
+        self, peer: Any, *, now: datetime | None = None
+    ) -> Any: ...
 
 
 class RouterAgentCredentialLookupProtocol(Protocol):

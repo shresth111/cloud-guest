@@ -239,6 +239,7 @@ import dataclasses
 import logging
 import secrets
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -651,6 +652,68 @@ async def get_or_reset_quota_usage(
     return usage
 
 
+async def get_or_reset_quota_usages(
+    repository: GuestRepositoryProtocol,
+    *,
+    guest_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    period_types: Sequence[QuotaPeriodType],
+    tz_name: str,
+    now: datetime,
+) -> dict[QuotaPeriodType, GuestQuotaUsage]:
+    """``get_or_reset_quota_usage`` for several periods at once, reading
+    them all in a single ``IN (...)`` query.
+
+    Design spec §5 S9. Callers that need every period -- which is every
+    caller, since a FUP policy can cap any combination of daily/weekly/
+    monthly -- were issuing one SELECT per period against the same table
+    for the same guest. On the guest-login request path that was three
+    round trips where one does.
+
+    Identical semantics to the singular helper, applied per period: a
+    missing row is created zeroed, a row whose own ``period_start``
+    predates the boundary ``now`` falls in is reset and advanced, and
+    anything else is returned untouched. Only the *read* is batched --
+    the create/update calls that follow are per-row by necessity, and in
+    steady state (every row present and current) there are none.
+    """
+    existing = {
+        QuotaPeriodType(row.period_type): row
+        for row in await repository.get_quota_usages(
+            guest_id, [period_type.value for period_type in period_types]
+        )
+    }
+    resolved: dict[QuotaPeriodType, GuestQuotaUsage] = {}
+    for period_type in period_types:
+        current_period_start = compute_period_start(
+            period_type, now=now, tz_name=tz_name
+        )
+        usage = existing.get(period_type)
+        if usage is None:
+            resolved[period_type] = await repository.create_quota_usage(
+                guest_id=guest_id,
+                organization_id=organization_id,
+                period_type=period_type.value,
+                period_start=current_period_start,
+                bytes_used=0,
+                minutes_used=0,
+                last_accrued_at=None,
+            )
+        elif usage.period_start < current_period_start:
+            resolved[period_type] = await repository.update_quota_usage(
+                usage,
+                {
+                    "period_start": current_period_start,
+                    "bytes_used": 0,
+                    "minutes_used": 0,
+                    "last_accrued_at": None,
+                },
+            )
+        else:
+            resolved[period_type] = usage
+    return resolved
+
+
 # ============================================================================
 # Narrow cross-domain protocols (composition, not duplication)
 # ============================================================================
@@ -836,6 +899,29 @@ class QueueAssignmentProtocol(Protocol):
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> object: ...
+
+
+class QueueAssignmentDispatcherProtocol(Protocol):
+    """Publishes the bandwidth-queue assignment to the background worker
+    instead of performing it inline -- design spec §5 S9.
+
+    Satisfied by ``tasks.enqueue_guest_queue_assignment``, which is what
+    ``dependencies.get_guest_service`` wires in. Kept as a Protocol so
+    this module never imports Celery (``tasks.py`` already imports *this*
+    module, so the reverse would be circular) and so tests can observe
+    the dispatch without a broker.
+    """
+
+    async def __call__(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID,
+        router_id: uuid.UUID,
+        session_id: uuid.UUID,
+        device_target: str,
+        guest_id: uuid.UUID | None,
+    ) -> None: ...
 
 
 class ResolvedDevicePolicyProtocol(Protocol):
@@ -1242,6 +1328,7 @@ class GuestService:
         monitoring_hook: GuestSessionBroadcastProtocol | None = None,
         access_control_hook: AccessDecisionProtocol | None = None,
         queue_assignment_hook: QueueAssignmentProtocol | None = None,
+        queue_assignment_dispatcher: QueueAssignmentDispatcherProtocol | None = None,
         policy_lookup: PolicyLookupProtocol | None = None,
         mac_authorization_hook: MacAuthorizationLookupProtocol | None = None,
         redis: Redis | None = None,
@@ -1255,6 +1342,7 @@ class GuestService:
         self.monitoring_hook = monitoring_hook
         self.access_control_hook = access_control_hook
         self.queue_assignment_hook = queue_assignment_hook
+        self.queue_assignment_dispatcher = queue_assignment_dispatcher
         self.policy_lookup = policy_lookup
         self.mac_authorization_hook = mac_authorization_hook
         self.redis = redis
@@ -1314,7 +1402,37 @@ class GuestService:
         location's own default when picking which queue profile to apply
         -- only the RouterOS-facing target stays session-scoped, the
         policy that determines its rate is guest-scoped."""
-        if self.queue_assignment_hook is None or not session.ip_address:
+        if not session.ip_address:
+            return
+
+        # Design spec §5 S9. Applying the queue means opening a fresh TCP
+        # connection to the venue's MikroTik -- no pooling, 10-second
+        # timeout. Awaited inline, that sat between the guest entering a
+        # correct OTP and seeing they were online: the failure was already
+        # swallowed, but a swallowed 10-second timeout is still 10 seconds
+        # of spinner. Handing it to the worker is the fix; queueing is a
+        # quality-of-service concern, not an authorization one, so it is
+        # correct for it to land a moment after the session rather than
+        # before it.
+        if self.queue_assignment_dispatcher is not None:
+            await self.queue_assignment_dispatcher(
+                organization_id=organization_id,
+                location_id=location_id,
+                router_id=router.id,
+                session_id=session.id,
+                device_target=session.ip_address,
+                guest_id=session.guest_id,
+            )
+            return
+
+        # No dispatcher wired -- run it inline, as before. This is the
+        # path unit tests and any broker-less deployment take; the real
+        # API always wires the dispatcher (see
+        # ``dependencies.get_guest_service``), so no guest request reaches
+        # here. Kept rather than made a no-op so that a deployment without
+        # a worker still gets queues applied, just slowly, instead of
+        # silently not at all.
+        if self.queue_assignment_hook is None:
             return
         try:
             await self.queue_assignment_hook.resolve_and_assign_queue(
@@ -3522,19 +3640,29 @@ class GuestService:
             return
         tz_name = await self.repository.get_organization_timezone(organization_id)
         now = datetime.now(UTC)
-        for period_type in QuotaPeriodType:
+        # Design spec §5 S9: one IN (...) read for every period that
+        # actually has a cap configured, instead of one SELECT per
+        # period. Periods with no cap at all are not fetched -- the loop
+        # below skipped them anyway, and materializing a row for a period
+        # nothing limits would be a write this path never needed.
+        capped_periods = [
+            period_type
+            for period_type in QuotaPeriodType
+            if data_limits[period_type] is not None
+            or time_limits[period_type] is not None
+        ]
+        usages = await get_or_reset_quota_usages(
+            self.repository,
+            guest_id=guest_id,
+            organization_id=organization_id,
+            period_types=capped_periods,
+            tz_name=tz_name,
+            now=now,
+        )
+        for period_type in capped_periods:
             limit_mb = data_limits[period_type]
             limit_minutes = time_limits[period_type]
-            if limit_mb is None and limit_minutes is None:
-                continue
-            usage = await get_or_reset_quota_usage(
-                self.repository,
-                guest_id=guest_id,
-                organization_id=organization_id,
-                period_type=period_type,
-                tz_name=tz_name,
-                now=now,
-            )
+            usage = usages[period_type]
             if limit_mb is not None and is_fup_usage_exceeded(
                 used=usage.bytes_used, limit=limit_mb * BYTES_PER_MB
             ):
@@ -3597,15 +3725,19 @@ class GuestService:
                 QuotaPeriodType.MONTHLY: resolved.rules.get("monthly_data_limit_mb"),
             }
             violated_period: str | None = None
+            # Same S9 batching as _enforce_fup_quota. This path runs on
+            # every RADIUS Interim-Update, so it is the higher-volume of
+            # the two even though it is not the latency-sensitive one.
+            usages = await get_or_reset_quota_usages(
+                self.repository,
+                guest_id=guest_id,
+                organization_id=organization_id,
+                period_types=list(data_limits),
+                tz_name=tz_name,
+                now=now,
+            )
             for period_type, limit_mb in data_limits.items():
-                usage = await get_or_reset_quota_usage(
-                    self.repository,
-                    guest_id=guest_id,
-                    organization_id=organization_id,
-                    period_type=period_type,
-                    tz_name=tz_name,
-                    now=now,
-                )
+                usage = usages[period_type]
                 usage = await self.repository.update_quota_usage(
                     usage, {"bytes_used": usage.bytes_used + delta_bytes}
                 )

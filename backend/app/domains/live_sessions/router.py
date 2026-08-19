@@ -14,10 +14,8 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from app.common.responses import ApiResponse, build_response
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
-    CurrentUser,
     RequirePermission,
 )
-from app.domains.auth.models import AuthUser
 
 from .dependencies import get_live_session_service
 from .schemas import LiveSessionListResponse, SessionActionResponse

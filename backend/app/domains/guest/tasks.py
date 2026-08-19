@@ -44,6 +44,7 @@ bridge, call the plain task function directly" contract
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,8 +62,12 @@ from app.domains.organization.repository import OrganizationRepository
 from app.domains.organization.service import OrganizationService
 from app.domains.policy.repository import PolicyRepository
 from app.domains.policy.service import PolicyService
+from app.domains.queue_management.constants import QueueTargetType
 
 from .constants import (
+    ASSIGN_GUEST_QUEUE_MAX_RETRIES,
+    ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS,
+    TASK_ASSIGN_GUEST_QUEUE,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
@@ -198,8 +203,186 @@ def run_quota_reset_sweep() -> dict[str, object]:
     return result
 
 
+# ============================================================================
+# Dynamic bandwidth-queue assignment, off the login request path (§5 S9)
+# ============================================================================
+
+
+def _build_queue_management_service(session: AsyncSession):
+    """Constructs a real ``QueueManagementService`` the way
+    ``app.domains.queue_management.dependencies.get_queue_management_service``
+    would via FastAPI's ``Depends`` chain -- there is no request/DI
+    container inside a Celery task, so this composes the same real
+    ``RouterService``/``PolicyService`` graph by hand, mirroring
+    ``_build_policy_service`` above.
+
+    Imported inside the function rather than at module scope: the router
+    domain pulls in a large dependency graph, and this task module is
+    imported by the API process too (``GuestService`` enqueues through
+    it), where none of that is needed."""
+    from app.domains.queue_management.repository import QueueManagementRepository
+    from app.domains.queue_management.service import QueueManagementService
+    from app.domains.rbac.repository import RBACRepository
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    organization_service = OrganizationService(OrganizationRepository(session))
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+    )
+    router_service = RouterService(
+        RouterRepository(session), organization_service, location_service
+    )
+    return QueueManagementService(
+        QueueManagementRepository(session),
+        router_service,
+        _build_policy_service(session),
+        audit_writer=RBACRepository(session),
+    )
+
+
+async def _assign_guest_queue_async(
+    *,
+    organization_id: str | None,
+    location_id: str,
+    router_id: str,
+    session_id: str,
+    device_target: str,
+    guest_id: str | None,
+) -> None:
+    """The actual async work behind ``assign_guest_queue`` -- a fresh
+    ``AsyncSession`` per task run, mirroring every other task in this
+    module.
+
+    Every value it needs arrives as an argument. Nothing is re-read from
+    ``guest_sessions``, which is what makes this free of a read-your-own-
+    write race against the request that enqueued it: the API request's own
+    commit may not have landed when the worker picks this up, and
+    ``QueueAssignment.target_id`` is deliberately not a foreign key (see
+    ``queue_management.models``' own docstring), so the assignment does
+    not need the session row to exist yet."""
+    async with SessionLocal() as session:
+        try:
+            service = _build_queue_management_service(session)
+            await service.resolve_and_assign_queue(
+                requesting_organization_id=(
+                    uuid.UUID(organization_id) if organization_id else None
+                ),
+                location_id=uuid.UUID(location_id),
+                router_id=uuid.UUID(router_id),
+                target_type=QueueTargetType.SESSION,
+                target_id=uuid.UUID(session_id),
+                device_target=device_target,
+                guest_id=uuid.UUID(guest_id) if guest_id else None,
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+@celery_app.task(
+    name=TASK_ASSIGN_GUEST_QUEUE,
+    bind=True,
+    max_retries=ASSIGN_GUEST_QUEUE_MAX_RETRIES,
+)
+def assign_guest_queue(
+    self,
+    *,
+    organization_id: str | None,
+    location_id: str,
+    router_id: str,
+    session_id: str,
+    device_target: str,
+    guest_id: str | None = None,
+) -> dict[str, object]:
+    """Applies a guest session's policy-resolved bandwidth queue to the
+    venue's router. Enqueued per login by
+    ``GuestService._assign_guest_queue``; never Beat-scheduled.
+
+    Arguments are strings, not UUIDs -- ``app.core.celery_app`` configures
+    JSON-only serialization (never pickle), so a UUID would not survive
+    the broker.
+
+    Retries on failure, unlike the inline call this replaces, which could
+    only swallow. That is a real behavioural gain and not just a
+    relocation: a router that was rebooting during a login used to lose
+    that guest's queue permanently."""
+    try:
+        run_celery_task(
+            _assign_guest_queue_async(
+                organization_id=organization_id,
+                location_id=location_id,
+                router_id=router_id,
+                session_id=session_id,
+                device_target=device_target,
+                guest_id=guest_id,
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "guest_task_assign_guest_queue_failed",
+            extra={"session_id": session_id, "error": str(exc)},
+        )
+        raise self.retry(
+            exc=exc, countdown=ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS
+        ) from exc
+    logger.info(
+        "guest_task_assign_guest_queue_completed",
+        extra={"session_id": session_id},
+    )
+    return {"session_id": session_id}
+
+
+async def enqueue_guest_queue_assignment(
+    *,
+    organization_id: uuid.UUID | None,
+    location_id: uuid.UUID,
+    router_id: uuid.UUID,
+    session_id: uuid.UUID,
+    device_target: str,
+    guest_id: uuid.UUID | None,
+) -> None:
+    """The dispatcher ``GuestService`` is wired with -- publishes the task
+    and returns, so the guest's login response no longer waits on a router.
+
+    ``.delay()`` is Kombu's *synchronous* broker publish. It is a single
+    Redis command, but calling it directly from an async request handler
+    would block the event loop, so it is pushed to a thread. That is the
+    difference between "the router connect is off the request path" and
+    "the request path now blocks on a broker instead".
+
+    Never raises: queueing is a quality-of-service concern, and a broker
+    hiccup must not fail a login that has otherwise succeeded -- the
+    identical best-effort posture ``_assign_guest_queue`` has always had.
+    """
+    from asyncio import to_thread
+
+    def _publish() -> None:
+        assign_guest_queue.delay(
+            organization_id=str(organization_id) if organization_id else None,
+            location_id=str(location_id),
+            router_id=str(router_id),
+            session_id=str(session_id),
+            device_target=device_target,
+            guest_id=str(guest_id) if guest_id else None,
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_queue_assignment_enqueue_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
 __all__ = [
     "run_session_timeout_sweep",
     "run_fup_time_accrual_sweep",
     "run_quota_reset_sweep",
+    "assign_guest_queue",
+    "enqueue_guest_queue_assignment",
 ]

@@ -725,7 +725,10 @@ class UserService:
             actor_user_id,
             AuditAction.USER_FORCE_LOGGED_OUT,
             entity_id=updated.id,
-            description=f"User '{updated.email}' force-logged-out ({revoked} session(s) revoked)",
+            description=(
+                f"User '{updated.email}' force-logged-out "
+                f"({revoked} session(s) revoked)"
+            ),
             organization_id=requesting_organization_id,
         )
         return updated

@@ -19,7 +19,9 @@ from app.domains.guest import models as guest_models  # noqa: F401
 from app.domains.guest_access import models as guest_access_models  # noqa: F401
 from app.domains.guest_teams import models as guest_teams_models  # noqa: F401
 from app.domains.location import models as location_models  # noqa: F401
-from app.domains.monitored_hardware import models as monitored_hardware_models  # noqa: F401
+from app.domains.monitored_hardware import (
+    models as monitored_hardware_models,  # noqa: F401
+)
 from app.domains.monitoring import models as monitoring_models  # noqa: F401
 from app.domains.network_device import models as network_device_models  # noqa: F401
 from app.domains.notification import models as notification_models  # noqa: F401

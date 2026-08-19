@@ -54,7 +54,11 @@ from typing import Protocol
 from .constants import HealthStatus
 from .exceptions import WireGuardPeerNotFoundError
 
-__all__ = ["WireGuardTunnelLookupProtocol", "TunnelState", "diagnose_connection_failure"]
+__all__ = [
+    "WireGuardTunnelLookupProtocol",
+    "TunnelState",
+    "diagnose_connection_failure",
+]
 
 
 class WireGuardTunnelLookupProtocol(Protocol):
@@ -68,7 +72,9 @@ class WireGuardTunnelLookupProtocol(Protocol):
         self, *, router_id: uuid.UUID, requesting_organization_id: uuid.UUID | None
     ) -> object: ...
 
-    def compute_health_status(self, peer: object, *, now: datetime | None = None) -> object: ...
+    def compute_health_status(
+        self, peer: object, *, now: datetime | None = None
+    ) -> object: ...
 
 
 class TunnelState:

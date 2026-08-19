@@ -1476,8 +1476,10 @@ class AlertService:
         if rule.target_component == ALERT_TARGET_MONITORED_HARDWARE:
             if self.monitored_hardware_service is None or rule.organization_id is None:
                 return triggered, resolved
-            devices = await self.monitored_hardware_service.list_all_devices_with_status(
-                organization_id=rule.organization_id
+            devices = await (
+                self.monitored_hardware_service.list_all_devices_with_status(
+                    organization_id=rule.organization_id
+                )
             )
             for item in devices:
                 # HardwareStatus.UNKNOWN ("never observed yet") is
@@ -1487,7 +1489,10 @@ class AlertService:
                 # in practice, but comparing to the enum's own value (not a
                 # hardcoded string) keeps this consistent with how
                 # ALERT_TARGET_ROUTER/ALERT_TARGET_ISP_LINK compare below.
-                condition_met = item.status == HardwareStatus.DOWN and expected_status == HardwareStatus.DOWN.value
+                condition_met = (
+                    item.status == HardwareStatus.DOWN
+                    and expected_status == HardwareStatus.DOWN.value
+                )
                 existing = await self.repository.find_active_alert(
                     rule_id=rule.id,
                     organization_id=item.device.organization_id,
@@ -1500,14 +1505,18 @@ class AlertService:
                         organization_id=item.device.organization_id,
                         location_id=item.device.location_id,
                         router_id=item.device.router_id,
-                        message=_health_status_message(item.device.name, item.status.value),
+                        message=_health_status_message(
+                            item.device.name, item.status.value
+                        ),
                     )
                     triggered.append(alert)
                 elif not condition_met and existing is not None:
                     resolved.append(
                         await self._auto_resolve(
                             existing,
-                            resolved_message=_health_status_message(item.device.name, item.status.value),
+                            resolved_message=_health_status_message(
+                                item.device.name, item.status.value
+                            ),
                         )
                     )
             return triggered, resolved

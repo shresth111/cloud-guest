@@ -174,6 +174,9 @@ class FakeUser:
     is_verified: bool = True
     data_masking_enabled: bool = True
     mfa_enabled: bool = False
+    # Mirrors app.domains.auth.models.User.phone -- AuthUser.from_model
+    # reads it, so a stand-in for a User row must carry it too.
+    phone: str | None = None
 
 
 @dataclass

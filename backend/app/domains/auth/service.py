@@ -484,7 +484,9 @@ class AuthService:
 
         AuthSecurity.check_account_lock(user.locked_until)
 
-        if not self._verify_password_safe(password, user.password_hash, user_id=user.id):
+        if not self._verify_password_safe(
+            password, user.password_hash, user_id=user.id
+        ):
             await self._register_failed_attempt(user)
             await self._record_attempt(
                 user.id, email, device_info, success=False, reason="invalid_password"
@@ -537,7 +539,9 @@ class AuthService:
                 )
                 raise PasswordChangeRequiredError()
 
-            if self._verify_password_safe(new_password, user.password_hash, user_id=user.id):
+            if self._verify_password_safe(
+                new_password, user.password_hash, user_id=user.id
+            ):
                 raise PasswordReuseError(
                     "New password must be different from the temporary password"
                 )
@@ -554,7 +558,9 @@ class AuthService:
                 must_change_password=False,
             )
             await self.repository.add_password_history(user.id, new_hash)
-            logger.info("password_changed_at_first_login", extra={"user_id": str(user.id)})
+            logger.info(
+                "password_changed_at_first_login", extra={"user_id": str(user.id)}
+            )
 
         await self.repository.update_user(
             user,
@@ -634,9 +640,13 @@ class AuthService:
         if not user:
             raise UserNotFoundError()
 
-        if not self._verify_password_safe(current_password, user.password_hash, user_id=user.id):
+        if not self._verify_password_safe(
+            current_password, user.password_hash, user_id=user.id
+        ):
             raise InvalidCredentialsError("Current password is incorrect")
-        if self._verify_password_safe(new_password, user.password_hash, user_id=user.id):
+        if self._verify_password_safe(
+            new_password, user.password_hash, user_id=user.id
+        ):
             raise PasswordReuseError(
                 "New password must be different from the current password"
             )
@@ -851,7 +861,9 @@ class AuthService:
             raise UserNotFoundError()
         if not user.mfa_enabled:
             raise MfaNotEnabledError()
-        if not self._verify_password_safe(password, user.password_hash, user_id=user.id):
+        if not self._verify_password_safe(
+            password, user.password_hash, user_id=user.id
+        ):
             raise InvalidCredentialsError()
         if not await self._verify_mfa_or_recovery_code(user_id, code):
             raise InvalidMfaCodeError()

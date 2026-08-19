@@ -3291,7 +3291,10 @@ class InvoiceService:
             raise BillingProfileNotFoundError(organization_id)
 
         subtotal = sum(
-            (quantity * unit_price for _description, quantity, unit_price in line_items),
+            (
+                quantity * unit_price
+                for _description, quantity, unit_price in line_items
+            ),
             start=Decimal("0"),
         ).quantize(Decimal("0.01"))
 
@@ -3364,7 +3367,10 @@ class InvoiceService:
             None,
             AuditAction.INVOICE_GENERATED,
             invoice,
-            description=f"Invoice {invoice.invoice_number} manually created for organization {organization_id}",
+            description=(
+                f"Invoice {invoice.invoice_number} manually created "
+                f"for organization {organization_id}"
+            ),
         )
         return invoice
 

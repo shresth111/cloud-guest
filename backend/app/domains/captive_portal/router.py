@@ -35,14 +35,11 @@ import uuid
 
 from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import JSONResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
-from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
-from app.domains.branding.repository import BrandingRepository
 from app.domains.branding.service import (
     PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE,
     PUBLIC_LOGO_PATH_TEMPLATE,
@@ -358,7 +355,6 @@ async def resolve_captive_portal_config(
     organization_id: uuid.UUID | None = Query(default=None),
     location_id: uuid.UUID | None = Query(default=None),
     service: CaptivePortalService = Depends(get_captive_portal_service),
-    db: AsyncSession = Depends(get_db_session),
 ):
     resolved = await service.resolve_portal_config(
         organization_id=organization_id, location_id=location_id
@@ -423,48 +419,56 @@ async def resolve_captive_portal_config(
     #
     # The same branding row also carries the three v7 image
     # measurements (background_luminance / _top_luminance / _entropy,
-    # design spec §1.4 C3/C5). They are read here, on the same row we
-    # already fetched, and only on the branch that actually adopts the
-    # branding image -- a config with its own typed-in
-    # background_image_url points at a file nothing measured, and
-    # reporting the org photo's numbers for a *different* image would be
-    # worse than reporting None. They are deliberately not part of the
-    # resolve cache payload: they live on `brandings`, not
-    # `captive_portal_configs`, and this fetch is already uncached (see
-    # spec §5 S7, which proposes folding the whole branding row into the
-    # cached payload -- a separate change).
+    # design spec §1.4 C3/C5). They are read off the same row, and only
+    # on the branch that actually adopts the branding image -- a config
+    # with its own typed-in background_image_url points at a file
+    # nothing measured, and reporting the org photo's numbers for a
+    # *different* image would be worse than reporting None.
+    #
+    # Design spec §5 S7: that row is no longer fetched here. It is
+    # resolved (and cached) by `CaptivePortalService.resolve_portal_config`
+    # itself, under the same key as everything else, so a cache hit costs
+    # no `SELECT brandings`, no connection checkout, and no COMMIT --
+    # `app.database.session.get_db_session` commits unconditionally, so
+    # this endpoint was paying a write-path round trip on a read-only
+    # guest request. `resolved.branding` is None both when the row does
+    # not exist and when this config supplied both its own URLs (in which
+    # case the service correctly never looked); the loop below is a no-op
+    # either way, which is exactly the old behaviour.
+    #
+    # What deliberately stays here rather than moving into the payload is
+    # URL *construction*. `request.base_url` is per-request, and the
+    # absolute-URL requirement is real (see the incident note below), so
+    # baking a host into a shared cache entry would make one origin's
+    # first guest pin the URL every other origin then serves.
     background_luminance: int | None = None
     background_top_luminance: int | None = None
     background_entropy: int | None = None
 
-    needs_logo = config_payload["logo_url"] is None
+    branding = resolved.branding
     needs_background = config_payload["background_image_url"] is None
-    if needs_logo or needs_background:
-        branding = await BrandingRepository(db).get_by_organization(
-            resolved.config.organization_id
-        )
-        if branding is not None:
-            org_id = str(resolved.config.organization_id)
-            api_base = str(request.base_url).rstrip("/") + get_settings().api_v1_prefix
-            if config_payload["logo_url"] is None:
-                if branding.logo_key:
-                    # An uploaded logo needs the public proxy -- the
-                    # object storage key isn't a URL a browser can load.
-                    logo_path = PUBLIC_LOGO_PATH_TEMPLATE.format(organization_id=org_id)
-                    config_payload["logo_url"] = api_base + logo_path
-                elif branding.logo_url:
-                    # A plain, already-hosted URL an admin typed in
-                    # instead of uploading a file -- directly
-                    # hotlinkable as-is, no proxy needed.
-                    config_payload["logo_url"] = branding.logo_url
-            if needs_background and branding.background_image_key:
-                bg_path = PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE.format(
-                    organization_id=org_id
-                )
-                config_payload["background_image_url"] = api_base + bg_path
-                background_luminance = branding.background_luminance
-                background_top_luminance = branding.background_top_luminance
-                background_entropy = branding.background_entropy
+    if branding is not None:
+        org_id = str(resolved.config.organization_id)
+        api_base = str(request.base_url).rstrip("/") + get_settings().api_v1_prefix
+        if config_payload["logo_url"] is None:
+            if branding.logo_key:
+                # An uploaded logo needs the public proxy -- the
+                # object storage key isn't a URL a browser can load.
+                logo_path = PUBLIC_LOGO_PATH_TEMPLATE.format(organization_id=org_id)
+                config_payload["logo_url"] = api_base + logo_path
+            elif branding.logo_url:
+                # A plain, already-hosted URL an admin typed in
+                # instead of uploading a file -- directly
+                # hotlinkable as-is, no proxy needed.
+                config_payload["logo_url"] = branding.logo_url
+        if needs_background and branding.background_image_key:
+            bg_path = PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE.format(
+                organization_id=org_id
+            )
+            config_payload["background_image_url"] = api_base + bg_path
+            background_luminance = branding.background_luminance
+            background_top_luminance = branding.background_top_luminance
+            background_entropy = branding.background_entropy
 
     response_payload = ResolvedCaptivePortalConfigResponse(
         **config_payload,

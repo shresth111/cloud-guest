@@ -104,7 +104,6 @@ from .schemas import (
     RadiusAccountingRequest,
     RadiusAccountingResponse,
     RadiusAuthorizeRequest,
-    RadiusAuthorizeResponse,
     RadiusNasCreatedResponse,
     RadiusNasDisableRequest,
     RadiusNasListResponse,

@@ -7,18 +7,16 @@ available workspaces and validates switches).
 
 from __future__ import annotations
 
-import uuid
 import logging
+import uuid
 
 from app.domains.organization.service import OrganizationService
-from app.domains.organization.repository import OrganizationRepositoryProtocol
 from app.domains.rbac.service import RBACService
-from app.domains.rbac.enums import ScopeType
 
 from .schemas import (
-    WorkspaceSummary,
-    WorkspaceListResponse,
     WorkspaceCurrentResponse,
+    WorkspaceListResponse,
+    WorkspaceSummary,
     WorkspaceSwitchResponse,
 )
 
@@ -48,7 +46,11 @@ class WorkspaceService:
         workspace_list = []
         for org in orgs:
             try:
-                role_assignments = await self.rbac_service.get_user_permissions(user_id)
+                # Result is intentionally unused -- this call is here for
+                # its raise/no-raise outcome, which the except branch
+                # below is what actually reacts to. Keeping the await
+                # (just not the binding) preserves that exactly.
+                await self.rbac_service.get_user_permissions(user_id)
                 primary_role = "member"
             except Exception:
                 primary_role = "member"
@@ -61,7 +63,9 @@ class WorkspaceService:
                     organization_slug=getattr(org, "slug", ""),
                     role=primary_role,
                     plan=getattr(org, "org_type", None),
-                    is_active=org.status == "active" if hasattr(org, "status") else True,
+                    is_active=(
+                        org.status == "active" if hasattr(org, "status") else True
+                    ),
                 )
             )
 

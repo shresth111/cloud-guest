@@ -22,7 +22,10 @@ def upgrade() -> None:
     op.add_column(
         "captive_portal_configs",
         sa.Column(
-            "business_hours_enabled", sa.Boolean(), nullable=False, server_default=sa.false()
+            "business_hours_enabled",
+            sa.Boolean(),
+            nullable=False,
+            server_default=sa.false(),
         ),
     )
     op.add_column(

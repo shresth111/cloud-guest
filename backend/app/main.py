@@ -60,6 +60,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         redis=redis_client,
         max_requests=app_settings.rate_limit_max_requests,
         window_seconds=app_settings.rate_limit_window_seconds,
+        # /captive-portal/resolve gets its own, venue-sized cap on its own,
+        # venue-keyed buckets -- design spec §5 S8.
+        resolve_max_requests=(
+            app_settings.captive_portal_resolve_rate_limit_max_requests
+        ),
     )
     app.add_middleware(
         CORSMiddleware,
