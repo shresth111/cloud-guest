@@ -86,10 +86,21 @@ _NONE_SENTINEL = "-"
 class CaptivePortalResolveCache:
     """Thin async wrapper around Redis for captive-portal resolve caching."""
 
-    def __init__(self, redis: Redis, *, ttl_seconds: int | None = None) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        *,
+        ttl_seconds: int | None = None,
+        negative_ttl_seconds: int | None = None,
+    ) -> None:
+        settings = get_settings()
         self._redis = redis
         self._ttl_seconds = (
-            ttl_seconds or get_settings().captive_portal_resolve_cache_ttl_seconds
+            ttl_seconds or settings.captive_portal_resolve_cache_ttl_seconds
+        )
+        self._negative_ttl_seconds = (
+            negative_ttl_seconds
+            or settings.captive_portal_resolve_negative_cache_ttl_seconds
         )
 
     @staticmethod
@@ -127,6 +138,7 @@ class CaptivePortalResolveCache:
         payload: dict[str, Any],
         *,
         index_organization_id: uuid.UUID | None = None,
+        negative: bool = False,
     ) -> None:
         """Writes the payload, and -- when ``index_organization_id`` is
         given -- records this key in that organization's own index set so
@@ -139,11 +151,15 @@ class CaptivePortalResolveCache:
         is not knowable from the key alone. Passing it explicitly is what
         lets an organization-scoped edit (a branding upload, an org-level
         default config change) fan out to that key too.
+
+        ``negative`` selects the much shorter negative TTL -- see
+        ``Settings.captive_portal_resolve_negative_cache_ttl_seconds`` for
+        why a "not configured" answer must not be held as long as a real
+        one.
         """
         key = self._key(organization_id, location_id)
-        await self._redis.set(
-            key, json.dumps(payload, default=str), ex=self._ttl_seconds
-        )
+        ttl = self._negative_ttl_seconds if negative else self._ttl_seconds
+        await self._redis.set(key, json.dumps(payload, default=str), ex=ttl)
         if index_organization_id is None:
             return
         index_key = self._org_index_key(index_organization_id)

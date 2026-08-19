@@ -61,6 +61,7 @@ so full coverage is the correct call, not merely the default one.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import uuid
@@ -195,6 +196,7 @@ class CaptivePortalResolveCacheProtocol(Protocol):
         payload: dict[str, Any],
         *,
         index_organization_id: uuid.UUID | None = None,
+        negative: bool = False,
     ) -> None: ...
 
     async def invalidate(
@@ -495,6 +497,43 @@ def _config_from_cache_payload(
     for field_name in _CACHED_CONFIG_SCALAR_FIELDS:
         fields[field_name] = payload[field_name]
     return _CachedCaptivePortalConfig(**fields)
+
+
+# The marker distinguishing a cached *negative* result (this
+# organization/location genuinely has no active portal config) from a
+# cached real one. Design spec §5 S10: without negative caching, a single
+# misconfigured location replays the entire resolution walk -- a location
+# lookup, a location-config query, an org-default query -- on every guest
+# device that joins, forever, and the walk ends in an exception so nothing
+# ever warms.
+_NOT_CONFIGURED_MARKER = "__not_configured__"
+
+
+# In-flight resolution registry, keyed identically to the cache itself.
+#
+# Design spec §5 S10's third problem: with a 60-second TTL and a venue's
+# worth of devices joining at once, every expiry is a small stampede --
+# every concurrent miss runs the same full walk against the same rows to
+# compute the same answer. Collapsing them means the first miss does the
+# work and the rest await its result.
+#
+# **Module-level, not per-service, deliberately.** ``CaptivePortalService``
+# is constructed per request by FastAPI's ``Depends`` chain, so an
+# instance attribute would be a fresh empty dict on every request and
+# would collapse exactly nothing.
+#
+# **In-process, not a Redis lock, deliberately.** A distributed lock would
+# also collapse across worker processes, but it puts a network round trip
+# -- and a lock that can be orphaned by a crashed holder -- directly on the
+# unauthenticated path a guest hits first, standing in a lobby with no
+# internet. That trades a bounded, cheap problem for an unbounded one. An
+# in-process collapse reduces the stampede by the worker's own concurrency
+# factor, cannot deadlock across processes, and adds no network hop; the
+# residual is one walk per worker process per expiry, which the negative
+# and positive caches then absorb.
+_INFLIGHT_RESOLUTIONS: dict[
+    tuple[uuid.UUID | None, uuid.UUID | None], asyncio.Future[ResolvedPortalConfig]
+] = {}
 
 
 # ============================================================================
@@ -866,27 +905,144 @@ class CaptivePortalService:
         if organization_id is None and location_id is None:
             raise MissingPortalResolutionParamsError()
 
-        if self.resolve_cache is not None:
-            cached = await self.resolve_cache.get(organization_id, location_id)
-            if cached is not None:
-                return ResolvedPortalConfig.from_cache_payload(cached)
+        cached = await self._cache_get(organization_id, location_id)
+        if cached is not None:
+            if _NOT_CONFIGURED_MARKER in cached:
+                raise CaptivePortalConfigNotConfiguredError(
+                    uuid.UUID(str(cached[_NOT_CONFIGURED_MARKER]))
+                )
+            return ResolvedPortalConfig.from_cache_payload(cached)
 
-        resolved = await self._resolve_portal_config_uncached(
+        return await self._resolve_single_flight(
             organization_id=organization_id, location_id=location_id
         )
 
-        if self.resolve_cache is not None:
+    async def _cache_get(
+        self,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> dict[str, Any] | None:
+        """Reads the resolve cache, treating any failure as a miss.
+
+        Design spec §5 S10. This ``await`` was unguarded, so a Redis blip
+        raised straight out of the unauthenticated ``GET
+        /captive-portal/resolve`` -- the first request a guest's device
+        makes on a WiFi join. A cache is an optimization; losing it must
+        cost latency, not availability. Failing open here means a Redis
+        outage degrades every venue to the pre-cache query path rather
+        than taking guest WiFi down platform-wide.
+        """
+        if self.resolve_cache is None:
+            return None
+        try:
+            return await self.resolve_cache.get(organization_id, location_id)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: fail open
+            logger.warning(
+                "captive_portal_resolve_cache_read_failed",
+                extra={
+                    "organization_id": str(organization_id),
+                    "location_id": str(location_id),
+                    "error": str(exc),
+                },
+            )
+            return None
+
+    async def _cache_set(
+        self,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        payload: dict[str, Any],
+        *,
+        index_organization_id: uuid.UUID,
+        negative: bool = False,
+    ) -> None:
+        """Writes the resolve cache, swallowing any failure -- the same
+        fail-open posture as ``_cache_get``. A write that does not land
+        costs the next request a cache miss, which is exactly what would
+        have happened anyway."""
+        if self.resolve_cache is None:
+            return
+        try:
             await self.resolve_cache.set(
                 organization_id,
                 location_id,
-                resolved.to_cache_payload(),
+                payload,
                 # The *resolved* organization, so an organization-scoped
                 # edit can fan out to this key even when the caller only
                 # supplied a location_id -- see the cache's own
                 # ``set``/``invalidate_organization`` docstrings.
+                index_organization_id=index_organization_id,
+                negative=negative,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: fail open
+            logger.warning(
+                "captive_portal_resolve_cache_write_failed",
+                extra={
+                    "organization_id": str(organization_id),
+                    "location_id": str(location_id),
+                    "error": str(exc),
+                },
+            )
+
+    async def _resolve_single_flight(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> ResolvedPortalConfig:
+        """Runs the uncached resolution, collapsing concurrent misses for
+        the same key onto one walk -- see ``_INFLIGHT_RESOLUTIONS``.
+
+        Both outcomes are shared with waiters, the exception included: a
+        venue with no config configured would otherwise have every
+        concurrent miss run the full walk only to raise the same error.
+        """
+        key = (organization_id, location_id)
+        loop = asyncio.get_running_loop()
+
+        existing = _INFLIGHT_RESOLUTIONS.get(key)
+        # ``get_loop()`` guards the case where a stale future outlived the
+        # loop that created it (test suites routinely run one loop per
+        # test). Awaiting such a future would hang forever, which on this
+        # path means a guest's first request never returning -- so an
+        # orphan is ignored and this caller simply does the work itself.
+        if existing is not None and existing.get_loop() is loop:
+            return await existing
+
+        future: asyncio.Future[ResolvedPortalConfig] = loop.create_future()
+        _INFLIGHT_RESOLUTIONS[key] = future
+        try:
+            resolved = await self._resolve_portal_config_uncached(
+                organization_id=organization_id, location_id=location_id
+            )
+        except CaptivePortalConfigNotConfiguredError as exc:
+            await self._cache_set(
+                organization_id,
+                location_id,
+                {_NOT_CONFIGURED_MARKER: str(exc.organization_id)},
+                index_organization_id=uuid.UUID(str(exc.organization_id)),
+                negative=True,
+            )
+            future.set_exception(exc)
+            # Mark retrieved even with no waiters, so asyncio does not log
+            # "exception was never retrieved" when the future is collected.
+            future.exception()
+            raise
+        except BaseException as exc:
+            future.set_exception(exc)
+            future.exception()
+            raise
+        else:
+            future.set_result(resolved)
+            await self._cache_set(
+                organization_id,
+                location_id,
+                resolved.to_cache_payload(),
                 index_organization_id=resolved.config.organization_id,
             )
-        return resolved
+            return resolved
+        finally:
+            _INFLIGHT_RESOLUTIONS.pop(key, None)
 
     async def _resolve_portal_config_uncached(
         self,
@@ -992,6 +1148,34 @@ class CaptivePortalService:
         out to *other* locations falling back to it)."""
         if self.resolve_cache is None:
             return
+        try:
+            await self._invalidate_resolve_cache_unguarded(
+                organization_id, location_id
+            )
+        except Exception as exc:  # noqa: BLE001 -- see below
+            # Same fail-open posture as ``_cache_get``/``_cache_set``
+            # (design spec §5 S10), applied to the admin write path. A
+            # failed invalidation means this config stays stale for up to
+            # one TTL -- which is exactly the backstop this cache is
+            # already documented as relying on. Failing the admin's save
+            # instead would be worse: they would retry a write that had
+            # already been committed.
+            logger.warning(
+                "captive_portal_resolve_cache_invalidation_failed",
+                extra={
+                    "organization_id": str(organization_id),
+                    "location_id": str(location_id),
+                    "error": str(exc),
+                },
+            )
+
+    async def _invalidate_resolve_cache_unguarded(
+        self,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+    ) -> None:
+        if self.resolve_cache is None:
+            return
         await self.resolve_cache.invalidate(organization_id, location_id)
         if location_id is not None:
             # A guest resolving via ``location_id`` alone -- the common
@@ -1002,6 +1186,17 @@ class CaptivePortalService:
             # invalidated, or a location-scoped edit would keep serving a
             # stale cached result to that call shape until TTL expiry.
             await self.resolve_cache.invalidate(None, location_id)
+            return
+
+        # An organization-*level* config (no location_id) is the fallback
+        # every location without its own override resolves to, so editing
+        # it changes the answer for all of them -- including any that
+        # cached a negative "not configured" result under a key whose
+        # organization is not recoverable from the key itself (design spec
+        # §5 S10). The per-organization index added for §5 S7 is what
+        # makes that fan-out possible; this is the gap this module's own
+        # docstring previously recorded as TTL-backstopped only.
+        await self.resolve_cache.invalidate_organization(organization_id)
 
     def _enforce_tenant_scope(
         self,

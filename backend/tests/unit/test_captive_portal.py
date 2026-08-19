@@ -17,6 +17,7 @@ environment.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -300,6 +301,7 @@ class FakeCaptivePortalResolveCache:
 
     store: dict[tuple[str, str], dict[str, object]] = field(default_factory=dict)
     org_index: dict[str, set[tuple[str, str]]] = field(default_factory=dict)
+    negative_keys: set[tuple[str, str]] = field(default_factory=set)
 
     @staticmethod
     def _key(
@@ -322,9 +324,13 @@ class FakeCaptivePortalResolveCache:
         payload: dict[str, object],
         *,
         index_organization_id: uuid.UUID | None = None,
+        negative: bool = False,
     ) -> None:
         key = self._key(organization_id, location_id)
         self.store[key] = payload
+        self.negative_keys.discard(key)
+        if negative:
+            self.negative_keys.add(key)
         if index_organization_id is not None:
             self.org_index.setdefault(str(index_organization_id), set()).add(key)
 
@@ -1739,6 +1745,307 @@ class TestBrandingWritesInvalidateTheResolveCache:
 
         service = BrandingService(repository=SimpleNamespace())
         await service._invalidate_portal_resolve_cache(uuid.uuid4())
+
+
+
+class TestResolveCacheFailsOpen:
+    """Design spec §5 S10, first problem. ``GET /captive-portal/resolve``
+    is unauthenticated and is the first request a guest's device makes on
+    a WiFi join. The cache ``await`` was unguarded, so a Redis blip raised
+    straight out of it -- taking guest WiFi down platform-wide for what is
+    only ever an optimization."""
+
+    class _ExplodingCache:
+        def __init__(self, *, fail_get: bool = True, fail_set: bool = True) -> None:
+            self.fail_get = fail_get
+            self.fail_set = fail_set
+            self.get_calls = 0
+            self.set_calls = 0
+
+        async def get(self, organization_id, location_id):
+            self.get_calls += 1
+            if self.fail_get:
+                raise ConnectionError("redis down")
+            return None
+
+        async def set(self, organization_id, location_id, payload, **kwargs):
+            self.set_calls += 1
+            if self.fail_set:
+                raise ConnectionError("redis down")
+
+        async def invalidate(self, organization_id, location_id):
+            raise ConnectionError("redis down")
+
+        async def invalidate_organization(self, organization_id):
+            raise ConnectionError("redis down")
+
+    async def test_a_read_failure_degrades_to_a_query_not_a_500(self) -> None:
+        fx = make_service()
+        cache = self._ExplodingCache()
+        fx.service.resolve_cache = cache
+        config = await _create_config(fx, name="Org default", is_default=True)
+
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+
+        assert resolved.config.id == config.id
+        assert cache.get_calls == 1
+
+    async def test_a_write_failure_never_reaches_the_guest(self) -> None:
+        fx = make_service()
+        cache = self._ExplodingCache(fail_get=False)
+        fx.service.resolve_cache = cache
+        config = await _create_config(fx, name="Org default", is_default=True)
+
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+
+        assert resolved.config.id == config.id
+        assert cache.set_calls == 1
+
+    async def test_a_corrupt_payload_is_treated_as_a_miss(self) -> None:
+        """The real Redis-backed cache already swallows a JSON decode
+        failure; this pins that a payload that decodes but is *shaped*
+        wrong cannot be silently served either."""
+        fx = make_service(with_cache=True)
+        await _create_config(fx, name="Org default", is_default=True)
+        await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        key = next(iter(fx.resolve_cache.store))
+        fx.resolve_cache.store[key] = {"config": {}, "branding": None}
+
+        with pytest.raises(KeyError):
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+
+
+class TestNegativeResolveCaching:
+    """Design spec §5 S10, second problem. A misconfigured location paid
+    the full resolution walk -- location lookup, location-config query,
+    org-default query -- on every guest device that joined, forever,
+    because the walk ends in an exception and nothing ever warmed."""
+
+    async def test_a_not_configured_result_is_cached(self) -> None:
+        fx = make_service(with_cache=True)
+
+        with pytest.raises(CaptivePortalConfigNotConfiguredError):
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+
+        assert len(fx.resolve_cache.store) == 1
+        payload = next(iter(fx.resolve_cache.store.values()))
+        assert "__not_configured__" in payload
+
+    async def test_the_second_miss_does_not_repeat_the_walk(self) -> None:
+        fx = make_service(with_cache=True)
+        calls: list[uuid.UUID] = []
+        original = fx.repository.find_active_org_default
+
+        async def _counting(organization_id):
+            calls.append(organization_id)
+            return await original(organization_id)
+
+        fx.repository.find_active_org_default = _counting
+
+        for _ in range(5):
+            with pytest.raises(CaptivePortalConfigNotConfiguredError):
+                await fx.service.resolve_portal_config(
+                    organization_id=fx.organization.id, location_id=None
+                )
+
+        assert len(calls) == 1, "the walk must run once, not once per guest"
+
+    async def test_the_cached_negative_raises_the_same_error(self) -> None:
+        fx = make_service(with_cache=True)
+        with pytest.raises(CaptivePortalConfigNotConfiguredError) as first:
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+        with pytest.raises(CaptivePortalConfigNotConfiguredError) as second:
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+        assert str(first.value) == str(second.value)
+
+    async def test_it_is_written_with_the_short_negative_ttl(self) -> None:
+        """A negative result must not be held as long as a real one -- an
+        operator who just configured a venue would otherwise watch the
+        portal keep saying 'not configured'."""
+        fx = make_service(with_cache=True)
+        with pytest.raises(CaptivePortalConfigNotConfiguredError):
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+        key = next(iter(fx.resolve_cache.store))
+        assert key in fx.resolve_cache.negative_keys
+
+    async def test_configuring_the_venue_clears_the_negative_immediately(self) -> None:
+        """The pre-existing guarantee this must not break: creating the
+        first config for a previously-unconfigured organization is
+        resolvable at once, not stuck behind a cached miss."""
+        fx = make_service(with_cache=True)
+        with pytest.raises(CaptivePortalConfigNotConfiguredError):
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+        config = await _create_config(fx, name="First config", is_default=True)
+
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert resolved.config.id == config.id
+
+    async def test_creating_an_org_default_clears_a_locations_negative(self) -> None:
+        """The operator-facing case: a location resolving by location_id
+        alone cached "not configured"; the admin then creates the
+        organization default that location falls back to. That key's own
+        organization is not recoverable from the key, so only the
+        per-organization fan-out can reach it."""
+        fx = make_service(with_cache=True)
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        with pytest.raises(CaptivePortalConfigNotConfiguredError):
+            await fx.service.resolve_portal_config(
+                organization_id=None, location_id=location.id
+            )
+
+        config = await _create_config(fx, name="Org default", is_default=True)
+
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=None, location_id=location.id
+        )
+        assert resolved.config.id == config.id
+
+    async def test_the_negative_is_indexed_for_organization_invalidation(self) -> None:
+        """A location resolving by location_id alone caches under a key
+        whose organization is not knowable from the key -- it must still
+        be reachable by an organization-scoped invalidation."""
+        fx = make_service(with_cache=True)
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+
+        with pytest.raises(CaptivePortalConfigNotConfiguredError):
+            await fx.service.resolve_portal_config(
+                organization_id=None, location_id=location.id
+            )
+        assert len(fx.resolve_cache.store) == 1
+
+        await fx.resolve_cache.invalidate_organization(fx.organization.id)
+        assert fx.resolve_cache.store == {}
+
+
+class TestResolveSingleFlight:
+    """Design spec §5 S10, third problem. With a 60s TTL and a venue's
+    worth of devices joining at once, every expiry was a small stampede --
+    every concurrent miss running the same walk against the same rows to
+    compute the same answer."""
+
+    async def test_concurrent_misses_collapse_onto_one_walk(self) -> None:
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx, name="Org default", is_default=True)
+
+        walks = 0
+        original = fx.repository.find_active_org_default
+
+        async def _slow(organization_id):
+            nonlocal walks
+            walks += 1
+            # Yield, so every coroutine is genuinely in flight together.
+            await asyncio.sleep(0.01)
+            return await original(organization_id)
+
+        fx.repository.find_active_org_default = _slow
+
+        results = await asyncio.gather(
+            *[
+                fx.service.resolve_portal_config(
+                    organization_id=fx.organization.id, location_id=None
+                )
+                for _ in range(20)
+            ]
+        )
+
+        assert walks == 1, f"20 concurrent misses ran {walks} walks"
+        assert all(r.config.id == config.id for r in results)
+
+    async def test_waiters_see_the_same_error_not_their_own_walk(self) -> None:
+        fx = make_service(with_cache=True)
+        walks = 0
+        original = fx.repository.find_active_org_default
+
+        async def _slow(organization_id):
+            nonlocal walks
+            walks += 1
+            await asyncio.sleep(0.01)
+            return await original(organization_id)
+
+        fx.repository.find_active_org_default = _slow
+
+        results = await asyncio.gather(
+            *[
+                fx.service.resolve_portal_config(
+                    organization_id=fx.organization.id, location_id=None
+                )
+                for _ in range(10)
+            ],
+            return_exceptions=True,
+        )
+
+        assert walks == 1
+        assert all(
+            isinstance(r, CaptivePortalConfigNotConfiguredError) for r in results
+        )
+
+    async def test_different_keys_do_not_block_each_other(self) -> None:
+        fx = make_service(with_cache=True)
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        await _create_config(fx, name="Org default", is_default=True)
+        await _create_config(fx, name="Loc override", location_id=location.id)
+
+        by_org, by_location = await asyncio.gather(
+            fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            ),
+            fx.service.resolve_portal_config(
+                organization_id=None, location_id=location.id
+            ),
+        )
+
+        assert by_org.resolved_via_location_override is False
+        assert by_location.resolved_via_location_override is True
+
+    async def test_the_registry_is_empty_once_resolution_settles(self) -> None:
+        """A leaked entry would make every later request for that key
+        await a future nobody will ever complete."""
+        from app.domains.captive_portal.service import _INFLIGHT_RESOLUTIONS
+
+        fx = make_service(with_cache=True)
+        await _create_config(fx, name="Org default", is_default=True)
+        await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert _INFLIGHT_RESOLUTIONS == {}
+
+        fx2 = make_service(with_cache=True)
+        with pytest.raises(CaptivePortalConfigNotConfiguredError):
+            await fx2.service.resolve_portal_config(
+                organization_id=fx2.organization.id, location_id=None
+            )
+        assert _INFLIGHT_RESOLUTIONS == {}
+
+    async def test_the_registry_is_shared_across_service_instances(self) -> None:
+        """``CaptivePortalService`` is constructed per request, so a
+        per-instance registry would collapse exactly nothing -- which is
+        the whole point of the module-level one."""
+        from app.domains.captive_portal.service import _INFLIGHT_RESOLUTIONS
+
+        assert isinstance(_INFLIGHT_RESOLUTIONS, dict)
+        first = make_service()
+        second = make_service()
+        assert first.service is not second.service
 
 
 class TestResolveCacheKeyVersion:

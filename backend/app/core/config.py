@@ -127,6 +127,26 @@ class Settings(BaseSettings):
             "trade-off."
         ),
     )
+    captive_portal_resolve_negative_cache_ttl_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=3_600,
+        description=(
+            "TTL for a *negative* captive-portal resolve result -- a "
+            "location/organization that resolved to "
+            "CaptivePortalConfigNotConfiguredError (design spec §5 S10). "
+            "Deliberately far shorter than "
+            "captive_portal_resolve_cache_ttl_seconds: a negative result "
+            "is almost always an admin mid-setup, and the cost of being "
+            "wrong is asymmetric. Caching it too long means an operator "
+            "who just configured a venue watches the portal keep saying "
+            "'not configured'; caching it briefly means a misconfigured "
+            "location stops replaying the full resolution walk on every "
+            "guest device that joins. Real invalidation still happens on "
+            "config create, so this TTL only backstops the window before "
+            "that write."
+        ),
+    )
     branding_asset_cache_ttl_seconds: int = Field(
         default=3600,
         ge=1,
