@@ -17,6 +17,7 @@ environment.
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -45,7 +46,10 @@ from app.domains.captive_portal.exceptions import (
     MissingPortalResolutionParamsError,
 )
 from app.domains.captive_portal.models import CaptivePortalConfig
-from app.domains.captive_portal.service import CaptivePortalService
+from app.domains.captive_portal.service import (
+    CaptivePortalService,
+    ResolvedPortalConfig,
+)
 from app.domains.captive_portal.validators import (
     validate_background_focal_point,
     validate_background_overlay_strength,
@@ -295,6 +299,7 @@ class FakeCaptivePortalResolveCache:
     ``None``) but backed by a plain dict instead of Redis."""
 
     store: dict[tuple[str, str], dict[str, object]] = field(default_factory=dict)
+    org_index: dict[str, set[tuple[str, str]]] = field(default_factory=dict)
 
     @staticmethod
     def _key(
@@ -315,13 +320,63 @@ class FakeCaptivePortalResolveCache:
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
         payload: dict[str, object],
+        *,
+        index_organization_id: uuid.UUID | None = None,
     ) -> None:
-        self.store[self._key(organization_id, location_id)] = payload
+        key = self._key(organization_id, location_id)
+        self.store[key] = payload
+        if index_organization_id is not None:
+            self.org_index.setdefault(str(index_organization_id), set()).add(key)
 
     async def invalidate(
         self, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
     ) -> None:
         self.store.pop(self._key(organization_id, location_id), None)
+
+    async def invalidate_organization(self, organization_id: uuid.UUID) -> None:
+        for key in self.org_index.pop(str(organization_id), set()):
+            self.store.pop(key, None)
+
+
+@dataclass
+class FakeBrandingLookup:
+    """In-memory stand-in for
+    ``app.domains.branding.repository.BrandingRepository`` -- only
+    ``get_by_organization``, the single method
+    ``service.BrandingLookupProtocol`` names. ``calls`` records every
+    lookup so a test can prove the query is (or is not) reaching the
+    database, which is the whole point of design spec §5 S7."""
+
+    rows: dict[uuid.UUID, SimpleNamespace] = field(default_factory=dict)
+    calls: list[uuid.UUID] = field(default_factory=list)
+
+    def add(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        logo_key: str | None = None,
+        logo_url: str | None = None,
+        background_image_key: str | None = None,
+        background_luminance: int | None = None,
+        background_top_luminance: int | None = None,
+        background_entropy: int | None = None,
+    ) -> SimpleNamespace:
+        row = SimpleNamespace(
+            logo_key=logo_key,
+            logo_url=logo_url,
+            background_image_key=background_image_key,
+            background_luminance=background_luminance,
+            background_top_luminance=background_top_luminance,
+            background_entropy=background_entropy,
+        )
+        self.rows[organization_id] = row
+        return row
+
+    async def get_by_organization(
+        self, organization_id: uuid.UUID
+    ) -> SimpleNamespace | None:
+        self.calls.append(organization_id)
+        return self.rows.get(organization_id)
 
 
 @dataclass
@@ -333,21 +388,26 @@ class Fixture:
     service: CaptivePortalService
     organization: Organization
     resolve_cache: FakeCaptivePortalResolveCache | None = None
+    branding_lookup: FakeBrandingLookup | None = None
 
 
-def make_service(*, with_cache: bool = False) -> Fixture:
+def make_service(
+    *, with_cache: bool = False, with_branding: bool = False
+) -> Fixture:
     repository = FakeCaptivePortalRepository()
     audit_writer = FakeAuditLogWriter()
     organization_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup()
     organization = organization_lookup.add()
     resolve_cache = FakeCaptivePortalResolveCache() if with_cache else None
+    branding_lookup = FakeBrandingLookup() if with_branding else None
     service = CaptivePortalService(
         repository,
         organization_lookup,
         location_lookup,
         audit_writer=audit_writer,
         resolve_cache=resolve_cache,
+        branding_lookup=branding_lookup,
     )
     return Fixture(
         repository=repository,
@@ -357,6 +417,7 @@ def make_service(*, with_cache: bool = False) -> Fixture:
         service=service,
         organization=organization,
         resolve_cache=resolve_cache,
+        branding_lookup=branding_lookup,
     )
 
 
@@ -1498,17 +1559,232 @@ class TestBackgroundFocalPointResolve:
         assert second.config.background_focal_y == 60
 
 
+class TestBrandingFoldedIntoResolveCache:
+    """Design spec §5 S7. The branding row used to be fetched by the
+    *route*, outside the resolve cache, on every resolve whose config
+    left a logo/background unset -- so a "cache hit" still cost a
+    ``SELECT brandings``, a connection checkout, and (because
+    ``get_db_session`` commits unconditionally) a COMMIT on a read-only
+    guest request."""
+
+    async def test_cache_hit_issues_no_branding_query(self) -> None:
+        """The actual S7 claim, measured rather than asserted by
+        inspection: the branding lookup is called once on the cold
+        resolve and never again while the entry is cached."""
+        fx = make_service(with_cache=True, with_branding=True)
+        await _create_config(fx, name="Org default", is_default=True)
+        fx.branding_lookup.add(
+            fx.organization.id, logo_key="branding/x/logo/a.png"
+        )
+
+        await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert len(fx.branding_lookup.calls) == 1
+
+        for _ in range(5):
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+        assert len(fx.branding_lookup.calls) == 1
+
+    async def test_branding_survives_the_cache_round_trip(self) -> None:
+        fx = make_service(with_cache=True, with_branding=True)
+        config = await _create_config(fx, name="Org default", is_default=True)
+        fx.branding_lookup.add(
+            fx.organization.id,
+            background_image_key="branding/x/background/abc.webp",
+            background_luminance=18,
+            background_top_luminance=71,
+            background_entropy=64,
+        )
+
+        await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        # Served from cache -- repository row and branding row both
+        # removed, so anything still correct came out of the payload.
+        del fx.repository.configs[config.id]
+        fx.branding_lookup.rows.clear()
+
+        cached = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert cached.branding is not None
+        assert cached.branding.background_image_key == "branding/x/background/abc.webp"
+        assert cached.branding.background_luminance == 18
+        assert cached.branding.background_top_luminance == 71
+        assert cached.branding.background_entropy == 64
+
+    async def test_config_supplying_both_urls_never_queries_branding(self) -> None:
+        """S7 must not turn a query that was being *skipped* into one
+        that always runs. The route's old ``needs_logo or
+        needs_background`` guard is preserved inside the service."""
+        fx = make_service(with_branding=True)
+        config = await _create_config(fx, name="Org default", is_default=True)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={
+                "logo_url": "https://cdn.example.com/logo.png",
+                "background_image_url": "https://cdn.example.com/bg.jpg",
+            },
+        )
+
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert fx.branding_lookup.calls == []
+        assert resolved.branding is None
+
+    async def test_missing_branding_row_caches_as_none(self) -> None:
+        """A "not consulted" and a "no row exists" branding both land as
+        None, and both round-trip -- so an organization with no branding
+        row does not re-query on every resolve either."""
+        fx = make_service(with_cache=True, with_branding=True)
+        await _create_config(fx, name="Org default", is_default=True)
+
+        first = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        second = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert first.branding is None
+        assert second.branding is None
+        assert len(fx.branding_lookup.calls) == 1
+
+    async def test_url_construction_stays_out_of_the_cached_payload(self) -> None:
+        """``request.base_url`` is per-request. Baking an absolute URL
+        into a shared entry would let one origin's first guest pin the
+        URL every other origin then serves -- the exact mixed-content
+        class of bug the route's own comment records an incident for."""
+        fx = make_service(with_cache=True, with_branding=True)
+        await _create_config(fx, name="Org default", is_default=True)
+        fx.branding_lookup.add(
+            fx.organization.id, logo_key="branding/x/logo/a.png"
+        )
+
+        await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        payload = next(iter(fx.resolve_cache.store.values()))
+        assert payload["branding"]["logo_key"] == "branding/x/logo/a.png"
+        assert "http" not in json.dumps(payload["branding"])
+
+    async def test_organization_invalidation_fans_out_to_every_location(self) -> None:
+        """A single ``brandings`` row now backs one cached entry per
+        location that falls back to it. Without the org index, an admin
+        uploading a logo would stay invisible to all of them for up to a
+        full TTL -- a real regression against the uncached per-request
+        fetch S7 replaces."""
+        fx = make_service(with_cache=True, with_branding=True)
+        await _create_config(fx, name="Org default", is_default=True)
+        location_a = fx.location_lookup.add(organization_id=fx.organization.id)
+        location_b = fx.location_lookup.add(organization_id=fx.organization.id)
+        fx.branding_lookup.add(
+            fx.organization.id, logo_key="branding/x/logo/old.png"
+        )
+
+        for location in (location_a, location_b):
+            await fx.service.resolve_portal_config(
+                organization_id=None, location_id=location.id
+            )
+        await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert len(fx.resolve_cache.store) == 3
+
+        await fx.resolve_cache.invalidate_organization(fx.organization.id)
+        assert fx.resolve_cache.store == {}
+
+
+class TestBrandingWritesInvalidateTheResolveCache:
+    """The other half of S7: ``brandings`` is written by the *branding*
+    domain, which had no reason to know the captive-portal resolve cache
+    existed. Once the row is folded into that cache, every branding
+    write must fan out to it."""
+
+    async def test_every_mutating_method_invalidates(self) -> None:
+        import inspect
+
+        from app.domains.branding import service as branding_service
+
+        source = inspect.getsource(branding_service.BrandingService)
+        # Each mutating method ends by returning a BrandingResponse built
+        # from the row it just wrote; each must invalidate first.
+        assert source.count("_invalidate_portal_resolve_cache(organization_id)") == 5
+
+    async def test_invalidation_failure_never_fails_the_upload(self) -> None:
+        """Redis being momentarily unreachable must not fail an admin's
+        logo upload -- the resolve cache's own TTL is the backstop."""
+        from app.domains.branding.service import BrandingService
+
+        class _ExplodingCache:
+            async def invalidate_organization(
+                self, organization_id: uuid.UUID
+            ) -> None:
+                raise RuntimeError("redis down")
+
+        service = BrandingService(
+            repository=SimpleNamespace(),
+            portal_resolve_cache=_ExplodingCache(),
+        )
+        # Must not raise.
+        await service._invalidate_portal_resolve_cache(uuid.uuid4())
+
+    async def test_no_cache_wired_is_a_no_op(self) -> None:
+        from app.domains.branding.service import BrandingService
+
+        service = BrandingService(repository=SimpleNamespace())
+        await service._invalidate_portal_resolve_cache(uuid.uuid4())
+
+
 class TestResolveCacheKeyVersion:
-    def test_cache_key_is_v3(self) -> None:
+    def test_cache_key_is_v4(self) -> None:
         """Spec §0.3: the version must be bumped in the same change that
-        adds a field to ``_CACHED_CONFIG_SCALAR_FIELDS``. Skipping it
-        makes every payload written by the previous build raise KeyError
-        out of the unauthenticated guest resolve endpoint -- a 500 for
-        every guest joining WiFi until the TTL expires."""
+        changes the cached field set. Skipping it makes every payload
+        written by the previous build raise KeyError out of the
+        unauthenticated guest resolve endpoint -- a 500 for every guest
+        joining WiFi until the TTL expires.
+
+        v4 is design spec §5 S7: the ``brandings`` row joined the payload
+        under a new top-level ``"branding"`` key."""
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
 
         key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
-        assert key == "captive_portal:resolve:v3:org:loc"
+        assert key == "captive_portal:resolve:v4:org:loc"
+
+    def test_org_index_key_is_versioned_in_lockstep_with_the_payload_key(self) -> None:
+        """The index names payload keys. Left at an older version it
+        would fan a delete out to keys nothing reads anymore, silently
+        doing nothing -- so its version must move with the payload's."""
+        from app.domains.captive_portal.cache import (
+            _CACHE_KEY_TEMPLATE,
+            _ORG_INDEX_KEY_TEMPLATE,
+        )
+
+        payload_version = _CACHE_KEY_TEMPLATE.split(":")[2]
+        index_version = _ORG_INDEX_KEY_TEMPLATE.split(":")[2]
+        assert payload_version == index_version == "v4"
+
+    def test_a_payload_from_the_previous_key_version_would_raise(self) -> None:
+        """The mechanism §0.3 is actually about, asserted rather than
+        assumed: ``from_cache_payload`` indexes unguarded, so a payload
+        written by the *previous* build -- one with no ``"branding"``
+        key -- raises ``KeyError``. That is deliberate (a missing field
+        must fail loudly in tests rather than degrade silently), and it
+        is precisely why the key version had to move: under a bumped
+        key, no such payload is ever read back in the first place."""
+        v3_payload = {
+            "config": {},
+            "resolved_via_location_override": False,
+            "location_country": None,
+            "location_name": None,
+        }
+        with pytest.raises(KeyError):
+            ResolvedPortalConfig.from_cache_payload(v3_payload)
 
     def test_every_cached_field_exists_on_the_model(self) -> None:
         """The versioning only protects a *deploy*; this catches the
@@ -1586,8 +1862,13 @@ async def _call_resolve_route(fx: Fixture, branding: _FakeBranding | None) -> di
     for config in fx.repository.configs.values():
         _apply_column_defaults(config)
 
-    original = router_module.BrandingRepository
-    router_module.BrandingRepository = lambda _db: SimpleNamespace(
+    # Design spec §5 S7: the route no longer runs its own
+    # ``BrandingRepository`` query (and no longer takes a ``db`` session
+    # at all) -- the branding row now arrives pre-resolved and cacheable
+    # on ``ResolvedPortalConfig.branding``. So the fake is installed on
+    # the *service*, which is where the lookup actually happens now.
+    original = fx.service.branding_lookup
+    fx.service.branding_lookup = SimpleNamespace(
         get_by_organization=_returning(branding)
     )
     try:
@@ -1596,10 +1877,9 @@ async def _call_resolve_route(fx: Fixture, branding: _FakeBranding | None) -> di
             organization_id=fx.organization.id,
             location_id=None,
             service=fx.service,
-            db=None,
         )
     finally:
-        router_module.BrandingRepository = original
+        fx.service.branding_lookup = original
     return response["data"]
 
 

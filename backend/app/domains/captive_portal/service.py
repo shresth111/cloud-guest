@@ -136,6 +136,37 @@ class LocationLookupProtocol(Protocol):
     ) -> Location: ...
 
 
+class BrandingRowProtocol(Protocol):
+    """The exact columns ``resolve_portal_config`` reads off an
+    ``app.domains.branding.models.Branding`` row -- structural, so this
+    module never imports that model."""
+
+    logo_key: str | None
+    logo_url: str | None
+    background_image_key: str | None
+    background_luminance: int | None
+    background_top_luminance: int | None
+    background_entropy: int | None
+
+
+class BrandingLookupProtocol(Protocol):
+    """The single method ``resolve_portal_config`` needs from the real
+    ``app.domains.branding.repository.BrandingRepository`` -- reused
+    directly, never reimplemented, the identical composition
+    ``OrganizationLookupProtocol``/``LocationLookupProtocol`` above
+    already establish for their own real collaborators.
+
+    ``None``-by-default on the service (see ``__init__``): a caller that
+    wires no branding lookup simply resolves with ``branding=None``,
+    exactly the shape a config carrying both its own ``logo_url`` and
+    ``background_image_url`` already produces -- never a crash.
+    """
+
+    async def get_by_organization(
+        self, organization_id: uuid.UUID
+    ) -> BrandingRowProtocol | None: ...
+
+
 class AuditLogWriter(Protocol):
     """The minimal surface this service needs to write into RBAC's shared
     ``audit_log_entries`` table -- the same narrow, duck-typed protocol
@@ -162,6 +193,8 @@ class CaptivePortalResolveCacheProtocol(Protocol):
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
         payload: dict[str, Any],
+        *,
+        index_organization_id: uuid.UUID | None = None,
     ) -> None: ...
 
     async def invalidate(
@@ -170,10 +203,78 @@ class CaptivePortalResolveCacheProtocol(Protocol):
         location_id: uuid.UUID | None,
     ) -> None: ...
 
+    async def invalidate_organization(self, organization_id: uuid.UUID) -> None: ...
+
 
 # ============================================================================
 # Read model
 # ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedBranding:
+    """The organization's own ``brandings`` row, reduced to exactly the
+    six columns ``router.resolve_captive_portal_config`` reads when it
+    falls back to org branding for a logo/background the config row
+    itself left unset.
+
+    **Why a reduced copy rather than the ORM row:** this object is
+    JSON-round-tripped through the resolve cache (design spec §5 S7), and
+    the router turns ``logo_key``/``background_image_key`` into absolute
+    URLs using ``request.base_url`` -- which is *per-request* and must
+    never be baked into a shared cache entry. Caching the raw facts and
+    letting the router build the URL keeps the cached payload
+    host-agnostic, so one entry stays correct for every origin the API is
+    reachable on.
+
+    Only the *presence* of a key matters to the router, but the real
+    values are carried anyway: they are small, and a boolean would make
+    the payload lossy for no saving.
+    """
+
+    logo_key: str | None
+    logo_url: str | None
+    background_image_key: str | None
+    background_luminance: int | None
+    background_top_luminance: int | None
+    background_entropy: int | None
+
+    @classmethod
+    def from_row(cls, row: BrandingRowProtocol) -> ResolvedBranding:
+        return cls(
+            logo_key=row.logo_key,
+            logo_url=row.logo_url,
+            background_image_key=row.background_image_key,
+            background_luminance=row.background_luminance,
+            background_top_luminance=row.background_top_luminance,
+            background_entropy=row.background_entropy,
+        )
+
+    def to_cache_payload(self) -> dict[str, Any]:
+        return {
+            "logo_key": self.logo_key,
+            "logo_url": self.logo_url,
+            "background_image_key": self.background_image_key,
+            "background_luminance": self.background_luminance,
+            "background_top_luminance": self.background_top_luminance,
+            "background_entropy": self.background_entropy,
+        }
+
+    @classmethod
+    def from_cache_payload(cls, payload: dict[str, Any]) -> ResolvedBranding:
+        # Indexed unguarded, exactly like ``_config_from_cache_payload``
+        # -- see ``cache._CACHE_KEY_TEMPLATE``'s own comment for why a
+        # missing field must fail loudly in tests rather than degrade
+        # silently in production, and why the key version is what keeps
+        # that failure from ever reaching a real guest.
+        return cls(
+            logo_key=payload["logo_key"],
+            logo_url=payload["logo_url"],
+            background_image_key=payload["background_image_key"],
+            background_luminance=payload["background_luminance"],
+            background_top_luminance=payload["background_top_luminance"],
+            background_entropy=payload["background_entropy"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +309,25 @@ class ResolvedPortalConfig:
     admin label. ``None`` whenever the caller resolved by ``organization_id``
     alone (no location context exists)."""
 
+    branding: ResolvedBranding | None = None
+    """The resolved organization's own ``brandings`` row, fetched by
+    ``_resolve_portal_config_uncached`` **only** when this config row
+    left ``logo_url`` or ``background_image_url`` unset -- i.e. only when
+    ``router.resolve_captive_portal_config`` would actually consult it.
+
+    Design spec §5 S7: that router previously ran its own
+    ``BrandingRepository.get_by_organization`` on every single resolve
+    that needed a fallback, *outside* the resolve cache -- so a "cache
+    hit" still cost a SELECT, a connection checkout, and (because
+    ``app.database.session.get_db_session`` commits unconditionally) a
+    COMMIT on a read-only guest request. Folding the row in here puts it
+    behind the same cache as everything else.
+
+    ``None`` means "not consulted", which the router treats identically
+    to "no branding row exists" -- both leave the config's own values
+    untouched, which is the correct outcome for a config that already
+    supplies both URLs itself."""
+
     def to_cache_payload(self) -> dict[str, Any]:
         """Serializes for ``CaptivePortalResolveCacheProtocol.set`` --
         mirrors ``app.domains.billing.service.EntitlementSnapshot
@@ -220,6 +340,9 @@ class ResolvedPortalConfig:
             "resolved_via_location_override": self.resolved_via_location_override,
             "location_country": self.location_country,
             "location_name": self.location_name,
+            "branding": (
+                self.branding.to_cache_payload() if self.branding is not None else None
+            ),
         }
 
     @classmethod
@@ -237,6 +360,11 @@ class ResolvedPortalConfig:
             location_name=(
                 str(payload["location_name"])
                 if payload.get("location_name") is not None
+                else None
+            ),
+            branding=(
+                ResolvedBranding.from_cache_payload(dict(branding_payload))
+                if (branding_payload := payload["branding"]) is not None
                 else None
             ),
         )
@@ -385,12 +513,14 @@ class CaptivePortalService:
         *,
         audit_writer: AuditLogWriter | None = None,
         resolve_cache: CaptivePortalResolveCacheProtocol | None = None,
+        branding_lookup: BrandingLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.organization_lookup = organization_lookup
         self.location_lookup = location_lookup
         self.audit_writer = audit_writer
         self.resolve_cache = resolve_cache
+        self.branding_lookup = branding_lookup
 
     # ========================================================================
     # Create / read / update / delete
@@ -747,7 +877,14 @@ class CaptivePortalService:
 
         if self.resolve_cache is not None:
             await self.resolve_cache.set(
-                organization_id, location_id, resolved.to_cache_payload()
+                organization_id,
+                location_id,
+                resolved.to_cache_payload(),
+                # The *resolved* organization, so an organization-scoped
+                # edit can fan out to this key even when the caller only
+                # supplied a location_id -- see the cache's own
+                # ``set``/``invalidate_organization`` docstrings.
+                index_organization_id=resolved.config.organization_id,
             )
         return resolved
 
@@ -776,6 +913,9 @@ class CaptivePortalService:
                     resolved_via_location_override=True,
                     location_country=location_country,
                     location_name=location_name,
+                    branding=await self._maybe_resolve_branding(
+                        location_config, resolved_organization_id
+                    ),
                 )
         else:
             # organization_id is guaranteed non-None here by the guard
@@ -792,8 +932,35 @@ class CaptivePortalService:
                 resolved_via_location_override=False,
                 location_country=location_country,
                 location_name=location_name,
+                branding=await self._maybe_resolve_branding(
+                    org_default, resolved_organization_id
+                ),
             )
         raise CaptivePortalConfigNotConfiguredError(resolved_organization_id)
+
+    async def _maybe_resolve_branding(
+        self,
+        config: CaptivePortalConfig,
+        organization_id: uuid.UUID,
+    ) -> ResolvedBranding | None:
+        """Fetches the organization's ``brandings`` row -- but only when
+        this config row actually leaves a logo/background for it to fill
+        in, which is the exact condition
+        ``router.resolve_captive_portal_config`` used to test before
+        running this query itself (design spec §5 S7).
+
+        Preserving that condition matters: a config supplying both its
+        own URLs never needed the row and still doesn't, so folding the
+        fetch into the cache does not turn a skipped query into an
+        unconditional one -- it only moves the queries that were already
+        happening to the cold path.
+        """
+        if self.branding_lookup is None:
+            return None
+        if config.logo_url is not None and config.background_image_url is not None:
+            return None
+        row = await self.branding_lookup.get_by_organization(organization_id)
+        return ResolvedBranding.from_row(row) if row is not None else None
 
     # ========================================================================
     # Internal helpers
@@ -872,10 +1039,13 @@ class CaptivePortalService:
 
 
 __all__ = [
+    "BrandingLookupProtocol",
+    "BrandingRowProtocol",
     "CaptivePortalService",
     "OrganizationLookupProtocol",
     "LocationLookupProtocol",
     "AuditLogWriter",
     "CaptivePortalResolveCacheProtocol",
+    "ResolvedBranding",
     "ResolvedPortalConfig",
 ]

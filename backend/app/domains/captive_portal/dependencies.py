@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
+from app.domains.branding.dependencies import get_branding_repository
+from app.domains.branding.repository import BrandingRepositoryProtocol
 from app.domains.location.dependencies import get_location_service
 from app.domains.location.service import LocationService
 from app.domains.organization.dependencies import get_organization_service
@@ -51,6 +53,7 @@ def get_captive_portal_service(
     resolve_cache: CaptivePortalResolveCache = Depends(
         get_captive_portal_resolve_cache
     ),
+    branding_repository: BrandingRepositoryProtocol = Depends(get_branding_repository),
 ) -> CaptivePortalService:
     return CaptivePortalService(
         repository,
@@ -58,6 +61,12 @@ def get_captive_portal_service(
         location_service,
         audit_writer=audit_repository,
         resolve_cache=resolve_cache,
+        # Design spec §5 S7 -- the guest-facing resolve endpoint used to
+        # run this repository's own get_by_organization itself, outside
+        # the resolve cache. Composed through the branding domain's own
+        # already-wired dependency function, never a second construction
+        # path.
+        branding_lookup=branding_repository,
     )
 
 
