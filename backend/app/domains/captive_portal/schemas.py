@@ -185,6 +185,25 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     business_hours_timezone: str | None = Field(default=None, max_length=64)
     business_hours_schedule: dict | None = Field(default=None)
     business_hours_closed_message: str | None = Field(default=None)
+    guest_font_choice: str | None = Field(
+        default=None,
+        max_length=20,
+        description=(
+            "Curated heading-font allowlist (v6 design spec §3.2): "
+            "'system' | 'modern-sans' | 'editorial-serif' | 'bold-display'. "
+            "Validated server-side against this exact allowlist -- never "
+            "free text."
+        ),
+    )
+    background_overlay_strength: int | None = Field(
+        default=None,
+        description=(
+            "Guest-facing background scrim peak opacity, 0-100 (v6 design "
+            "spec §4.2). Validated server-side to the full [0, 100] "
+            "range; the frontend applies its own separate [15, 85] "
+            "render-time guardrail on top of whatever is stored here."
+        ),
+    )
 
 
 # ============================================================================
@@ -227,6 +246,8 @@ class CaptivePortalConfigResponse(BaseModel):
     business_hours_timezone: str
     business_hours_schedule: dict
     business_hours_closed_message: str | None
+    guest_font_choice: str
+    background_overlay_strength: int
     created_at: datetime
     updated_at: datetime
 

@@ -23,12 +23,19 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.domains.captive_portal.constants import TERMS_AND_CONDITIONS_LABEL
+from app.domains.captive_portal.constants import (
+    DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
+    DEFAULT_GUEST_FONT_CHOICE,
+    TERMS_AND_CONDITIONS_LABEL,
+    GuestFontChoice,
+)
 from app.domains.captive_portal.exceptions import (
     CaptivePortalConfigNotConfiguredError,
     CaptivePortalConfigNotFoundError,
     CrossOrganizationCaptivePortalConfigAccessError,
+    InvalidBackgroundOverlayStrengthError,
     InvalidDefaultConfigScopeError,
+    InvalidGuestFontChoiceError,
     InvalidHexColorError,
     InvalidPortalContentSourceError,
     MissingPortalResolutionParamsError,
@@ -36,7 +43,9 @@ from app.domains.captive_portal.exceptions import (
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.captive_portal.validators import (
+    validate_background_overlay_strength,
     validate_default_scope,
+    validate_guest_font_choice,
     validate_hex_color,
     validate_single_content_source,
 )
@@ -1124,3 +1133,220 @@ class TestSocialLoginPlaceholder:
             social_login_providers=["not-a-real-provider", ""],
         )
         assert config.social_login_providers == ["not-a-real-provider", ""]
+
+
+# ============================================================================
+# Guest font choice validation (v6 design spec §3.2) -- curated allowlist,
+# never free text.
+# ============================================================================
+
+
+class TestGuestFontChoiceValidation:
+    @pytest.mark.parametrize(
+        "value",
+        ["system", "modern-sans", "editorial-serif", "bold-display"],
+    )
+    def test_valid_choices_pass(self, value: str) -> None:
+        validate_guest_font_choice(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["Comic Sans MS", "inter", "MODERN-SANS", "", "system "],
+    )
+    def test_invalid_choices_raise(self, value: str) -> None:
+        with pytest.raises(InvalidGuestFontChoiceError):
+            validate_guest_font_choice(value)
+
+    def test_allowlist_matches_enum_exactly(self) -> None:
+        """Guards against the allowlist and the GuestFontChoice enum
+        silently drifting apart -- every enum member must validate, and
+        nothing else may."""
+        assert {c.value for c in GuestFontChoice} == {
+            "system",
+            "modern-sans",
+            "editorial-serif",
+            "bold-display",
+        }
+
+    async def test_update_accepts_a_curated_choice(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"guest_font_choice": "bold-display"},
+        )
+        assert updated.guest_font_choice == "bold-display"
+
+    async def test_update_rejects_a_free_text_font_name(self) -> None:
+        """The one thing this field must never become -- see spec §3.2/
+        §6.2 item 9 ("let guestFontChoice become free text")."""
+        fx = make_service()
+        config = await _create_config(fx)
+        with pytest.raises(InvalidGuestFontChoiceError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"guest_font_choice": "Comic Sans MS"},
+            )
+
+
+# ============================================================================
+# Background overlay strength validation (v6 design spec §4.2) -- the real
+# per-venue admin lever replacing three sequential hardcoded opacity
+# guesses.
+# ============================================================================
+
+
+class TestBackgroundOverlayStrengthValidation:
+    @pytest.mark.parametrize("value", [0, 1, 55, 99, 100])
+    def test_valid_range_passes(self, value: int) -> None:
+        validate_background_overlay_strength(value)
+
+    @pytest.mark.parametrize("value", [-1, 101, 1000, -100])
+    def test_out_of_range_raises(self, value: int) -> None:
+        with pytest.raises(InvalidBackgroundOverlayStrengthError):
+            validate_background_overlay_strength(value)
+
+    @pytest.mark.parametrize("value", [True, False, "55", 55.0, None])
+    def test_non_integer_raises(self, value: object) -> None:
+        """``bool`` is explicitly excluded even though Python's ``bool``
+        is a subclass of ``int`` -- True/False are never a legal overlay
+        strength."""
+        with pytest.raises(InvalidBackgroundOverlayStrengthError):
+            validate_background_overlay_strength(value)
+
+    async def test_update_accepts_a_valid_strength(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"background_overlay_strength": 80},
+        )
+        assert updated.background_overlay_strength == 80
+
+    async def test_update_accepts_boundary_values(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        for boundary in (0, 100):
+            updated = await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"background_overlay_strength": boundary},
+            )
+            assert updated.background_overlay_strength == boundary
+
+    async def test_update_rejects_out_of_range_strength(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        with pytest.raises(InvalidBackgroundOverlayStrengthError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"background_overlay_strength": 150},
+            )
+
+    async def test_update_rejects_negative_strength(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        with pytest.raises(InvalidBackgroundOverlayStrengthError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"background_overlay_strength": -5},
+            )
+
+
+# ============================================================================
+# Model defaults (v6 design spec §3.2/§4.2) -- background_overlay_strength
+# defaults to 55 specifically to reproduce today's hardcoded 0.55 scrim
+# opacity exactly, so any pre-v6 config row (which never explicitly set
+# these two new columns) renders unchanged.
+# ============================================================================
+
+
+class TestGuestFontChoiceAndOverlayStrengthDefaults:
+    def test_model_column_defaults_match_the_documented_constants(self) -> None:
+        """Asserts the real SQLAlchemy column-level defaults (applied on
+        INSERT for any row that doesn't set these explicitly) match the
+        spec's documented constants."""
+        table = CaptivePortalConfig.__table__
+        assert table.c.guest_font_choice.default.arg == DEFAULT_GUEST_FONT_CHOICE.value
+        assert table.c.guest_font_choice.default.arg == "system"
+        assert (
+            table.c.background_overlay_strength.default.arg
+            == DEFAULT_BACKGROUND_OVERLAY_STRENGTH
+        )
+        assert table.c.background_overlay_strength.default.arg == 55
+
+    def test_columns_are_not_nullable(self) -> None:
+        table = CaptivePortalConfig.__table__
+        assert table.c.guest_font_choice.nullable is False
+        assert table.c.background_overlay_strength.nullable is False
+
+
+# ============================================================================
+# Guest-facing resolve surfaces the two new fields (v6 design spec §6.1
+# item 4: "Surface both on GET /captive-portal/resolve")
+# ============================================================================
+
+
+class TestGuestFontChoiceAndOverlayStrengthResolve:
+    async def test_resolve_surfaces_a_custom_font_choice_and_overlay_strength(
+        self,
+    ) -> None:
+        fx = make_service()
+        config = await _create_config(fx, name="Org default", is_default=True)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={
+                "guest_font_choice": "editorial-serif",
+                "background_overlay_strength": 72,
+            },
+        )
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert resolved.config.guest_font_choice == "editorial-serif"
+        assert resolved.config.background_overlay_strength == 72
+
+    async def test_resolve_cache_round_trips_the_two_new_fields(self) -> None:
+        """The cached payload (Redis-backed in production, a plain dict in
+        this fake) must preserve these two fields across a cache hit --
+        not just the fields every pre-existing cache test already
+        covers."""
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx, name="Org default", is_default=True)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={
+                "guest_font_choice": "bold-display",
+                "background_overlay_strength": 30,
+            },
+        )
+        first = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert first.config.guest_font_choice == "bold-display"
+        assert first.config.background_overlay_strength == 30
+
+        # Second call must be served from cache (repository row deleted
+        # directly, bypassing the service) -- same proof technique as
+        # TestResolveCache.test_second_resolve_is_served_from_cache.
+        del fx.repository.configs[config.id]
+        second = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert second.config.guest_font_choice == "bold-display"
+        assert second.config.background_overlay_strength == 30

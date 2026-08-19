@@ -125,13 +125,15 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, ForeignKey, Index, String, Text, text
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
 from .constants import (
+    DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
+    DEFAULT_GUEST_FONT_CHOICE,
     DEFAULT_LANGUAGE,
     DEFAULT_PRIMARY_COLOR,
     DEFAULT_SECONDARY_COLOR,
@@ -185,6 +187,35 @@ class CaptivePortalConfig(BaseModel):
     )
     supported_languages: Mapped[list[str]] = mapped_column(
         JSONB, default=_default_supported_languages, nullable=False
+    )
+    # Curated heading-font allowlist (v6 design spec §3.2) -- a plain
+    # String, not a native PostgreSQL enum type, for the same reason
+    # `theme` above is (see constants.py's module docstring): adding a 5th
+    # curated face never requires an ALTER TYPE migration, only a new
+    # additive GuestFontChoice member plus validators.validate_
+    # guest_font_choice's allowlist. Governs the guest-facing heading layer
+    # only (frontend's pg-display/pg-title/pg-subtitle) -- never body/UI
+    # text. Validated server-side against GuestFontChoice's exact 4 values
+    # in validators.validate_guest_font_choice -- deliberately never a
+    # free-text field (spec §3.2/§6.1 item 2).
+    guest_font_choice: Mapped[str] = mapped_column(
+        String(20), default=DEFAULT_GUEST_FONT_CHOICE.value, nullable=False
+    )
+    # Guest-facing background scrim peak opacity, 0-100 (v6 design spec
+    # §4.2) -- the structural, per-venue-tunable fix to a saga of three
+    # sequential hardcoded single-engineer opacity guesses (see the spec's
+    # §1.2/§4.1). Default 55 reproduces today's hardcoded 0.55 peak scrim
+    # opacity exactly, so a venue with no explicit value set (every venue
+    # migrated from before this field existed) renders pixel-identical to
+    # previously-shipped output. Stored as the admin's literal chosen
+    # integer across the full [0, 100] range -- the frontend's own
+    # [15, 85] guardrail (spec §4.3's buildGuestBackdropScrim) is a
+    # render-time clamp applied on read, never applied to what's stored
+    # here, so the admin UI's slider always reflects the real saved value.
+    # Validated server-side in validators.validate_background_overlay_
+    # strength.
+    background_overlay_strength: Mapped[int] = mapped_column(
+        Integer, default=DEFAULT_BACKGROUND_OVERLAY_STRENGTH, nullable=False
     )
 
     # -- content -----------------------------------------------------------------

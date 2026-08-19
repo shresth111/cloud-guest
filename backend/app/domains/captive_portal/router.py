@@ -108,6 +108,8 @@ def _config_response(config: CaptivePortalConfig) -> CaptivePortalConfigResponse
         business_hours_timezone=config.business_hours_timezone,
         business_hours_schedule=dict(config.business_hours_schedule),
         business_hours_closed_message=config.business_hours_closed_message,
+        guest_font_choice=config.guest_font_choice,
+        background_overlay_strength=config.background_overlay_strength,
         created_at=config.created_at,
         updated_at=config.updated_at,
     )

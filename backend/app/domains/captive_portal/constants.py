@@ -32,6 +32,30 @@ class PortalTheme(StrEnum):
     CUSTOM = "custom"
 
 
+class GuestFontChoice(StrEnum):
+    """The curated heading-font allowlist for the guest-facing captive
+    portal -- v6 design spec §3.2 (``docs/captive-portal-v6-design-spec.md``
+    in the ``cloudguest-foundation`` repo). Deliberately a small, curated
+    enum, not a free-text/Google-Fonts-catalog picker: every option here is
+    a real, self-hosted, perf-budgeted asset the frontend controls, not an
+    unbounded promise (see the spec's §1.3 for the bug this replaces -- a
+    previous admin UI had an 8-option free-text font ``<Select>`` that was
+    never actually wired to any backend field at all, so a chosen font was
+    silently discarded on save). Governs the heading layer only (``pg-
+    display``/``pg-title``/``pg-subtitle`` on the frontend) -- body/UI text
+    is unaffected by this field, always rendered in the frontend's own
+    system font stack, for every venue including ones with a font chosen.
+
+    Adding a 5th+ option later must ship its own individually-budgeted
+    self-hosted asset, exactly like the first four -- see spec §6.2 item 9
+    ("never let guestFontChoice become free text")."""
+
+    SYSTEM = "system"
+    MODERN_SANS = "modern-sans"
+    EDITORIAL_SERIF = "editorial-serif"
+    BOLD_DISPLAY = "bold-display"
+
+
 # 6-digit hex color, leading '#' required (e.g. "#1A73E8") -- deliberately
 # does not accept the 3-digit shorthand (e.g. "#FFF") or an alpha channel:
 # a single, unambiguous, copy-paste-from-a-design-tool format keeps
@@ -45,6 +69,22 @@ DEFAULT_SECONDARY_COLOR = "#FFFFFF"
 DEFAULT_LANGUAGE = "en"
 DEFAULT_SUPPORTED_LANGUAGES: tuple[str, ...] = ("en",)
 
+DEFAULT_GUEST_FONT_CHOICE = GuestFontChoice.SYSTEM
+
+# Integer 0-100, the guest-facing scrim's peak opacity as a percentage --
+# v6 design spec §4.2. 55 is not arbitrary: it is defined to reproduce the
+# frontend's current hardcoded 0.55 peak-opacity scrim exactly, so a venue
+# migrated from v5 with no explicit value set renders pixel-identical to
+# today's shipped output (see spec §4.2/§4.3 -- confirmed there to within a
+# rounding hair). The [15, 85] guardrail the frontend actually renders
+# within (spec §4.3's `buildGuestBackdropScrim`) is a *client-side* render
+# clamp, not a stored-value constraint -- this backend stores and validates
+# the admin's literal chosen number across the full [0, 100] range, so the
+# UI slider's displayed value always matches what was actually saved.
+DEFAULT_BACKGROUND_OVERLAY_STRENGTH = 55
+MIN_BACKGROUND_OVERLAY_STRENGTH = 0
+MAX_BACKGROUND_OVERLAY_STRENGTH = 100
+
 # Field-label constants for the "at most one of text/url" validation --
 # see validators.validate_single_content_source's docstring for why this is
 # "at most one", not "exactly one".
@@ -53,12 +93,17 @@ PRIVACY_POLICY_LABEL = "privacy policy"
 
 __all__ = [
     "PortalTheme",
+    "GuestFontChoice",
     "HEX_COLOR_PATTERN",
     "DEFAULT_THEME",
     "DEFAULT_PRIMARY_COLOR",
     "DEFAULT_SECONDARY_COLOR",
     "DEFAULT_LANGUAGE",
     "DEFAULT_SUPPORTED_LANGUAGES",
+    "DEFAULT_GUEST_FONT_CHOICE",
+    "DEFAULT_BACKGROUND_OVERLAY_STRENGTH",
+    "MIN_BACKGROUND_OVERLAY_STRENGTH",
+    "MAX_BACKGROUND_OVERLAY_STRENGTH",
     "TERMS_AND_CONDITIONS_LABEL",
     "PRIVACY_POLICY_LABEL",
 ]
