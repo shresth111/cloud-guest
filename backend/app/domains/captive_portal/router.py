@@ -47,7 +47,6 @@ from app.domains.branding.service import (
     PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE,
     PUBLIC_LOGO_PATH_TEMPLATE,
 )
-from app.domains.location.repository import LocationRepository
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
@@ -379,10 +378,12 @@ async def resolve_captive_portal_config(
     # substituted here whenever a real location is resolvable, falling
     # back to the config's own name only when there isn't one (an
     # org-level default with no location context at all).
-    if location_id is not None:
-        location = await LocationRepository(db).get_by_id(location_id)
-        if location is not None:
-            config_payload["name"] = location.name
+    if location_id is not None and resolved.location_name is not None:
+        # Sourced off the same location lookup `resolve_portal_config`
+        # already made internally (piggybacked onto `location_country`) --
+        # no second `LocationRepository` query needed, and it stays correct
+        # on a cache hit too (baked into the cached payload itself).
+        config_payload["name"] = resolved.location_name
 
     # Fall back to the organization's own branding (app.domains.branding)
     # for whichever of logo_url/background_image_url this specific

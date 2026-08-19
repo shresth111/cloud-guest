@@ -107,6 +107,26 @@ class Settings(BaseSettings):
             "catalog edit (which does not fan out to affected organizations)."
         ),
     )
+    captive_portal_resolve_cache_ttl_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=86_400,
+        description=(
+            "TTL for the Redis-backed captive-portal resolve cache "
+            "(app.domains.captive_portal.cache.CaptivePortalResolveCache). "
+            "GET /captive-portal/resolve is guest-device-facing, unauthenticated, "
+            "hit-on-every-WiFi-join traffic against config that changes rarely "
+            "(an admin editing branding/login-method toggles) -- caching it is a "
+            "clear win. Real invalidation happens on every "
+            "create/update/activate/deactivate/delete of the exact "
+            "(organization_id, location_id) captive-portal config mutated; this "
+            "TTL is only a backstop against a missed invalidation and against an "
+            "organization-level default change (which does not fan out to every "
+            "location under that org lacking its own override), mirroring "
+            "billing_entitlement_cache_ttl_seconds's identical documented "
+            "trade-off."
+        ),
+    )
     rbac_max_parent_role_depth: int = Field(
         default=10,
         ge=1,
