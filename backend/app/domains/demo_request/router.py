@@ -43,6 +43,7 @@ from .schemas import (
     DemoRequestListResponse,
     DemoRequestResponse,
     DemoRequestUpdateRequest,
+    compute_lead_priority,
 )
 from .service import DemoRequestService
 
@@ -61,6 +62,12 @@ def _demo_request_response(demo_request: DemoRequest) -> DemoRequestResponse:
         phone=demo_request.phone,
         company_name=demo_request.company_name,
         message=demo_request.message,
+        property_type=demo_request.property_type,
+        location_count=demo_request.location_count,
+        router_count=demo_request.router_count,
+        lead_priority=compute_lead_priority(
+            demo_request.location_count, demo_request.router_count
+        ),
         status=demo_request.status,
         internal_notes=demo_request.internal_notes,
         submitted_at=demo_request.created_at,
@@ -89,6 +96,9 @@ async def submit_demo_request(
         phone=payload.phone,
         company_name=payload.company_name,
         message=payload.message,
+        property_type=payload.property_type,
+        location_count=payload.location_count,
+        router_count=payload.router_count,
     )
     return build_response(
         success=True,
@@ -115,10 +125,15 @@ async def list_demo_requests(
     page_size: int = Query(default=25, ge=1, le=100),
     request_status: str | None = Query(default=None, alias="status"),
     search: str | None = Query(default=None),
+    property_type: str | None = Query(default=None),
     service: DemoRequestService = Depends(get_demo_request_service),
 ):
     result = await service.list_demo_requests(
-        page=page, page_size=page_size, status=request_status, search=search
+        page=page,
+        page_size=page_size,
+        status=request_status,
+        search=search,
+        property_type=property_type,
     )
     payload = DemoRequestListResponse(
         items=[_demo_request_response(r) for r in result.items],

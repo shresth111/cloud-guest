@@ -65,17 +65,28 @@ class DemoRequestService:
         phone: str | None,
         company_name: str,
         message: str | None,
+        property_type: str | None = None,
+        location_count: int | None = None,
+        router_count: int | None = None,
     ) -> DemoRequest:
         """The public "Book a Demo" form submission -- no actor/organization
         of any kind exists yet, so unlike every other domain's ``create_*``
         this never sets ``created_by``/``updated_by`` (both stay ``None``,
-        ``BaseModel``'s own default)."""
+        ``BaseModel``'s own default). ``property_type``/``location_count``/
+        ``router_count`` are the optional, structured lead-qualification
+        fields -- validated/bounded already by ``schemas
+        .DemoRequestCreateRequest`` before this method is ever called, so
+        no further normalization is needed here beyond the same
+        strip()-on-strings posture every other field already gets."""
         demo_request = await self.repository.create(
             full_name=full_name.strip(),
             email=str(email).strip().lower(),
             phone=phone.strip() if phone else None,
             company_name=company_name.strip(),
             message=message.strip() if message else None,
+            property_type=property_type,
+            location_count=location_count,
+            router_count=router_count,
         )
         logger.info(
             "demo_request_submitted",
@@ -111,6 +122,23 @@ class DemoRequestService:
                 )
                 + info_box(
                     [
+                        ("Property type", esc(demo_request.property_type or "—")),
+                        (
+                            "Locations",
+                            esc(
+                                str(demo_request.location_count)
+                                if demo_request.location_count is not None
+                                else "—"
+                            ),
+                        ),
+                        (
+                            "Routers",
+                            esc(
+                                str(demo_request.router_count)
+                                if demo_request.router_count is not None
+                                else "—"
+                            ),
+                        ),
                         ("Phone", esc(demo_request.phone or "—")),
                         ("Message", esc(demo_request.message or "—")),
                     ]
@@ -154,9 +182,14 @@ class DemoRequestService:
         page_size: int = 25,
         status: str | None = None,
         search: str | None = None,
+        property_type: str | None = None,
     ) -> DemoRequestListResult:
         items, meta = await self.repository.list_records(
-            page=page, page_size=page_size, status=status, search=search
+            page=page,
+            page_size=page_size,
+            status=status,
+            search=search,
+            property_type=property_type,
         )
         return DemoRequestListResult(items=items, meta=meta)
 

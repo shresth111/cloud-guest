@@ -40,6 +40,7 @@ class DemoRequestRepositoryProtocol(Protocol):
         page_size: int,
         status: str | None = None,
         search: str | None = None,
+        property_type: str | None = None,
     ) -> tuple[list[DemoRequest], PaginationMeta]: ...
 
 
@@ -62,10 +63,18 @@ class DemoRequestRepository:
     ) -> DemoRequest:
         return await self.demo_requests.update(demo_request, data)
 
-    def _list_filters(self, *, status: str | None, search: str | None) -> list:
+    def _list_filters(
+        self,
+        *,
+        status: str | None,
+        search: str | None,
+        property_type: str | None = None,
+    ) -> list:
         filters = [DemoRequest.is_deleted.is_(False)]
         if status is not None:
             filters.append(DemoRequest.status == status)
+        if property_type is not None:
+            filters.append(DemoRequest.property_type == property_type)
         if search is not None:
             like = f"%{search}%"
             filters.append(
@@ -84,8 +93,11 @@ class DemoRequestRepository:
         page_size: int,
         status: str | None = None,
         search: str | None = None,
+        property_type: str | None = None,
     ) -> tuple[list[DemoRequest], PaginationMeta]:
-        filters = self._list_filters(status=status, search=search)
+        filters = self._list_filters(
+            status=status, search=search, property_type=property_type
+        )
 
         count_statement = select(func.count()).select_from(DemoRequest).where(*filters)
         total_result = await self.session.execute(count_statement)
