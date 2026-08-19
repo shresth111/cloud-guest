@@ -15,11 +15,16 @@ Follows this project's plain-``assert``/native-``async def`` style (see
 from __future__ import annotations
 
 import hashlib
+import inspect
+import io
+import random
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import pytest
+from PIL import Image
 from starlette.requests import Request
 
 from app.common.responses import ApiResponse
@@ -36,12 +41,20 @@ from app.domains.branding.router import _asset_response
 from app.domains.branding.router import router as branding_router
 from app.domains.branding.schemas import BrandingResponse, DefaultBrandingResponse
 from app.domains.branding.service import (
+    _BACKGROUND_MAX_PROCESS_DIM,
+    _BACKGROUND_MAX_PROCESS_PIXELS,
+    _BACKGROUND_TARGET_LONG_EDGE,
+    _EXTENSION_TO_CONTENT_TYPE,
+    BACKGROUND_IMAGE_ALLOWED_CONTENT_TYPES,
     BACKGROUND_IMAGE_MAX_BYTES,
+    BACKGROUND_IMAGE_MIN_LONG_EDGE,
     BACKGROUND_IMAGE_RAW_PATH,
     DEFAULT_BRANDING,
     LOGO_MAX_BYTES,
     LOGO_RAW_PATH,
     BrandingService,
+    _process_background_image,
+    _process_logo,
 )
 
 # ============================================================================
@@ -120,17 +133,26 @@ class FakeBrandingRepository:
         organization_id: uuid.UUID,
         key: str | None,
         *,
+        luminance: int | None = None,
+        top_luminance: int | None = None,
+        entropy: int | None = None,
         actor_user_id: uuid.UUID | None = None,
     ) -> Branding:
         existing = self._by_org.get(organization_id)
         if existing:
             existing.background_image_key = key
+            existing.background_luminance = luminance
+            existing.background_top_luminance = top_luminance
+            existing.background_entropy = entropy
             existing.updated_by = actor_user_id
             return existing
         branding = Branding(
             id=uuid.uuid4(),
             organization_id=organization_id,
             background_image_key=key,
+            background_luminance=luminance,
+            background_top_luminance=top_luminance,
+            background_entropy=entropy,
             created_by=actor_user_id,
             updated_by=actor_user_id,
             created_at=datetime.now(UTC),
@@ -726,3 +748,470 @@ class TestAssetResponseCacheHeaders:
         # documents the actual, narrower behavior rather than asserting an
         # unimplemented spec nicety.
         assert response.status_code == 200
+
+
+# ============================================================================
+# Background image pipeline -- captive-portal v7 design spec, Part 4
+#
+# Note the deliberate difference from every test above this line:
+# ``PNG_BYTES`` is a PNG magic header followed by 100 ASCII zeros, which
+# Pillow cannot decode. That is *why* the tests above still pass
+# unchanged after v7 -- every one of them takes ``_process_background_
+# image``'s graceful "return None, store the original unchanged" path,
+# so their ``.png``/``.jpg`` key assertions still hold. It also means
+# not one of them exercises the pipeline. Everything below builds a real
+# image with ``Image.new(...)``.
+# ============================================================================
+
+
+def _png(size: tuple[int, int], color: tuple[int, int, int] = (120, 130, 140)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _two_tone_png(
+    size: tuple[int, int],
+    top: tuple[int, int, int],
+    bottom: tuple[int, int, int],
+) -> bytes:
+    """A image whose top band differs from the rest -- the only way to
+    tell ``background_top_luminance`` apart from ``background_luminance``
+    and prove it really measures the headline zone."""
+    img = Image.new("RGB", size, bottom)
+    img.paste(top, (0, 0, size[0], size[1] // 3))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _animated_gif(size: tuple[int, int]) -> bytes:
+    first = Image.new("RGB", size, (220, 20, 20))
+    second = Image.new("RGB", size, (20, 20, 220))
+    buf = io.BytesIO()
+    first.save(buf, format="GIF", save_all=True, append_images=[second], duration=100)
+    return buf.getvalue()
+
+
+def _decoded(content: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(content))
+
+
+class TestProcessBackgroundImage:
+    def test_returns_webp_bytes_content_type_and_extension(self) -> None:
+        result = _process_background_image(_png((1600, 1200)))
+
+        assert result is not None
+        content, content_type, extension, metrics = result
+        assert content_type == "image/webp"
+        assert extension == "webp"
+        assert _decoded(content).format == "WEBP"
+        # Part 4's whole economic argument: a correctly-sized WebP is a
+        # fraction of what a camera upload weighs.
+        assert len(content) < len(_png((1600, 1200)))
+        assert 0 <= metrics.luminance <= 100
+
+    def test_serving_map_already_knows_webp(self) -> None:
+        """Part 4's "WebP is safe" claim, asserted rather than assumed:
+        the serving path resolves content type from the stored key's
+        extension, so a ``.webp`` key must already map without any
+        change to that path."""
+        assert _EXTENSION_TO_CONTENT_TYPE["webp"] == "image/webp"
+
+    def test_exif_orientation_is_applied(self) -> None:
+        """The single most consequential line in the pipeline. Browsers
+        auto-rotate a JPEG by its EXIF Orientation tag, Pillow does not,
+        and re-encoding to WebP drops the tag -- so without
+        ``ImageOps.exif_transpose`` every portrait phone photo would
+        ship sideways the day v7 deploys. Here: a 1600x900 *landscape*
+        JPEG carrying Orientation=6 ("rotate 90 CW"), which a browser
+        renders as 900x1600 portrait."""
+        img = Image.new("RGB", (1600, 900), (200, 60, 60))
+        exif = img.getexif()
+        exif[274] = 6
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", exif=exif)
+
+        result = _process_background_image(buf.getvalue())
+
+        assert result is not None
+        out = _decoded(result[0])
+        # Rotated, i.e. portrait -- not the 1600x900 Pillow would have
+        # produced had the tag been ignored.
+        assert out.size == (900, 1600)
+
+    def test_exif_free_image_is_unrotated(self) -> None:
+        result = _process_background_image(_png((1600, 900)))
+        assert result is not None
+        assert _decoded(result[0]).size == (1600, 900)
+
+    def test_downscales_to_the_target_long_edge(self) -> None:
+        result = _process_background_image(_png((4000, 3000)))
+
+        assert result is not None
+        out = _decoded(result[0])
+        assert max(out.size) == _BACKGROUND_TARGET_LONG_EDGE
+        # Aspect ratio preserved.
+        assert out.size == (2560, 1920)
+
+    def test_does_not_upscale_a_smaller_image(self) -> None:
+        """Only ever downscales. Upscaling here would manufacture bytes
+        and detail that were never in the file -- the exact thing CSS
+        `cover` already does badly and that Part 4 exists to stop."""
+        result = _process_background_image(_png((1400, 1050)))
+        assert result is not None
+        assert _decoded(result[0]).size == (1400, 1050)
+
+    def test_animated_gif_flattens_to_frame_zero(self) -> None:
+        """Correct for a background -- nobody wants a loop behind a
+        sign-in form -- and frame 0 specifically, not some other frame."""
+        result = _process_background_image(_animated_gif((1600, 1200)))
+
+        assert result is not None
+        out = _decoded(result[0]).convert("RGB")
+        assert getattr(out, "n_frames", 1) == 1
+        r, g, b = out.resize((1, 1)).getpixel((0, 0))
+        # Frame 0 is red, frame 1 is blue. The blur and the tint shift
+        # the values but cannot invert which channel dominates.
+        assert r > b, f"flattened to the wrong frame: {(r, g, b)}"
+
+    def test_gif_is_still_an_accepted_upload_type(self) -> None:
+        """Part 4's first trap. Removing ``image/gif`` from the ingress
+        allowlist used to also remove ``gif`` from the *derived* serving
+        map, and every already-stored ``.gif`` key would begin serving as
+        ``application/octet-stream`` -- which a browser will not paint as
+        a background-image. The two dicts are now independent (see
+        ``_EXTENSION_TO_CONTENT_TYPE``'s comment); this asserts the
+        second half of that, so a future ingress restriction cannot take
+        the serving map with it."""
+        assert "image/gif" in BACKGROUND_IMAGE_ALLOWED_CONTENT_TYPES
+        assert _EXTENSION_TO_CONTENT_TYPE["gif"] == "image/gif"
+
+    def test_every_ingress_extension_is_servable(self) -> None:
+        for extension in BACKGROUND_IMAGE_ALLOWED_CONTENT_TYPES.values():
+            assert extension in _EXTENSION_TO_CONTENT_TYPE
+
+    def test_undecodable_bytes_return_none(self) -> None:
+        """The graceful fallback the whole contract rests on -- the
+        caller stores the original unchanged rather than failing the
+        upload."""
+        assert _process_background_image(PNG_BYTES) is None
+        assert _process_background_image(b"not an image at all") is None
+
+    def test_decompression_bomb_returns_none(self) -> None:
+        """``Image.DecompressionBombError`` subclasses bare ``Exception``,
+        so it is caught by none of UnidentifiedImageError / OSError /
+        SyntaxError / ValueError, and Pillow raises it from inside
+        ``load()`` -- before any size guard in this module can run.
+        Simulated by lowering Pillow's own threshold rather than
+        allocating a real 400-megapixel image."""
+        content = _png((1600, 1200))
+        original = Image.MAX_IMAGE_PIXELS
+        try:
+            Image.MAX_IMAGE_PIXELS = 10
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                assert _process_background_image(content) is None
+        finally:
+            Image.MAX_IMAGE_PIXELS = original
+
+    def test_rejects_an_image_past_the_per_edge_ceiling(self) -> None:
+        # 20000 x 4 is only 80k pixels -- it passes any total-pixel test
+        # but is absurd on one edge.
+        assert _process_background_image(_png((20000, 4))) is None
+
+    def test_total_pixel_guard_catches_what_a_per_edge_guard_misses(self) -> None:
+        """A 1 x 200000000 aspect passes a per-edge check while decoding
+        to 200 megapixels, which is why both guards exist. Asserted
+        against the constants rather than by building such a file, since
+        constructing it would itself allocate the memory the guard is
+        there to prevent."""
+        assert (
+            _BACKGROUND_MAX_PROCESS_DIM * _BACKGROUND_MAX_PROCESS_DIM
+            > _BACKGROUND_MAX_PROCESS_PIXELS
+        ), "the total-pixel guard must be reachable, not dead code"
+        assert _BACKGROUND_MAX_PROCESS_DIM > 4096, (
+            "must sit far above the logo ceiling -- a 24MP phone photo is "
+            "6000x4000, and a 4096 ceiling would make the fallback fire on "
+            "exactly the uploads that most need downscaling"
+        )
+
+    def test_flattens_transparency_rather_than_carrying_alpha(self) -> None:
+        img = Image.new("RGBA", (1600, 1200), (255, 0, 0, 0))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+
+        result = _process_background_image(buf.getvalue())
+
+        assert result is not None
+        out = _decoded(result[0]).convert("RGB")
+        r, g, b = out.resize((1, 1)).getpixel((0, 0))
+        # Fully transparent red composited onto white, then tinted --
+        # near-white, and specifically *not* red.
+        assert r > 180 and g > 180 and b > 180, (r, g, b)
+
+
+class TestBackgroundImageMetrics:
+    def test_dark_and_bright_images_measure_apart(self) -> None:
+        dark = _process_background_image(_png((1600, 1200), (10, 10, 10)))
+        bright = _process_background_image(_png((1600, 1200), (245, 245, 245)))
+
+        assert dark is not None and bright is not None
+        assert dark[3].luminance < 15
+        assert bright[3].luminance > 85
+
+    def test_top_luminance_measures_the_top_band_not_the_whole_image(self) -> None:
+        """The distinction C3 actually needs: an image can be dark
+        overall while the band the headline sits over is blown-out sky."""
+        result = _process_background_image(
+            _two_tone_png((1600, 1200), top=(250, 250, 250), bottom=(15, 15, 15))
+        )
+
+        assert result is not None
+        metrics = result[3]
+        assert metrics.top_luminance > 85
+        assert metrics.luminance < 60
+        assert metrics.top_luminance > metrics.luminance
+
+    def test_flat_image_is_low_entropy_and_noise_is_high(self) -> None:
+        """C5's "busyness" measure. A flat colour has a one-bucket
+        histogram; random noise fills every bucket."""
+        flat = _process_background_image(_png((1600, 1200), (128, 128, 128)))
+
+        noise = Image.frombytes(
+            "RGB",
+            (1600, 1200),
+            bytes(random.randbytes(1600 * 1200 * 3)),
+        )
+        buf = io.BytesIO()
+        noise.save(buf, format="PNG")
+        busy = _process_background_image(buf.getvalue())
+
+        assert flat is not None and busy is not None
+        assert flat[3].entropy < 10
+        assert busy[3].entropy > flat[3].entropy
+
+    def test_all_metrics_are_ints_in_range(self) -> None:
+        result = _process_background_image(
+            _two_tone_png((1600, 1200), (200, 0, 0), (0, 0, 90))
+        )
+        assert result is not None
+        metrics = result[3]
+        for value in (metrics.luminance, metrics.top_luminance, metrics.entropy):
+            assert isinstance(value, int)
+            assert 0 <= value <= 100
+
+
+class TestUploadBackgroundImageThroughThePipeline:
+    async def test_real_image_is_stored_as_webp_with_metrics(self) -> None:
+        service, repository, storage, _audit = make_service()
+        org_id = uuid.uuid4()
+
+        result = await service.upload_background_image(
+            org_id,
+            filename="lobby.png",
+            content_type="image/png",
+            content=_png((1600, 1200), (30, 40, 50)),
+        )
+
+        stored = repository._by_org[org_id]
+        assert stored.background_image_key.endswith(".webp")
+        assert _decoded(storage.uploaded[stored.background_image_key]).format == "WEBP"
+        assert stored.background_luminance is not None
+        assert stored.background_top_luminance is not None
+        assert stored.background_entropy is not None
+        # And they come back out on the read model the dashboard uses.
+        assert result.background_luminance == stored.background_luminance
+        assert result.background_entropy == stored.background_entropy
+
+    async def test_jpeg_upload_is_normalized_to_webp(self) -> None:
+        service, repository, _storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        buf = io.BytesIO()
+        Image.new("RGB", (2000, 1500), (90, 100, 110)).save(buf, format="JPEG")
+
+        await service.upload_background_image(
+            org_id, filename="a.jpg", content_type="image/jpeg", content=buf.getvalue()
+        )
+
+        assert repository._by_org[org_id].background_image_key.endswith(".webp")
+
+    async def test_unprocessable_upload_still_stores_the_original_unchanged(
+        self,
+    ) -> None:
+        """The contract ``_process_logo`` established and this function
+        mirrors: an image we cannot process is stored as-is, not
+        rejected. Metrics stay ``None`` -- "not measured", which the
+        frontend must be able to tell apart from "measured 0"."""
+        service, repository, storage, _audit = make_service()
+        org_id = uuid.uuid4()
+
+        await service.upload_background_image(
+            org_id, filename="bg.png", content_type="image/png", content=PNG_BYTES
+        )
+
+        stored = repository._by_org[org_id]
+        assert stored.background_image_key.endswith(".png")
+        assert storage.uploaded[stored.background_image_key] == PNG_BYTES
+        assert stored.background_luminance is None
+        assert stored.background_top_luminance is None
+        assert stored.background_entropy is None
+
+    async def test_rejects_an_image_below_the_resolution_floor(self) -> None:
+        """Part 4 item 8: below ~1200px on the long edge, `cover` on a
+        phone is upscaling by 2x or more and no processing recovers the
+        detail. Refused with a reason, never silently accepted."""
+        service, _repository, _storage, _audit = make_service()
+
+        with pytest.raises(InvalidBackgroundImageError) as exc:
+            await service.upload_background_image(
+                uuid.uuid4(),
+                filename="tiny.png",
+                content_type="image/png",
+                content=_png((800, 600)),
+            )
+        assert str(BACKGROUND_IMAGE_MIN_LONG_EDGE) in str(exc.value)
+
+    async def test_accepts_exactly_the_resolution_floor(self) -> None:
+        service, repository, _storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        await service.upload_background_image(
+            org_id,
+            filename="ok.png",
+            content_type="image/png",
+            content=_png((BACKGROUND_IMAGE_MIN_LONG_EDGE, 700)),
+        )
+        assert repository._by_org[org_id].background_image_key.endswith(".webp")
+
+    async def test_undecodable_upload_skips_the_resolution_floor(self) -> None:
+        """Refusing a file for being too small when we could not measure
+        it at all would be worse than storing it -- and would break every
+        pre-v7 test that uploads undecodable bytes."""
+        service, repository, _storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        await service.upload_background_image(
+            org_id, filename="bg.png", content_type="image/png", content=PNG_BYTES
+        )
+        assert repository._by_org[org_id].background_image_key is not None
+
+    async def test_size_cap_still_applies_to_ingress_bytes(self) -> None:
+        """The 5 MiB cap must be checked *before* processing. Checking it
+        after would let a 40 MB upload through on the grounds that it
+        compresses well -- having already paid the bandwidth, the decode
+        and the memory."""
+        service, _repository, _storage, _audit = make_service()
+        oversized = _png((3000, 2000)) + b"\x00" * BACKGROUND_IMAGE_MAX_BYTES
+
+        with pytest.raises(InvalidBackgroundImageError) as exc:
+            await service.upload_background_image(
+                uuid.uuid4(),
+                filename="huge.png",
+                content_type="image/png",
+                content=oversized,
+            )
+        assert "limit" in str(exc.value)
+
+    async def test_delete_clears_the_metrics_too(self) -> None:
+        service, repository, _storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        await service.upload_background_image(
+            org_id,
+            filename="bg.png",
+            content_type="image/png",
+            content=_png((1600, 1200)),
+        )
+        assert repository._by_org[org_id].background_luminance is not None
+
+        await service.delete_background_image(org_id)
+
+        stored = repository._by_org[org_id]
+        assert stored.background_image_key is None
+        assert stored.background_luminance is None
+        assert stored.background_top_luminance is None
+        assert stored.background_entropy is None
+
+    async def test_stored_webp_serves_with_the_right_content_type(self) -> None:
+        """End to end: the pipeline writes a ``.webp`` key and the read
+        path resolves its content type from that extension, with no
+        change to the serving path at all."""
+        service, _repository, _storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        await service.upload_background_image(
+            org_id,
+            filename="bg.png",
+            content_type="image/png",
+            content=_png((1600, 1200)),
+        )
+
+        content, content_type = await service.get_background_image_bytes(org_id)
+
+        assert content_type == "image/webp"
+        assert _decoded(content).format == "WEBP"
+
+
+# ============================================================================
+# _process_logo -- the DecompressionBombError fix
+#
+# A live 500 today, independent of v7: the class subclasses bare
+# ``Exception`` so none of the enumerated handlers catch it, and Pillow
+# raises it from ``load()`` -- which runs *before* the
+# ``_LOGO_MAX_PROCESS_DIM`` guard. A ~20000x20000 mostly-flat PNG (what
+# "export at maximum size" produces) compresses to well under the 5 MiB
+# ingress cap and crashes the logo upload.
+# ============================================================================
+
+
+class TestProcessLogoDecompressionBomb:
+    def test_process_logo_returns_none_instead_of_raising(self) -> None:
+        content = _png((400, 400))
+        original = Image.MAX_IMAGE_PIXELS
+        try:
+            Image.MAX_IMAGE_PIXELS = 10
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                assert _process_logo(content) is None
+        finally:
+            Image.MAX_IMAGE_PIXELS = original
+
+    async def test_upload_logo_falls_back_instead_of_500ing(self) -> None:
+        service, repository, storage, _audit = make_service()
+        org_id = uuid.uuid4()
+        content = _png((400, 400))
+
+        original = Image.MAX_IMAGE_PIXELS
+        try:
+            Image.MAX_IMAGE_PIXELS = 10
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                await service.upload_logo(
+                    org_id,
+                    filename="logo.png",
+                    content_type="image/png",
+                    content=content,
+                )
+        finally:
+            Image.MAX_IMAGE_PIXELS = original
+
+        # The original bytes, stored unchanged -- the documented
+        # fallback, not an exception.
+        key = repository._by_org[org_id].logo_key
+        assert key is not None
+        assert storage.uploaded[key] == content
+
+    def test_the_enumerated_except_list_was_not_widened_to_bare_exception(
+        self,
+    ) -> None:
+        """The list is deliberate and auditable: every entry names a
+        real, reproduced failure. Catching bare ``Exception`` would make
+        the next genuine bug in this function invisible."""
+        for fn in (_process_logo, _process_background_image):
+            # Comments stripped first -- both functions *discuss* why
+            # they are not `except Exception`, and matching that prose
+            # would make this assertion pass for the wrong reason.
+            code = "\n".join(
+                line
+                for line in inspect.getsource(fn).splitlines()
+                if not line.lstrip().startswith("#")
+            )
+            assert "except Exception" not in code
+            assert "DecompressionBombError" in code

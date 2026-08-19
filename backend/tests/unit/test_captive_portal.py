@@ -20,10 +20,13 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
 from app.domains.captive_portal.constants import (
+    DEFAULT_BACKGROUND_FOCAL_X,
+    DEFAULT_BACKGROUND_FOCAL_Y,
     DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
     DEFAULT_GUEST_FONT_CHOICE,
     TERMS_AND_CONDITIONS_LABEL,
@@ -33,6 +36,7 @@ from app.domains.captive_portal.exceptions import (
     CaptivePortalConfigNotConfiguredError,
     CaptivePortalConfigNotFoundError,
     CrossOrganizationCaptivePortalConfigAccessError,
+    InvalidBackgroundFocalPointError,
     InvalidBackgroundOverlayStrengthError,
     InvalidDefaultConfigScopeError,
     InvalidGuestFontChoiceError,
@@ -43,6 +47,7 @@ from app.domains.captive_portal.exceptions import (
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.captive_portal.validators import (
+    validate_background_focal_point,
     validate_background_overlay_strength,
     validate_default_scope,
     validate_guest_font_choice,
@@ -1350,3 +1355,344 @@ class TestGuestFontChoiceAndOverlayStrengthResolve:
         )
         assert second.config.guest_font_choice == "bold-display"
         assert second.config.background_overlay_strength == 30
+
+
+# ============================================================================
+# Per-venue background focal point (v7 design spec §1.4 C4)
+# ============================================================================
+
+
+class TestBackgroundFocalPointValidation:
+    @pytest.mark.parametrize("value", [0, 1, 25, 50, 99, 100])
+    def test_valid_range_passes(self, value: int) -> None:
+        validate_background_focal_point("x", value)
+        validate_background_focal_point("y", value)
+
+    @pytest.mark.parametrize("value", [-1, 101, 1000, -100])
+    def test_out_of_range_raises(self, value: int) -> None:
+        with pytest.raises(InvalidBackgroundFocalPointError):
+            validate_background_focal_point("x", value)
+
+    @pytest.mark.parametrize("value", [True, False, "50", 50.0, None])
+    def test_non_integer_raises(self, value: object) -> None:
+        """``bool`` excluded for the same reason
+        ``validate_background_overlay_strength`` excludes it: Python's
+        ``bool`` subclasses ``int``, and ``True`` is never a legal focal
+        percentage."""
+        with pytest.raises(InvalidBackgroundFocalPointError):
+            validate_background_focal_point("y", value)
+
+    def test_error_names_the_offending_axis(self) -> None:
+        """An admin who mistypes one of two adjacent numeric fields needs
+        to be told which one."""
+        with pytest.raises(InvalidBackgroundFocalPointError) as exc:
+            validate_background_focal_point("y", 140)
+        assert "background_focal_y" in str(exc.value)
+
+    async def test_update_accepts_a_valid_focal_point(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"background_focal_x": 30, "background_focal_y": 70},
+        )
+        assert updated.background_focal_x == 30
+        assert updated.background_focal_y == 70
+
+    async def test_update_accepts_boundary_values(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        for boundary in (0, 100):
+            updated = await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={
+                    "background_focal_x": boundary,
+                    "background_focal_y": boundary,
+                },
+            )
+            assert updated.background_focal_x == boundary
+            assert updated.background_focal_y == boundary
+
+    async def test_update_rejects_out_of_range_x(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        with pytest.raises(InvalidBackgroundFocalPointError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"background_focal_x": 120},
+            )
+
+    async def test_update_rejects_out_of_range_y(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        with pytest.raises(InvalidBackgroundFocalPointError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"background_focal_y": -3},
+            )
+
+
+class TestBackgroundFocalPointDefaults:
+    def test_model_column_defaults_reproduce_todays_center_25_percent(self) -> None:
+        """50/25 is the whole point of these defaults: it is exactly the
+        frontend's current hardcoded ``background-position: center 25%``,
+        so the migration that adds these columns changes nothing that
+        any existing venue renders."""
+        table = CaptivePortalConfig.__table__
+        assert table.c.background_focal_x.default.arg == DEFAULT_BACKGROUND_FOCAL_X
+        assert table.c.background_focal_x.default.arg == 50
+        assert table.c.background_focal_y.default.arg == DEFAULT_BACKGROUND_FOCAL_Y
+        assert table.c.background_focal_y.default.arg == 25
+
+    def test_columns_are_not_nullable(self) -> None:
+        table = CaptivePortalConfig.__table__
+        assert table.c.background_focal_x.nullable is False
+        assert table.c.background_focal_y.nullable is False
+
+
+class TestBackgroundFocalPointResolve:
+    async def test_resolve_surfaces_the_focal_point(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, name="Org default", is_default=True)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"background_focal_x": 20, "background_focal_y": 80},
+        )
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert resolved.config.background_focal_x == 20
+        assert resolved.config.background_focal_y == 80
+
+    async def test_resolve_cache_round_trips_the_focal_point(self) -> None:
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx, name="Org default", is_default=True)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"background_focal_x": 15, "background_focal_y": 60},
+        )
+        first = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert first.config.background_focal_x == 15
+
+        # Served from cache -- repository row deleted directly, bypassing
+        # the service, same proof technique as TestResolveCache.
+        del fx.repository.configs[config.id]
+        second = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert second.config.background_focal_x == 15
+        assert second.config.background_focal_y == 60
+
+
+class TestResolveCacheKeyVersion:
+    def test_cache_key_is_v3(self) -> None:
+        """Spec §0.3: the version must be bumped in the same change that
+        adds a field to ``_CACHED_CONFIG_SCALAR_FIELDS``. Skipping it
+        makes every payload written by the previous build raise KeyError
+        out of the unauthenticated guest resolve endpoint -- a 500 for
+        every guest joining WiFi until the TTL expires."""
+        from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
+
+        key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
+        assert key == "captive_portal:resolve:v3:org:loc"
+
+    def test_every_cached_field_exists_on_the_model(self) -> None:
+        """The versioning only protects a *deploy*; this catches the
+        other half -- a name in the tuple that no column backs, which
+        would fail at write time instead."""
+        from app.domains.captive_portal.service import _CACHED_CONFIG_SCALAR_FIELDS
+
+        columns = set(CaptivePortalConfig.__table__.c.keys())
+        assert set(_CACHED_CONFIG_SCALAR_FIELDS) <= columns
+        assert "background_focal_x" in _CACHED_CONFIG_SCALAR_FIELDS
+        assert "background_focal_y" in _CACHED_CONFIG_SCALAR_FIELDS
+
+
+# ============================================================================
+# Guest-facing resolve surfaces the branding-side image measurements
+# (v7 design spec §1.4 C3/C5).
+#
+# These three live on ``brandings``, not ``captive_portal_configs``, so
+# unlike the focal point they are not part of the resolve cache payload
+# -- they ride along on the branding row the resolve route already
+# fetches for the logo/background fallback. Exercised at the *route*
+# level because that fallback, and therefore the whole passthrough, only
+# exists there.
+# ============================================================================
+
+
+@dataclass
+class _FakeBranding:
+    background_image_key: str | None = None
+    logo_key: str | None = None
+    logo_url: str | None = None
+    background_luminance: int | None = None
+    background_top_luminance: int | None = None
+    background_entropy: int | None = None
+
+
+def _resolve_request() -> object:
+    from starlette.requests import Request
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/captive-portal/resolve",
+            "headers": [],
+            "scheme": "https",
+            "server": ("api.example.com", 443),
+            "query_string": b"",
+        }
+    )
+    request.state.request_id = "test-request-id"
+    return request
+
+
+def _apply_column_defaults(config: CaptivePortalConfig) -> None:
+    """SQLAlchemy column-level ``default=``s are applied by the INSERT,
+    which never runs against ``FakeCaptivePortalRepository`` -- so a fake
+    config carries ``None`` for every column the service does not set
+    explicitly (``business_hours_schedule``, ``guest_font_choice``,
+    ``background_focal_x`` ...). Harmless for the service-level tests
+    above, which read one field at a time, but the *route* builds a full
+    response model and would trip over the Nones for reasons that have
+    nothing to do with what is being tested. Applied here rather than
+    hand-listing the columns so this cannot go stale as columns are
+    added."""
+    for column in CaptivePortalConfig.__table__.columns:
+        if getattr(config, column.name, None) is None and column.default is not None:
+            arg = column.default.arg
+            setattr(config, column.name, arg(None) if callable(arg) else arg)
+
+
+async def _call_resolve_route(fx: Fixture, branding: _FakeBranding | None) -> dict:
+    from app.domains.captive_portal import router as router_module
+
+    for config in fx.repository.configs.values():
+        _apply_column_defaults(config)
+
+    original = router_module.BrandingRepository
+    router_module.BrandingRepository = lambda _db: SimpleNamespace(
+        get_by_organization=_returning(branding)
+    )
+    try:
+        response = await router_module.resolve_captive_portal_config(
+            _resolve_request(),
+            organization_id=fx.organization.id,
+            location_id=None,
+            service=fx.service,
+            db=None,
+        )
+    finally:
+        router_module.BrandingRepository = original
+    return response["data"]
+
+
+def _returning(value: object):
+    async def _get(_organization_id: uuid.UUID) -> object:
+        return value
+
+    return _get
+
+
+class TestResolveSurfacesBackgroundImageMetrics:
+    async def test_metrics_ride_along_with_the_branding_background(self) -> None:
+        fx = make_service()
+        await _create_config(fx, name="Org default", is_default=True)
+
+        data = await _call_resolve_route(
+            fx,
+            _FakeBranding(
+                background_image_key="branding/x/background/abc.webp",
+                background_luminance=18,
+                background_top_luminance=71,
+                background_entropy=64,
+            ),
+        )
+
+        assert data["background_image_url"].endswith("/background-image/public")
+        assert data["background_luminance"] == 18
+        assert data["background_top_luminance"] == 71
+        assert data["background_entropy"] == 64
+
+    async def test_metrics_are_none_when_no_branding_row_exists(self) -> None:
+        fx = make_service()
+        await _create_config(fx, name="Org default", is_default=True)
+
+        data = await _call_resolve_route(fx, None)
+
+        assert data["background_luminance"] is None
+        assert data["background_top_luminance"] is None
+        assert data["background_entropy"] is None
+
+    async def test_unmeasured_image_reports_none_not_zero(self) -> None:
+        """A pre-v7 image nobody has backfilled. None must reach the
+        frontend as None: 0 is a legitimate reading (a black photo), and
+        conflating the two would let the frontend use *less* scrim than
+        the §1.3 floor on an image it has never seen."""
+        fx = make_service()
+        await _create_config(fx, name="Org default", is_default=True)
+
+        data = await _call_resolve_route(
+            fx, _FakeBranding(background_image_key="branding/x/background/old.jpg")
+        )
+
+        assert data["background_image_url"] is not None
+        assert data["background_luminance"] is None
+        assert data["background_entropy"] is None
+
+    async def test_no_metrics_when_the_config_has_its_own_background_url(self) -> None:
+        """The config's own typed-in URL points at a file nothing
+        measured. Reporting the organization photo's numbers for a
+        *different* image would be worse than reporting nothing."""
+        fx = make_service()
+        config = await _create_config(fx, name="Org default", is_default=True)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"background_image_url": "https://cdn.example.com/venue.jpg"},
+        )
+
+        data = await _call_resolve_route(
+            fx,
+            _FakeBranding(
+                background_image_key="branding/x/background/abc.webp",
+                background_luminance=18,
+                background_top_luminance=71,
+                background_entropy=64,
+            ),
+        )
+
+        assert data["background_image_url"] == "https://cdn.example.com/venue.jpg"
+        assert data["background_luminance"] is None
+
+    async def test_focal_point_reaches_the_guest_response(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, name="Org default", is_default=True)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"background_focal_x": 35, "background_focal_y": 15},
+        )
+
+        data = await _call_resolve_route(fx, None)
+
+        assert data["background_focal_x"] == 35
+        assert data["background_focal_y"] == 15

@@ -28,6 +28,15 @@ class BrandingResponse(BaseModel):
     # not a persisted column itself -- see
     # BrandingService._resolve_background_image_url.
     background_image_url: str | None = None
+    # Computed once at upload from the image itself (v7 spec §1.4
+    # C3/C5) -- read-only, never part of BrandingUpdateRequest. 0-100,
+    # or None for an image uploaded before the v7 pipeline existed (or
+    # one whose processing took the graceful fallback): "not measured"
+    # is deliberately distinguishable from "measured 0", see
+    # Branding.background_luminance's own comment.
+    background_luminance: int | None = None
+    background_top_luminance: int | None = None
+    background_entropy: int | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

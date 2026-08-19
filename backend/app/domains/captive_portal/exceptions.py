@@ -15,7 +15,9 @@ from fastapi import status
 from app.common.exceptions import CloudGuestError
 
 from .constants import (
+    MAX_BACKGROUND_FOCAL,
     MAX_BACKGROUND_OVERLAY_STRENGTH,
+    MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
     GuestFontChoice,
 )
@@ -33,6 +35,7 @@ __all__ = [
     "InvalidBusinessHoursScheduleError",
     "InvalidGuestFontChoiceError",
     "InvalidBackgroundOverlayStrengthError",
+    "InvalidBackgroundFocalPointError",
 ]
 
 
@@ -175,5 +178,22 @@ class InvalidBackgroundOverlayStrengthError(CaptivePortalError):
             "background_overlay_strength must be an integer between "
             f"{MIN_BACKGROUND_OVERLAY_STRENGTH} and "
             f"{MAX_BACKGROUND_OVERLAY_STRENGTH}, got '{value}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidBackgroundFocalPointError(CaptivePortalError):
+    """``background_focal_x`` or ``background_focal_y`` was outside the
+    valid [0, 100] integer range -- see
+    ``validators.validate_background_focal_point``. Both axes are
+    percentages of the image's own width/height (v7 design spec §1.4
+    C4), so the range is the full 0-100 on each; there is no separate
+    render-time clamp on the frontend for these, unlike
+    ``background_overlay_strength``."""
+
+    def __init__(self, axis: str, value: object) -> None:
+        super().__init__(
+            f"background_focal_{axis} must be an integer between "
+            f"{MIN_BACKGROUND_FOCAL} and {MAX_BACKGROUND_FOCAL}, got '{value}'",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
