@@ -17,11 +17,21 @@ the moment the row was inserted, i.e. the moment the request was submitted
 -- ``schemas.DemoRequestResponse`` exposes it under the ``submitted_at``
 name for a clearer public-facing/Master-console contract, without storing
 the same timestamp twice.
+
+``property_type``/``location_count``/``router_count`` are the structured
+lead-qualification fields the public form optionally collects alongside
+the original free-text ``message`` -- see ``constants
+.DemoRequestPropertyType`` for the bounded vertical taxonomy and
+``schemas.compute_lead_priority`` for how they're turned into a triage
+signal. All three are nullable: the original form fields
+(``full_name``/``email``/``phone``/``company_name``/``message``) stay the
+only ones a prospect is ever required to fill in, and every row inserted
+before this feature shipped is simply "unknown", never a data migration.
 """
 
 from __future__ import annotations
 
-from sqlalchemy import Index, String, Text
+from sqlalchemy import Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
@@ -40,6 +50,15 @@ class DemoRequest(BaseModel):
     phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     company_name: Mapped[str] = mapped_column(String(255), nullable=False)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Structured lead-qualification fields -- all optional, all
+    # self-reported by the prospect on the public form. See this class's
+    # own module docstring.
+    property_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    location_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Often less certain than location_count (a prospect may know they run
+    # "12 branches" without knowing their exact router count) -- kept as
+    # its own genuinely-optional column rather than derived/required.
+    router_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default=DemoRequestStatus.NEW.value
     )
@@ -54,6 +73,11 @@ class DemoRequest(BaseModel):
         # ix_support_tickets_status index.
         Index("ix_demo_requests_status", "status"),
         Index("ix_demo_requests_email", "email"),
+        # Justified (not speculative): list_demo_requests now supports
+        # filtering by property_type (see repository.py's
+        # _list_filters) so sales can triage the queue by vertical the
+        # same way it already does by status.
+        Index("ix_demo_requests_property_type", "property_type"),
     )
 
     def __repr__(self) -> str:
