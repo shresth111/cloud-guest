@@ -273,6 +273,44 @@ class FakeCaptivePortalRepository:
 
 
 @dataclass
+class FakeCaptivePortalResolveCache:
+    """In-memory stand-in for ``cache.CaptivePortalResolveCache`` -- same
+    ``get``/``set``/``invalidate`` surface as
+    ``service.CaptivePortalResolveCacheProtocol``, keyed identically (a
+    ``(organization_id, location_id)`` pair, with a ``"-"`` sentinel for
+    ``None``) but backed by a plain dict instead of Redis."""
+
+    store: dict[tuple[str, str], dict[str, object]] = field(default_factory=dict)
+
+    @staticmethod
+    def _key(
+        organization_id: uuid.UUID | None, location_id: uuid.UUID | None
+    ) -> tuple[str, str]:
+        return (
+            str(organization_id) if organization_id else "-",
+            str(location_id) if location_id else "-",
+        )
+
+    async def get(
+        self, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
+    ) -> dict[str, object] | None:
+        return self.store.get(self._key(organization_id, location_id))
+
+    async def set(
+        self,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        payload: dict[str, object],
+    ) -> None:
+        self.store[self._key(organization_id, location_id)] = payload
+
+    async def invalidate(
+        self, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
+    ) -> None:
+        self.store.pop(self._key(organization_id, location_id), None)
+
+
+@dataclass
 class Fixture:
     repository: FakeCaptivePortalRepository
     audit_writer: FakeAuditLogWriter
@@ -280,19 +318,22 @@ class Fixture:
     location_lookup: FakeLocationLookup
     service: CaptivePortalService
     organization: Organization
+    resolve_cache: FakeCaptivePortalResolveCache | None = None
 
 
-def make_service() -> Fixture:
+def make_service(*, with_cache: bool = False) -> Fixture:
     repository = FakeCaptivePortalRepository()
     audit_writer = FakeAuditLogWriter()
     organization_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup()
     organization = organization_lookup.add()
+    resolve_cache = FakeCaptivePortalResolveCache() if with_cache else None
     service = CaptivePortalService(
         repository,
         organization_lookup,
         location_lookup,
         audit_writer=audit_writer,
+        resolve_cache=resolve_cache,
     )
     return Fixture(
         repository=repository,
@@ -301,6 +342,7 @@ def make_service() -> Fixture:
         location_lookup=location_lookup,
         service=service,
         organization=organization,
+        resolve_cache=resolve_cache,
     )
 
 
@@ -699,6 +741,194 @@ class TestResolution:
             organization_id=fx.organization.id, location_id=None
         )
         assert resolved.location_country is None
+
+    async def test_location_name_populated_alongside_location_country(self) -> None:
+        """``location_name`` is sourced off the exact same
+        ``location_lookup.get_location`` call ``location_country`` already
+        piggybacks on -- see ``ResolvedPortalConfig.location_name``'s own
+        docstring for why this replaces a second, router-level query."""
+        fx = make_service()
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        await _create_config(fx, name="Org default", is_default=True)
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=None, location_id=location.id
+        )
+        assert resolved.location_name == location.name
+
+    async def test_location_name_is_none_when_resolved_by_organization_only(
+        self,
+    ) -> None:
+        fx = make_service()
+        await _create_config(fx, name="Org default", is_default=True)
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert resolved.location_name is None
+
+
+# ============================================================================
+# Guest-facing resolve cache
+# ============================================================================
+
+
+class TestResolveCache:
+    """``resolve_portal_config`` is opt-in cache-or-fetch (a ``None``
+    ``resolve_cache`` -- ``make_service()``'s default -- behaves exactly as
+    it always has, per every test above this class). These tests exercise
+    ``make_service(with_cache=True)``, proving both that a cache hit really
+    does short-circuit the repository, and that every mutation invalidates
+    the real keys a guest call could have populated -- including the
+    ``(None, location_id)`` key shape a location-only guest call warms."""
+
+    async def test_second_resolve_is_served_from_cache(self) -> None:
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx, name="Org default", is_default=True)
+        first = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert first.config.id == config.id
+
+        # Delete the row straight out of the backing store, bypassing the
+        # service entirely -- if the second call still succeeds with the
+        # same data, it can only have come from the cache, not a real
+        # repository lookup.
+        del fx.repository.configs[config.id]
+
+        second = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert second.config.id == config.id
+        assert second.config.name == "Org default"
+
+    async def test_update_invalidates_org_default_cache_entry(self) -> None:
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx, name="Org default", is_default=True)
+        await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"splash_headline": "New headline"},
+        )
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert resolved.config.splash_headline == "New headline"
+
+    async def test_update_invalidates_both_key_shapes_for_location_config(
+        self,
+    ) -> None:
+        """A real guest call for a location-scoped config commonly supplies
+        ``location_id`` alone (no ``organization_id``) -- that resolution
+        is cached under a ``(None, location_id)`` key distinct from
+        ``(organization_id, location_id)``. An edit must invalidate both,
+        or this exact call shape would keep serving stale data."""
+        fx = make_service(with_cache=True)
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        config = await _create_config(
+            fx, name="Location override", location_id=location.id
+        )
+        # Warm the (None, location_id) cache entry -- the location-only
+        # call shape.
+        await fx.service.resolve_portal_config(
+            organization_id=None, location_id=location.id
+        )
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"splash_headline": "Updated"},
+        )
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=None, location_id=location.id
+        )
+        assert resolved.config.splash_headline == "Updated"
+
+    async def test_activate_deactivate_invalidate_cache(self) -> None:
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx, is_default=True, is_active=False)
+        with pytest.raises(CaptivePortalConfigNotConfiguredError):
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+        await fx.service.activate_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+        )
+        activated = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert activated.config.id == config.id
+
+        await fx.service.deactivate_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+        )
+        with pytest.raises(CaptivePortalConfigNotConfiguredError):
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+
+    async def test_delete_invalidates_cache(self) -> None:
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx, is_default=True)
+        await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        await fx.service.delete_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+        )
+        with pytest.raises(CaptivePortalConfigNotConfiguredError):
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+
+    async def test_create_new_default_invalidates_stale_not_configured_cache(
+        self,
+    ) -> None:
+        """Guards against caching a *negative* result forever: nothing
+        warms the cache on a ``CaptivePortalConfigNotConfiguredError`` (it's
+        raised before ``resolve_cache.set`` is ever reached), so creating
+        the first config for a previously-unconfigured organization must be
+        immediately resolvable, not stuck behind a cached miss."""
+        fx = make_service(with_cache=True)
+        with pytest.raises(CaptivePortalConfigNotConfiguredError):
+            await fx.service.resolve_portal_config(
+                organization_id=fx.organization.id, location_id=None
+            )
+        config = await _create_config(fx, name="First config", is_default=True)
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert resolved.config.id == config.id
+
+    async def test_cached_payload_round_trips_via_resolved_portal_config(self) -> None:
+        """The cached payload isn't merely equal-looking data -- it's the
+        exact ``ResolvedPortalConfig`` a caller gets on a cache miss too,
+        round-tripped through ``to_cache_payload``/``from_cache_payload``
+        (JSON-serializable primitives only, since the real cache is Redis)."""
+        fx = make_service(with_cache=True)
+        location = fx.location_lookup.add(
+            organization_id=fx.organization.id, country="IN"
+        )
+        await _create_config(fx, name="Location override", location_id=location.id)
+        first = await fx.service.resolve_portal_config(
+            organization_id=None, location_id=location.id
+        )
+        second = await fx.service.resolve_portal_config(
+            organization_id=None, location_id=location.id
+        )
+        assert second.config.id == first.config.id
+        assert second.config.name == first.config.name
+        assert second.resolved_via_location_override is True
+        assert second.location_country == "IN"
+        assert second.location_name == location.name
 
 
 # ============================================================================
