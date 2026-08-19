@@ -145,7 +145,10 @@ class FakeRouterLookup:
         return router
 
     async def get_router(
-        self, router_id: uuid.UUID, *, requesting_organization_id: uuid.UUID | None = None
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
     ) -> Router:
         return self.routers[router_id]
 
@@ -451,7 +454,9 @@ async def _repo_get(
 class TestSummarize:
     async def test_counts_pass_fail_not_checked(self) -> None:
         service, _repo, router_lookup, _isp, wg_lookup, agent_lookup = _build_service()
-        router = router_lookup.add(_make_router(status="online", health_status="healthy"))
+        router = router_lookup.add(
+            _make_router(status="online", health_status="healthy")
+        )
         agent_lookup.credentials_by_router[router.id] = FakeCredential(
             revoked_at=None, expires_at=_now() + timedelta(days=30)
         )

@@ -259,7 +259,9 @@ class IspRepository:
         if end is not None:
             conditions.append(IspHealthCheck.checked_at <= end)
         params = PageParams(page=page, page_size=page_size)
-        count_statement = select(func.count()).select_from(IspHealthCheck).where(*conditions)
+        count_statement = (
+            select(func.count()).select_from(IspHealthCheck).where(*conditions)
+        )
         total_result = await self.session.execute(count_statement)
         total_items = int(total_result.scalar_one())
         statement = (

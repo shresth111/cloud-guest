@@ -29,7 +29,11 @@ from app.database.utils.pagination import PaginationMeta
 from app.domains.location.exceptions import LocationNotFoundError
 from app.domains.rbac.enums import AuditAction
 
-from .constants import RESOLVED_STATUSES, SUPPORT_TICKETS_LIVE_CHANNEL, TicketRealtimeMessageType
+from .constants import (
+    RESOLVED_STATUSES,
+    SUPPORT_TICKETS_LIVE_CHANNEL,
+    TicketRealtimeMessageType,
+)
 from .exceptions import (
     CrossOrganizationTicketAccessError,
     InvalidTicketLocationError,
@@ -73,7 +77,9 @@ async def _publish_live_message(
         )
 
 
-def _reply_live_payload(record: TicketReplyRecord, *, organization_id: uuid.UUID) -> dict[str, object]:
+def _reply_live_payload(
+    record: TicketReplyRecord, *, organization_id: uuid.UUID
+) -> dict[str, object]:
     reply = record.reply
     return {
         "id": str(reply.id),
@@ -441,4 +447,9 @@ class TicketService:
         )
 
 
-__all__ = ["TicketService", "TicketListResult", "LocationLookupProtocol", "AuditLogWriter"]
+__all__ = [
+    "TicketService",
+    "TicketListResult",
+    "LocationLookupProtocol",
+    "AuditLogWriter",
+]

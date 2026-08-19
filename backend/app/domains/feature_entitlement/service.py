@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any
 
 from app.domains.billing.constants import (
     BOOLEAN_FEATURE_KEYS,
@@ -20,8 +19,6 @@ from app.domains.billing.constants import (
     SupportTier,
 )
 from app.domains.billing.service import SuperAdminBillingDashboardService
-from app.domains.organization.repository import OrganizationRepositoryProtocol
-from app.domains.organization.service import OrganizationService
 
 from .schemas import (
     CustomerFeaturesResponse,
@@ -34,23 +31,67 @@ from .schemas import (
 logger = logging.getLogger(__name__)
 
 FEATURE_META: dict[PlanFeatureKey, tuple[str, str, str]] = {
-    PlanFeatureKey.CAPTIVE_PORTAL_BUILDER: ("Captive Portal Builder", "Design and customize guest captive portals", "portal"),
-    PlanFeatureKey.AI_FEATURES: ("AI Features", "AI-powered network insights and recommendations", "ai"),
-    PlanFeatureKey.ANALYTICS: ("Analytics", "Advanced analytics and reporting", "analytics"),
-    PlanFeatureKey.MONITORING: ("Monitoring", "Real-time network monitoring and alerts", "monitoring"),
-    PlanFeatureKey.WHITE_LABEL: ("White Label", "Custom branding and white-label portals", "branding"),
+    PlanFeatureKey.CAPTIVE_PORTAL_BUILDER: (
+        "Captive Portal Builder",
+        "Design and customize guest captive portals",
+        "portal",
+    ),
+    PlanFeatureKey.AI_FEATURES: (
+        "AI Features",
+        "AI-powered network insights and recommendations",
+        "ai",
+    ),
+    PlanFeatureKey.ANALYTICS: (
+        "Analytics",
+        "Advanced analytics and reporting",
+        "analytics",
+    ),
+    PlanFeatureKey.MONITORING: (
+        "Monitoring",
+        "Real-time network monitoring and alerts",
+        "monitoring",
+    ),
+    PlanFeatureKey.WHITE_LABEL: (
+        "White Label",
+        "Custom branding and white-label portals",
+        "branding",
+    ),
     PlanFeatureKey.VOUCHER_LOGIN: ("Vouchers", "Voucher-based guest access", "guest"),
-    PlanFeatureKey.AUDIT_LOGS: ("Audit Logs", "Comprehensive audit trail", "compliance"),
-    PlanFeatureKey.API_ACCESS: ("API Access", "Programmatic API access", "integrations"),
-    PlanFeatureKey.FREERADIUS: ("RADIUS", "RADIUS authentication and accounting", "network"),
+    PlanFeatureKey.AUDIT_LOGS: (
+        "Audit Logs",
+        "Comprehensive audit trail",
+        "compliance",
+    ),
+    PlanFeatureKey.API_ACCESS: (
+        "API Access",
+        "Programmatic API access",
+        "integrations",
+    ),
+    PlanFeatureKey.FREERADIUS: (
+        "RADIUS",
+        "RADIUS authentication and accounting",
+        "network",
+    ),
     PlanFeatureKey.VLAN: ("VLAN", "VLAN management and segmentation", "network"),
     PlanFeatureKey.DHCP: ("DHCP", "DHCP pool management", "network"),
     PlanFeatureKey.WIREGUARD: ("WireGuard", "WireGuard VPN management", "network"),
-    PlanFeatureKey.CAMPAIGNS: ("Campaigns", "Marketing campaign management", "marketing"),
-    PlanFeatureKey.SOCIAL_LOGIN: ("Social Login", "Social media login for guests", "auth"),
+    PlanFeatureKey.CAMPAIGNS: (
+        "Campaigns",
+        "Marketing campaign management",
+        "marketing",
+    ),
+    PlanFeatureKey.SOCIAL_LOGIN: (
+        "Social Login",
+        "Social media login for guests",
+        "auth",
+    ),
     PlanFeatureKey.MFA: ("MFA", "Multi-factor authentication for admins", "security"),
     PlanFeatureKey.EXPORTS: ("Exports", "CSV/Excel/PDF export capabilities", "reports"),
-    PlanFeatureKey.ISP_FAILOVER: ("ISP Failover", "Automatic ISP failover and routing", "network"),
+    PlanFeatureKey.ISP_FAILOVER: (
+        "ISP Failover",
+        "Automatic ISP failover and routing",
+        "network",
+    ),
 }
 
 
@@ -64,7 +105,9 @@ class FeatureEntitlementService:
     async def list_features(self) -> FeatureListResponse:
         features = []
         for key in PlanFeatureKey:
-            meta = FEATURE_META.get(key, (key.value, key.value.replace("_", " ").title(), "general"))
+            meta = FEATURE_META.get(
+                key, (key.value, key.value.replace("_", " ").title(), "general")
+            )
             is_limit = key in LIMIT_FEATURE_KEYS
             # ``support_level`` is the one TIER-typed feature key this
             # domain has today (``TIER_FEATURE_KEYS`` -- see that

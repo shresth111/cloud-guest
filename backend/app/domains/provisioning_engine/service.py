@@ -825,7 +825,9 @@ class ProvisioningEngineService:
             return exc
         if message is None:
             return exc
-        enriched = ProvisionDeviceConnectionError(exc.host, f"{exc.detail} -- {message}")
+        enriched = ProvisionDeviceConnectionError(
+            exc.host, f"{exc.detail} -- {message}"
+        )
         enriched.__cause__ = exc.__cause__
         return enriched
 

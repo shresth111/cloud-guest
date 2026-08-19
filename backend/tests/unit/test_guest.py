@@ -4979,7 +4979,9 @@ class TestRadius:
         fx = make_fixture()
         await self._register_nas(fx)
         other_router = fx.router_service.add(organization_id=fx.organization_id)
-        login = await fx.guest_service.login_via_otp(
+        # Seeds a live session on the *other* router; the returned object
+        # is not needed, only the state it creates.
+        await fx.guest_service.login_via_otp(
             identifier="+15556667777",
             code="GOOD",
             auth_method=GuestAuthMethod.OTP_SMS,

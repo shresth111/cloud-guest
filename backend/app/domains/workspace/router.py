@@ -12,7 +12,10 @@ from fastapi import APIRouter, Depends, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
-from app.domains.rbac.dependencies import CurrentOrganization, CurrentUser, RequirePermission
+from app.domains.rbac.dependencies import (
+    CurrentOrganization,
+    CurrentUser,
+)
 
 from .dependencies import get_workspace_service
 from .schemas import (

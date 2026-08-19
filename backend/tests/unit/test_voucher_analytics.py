@@ -52,7 +52,12 @@ class FakeVoucherRedemptionLookup:
         return self.by_plan
 
     async def list_redeemed_vouchers(
-        self, *, page: int, page_size: int, order_by_use_count: bool = False, **kwargs: object
+        self,
+        *,
+        page: int,
+        page_size: int,
+        order_by_use_count: bool = False,
+        **kwargs: object,
     ) -> tuple[list[VoucherRedemptionRow], PaginationMeta]:
         self.calls.append("list_redeemed_vouchers")
         self.last_order_by_use_count = order_by_use_count
@@ -154,7 +159,9 @@ class TestVoucherAnalyticsService:
         assert response.by_plan[0].plan_id is None
 
 
-def _row(*, use_count: int = 1, plan_id: uuid.UUID | None = None) -> VoucherRedemptionRow:
+def _row(
+    *, use_count: int = 1, plan_id: uuid.UUID | None = None
+) -> VoucherRedemptionRow:
     return VoucherRedemptionRow(
         id=uuid.uuid4(),
         code="ZW-1000",

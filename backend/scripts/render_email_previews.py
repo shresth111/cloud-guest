@@ -29,7 +29,6 @@ from app.core.email_layout import (  # noqa: E402
     esc,
     heading,
     info_box,
-    link_fallback,
     paragraph,
     render_email,
 )
@@ -272,7 +271,9 @@ def render_all() -> None:
     # -- Invoice email --------------------------------------------------------
     content = (
         heading("Your invoice is ready")
-        + paragraph("Your invoice <strong>INV-2026-000482</strong> from Wyfy Guest is ready.")
+        + paragraph(
+            "Your invoice <strong>INV-2026-000482</strong> from Wyfy Guest is ready."
+        )
         + info_box(
             [
                 ("Invoice number", esc("INV-2026-000482")),
@@ -318,7 +319,10 @@ def render_all() -> None:
     _write(
         "14_quotation",
         render_email(
-            preheader="Your WyfyGuest quotation QUO-2026-A1B2C3D4, valid until 15 Sep 2026.",
+            preheader=(
+                "Your WyfyGuest quotation QUO-2026-A1B2C3D4, "
+                "valid until 15 Sep 2026."
+            ),
             content_html=content,
         ),
     )

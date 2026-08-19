@@ -455,7 +455,11 @@ def _mask_identifier(identifier: str, channel: OtpChannel) -> str:
     ``+91••••••210`` or ``ad••••@example.com``."""
     if channel == OtpChannel.SMS:
         digits = "".join(c for c in identifier if c.isdigit())
-        return identifier if len(digits) <= 4 else f"+{'•' * (len(digits) - 4)}{digits[-4:]}"
+        return (
+            identifier
+            if len(digits) <= 4
+            else f"+{'•' * (len(digits) - 4)}{digits[-4:]}"
+        )
     at = identifier.find("@")
     if at <= 1:
         return identifier
@@ -480,7 +484,10 @@ async def request_data_masking_otp(
         organization_id=None,
         location_id=None,
     )
-    message = f"Verification code sent via {channel.value} to {_mask_identifier(identifier, channel)}"
+    message = (
+        f"Verification code sent via {channel.value} "
+        f"to {_mask_identifier(identifier, channel)}"
+    )
     return build_response(
         success=True,
         message=message,
@@ -512,7 +519,11 @@ async def verify_data_masking_otp(
     )
     return build_response(
         success=True,
-        message="Guest data is now masked" if payload.masked else "Guest data is now shown unmasked",
+        message=(
+            "Guest data is now masked"
+            if payload.masked
+            else "Guest data is now shown unmasked"
+        ),
         data=_user_response(updated).model_dump(),
         request_id=_request_id(request),
     )

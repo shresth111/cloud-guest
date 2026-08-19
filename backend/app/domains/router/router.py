@@ -540,7 +540,9 @@ async def create_webfig_session(
 WEBFIG_PROXY_PREFIX_TEMPLATE = "/api/v1/routers/{router_id}/webfig"
 
 
-def _rewrite_webfig_absolute_paths(body: bytes, content_type: str, router_id: uuid.UUID) -> bytes:
+def _rewrite_webfig_absolute_paths(
+    body: bytes, content_type: str, router_id: uuid.UUID
+) -> bytes:
     """RouterOS's own WebFig assets hardcode a handful of *absolute*
     (root-relative) paths -- confirmed live in its login script.js:
     ``window.location.replace(`/webfig/${window.location.hash}`)``. A
@@ -619,23 +621,36 @@ async def proxy_webfig(
     cookie_name = f"wf_session_{router_id}"
     token = session or request.cookies.get(cookie_name)
     if token is None:
-        return Response(status_code=status.HTTP_401_UNAUTHORIZED, content="Missing WebFig session")
+        return Response(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content="Missing WebFig session",
+        )
 
     session_key = WEBFIG_SESSION_KEY_TEMPLATE.format(token=token)
     scoped_router_id = await redis.get(session_key)
     if scoped_router_id is None or scoped_router_id != str(router_id):
-        return Response(status_code=status.HTTP_401_UNAUTHORIZED, content="Invalid or expired WebFig session")
+        return Response(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content="Invalid or expired WebFig session",
+        )
 
     router_row = await router_service.get_router(router_id)
     host = router_row.management_ip_address or router_row.public_ip_address
     if not host:
-        return Response(status_code=status.HTTP_502_BAD_GATEWAY, content="This router has no reachable management address")
+        return Response(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content="This router has no reachable management address",
+        )
     password = router_service.get_decrypted_api_secret(router_row)
 
     upstream_url = f"http://{host}/{path}"
     body = await request.body()
     excluded_headers = {"host", "authorization", "content-length"}
-    forward_headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded_headers}
+    forward_headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in excluded_headers
+    }
     # WebFig establishes its own router-side session via a Set-Cookie on a
     # successful request; that cookie must round-trip (browser -> proxy ->
     # router, and router -> proxy -> browser) for the router to recognize
@@ -658,7 +673,9 @@ async def proxy_webfig(
         follow_redirects=False,
     ) as client:
         try:
-            upstream_params = {k: v for k, v in request.query_params.items() if k != "session"}
+            upstream_params = {
+                k: v for k, v in request.query_params.items() if k != "session"
+            }
             upstream = await client.request(
                 request.method,
                 upstream_url,
@@ -671,15 +688,27 @@ async def proxy_webfig(
                 "router_webfig_proxy_failed",
                 extra={"router_id": str(router_id), "error": str(exc)},
             )
-            return Response(status_code=status.HTTP_502_BAD_GATEWAY, content=f"Could not reach the router: {exc}")
+            return Response(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content=f"Could not reach the router: {exc}",
+            )
 
     response_headers = {
         k: v
         for k, v in upstream.headers.items()
-        if k.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection", "set-cookie"}
+        if k.lower()
+        not in {
+            "content-encoding",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "set-cookie",
+        }
     }
     content_type = upstream.headers.get("content-type", "")
-    response_body = _rewrite_webfig_absolute_paths(upstream.content, content_type, router_id)
+    response_body = _rewrite_webfig_absolute_paths(
+        upstream.content, content_type, router_id
+    )
     proxy_response = Response(
         content=response_body,
         status_code=upstream.status_code,
@@ -797,11 +826,15 @@ async def reboot_router(
         return build_response(
             success=False,
             message="Device has no API credentials configured",
-            data=MessageResponse(message="Cannot reboot: no device credentials").model_dump(),
+            data=MessageResponse(
+                message="Cannot reboot: no device credentials"
+            ).model_dump(),
             request_id=_request_id(request),
         )
     try:
-        await reboot_device(host=host, username=router_row.api_username, password=password)
+        await reboot_device(
+            host=host, username=router_row.api_username, password=password
+        )
     except DeviceInterfaceQueryError as exc:
         return build_response(
             success=False,

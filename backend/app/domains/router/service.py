@@ -769,7 +769,9 @@ class RouterService:
             actor_user_id,
             AuditAction.ROUTER_CREDENTIALS_REVEALED,
             router=router,
-            description=f"Remote-access credentials revealed for router '{router.name}'",
+            description=(
+                f"Remote-access credentials revealed for router '{router.name}'"
+            ),
         )
         return router
 

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from fastapi import Depends
 
-from app.domains.organization.dependencies import get_organization_service
-from app.domains.organization.service import OrganizationService
 from app.domains.location.dependencies import get_location_service
 from app.domains.location.service import LocationService
+from app.domains.organization.dependencies import get_organization_service
+from app.domains.organization.service import OrganizationService
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 

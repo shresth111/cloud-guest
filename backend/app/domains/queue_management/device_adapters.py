@@ -36,7 +36,10 @@ from typing import Protocol
 
 from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
 from wyfy_device_gateway.contract import DeviceVendor
-from wyfy_device_gateway.mikrotik_adapter import MikroTikConnectionError, MikroTikDeviceError
+from wyfy_device_gateway.mikrotik_adapter import (
+    MikroTikConnectionError,
+    MikroTikDeviceError,
+)
 from wyfy_device_gateway.registry import get_adapter
 
 from .constants import DEFAULT_QUEUE_PRIORITY

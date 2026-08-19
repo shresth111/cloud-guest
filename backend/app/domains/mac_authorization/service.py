@@ -372,7 +372,9 @@ class MacAuthorizationService:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
-        entries = await self.repository.list_all_for_organization(router.organization_id)
+        entries = await self.repository.list_all_for_organization(
+            router.organization_id
+        )
         now = datetime.now(UTC)
         return [
             entry

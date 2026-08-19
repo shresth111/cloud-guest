@@ -173,7 +173,12 @@ def _process_logo(content: bytes) -> tuple[bytes, str, str] | None:
         return None
 
     width, height = img.size
-    if width == 0 or height == 0 or width > _LOGO_MAX_PROCESS_DIM or height > _LOGO_MAX_PROCESS_DIM:
+    if (
+        width == 0
+        or height == 0
+        or width > _LOGO_MAX_PROCESS_DIM
+        or height > _LOGO_MAX_PROCESS_DIM
+    ):
         return None
 
     img = img.convert("RGBA")
@@ -201,7 +206,9 @@ def _process_logo(content: bytes) -> tuple[bytes, str, str] | None:
     cropped = img.crop(bbox)
     content_w, content_h = cropped.size
     margin = max(4, round(max(content_w, content_h) * _LOGO_MARGIN_FRACTION))
-    canvas = Image.new("RGBA", (content_w + margin * 2, content_h + margin * 2), (0, 0, 0, 0))
+    canvas = Image.new(
+        "RGBA", (content_w + margin * 2, content_h + margin * 2), (0, 0, 0, 0)
+    )
     canvas.paste(cropped, (margin, margin), cropped)
 
     buf = io.BytesIO()

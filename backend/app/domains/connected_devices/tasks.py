@@ -147,7 +147,9 @@ def run_connected_device_sync_sweep() -> dict[str, object]:
     return result
 
 
-async def _sync_single_router_devices_async(router_id: uuid.UUID) -> DeviceSyncSweepSummary:
+async def _sync_single_router_devices_async(
+    router_id: uuid.UUID,
+) -> DeviceSyncSweepSummary:
     """The real per-router fan-out leaf task's own async body -- a fresh
     session per invocation (this task runs once per router, potentially
     many times concurrently across worker slots). Loads exactly the one
