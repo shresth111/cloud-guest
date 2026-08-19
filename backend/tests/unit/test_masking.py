@@ -131,11 +131,20 @@ class TestMaskName:
 
 
 class TestMaskMac:
-    def test_masks_first_four_octets(self) -> None:
-        assert mask_mac("AA:BB:CC:DD:EE:FF") == "XX:XX:XX:XX:EE:FF"
+    """``mask_mac`` is a deliberate no-op: MAC addresses are shown
+    unmasked platform-wide by explicit product decision (customers need
+    the real address to identify a device for support) -- see commit
+    "Stop masking MAC addresses platform-wide" and ``mask_mac``'s own
+    docstring. The function is kept wired up so every ``MaskedMac``
+    field routes through one place if masking is ever reintroduced, so
+    these assert the real contract: the value comes back *unchanged*,
+    colon- and dash-separated forms alike."""
 
-    def test_preserves_dash_separator(self) -> None:
-        assert mask_mac("AA-BB-CC-DD-EE-FF") == "XX-XX-XX-XX-EE-FF"
+    def test_colon_separated_mac_is_returned_unmasked(self) -> None:
+        assert mask_mac("AA:BB:CC:DD:EE:FF") == "AA:BB:CC:DD:EE:FF"
+
+    def test_dash_separated_mac_is_returned_unmasked(self) -> None:
+        assert mask_mac("AA-BB-CC-DD-EE-FF") == "AA-BB-CC-DD-EE-FF"
 
     def test_null_is_passed_through(self) -> None:
         assert mask_mac(None) is None
@@ -146,7 +155,9 @@ class TestMaskMac:
     def test_not_a_mac_address_is_passed_through(self) -> None:
         assert mask_mac("not-a-mac") == "not-a-mac"
 
-    def test_idempotent_on_already_masked_value(self) -> None:
+    def test_idempotent_on_a_previously_masked_value(self) -> None:
+        # A value stored/received in the old masked shape must still come
+        # back untouched -- the no-op has nothing to re-mask or strip.
         assert mask_mac("XX:XX:XX:XX:EE:FF") == "XX:XX:XX:XX:EE:FF"
 
 
@@ -229,7 +240,9 @@ class TestMaskedTypesSerialization:
             "mobile": "XXXXXXX98647",
             "email": "a****i@gmail.com",
             "name": "Akhil S.",
-            "mac": "XX:XX:XX:XX:EE:FF",
+            # Unmasked even with masking on -- mask_mac is a no-op by
+            # explicit product decision (see TestMaskMac's docstring).
+            "mac": "AA:BB:CC:DD:EE:FF",
             "identifier": "a****i@gmail.com",
         }
 

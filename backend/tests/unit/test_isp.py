@@ -71,6 +71,22 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _hours_ago_on_the_hour(hours: int) -> datetime:
+    """A point ``hours`` in the past, snapped down to the top of that
+    hour. The hour-bucket summary tests below seed checks a few *minutes*
+    apart and assert they land in one bucket -- anchored to a raw
+    ``_now() - timedelta(hours=2)`` that is only true for 59 of every 60
+    wall-clock minutes: when the suite happened to run at HH:59, the
+    ``base + 1min``/``+2min`` checks crossed into the next hour and the
+    tests failed. Snapping to :00 makes the several-minute spread fit
+    inside one bucket regardless of when the suite runs. (Splitting at
+    the hour boundary is correct behaviour, not a bug -- so the fixture
+    is what has to be deterministic.)"""
+    return (_now() - timedelta(hours=hours)).replace(
+        minute=0, second=0, microsecond=0
+    )
+
+
 def _base_fields(**overrides: object) -> dict[str, object]:
     base: dict[str, object] = {
         "id": uuid.uuid4(),
@@ -1094,7 +1110,7 @@ class TestHealthCheckDateRangeAndSummary:
         h = make_harness()
         router = h.router_lookup.add(_make_router())
         link = await _create_primary(h, router)
-        base = _now() - timedelta(hours=2)
+        base = _hours_ago_on_the_hour(2)
         await h.repository.create_health_check(
             isp_link_id=link.id,
             checked_at=base,
@@ -1137,7 +1153,7 @@ class TestHealthCheckDateRangeAndSummary:
         h = make_harness()
         router = h.router_lookup.add(_make_router())
         link = await _create_primary(h, router)
-        base = _now() - timedelta(hours=2)
+        base = _hours_ago_on_the_hour(2)
         # Two real traffic samples in the same hour bucket -- avg/max
         # should reflect only these two real numbers.
         await h.repository.create_health_check(
@@ -1198,7 +1214,7 @@ class TestHealthCheckDateRangeAndSummary:
         h = make_harness()
         router = h.router_lookup.add(_make_router())
         link = await _create_primary(h, router)
-        base = _now() - timedelta(hours=2)
+        base = _hours_ago_on_the_hour(2)
         await h.repository.create_health_check(
             isp_link_id=link.id,
             checked_at=base,
