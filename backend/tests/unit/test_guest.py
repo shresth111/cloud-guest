@@ -651,6 +651,11 @@ class FakeGuestRepository:
     nas_clients: dict[uuid.UUID, RadiusNasClient] = field(default_factory=dict)
     quota_usages: dict[uuid.UUID, GuestQuotaUsage] = field(default_factory=dict)
     organization_timezones: dict[uuid.UUID, str] = field(default_factory=dict)
+    # Call counter, not a behavioral fake -- lets tests assert
+    # get_device_by_mac is queried at most once per login for a given MAC
+    # (GuestService._enforce_device_limit's fetch reused via known_device,
+    # not re-queried a second time by get_or_create_device).
+    get_device_by_mac_call_count: int = 0
 
     # -- guests ----------------------------------------------------------------
     async def create_guest(self, **fields: object) -> Guest:
@@ -724,6 +729,7 @@ class FakeGuestRepository:
         return self.devices.get(device_id)
 
     async def get_device_by_mac(self, mac_address: str) -> GuestDevice | None:
+        self.get_device_by_mac_call_count += 1
         for device in self.devices.values():
             if device.mac_address == mac_address:
                 return device
@@ -2798,6 +2804,171 @@ class TestDeviceHandling:
         )
         assert result.device is None
         assert result.session.device_id is None
+
+
+# ============================================================================
+# get_device_by_mac is not queried twice per login -- _enforce_device_limit
+# already fetches the real GuestDevice for a returning guest, and
+# get_or_create_device now reuses that result (known_device) instead of
+# re-querying the identical MAC a second time moments later. See
+# _DEVICE_NOT_PREFETCHED's own module-level docstring in service.py.
+# ============================================================================
+
+
+class TestDeviceLookupNotDuplicated:
+    async def test_otp_login_queries_device_by_mac_once_for_returning_guest(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        mac = "aa:bb:cc:dd:ee:ff"
+        await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac=mac,
+        )
+        fx.repository.get_device_by_mac_call_count = 0
+        await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac=mac,
+        )
+        assert fx.repository.get_device_by_mac_call_count == 1
+
+    async def test_voucher_login_queries_device_by_mac_once_for_returning_guest(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        mac = "aa:bb:cc:dd:ee:ff"
+        fx.voucher_service.register(
+            "VOUCHER-A", data_limit_mb=None, validity_minutes=60
+        )
+        await fx.guest_service.login_via_voucher(
+            code="VOUCHER-A",
+            identifier="guest-v@example.com",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac=mac,
+        )
+        fx.voucher_service.register(
+            "VOUCHER-B", data_limit_mb=None, validity_minutes=60
+        )
+        fx.repository.get_device_by_mac_call_count = 0
+        await fx.guest_service.login_via_voucher(
+            code="VOUCHER-B",
+            identifier="guest-v@example.com",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac=mac,
+        )
+        assert fx.repository.get_device_by_mac_call_count == 1
+
+    async def test_password_login_queries_device_by_mac_once_for_returning_guest(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        mac = "aa:bb:cc:dd:ee:ff"
+        otp_result = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac=mac,
+        )
+        await fx.guest_service.set_guest_password(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            password="Correct-Horse-1!",
+        )
+        fx.repository.get_device_by_mac_call_count = 0
+        await fx.guest_service.login_via_password(
+            identifier="+15551234567",
+            password="Correct-Horse-1!",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac=mac,
+        )
+        assert fx.repository.get_device_by_mac_call_count == 1
+
+    async def test_pin_login_queries_device_by_mac_once_for_returning_guest(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        mac = "aa:bb:cc:dd:ee:ff"
+        otp_result = await fx.guest_service.login_via_otp(
+            identifier="+15551234567",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac=mac,
+        )
+        await fx.guest_service.set_guest_pin(
+            guest_id=otp_result.guest.id,
+            session_id=otp_result.session.id,
+            pin="048213",
+        )
+        fx.repository.get_device_by_mac_call_count = 0
+        await fx.guest_service.login_via_pin(
+            identifier="+15551234567",
+            pin="048213",
+            device_mac=mac,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert fx.repository.get_device_by_mac_call_count == 1
+
+    async def test_mac_whitelist_login_queries_device_by_mac_once_for_returning_guest(
+        self,
+    ) -> None:
+        hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(mac_authorization_hook=hook)
+        await fx.guest_service.login_via_mac_whitelist(
+            mac_address="AA:BB:CC:DD:EE:FF",
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        fx.repository.get_device_by_mac_call_count = 0
+        await fx.guest_service.login_via_mac_whitelist(
+            mac_address="AA:BB:CC:DD:EE:FF",
+            organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert fx.repository.get_device_by_mac_call_count == 1
+
+    async def test_new_guest_login_still_queries_device_by_mac_once(self) -> None:
+        """A brand-new guest never runs ``_enforce_device_limit`` at all
+        (that method's own docstring: a guest that doesn't exist yet
+        trivially holds zero devices) -- ``get_or_create_device`` must
+        still perform its own real, fresh lookup exactly once here, not
+        zero times (there is no earlier fetch to reuse)."""
+        fx = make_fixture()
+        await fx.guest_service.login_via_otp(
+            identifier="+15559998888",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="11:22:33:44:55:66",
+        )
+        assert fx.repository.get_device_by_mac_call_count == 1
 
 
 # ============================================================================

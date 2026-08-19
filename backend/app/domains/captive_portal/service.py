@@ -65,7 +65,8 @@ import dataclasses
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Protocol
+from datetime import datetime
+from typing import Any, Protocol
 
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
@@ -140,6 +141,33 @@ class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
 
+class CaptivePortalResolveCacheProtocol(Protocol):
+    """The minimal surface ``resolve_portal_config`` needs from
+    ``cache.CaptivePortalResolveCache`` -- kept structural so this module
+    never imports the concrete Redis-backed class, mirroring
+    ``app.domains.billing.service.EntitlementCacheProtocol``'s identical
+    narrow-Protocol convention."""
+
+    async def get(
+        self,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> dict[str, Any] | None: ...
+
+    async def set(
+        self,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        payload: dict[str, Any],
+    ) -> None: ...
+
+    async def invalidate(
+        self,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> None: ...
+
+
 # ============================================================================
 # Read model
 # ============================================================================
@@ -168,6 +196,166 @@ class ResolvedPortalConfig:
     config: CaptivePortalConfig
     resolved_via_location_override: bool
     location_country: str | None = None
+    location_name: str | None = None
+    """The resolved location's own ``Location.name`` -- piggybacked off the
+    same ``location_lookup.get_location`` call ``location_country`` is
+    sourced from, so ``router.resolve_captive_portal_config`` no longer
+    needs its own second ``LocationRepository.get_by_id`` query just to
+    render "courtesy of {location name}" instead of the config's internal
+    admin label. ``None`` whenever the caller resolved by ``organization_id``
+    alone (no location context exists)."""
+
+    def to_cache_payload(self) -> dict[str, Any]:
+        """Serializes for ``CaptivePortalResolveCacheProtocol.set`` --
+        mirrors ``app.domains.billing.service.EntitlementSnapshot
+        .to_cache_payload``'s identical shape. Every field
+        ``router._config_response``/``resolve_captive_portal_config``
+        reads off ``resolved.config`` is included, so a cache hit never
+        needs to fall back to a real query."""
+        return {
+            "config": _config_to_cache_payload(self.config),
+            "resolved_via_location_override": self.resolved_via_location_override,
+            "location_country": self.location_country,
+            "location_name": self.location_name,
+        }
+
+    @classmethod
+    def from_cache_payload(cls, payload: dict[str, Any]) -> ResolvedPortalConfig:
+        return cls(
+            config=_config_from_cache_payload(dict(payload["config"])),
+            resolved_via_location_override=bool(
+                payload["resolved_via_location_override"]
+            ),
+            location_country=(
+                str(payload["location_country"])
+                if payload.get("location_country") is not None
+                else None
+            ),
+            location_name=(
+                str(payload["location_name"])
+                if payload.get("location_name") is not None
+                else None
+            ),
+        )
+
+
+# The exact subset of ``CaptivePortalConfig`` columns
+# ``router._config_response``/``resolve_captive_portal_config`` read off a
+# resolved config -- kept as one explicit tuple so ``_config_to_cache_payload``/
+# ``_CachedCaptivePortalConfig`` can't silently drift apart from each other.
+_CACHED_CONFIG_SCALAR_FIELDS = (
+    "name",
+    "is_active",
+    "is_default",
+    "theme",
+    "logo_url",
+    "background_image_url",
+    "primary_color",
+    "secondary_color",
+    "default_language",
+    "supported_languages",
+    "advertisement_banner_url",
+    "advertisement_banner_link",
+    "terms_and_conditions_text",
+    "terms_and_conditions_url",
+    "privacy_policy_text",
+    "privacy_policy_url",
+    "splash_headline",
+    "splash_welcome_message",
+    "redirect_url",
+    "otp_sms_enabled",
+    "otp_email_enabled",
+    "otp_whatsapp_enabled",
+    "voucher_enabled",
+    "username_password_enabled",
+    "pin_login_enabled",
+    "social_login_enabled",
+    "social_login_providers",
+    "business_hours_enabled",
+    "business_hours_timezone",
+    "business_hours_schedule",
+    "business_hours_closed_message",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedCaptivePortalConfig:
+    """A plain, JSON-round-trippable stand-in for ``CaptivePortalConfig``,
+    exposing the identical attribute names ``router._config_response``
+    reads -- so a cache hit can be handed to that function (and to
+    ``resolve_captive_portal_config``'s own business-hours/branding-
+    fallback logic) exactly as if it were the real ORM row, without a
+    second query to reconstruct one. Never persisted, never passed to
+    ``self.repository`` -- read-only, guest-facing-response shape only."""
+
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    location_id: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+    name: str
+    is_active: bool
+    is_default: bool
+    theme: str
+    logo_url: str | None
+    background_image_url: str | None
+    primary_color: str
+    secondary_color: str
+    default_language: str
+    supported_languages: list[str]
+    advertisement_banner_url: str | None
+    advertisement_banner_link: str | None
+    terms_and_conditions_text: str | None
+    terms_and_conditions_url: str | None
+    privacy_policy_text: str | None
+    privacy_policy_url: str | None
+    splash_headline: str | None
+    splash_welcome_message: str | None
+    redirect_url: str | None
+    otp_sms_enabled: bool
+    otp_email_enabled: bool
+    otp_whatsapp_enabled: bool
+    voucher_enabled: bool
+    username_password_enabled: bool
+    pin_login_enabled: bool
+    social_login_enabled: bool
+    social_login_providers: list[str]
+    business_hours_enabled: bool
+    business_hours_timezone: str
+    business_hours_schedule: dict[str, Any]
+    business_hours_closed_message: str | None
+
+
+def _config_to_cache_payload(config: CaptivePortalConfig) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": str(config.id),
+        "organization_id": str(config.organization_id),
+        "location_id": str(config.location_id) if config.location_id else None,
+        "created_at": config.created_at.isoformat(),
+        "updated_at": config.updated_at.isoformat(),
+    }
+    for field_name in _CACHED_CONFIG_SCALAR_FIELDS:
+        payload[field_name] = getattr(config, field_name)
+    return payload
+
+
+def _config_from_cache_payload(
+    payload: dict[str, Any],
+) -> _CachedCaptivePortalConfig:
+    fields: dict[str, Any] = {
+        "id": uuid.UUID(str(payload["id"])),
+        "organization_id": uuid.UUID(str(payload["organization_id"])),
+        "location_id": (
+            uuid.UUID(str(payload["location_id"]))
+            if payload.get("location_id") is not None
+            else None
+        ),
+        "created_at": datetime.fromisoformat(str(payload["created_at"])),
+        "updated_at": datetime.fromisoformat(str(payload["updated_at"])),
+    }
+    for field_name in _CACHED_CONFIG_SCALAR_FIELDS:
+        fields[field_name] = payload[field_name]
+    return _CachedCaptivePortalConfig(**fields)
 
 
 # ============================================================================
@@ -185,11 +373,13 @@ class CaptivePortalService:
         location_lookup: LocationLookupProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        resolve_cache: CaptivePortalResolveCacheProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.organization_lookup = organization_lookup
         self.location_lookup = location_lookup
         self.audit_writer = audit_writer
+        self.resolve_cache = resolve_cache
 
     # ========================================================================
     # Create / read / update / delete
@@ -310,6 +500,7 @@ class CaptivePortalService:
             config,
             f"Captive portal config '{config.name}' created",
         )
+        await self._invalidate_resolve_cache(config.organization_id, config.location_id)
         return config
 
     async def get_config(
@@ -413,6 +604,9 @@ class CaptivePortalService:
             updated,
             f"Captive portal config '{updated.name}' updated",
         )
+        await self._invalidate_resolve_cache(
+            updated.organization_id, updated.location_id
+        )
         return updated
 
     async def activate_config(
@@ -435,6 +629,9 @@ class CaptivePortalService:
             AuditAction.CAPTIVE_PORTAL_CONFIG_ACTIVATED,
             updated,
             f"Captive portal config '{updated.name}' activated",
+        )
+        await self._invalidate_resolve_cache(
+            updated.organization_id, updated.location_id
         )
         return updated
 
@@ -459,6 +656,9 @@ class CaptivePortalService:
             updated,
             f"Captive portal config '{updated.name}' deactivated",
         )
+        await self._invalidate_resolve_cache(
+            updated.organization_id, updated.location_id
+        )
         return updated
 
     async def delete_config(
@@ -482,6 +682,9 @@ class CaptivePortalService:
             AuditAction.CAPTIVE_PORTAL_CONFIG_DELETED,
             deleted,
             f"Captive portal config '{deleted.name}' deleted",
+        )
+        await self._invalidate_resolve_cache(
+            deleted.organization_id, deleted.location_id
         )
         return deleted
 
@@ -510,14 +713,37 @@ class CaptivePortalService:
         if organization_id is None and location_id is None:
             raise MissingPortalResolutionParamsError()
 
+        if self.resolve_cache is not None:
+            cached = await self.resolve_cache.get(organization_id, location_id)
+            if cached is not None:
+                return ResolvedPortalConfig.from_cache_payload(cached)
+
+        resolved = await self._resolve_portal_config_uncached(
+            organization_id=organization_id, location_id=location_id
+        )
+
+        if self.resolve_cache is not None:
+            await self.resolve_cache.set(
+                organization_id, location_id, resolved.to_cache_payload()
+            )
+        return resolved
+
+    async def _resolve_portal_config_uncached(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> ResolvedPortalConfig:
         resolved_organization_id = organization_id
         location_country: str | None = None
+        location_name: str | None = None
         if location_id is not None:
             location = await self.location_lookup.get_location(
                 location_id, requesting_organization_id=organization_id
             )
             resolved_organization_id = location.organization_id
             location_country = location.country
+            location_name = location.name
             location_config = await self.repository.find_active_for_location(
                 resolved_organization_id, location_id
             )
@@ -526,6 +752,7 @@ class CaptivePortalService:
                     config=location_config,
                     resolved_via_location_override=True,
                     location_country=location_country,
+                    location_name=location_name,
                 )
         else:
             # organization_id is guaranteed non-None here by the guard
@@ -541,6 +768,7 @@ class CaptivePortalService:
                 config=org_default,
                 resolved_via_location_override=False,
                 location_country=location_country,
+                location_name=location_name,
             )
         raise CaptivePortalConfigNotConfiguredError(resolved_organization_id)
 
@@ -561,6 +789,29 @@ class CaptivePortalService:
         existing = await self.repository.find_default_for_organization(organization_id)
         if existing is not None and existing.id != exclude_config_id:
             await self.repository.update_config(existing, {"is_default": False})
+
+    async def _invalidate_resolve_cache(
+        self,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+    ) -> None:
+        """Invalidates the guest-facing resolve cache for every key shape a
+        real guest call could have populated for this exact config row --
+        see ``cache.CaptivePortalResolveCache``'s module docstring for the
+        one gap this doesn't cover (an org-level default's edit not fanning
+        out to *other* locations falling back to it)."""
+        if self.resolve_cache is None:
+            return
+        await self.resolve_cache.invalidate(organization_id, location_id)
+        if location_id is not None:
+            # A guest resolving via ``location_id`` alone -- the common
+            # real-world call shape, since a location's own QR code/
+            # redirect only ever encodes ``location_id`` -- caches under a
+            # ``(None, location_id)`` key distinct from this
+            # ``(organization_id, location_id)`` pair. Both must be
+            # invalidated, or a location-scoped edit would keep serving a
+            # stale cached result to that call shape until TTL expiry.
+            await self.resolve_cache.invalidate(None, location_id)
 
     def _enforce_tenant_scope(
         self,
@@ -602,5 +853,6 @@ __all__ = [
     "OrganizationLookupProtocol",
     "LocationLookupProtocol",
     "AuditLogWriter",
+    "CaptivePortalResolveCacheProtocol",
     "ResolvedPortalConfig",
 ]

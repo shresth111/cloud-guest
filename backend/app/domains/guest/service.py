@@ -407,6 +407,21 @@ _DUMMY_PASSWORD_HASH = PasswordManager.hash("Dummy-Guest-Password-000!")
 # docstring for why ``set_guest_pin`` hashes real guest PINs the same way).
 _DUMMY_PIN_HASH = PasswordManager.hash_raw("047183")
 
+# Sentinel distinguishing "caller has no already-fetched GuestDevice to
+# hand in" from a real, meaningful ``None`` (a fresh lookup came back
+# empty) -- see ``GuestService.get_or_create_device``'s ``known_device``
+# parameter. Every login method calls ``_enforce_device_limit`` (which
+# already performs a real ``get_device_by_mac`` for this exact MAC) and
+# then, moments later with no intervening write to ``guest_devices``,
+# ``_maybe_get_or_create_device``/``get_or_create_device`` for the *same*
+# MAC -- previously a second, identical query every single login with a
+# device MAC made. Threading the first lookup's result through via
+# ``known_device`` removes that redundant round trip; a caller that never
+# ran ``_enforce_device_limit`` (a brand-new guest, whose MAC might still
+# already exist under some *other* guest_id) leaves this at the sentinel,
+# getting the original real, fresh lookup.
+_DEVICE_NOT_PREFETCHED: Any = object()
+
 # Redis key template for GuestPinSecurity's brute-force lockout counter --
 # scoped by (organization_id, identifier), mirroring
 # app.domains.auth.security.AuthSecurity's own ``_RATE_LIMIT_KEY``
@@ -1434,6 +1449,7 @@ class GuestService:
             identifier=identifier,
             device_mac=device_mac,
         )
+        known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
             # A brand-new guest (``existing_guest is None``) trivially holds
             # zero active sessions -- skip the query entirely rather than
@@ -1443,8 +1459,12 @@ class GuestService:
             # attempt on a login that was always going to be rejected.
             await self._enforce_concurrent_session_limit(existing_guest.id)
             # Same "brand-new guest trivially holds zero devices" skip --
-            # see _enforce_device_limit's own docstring.
-            await self._enforce_device_limit(
+            # see _enforce_device_limit's own docstring. Its return value
+            # is threaded into _maybe_get_or_create_device below as
+            # known_device, so that call doesn't repeat the identical
+            # get_device_by_mac query verify_otp/_get_or_create_guest don't
+            # touch in between.
+            known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=device_mac,
                 organization_id=resolved_org_id,
@@ -1480,7 +1500,10 @@ class GuestService:
             identifier=identifier,
         )
         device = await self._maybe_get_or_create_device(
-            guest_id=guest.id, mac_address=device_mac, device_name=device_name
+            guest_id=guest.id,
+            mac_address=device_mac,
+            device_name=device_name,
+            known_device=known_device,
         )
         session, created = await self._reuse_or_create_session(
             guest=guest,
@@ -1568,6 +1591,7 @@ class GuestService:
             identifier=identifier,
             device_mac=device_mac,
         )
+        known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
             # See the identical comment in login_via_otp: skip the query for
             # a brand-new guest, and check before the voucher is redeemed
@@ -1575,7 +1599,7 @@ class GuestService:
             # spends a real (single-use) voucher on a login that was always
             # going to be rejected.
             await self._enforce_concurrent_session_limit(existing_guest.id)
-            await self._enforce_device_limit(
+            known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=device_mac,
                 organization_id=resolved_org_id,
@@ -1611,7 +1635,10 @@ class GuestService:
             identifier=identifier,
         )
         device = await self._maybe_get_or_create_device(
-            guest_id=guest.id, mac_address=device_mac, device_name=device_name
+            guest_id=guest.id,
+            mac_address=device_mac,
+            device_name=device_name,
+            known_device=known_device,
         )
         # Copied, not referenced -- see module docstring.
         session, created = await self._reuse_or_create_session(
@@ -1740,9 +1767,10 @@ class GuestService:
             identifier=identifier,
             device_mac=device_mac,
         )
+        known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
             await self._enforce_concurrent_session_limit(existing_guest.id)
-            await self._enforce_device_limit(
+            known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=device_mac,
                 organization_id=resolved_org_id,
@@ -1769,7 +1797,10 @@ class GuestService:
         guest = existing_guest
         assert guest is not None  # narrowed by _verify_guest_password above
         device = await self._maybe_get_or_create_device(
-            guest_id=guest.id, mac_address=device_mac, device_name=device_name
+            guest_id=guest.id,
+            mac_address=device_mac,
+            device_name=device_name,
+            known_device=known_device,
         )
         session, created = await self._reuse_or_create_session(
             guest=guest,
@@ -1976,9 +2007,10 @@ class GuestService:
             identifier=identifier,
             device_mac=device_mac,
         )
+        known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
             await self._enforce_concurrent_session_limit(existing_guest.id)
-            await self._enforce_device_limit(
+            known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=device_mac,
                 organization_id=resolved_org_id,
@@ -1990,12 +2022,21 @@ class GuestService:
 
         router = await self._get_eligible_router(router_id)
 
+        # _enforce_device_limit above already fetched this exact MAC's
+        # GuestDevice moments earlier (nothing in between writes to
+        # guest_devices) whenever existing_guest was resolved -- reused
+        # directly here instead of a second, identical get_device_by_mac
+        # query. Only a genuinely brand-new guest (never enforced above,
+        # since a guest that doesn't exist yet has no PIN to ever match
+        # anyway -- see this method's own device-scoped docstring) still
+        # needs the real, fresh lookup.
         normalized_mac = normalize_mac_address(device_mac) if device_mac else None
-        device = (
-            await self.repository.get_device_by_mac(normalized_mac)
-            if normalized_mac
-            else None
-        )
+        if known_device is not _DEVICE_NOT_PREFETCHED:
+            device = known_device
+        elif normalized_mac:
+            device = await self.repository.get_device_by_mac(normalized_mac)
+        else:
+            device = None
         device_matches = (
             existing_guest is not None
             and device is not None
@@ -2170,9 +2211,10 @@ class GuestService:
             identifier=identifier,
             device_mac=normalized_mac,
         )
+        known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
             await self._enforce_concurrent_session_limit(existing_guest.id)
-            await self._enforce_device_limit(
+            known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=normalized_mac,
                 organization_id=resolved_org_id,
@@ -2194,6 +2236,7 @@ class GuestService:
             guest_id=guest.id,
             mac_address=normalized_mac,
             device_name="Whitelisted device",
+            known_device=known_device,
         )
         session, created = await self._reuse_or_create_session(
             guest=guest,
@@ -2658,14 +2701,27 @@ class GuestService:
         guest_id: uuid.UUID,
         mac_address: str,
         device_name: str | None = None,
+        known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED,
     ) -> GuestDevice:
         """Get-or-create a :class:`~.models.GuestDevice` by MAC address --
         see ``models.py``'s module docstring for why ``mac_address`` is
         globally unique with ``guest_id`` reassignable, not scoped per
-        guest."""
+        guest.
+
+        ``known_device``, when passed (anything other than the
+        ``_DEVICE_NOT_PREFETCHED`` sentinel default -- see that sentinel's
+        own module-level docstring), is trusted as an already-fresh
+        ``get_device_by_mac(mac_address)`` result a caller obtained
+        moments earlier in the same request, skipping a second, identical
+        query here.
+        """
         mac = normalize_mac_address(mac_address)
         now = datetime.now(UTC)
-        device = await self.repository.get_device_by_mac(mac)
+        device = (
+            await self.repository.get_device_by_mac(mac)
+            if known_device is _DEVICE_NOT_PREFETCHED
+            else known_device
+        )
         if device is None:
             return await self.repository.create_device(
                 guest_id=guest_id,
@@ -3390,7 +3446,7 @@ class GuestService:
         mac_address: str | None,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
-    ) -> None:
+    ) -> GuestDevice | None:
         """Guest Session Engine (Phase 1): raises
         ``GuestDeviceLimitExceededError`` if registering ``mac_address``
         against ``guest_id`` would push the guest over their own resolved
@@ -3402,20 +3458,30 @@ class GuestService:
         ``login_via_voucher`` after ``_enforce_concurrent_session_limit``,
         before ``_maybe_get_or_create_device`` ever creates or reassigns a
         row -- the identical "reject before touching anything with a side
-        effect" ordering that method's own docstring establishes."""
+        effect" ordering that method's own docstring establishes.
+
+        Returns the real ``GuestDevice`` row this check already fetched by
+        ``mac_address`` (``None`` when ``mac_address`` is absent) -- every
+        caller passes this straight back into
+        ``_maybe_get_or_create_device``'s/``get_or_create_device``'s own
+        ``known_device`` moments later for the identical MAC, with no
+        write to ``guest_devices`` happening in between, so that method
+        doesn't re-run the exact same query a second time. See
+        ``_DEVICE_NOT_PREFETCHED``'s own module-level docstring."""
         if not mac_address:
-            return
+            return None
         existing_device = await self.repository.get_device_by_mac(
             normalize_mac_address(mac_address)
         )
         if existing_device is not None and existing_device.guest_id == guest_id:
-            return
+            return existing_device
         device_count = await self.repository.count_devices_for_guest(guest_id)
         limit = await self._resolve_device_limit(
             organization_id=organization_id, location_id=location_id, guest_id=guest_id
         )
         if is_device_limit_reached(device_count=device_count, limit=limit):
             raise GuestDeviceLimitExceededError(guest_id=guest_id, limit=limit)
+        return existing_device
 
     async def _enforce_fup_quota(
         self, *, guest_id: uuid.UUID, organization_id: uuid.UUID
@@ -3589,11 +3655,15 @@ class GuestService:
         guest_id: uuid.UUID,
         mac_address: str | None,
         device_name: str | None,
+        known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED,
     ) -> GuestDevice | None:
         if not mac_address:
             return None
         return await self.get_or_create_device(
-            guest_id=guest_id, mac_address=mac_address, device_name=device_name
+            guest_id=guest_id,
+            mac_address=mac_address,
+            device_name=device_name,
+            known_device=known_device,
         )
 
     async def _create_session(

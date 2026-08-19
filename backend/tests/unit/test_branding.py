@@ -14,11 +14,13 @@ Follows this project's plain-``assert``/native-``async def`` style (see
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import pytest
+from starlette.requests import Request
 
 from app.common.responses import ApiResponse
 from app.core.storage import ObjectStorageError
@@ -30,6 +32,7 @@ from app.domains.branding.exceptions import (
     LogoNotFoundError,
 )
 from app.domains.branding.models import Branding
+from app.domains.branding.router import _asset_response
 from app.domains.branding.router import router as branding_router
 from app.domains.branding.schemas import BrandingResponse, DefaultBrandingResponse
 from app.domains.branding.service import (
@@ -618,3 +621,108 @@ class TestEveryRouteRequiresPermission:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+# ============================================================================
+# Image-serving cache headers (_asset_response) -- see that helper's own
+# docstring: get_logo_public/get_background_image_public are exactly what a
+# guest's browser fetches on every WiFi join via GET /captive-portal/resolve,
+# and previously shipped with zero cache headers at all.
+# ============================================================================
+
+
+def _make_request(*, if_none_match: str | None = None) -> Request:
+    headers = (
+        [] if if_none_match is None else [(b"if-none-match", if_none_match.encode())]
+    )
+    return Request(
+        {"type": "http", "method": "GET", "path": "/branding/x", "headers": headers}
+    )
+
+
+class TestAssetResponseCacheHeaders:
+    def test_sets_etag_and_cache_control(self) -> None:
+        response = _asset_response(
+            _make_request(),
+            content=b"fake-image-bytes",
+            content_type="image/png",
+            visibility="public",
+        )
+        assert response.status_code == 200
+        assert response.body == b"fake-image-bytes"
+        etag = response.headers["etag"]
+        assert etag == f'"{hashlib.sha256(b"fake-image-bytes").hexdigest()}"'
+        cache_control = response.headers["cache-control"]
+        assert "public" in cache_control
+        assert "max-age=" in cache_control
+        assert "must-revalidate" in cache_control
+
+    def test_private_visibility_for_authenticated_endpoints(self) -> None:
+        response = _asset_response(
+            _make_request(),
+            content=b"fake-image-bytes",
+            content_type="image/png",
+            visibility="private",
+        )
+        assert "private" in response.headers["cache-control"]
+        assert "public" not in response.headers["cache-control"]
+
+    def test_matching_if_none_match_returns_304_with_no_body(self) -> None:
+        content = b"fake-image-bytes"
+        etag = f'"{hashlib.sha256(content).hexdigest()}"'
+        response = _asset_response(
+            _make_request(if_none_match=etag),
+            content=content,
+            content_type="image/png",
+            visibility="public",
+        )
+        assert response.status_code == 304
+        assert response.body == b""
+        # A 304 still needs to carry the cache directives so the client
+        # refreshes its cache entry's freshness lifetime, not just its
+        # validator.
+        assert response.headers["etag"] == etag
+        assert "cache-control" in response.headers
+
+    def test_mismatched_if_none_match_returns_full_body(self) -> None:
+        response = _asset_response(
+            _make_request(if_none_match='"some-other-etag"'),
+            content=b"fake-image-bytes",
+            content_type="image/png",
+            visibility="public",
+        )
+        assert response.status_code == 200
+        assert response.body == b"fake-image-bytes"
+
+    def test_changed_content_changes_etag(self) -> None:
+        """Content-addressed correctness: a re-upload writes new bytes
+        under a fresh object-storage key (BrandingService's own upload_*
+        methods), but the URL a browser has cached never changes -- the
+        ETag must actually reflect *these* bytes on every real request, or
+        a stale cached image could otherwise look validated forever."""
+        etag_v1 = _asset_response(
+            _make_request(),
+            content=b"version-1",
+            content_type="image/png",
+            visibility="public",
+        ).headers["etag"]
+        etag_v2 = _asset_response(
+            _make_request(),
+            content=b"version-2",
+            content_type="image/png",
+            visibility="public",
+        ).headers["etag"]
+        assert etag_v1 != etag_v2
+
+    def test_wildcard_if_none_match_matches(self) -> None:
+        response = _asset_response(
+            _make_request(if_none_match="*"),
+            content=b"fake-image-bytes",
+            content_type="image/png",
+            visibility="public",
+        )
+        # RFC 7232: "*" matches any current representation -- not handled
+        # specially here (only exact-etag matching is implemented), so this
+        # documents the actual, narrower behavior rather than asserting an
+        # unimplemented spec nicety.
+        assert response.status_code == 200

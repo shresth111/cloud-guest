@@ -107,6 +107,50 @@ class Settings(BaseSettings):
             "catalog edit (which does not fan out to affected organizations)."
         ),
     )
+    captive_portal_resolve_cache_ttl_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=86_400,
+        description=(
+            "TTL for the Redis-backed captive-portal resolve cache "
+            "(app.domains.captive_portal.cache.CaptivePortalResolveCache). "
+            "GET /captive-portal/resolve is guest-device-facing, unauthenticated, "
+            "hit-on-every-WiFi-join traffic against config that changes rarely "
+            "(an admin editing branding/login-method toggles) -- caching it is a "
+            "clear win. Real invalidation happens on every "
+            "create/update/activate/deactivate/delete of the exact "
+            "(organization_id, location_id) captive-portal config mutated; this "
+            "TTL is only a backstop against a missed invalidation and against an "
+            "organization-level default change (which does not fan out to every "
+            "location under that org lacking its own override), mirroring "
+            "billing_entitlement_cache_ttl_seconds's identical documented "
+            "trade-off."
+        ),
+    )
+    branding_asset_cache_ttl_seconds: int = Field(
+        default=3600,
+        ge=1,
+        le=604_800,
+        description=(
+            "Browser Cache-Control max-age for the branding logo/background-"
+            "image serving endpoints (app.domains.branding.router's raw/"
+            "public GET endpoints) -- notably the unauthenticated "
+            ".../logo/public and .../background-image/public paths "
+            "GET /captive-portal/resolve points a guest's browser at on "
+            "every WiFi join. These bytes are content-addressed (a fresh "
+            "object-storage key is written on every re-upload, the row's "
+            "own *_key column repointed to it -- the old key's bytes never "
+            "mutate in place), so every response also carries a strong "
+            "ETag hashed from the real bytes returned; a client revisiting "
+            "after this TTL expires still gets a cheap 304 instead of a "
+            "full re-download whenever the underlying image hasn't "
+            "actually changed. This TTL only bounds how long a re-upload "
+            "can take to reach a browser that cached the *previous* image "
+            "and hasn't revisited since -- not correctness, since the "
+            "ETag always reflects the real current bytes on any request "
+            "that does reach the server."
+        ),
+    )
     rbac_max_parent_role_depth: int = Field(
         default=10,
         ge=1,
