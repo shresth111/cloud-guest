@@ -206,6 +206,10 @@ class GuestRepositoryProtocol(Protocol):
         self, guest_id: uuid.UUID, period_type: str
     ) -> GuestQuotaUsage | None: ...
 
+    async def get_quota_usages(
+        self, guest_id: uuid.UUID, period_types: list[str]
+    ) -> list[GuestQuotaUsage]: ...
+
     async def create_quota_usage(self, **fields: object) -> GuestQuotaUsage: ...
 
     async def update_quota_usage(
@@ -674,6 +678,27 @@ class GuestRepository:
             filters={"guest_id": guest_id, "period_type": period_type}, limit=1
         )
         return results[0] if results else None
+
+    async def get_quota_usages(
+        self, guest_id: uuid.UUID, period_types: list[str]
+    ) -> list[GuestQuotaUsage]:
+        """Every quota row this guest has for the named periods, in one
+        ``IN (...)`` query.
+
+        Design spec §5 S9: ``GuestService._enforce_fup_quota`` runs on the
+        guest-login request path and needs all three periods
+        (daily/weekly/monthly) every time. Fetching them one at a time was
+        three round trips against the same table, for the same guest, to
+        answer one question."""
+        if not period_types:
+            return []
+        statement = select(GuestQuotaUsage).where(
+            GuestQuotaUsage.guest_id == guest_id,
+            GuestQuotaUsage.period_type.in_(period_types),
+            GuestQuotaUsage.is_deleted.is_(False),
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def create_quota_usage(self, **fields: object) -> GuestQuotaUsage:
         return await self.quota_usages.create(fields)

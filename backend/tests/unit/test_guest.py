@@ -19,6 +19,8 @@ Redis in this environment.
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -891,6 +893,16 @@ class FakeGuestRepository:
             if usage.guest_id == guest_id and usage.period_type == period_type:
                 return usage
         return None
+
+    async def get_quota_usages(
+        self, guest_id: uuid.UUID, period_types: list[str]
+    ) -> list[GuestQuotaUsage]:
+        wanted = set(period_types)
+        return [
+            usage
+            for usage in self.quota_usages.values()
+            if usage.guest_id == guest_id and usage.period_type in wanted
+        ]
 
     async def create_quota_usage(self, **fields: object) -> GuestQuotaUsage:
         usage = GuestQuotaUsage(**_base_fields(**fields))
@@ -2620,6 +2632,349 @@ class TestMacWhitelistLogin:
         )
         assert resolved.config.otp_sms_enabled is True
         assert resolved.config.username_password_enabled is True
+
+
+
+class TestGuestQueueAssignmentIsOffTheRequestPath:
+    """Design spec §5 S9. ``_assign_guest_queue`` opened a fresh TCP
+    connection to the venue's MikroTik -- no pooling, 10-second timeout --
+    awaited inline on the login request. It was exception-swallowed, so a
+    failure never blocked the login; but a swallowed 10-second timeout is
+    still 10 seconds of spinner after a correct OTP."""
+
+    @staticmethod
+    def _dispatcher(record: list[dict]):
+        async def _dispatch(**kwargs):
+            record.append(kwargs)
+
+        return _dispatch
+
+    async def test_router_is_never_touched_on_the_request_path(self) -> None:
+        """The proof that this is genuinely deferred and not merely
+        relocated: the queue hook -- the only thing that can reach a
+        router -- fails the test outright if the request path calls it."""
+
+        class ExplodingQueueHook:
+            async def resolve_and_assign_queue(self, **kwargs):
+                raise AssertionError(
+                    "the request path reached the router; S9 is not fixed"
+                )
+
+            async def create_assignment(self, **kwargs):
+                raise AssertionError("unexpected")
+
+            async def apply_queue(self, *a, **k):
+                raise AssertionError("unexpected")
+
+        dispatched: list[dict] = []
+        fx = make_fixture(queue_assignment_hook=ExplodingQueueHook())
+        fx.guest_service.queue_assignment_dispatcher = self._dispatcher(dispatched)
+
+        result = await fx.guest_service.login_via_otp(
+            identifier="guest@example.com",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            ip_address="10.0.0.5",
+        )
+
+        assert result.session is not None
+        assert len(dispatched) == 1
+        assert dispatched[0]["session_id"] == result.session.id
+        assert dispatched[0]["device_target"] == "10.0.0.5"
+        assert dispatched[0]["router_id"] == fx.router.id
+        assert dispatched[0]["guest_id"] == result.guest.id
+
+    async def test_a_ten_second_router_stall_no_longer_delays_the_guest(self) -> None:
+        """The user-visible claim, measured. The same hook that stalls a
+        login for the adapter's full timeout when awaited inline costs
+        the guest nothing once dispatched.
+
+        Uses a short stall rather than a real 10s one so the suite stays
+        fast; the point is the ratio, not the constant."""
+        stall_seconds = 0.5
+
+        class StallingQueueHook:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def resolve_and_assign_queue(self, **kwargs):
+                self.calls += 1
+                await asyncio.sleep(stall_seconds)
+
+        # Inline (the old behaviour): the guest waits for the router.
+        inline_fx = make_fixture(queue_assignment_hook=StallingQueueHook())
+        started = time.perf_counter()
+        await inline_fx.guest_service.login_via_otp(
+            identifier="inline@example.com",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=inline_fx.location_id,
+            router_id=inline_fx.router.id,
+            ip_address="10.0.0.6",
+        )
+        inline_elapsed = time.perf_counter() - started
+        assert inline_fx.guest_service.queue_assignment_hook.calls == 1
+        assert inline_elapsed >= stall_seconds
+
+        # Dispatched (the fix): the guest does not.
+        dispatched: list[dict] = []
+        deferred_fx = make_fixture(queue_assignment_hook=StallingQueueHook())
+        deferred_fx.guest_service.queue_assignment_dispatcher = self._dispatcher(
+            dispatched
+        )
+        started = time.perf_counter()
+        await deferred_fx.guest_service.login_via_otp(
+            identifier="deferred@example.com",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=deferred_fx.location_id,
+            router_id=deferred_fx.router.id,
+            ip_address="10.0.0.7",
+        )
+        deferred_elapsed = time.perf_counter() - started
+
+        assert deferred_fx.guest_service.queue_assignment_hook.calls == 0
+        assert len(dispatched) == 1
+        assert deferred_elapsed < stall_seconds / 2
+
+    async def test_a_broker_outage_never_fails_the_login(self) -> None:
+        """Queueing is a quality-of-service concern, not an authorization
+        one -- the same best-effort posture the inline call always had."""
+        from app.domains.guest.tasks import enqueue_guest_queue_assignment
+
+        def _explode(*a, **k):
+            raise RuntimeError("broker unreachable")
+
+        fx = make_fixture()
+        fx.guest_service.queue_assignment_dispatcher = enqueue_guest_queue_assignment
+
+        with patch(
+            "app.domains.guest.tasks.assign_guest_queue.delay", side_effect=_explode
+        ):
+            result = await fx.guest_service.login_via_otp(
+                identifier="broker@example.com",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                ip_address="10.0.0.8",
+            )
+
+        assert result.session is not None
+
+    async def test_enqueue_does_not_block_the_event_loop(self) -> None:
+        """``.delay()`` is Kombu's *synchronous* publish. Called directly
+        from an async handler it would block the event loop -- which would
+        make this "the request path now blocks on a broker" rather than
+        "the router is off the request path". It must be threaded."""
+        from app.domains.guest.tasks import enqueue_guest_queue_assignment
+
+        publish_seconds = 0.4
+        ticks = 0
+
+        def _slow_publish(*a, **k):
+            time.sleep(publish_seconds)
+
+        async def _tick():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        ticker = asyncio.create_task(_tick())
+        try:
+            with patch(
+                "app.domains.guest.tasks.assign_guest_queue.delay",
+                side_effect=_slow_publish,
+            ):
+                await enqueue_guest_queue_assignment(
+                    organization_id=None,
+                    location_id=uuid.uuid4(),
+                    router_id=uuid.uuid4(),
+                    session_id=uuid.uuid4(),
+                    device_target="10.0.0.9",
+                    guest_id=None,
+                )
+        finally:
+            ticker.cancel()
+
+        # A blocked loop cannot run the ticker at all.
+        assert ticks > 5, f"event loop was blocked during publish (ticks={ticks})"
+
+    async def test_no_dispatch_when_the_session_has_no_ip(self) -> None:
+        dispatched: list[dict] = []
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        fx.guest_service.queue_assignment_dispatcher = self._dispatcher(dispatched)
+
+        await fx.guest_service.login_via_otp(
+            identifier="noip@example.com",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+
+        assert dispatched == []
+        hook = fx.guest_service.queue_assignment_hook
+        assert hook.resolve_and_assign_queue_calls == []
+
+    def test_the_real_api_wiring_supplies_a_dispatcher(self) -> None:
+        """The inline fallback is kept for broker-less deployments, so
+        the thing that actually takes the router off the guest's request
+        is this wiring. Pin it."""
+        import inspect
+
+        from app.domains.guest import dependencies
+
+        source = inspect.getsource(dependencies.get_guest_service)
+        assert "queue_assignment_dispatcher=enqueue_guest_queue_assignment" in source
+
+    async def test_the_task_passes_everything_through_to_the_real_service(
+        self,
+    ) -> None:
+        """The worker half. Nothing is re-read from ``guest_sessions``,
+        which is what keeps this free of a read-your-own-write race
+        against the request that enqueued it."""
+        from app.domains.guest import tasks as guest_tasks
+
+        recorded: dict = {}
+
+        class _Service:
+            async def resolve_and_assign_queue(self, **kwargs):
+                recorded.update(kwargs)
+
+        session_id = uuid.uuid4()
+        router_id = uuid.uuid4()
+        location_id = uuid.uuid4()
+
+        class _Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def commit(self):
+                pass
+
+            async def rollback(self):
+                pass
+
+        with (
+            patch.object(guest_tasks, "SessionLocal", lambda: _Session()),
+            patch.object(
+                guest_tasks, "_build_queue_management_service", lambda _s: _Service()
+            ),
+        ):
+            await guest_tasks._assign_guest_queue_async(
+                organization_id=None,
+                location_id=str(location_id),
+                router_id=str(router_id),
+                session_id=str(session_id),
+                device_target="10.0.0.5",
+                guest_id=None,
+            )
+
+        assert recorded["target_id"] == session_id
+        assert recorded["router_id"] == router_id
+        assert recorded["location_id"] == location_id
+        assert recorded["device_target"] == "10.0.0.5"
+        assert recorded["target_type"] == QueueTargetType.SESSION
+
+
+class TestFupQuotaReadsAreBatched:
+    """Design spec §5 S9: the three-iteration quota loop issued one SELECT
+    per period against the same table for the same guest."""
+
+    async def test_one_read_covers_every_configured_period(self) -> None:
+        fx = make_fixture(
+            policy_lookup=FakeFupPolicyLookup(
+                fup_rules={
+                    "daily_data_limit_mb": 1000,
+                    "weekly_data_limit_mb": 5000,
+                    "monthly_data_limit_mb": 20000,
+                }
+            )
+        )
+        singular: list[str] = []
+        batched: list[list[str]] = []
+        original_batched = fx.repository.get_quota_usages
+        original_singular = fx.repository.get_quota_usage
+
+        async def _count_batched(guest_id, period_types):
+            batched.append(list(period_types))
+            return await original_batched(guest_id, period_types)
+
+        async def _count_singular(guest_id, period_type):
+            singular.append(period_type)
+            return await original_singular(guest_id, period_type)
+
+        fx.repository.get_quota_usages = _count_batched
+        fx.repository.get_quota_usage = _count_singular
+
+        # First login materializes the rows; the second is steady state.
+        for i in range(2):
+            if i == 1:
+                batched.clear()
+                singular.clear()
+            await fx.guest_service.login_via_otp(
+                identifier="quota@example.com",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac=f"AA:BB:CC:DD:EE:0{i}",
+                ip_address="10.0.0.5",
+            )
+
+        assert len(batched) == 1, "all three periods must come from one read"
+        assert sorted(batched[0]) == ["daily", "monthly", "weekly"]
+        assert singular == [], "no per-period SELECT should remain"
+
+    async def test_periods_with_no_cap_are_not_fetched_or_created(self) -> None:
+        """A period nothing limits was skipped by the old loop too --
+        batching must not turn it into a row this path writes."""
+        fx = make_fixture(
+            policy_lookup=FakeFupPolicyLookup(
+                fup_rules={"daily_data_limit_mb": 1000}
+            )
+        )
+        batched: list[list[str]] = []
+        original = fx.repository.get_quota_usages
+
+        async def _record(guest_id, period_types):
+            batched.append(list(period_types))
+            return await original(guest_id, period_types)
+
+        fx.repository.get_quota_usages = _record
+
+        # The quota gate only runs for an *existing* guest -- a brand-new
+        # one trivially has no usage. So the first login registers the
+        # guest and the second is the one that enforces.
+        for i in range(2):
+            if i == 1:
+                batched.clear()
+            await fx.guest_service.login_via_otp(
+                identifier="onecap@example.com",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac=f"AA:BB:CC:DD:EE:1{i}",
+                ip_address="10.0.0.5",
+            )
+
+        assert batched == [["daily"]]
+        assert len(fx.repository.quota_usages) == 1
 
 
 class TestSpeedLinkedVoucherQueueAssignment:
