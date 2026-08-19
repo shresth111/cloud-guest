@@ -129,7 +129,18 @@ def get_guest_service(
     application, rather than this being dead code no request path ever
     exercises (see ``GuestService``'s own docstring for the full write-up
     of why this is a raw Redis client, not a duck-typed hook, unlike
-    every other parameter here)."""
+    every other parameter here).
+
+    Design spec §5 S9 addition: wires ``tasks.enqueue_guest_queue_assignment``
+    in as ``GuestService``'s ``queue_assignment_dispatcher``. This is the
+    edit that actually takes the venue's MikroTik off the login request
+    path -- ``_assign_guest_queue`` prefers the dispatcher over the inline
+    ``queue_assignment_hook`` whenever one is wired, and it is wired here,
+    so no real guest request performs the router connect itself.
+    ``queue_assignment_hook`` stays wired because the voucher path still
+    uses it directly."""
+    from .tasks import enqueue_guest_queue_assignment
+
     return GuestService(
         repository,
         otp_service,
@@ -140,6 +151,7 @@ def get_guest_service(
         monitoring_hook=monitoring_service,
         access_control_hook=guest_access_service,
         queue_assignment_hook=queue_management_service,
+        queue_assignment_dispatcher=enqueue_guest_queue_assignment,
         policy_lookup=policy_service,
         mac_authorization_hook=mac_authorization_service,
         redis=redis,

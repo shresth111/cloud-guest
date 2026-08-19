@@ -114,6 +114,12 @@ class CaptivePortalConfigNotConfiguredError(CaptivePortalError):
     configure at least a default portal before going live."""
 
     def __init__(self, organization_id: uuid.UUID | str) -> None:
+        # Retained as an attribute so the negative resolve-cache entry can
+        # record *which* organization resolved to "not configured" -- see
+        # ``service._NOT_CONFIGURED_MARKER`` (design spec §5 S10). Without
+        # it the cached negative could not reconstruct this same error, nor
+        # be indexed for organization-scoped invalidation.
+        self.organization_id = organization_id
         super().__init__(
             f"No active captive portal config is configured for "
             f"organization {organization_id} (no location override and no "
