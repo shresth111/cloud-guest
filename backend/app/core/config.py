@@ -1134,6 +1134,25 @@ class Settings(BaseSettings):
             "every route."
         ),
     )
+    captive_portal_resolve_rate_limit_max_requests: int = Field(
+        default=600,
+        ge=1,
+        le=100_000,
+        description=(
+            "Requests GET /captive-portal/resolve may serve per "
+            "rate_limit_window_seconds, applied separately to each venue "
+            "(organization/location) and to each client IP -- see design "
+            "spec §5 S8 and app.middleware.rate_limit's own module "
+            "docstring. Sized for a venue, not a device: every guest at a "
+            "venue leaves through one NAT egress IP, so the previous "
+            "device-sized 60 meant roughly twenty simultaneous arrivals "
+            "could 429 each other off the WiFi they were joining. 600 "
+            "over the default 60s window is ~10 req/s per venue, which "
+            "clears a realistic arrival burst by a wide margin while "
+            "still bounding how hard one source can drive an "
+            "unauthenticated endpoint."
+        ),
+    )
     rate_limit_window_seconds: int = Field(
         default=60,
         ge=1,
