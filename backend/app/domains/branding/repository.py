@@ -33,6 +33,9 @@ class BrandingRepositoryProtocol(Protocol):
         organization_id: uuid.UUID,
         key: str | None,
         *,
+        luminance: int | None = None,
+        top_luminance: int | None = None,
+        entropy: int | None = None,
         actor_user_id: uuid.UUID | None = None,
     ) -> Branding: ...
 
@@ -95,17 +98,30 @@ class BrandingRepository(BrandingRepositoryProtocol):
         organization_id: uuid.UUID,
         key: str | None,
         *,
+        luminance: int | None = None,
+        top_luminance: int | None = None,
+        entropy: int | None = None,
         actor_user_id: uuid.UUID | None = None,
     ) -> Branding:
-        """Sets (or, with ``key=None``, clears) the background image key.
+        """Sets (or, with ``key=None``, clears) the background image key
+        together with the three v7 image measurements that describe it.
 
         Deliberately separate from :meth:`upsert`, which skips ``None``
         values -- that logic is right for a partial ``PUT`` body, but
-        wrong here: clearing the background image *is* the operation.
+        wrong here: clearing the background image *is* the operation,
+        and the metrics are assigned unconditionally for the same
+        reason. A ``None`` metric means "not measured" (the image was
+        deleted, or processing took its graceful fallback), and leaving
+        a previous image's numbers behind would be worse than storing
+        nothing -- the frontend would size a scrim against a photo that
+        is no longer there.
         """
         existing = await self.get_by_organization(organization_id)
         if existing:
             existing.background_image_key = key
+            existing.background_luminance = luminance
+            existing.background_top_luminance = top_luminance
+            existing.background_entropy = entropy
             existing.updated_by = actor_user_id
             await self.db.flush()
             return existing
@@ -113,6 +129,9 @@ class BrandingRepository(BrandingRepositoryProtocol):
         branding = Branding(
             organization_id=organization_id,
             background_image_key=key,
+            background_luminance=luminance,
+            background_top_luminance=top_luminance,
+            background_entropy=entropy,
             created_by=actor_user_id,
             updated_by=actor_user_id,
         )

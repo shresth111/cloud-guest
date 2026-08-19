@@ -14,11 +14,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .constants import (
     HEX_COLOR_PATTERN,
+    MAX_BACKGROUND_FOCAL,
     MAX_BACKGROUND_OVERLAY_STRENGTH,
+    MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
     GuestFontChoice,
 )
 from .exceptions import (
+    InvalidBackgroundFocalPointError,
     InvalidBackgroundOverlayStrengthError,
     InvalidBusinessHoursScheduleError,
     InvalidDefaultConfigScopeError,
@@ -99,6 +102,27 @@ def validate_background_overlay_strength(value: object) -> None:
     )
     if not in_range:
         raise InvalidBackgroundOverlayStrengthError(value)
+
+
+def validate_background_focal_point(axis: str, value: object) -> None:
+    """Raises ``InvalidBackgroundFocalPointError`` unless ``value`` is a
+    real ``int`` (``bool`` excluded for the same reason
+    ``validate_background_overlay_strength`` excludes it -- Python's
+    ``bool`` subclasses ``int`` and ``True`` is never a legal focal
+    percentage) within ``[0, 100]`` inclusive.
+
+    ``axis`` is ``"x"`` or ``"y"``, used only to name the offending
+    field in the error message. Both axes share one validator because
+    they share one range: they are percentages of the image's own
+    width/height (v7 design spec §1.4 C4), and CSS
+    ``background-position`` accepts the full 0-100 on each."""
+    in_range = (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and MIN_BACKGROUND_FOCAL <= value <= MAX_BACKGROUND_FOCAL
+    )
+    if not in_range:
+        raise InvalidBackgroundFocalPointError(axis, value)
 
 
 def validate_default_scope(*, is_default: bool, location_id: uuid.UUID | None) -> None:
@@ -198,5 +222,6 @@ __all__ = [
     "validate_business_hours_schedule",
     "validate_guest_font_choice",
     "validate_background_overlay_strength",
+    "validate_background_focal_point",
     "is_open_now",
 ]

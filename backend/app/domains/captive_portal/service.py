@@ -89,6 +89,7 @@ from .exceptions import (
 from .models import CaptivePortalConfig
 from .repository import CaptivePortalRepositoryProtocol
 from .validators import (
+    validate_background_focal_point,
     validate_background_overlay_strength,
     validate_business_hours_schedule,
     validate_business_hours_timezone,
@@ -279,6 +280,8 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "business_hours_closed_message",
     "guest_font_choice",
     "background_overlay_strength",
+    "background_focal_x",
+    "background_focal_y",
 )
 
 
@@ -330,6 +333,8 @@ class _CachedCaptivePortalConfig:
     business_hours_closed_message: str | None
     guest_font_choice: str
     background_overlay_strength: int
+    background_focal_x: int
+    background_focal_y: int
 
 
 def _config_to_cache_payload(config: CaptivePortalConfig) -> dict[str, Any]:
@@ -601,6 +606,10 @@ class CaptivePortalService:
             validate_background_overlay_strength(
                 update_data["background_overlay_strength"]
             )
+        for axis in ("x", "y"):
+            field_name = f"background_focal_{axis}"
+            if field_name in update_data:
+                validate_background_focal_point(axis, update_data[field_name])
 
         if merged_is_default and not config.is_default:
             await self._clear_existing_default(

@@ -110,6 +110,8 @@ def _config_response(config: CaptivePortalConfig) -> CaptivePortalConfigResponse
         business_hours_closed_message=config.business_hours_closed_message,
         guest_font_choice=config.guest_font_choice,
         background_overlay_strength=config.background_overlay_strength,
+        background_focal_x=config.background_focal_x,
+        background_focal_y=config.background_focal_y,
         created_at=config.created_at,
         updated_at=config.updated_at,
     )
@@ -418,6 +420,23 @@ async def resolve_captive_portal_config(
     # incident this fixed: guest phones on the real captive portal
     # silently never showed the org's logo, because this was quietly
     # "http" instead and the browser dropped the mixed-content image).
+    #
+    # The same branding row also carries the three v7 image
+    # measurements (background_luminance / _top_luminance / _entropy,
+    # design spec §1.4 C3/C5). They are read here, on the same row we
+    # already fetched, and only on the branch that actually adopts the
+    # branding image -- a config with its own typed-in
+    # background_image_url points at a file nothing measured, and
+    # reporting the org photo's numbers for a *different* image would be
+    # worse than reporting None. They are deliberately not part of the
+    # resolve cache payload: they live on `brandings`, not
+    # `captive_portal_configs`, and this fetch is already uncached (see
+    # spec §5 S7, which proposes folding the whole branding row into the
+    # cached payload -- a separate change).
+    background_luminance: int | None = None
+    background_top_luminance: int | None = None
+    background_entropy: int | None = None
+
     needs_logo = config_payload["logo_url"] is None
     needs_background = config_payload["background_image_url"] is None
     if needs_logo or needs_background:
@@ -443,6 +462,9 @@ async def resolve_captive_portal_config(
                     organization_id=org_id
                 )
                 config_payload["background_image_url"] = api_base + bg_path
+                background_luminance = branding.background_luminance
+                background_top_luminance = branding.background_top_luminance
+                background_entropy = branding.background_entropy
 
     response_payload = ResolvedCaptivePortalConfigResponse(
         **config_payload,
@@ -453,6 +475,9 @@ async def resolve_captive_portal_config(
             schedule=resolved.config.business_hours_schedule,
         ),
         location_country=resolved.location_country,
+        background_luminance=background_luminance,
+        background_top_luminance=background_top_luminance,
+        background_entropy=background_entropy,
     )
     return build_response(
         success=True,

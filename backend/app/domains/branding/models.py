@@ -38,7 +38,7 @@ Architecture notes:
 
 import uuid
 
-from sqlalchemy import ForeignKey, Index, String
+from sqlalchemy import ForeignKey, Index, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -68,6 +68,38 @@ class Branding(BaseModel):
     background_image_key: Mapped[str | None] = mapped_column(
         String(1024), nullable=True
     )
+
+    # Measurements of the background image above, computed once at
+    # upload by ``BrandingService``'s ``_process_background_image``
+    # (captive-portal v7 design spec §1.4 C3/C5) and never edited by
+    # hand. They live on ``brandings``, next to the image, because they
+    # *describe the image* -- a second venue reusing the same org photo
+    # measures identically, so per-venue storage would be duplication
+    # that can go stale. (The per-venue half of the same feature,
+    # ``background_focal_x``/``_y``, is on ``captive_portal_configs``
+    # for the mirror-image reason: the same photo should crop
+    # differently at different venues.)
+    #
+    # All three are 0-100 and all three are nullable, which is the
+    # correct shape rather than a NOT NULL DEFAULT: "we have not
+    # measured this image" is a real, distinguishable state -- every row
+    # uploaded before v7, plus any upload that took the graceful
+    # store-the-original fallback -- and it is not the same statement as
+    # "this image measured 0" (a pure black photo). The frontend needs
+    # to tell those apart to decide between C3's adaptive scrim and the
+    # unconditional §1.3 floor, and a NOT NULL default would quietly
+    # assert a measurement that was never taken.
+    #
+    # ``background_luminance``: mean luma of the whole image.
+    # ``background_top_luminance``: mean luma of the top band the
+    # headline sits over. ``background_entropy``: normalized histogram
+    # entropy, the "busyness" measure C5's refusal rule reads to decide
+    # whether the headline must drop onto the card.
+    background_luminance: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    background_top_luminance: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    background_entropy: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Object storage key (not a URL) for an uploaded logo -- same pattern
     # as background_image_key. Takes priority over the plain-text

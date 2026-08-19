@@ -85,6 +85,33 @@ DEFAULT_BACKGROUND_OVERLAY_STRENGTH = 55
 MIN_BACKGROUND_OVERLAY_STRENGTH = 0
 MAX_BACKGROUND_OVERLAY_STRENGTH = 100
 
+# Per-venue background focal point, as integer percentages of the image's
+# width and height -- v7 design spec §1.4 C4. 50/25 is not a taste
+# judgement: it is exactly the frontend's current hardcoded
+# ``background-position: center 25%``, so every existing venue renders
+# byte-identically after the migration that adds these columns.
+#
+# Per-venue on ``captive_portal_configs`` rather than org-level on
+# ``brandings`` deliberately (spec C4): the *same* shared organization
+# photo should crop differently at different venues, because what is
+# worth centring on is a property of the venue, not of the file. The
+# measurements that genuinely describe the file
+# (``background_luminance``/``_top_luminance``/``_entropy``) live on
+# ``brandings`` for the mirror-image reason.
+#
+# Worth knowing while reading this: spec §1.1 L7 records that
+# ``center 25%`` has only ever worked on desktop. A percentage
+# background-position only acts along the axis where the image overflows
+# its box, and with ``cover`` on a tall narrow phone box the overflow is
+# horizontal -- so the vertical 25% has had nothing to act against on
+# any portrait phone since it shipped. The frontend fix for that is C1
+# (crop against the viewport, not the document); these columns are what
+# C1 then has something useful to position *with*.
+DEFAULT_BACKGROUND_FOCAL_X = 50
+DEFAULT_BACKGROUND_FOCAL_Y = 25
+MIN_BACKGROUND_FOCAL = 0
+MAX_BACKGROUND_FOCAL = 100
+
 # Field-label constants for the "at most one of text/url" validation --
 # see validators.validate_single_content_source's docstring for why this is
 # "at most one", not "exactly one".
@@ -104,6 +131,10 @@ __all__ = [
     "DEFAULT_BACKGROUND_OVERLAY_STRENGTH",
     "MIN_BACKGROUND_OVERLAY_STRENGTH",
     "MAX_BACKGROUND_OVERLAY_STRENGTH",
+    "DEFAULT_BACKGROUND_FOCAL_X",
+    "DEFAULT_BACKGROUND_FOCAL_Y",
+    "MIN_BACKGROUND_FOCAL",
+    "MAX_BACKGROUND_FOCAL",
     "TERMS_AND_CONDITIONS_LABEL",
     "PRIVACY_POLICY_LABEL",
 ]

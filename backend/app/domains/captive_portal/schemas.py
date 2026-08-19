@@ -204,6 +204,24 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
             "render-time guardrail on top of whatever is stored here."
         ),
     )
+    background_focal_x: int | None = Field(
+        default=None,
+        description=(
+            "Per-venue background focal point, horizontal, as a "
+            "percentage of the image width, 0-100 (v7 design spec §1.4 "
+            "C4). Defaults to 50, exactly today's `background-position: "
+            "center`."
+        ),
+    )
+    background_focal_y: int | None = Field(
+        default=None,
+        description=(
+            "Per-venue background focal point, vertical, as a percentage "
+            "of the image height, 0-100 (v7 design spec §1.4 C4). "
+            "Defaults to 25, exactly today's `background-position: "
+            "center 25%`."
+        ),
+    )
 
 
 # ============================================================================
@@ -248,6 +266,8 @@ class CaptivePortalConfigResponse(BaseModel):
     business_hours_closed_message: str | None
     guest_font_choice: str
     background_overlay_strength: int
+    background_focal_x: int
+    background_focal_y: int
     created_at: datetime
     updated_at: datetime
 
@@ -290,5 +310,47 @@ class ResolvedCaptivePortalConfigResponse(CaptivePortalConfigResponse):
             "the alpha-2 -> dialing-code mapping; this field intentionally "
             "returns the raw ISO country, not a pre-computed '+91' string, "
             "so the mapping stays a presentation concern."
+        ),
+    )
+    background_luminance: int | None = Field(
+        default=None,
+        description=(
+            "Mean luma (0-100) of the resolved background image, "
+            "computed once at upload by the v7 pipeline "
+            "(app.domains.branding.service._process_background_image) "
+            "-- v7 design spec §1.4 C3. Sourced from the organization's "
+            "`brandings` row, so it is present only when the background "
+            "actually came from that upload; None when this config "
+            "carries its own typed-in background_image_url (nothing "
+            "measured it), and None for any image uploaded before the "
+            "v7 pipeline existed and not yet backfilled. **None means "
+            "'not measured', never 'measured 0'** -- a black photo "
+            "legitimately measures 0, and the two must not be "
+            "conflated. With None the frontend uses the unconditional "
+            "§1.3 scrim floor, which is AA-safe over literally any "
+            "image; these values only ever let a *nice* photo use less "
+            "scrim than that floor, or flip the scrim's polarity."
+        ),
+    )
+    background_top_luminance: int | None = Field(
+        default=None,
+        description=(
+            "Mean luma (0-100) of the top band of the resolved "
+            "background image -- the zone the headline sits over "
+            "(v7 §1.4 C3). Same source and same None semantics as "
+            "background_luminance."
+        ),
+    )
+    background_entropy: int | None = Field(
+        default=None,
+        description=(
+            "Normalized histogram entropy (0-100) of the resolved "
+            "background image: how *busy* it is. Feeds v7 §1.4 C5's "
+            "refusal rule -- above threshold, and combined with "
+            "background_top_luminance, the headline drops onto the "
+            "opaque card instead of sitting on the photo, because a "
+            "mathematically compliant contrast ratio still reads badly "
+            "when glyph edges compete with image edges. Same source and "
+            "same None semantics as background_luminance."
         ),
     )

@@ -52,10 +52,14 @@ from app.core.config import get_settings
 # never read again and expire on their own. Chosen over
 # ``payload.get(name, default)`` deliberately -- a genuinely missing
 # field should fail loudly in tests, not degrade silently in production.
-# This is v2 because v6's guest_font_choice/background_overlay_strength
-# are the first fields added since the cache shipped.
+# v2 was v6's guest_font_choice/background_overlay_strength, the first
+# fields added since the cache shipped. v3 is v7's background_focal_x/
+# background_focal_y (design spec §1.4 C4), added to
+# _CACHED_CONFIG_SCALAR_FIELDS by the same change -- the spec calls this
+# bump out explicitly in §0.3 because skipping it is exactly the
+# guest-facing 500 the versioning exists to prevent.
 _CACHE_KEY_TEMPLATE = (
-    "captive_portal:resolve:v2:{organization_id}:{location_id}"
+    "captive_portal:resolve:v3:{organization_id}:{location_id}"
 )
 _NONE_SENTINEL = "-"
 

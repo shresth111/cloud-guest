@@ -132,6 +132,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.database.base import BaseModel
 
 from .constants import (
+    DEFAULT_BACKGROUND_FOCAL_X,
+    DEFAULT_BACKGROUND_FOCAL_Y,
     DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
     DEFAULT_GUEST_FONT_CHOICE,
     DEFAULT_LANGUAGE,
@@ -216,6 +218,29 @@ class CaptivePortalConfig(BaseModel):
     # strength.
     background_overlay_strength: Mapped[int] = mapped_column(
         Integer, default=DEFAULT_BACKGROUND_OVERLAY_STRENGTH, nullable=False
+    )
+    # Per-venue background focal point as integer percentages of the
+    # image's width/height (v7 design spec §1.4 C4). NOT NULL with
+    # defaults 50/25 chosen to be exactly the frontend's current
+    # hardcoded `background-position: center 25%`, so this is a
+    # zero-rendered-change addition for every venue that already exists
+    # -- the same discipline background_overlay_strength's default 55
+    # follows above.
+    #
+    # On captive_portal_configs, not brandings, deliberately: an
+    # organization's single uploaded photo is shared across its venues,
+    # and the crop worth using differs per venue (a wide lobby shot may
+    # want its left third at one site and its right at another). The
+    # numbers that describe the *file* rather than the venue --
+    # brandings.background_luminance / _top_luminance / _entropy, from
+    # the same v7 pass -- live with the file for the same reason.
+    #
+    # Validated server-side in validators.validate_background_focal_point.
+    background_focal_x: Mapped[int] = mapped_column(
+        Integer, default=DEFAULT_BACKGROUND_FOCAL_X, nullable=False
+    )
+    background_focal_y: Mapped[int] = mapped_column(
+        Integer, default=DEFAULT_BACKGROUND_FOCAL_Y, nullable=False
     )
 
     # -- content -----------------------------------------------------------------
