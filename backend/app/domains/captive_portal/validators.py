@@ -12,10 +12,17 @@ import uuid
 from datetime import datetime, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .constants import HEX_COLOR_PATTERN
+from .constants import (
+    HEX_COLOR_PATTERN,
+    MAX_BACKGROUND_OVERLAY_STRENGTH,
+    MIN_BACKGROUND_OVERLAY_STRENGTH,
+    GuestFontChoice,
+)
 from .exceptions import (
+    InvalidBackgroundOverlayStrengthError,
     InvalidBusinessHoursScheduleError,
     InvalidDefaultConfigScopeError,
+    InvalidGuestFontChoiceError,
     InvalidHexColorError,
     InvalidPortalContentSourceError,
 )
@@ -61,6 +68,37 @@ def validate_single_content_source(
     has_url = bool(url_value and url_value.strip())
     if has_text and has_url:
         raise InvalidPortalContentSourceError(field_label)
+
+
+_GUEST_FONT_CHOICE_VALUES = frozenset(choice.value for choice in GuestFontChoice)
+
+
+def validate_guest_font_choice(value: str) -> None:
+    """Raises ``InvalidGuestFontChoiceError`` unless ``value`` is one of
+    the curated 4-value allowlist (v6 design spec §3.2). Deliberately
+    rejects everything else, including a syntactically-plausible font
+    name -- this is a curated enum, never a free-text field, per the
+    spec's own explicit guardrail (§6.2 item 9)."""
+    if value not in _GUEST_FONT_CHOICE_VALUES:
+        raise InvalidGuestFontChoiceError(value)
+
+
+def validate_background_overlay_strength(value: object) -> None:
+    """Raises ``InvalidBackgroundOverlayStrengthError`` unless ``value`` is
+    a real ``int`` (``bool`` explicitly excluded -- Python's ``bool`` is a
+    subclass of ``int``, and ``True``/``False`` are never a legal overlay
+    strength) within ``[0, 100]`` inclusive. This is the stored-value
+    range (v6 design spec §4.2) -- the frontend's own ``[15, 85]``
+    guardrail (spec §4.3) is a separate, render-time-only clamp this
+    module never applies, so the admin UI's slider always reflects exactly
+    what was saved."""
+    in_range = (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and MIN_BACKGROUND_OVERLAY_STRENGTH <= value <= MAX_BACKGROUND_OVERLAY_STRENGTH
+    )
+    if not in_range:
+        raise InvalidBackgroundOverlayStrengthError(value)
 
 
 def validate_default_scope(*, is_default: bool, location_id: uuid.UUID | None) -> None:
@@ -158,5 +196,7 @@ __all__ = [
     "validate_default_scope",
     "validate_business_hours_timezone",
     "validate_business_hours_schedule",
+    "validate_guest_font_choice",
+    "validate_background_overlay_strength",
     "is_open_now",
 ]

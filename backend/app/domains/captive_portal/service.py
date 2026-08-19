@@ -89,9 +89,11 @@ from .exceptions import (
 from .models import CaptivePortalConfig
 from .repository import CaptivePortalRepositoryProtocol
 from .validators import (
+    validate_background_overlay_strength,
     validate_business_hours_schedule,
     validate_business_hours_timezone,
     validate_default_scope,
+    validate_guest_font_choice,
     validate_hex_color,
     validate_single_content_source,
 )
@@ -275,6 +277,8 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "business_hours_timezone",
     "business_hours_schedule",
     "business_hours_closed_message",
+    "guest_font_choice",
+    "background_overlay_strength",
 )
 
 
@@ -324,6 +328,8 @@ class _CachedCaptivePortalConfig:
     business_hours_timezone: str
     business_hours_schedule: dict[str, Any]
     business_hours_closed_message: str | None
+    guest_font_choice: str
+    background_overlay_strength: int
 
 
 def _config_to_cache_payload(config: CaptivePortalConfig) -> dict[str, Any]:
@@ -582,10 +588,18 @@ class CaptivePortalService:
         )
 
         if "business_hours_timezone" in update_data:
-            validate_business_hours_timezone(str(update_data["business_hours_timezone"]))
+            validate_business_hours_timezone(
+                str(update_data["business_hours_timezone"])
+            )
         if "business_hours_schedule" in update_data:
             validate_business_hours_schedule(
                 dict(update_data["business_hours_schedule"] or {})
+            )
+        if "guest_font_choice" in update_data:
+            validate_guest_font_choice(str(update_data["guest_font_choice"]))
+        if "background_overlay_strength" in update_data:
+            validate_background_overlay_strength(
+                update_data["background_overlay_strength"]
             )
 
         if merged_is_default and not config.is_default:

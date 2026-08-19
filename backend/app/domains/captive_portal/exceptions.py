@@ -14,6 +14,12 @@ from fastapi import status
 
 from app.common.exceptions import CloudGuestError
 
+from .constants import (
+    MAX_BACKGROUND_OVERLAY_STRENGTH,
+    MIN_BACKGROUND_OVERLAY_STRENGTH,
+    GuestFontChoice,
+)
+
 __all__ = [
     "CaptivePortalError",
     "CaptivePortalConfigNotFoundError",
@@ -25,6 +31,8 @@ __all__ = [
     "MissingPortalResolutionParamsError",
     "CaptivePortalConfigImmutableFieldError",
     "InvalidBusinessHoursScheduleError",
+    "InvalidGuestFontChoiceError",
+    "InvalidBackgroundOverlayStrengthError",
 ]
 
 
@@ -137,5 +145,35 @@ class CaptivePortalConfigImmutableFieldError(CaptivePortalError):
         super().__init__(
             f"{field_name} cannot be changed after a captive portal config "
             "is created",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidGuestFontChoiceError(CaptivePortalError):
+    """``guest_font_choice`` was set to something outside the curated
+    4-value allowlist (v6 design spec §3.2) -- see
+    ``validators.validate_guest_font_choice``. Deliberately never accepts
+    free text, per the spec's explicit "never let this become free text"
+    guardrail (§6.2 item 9)."""
+
+    def __init__(self, value: str) -> None:
+        allowed = ", ".join(sorted(c.value for c in GuestFontChoice))
+        super().__init__(
+            f"guest_font_choice must be one of [{allowed}], got '{value}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidBackgroundOverlayStrengthError(CaptivePortalError):
+    """``background_overlay_strength`` was outside the valid [0, 100]
+    integer range -- see ``validators.validate_background_overlay_
+    strength``. This is the stored-value range (v6 design spec §4.2), not
+    the frontend's separate [15, 85] render-time guardrail (spec §4.3)."""
+
+    def __init__(self, value: object) -> None:
+        super().__init__(
+            "background_overlay_strength must be an integer between "
+            f"{MIN_BACKGROUND_OVERLAY_STRENGTH} and "
+            f"{MAX_BACKGROUND_OVERLAY_STRENGTH}, got '{value}'",
             status_code=status.HTTP_400_BAD_REQUEST,
         )

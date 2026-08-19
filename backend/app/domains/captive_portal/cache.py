@@ -39,7 +39,24 @@ from redis.asyncio import Redis
 
 from app.core.config import get_settings
 
-_CACHE_KEY_TEMPLATE = "captive_portal:resolve:{organization_id}:{location_id}"
+# Bump ``v<N>`` whenever the set of fields carried in the cached payload
+# changes -- i.e. whenever ``_CACHED_CONFIG_SCALAR_FIELDS`` in
+# ``service.py`` gains or loses a name. ``_config_from_cache_payload``
+# indexes that payload unguarded (``payload[field_name]``), and the
+# cache-hit call site has no ``try``/``except``, so a deploy that adds a
+# field makes every payload written by the *previous* build raise
+# ``KeyError`` straight out of the unauthenticated ``GET
+# /captive-portal/resolve`` -- a 500 for every guest joining WiFi, for up
+# to the full TTL. Versioning the key sidesteps that by making the old
+# and new payloads live under different keys: the stale ones are simply
+# never read again and expire on their own. Chosen over
+# ``payload.get(name, default)`` deliberately -- a genuinely missing
+# field should fail loudly in tests, not degrade silently in production.
+# This is v2 because v6's guest_font_choice/background_overlay_strength
+# are the first fields added since the cache shipped.
+_CACHE_KEY_TEMPLATE = (
+    "captive_portal:resolve:v2:{organization_id}:{location_id}"
+)
 _NONE_SENTINEL = "-"
 
 
