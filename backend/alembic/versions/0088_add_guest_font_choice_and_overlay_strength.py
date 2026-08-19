@@ -27,8 +27,8 @@ opt-in/tunable column, ``NOT NULL`` with a ``server_default`` so this is a
 genuinely zero-behavior-change migration for every row that already
 exists.
 
-Revision ID: 0087_add_guest_font_choice_and_overlay_strength
-Revises: 0086_create_channel_partners_table
+Revision ID: 0088_add_guest_font_choice_and_overlay_strength
+Revises: 0087_add_lead_qualification_fields_to_demo_requests
 Create Date: 2026-08-19
 """
 
