@@ -28,7 +28,11 @@ from app.domains.notification import models as notification_models  # noqa: F401
 from app.domains.organization import models as organization_models  # noqa: F401
 from app.domains.otp import models as otp_models  # noqa: F401
 from app.domains.policy import models as policy_models  # noqa: F401
+from app.domains.provisioning_engine import (
+    models as provisioning_engine_models,  # noqa: F401,E501
+)
 from app.domains.rbac import models as rbac_models  # noqa: F401
+from app.domains.readiness import models as readiness_models  # noqa: F401
 from app.domains.router import models as router_models  # noqa: F401
 from app.domains.router_agent import models as router_agent_models  # noqa: F401
 from app.domains.router_provisioning import (

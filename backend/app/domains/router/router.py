@@ -88,6 +88,16 @@ from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.exceptions import WireGuardPeerNotFoundError
 from app.domains.wireguard.service import WireGuardService
 
+from app.domains.provisioning_engine.planner.constants import SnapshotTrigger
+from app.domains.provisioning_engine.planner.dependencies import get_discovery_service
+from app.domains.provisioning_engine.planner.schemas import (
+    CompatibilityReport,
+    DiscoverRouterResponse,
+    RouterSnapshotListResponse,
+    RouterSnapshotResponse,
+)
+from app.domains.provisioning_engine.planner.service import DiscoveryService
+
 from .dependencies import get_router_service
 from .device_adapters import (
     DeviceInterfaceQueryError,
@@ -963,6 +973,123 @@ async def regenerate_agent_credential(
             "shown again"
         ),
         data={"agent_credential": plaintext},
+        request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# Wave 1 discovery / snapshot / compatibility
+# ============================================================================
+
+
+@router.post(
+    "/routers/{router_id}/discover",
+    response_model=ApiResponse[DiscoverRouterResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def discover_router(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    discovery_service: DiscoveryService = Depends(get_discovery_service),
+    trigger: SnapshotTrigger = Query(default=SnapshotTrigger.WIZARD_DISCOVERY),
+):
+    """Read-only RouterOS discovery sweep via ``ReadOnlyDeviceReader``.
+
+    Persists a sanitized ``RouterSnapshot`` and returns it together with a
+    Wave 1 compatibility report. Never applies configuration.
+    """
+    result = await discovery_service.discover_router(
+        router_id,
+        requesting_organization_id=requesting_organization_id,
+        trigger=trigger,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="Router discovery completed",
+        data=result.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/snapshots",
+    response_model=ApiResponse[RouterSnapshotListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.read"))],
+)
+async def list_router_snapshots(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    discovery_service: DiscoveryService = Depends(get_discovery_service),
+    limit: int = Query(default=10, ge=1, le=100),
+):
+    """List recent discovery snapshots for a router (newest first)."""
+    result = await discovery_service.list_snapshots(
+        router_id,
+        requesting_organization_id=requesting_organization_id,
+        limit=limit,
+    )
+    return build_response(
+        success=True,
+        message="Router snapshots retrieved",
+        data=result.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/snapshots/{snapshot_id}",
+    response_model=ApiResponse[RouterSnapshotResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.read"))],
+)
+async def get_router_snapshot(
+    request: Request,
+    router_id: uuid.UUID,
+    snapshot_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    discovery_service: DiscoveryService = Depends(get_discovery_service),
+):
+    """Fetch one discovery snapshot by id (scoped to the given router)."""
+    result = await discovery_service.get_snapshot(
+        router_id,
+        snapshot_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Router snapshot retrieved",
+        data=result.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/compatibility",
+    response_model=ApiResponse[CompatibilityReport],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.read"))],
+)
+async def get_router_compatibility(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    discovery_service: DiscoveryService = Depends(get_discovery_service),
+):
+    """Evaluate compatibility against the router's latest snapshot (404 if none)."""
+    result = await discovery_service.get_compatibility(
+        router_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Router compatibility evaluated",
+        data=result.model_dump(),
         request_id=_request_id(request),
     )
 
