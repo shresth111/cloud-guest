@@ -167,14 +167,32 @@ MAX_BACKGROUND_FOCAL = 100
 #     Devanagari (hi)   104            |   Devanagari (hi)   55
 #     Malayalam (ml)     98            |   Malayalam (ml)    31
 #     Arabic (ar)        96            |   Arabic (ar)       48
-#     Tamil (ta)     ->  92 <- binding |   Tamil (ta)    ->  26 <- binding
+#     Tamil (ta)     ->  78 <- binding |   Tamil (ta)    ->  26 <- binding
 #
-# Tamil binds both. Its per-character advance is ~1.24x Latin's and its
-# long words waste more of each line to greedy word-breaks. One global
-# limit per field, set by the worst supported script, is deliberate: the
-# cost is that an English venue gets fewer characters than it strictly
-# could, and the alternative cost is a buried Connect button, which is a
-# total conversion loss rather than a minor one.
+# Tamil binds both. One global limit per field, set by the worst supported
+# script, is deliberate: the cost is that an English venue gets fewer
+# characters than it strictly could, and the alternative cost is a buried
+# Connect button, which is a total conversion loss rather than a minor one.
+#
+# ---- Correction (2026-08-20): the Tamil welcome figure ----------------
+# The first pass measured Tamil at 92 using a macOS Tamil face
+# (Tamil MN-class metrics, ~0.57em average text advance) -- but the
+# device this budget is derived on is Android, whose Tamil face is Noto
+# Sans Tamil. Measured from the actual Noto Sans Tamil file this product
+# ships (wyfy-guest-website/public/fonts/noto-sans-tamil.woff2,
+# per-codepoint hmtx advances weighted over realistic venue copy), Tamil
+# text averages ~0.745em -- ~1.47x a Latin UI face's ~0.5em, not the
+# ~1.24x the narrower macOS face implied. At 15px that is 11.2px per code
+# point, so the 288px column holds floor(288/11.2) = 25 code points per
+# line and 3 lines hold **78**. Greedy wrap-waste on long Tamil words can
+# still cost a line below that (measured realistic strings consume 69-81
+# code points in 3 lines); a character limit cannot encode word lengths,
+# so 78 charges the mean advance and accepts that residual. The headline
+# needed no correction: 26 is already inside Noto Tamil's 2-line capacity
+# at 26px (floor(288/19.4) = 14 per line, 29 over 2 lines). The other
+# scripts' figures carry the same macOS-face caveat, but Tamil binds with
+# enough margin (78 vs 96+) that re-measuring them cannot change which
+# script sets the limit.
 #
 # Counted over the **stripped** value, in Unicode code points -- exactly
 # what the frontend renders (`splashWelcomeMessage?.trim()`,
@@ -187,7 +205,7 @@ MAX_BACKGROUND_FOCAL = 100
 # welcome budget, and accepting a 3-line headline on 360px Tamil costs
 # the welcome message roughly a third of its allowance.
 SPLASH_HEADLINE_MAX_LENGTH = 26
-SPLASH_WELCOME_MESSAGE_MAX_LENGTH = 92
+SPLASH_WELCOME_MESSAGE_MAX_LENGTH = 78
 
 # Field-label constants for the "at most one of text/url" validation --
 # see validators.validate_single_content_source's docstring for why this is

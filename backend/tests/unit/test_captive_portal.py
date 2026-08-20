@@ -1722,11 +1722,11 @@ class TestResolveSurfacesBackgroundImageMetrics:
 _WELCOME_AT_LIMIT = {
     "en": (
         "Welcome to The Grand Palace Hotel. Enjoy complimentary WiFi"
-        " during your stay with us today."
+        " during your stay."
     ),
     "hi": (
         "ग्रैंड पैलेस होटल में आपका स्वागत है।"
-        " प्रवास के दौरान निःशुल्क वाईफाई का आनंद लें।"
+        " निःशुल्क वाईफाई का आनंद लें।"
     ),
     "ta": (
         "கிராண்ட் பேலஸ் ஹோட்டலுக்கு வரவேற்கிறோம்."
@@ -1738,7 +1738,7 @@ _WELCOME_AT_LIMIT = {
     ),
     "ar": (
         "مرحبًا بكم في فندق جراند بالاس."
-        " استمتعوا بإنترنت لاسلكي مجاني وعالي السرعة طوال إقامتكم."
+        " استمتعوا بإنترنت لاسلكي مجاني طوال إقامتكم."
     ),
 }
 
@@ -1749,7 +1749,7 @@ class TestSplashTextLengthConstants:
     and not a silently-shipped layout regression."""
 
     def test_limits_are_the_derived_values(self) -> None:
-        assert SPLASH_WELCOME_MESSAGE_MAX_LENGTH == 92
+        assert SPLASH_WELCOME_MESSAGE_MAX_LENGTH == 78
         assert SPLASH_HEADLINE_MAX_LENGTH == 26
 
     def test_headline_limit_is_tighter_than_the_welcome_limit(self) -> None:
@@ -1781,7 +1781,7 @@ class TestSplashTextLengthValidator:
         assert exc.value.status_code == 400
 
     def test_error_carries_the_limit_and_the_actual_length(self) -> None:
-        # The dashboard has to be able to render "94 of 92" next to a live
+        # The dashboard has to be able to render "80 of 78" next to a live
         # counter; a bare "string too long" would be worse than the render
         # truncation this replaces.
         over = SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 2
