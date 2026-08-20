@@ -42,7 +42,6 @@ from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
 from app.domains.billing.dependencies import get_entitlement_checker
 from app.domains.billing.service import EntitlementChecker
-from app.domains.branding.repository import BrandingRepository
 from app.domains.branding.service import (
     PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE,
     PUBLIC_LOGO_PATH_TEMPLATE,
