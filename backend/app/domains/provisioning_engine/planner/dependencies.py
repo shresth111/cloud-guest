@@ -11,6 +11,7 @@ from app.domains.isp.service import IspService
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 
+from .guest_input_service import GuestInputService
 from .repository import RouterSnapshotRepository, RouterSnapshotRepositoryProtocol
 from .service import DiscoveryService
 from .verification_repository import (
@@ -53,9 +54,20 @@ def get_wan_verification_service(
     )
 
 
+def get_guest_input_service(
+    repository: RouterSnapshotRepositoryProtocol = Depends(
+        get_router_snapshot_repository
+    ),
+    router_service: RouterService = Depends(get_router_service),
+    isp_service: IspService = Depends(get_isp_service),
+) -> GuestInputService:
+    return GuestInputService(repository, router_service, isp_service)
+
+
 __all__ = [
     "get_router_snapshot_repository",
     "get_verification_run_repository",
     "get_discovery_service",
     "get_wan_verification_service",
+    "get_guest_input_service",
 ]

@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from .constants import (
     CompatibilityCheckStatus,
     CompatibilityOverall,
+    InterfaceAvailabilityStatus,
     SnapshotStatus,
     SnapshotTrigger,
     VerificationCheckStatus,
@@ -224,6 +225,32 @@ class WanVerificationGateResponse(BaseModel):
     message: str | None = None
 
 
+class GuestInterfaceAvailability(BaseModel):
+    name: str
+    status: InterfaceAvailabilityStatus
+    detail: str | None = None
+    bridge: str | None = None
+
+
+class GuestInputRecommendation(BaseModel):
+    recommended_interfaces: list[str] = Field(default_factory=list)
+    parent_bridge_hint: str | None = None
+    message: str | None = None
+
+
+class GuestInterfaceAvailabilityReport(BaseModel):
+    snapshot_id: str | None = None
+    interfaces: list[GuestInterfaceAvailability]
+    recommendation: GuestInputRecommendation
+
+
+class GuestInterfaceAvailabilityResponse(BaseModel):
+    router_id: str
+    snapshot_id: str
+    interfaces: list[GuestInterfaceAvailability]
+    recommendation: GuestInputRecommendation
+
+
 __all__ = [
     "InterfaceSnapshot",
     "BridgeSnapshot",
@@ -249,4 +276,8 @@ __all__ = [
     "WanVerificationRunResponse",
     "WanVerificationResponse",
     "WanVerificationGateResponse",
+    "GuestInterfaceAvailability",
+    "GuestInputRecommendation",
+    "GuestInterfaceAvailabilityReport",
+    "GuestInterfaceAvailabilityResponse",
 ]
