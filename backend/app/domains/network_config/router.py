@@ -40,7 +40,10 @@ from app.domains.router_provisioning.service import RouterProvisioningService
 
 from .dependencies import get_network_config_service
 from .schemas import (
+    BasicWanApplyRequest,
     NetworkConfigApplyLiveResponse,
+    NetworkConfigBasicWanPreviewResponse,
+    NetworkConfigBasicWanPushResponse,
     NetworkConfigNetwatchPushResponse,
     NetworkConfigPreviewResponse,
 )
@@ -343,6 +346,75 @@ async def push_isp_netwatch_config(
         success=True,
         message="ISP Netwatch config rendered and queued for application",
         data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/wan/basic/preview",
+    response_model=ApiResponse[NetworkConfigBasicWanPreviewResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("network_config.read"))],
+)
+async def preview_basic_wan_config(
+    request: Request,
+    router_id: uuid.UUID,
+    lan_bridge: str = Query(default="bridge1"),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: NetworkConfigService = Depends(get_network_config_service),
+):
+    preview = await service.preview_basic_wan_config(
+        router_id,
+        requesting_organization_id=requesting_organization_id,
+        lan_bridge=lan_bridge,
+    )
+    payload = NetworkConfigBasicWanPreviewResponse(
+        router_id=str(preview.router_id),
+        rendered_content=preview.rendered_content,
+        wan_link_count=preview.wan_link_count,
+    )
+    return build_response(
+        success=True,
+        message="Basic WAN config preview rendered",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/wan/basic/apply",
+    response_model=ApiResponse[NetworkConfigBasicWanPushResponse],
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(RequirePermission("network_config.execute"))],
+)
+async def apply_basic_wan_config(
+    request: Request,
+    router_id: uuid.UUID,
+    payload: BasicWanApplyRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: NetworkConfigService = Depends(get_network_config_service),
+):
+    static_map = {
+        uuid.UUID(item.link_id): item.static_address
+        for item in payload.static_addresses
+    }
+    result = await service.push_basic_wan_config(
+        router_id,
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+        lan_bridge=payload.lan_bridge,
+        static_addresses=static_map,
+    )
+    response_payload = NetworkConfigBasicWanPushResponse(
+        version=_version_response(result.version),
+        job=_job_response(result.job),
+        wan_link_count=result.wan_link_count,
+    )
+    return build_response(
+        success=True,
+        message="Basic WAN config rendered and queued for application",
+        data=response_payload.model_dump(),
         request_id=_request_id(request),
     )
 
