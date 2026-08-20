@@ -753,9 +753,7 @@ class TestRenderIspNetwatchEntry:
         # authenticated with the real supplied credential, carrying this
         # link's own real id and the up/down status as a render-time
         # literal JSON payload.
-        assert (
-            "https://api.cloudguest.example/api/v1/agent/netwatch-event" in script
-        )
+        assert "https://api.cloudguest.example/api/v1/agent/netwatch-event" in script
         assert "X-Agent-Credential: cred123" in script
         assert f'\\"isp_link_id\\":\\"{link.id}\\"' in script
         assert '\\"status\\":\\"up\\"' in script
@@ -1526,6 +1524,52 @@ class TestRollbackAndApply:
 # ============================================================================
 # RBAC -- every route requires a permission dependency
 # ============================================================================
+
+
+class TestConfigAgentBridgeRetirement:
+    """The SSH config-agent bridge is a retired transport (router-fleet
+    plan section A1). Its coordinates -- previously hardcoded module
+    constants, i.e. a live shared secret committed to source -- must come
+    from Settings and default to disabled."""
+
+    async def test_apply_live_reports_bridge_disabled_when_unconfigured(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+
+        from app.core.config import Settings
+        from app.domains.network_config.router import apply_network_config_live
+
+        fake_request = SimpleNamespace(state=SimpleNamespace(request_id="req-1"))
+        result = await apply_network_config_live(
+            request=fake_request,  # type: ignore[arg-type]
+            router_id=uuid.uuid4(),
+            version_id=uuid.uuid4(),
+            user=None,  # type: ignore[arg-type]  # unused on the gated path
+            requesting_organization_id=None,
+            provisioning_service=None,  # type: ignore[arg-type]  # unused
+            router_service=None,  # type: ignore[arg-type]  # unused
+            settings=Settings(
+                _env_file=None, config_agent_url="", config_agent_secret=""
+            ),
+        )
+        assert result["success"] is True
+        assert result["data"]["applied"] is False
+        assert "disabled" in (result["data"]["detail"] or "")
+
+    def test_no_hardcoded_bridge_coordinates_in_source(self) -> None:
+        """Regression guard for the leaked ``configagent-*`` secret: no
+        bridge URL/secret literal may reappear in either module that used
+        to hardcode them."""
+        import inspect
+
+        from app.domains.network_config import router as nc_router
+        from app.domains.router import device_credential_rotator
+
+        for module in (nc_router, device_credential_rotator):
+            source = inspect.getsource(module)
+            assert "configagent-" not in source
+            assert "20.219.72.235" not in source
 
 
 class TestEveryRouteRequiresPermission:

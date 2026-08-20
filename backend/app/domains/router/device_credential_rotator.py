@@ -33,13 +33,17 @@ from the browser). The bridge already accepts an arbitrary RouterOS script
 string and runs it over the device's real SSH console after connecting
 with the caller-supplied credentials -- a ``/user set ... password=...``
 command is no different, from the bridge's point of view, than the
-config-apply scripts it already runs. ``_CONFIG_AGENT_URL``/
-``_CONFIG_AGENT_SECRET`` are duplicated here rather than imported from
-that route module -- the same "small cross-domain literal, independently
-duplicated rather than cross-imported across domain boundaries" convention
-``wyfy_device_gateway.mikrotik_adapter`` already uses for its own content-
-filtering constants (see that module's docstring); keeping the two literal
-*values* identical is what keeps them describing the same real bridge.
+config-apply scripts it already runs.
+
+The bridge's URL and shared secret were previously hardcoded module
+constants (a live credential committed to source, duplicated here and in
+``app.domains.network_config.router``). The bridge transport is retired
+(router-fleet plan section A1); both values now come from Settings
+(``config_agent_url``/``config_agent_secret``) and are injected by
+``app.domains.router.dependencies``, which wires ``credential_rotator=None``
+-- the documented persist-only fallback in
+``RouterService._rotate_live_device_credential`` -- when the bridge is not
+configured.
 """
 
 from __future__ import annotations
@@ -50,11 +54,6 @@ from typing import Protocol
 import httpx
 
 logger = logging.getLogger(__name__)
-
-# Kept identical to app.domains.network_config.router's own copy -- see
-# module docstring's "Bridge, not a direct connection" section.
-_CONFIG_AGENT_URL = "http://20.219.72.235:9093/config/apply"
-_CONFIG_AGENT_SECRET = "configagent-55952aac79cbbf5ac9dc404c228ed5b7"
 
 _BRIDGE_TIMEOUT_SECONDS = 30.0
 
@@ -90,7 +89,13 @@ class DeviceCredentialRotatorProtocol(Protocol):
 
 
 class ConfigAgentBridgeCredentialRotator:
-    """Real implementation -- see module docstring."""
+    """Real implementation -- see module docstring. Stateless apart from
+    the bridge coordinates it is constructed with (never hardcode them --
+    they come from Settings via ``app.domains.router.dependencies``)."""
+
+    def __init__(self, *, agent_url: str, agent_secret: str) -> None:
+        self._agent_url = agent_url
+        self._agent_secret = agent_secret
 
     async def rotate_password(
         self,
@@ -110,8 +115,8 @@ class ConfigAgentBridgeCredentialRotator:
         try:
             async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_SECONDS) as client:
                 resp = await client.post(
-                    _CONFIG_AGENT_URL,
-                    headers={"X-Agent-Secret": _CONFIG_AGENT_SECRET},
+                    self._agent_url,
+                    headers={"X-Agent-Secret": self._agent_secret},
                     json={
                         "tunnel_ip": host,
                         "username": username,
@@ -128,9 +133,7 @@ class ConfigAgentBridgeCredentialRotator:
 
         if not result.get("applied"):
             detail = (
-                result.get("detail")
-                or result.get("error")
-                or "bridge reported failure"
+                result.get("detail") or result.get("error") or "bridge reported failure"
             )
             raise DeviceCredentialRotationError(str(detail))
 
