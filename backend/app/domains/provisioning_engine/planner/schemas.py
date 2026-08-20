@@ -116,6 +116,31 @@ class CompatibilityReport(BaseModel):
     checks: list[CompatibilityCheck]
 
 
+class TopologyFinding(BaseModel):
+    """One P8 topology observation (recommendation — never auto-applied)."""
+
+    code: str
+    status: CompatibilityCheckStatus
+    summary: str
+    detail: str | None = None
+    resources: list[str] = Field(default_factory=list)
+
+
+class TopologyReport(BaseModel):
+    overall: CompatibilityOverall
+    findings: list[TopologyFinding]
+
+
+class PlanConflict(BaseModel):
+    """Hard-stop conflict (P9 / R6) — planner must not continue."""
+
+    code: str
+    status: CompatibilityCheckStatus
+    summary: str
+    detail: str | None = None
+    cidrs: list[str] = Field(default_factory=list)
+
+
 class RouterSnapshotResponse(BaseModel):
     id: str
     router_id: str
@@ -213,6 +238,9 @@ __all__ = [
     "HotspotStateSnapshot",
     "CompatibilityCheck",
     "CompatibilityReport",
+    "TopologyFinding",
+    "TopologyReport",
+    "PlanConflict",
     "RouterSnapshotResponse",
     "RouterSnapshotListResponse",
     "DiscoverRouterResponse",
