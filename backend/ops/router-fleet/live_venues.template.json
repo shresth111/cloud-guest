@@ -1,0 +1,10 @@
+{
+  "venues": [
+    {
+      "venue_name": "Example Venue 1",
+      "router_id": "00000000-0000-0000-0000-000000000001",
+      "organization_id": null,
+      "notes": "Replace with real router UUID from Master Console"
+    }
+  ]
+}

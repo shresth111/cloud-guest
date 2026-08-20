@@ -31,6 +31,10 @@ from .exceptions import (
     NoRouterSnapshotError,
     RouterSnapshotNotFoundError,
 )
+from .managed_resource_repository import (
+    ManagedRouterResourceRepositoryProtocol,
+)
+from .managed_resources import build_managed_resource_backfill_rows
 from .models import RouterSnapshot
 from .repository import RouterSnapshotRepositoryProtocol
 from .schemas import (
@@ -152,10 +156,14 @@ class DiscoveryService:
         repository: RouterSnapshotRepositoryProtocol,
         router_lookup: RouterLookupProtocol,
         *,
+        managed_resource_repository: (
+            ManagedRouterResourceRepositoryProtocol | None
+        ) = None,
         reader_factory: Any | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
+        self.managed_resource_repository = managed_resource_repository
         # Injection seam for unit tests (defaults to ReadOnlyDeviceReader).
         self._reader_factory = reader_factory or ReadOnlyDeviceReader
 
@@ -228,6 +236,21 @@ class DiscoveryService:
                 **fields,
             }
         )
+        if (
+            self.managed_resource_repository is not None
+            and fields.get("status") != SnapshotStatus.FAILED.value
+        ):
+            backfill_rows = build_managed_resource_backfill_rows(
+                fields,
+                capture,
+                router_id=router.id,
+                organization_id=router.organization_id,
+                location_id=router.location_id,
+                applied_at=captured_at,
+            )
+            await self.managed_resource_repository.replace_discovery_backfill(
+                router.id, backfill_rows
+            )
         response = snapshot_to_response(row)
         compatibility = evaluate_compatibility(row)
         return DiscoverRouterResponse(snapshot=response, compatibility=compatibility)

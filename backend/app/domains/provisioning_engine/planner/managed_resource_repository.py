@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Protocol
 
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
@@ -17,6 +18,10 @@ from .managed_resource_models import ManagedRouterResource
 class ManagedRouterResourceRepositoryProtocol(Protocol):
     async def create_many(
         self, rows: list[dict[str, object]]
+    ) -> list[ManagedRouterResource]: ...
+
+    async def replace_discovery_backfill(
+        self, router_id: uuid.UUID, rows: list[dict[str, object]]
     ) -> list[ManagedRouterResource]: ...
 
     async def list_for_plan(
@@ -40,6 +45,21 @@ class ManagedRouterResourceRepository:
         for row in rows:
             created.append(await self.resources.create(row))
         return created
+
+    async def replace_discovery_backfill(
+        self, router_id: uuid.UUID, rows: list[dict[str, object]]
+    ) -> list[ManagedRouterResource]:
+        """Replace Phase-B rows (``plan_id IS NULL``) for one router.
+
+        Plan-scoped rows created at render time are left untouched."""
+        await self.session.execute(
+            delete(ManagedRouterResource).where(
+                ManagedRouterResource.router_id == router_id,
+                ManagedRouterResource.plan_id.is_(None),
+            )
+        )
+        await self.session.flush()
+        return await self.create_many(rows)
 
     async def list_for_plan(
         self, plan_id: uuid.UUID, *, router_id: uuid.UUID | None = None

@@ -44,13 +44,26 @@ def get_verification_run_repository(
     return VerificationRunRepository(db)
 
 
+def get_managed_router_resource_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> ManagedRouterResourceRepositoryProtocol:
+    return ManagedRouterResourceRepository(db)
+
+
 def get_discovery_service(
     repository: RouterSnapshotRepositoryProtocol = Depends(
         get_router_snapshot_repository
     ),
     router_service: RouterService = Depends(get_router_service),
+    managed_resource_repository: ManagedRouterResourceRepositoryProtocol = Depends(
+        get_managed_router_resource_repository
+    ),
 ) -> DiscoveryService:
-    return DiscoveryService(repository, router_service)
+    return DiscoveryService(
+        repository,
+        router_service,
+        managed_resource_repository=managed_resource_repository,
+    )
 
 
 def get_wan_verification_service(
@@ -79,12 +92,6 @@ def get_configuration_plan_repository(
     db: AsyncSession = Depends(get_db_session),
 ) -> ConfigurationPlanRepositoryProtocol:
     return ConfigurationPlanRepository(db)
-
-
-def get_managed_router_resource_repository(
-    db: AsyncSession = Depends(get_db_session),
-) -> ManagedRouterResourceRepositoryProtocol:
-    return ManagedRouterResourceRepository(db)
 
 
 def get_configuration_plan_service(
