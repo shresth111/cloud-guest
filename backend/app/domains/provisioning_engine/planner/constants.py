@@ -19,6 +19,9 @@ MANAGED_COMMENT_PREFIXES: tuple[str, ...] = (
     "cloudguest-",
 )
 
+PLAN_ENGINE_VERSION = "wave1-1"
+DEFAULT_GUEST_BRIDGE_NAME = "WYFYGUEST-bridge-guest"
+
 
 class SnapshotTrigger(StrEnum):
     """Why a snapshot was captured."""
@@ -91,6 +94,7 @@ class VerificationCheckStatus(StrEnum):
 
 class PlanStatus(StrEnum):
     DRAFT = "draft"
+    BLOCKED = "blocked"
     AWAITING_APPROVAL = "awaiting_approval"
     APPROVED = "approved"
     RENDERING = "rendering"
@@ -113,8 +117,36 @@ class InterfaceAvailabilityStatus(StrEnum):
     UNAVAILABLE = "UNAVAILABLE"
 
 
+class PlanActionType(StrEnum):
+    CREATE = "create"
+    MODIFY = "modify"
+    REMOVE = "remove"
+    NOOP = "noop"
+
+
+class PlanRisk(StrEnum):
+    NONE = "none"
+    LOW = "low"
+    MANAGEMENT_CONNECTIVITY = "management_connectivity"
+
+
+class RuleId(StrEnum):
+    R1 = "R1"
+    R2 = "R2"
+    R3 = "R3"
+    R4 = "R4"
+    R5 = "R5"
+    R6 = "R6"
+    R7 = "R7"
+    R8 = "R8"
+    R9 = "R9"
+    R10 = "R10"
+
+
 __all__ = [
     "MANAGED_COMMENT_PREFIXES",
+    "PLAN_ENGINE_VERSION",
+    "DEFAULT_GUEST_BRIDGE_NAME",
     "SnapshotTrigger",
     "SnapshotStatus",
     "CompatibilityOverall",
@@ -124,4 +156,7 @@ __all__ = [
     "VerificationCheckStatus",
     "PlanStatus",
     "InterfaceAvailabilityStatus",
+    "PlanActionType",
+    "PlanRisk",
+    "RuleId",
 ]
