@@ -31,6 +31,11 @@ zero-touch provisioning flow and device-auth scheme, the
 `organization_id` denormalization decision, and why no `RouterRole` table
 was added).
 
+> **Wave 1 router fleet:** read-only discovery, WAN verification, configuration
+> plans, and the operator runbook live in
+> [`docs/router_fleet/README.md`](../router_fleet/README.md) (Master Console
+> wizard + `/routers/{id}/discover` … `/plans/{id}/verify/final` APIs).
+
 ## Folder Structure
 
 ```text

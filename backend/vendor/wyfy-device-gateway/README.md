@@ -4,80 +4,79 @@ Vendor-agnostic network device gateway for Wyfy Guest (formerly branded "ZIP WiF
 
 ## What this is
 
-Wyfy Guest's main platform (`cloud-guest-repo`) today only speaks to MikroTik RouterOS devices, and
-it does so by calling MikroTik's own `librouteros` client library directly from six different
-backend domains, each with its own copy-pasted "adapter" pattern. This repo is the fix: **one**
-stable interface (`wyfy_device_gateway.contract.DeviceGatewayAdapter`) that the main backend calls
-regardless of what hardware is actually deployed at a customer's location, with one adapter
-implementation per vendor behind it.
+Wyfy Guest's main platform (`cloud-guest-repo`) speaks to MikroTik RouterOS devices through
+this package: **one** stable interface (`wyfy_device_gateway.contract.DeviceGatewayAdapter`) that
+the backend calls regardless of vendor, with one adapter implementation per vendor behind it.
 
-Read [`PRD.md`](./PRD.md) before touching any code. It contains:
+Read [`PRD.md`](./PRD.md) before touching any code.
 
-- A full audit of every place `cloud-guest-repo` currently talks to a router directly (file/line
-  references), and why those six places all reinvented a slightly different version of the same
-  idea.
-- Research on what TP-Link Omada, Ruckus, Ubiquiti UniFi, Aruba, and Cisco (Meraki/Catalyst) each
-  expose for programmatic management, RADIUS, and captive portal -- flagged where it needs live
-  API-doc verification rather than trusted as-is.
-- The actual API contract this repo exposes (concrete method signatures).
-- Why Phase 1 ships as an importable Python package, not an HTTP microservice -- and the concrete
-  conditions under which that should change.
-- How per-device credentials work across vendors without touching `cloud-guest-repo`'s existing
-  Fernet-encryption scheme.
-- A step-by-step, zero-downtime migration plan for moving `cloud-guest-repo`'s six existing
-  MikroTik call sites onto this package without changing any production behavior or touching the
-  live RADIUS/hotspot authentication flow.
-- What frontend work does (and mostly doesn't) exist for this.
-- The phased vendor rollout plan.
+## What this is not
 
-## What this is not (yet)
-
-- Not a rewrite of RADIUS/hotspot auth -- that flow is already vendor-neutral (standard RADIUS) and
-  is explicitly out of scope; see PRD section 2.3.
-- Not a running service in Phase 1 -- it's a library `cloud-guest-repo` imports. See PRD section 5
-  for why, and what would need to be true before that changes.
-- Not a place that touches secrets/encryption directly -- `cloud-guest-repo` decrypts a device's
-  credentials and hands this package plaintext for the duration of one call, same as every existing
-  adapter does today. See PRD section 6.
+- Not a rewrite of RADIUS/hotspot auth (standard RADIUS — out of scope; PRD §2.3).
+- Not a running HTTP service in Phase 1 — a library `cloud-guest-repo` vendors into
+  `backend/vendor/wyfy-device-gateway/` (private repos; Docker build has no git credentials).
+- Not a secrets/encryption layer — `cloud-guest-repo` decrypts credentials per call (PRD §6).
 
 ## Status
 
-Phase 1: repo scaffolded, PRD complete, MikroTik adapter and contract not yet implemented in code
-(the PRD includes the illustrative contract shape -- implementing it is the next task). No other
-vendor has a real implementation; each has a stub that raises `NotImplementedError` and reports no
-capabilities, so the Protocol shape is complete and checkable even though only MikroTik is real.
+**Phase 1 write path — shipped.** `contract.py`, `mikrotik_adapter.py` (`MikroTikAdapter`), and
+vendor stubs are implemented with unit tests against a fake transport (no live device required).
 
-## Repo layout (target, once Phase 1 code lands)
+**Wave 1 read-only discovery — shipped in the vendored copy.** `read_only_reader.py`
+(`ReadOnlyDeviceReader`) is used by `POST /api/v1/routers/{id}/discover` in `cloud-guest-repo`.
+It is read-only **by construction** (no write methods, print-path allowlist, row sanitization before
+persistence). Source of truth today: `cloud-guest-repo/backend/vendor/wyfy-device-gateway/` —
+backport to this standalone repo is tracked separately.
+
+**Call-site migration (PRD §7) — in progress.** `router/device_adapters.py` (`list_available_device_interfaces`,
+`reboot_device`) delegates here. Other domains (`network_diagnostics`, `queue_management`, most of
+`provisioning_engine`, granular `isp/device_adapters` methods) remain on legacy adapters until the
+contract is extended deliberately — see PRD §4.1 Phase 2 deferrals.
+
+**Operator docs (Wave 1):** `cloud-guest-repo/backend/docs/router_fleet/` — provisioning runbook and
+live-venue adoption procedure.
+
+## Repo layout
 
 ```
 wyfy_device_gateway/
-  contract.py       # DeviceGatewayAdapter Protocol + shared dataclasses -- the ONE stable API
-  adapters/
-    mikrotik.py      # real, ported from cloud-guest-repo's six existing librouteros call sites
-    tplink_omada.py  # stub
-    ruckus.py        # stub
-    unifi.py         # stub
-    aruba.py         # stub
-    cisco_meraki.py  # stub
-  registry.py        # get_adapter(vendor) / list_supported_vendors()
+  __init__.py
+  contract.py           # DeviceGatewayAdapter Protocol + shared dataclasses
+  mikrotik_adapter.py    # MikroTikAdapter — librouteros API + asyncssh provision path
+  read_only_reader.py    # ReadOnlyDeviceReader — discovery-only (vendored copy; backport pending here)
+  stub_adapters.py       # TP-Link Omada, Ruckus, UniFi, Aruba, Cisco Meraki stubs
+  registry.py            # get_adapter(vendor) / list_supported_vendors()
+  snmp_poller.py         # SNMP helpers (vendored copy only today)
 tests/
-  ...                # unit tests against a fake transport, no live device required
+  fake_transport.py      # in vendored copy; fake/mocked transports in standalone tests/
 PRD.md
 README.md
 ```
 
+## ReadOnlyDeviceReader (Wave 1 discovery)
+
+Used exclusively for router fleet **discovery** — not for config push.
+
+| Layer | Enforcement |
+|---|---|
+| Surface | Only `read_section`, `read_all`, `section_names` — no SSH, no `push_config`, no raw command API |
+| Allowlist | Every RouterOS path is a frozen `/.../print` entry validated before socket I/O |
+| Sanitization | PPPoE passwords, WG private keys, RADIUS secrets stripped → `has_*` booleans |
+
+Discovery service code in `cloud-guest-repo` is typed against this class so writes cannot be
+expressed at the call site. See `app/domains/provisioning_engine/planner/service.py` and
+`backend/docs/router_fleet/PROVISIONING_RUNBOOK.md`.
+
 ## Relationship to cloud-guest-repo
 
-`cloud-guest-repo` is the main Wyfy Guest backend (FastAPI + SQLAlchemy + Celery + PostgreSQL) and
-is not modified by this repo directly -- PRD section 7 describes the migration as a series of small
-PRs *against cloud-guest-repo* that add this package as a dependency and swap one call site at a
-time to delegate to it, keeping every existing function signature unchanged. This repo can be built,
-tested, and released entirely on its own before `cloud-guest-repo` ever depends on it.
+`cloud-guest-repo` vendors this directory and syncs README + code on gateway PRs. Migration is a
+series of small PRs that swap one legacy `librouteros` call site at a time without changing outward
+API behavior. This repo can be built and tested independently before any vendor bump lands in
+production.
 
-## New here? Start with
+## New here?
 
-1. `PRD.md` section 2 (current-state audit) -- understand what actually exists today before
-   assuming anything about the design.
-2. `PRD.md` section 4 (API contract) -- the actual interface you're building against.
-3. `PRD.md` section 7 (migration plan) -- how this gets adopted without breaking a live production
-   system serving a real customer.
+1. `PRD.md` §2 — current-state audit
+2. `PRD.md` §4 — API contract
+3. `PRD.md` §7 — migration order
+4. `cloud-guest-repo/backend/docs/router_fleet/README.md` — operator-facing Wave 1 docs
