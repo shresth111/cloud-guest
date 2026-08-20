@@ -76,9 +76,18 @@ class FakeIdentityRepository:
     (a narrow subset of the real ``AuthRepositoryProtocol``)."""
 
     users_by_id: dict[uuid.UUID, User] = field(default_factory=dict)
+    # Records each force-logout's session revocation so the force_logout_user
+    # test can assert the "real, immediate session termination" half of the
+    # two-step flow actually happened (not just the tokens_invalidated_at
+    # timestamp half).
+    revoked_session_user_ids: list[uuid.UUID] = field(default_factory=list)
 
     async def get_user_by_id(self, user_id: uuid.UUID) -> User | None:
         return self.users_by_id.get(user_id)
+
+    async def revoke_all_sessions(self, user_id: uuid.UUID) -> int:
+        self.revoked_session_user_ids.append(user_id)
+        return 1
 
     async def get_user_by_email(self, email: str) -> User | None:
         return next(
@@ -876,6 +885,57 @@ class TestDeactivateReactivate:
         assert updated.failed_login_attempts == 0
         assert updated.locked_until is None
         assert any(e["action"] == "user_reactivated" for e in audit.entries)
+
+    async def test_force_logout_revokes_sessions_and_sets_invalidation_timestamp(
+        self,
+    ) -> None:
+        """The "revoke access when someone leaves" action's real teeth:
+        force_logout does BOTH halves -- revokes existing sessions (so a
+        still-valid refresh token can't mint a fresh access token) AND sets
+        ``tokens_invalidated_at`` (so an already-issued access token is
+        rejected on its next request) -- while leaving ``is_active``
+        untouched. See ``UserService.force_logout_user``'s own docstring."""
+        service, identity, *_rest, audit = make_service()
+        user = await service.create_user(**_create_kwargs())
+
+        updated = await service.force_logout_user(
+            actor_user_id=uuid.uuid4(),
+            user_id=user.id,
+            requesting_organization_id=None,
+        )
+
+        assert user.id in identity.revoked_session_user_ids
+        assert updated.tokens_invalidated_at is not None
+        assert updated.is_active is True  # account itself stays usable
+        assert any(e["action"] == "user_force_logged_out" for e in audit.entries)
+
+    async def test_force_logged_out_user_token_issued_before_is_rejected(self) -> None:
+        """Adversarial "revoked-token" case: an access token minted *before*
+        an admin force-logout must be rejected on its very next request,
+        even though its own ``exp`` hasn't lapsed -- proving revoke actually
+        kills a live session, not just future logins."""
+        service, identity, *_rest = make_service()
+        user = await service.create_user(**_create_kwargs())
+
+        token, _jti = JWTManager.create_access_token(str(user.id), user.email)
+        await service.force_logout_user(
+            actor_user_id=uuid.uuid4(),
+            user_id=user.id,
+            requesting_organization_id=None,
+        )
+
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(
+                request=request,
+                credentials=credentials,
+                repository=identity,
+                api_key_service=None,
+            )
+
+        assert exc_info.value.status_code == 401
 
     async def test_deactivated_user_fails_get_current_user_active_check(self) -> None:
         """Confirms ``auth.dependencies.get_current_user`` (Module 003)

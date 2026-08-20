@@ -35,6 +35,7 @@ from .exceptions import (
     CrossTenantAccessError,
     DuplicateRoleError,
     InvalidScopeAssignmentError,
+    LastGlobalAdminError,
     LastOrganizationOwnerError,
     OverrideEscalationError,
     PermissionGroupNotFoundError,
@@ -71,6 +72,16 @@ _PERMISSION_MANAGE_BYPASS_PERMISSION = "permissions.manage"
 # ``_assert_not_last_organization_owner`` below to keep an organization from
 # ever ending up with zero active holders of it.
 _ORGANIZATION_OWNER_ROLE_SLUG = "organization-owner"
+
+# The seeded, GLOBAL-scoped system role that confers unrestricted
+# platform-wide access (see app.domains.rbac.seed's SYSTEM_ROLES: it is the
+# only role with scope_type=GLOBAL and an unqualified FULL default_level).
+# Used by ``_assert_not_last_global_admin`` to keep the platform from ever
+# ending up with zero active Super Admins -- the internal-staff analogue of
+# ``_ORGANIZATION_OWNER_ROLE_SLUG``'s per-organization guard. This is the
+# role the Master Console "Team & Access" page manages at GLOBAL scope
+# (organization_id IS NULL), where the organization-owner guard never fires.
+_SUPER_ADMIN_ROLE_SLUG = "super-admin"
 
 
 class RBACService:
@@ -598,6 +609,7 @@ class RBACService:
         ):
             raise CrossTenantAccessError()
         await self._assert_not_last_organization_owner(assignment)
+        await self._assert_not_last_global_admin(assignment)
 
         await self.repository.deactivate_user_role(assignment)
         await self._invalidate_users([assignment.user_id])
@@ -639,6 +651,35 @@ class RBACService:
         )
         if remaining == 0:
             raise LastOrganizationOwnerError(assignment.organization_id)
+
+    async def _assert_not_last_global_admin(self, assignment: UserRole) -> None:
+        """The platform must always retain at least one active, GLOBAL-scoped
+        ``super-admin`` holder -- refuse to revoke this assignment if it is
+        the last one. This is the internal-staff counterpart to
+        ``_assert_not_last_organization_owner`` above: that guard only fires
+        for an *organization*-scoped ``organization-owner`` assignment
+        (``assignment.organization_id`` is not None), so it never protected
+        the Master Console "Team & Access" page, whose staff grants are
+        GLOBAL (``organization_id`` IS NULL). Without this, revoking (or, via
+        the AssignRoleDialog assign-then-revoke downgrade pattern,
+        downgrading) the last Super Admin's global grant would leave the
+        platform with nobody able to administer RBAC -- including the actor
+        itself losing ``roles.assign``/``users.manage`` at GLOBAL scope, with
+        no in-product recovery path. A real handover -- granting another
+        account Super Admin first -- is required before this one can go."""
+        if assignment.organization_id is not None or not assignment.is_active:
+            return
+        if assignment.scope_type != ScopeType.GLOBAL.value:
+            return
+        role = await self.repository.get_role_by_id(assignment.role_id)
+        if role is None or role.slug != _SUPER_ADMIN_ROLE_SLUG:
+            return
+        remaining = await self.repository.count_active_global_role_assignments(
+            assignment.role_id,
+            exclude_assignment_id=assignment.id,
+        )
+        if remaining == 0:
+            raise LastGlobalAdminError()
 
     async def _validate_scope_assignment(
         self,
