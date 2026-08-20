@@ -352,6 +352,21 @@ class WebfigSessionResponse(BaseModel):
     expires_in: int
 
 
+class BootstrapScriptPreviewResponse(BaseModel):
+    """Server-rendered Step 0 bootstrap script for a not-yet-enrolled router.
+
+    The one-time provisioning token is embedded in ``script``/``lines`` only
+    -- it is minted by this call and never retrievable again afterward.
+    """
+
+    router_id: str
+    location_code: str
+    lines: list[str]
+    script: str
+    line_count: int
+    token_expires_at: datetime
+
+
 class DeviceInterfaceResponse(BaseModel):
     """One real, currently-available interface on the physical device --
     see ``device_adapters.list_available_device_interfaces``'s own

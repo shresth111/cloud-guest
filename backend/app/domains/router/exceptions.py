@@ -141,6 +141,18 @@ class ProvisioningTokenRouterStateError(RouterError):
         )
 
 
+class BootstrapLocationCodeMissingError(RouterError):
+    """Bootstrap script rendering requires a ``location_code`` on the
+    router's location row."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router {router_id}'s location has no location_code -- cannot "
+            "render bootstrap script",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 class ProvisioningTokenGenerationNotAllowedError(RouterError):
     """A provisioning token may only be generated while a router is still
     ``pending_provisioning`` -- see ``docs/router/ROUTER_ARCHITECTURE.md``

@@ -67,6 +67,7 @@ from .device_credential_rotator import (
 )
 from .enums import ROUTER_STATUS_TRANSITIONS, RouterStatus
 from .exceptions import (
+    BootstrapLocationCodeMissingError,
     CrossOrganizationRouterAccessError,
     DuplicateMacAddressError,
     DuplicateSerialNumberError,
@@ -632,6 +633,42 @@ class RouterService:
             description=f"Provisioning token generated for router '{router.name}'",
         )
         return token, plaintext
+
+    async def preview_bootstrap_script(
+        self,
+        *,
+        actor_user_id: uuid.UUID,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        api_base_url: str,
+    ) -> tuple[str, list[str], datetime]:
+        """Mint a provisioning token and render the Step 0 bootstrap script.
+
+        Returns ``(location_code, lines, token_expires_at)``. See
+        ``app.domains.network_config.renderers.render_bootstrap_script``."""
+        from app.domains.network_config.renderers import render_bootstrap_script
+
+        router = await self.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        location = await self.location_lookup.get_location(
+            router.location_id,
+            requesting_organization_id=requesting_organization_id,
+        )
+        if not location.location_code:
+            raise BootstrapLocationCodeMissingError(router_id)
+
+        token, plaintext = await self.generate_provisioning_token(
+            actor_user_id=actor_user_id,
+            router_id=router_id,
+            requesting_organization_id=requesting_organization_id,
+        )
+        lines = render_bootstrap_script(
+            location_code=location.location_code,
+            provisioning_token=plaintext,
+            api_base_url=api_base_url,
+        )
+        return location.location_code, lines, token.expires_at
 
     async def check_in(self, *, plaintext_token: str) -> Router:
         """Device-presented token exchange: validates and consumes a

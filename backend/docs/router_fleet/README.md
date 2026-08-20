@@ -39,6 +39,7 @@ All router-scoped Wave 1 endpoints live on the router domain router
 (read-only steps) and `routers.manage` (mutating steps).
 
 ```text
+GET    /routers/{id}/bootstrap/preview          # Step 0 bootstrap script (pending routers)
 POST   /routers/{id}/discover
 GET    /routers/{id}/snapshots[/{snapshot_id}]
 GET    /routers/{id}/compatibility
