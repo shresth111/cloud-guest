@@ -221,37 +221,6 @@ class Settings(BaseSettings):
         ),
     )
 
-    config_agent_url: str = Field(
-        default="",
-        description=(
-            "Full apply URL of the legacy SSH 'config-agent' bridge (a "
-            "plain-HTTP sidecar next to the WireGuard hub that runs "
-            "arbitrary RouterOS scripts over the device's SSH console) "
-            "used by network_config's POST .../apply-live endpoint and by "
-            "app.domains.router.device_credential_rotator. This transport "
-            "is RETIRED for new work -- the vendored wyfy_device_gateway "
-            "(librouteros API + asyncssh over the WireGuard tunnel) is the "
-            "transport of record. Empty = disabled, the honest default "
-            "(mirrors stripe_secret_key's 'empty = unconfigured' posture): "
-            "apply-live reports the bridge as disabled instead of calling "
-            "it, and credential rotation falls back to persist-only. Both "
-            "this and config_agent_secret must be set together to "
-            "temporarily re-enable the bridge during its decommissioning "
-            "window. Previously a hardcoded module constant (URL and live "
-            "shared secret in source) -- that credential is considered "
-            "leaked via git history and must be rotated on the sidecar "
-            "host regardless of whether the bridge is ever re-enabled."
-        ),
-    )
-    config_agent_secret: str = Field(
-        default="",
-        description=(
-            "Shared secret sent as X-Agent-Secret to config_agent_url. "
-            "Empty = disabled -- see config_agent_url. Never commit a "
-            "real value; set via CLOUDGUEST_CONFIG_AGENT_SECRET only."
-        ),
-    )
-
     snmp_default_community: str = Field(
         default="",
         description=(

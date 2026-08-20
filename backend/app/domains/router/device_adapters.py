@@ -42,8 +42,15 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from wyfy_device_gateway.contract import DeviceCredentials, DeviceVendor
-from wyfy_device_gateway.mikrotik_adapter import MikroTikDeviceError
+from wyfy_device_gateway.contract import (
+    DeviceCredentials,
+    DeviceVendor,
+    RawCommandResult,
+)
+from wyfy_device_gateway.mikrotik_adapter import (
+    MikroTikConnectionError,
+    MikroTikDeviceError,
+)
 from wyfy_device_gateway.registry import get_adapter
 
 logger = logging.getLogger(__name__)
@@ -57,6 +64,25 @@ class DeviceInterfaceQueryError(Exception):
         self.host = host
         self.detail = detail
         super().__init__(f"Failed to query interfaces on {host}: {detail}")
+
+
+class DeviceLiveConnectionError(Exception):
+    """The device could not be reached (bad host, tunnel down, auth
+    rejected before any operation ran)."""
+
+    def __init__(self, host: str, detail: str) -> None:
+        self.host = host
+        self.detail = detail
+        super().__init__(f"Could not reach {host}: {detail}")
+
+
+class DeviceLiveOperationError(Exception):
+    """The device was reachable but the requested operation failed."""
+
+    def __init__(self, host: str, detail: str) -> None:
+        self.host = host
+        self.detail = detail
+        super().__init__(f"Live device operation failed on {host}: {detail}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +127,39 @@ async def list_available_device_interfaces(
     ]
 
 
+async def push_live_config(
+    *, host: str, username: str, password: str, config_content: str
+) -> None:
+    """Uploads and imports ``config_content`` over the WireGuard tunnel via
+    the vendored ``wyfy_device_gateway`` -- the transport of record for
+    ``network_config``'s apply-live endpoint (retired config-agent bridge
+    replacement)."""
+    creds = _build_credentials(host, username, password)
+    try:
+        await get_adapter(DeviceVendor.MIKROTIK).push_config(
+            creds, config_content=config_content
+        )
+    except MikroTikConnectionError as exc:
+        raise DeviceLiveConnectionError(host, exc.detail) from exc
+    except MikroTikDeviceError as exc:
+        raise DeviceLiveOperationError(host, exc.detail) from exc
+
+
+async def execute_live_command(
+    *, host: str, username: str, password: str, command: str
+) -> RawCommandResult:
+    """Runs one RouterOS console command over SSH -- used for credential
+    rotation (``/user set ... password=...``) where the platform needs the
+    real exit status rather than a raised exception."""
+    creds = _build_credentials(host, username, password)
+    try:
+        return await get_adapter(DeviceVendor.MIKROTIK).execute_raw_command(
+            creds, command=command
+        )
+    except MikroTikConnectionError as exc:
+        raise DeviceLiveConnectionError(host, exc.detail) from exc
+
+
 async def reboot_device(*, host: str, username: str, password: str) -> None:
     """Issues a real ``/system reboot`` -- the device drops the connection
     the instant it accepts the command (it's already restarting), so a
@@ -121,5 +180,10 @@ async def reboot_device(*, host: str, username: str, password: str) -> None:
 __all__ = [
     "DeviceInterface",
     "DeviceInterfaceQueryError",
+    "DeviceLiveConnectionError",
+    "DeviceLiveOperationError",
+    "execute_live_command",
     "list_available_device_interfaces",
+    "push_live_config",
+    "reboot_device",
 ]

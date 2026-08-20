@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import uuid
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
@@ -25,6 +24,11 @@ from app.domains.rbac.dependencies import (
     RequirePermission,
 )
 from app.domains.router.dependencies import get_router_service
+from app.domains.router.device_adapters import (
+    DeviceLiveConnectionError,
+    DeviceLiveOperationError,
+    push_live_config,
+)
 from app.domains.router.service import RouterService
 from app.domains.router_provisioning.dependencies import get_router_provisioning_service
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
@@ -47,15 +51,6 @@ from .schemas import (
 from .service import NetworkConfigService
 
 router = APIRouter(prefix="/network-config", tags=["Network Configuration Management"])
-
-# The SSH-capable config-agent bridge this module's apply-live endpoint
-# forwards to is a RETIRED transport (router-fleet plan section A1: the
-# vendored wyfy_device_gateway over the WireGuard tunnel is the transport
-# of record). Its URL and shared secret -- previously hardcoded module
-# constants here, i.e. a live credential committed to source -- now live
-# in Settings (config_agent_url / config_agent_secret) and default to
-# empty, which disables the endpoint below with an honest
-# "bridge disabled" response instead of a network call.
 
 
 def _request_id(request: Request) -> str:
@@ -202,47 +197,25 @@ async def apply_network_config_live(
         get_router_provisioning_service
     ),
     router_service: RouterService = Depends(get_router_service),
-    settings: Settings = Depends(get_settings),
 ):
     """Server-side equivalent of what ``ConfigTab.handlePush`` (frontend)
     previously did itself in two direct browser calls: fetch this
-    router's real connection info, then hand the already-rendered
-    ``ConfigVersion.rendered_content`` to the SSH-capable config-agent
-    bridge. Moving both steps here fixes two real problems at once --
-    the bridge is a plain ``http://`` endpoint with no CORS support,
+    router's real connection info, then push the already-rendered
+    ``ConfigVersion.rendered_content`` to the live device. Moving both
+    steps here fixes two real problems at once -- the old config-agent
+    bridge was a plain ``http://`` endpoint with no CORS support,
     silently blocked as mixed content once called from an HTTPS page
-    (confirmed live), and the frontend previously had to ship
-    ``_CONFIG_AGENT_SECRET`` in its own JS bundle just to make the call
-    at all. See ``get_device_connection``'s own docstring for why
+    (confirmed live), and the frontend previously had to ship the
+    bridge secret in its own JS bundle just to make the call at all.
+    See ``get_device_connection``'s own docstring for why
     ``reveal_credentials`` (not a lower-tier read) is the right gate here
     too -- this is the same real, high-trust device operation, exposing
     the same decrypted secret, just consumed server-side instead of
     handed back to the browser.
 
-    The bridge transport itself is retired (see the module-level note):
-    unless a deployment explicitly re-enables it via
-    ``CLOUDGUEST_CONFIG_AGENT_URL``/``CLOUDGUEST_CONFIG_AGENT_SECRET``,
-    this endpoint reports the bridge as disabled -- before fetching the
-    version or revealing any credential -- rather than calling it."""
-    if not settings.config_agent_url or not settings.config_agent_secret:
-        payload = NetworkConfigApplyLiveResponse(
-            router_id=str(router_id),
-            version_id=str(version_id),
-            applied=False,
-            detail=(
-                "The config-agent bridge is disabled on this deployment "
-                "(retired transport; not configured via "
-                "CLOUDGUEST_CONFIG_AGENT_URL/CLOUDGUEST_CONFIG_AGENT_SECRET). "
-                "Use the queued agent push instead."
-            ),
-        )
-        return build_response(
-            success=True,
-            message="Config-agent bridge is disabled",
-            data=payload.model_dump(),
-            request_id=_request_id(request),
-        )
-
+    The config-agent HTTP bridge is retired (router-fleet plan section
+    A1); this endpoint now uses the vendored ``wyfy_device_gateway``'s
+    ``push_config`` over the WireGuard tunnel."""
     version = await provisioning_service.get_version(
         router_id=router_id,
         version_id=version_id,
@@ -271,36 +244,39 @@ async def apply_network_config_live(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                settings.config_agent_url,
-                headers={"X-Agent-Secret": settings.config_agent_secret},
-                json={
-                    "tunnel_ip": host,
-                    "username": username,
-                    "password": password,
-                    "script": version.rendered_content,
-                },
-            )
-            resp.raise_for_status()
-            result = resp.json()
-    except httpx.HTTPError as exc:
+        await push_live_config(
+            host=host,
+            username=username,
+            password=password,
+            config_content=version.rendered_content,
+        )
+    except DeviceLiveConnectionError as exc:
         raise HTTPException(
-            status_code=502, detail="Could not reach the config-agent bridge"
+            status_code=502, detail=f"Could not reach the device: {exc.detail}"
         ) from exc
+    except DeviceLiveOperationError as exc:
+        payload = NetworkConfigApplyLiveResponse(
+            router_id=str(router_id),
+            version_id=str(version_id),
+            applied=False,
+            detail=exc.detail,
+        )
+        return build_response(
+            success=True,
+            message="Live apply failed",
+            data=payload.model_dump(),
+            request_id=_request_id(request),
+        )
 
     payload = NetworkConfigApplyLiveResponse(
         router_id=str(router_id),
         version_id=str(version_id),
-        applied=bool(result.get("applied")),
-        detail=result.get("detail") or result.get("error"),
-    )
-    message = (
-        "Config applied to the live device" if payload.applied else "Live apply failed"
+        applied=True,
+        detail=None,
     )
     return build_response(
         success=True,
-        message=message,
+        message="Config applied to the live device",
         data=payload.model_dump(),
         request_id=_request_id(request),
     )
