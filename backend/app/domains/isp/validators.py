@@ -18,9 +18,10 @@ from .constants import (
     DEFAULT_PACKET_LOSS_DEGRADED_THRESHOLD_PERCENT,
     DEFAULT_PACKET_LOSS_UNHEALTHY_THRESHOLD_PERCENT,
     HealthStatus,
+    IspConnectionMode,
     WanRoutingMode,
 )
-from .exceptions import MixedWanRoutingWeightsError
+from .exceptions import IspLinkInterfaceInvariantError, MixedWanRoutingWeightsError
 
 
 def classify_health_status(
@@ -94,6 +95,92 @@ def validate_wan_routing_weights(
         raise ValueError("load_balance_weight must be a positive integer")
 
 
+def derive_pppoe_routing_interface(*, wan_slot: int) -> str:
+    """Return the canonical PPPoE virtual interface name for a WAN slot.
+
+    ``wan_slot`` is 1-based (WAN1 → ``pppoe-wan1``).
+    """
+    if wan_slot < 1:
+        raise ValueError("wan_slot must be >= 1")
+    return f"pppoe-wan{wan_slot}"
+
+
+def normalize_isp_link_interfaces(
+    *,
+    connection_mode: str,
+    interface: str | None = None,
+    physical_interface: str | None = None,
+    routing_interface: str | None = None,
+    pppoe_username: str | None = None,
+    has_pppoe_password: bool = False,
+    wan_slot: int = 1,
+    is_create: bool = False,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve physical/routing/legacy ``interface`` fields for persistence.
+
+    Returns ``(physical_interface, routing_interface, legacy_interface)``
+    where ``legacy_interface`` is kept equal to ``routing_interface`` so
+    existing health-check and netwatch code that reads ``interface`` keeps
+    working without modification in this step.
+
+  Invariants (enforced here, not DB CHECK constraints):
+    * static/dhcp: ``routing_interface == physical_interface`` (both required).
+    * pppoe: physical required; routing defaults to ``pppoe-wan{wan_slot}``
+      unless explicitly provided; username + password required on create.
+    """
+    mode = IspConnectionMode(connection_mode)
+    physical = (physical_interface or "").strip() or None
+    legacy_interface = (interface or "").strip() or None
+    routing = (routing_interface or "").strip() or None
+
+    if not physical and not routing and not legacy_interface:
+        if mode is IspConnectionMode.PPPOE and is_create:
+            if pppoe_username or has_pppoe_password:
+                raise IspLinkInterfaceInvariantError(
+                    "PPPoE links require physical_interface (or interface) "
+                    "when credentials are supplied"
+                )
+        return None, None, None
+
+    if mode in (IspConnectionMode.STATIC, IspConnectionMode.DHCP):
+        resolved_physical = physical or legacy_interface
+        if not resolved_physical:
+            return None, None, None
+        if routing and routing != resolved_physical:
+            raise IspLinkInterfaceInvariantError(
+                f"{mode.value} links must have routing_interface equal to "
+                "physical_interface"
+            )
+        return resolved_physical, resolved_physical, resolved_physical
+
+    if mode is IspConnectionMode.PPPOE:
+        if physical:
+            if not routing:
+                routing = derive_pppoe_routing_interface(wan_slot=wan_slot)
+            legacy = routing
+        elif legacy_interface:
+            # Legacy callers stored the virtual PPPoE client name in
+            # ``interface`` (e.g. ``pppoe-out1``) with no physical split.
+            routing = routing or legacy_interface
+            legacy = legacy_interface
+        else:
+            raise IspLinkInterfaceInvariantError(
+                "PPPoE links require physical_interface (or interface)"
+            )
+        if is_create and (pppoe_username or has_pppoe_password):
+            if not pppoe_username:
+                raise IspLinkInterfaceInvariantError(
+                    "PPPoE links require pppoe_username when a password is supplied"
+                )
+            if not has_pppoe_password:
+                raise IspLinkInterfaceInvariantError(
+                    "PPPoE links require pppoe_password when a username is supplied"
+                )
+        return physical, routing, legacy
+
+    raise IspLinkInterfaceInvariantError(f"Unsupported connection_mode: {connection_mode}")
+
+
 def is_failover_threshold_reached(
     *, consecutive_unhealthy_count: int, threshold: int
 ) -> bool:
@@ -107,6 +194,8 @@ def is_failover_threshold_reached(
 
 __all__ = [
     "classify_health_status",
+    "derive_pppoe_routing_interface",
     "is_failover_threshold_reached",
+    "normalize_isp_link_interfaces",
     "validate_wan_routing_weights",
 ]
