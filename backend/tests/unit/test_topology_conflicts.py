@@ -59,7 +59,9 @@ class TestNetworksOverlap:
 class TestDetectSubnetConflicts:
     def test_detects_desired_vs_snapshot_overlap(self) -> None:
         snapshot = FakeSnapshot(
-            ip_addresses=[IpAddressSnapshot(address="192.168.50.1/24", interface="bridge1")]
+            ip_addresses=[
+                IpAddressSnapshot(address="192.168.50.1/24", interface="bridge1")
+            ]
         )
         conflicts = detect_subnet_conflicts(
             snapshot, desired_cidrs=["192.168.50.0/24"]
@@ -160,16 +162,30 @@ class TestAnalyzeTopology:
 
     def test_active_default_route_passes(self) -> None:
         snapshot = FakeSnapshot(
-            routes=[RouteSnapshot(dst_address="0.0.0.0/0", gateway="203.0.113.1", active=True)]
+            routes=[
+                RouteSnapshot(
+                    dst_address="0.0.0.0/0",
+                    gateway="203.0.113.1",
+                    active=True,
+                )
+            ]
         )
         report = analyze_topology(snapshot)
-        route_finding = next(f for f in report.findings if f.code == "active_default_route")
+        route_finding = next(
+            f for f in report.findings if f.code == "active_default_route"
+        )
         assert route_finding.status is CompatibilityCheckStatus.PASS
 
     def test_clean_topology_still_reports_bridge_inventory(self) -> None:
         snapshot = FakeSnapshot(
             bridges=[BridgeSnapshot(name="bridgeGuest", ports=["ether2"])],
-            routes=[RouteSnapshot(dst_address="0.0.0.0/0", gateway="ether1", active=True)],
+            routes=[
+                RouteSnapshot(
+                    dst_address="0.0.0.0/0",
+                    gateway="ether1",
+                    active=True,
+                )
+            ],
         )
         report = analyze_topology(snapshot, wan_interfaces={"ether1"})
         assert any(f.code == "bridge_inventory" for f in report.findings)

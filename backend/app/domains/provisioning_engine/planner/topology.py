@@ -123,7 +123,11 @@ def analyze_topology(
     wan_interfaces: set[str] | None = None,
 ) -> TopologyReport:
     """Analyze bridge/WAN/hotspot/DHCP topology from a discovery snapshot."""
-    wan = wan_interfaces if wan_interfaces is not None else _infer_wan_interfaces(snapshot)
+    wan = (
+        wan_interfaces
+        if wan_interfaces is not None
+        else _infer_wan_interfaces(snapshot)
+    )
     port_map = _bridge_port_map(snapshot.bridges)
     iface_to_bridge: dict[str, str] = {}
     for bridge_name, ports in port_map.items():

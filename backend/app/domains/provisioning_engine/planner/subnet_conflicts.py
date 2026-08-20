@@ -44,10 +44,11 @@ def networks_overlap(
 
 
 def _address_field(row: Any) -> str | None:
-    if isinstance(row, dict):
-        raw = row.get("address")
-    else:
-        raw = getattr(row, "address", None)
+    raw = (
+        row.get("address")
+        if isinstance(row, dict)
+        else getattr(row, "address", None)
+    )
     if raw is None or raw == "":
         return None
     return str(raw)
