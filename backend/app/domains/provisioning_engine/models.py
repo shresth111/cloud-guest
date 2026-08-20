@@ -310,4 +310,15 @@ class ProvisionTemplate(BaseModel):
         )
 
 
-__all__ = ["ProvisionJob", "ProvisionStep", "ProvisionLog", "ProvisionTemplate"]
+# Wave 1 discovery snapshots live in planner.models; re-exported here so
+# alembic/env.py's single ``provisioning_engine.models`` import registers
+# the table on ``Base.metadata`` alongside the job/step/log/template set.
+from .planner.models import RouterSnapshot  # noqa: E402
+
+__all__ = [
+    "ProvisionJob",
+    "ProvisionStep",
+    "ProvisionLog",
+    "ProvisionTemplate",
+    "RouterSnapshot",
+]

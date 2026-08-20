@@ -21,6 +21,12 @@ from .contract import (
     VlanConfig,
     WanHealth,
 )
+from .read_only_reader import (
+    READ_ONLY_SECTION_PATHS,
+    ReadOnlyDeviceReader,
+    ReadOnlyStateCapture,
+    ReadOnlyViolationError,
+)
 from .registry import get_adapter, list_supported_vendors
 
 __all__ = [
@@ -32,7 +38,11 @@ __all__ = [
     "InterfaceInfo",
     "PortForwardConfig",
     "ProvisionResult",
+    "READ_ONLY_SECTION_PATHS",
     "RadiusClientConfig",
+    "ReadOnlyDeviceReader",
+    "ReadOnlyStateCapture",
+    "ReadOnlyViolationError",
     "UnsupportedVendorError",
     "VlanConfig",
     "WanHealth",
