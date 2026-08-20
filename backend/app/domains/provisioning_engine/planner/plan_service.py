@@ -8,11 +8,14 @@ from typing import Protocol
 
 from app.domains.isp.models import IspLink
 from app.domains.router.models import Router
+from app.domains.router_provisioning.models import ConfigVersion
 
+from .compile import compile_configuration_plan
 from .constants import PlanStatus, VerificationScope
 from .exceptions import (
     ConfigurationPlanNotApprovableError,
     ConfigurationPlanNotFoundError,
+    ConfigurationPlanNotRenderableError,
     NoRouterSnapshotError,
     RouterSnapshotNotFoundError,
 )
@@ -21,6 +24,7 @@ from .plan_repository import ConfigurationPlanRepositoryProtocol
 from .repository import RouterSnapshotRepositoryProtocol
 from .schemas import (
     BuildConfigurationPlanRequest,
+    ConfigurationPlanRenderResponse,
     ConfigurationPlanResponse,
     GuestNetworkRequest,
 )
@@ -46,6 +50,17 @@ class IspLinkLookupProtocol(Protocol):
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[IspLink], object]: ...
+
+
+class ConfigVersionCreatorProtocol(Protocol):
+    async def create_version_from_content(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        rendered_content: str,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> ConfigVersion: ...
 
 
 def _wan_interfaces_from_links(links: list[IspLink]) -> set[str]:
@@ -206,6 +221,55 @@ class ConfigurationPlanService:
             },
         )
         return self._row_to_response(updated)
+
+    async def render_plan(
+        self,
+        router_id: uuid.UUID,
+        plan_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        config_version_creator: ConfigVersionCreatorProtocol,
+    ) -> ConfigurationPlanRenderResponse:
+        await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        row = await self.plan_repository.get_by_id(plan_id, router_id=router_id)
+        if row is None:
+            raise ConfigurationPlanNotFoundError(plan_id)
+        if row.status != PlanStatus.APPROVED.value:
+            raise ConfigurationPlanNotRenderableError(plan_id, row.status)
+        if row.rendered_version_id is not None:
+            raise ConfigurationPlanNotRenderableError(plan_id, row.status)
+
+        plan = self._row_to_response(row)
+        if plan.conflicts:
+            raise ConfigurationPlanNotRenderableError(plan_id, row.status)
+
+        await self.plan_repository.update(row, {"status": PlanStatus.RENDERING.value})
+        compiled = compile_configuration_plan(plan)
+        version = await config_version_creator.create_version_from_content(
+            actor_user_id=actor_user_id,
+            router_id=router_id,
+            rendered_content=compiled.script,
+            requesting_organization_id=requesting_organization_id,
+        )
+        updated = await self.plan_repository.update(
+            row,
+            {
+                "status": PlanStatus.RENDERING.value,
+                "rendered_version_id": version.id,
+            },
+        )
+        return ConfigurationPlanRenderResponse(
+            plan_id=str(updated.id),
+            config_version_id=str(version.id),
+            config_version_number=int(version.version_number),
+            status=PlanStatus(updated.status),
+            profiles_used=compiled.profiles_used,
+            secret_refs=compiled.secret_refs,
+            line_count=compiled.line_count,
+        )
 
     def _row_to_response(self, row: object) -> ConfigurationPlanResponse:
         from .constants import PlanRisk

@@ -311,6 +311,16 @@ class ConfigurationPlanResponse(BaseModel):
     summary: PlanSummary
 
 
+class ConfigurationPlanRenderResponse(BaseModel):
+    plan_id: str
+    config_version_id: str
+    config_version_number: int
+    status: PlanStatus
+    profiles_used: list[str]
+    secret_refs: list[str]
+    line_count: int
+
+
 __all__ = [
     "InterfaceSnapshot",
     "BridgeSnapshot",
@@ -347,4 +357,5 @@ __all__ = [
     "PlanSummary",
     "BuildConfigurationPlanRequest",
     "ConfigurationPlanResponse",
+    "ConfigurationPlanRenderResponse",
 ]
