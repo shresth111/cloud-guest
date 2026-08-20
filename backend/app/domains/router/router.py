@@ -79,11 +79,16 @@ from app.domains.guest.service import RadiusService
 from app.domains.provisioning_engine.planner.constants import SnapshotTrigger
 from app.domains.provisioning_engine.planner.dependencies import (
     get_discovery_service,
+    get_guest_input_service,
     get_wan_verification_service,
+)
+from app.domains.provisioning_engine.planner.guest_input_service import (
+    GuestInputService,
 )
 from app.domains.provisioning_engine.planner.schemas import (
     CompatibilityReport,
     DiscoverRouterResponse,
+    GuestInterfaceAvailabilityResponse,
     RouterSnapshotListResponse,
     RouterSnapshotResponse,
     WanVerificationGateResponse,
@@ -1156,6 +1161,31 @@ async def get_router_wan_verification_gate(
     return build_response(
         success=True,
         message="WAN verification gate evaluated",
+        data=result.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/guest/interfaces/availability",
+    response_model=ApiResponse[GuestInterfaceAvailabilityResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.read"))],
+)
+async def get_guest_interface_availability(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    guest_input_service: GuestInputService = Depends(get_guest_input_service),
+):
+    """Guest Wi-Fi port suitability from the latest discovery snapshot (P10)."""
+    result = await guest_input_service.get_interface_availability(
+        router_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Guest interface availability evaluated",
         data=result.model_dump(),
         request_id=_request_id(request),
     )

@@ -101,6 +101,18 @@ class PlanStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class InterfaceAvailabilityStatus(StrEnum):
+    """Per-port suitability for guest Wi-Fi assignment (P10)."""
+
+    RECOMMENDED = "RECOMMENDED"
+    AVAILABLE = "AVAILABLE"
+    IN_USE = "IN_USE"
+    WAN = "WAN"
+    BRIDGE_MEMBER = "BRIDGE_MEMBER"
+    DISABLED = "DISABLED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 __all__ = [
     "MANAGED_COMMENT_PREFIXES",
     "SnapshotTrigger",
@@ -111,4 +123,5 @@ __all__ = [
     "WanVerificationOverall",
     "VerificationCheckStatus",
     "PlanStatus",
+    "InterfaceAvailabilityStatus",
 ]
