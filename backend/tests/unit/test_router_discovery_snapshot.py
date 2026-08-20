@@ -163,7 +163,11 @@ def _canned_capture(*, with_secrets: bool = True) -> ReadOnlyStateCapture:
         ],
         "dns": [{"servers": "1.1.1.1", "allow-remote-requests": True}],
         "firewall_filter": [
-            {"comment": "WYFYGUEST-accept-guest", "disabled": False, "action": "accept"},
+            {
+                "comment": "WYFYGUEST-accept-guest",
+                "disabled": False,
+                "action": "accept",
+            },
             {"comment": "drop-all", "disabled": False, "action": "drop"},
             {"comment": "legacy", "disabled": True, "action": "accept"},
         ],

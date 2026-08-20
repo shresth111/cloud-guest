@@ -574,7 +574,9 @@ class IspService:
             "connection_mode",
             "pppoe_username",
         }
-        should_normalize = bool(interface_keys & fields.keys()) or pppoe_password is not None
+        should_normalize = bool(interface_keys & fields.keys()) or (
+            pppoe_password is not None
+        )
         if should_normalize:
             siblings = await self.repository.list_links_for_router(link.router_id)
             wan_slot = _resolve_wan_slot(

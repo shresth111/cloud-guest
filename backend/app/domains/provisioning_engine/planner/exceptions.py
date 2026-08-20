@@ -14,6 +14,7 @@ __all__ = [
     "NoRouterSnapshotError",
     "DiscoveryMissingCredentialsError",
     "DiscoveryDeviceConnectionError",
+    "NoWanLinksToVerifyError",
 ]
 
 
@@ -60,4 +61,12 @@ class DiscoveryDeviceConnectionError(PlannerError):
         super().__init__(
             f"Could not connect to device at '{host}' for discovery: {detail}",
             status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class NoWanLinksToVerifyError(PlannerError):
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router '{router_id}' has no enabled WAN links to verify",
+            status_code=status.HTTP_400_BAD_REQUEST,
         )

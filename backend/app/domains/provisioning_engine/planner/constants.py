@@ -67,10 +67,48 @@ class CompatibilityCheckStatus(StrEnum):
     BLOCKED = "BLOCKED"
 
 
+class VerificationScope(StrEnum):
+    WAN = "wan"
+    FINAL = "final"
+    PLAN_STEP = "plan_step"
+
+
+class WanVerificationOverall(StrEnum):
+    """Per-WAN uplink verification result (P7)."""
+
+    ONLINE = "ONLINE"
+    OFFLINE = "OFFLINE"
+    ERROR = "ERROR"
+    DISABLED = "DISABLED"
+
+
+class VerificationCheckStatus(StrEnum):
+    PASS = "PASS"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    BLOCKED = "BLOCKED"
+
+
+class PlanStatus(StrEnum):
+    DRAFT = "draft"
+    AWAITING_APPROVAL = "awaiting_approval"
+    APPROVED = "approved"
+    RENDERING = "rendering"
+    APPLYING = "applying"
+    APPLIED = "applied"
+    FAILED = "failed"
+    SUPERSEDED = "superseded"
+    REJECTED = "rejected"
+
+
 __all__ = [
     "MANAGED_COMMENT_PREFIXES",
     "SnapshotTrigger",
     "SnapshotStatus",
     "CompatibilityOverall",
     "CompatibilityCheckStatus",
+    "VerificationScope",
+    "WanVerificationOverall",
+    "VerificationCheckStatus",
+    "PlanStatus",
 ]

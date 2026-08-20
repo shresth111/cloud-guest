@@ -314,6 +314,8 @@ class ProvisionTemplate(BaseModel):
 # alembic/env.py's single ``provisioning_engine.models`` import registers
 # the table on ``Base.metadata`` alongside the job/step/log/template set.
 from .planner.models import RouterSnapshot  # noqa: E402
+from .planner.plan_models import ConfigurationPlan  # noqa: E402
+from .planner.verification_models import VerificationRun  # noqa: E402
 
 __all__ = [
     "ProvisionJob",
@@ -321,4 +323,6 @@ __all__ = [
     "ProvisionLog",
     "ProvisionTemplate",
     "RouterSnapshot",
+    "ConfigurationPlan",
+    "VerificationRun",
 ]
