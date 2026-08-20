@@ -42,6 +42,8 @@ from app.core.config import get_settings
 from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
+from app.domains.billing.dependencies import get_entitlement_checker
+from app.domains.billing.service import EntitlementChecker
 from app.domains.branding.repository import BrandingRepository
 from app.domains.branding.service import (
     PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE,
@@ -66,6 +68,40 @@ from .service import CaptivePortalService
 from .validators import is_open_now
 
 router = APIRouter(tags=["Captive Portal"])
+
+
+def get_entitlement_aware_captive_portal_service(
+    service: CaptivePortalService = Depends(get_captive_portal_service),
+    entitlement_checker: EntitlementChecker = Depends(get_entitlement_checker),
+) -> CaptivePortalService:
+    """The admin write endpoints' service, with v7 Part 3 (P4)'s
+    white-label entitlement check wired in.
+
+    **Why this lives here and not in ``dependencies.py``.**
+    ``app.domains.billing.dependencies`` reaches back into
+    ``app.domains.captive_portal.dependencies`` through
+    ``analytics.dependencies`` -> ``guest.dependencies``, so importing
+    billing *from* that module is a genuine cycle -- it was tried, and it
+    fails at import time from every entry point. ``router.py`` is a leaf
+    nothing else imports, and ``captive_portal.dependencies`` itself has
+    no billing edge, so the chain closes cleanly from here whichever
+    module is loaded first.
+
+    **Why only the write endpoints get it.** The gate must never touch
+    ``GET /captive-portal/resolve``: that endpoint is unauthenticated and
+    a 402 there would break the portal outright for every non-entitled
+    tenant. Scoping the checker to this factory makes that structural
+    rather than a comment -- the resolve endpoint is handed a service that
+    has no checker to consult. ``guest``'s own login flow, which shares
+    the plain ``get_captive_portal_service``, is unaffected for the same
+    reason.
+
+    Attaching rather than re-constructing keeps the whole service graph in
+    ``dependencies.py``; this factory adds exactly one collaborator to the
+    instance FastAPI has already built for this request.
+    """
+    service.entitlement_checker = entitlement_checker
+    return service
 
 
 def _request_id(request: Request) -> str:
@@ -112,6 +148,7 @@ def _config_response(config: CaptivePortalConfig) -> CaptivePortalConfigResponse
         background_overlay_strength=config.background_overlay_strength,
         background_focal_x=config.background_focal_x,
         background_focal_y=config.background_focal_y,
+        powered_by_enabled=config.powered_by_enabled,
         created_at=config.created_at,
         updated_at=config.updated_at,
     )
@@ -133,7 +170,9 @@ async def create_captive_portal_config(
     payload: CaptivePortalConfigCreateRequest,
     user: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    service: CaptivePortalService = Depends(get_captive_portal_service),
+    service: CaptivePortalService = Depends(
+        get_entitlement_aware_captive_portal_service
+    ),
 ):
     config = await service.create_config(
         actor_user_id=uuid.UUID(user.id),
@@ -158,6 +197,7 @@ async def create_captive_portal_config(
         privacy_policy_url=payload.privacy_policy_url,
         splash_headline=payload.splash_headline,
         splash_welcome_message=payload.splash_welcome_message,
+        powered_by_enabled=payload.powered_by_enabled,
         redirect_url=payload.redirect_url,
         otp_sms_enabled=payload.otp_sms_enabled,
         otp_email_enabled=payload.otp_email_enabled,
@@ -248,7 +288,9 @@ async def update_captive_portal_config(
     payload: CaptivePortalConfigUpdateRequest,
     user: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    service: CaptivePortalService = Depends(get_captive_portal_service),
+    service: CaptivePortalService = Depends(
+        get_entitlement_aware_captive_portal_service
+    ),
 ):
     data = payload.model_dump(exclude_unset=True)
     config = await service.update_config(

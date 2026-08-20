@@ -57,9 +57,13 @@ from app.core.config import get_settings
 # background_focal_y (design spec §1.4 C4), added to
 # _CACHED_CONFIG_SCALAR_FIELDS by the same change -- the spec calls this
 # bump out explicitly in §0.3 because skipping it is exactly the
-# guest-facing 500 the versioning exists to prevent.
+# guest-facing 500 the versioning exists to prevent. v4 is v7 Part 3's
+# powered_by_enabled (P4), added to that same tuple: without this bump the
+# first resolve after that deploy reads a v3 payload written by the
+# previous build, `payload["powered_by_enabled"]` raises KeyError, and
+# every guest joining WiFi gets a 500 until the TTL expires.
 _CACHE_KEY_TEMPLATE = (
-    "captive_portal:resolve:v3:{organization_id}:{location_id}"
+    "captive_portal:resolve:v4:{organization_id}:{location_id}"
 )
 _NONE_SENTINEL = "-"
 

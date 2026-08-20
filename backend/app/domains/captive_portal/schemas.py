@@ -75,6 +75,16 @@ class CaptivePortalConfigCreateRequest(BaseModel):
     terms_and_conditions_url: str | None = Field(default=None, max_length=500)
     privacy_policy_text: str | None = Field(default=None)
     privacy_policy_url: str | None = Field(default=None, max_length=500)
+    powered_by_enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether the guest-facing portal renders the 'Powered by Wyfy "
+            "Guest' attribution (v7 design spec Part 3 / P4). Setting this "
+            "to false is a white-label entitlement: it requires the "
+            "'white_label' plan feature and otherwise returns 402. Setting "
+            "it back to true is always free."
+        ),
+    )
     splash_headline: str | None = Field(
         default=None,
         description=(
@@ -194,6 +204,16 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     terms_and_conditions_url: str | None = Field(default=None, max_length=500)
     privacy_policy_text: str | None = Field(default=None)
     privacy_policy_url: str | None = Field(default=None, max_length=500)
+    powered_by_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the guest-facing portal renders the 'Powered by Wyfy "
+            "Guest' attribution (v7 design spec Part 3 / P4). Turning it "
+            "OFF requires the 'white_label' plan feature and otherwise "
+            "returns 402 with `data.required_feature`; turning it ON, and "
+            "re-sending an already-false value, are always free."
+        ),
+    )
     splash_headline: str | None = Field(
         default=None,
         description=(
@@ -314,6 +334,7 @@ class CaptivePortalConfigResponse(BaseModel):
     background_overlay_strength: int
     background_focal_x: int
     background_focal_y: int
+    powered_by_enabled: bool
     created_at: datetime
     updated_at: datetime
 

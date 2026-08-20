@@ -17,6 +17,7 @@ environment.
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -24,6 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.domains.billing.constants import PlanFeatureKey
 from app.domains.captive_portal.constants import (
     DEFAULT_BACKGROUND_FOCAL_X,
     DEFAULT_BACKGROUND_FOCAL_Y,
@@ -45,6 +47,7 @@ from app.domains.captive_portal.exceptions import (
     InvalidHexColorError,
     InvalidPortalContentSourceError,
     MissingPortalResolutionParamsError,
+    PoweredByAttributionNotEntitledError,
     SplashTextTooLongError,
 )
 from app.domains.captive_portal.models import CaptivePortalConfig
@@ -1505,7 +1508,7 @@ class TestBackgroundFocalPointResolve:
 
 
 class TestResolveCacheKeyVersion:
-    def test_cache_key_is_v3(self) -> None:
+    def test_cache_key_is_v4(self) -> None:
         """Spec §0.3: the version must be bumped in the same change that
         adds a field to ``_CACHED_CONFIG_SCALAR_FIELDS``. Skipping it
         makes every payload written by the previous build raise KeyError
@@ -1514,7 +1517,7 @@ class TestResolveCacheKeyVersion:
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
 
         key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
-        assert key == "captive_portal:resolve:v3:org:loc"
+        assert key == "captive_portal:resolve:v4:org:loc"
 
     def test_every_cached_field_exists_on_the_model(self) -> None:
         """The versioning only protects a *deploy*; this catches the
@@ -1526,6 +1529,7 @@ class TestResolveCacheKeyVersion:
         assert set(_CACHED_CONFIG_SCALAR_FIELDS) <= columns
         assert "background_focal_x" in _CACHED_CONFIG_SCALAR_FIELDS
         assert "background_focal_y" in _CACHED_CONFIG_SCALAR_FIELDS
+        assert "powered_by_enabled" in _CACHED_CONFIG_SCALAR_FIELDS
 
 
 # ============================================================================
@@ -1990,3 +1994,331 @@ class TestSplashTextLengthOnUpdate:
                 data={"splash_headline": between},
             )
         assert exc.value.data["field"] == "splash_headline"
+
+
+# ============================================================================
+# v7 §Part 3 (P4) -- powered_by_enabled as a white-label entitlement
+# ============================================================================
+
+
+@dataclass
+class FakeEntitlementSnapshot:
+    features: set[str] = field(default_factory=set)
+
+    def has_feature(self, feature_key: object) -> bool:
+        return str(getattr(feature_key, "value", feature_key)) in self.features
+
+
+@dataclass
+class FakeEntitlementChecker:
+    """Stand-in for ``billing.service.EntitlementChecker``. ``calls``
+    records every organization asked about, so a test can assert the gate
+    did *not* reach billing at all on the paths that must stay free."""
+
+    entitled: bool = True
+    calls: list[uuid.UUID] = field(default_factory=list)
+
+    async def get_snapshot(self, organization_id: uuid.UUID):
+        self.calls.append(organization_id)
+        return FakeEntitlementSnapshot(
+            features={PlanFeatureKey.WHITE_LABEL.value} if self.entitled else set()
+        )
+
+
+def make_entitled_service(*, entitled: bool) -> tuple[Fixture, FakeEntitlementChecker]:
+    fx = make_service()
+    checker = FakeEntitlementChecker(entitled=entitled)
+    fx.service.entitlement_checker = checker
+    return fx, checker
+
+
+class TestPoweredByEnabledDefaults:
+    async def test_defaults_to_true_on_create(self) -> None:
+        # Every row predating this column rendered the attribution, so True
+        # is the "unchanged" value -- and the only default that cannot leak
+        # revenue the moment the migration deploys.
+        fx = make_service()
+        config = await _create_config(fx)
+        assert config.powered_by_enabled is True
+
+    def test_column_is_not_nullable_and_defaults_true(self) -> None:
+        column = CaptivePortalConfig.__table__.columns["powered_by_enabled"]
+        assert column.nullable is False
+        assert column.default.arg is True
+
+    def test_is_part_of_the_resolve_cache_payload(self) -> None:
+        from app.domains.captive_portal.service import _CACHED_CONFIG_SCALAR_FIELDS
+
+        assert "powered_by_enabled" in _CACHED_CONFIG_SCALAR_FIELDS
+
+
+class TestPoweredByEntitlementOnUpdate:
+    async def test_turning_off_without_entitlement_is_402(self) -> None:
+        fx, checker = make_entitled_service(entitled=False)
+        config = await _create_config(fx)
+        with pytest.raises(PoweredByAttributionNotEntitledError) as exc:
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"powered_by_enabled": False},
+            )
+        # 402, not 403: the caller holds captive_portal.update and is
+        # allowed to make this request -- their plan just does not include
+        # the feature. A 403 would send an admin off to ask for a
+        # permission that would not help them.
+        assert exc.value.status_code == 402
+        assert exc.value.data == {
+            "field": "powered_by_enabled",
+            "required_feature": PlanFeatureKey.WHITE_LABEL.value,
+        }
+        assert config.powered_by_enabled is True
+
+    async def test_turning_off_with_entitlement_succeeds(self) -> None:
+        fx, checker = make_entitled_service(entitled=True)
+        config = await _create_config(fx)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": False},
+        )
+        assert updated.powered_by_enabled is False
+        assert checker.calls == [fx.organization.id]
+
+    async def test_turning_on_without_entitlement_succeeds(self) -> None:
+        # Turning attribution back ON must always be free, or a tenant who
+        # downgrades is stuck with a setting they cannot revert.
+        fx, checker = make_entitled_service(entitled=False)
+        config = await _create_config(fx)
+        config.powered_by_enabled = False
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": True},
+        )
+        assert updated.powered_by_enabled is True
+        assert checker.calls == [], "turning attribution on must not consult billing"
+
+    async def test_other_fields_are_not_gated(self) -> None:
+        # The check is service-layer and field-scoped precisely so it does
+        # not become a gate on the whole PUT: a non-entitled tenant must
+        # still be able to change their logo and their colours.
+        fx, checker = make_entitled_service(entitled=False)
+        config = await _create_config(fx)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={
+                "logo_url": "https://cdn.example.com/logo.png",
+                "primary_color": "#FF0000",
+            },
+        )
+        assert updated.logo_url == "https://cdn.example.com/logo.png"
+        assert updated.primary_color == "#FF0000"
+        assert checker.calls == []
+
+    async def test_absent_field_never_consults_billing(self) -> None:
+        fx, checker = make_entitled_service(entitled=False)
+        config = await _create_config(fx)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"name": "Renamed"},
+        )
+        assert checker.calls == []
+
+
+class TestPoweredByEntitlementAfterDowngrade:
+    """The downgrade path, which is the case with a revenue consequence."""
+
+    async def test_downgraded_tenant_can_still_edit_other_fields(self) -> None:
+        # The tenant turned the mark off while entitled, then lost the
+        # feature. The dashboard PUTs its whole form, so `powered_by_enabled:
+        # false` is present on every subsequent save. Re-asserting a value
+        # that is already false is not a new purchase -- gating it would
+        # lock a downgraded tenant out of every other field on the page.
+        fx, checker = make_entitled_service(entitled=True)
+        config = await _create_config(fx)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": False},
+        )
+        checker.entitled = False  # the downgrade
+        checker.calls.clear()
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={
+                "powered_by_enabled": False,
+                "logo_url": "https://cdn.example.com/new-logo.png",
+            },
+        )
+        assert updated.logo_url == "https://cdn.example.com/new-logo.png"
+        assert updated.powered_by_enabled is False
+        assert checker.calls == []
+
+    async def test_downgraded_tenant_who_turns_it_on_cannot_turn_it_off_again(
+        self,
+    ) -> None:
+        # The other half of the same policy: once they revert to attribution
+        # ON, turning it back off is a fresh purchase and is gated.
+        fx, checker = make_entitled_service(entitled=True)
+        config = await _create_config(fx)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": False},
+        )
+        checker.entitled = False
+
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": True},
+        )
+        with pytest.raises(PoweredByAttributionNotEntitledError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"powered_by_enabled": False},
+            )
+
+    async def test_resolve_honours_the_stored_false_after_downgrade(self) -> None:
+        # POLICY, stated rather than left to the code: resolve returns what
+        # is stored and never consults billing. The read path is
+        # unauthenticated and a 402 there would break the portal outright
+        # for every non-entitled tenant, so it is not gated -- which means
+        # a tenant who turned the mark off while entitled keeps it off
+        # after downgrading. Closing that belongs on the licence-downgrade
+        # path, not on the guest hot path. See
+        # _enforce_powered_by_entitlement's docstring.
+        fx, checker = make_entitled_service(entitled=True)
+        await _create_config(fx, is_default=True)
+        config = next(iter(fx.repository.configs.values()))
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": False},
+        )
+        checker.entitled = False
+        checker.calls.clear()
+
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert resolved.config.powered_by_enabled is False
+        assert checker.calls == [], "resolve must never consult billing"
+
+
+class TestPoweredByEntitlementOnCreate:
+    """Create is gated too. The spec names ``update_config`` only, but
+    leaving create open is a one-request bypass: POST a fresh config with
+    ``powered_by_enabled=false`` and the update gate is never consulted."""
+
+    async def test_creating_with_attribution_off_without_entitlement_is_402(
+        self,
+    ) -> None:
+        fx, _ = make_entitled_service(entitled=False)
+        with pytest.raises(PoweredByAttributionNotEntitledError):
+            await fx.service.create_config(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=fx.organization.id,
+                organization_id=fx.organization.id,
+                location_id=None,
+                name="Bypass Portal",
+                is_active=True,
+                is_default=False,
+                theme="light",
+                logo_url=None,
+                background_image_url=None,
+                primary_color="#1A73E8",
+                secondary_color="#FFFFFF",
+                default_language="en",
+                supported_languages=["en"],
+                advertisement_banner_url=None,
+                advertisement_banner_link=None,
+                terms_and_conditions_text=None,
+                terms_and_conditions_url=None,
+                privacy_policy_text=None,
+                privacy_policy_url=None,
+                splash_headline=None,
+                splash_welcome_message=None,
+                redirect_url=None,
+                otp_sms_enabled=True,
+                otp_email_enabled=False,
+                otp_whatsapp_enabled=False,
+                voucher_enabled=True,
+                username_password_enabled=True,
+                social_login_enabled=False,
+                social_login_providers=[],
+                powered_by_enabled=False,
+            )
+
+    async def test_creating_with_attribution_on_never_consults_billing(self) -> None:
+        fx, checker = make_entitled_service(entitled=False)
+        config = await _create_config(fx)
+        assert config.powered_by_enabled is True
+        assert checker.calls == []
+
+
+class TestPoweredByWithoutAnEntitlementChecker:
+    """``entitlement_checker=None`` disables the gate. That is the shape
+    the one pre-existing non-HTTP caller relies on --
+    ``location.provisioning_service`` creates configs during smart-location
+    provisioning and never sets this field."""
+
+    async def test_gate_is_inert_without_a_checker(self) -> None:
+        fx = make_service()
+        assert fx.service.entitlement_checker is None
+        config = await _create_config(fx)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": False},
+        )
+        assert updated.powered_by_enabled is False
+
+
+class TestPoweredByRouterWiring:
+    def test_write_endpoints_use_the_entitlement_aware_service(self) -> None:
+        """The gate is only real if the write routes actually receive a
+        service that has a checker. Asserted structurally so a future
+        refactor that swaps the dependency back cannot pass silently."""
+        from app.domains.captive_portal import router as router_module
+
+        aware = router_module.get_entitlement_aware_captive_portal_service
+        for handler in (
+            router_module.create_captive_portal_config,
+            router_module.update_captive_portal_config,
+        ):
+            default = inspect.signature(handler).parameters["service"].default
+            assert default.dependency is aware, handler.__name__
+
+    def test_resolve_endpoint_does_not_get_a_checker(self) -> None:
+        """The read path must stay unauthenticated and ungated -- a 402
+        there would break the portal for every non-entitled tenant."""
+        from app.domains.captive_portal import router as router_module
+
+        default = (
+            inspect.signature(router_module.resolve_captive_portal_config)
+            .parameters["service"]
+            .default
+        )
+        assert (
+            default.dependency
+            is not router_module.get_entitlement_aware_captive_portal_service
+        )
