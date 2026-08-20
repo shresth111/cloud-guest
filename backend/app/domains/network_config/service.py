@@ -76,8 +76,11 @@ from .exceptions import (
     EmptyNetworkConfigError,
     NetwatchIntegrationUnavailableError,
     NoNetwatchTargetsError,
+    NoWanLinksError,
 )
 from .renderers import render_isp_netwatch_config, render_network_config
+from .wan import render_basic_wan_config
+from .wan.build_context import build_wan_render_context
 
 
 class DhcpLookupProtocol(Protocol):
@@ -300,6 +303,20 @@ class NetwatchPushResult:
     version: ConfigVersion
     job: ProvisioningJob
     watched_link_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class BasicWanPreview:
+    router_id: uuid.UUID
+    rendered_content: str
+    wan_link_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class BasicWanPushResult:
+    version: ConfigVersion
+    job: ProvisioningJob
+    wan_link_count: int
 
 
 class NetworkConfigService:
@@ -685,6 +702,97 @@ class NetworkConfigService:
             version=applied_version, job=job, watched_link_count=len(watched_links)
         )
 
+    async def _gather_basic_wan_render(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        lan_bridge: str,
+        static_addresses: dict[uuid.UUID, str],
+    ) -> tuple[Router, str, int]:
+        if self.isp_link_lookup is None or self.router_lookup is None:
+            raise NetwatchIntegrationUnavailableError(router_id)
+
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        links, _meta = await self.isp_link_lookup.list_links(
+            requesting_organization_id=requesting_organization_id,
+            router_id=router_id,
+            page=1,
+            page_size=100,
+        )
+        ctx = build_wan_render_context(
+            router=router,
+            links=links,
+            lan_bridge=lan_bridge,
+            static_addresses=static_addresses,
+        )
+        if not ctx.links:
+            raise NoWanLinksError(router_id)
+
+        rendered = render_basic_wan_config(ctx)
+        if not rendered.strip():
+            raise NoWanLinksError(router_id)
+        return router, rendered, len(ctx.links)
+
+    async def preview_basic_wan_config(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        lan_bridge: str = "bridge1",
+        static_addresses: dict[uuid.UUID, str] | None = None,
+    ) -> BasicWanPreview:
+        _router, rendered, count = await self._gather_basic_wan_render(
+            router_id,
+            requesting_organization_id=requesting_organization_id,
+            lan_bridge=lan_bridge,
+            static_addresses=static_addresses or {},
+        )
+        return BasicWanPreview(
+            router_id=router_id,
+            rendered_content=rendered,
+            wan_link_count=count,
+        )
+
+    async def push_basic_wan_config(
+        self,
+        router_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+        lan_bridge: str = "bridge1",
+        static_addresses: dict[uuid.UUID, str] | None = None,
+    ) -> BasicWanPushResult:
+        """Render and queue the ``basic`` WAN profile (bridge cleanup,
+        addressing, routing, mangle, DNS) from enabled ``isp_links`` rows.
+
+        Deliberately a standalone push path -- like Netwatch -- so WAN
+        apply never silently rotates agent credentials or pulls unrelated
+        DHCP/VLAN rows into the same script."""
+        _router, rendered, count = await self._gather_basic_wan_render(
+            router_id,
+            requesting_organization_id=requesting_organization_id,
+            lan_bridge=lan_bridge,
+            static_addresses=static_addresses or {},
+        )
+        version = await self.router_provisioning_lookup.create_version_from_content(
+            actor_user_id=actor_user_id,
+            router_id=router_id,
+            rendered_content=rendered,
+            requesting_organization_id=requesting_organization_id,
+        )
+        applied_version, job = await self.router_provisioning_lookup.apply_version(
+            actor_user_id=actor_user_id,
+            router_id=router_id,
+            version_id=version.id,
+            requesting_organization_id=requesting_organization_id,
+        )
+        return BasicWanPushResult(
+            version=applied_version, job=job, wan_link_count=count
+        )
+
     async def get_version(
         self,
         router_id: uuid.UUID,
@@ -768,5 +876,7 @@ __all__ = [
     "RouterProvisioningLookupProtocol",
     "NetworkConfigPreview",
     "NetwatchPushResult",
+    "BasicWanPreview",
+    "BasicWanPushResult",
     "NetworkConfigService",
 ]

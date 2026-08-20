@@ -15,7 +15,7 @@ owns directly -- neither has an analog anywhere else.
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.domains.router_provisioning.schemas import (
     ConfigVersionResponse,
@@ -26,6 +26,10 @@ __all__ = [
     "NetworkConfigPreviewResponse",
     "NetworkConfigNetwatchPushResponse",
     "NetworkConfigApplyLiveResponse",
+    "BasicWanApplyRequest",
+    "BasicWanStaticAddressOverride",
+    "NetworkConfigBasicWanPreviewResponse",
+    "NetworkConfigBasicWanPushResponse",
 ]
 
 
@@ -69,3 +73,27 @@ class NetworkConfigApplyLiveResponse(BaseModel):
     version_id: str
     applied: bool
     detail: str | None = None
+
+
+class BasicWanStaticAddressOverride(BaseModel):
+    link_id: str
+    static_address: str = Field(
+        description="Static WAN address in ip/prefix form, e.g. 203.0.113.5/24"
+    )
+
+
+class BasicWanApplyRequest(BaseModel):
+    lan_bridge: str = "bridge1"
+    static_addresses: list[BasicWanStaticAddressOverride] = Field(default_factory=list)
+
+
+class NetworkConfigBasicWanPreviewResponse(BaseModel):
+    router_id: str
+    rendered_content: str
+    wan_link_count: int
+
+
+class NetworkConfigBasicWanPushResponse(BaseModel):
+    version: ConfigVersionResponse
+    job: ProvisioningJobResponse
+    wan_link_count: int

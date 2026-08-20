@@ -23,6 +23,8 @@ __all__ = [
     "EmptyNetworkConfigError",
     "NetwatchIntegrationUnavailableError",
     "NoNetwatchTargetsError",
+    "NoWanLinksError",
+    "MissingStaticWanAddressError",
 ]
 
 
@@ -57,9 +59,7 @@ class NoNetwatchTargetsError(NetworkConfigError):
     """Raised when a router has zero enabled, ``STATIC``-mode ISP links
     with a known ``gateway_ip_address`` -- pushing an empty Netwatch script
     would create a real, durable, permanently-empty ``ConfigVersion`` row
-    and queue a real device-side no-op job, the identical "don't push
-    nothing" discipline :class:`EmptyNetworkConfigError` already
-    establishes for the main config-push flow."""
+    and queue a real device-side no-op job."""
 
     def __init__(self, router_id: uuid.UUID) -> None:
         super().__init__(
@@ -82,5 +82,29 @@ class EmptyNetworkConfigError(NetworkConfigError):
         super().__init__(
             f"Router {router_id} has no enabled DHCP pools, VLANs, or "
             "port-forwarding rules to push",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class NoWanLinksError(NetworkConfigError):
+    """Raised when a router has no enabled ISP links with a configured
+    physical interface to render a basic WAN profile against."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router {router_id} has no enabled WAN links with a physical "
+            "interface configured",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class MissingStaticWanAddressError(NetworkConfigError):
+    """Raised when a STATIC-mode WAN link has no ``ip/prefix`` supplied via
+    the apply request (not stored on ``isp_links`` yet)."""
+
+    def __init__(self, link_id: uuid.UUID) -> None:
+        super().__init__(
+            f"STATIC WAN link {link_id} requires static_address (ip/prefix) "
+            "in the apply request",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
