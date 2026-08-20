@@ -155,6 +155,25 @@ class LastOrganizationOwnerError(RBACError):
         )
 
 
+class LastGlobalAdminError(RBACError):
+    """The platform must always retain at least one active, GLOBAL-scoped
+    ``super-admin`` role holder -- revoking (or, via the assign-then-revoke
+    downgrade pattern, downgrading) the sole remaining holder would leave the
+    platform with nobody able to administer RBAC at all, the actor itself
+    included. The internal-staff counterpart to ``LastOrganizationOwnerError``
+    (which only guards per-organization ``organization-owner`` grants, never
+    the GLOBAL staff grants the Master Console "Team & Access" page manages).
+    A real handover -- granting another account Super Admin first -- is
+    required before this one can be revoked."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot remove the platform's last Super Admin -- assign Super "
+            "Admin to another account first, then remove this one",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class CrossTenantAccessError(RBACError):
     """An operation attempted to read or mutate another organization's RBAC data."""
 

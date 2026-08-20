@@ -146,6 +146,13 @@ class RBACRepositoryProtocol(Protocol):
         exclude_assignment_id: uuid.UUID | None = None,
     ) -> int: ...
 
+    async def count_active_global_role_assignments(
+        self,
+        role_id: uuid.UUID,
+        *,
+        exclude_assignment_id: uuid.UUID | None = None,
+    ) -> int: ...
+
     # -- permission overrides ------------------------------------------------
     async def get_active_overrides_for_user(
         self, user_id: uuid.UUID, *, now: datetime | None = None
@@ -474,6 +481,34 @@ class RBACRepository:
             .where(
                 UserRole.role_id == role_id,
                 UserRole.organization_id == organization_id,
+                UserRole.is_active.is_(True),
+                UserRole.is_deleted.is_(False),
+            )
+        )
+        if exclude_assignment_id is not None:
+            statement = statement.where(UserRole.id != exclude_assignment_id)
+        result = await self.session.execute(statement)
+        return int(result.scalar_one())
+
+    async def count_active_global_role_assignments(
+        self,
+        role_id: uuid.UUID,
+        *,
+        exclude_assignment_id: uuid.UUID | None = None,
+    ) -> int:
+        """Used to guard "is this the platform's last holder of this
+        GLOBAL-scoped role" checks (see
+        ``RBACService._assert_not_last_global_admin``). GLOBAL staff grants
+        carry no ``organization_id`` (it IS NULL), so unlike
+        ``count_active_role_assignments_in_organization`` above this counts
+        across the whole platform, filtered to GLOBAL scope explicitly."""
+        statement = (
+            select(func.count())
+            .select_from(UserRole)
+            .where(
+                UserRole.role_id == role_id,
+                UserRole.scope_type == ScopeType.GLOBAL.value,
+                UserRole.organization_id.is_(None),
                 UserRole.is_active.is_(True),
                 UserRole.is_deleted.is_(False),
             )

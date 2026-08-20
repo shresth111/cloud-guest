@@ -31,6 +31,7 @@ from app.domains.rbac.exceptions import (
     CrossTenantAccessError,
     DuplicateRoleError,
     InvalidScopeAssignmentError,
+    LastGlobalAdminError,
     LastOrganizationOwnerError,
     OverrideEscalationError,
     PermissionDeniedError,
@@ -378,6 +379,23 @@ class FakeRBACRepository:
             for row in self.user_role_rows
             if row.role_id == role_id
             and row.organization_id == organization_id
+            and row.is_active
+            and not row.is_deleted
+            and row.id != exclude_assignment_id
+        )
+
+    async def count_active_global_role_assignments(
+        self,
+        role_id: uuid.UUID,
+        *,
+        exclude_assignment_id: uuid.UUID | None = None,
+    ) -> int:
+        return sum(
+            1
+            for row in self.user_role_rows
+            if row.role_id == role_id
+            and row.scope_type == ScopeType.GLOBAL.value
+            and row.organization_id is None
             and row.is_active
             and not row.is_deleted
             and row.id != exclude_assignment_id
@@ -1214,6 +1232,88 @@ class TestRoleAssignment:
                 assignment_id=assignment_a.id,
                 requesting_organization_id=org_a,
             )
+
+    async def test_revoke_role_blocks_sole_global_super_admin(self) -> None:
+        """The Master Console "Team & Access" analogue of the last-owner
+        guard: revoking the platform's last active GLOBAL 'super-admin'
+        assignment must fail loudly. These grants carry no organization_id,
+        so ``_assert_not_last_organization_owner`` never fired for them --
+        without the GLOBAL guard this silently locked the whole platform out
+        of RBAC administration (see
+        ``RBACService._assert_not_last_global_admin``)."""
+        service, repo, _cache = make_service()
+        super_admin_role = await make_role(
+            repo, "Super Admin", scope_type=ScopeType.GLOBAL
+        )
+        assert super_admin_role.slug == "super-admin"
+        assignment = await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=super_admin_role,
+            scope_type=ScopeType.GLOBAL,
+        )
+
+        with pytest.raises(LastGlobalAdminError):
+            await service.revoke_role_from_user(
+                actor_user_id=uuid.uuid4(),
+                assignment_id=assignment.id,
+                requesting_organization_id=None,
+            )
+
+        assert assignment.is_active is True
+
+    async def test_revoke_role_allows_global_super_admin_when_a_second_remains(
+        self,
+    ) -> None:
+        service, repo, _cache = make_service()
+        super_admin_role = await make_role(
+            repo, "Super Admin", scope_type=ScopeType.GLOBAL
+        )
+        first = await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=super_admin_role,
+            scope_type=ScopeType.GLOBAL,
+        )
+        await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=super_admin_role,
+            scope_type=ScopeType.GLOBAL,
+        )
+
+        await service.revoke_role_from_user(
+            actor_user_id=uuid.uuid4(),
+            assignment_id=first.id,
+            requesting_organization_id=None,
+        )
+
+        assert first.is_active is False
+
+    async def test_revoke_role_non_superadmin_global_role_not_guarded(self) -> None:
+        """The GLOBAL guard is specific to 'super-admin' -- another
+        GLOBAL-scoped role (e.g. Platform Support) is freely revocable even
+        as its sole holder, mirroring how the org guard targets only
+        'organization-owner'."""
+        service, repo, _cache = make_service()
+        support_role = await make_role(
+            repo, "Platform Support", scope_type=ScopeType.GLOBAL
+        )
+        assert support_role.slug != "super-admin"
+        assignment = await assign_role(
+            repo,
+            user_id=uuid.uuid4(),
+            role=support_role,
+            scope_type=ScopeType.GLOBAL,
+        )
+
+        await service.revoke_role_from_user(
+            actor_user_id=uuid.uuid4(),
+            assignment_id=assignment.id,
+            requesting_organization_id=None,
+        )
+
+        assert assignment.is_active is False
 
 
 # ============================================================================
