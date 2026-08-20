@@ -78,6 +78,7 @@ from app.domains.guest.router import deregister_radius_nas_client
 from app.domains.guest.service import RadiusService
 from app.domains.provisioning_engine.planner.constants import SnapshotTrigger
 from app.domains.provisioning_engine.planner.dependencies import (
+    get_configuration_plan_service,
     get_discovery_service,
     get_guest_input_service,
     get_wan_verification_service,
@@ -85,8 +86,13 @@ from app.domains.provisioning_engine.planner.dependencies import (
 from app.domains.provisioning_engine.planner.guest_input_service import (
     GuestInputService,
 )
+from app.domains.provisioning_engine.planner.plan_service import (
+    ConfigurationPlanService,
+)
 from app.domains.provisioning_engine.planner.schemas import (
+    BuildConfigurationPlanRequest,
     CompatibilityReport,
+    ConfigurationPlanResponse,
     DiscoverRouterResponse,
     GuestInterfaceAvailabilityResponse,
     RouterSnapshotListResponse,
@@ -1187,6 +1193,91 @@ async def get_guest_interface_availability(
         success=True,
         message="Guest interface availability evaluated",
         data=result.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/plans",
+    response_model=ApiResponse[ConfigurationPlanResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def build_router_configuration_plan(
+    request: Request,
+    router_id: uuid.UUID,
+    body: BuildConfigurationPlanRequest,
+    snapshot_id: uuid.UUID | None = Query(default=None),
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    plan_service: ConfigurationPlanService = Depends(get_configuration_plan_service),
+):
+    """Build and persist a configuration plan (snapshot + guest request)."""
+    result = await plan_service.build_plan(
+        router_id,
+        body,
+        snapshot_id=snapshot_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Configuration plan built",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/plans/{plan_id}",
+    response_model=ApiResponse[ConfigurationPlanResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.read"))],
+)
+async def get_router_configuration_plan(
+    request: Request,
+    router_id: uuid.UUID,
+    plan_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    plan_service: ConfigurationPlanService = Depends(get_configuration_plan_service),
+):
+    result = await plan_service.get_plan(
+        router_id,
+        plan_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Configuration plan retrieved",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/plans/{plan_id}/approve",
+    response_model=ApiResponse[ConfigurationPlanResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def approve_router_configuration_plan(
+    request: Request,
+    router_id: uuid.UUID,
+    plan_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    plan_service: ConfigurationPlanService = Depends(get_configuration_plan_service),
+):
+    result = await plan_service.approve_plan(
+        router_id,
+        plan_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Configuration plan approved",
+        data=result.model_dump(mode="json"),
         request_id=_request_id(request),
     )
 

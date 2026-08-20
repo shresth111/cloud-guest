@@ -12,6 +12,11 @@ from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 
 from .guest_input_service import GuestInputService
+from .plan_repository import (
+    ConfigurationPlanRepository,
+    ConfigurationPlanRepositoryProtocol,
+)
+from .plan_service import ConfigurationPlanService
 from .repository import RouterSnapshotRepository, RouterSnapshotRepositoryProtocol
 from .service import DiscoveryService
 from .verification_repository import (
@@ -64,10 +69,40 @@ def get_guest_input_service(
     return GuestInputService(repository, router_service, isp_service)
 
 
+def get_configuration_plan_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> ConfigurationPlanRepositoryProtocol:
+    return ConfigurationPlanRepository(db)
+
+
+def get_configuration_plan_service(
+    plan_repository: ConfigurationPlanRepositoryProtocol = Depends(
+        get_configuration_plan_repository
+    ),
+    snapshot_repository: RouterSnapshotRepositoryProtocol = Depends(
+        get_router_snapshot_repository
+    ),
+    verification_repository: VerificationRunRepositoryProtocol = Depends(
+        get_verification_run_repository
+    ),
+    router_service: RouterService = Depends(get_router_service),
+    isp_service: IspService = Depends(get_isp_service),
+) -> ConfigurationPlanService:
+    return ConfigurationPlanService(
+        plan_repository,
+        snapshot_repository,
+        verification_repository,
+        router_service,
+        isp_service,
+    )
+
+
 __all__ = [
     "get_router_snapshot_repository",
     "get_verification_run_repository",
     "get_discovery_service",
     "get_wan_verification_service",
     "get_guest_input_service",
+    "get_configuration_plan_repository",
+    "get_configuration_plan_service",
 ]

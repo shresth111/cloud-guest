@@ -16,6 +16,9 @@ from .constants import (
     CompatibilityCheckStatus,
     CompatibilityOverall,
     InterfaceAvailabilityStatus,
+    PlanActionType,
+    PlanRisk,
+    PlanStatus,
     SnapshotStatus,
     SnapshotTrigger,
     VerificationCheckStatus,
@@ -251,6 +254,63 @@ class GuestInterfaceAvailabilityResponse(BaseModel):
     recommendation: GuestInputRecommendation
 
 
+class GuestVlanRequest(BaseModel):
+    vlan_id: int
+    name: str
+    subnet_cidr: str
+    enable_hotspot: bool = True
+
+
+class GuestNetworkRequest(BaseModel):
+    guest_interfaces: list[str] = Field(default_factory=list)
+    vlan_mode: bool = False
+    vlans: list[GuestVlanRequest] = Field(default_factory=list)
+    parent_bridge: str | None = None
+
+
+class PlanAction(BaseModel):
+    seq: int
+    rule_id: str
+    action_type: PlanActionType
+    resource_kind: str
+    routeros_path: str
+    resource_ref: str
+    summary: str
+    risk: PlanRisk = PlanRisk.NONE
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class PlanDecision(BaseModel):
+    code: str
+    summary: str
+    detail: str | None = None
+    options: list[str] = Field(default_factory=list)
+
+
+class PlanSummary(BaseModel):
+    action_count: int = 0
+    conflict_count: int = 0
+    decision_count: int = 0
+    highest_risk: PlanRisk = PlanRisk.NONE
+
+
+class BuildConfigurationPlanRequest(BaseModel):
+    requested_config: GuestNetworkRequest
+
+
+class ConfigurationPlanResponse(BaseModel):
+    id: str
+    router_id: str
+    snapshot_id: str
+    status: PlanStatus
+    engine_version: str
+    requested_config: GuestNetworkRequest
+    actions: list[PlanAction]
+    conflicts: list[PlanConflict]
+    decisions: list[PlanDecision]
+    summary: PlanSummary
+
+
 __all__ = [
     "InterfaceSnapshot",
     "BridgeSnapshot",
@@ -280,4 +340,11 @@ __all__ = [
     "GuestInputRecommendation",
     "GuestInterfaceAvailabilityReport",
     "GuestInterfaceAvailabilityResponse",
+    "GuestVlanRequest",
+    "GuestNetworkRequest",
+    "PlanAction",
+    "PlanDecision",
+    "PlanSummary",
+    "BuildConfigurationPlanRequest",
+    "ConfigurationPlanResponse",
 ]

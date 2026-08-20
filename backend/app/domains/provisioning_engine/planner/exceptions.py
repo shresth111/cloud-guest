@@ -15,6 +15,8 @@ __all__ = [
     "DiscoveryMissingCredentialsError",
     "DiscoveryDeviceConnectionError",
     "NoWanLinksToVerifyError",
+    "ConfigurationPlanNotFoundError",
+    "ConfigurationPlanNotApprovableError",
 ]
 
 
@@ -68,5 +70,22 @@ class NoWanLinksToVerifyError(PlannerError):
     def __init__(self, router_id: uuid.UUID) -> None:
         super().__init__(
             f"Router '{router_id}' has no enabled WAN links to verify",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ConfigurationPlanNotFoundError(PlannerError):
+    def __init__(self, plan_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Configuration plan '{plan_id}' was not found",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class ConfigurationPlanNotApprovableError(PlannerError):
+    def __init__(self, plan_id: uuid.UUID, current_status: str) -> None:
+        super().__init__(
+            f"Configuration plan '{plan_id}' cannot be approved from status "
+            f"'{current_status}'",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
