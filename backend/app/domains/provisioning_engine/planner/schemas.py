@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from .constants import (
     CompatibilityCheckStatus,
     CompatibilityOverall,
+    FinalVerificationOverall,
     InterfaceAvailabilityStatus,
     PlanActionType,
     PlanRisk,
@@ -330,6 +331,30 @@ class ConfigurationPlanPrepareResponse(BaseModel):
     requires_safety_net: bool
 
 
+class ConfigurationPlanApplyResponse(BaseModel):
+    plan_id: str
+    config_version_id: str
+    provisioning_job_id: str
+    status: PlanStatus
+    config_version_status: str
+
+
+class FinalVerificationChecklistSummary(BaseModel):
+    total: int
+    passing: int
+    failing: int
+    not_checked: int
+
+
+class ConfigurationPlanFinalVerificationResponse(BaseModel):
+    plan_id: str
+    verification_run_id: str
+    overall: FinalVerificationOverall
+    checks: list[VerificationCheck]
+    checklist: FinalVerificationChecklistSummary
+    safety_net_removed: bool = False
+
+
 __all__ = [
     "InterfaceSnapshot",
     "BridgeSnapshot",
@@ -368,4 +393,7 @@ __all__ = [
     "ConfigurationPlanResponse",
     "ConfigurationPlanRenderResponse",
     "ConfigurationPlanPrepareResponse",
+    "ConfigurationPlanApplyResponse",
+    "ConfigurationPlanFinalVerificationResponse",
+    "FinalVerificationChecklistSummary",
 ]

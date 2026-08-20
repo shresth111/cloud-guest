@@ -92,6 +92,8 @@ from app.domains.provisioning_engine.planner.plan_service import (
 from app.domains.provisioning_engine.planner.schemas import (
     BuildConfigurationPlanRequest,
     CompatibilityReport,
+    ConfigurationPlanApplyResponse,
+    ConfigurationPlanFinalVerificationResponse,
     ConfigurationPlanPrepareResponse,
     ConfigurationPlanRenderResponse,
     ConfigurationPlanResponse,
@@ -112,6 +114,8 @@ from app.domains.rbac.dependencies import (
     RequirePermission,
 )
 from app.domains.rbac.enums import ScopeType
+from app.domains.readiness.dependencies import get_readiness_service
+from app.domains.readiness.service import ReadinessService
 from app.domains.router_agent.dependencies import get_router_agent_service
 from app.domains.router_agent.service import RouterAgentService
 from app.domains.router_provisioning.dependencies import get_router_provisioning_service
@@ -1347,6 +1351,74 @@ async def prepare_router_configuration_plan(
     return build_response(
         success=True,
         message="Configuration plan prepared",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/plans/{plan_id}/apply",
+    response_model=ApiResponse[ConfigurationPlanApplyResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def apply_router_configuration_plan(
+    request: Request,
+    router_id: uuid.UUID,
+    plan_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    plan_service: ConfigurationPlanService = Depends(get_configuration_plan_service),
+    provisioning_service: RouterProvisioningService = Depends(
+        get_router_provisioning_service
+    ),
+):
+    """Push a rendered plan to the device via the provisioning apply pipeline."""
+    result = await plan_service.apply_plan(
+        router_id,
+        plan_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+        version_applier=provisioning_service,
+    )
+    return build_response(
+        success=True,
+        message="Configuration plan applied",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/plans/{plan_id}/verify/final",
+    response_model=ApiResponse[ConfigurationPlanFinalVerificationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def final_verify_router_configuration_plan(
+    request: Request,
+    router_id: uuid.UUID,
+    plan_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    plan_service: ConfigurationPlanService = Depends(get_configuration_plan_service),
+    provisioning_service: RouterProvisioningService = Depends(
+        get_router_provisioning_service
+    ),
+    readiness_service: ReadinessService = Depends(get_readiness_service),
+):
+    result = await plan_service.verify_plan_final(
+        router_id,
+        plan_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+        readiness_service=readiness_service,
+        version_applier=provisioning_service,
+        config_version_creator=provisioning_service,
+    )
+    return build_response(
+        success=True,
+        message="Final verification completed",
         data=result.model_dump(mode="json"),
         request_id=_request_id(request),
     )

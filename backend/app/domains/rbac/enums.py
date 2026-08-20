@@ -274,6 +274,10 @@ class AuditAction(StrEnum):
     ROUTER_CONFIG_VERSION_ROLLED_BACK = "router_config_version_rolled_back"
     ROUTER_BACKUP_CREATED = "router_backup_created"
     ROUTER_RESTORE_COMPLETED = "router_restore_completed"
+    ROUTER_CONFIGURATION_PLAN_APPLIED = "router_configuration_plan_applied"
+    ROUTER_CONFIGURATION_PLAN_FINAL_VERIFIED = (
+        "router_configuration_plan_final_verified"
+    )
     ROUTER_WAN_ROUTING_MODE_CHANGED = "router_wan_routing_mode_changed"
 
     # WireGuard domain events (Module 009 Part 3) -- written through this
