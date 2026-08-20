@@ -48,19 +48,14 @@ from .service import NetworkConfigService
 
 router = APIRouter(prefix="/network-config", tags=["Network Configuration Management"])
 
-# The dashboard's SSH-capable config-push bridge -- same small agent
-# (running alongside the WireGuard hub) that already backs
-# app.domains.wireguard.router's own _WG_AGENT_URL/_WG_AGENT_SECRET,
-# mirrored here with the identical naming/module-level-constant
-# convention. Previously called directly from the browser
-# (RouterDetailTabs.tsx's ConfigTab.handlePush) -- a plain http:// URL
-# with the secret shipped in the JS bundle, silently blocked as mixed
-# content once the app moved to HTTPS. Calling it from here instead
-# sidesteps that (a server has no browser mixed-content policy) and
-# keeps the secret out of client code entirely, mirroring exactly how
-# the WireGuard/RADIUS bridges already avoid a direct browser call.
-_CONFIG_AGENT_URL = "http://20.219.72.235:9093/config/apply"
-_CONFIG_AGENT_SECRET = "configagent-55952aac79cbbf5ac9dc404c228ed5b7"
+# The SSH-capable config-agent bridge this module's apply-live endpoint
+# forwards to is a RETIRED transport (router-fleet plan section A1: the
+# vendored wyfy_device_gateway over the WireGuard tunnel is the transport
+# of record). Its URL and shared secret -- previously hardcoded module
+# constants here, i.e. a live credential committed to source -- now live
+# in Settings (config_agent_url / config_agent_secret) and default to
+# empty, which disables the endpoint below with an honest
+# "bridge disabled" response instead of a network call.
 
 
 def _request_id(request: Request) -> str:
@@ -207,6 +202,7 @@ async def apply_network_config_live(
         get_router_provisioning_service
     ),
     router_service: RouterService = Depends(get_router_service),
+    settings: Settings = Depends(get_settings),
 ):
     """Server-side equivalent of what ``ConfigTab.handlePush`` (frontend)
     previously did itself in two direct browser calls: fetch this
@@ -221,7 +217,32 @@ async def apply_network_config_live(
     ``reveal_credentials`` (not a lower-tier read) is the right gate here
     too -- this is the same real, high-trust device operation, exposing
     the same decrypted secret, just consumed server-side instead of
-    handed back to the browser."""
+    handed back to the browser.
+
+    The bridge transport itself is retired (see the module-level note):
+    unless a deployment explicitly re-enables it via
+    ``CLOUDGUEST_CONFIG_AGENT_URL``/``CLOUDGUEST_CONFIG_AGENT_SECRET``,
+    this endpoint reports the bridge as disabled -- before fetching the
+    version or revealing any credential -- rather than calling it."""
+    if not settings.config_agent_url or not settings.config_agent_secret:
+        payload = NetworkConfigApplyLiveResponse(
+            router_id=str(router_id),
+            version_id=str(version_id),
+            applied=False,
+            detail=(
+                "The config-agent bridge is disabled on this deployment "
+                "(retired transport; not configured via "
+                "CLOUDGUEST_CONFIG_AGENT_URL/CLOUDGUEST_CONFIG_AGENT_SECRET). "
+                "Use the queued agent push instead."
+            ),
+        )
+        return build_response(
+            success=True,
+            message="Config-agent bridge is disabled",
+            data=payload.model_dump(),
+            request_id=_request_id(request),
+        )
+
     version = await provisioning_service.get_version(
         router_id=router_id,
         version_id=version_id,
@@ -252,8 +273,8 @@ async def apply_network_config_live(
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                _CONFIG_AGENT_URL,
-                headers={"X-Agent-Secret": _CONFIG_AGENT_SECRET},
+                settings.config_agent_url,
+                headers={"X-Agent-Secret": settings.config_agent_secret},
                 json={
                     "tunnel_ip": host,
                     "username": username,

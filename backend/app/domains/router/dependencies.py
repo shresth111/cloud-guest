@@ -32,10 +32,21 @@ from .device_credential_rotator import ConfigAgentBridgeCredentialRotator
 from .repository import RouterRepository, RouterRepositoryProtocol
 from .service import RouterService
 
-# Module-level singleton -- stateless (see ConfigAgentBridgeCredentialRotator's
-# own docstring), so there is no reason to build a fresh one per request the
-# way the DB-backed dependencies below need to.
-_credential_rotator = ConfigAgentBridgeCredentialRotator()
+
+def _build_credential_rotator(
+    settings: Settings,
+) -> ConfigAgentBridgeCredentialRotator | None:
+    """The config-agent bridge is a retired transport whose coordinates
+    (previously hardcoded constants -- a live secret in source) now come
+    from Settings and default to empty. Unconfigured => ``None``, which
+    ``RouterService._rotate_live_device_credential`` documents as the
+    persist-only fallback (no live device push, no hard failure)."""
+    if not settings.config_agent_url or not settings.config_agent_secret:
+        return None
+    return ConfigAgentBridgeCredentialRotator(
+        agent_url=settings.config_agent_url,
+        agent_secret=settings.config_agent_secret,
+    )
 
 
 def get_router_repository(
@@ -61,6 +72,7 @@ def get_router_service(
         # see RouterLiveCredentialRotationFailedError's own docstring:
         # without this, PUT /routers/{id} would happily persist a new
         # api_secret with no guarantee the physical device was ever told
-        # about it.
-        credential_rotator=_credential_rotator,
+        # about it. None when the (retired) config-agent bridge is not
+        # configured -- see _build_credential_rotator.
+        credential_rotator=_build_credential_rotator(settings),
     )
