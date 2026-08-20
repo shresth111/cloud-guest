@@ -89,6 +89,7 @@ from .exceptions import (
 from .models import CaptivePortalConfig
 from .repository import CaptivePortalRepositoryProtocol
 from .validators import (
+    SPLASH_TEXT_MAX_LENGTHS,
     validate_background_focal_point,
     validate_background_overlay_strength,
     validate_business_hours_schedule,
@@ -97,6 +98,7 @@ from .validators import (
     validate_guest_font_choice,
     validate_hex_color,
     validate_single_content_source,
+    validate_splash_text_length,
 )
 
 logger = logging.getLogger(__name__)
@@ -337,6 +339,22 @@ class _CachedCaptivePortalConfig:
     background_focal_y: int
 
 
+def _splash_text_changed(incoming: object, stored: object) -> bool:
+    """Whether an incoming splash value is a real change to what the guest
+    already sees.
+
+    Compares the **stripped** forms because that is what the frontend
+    renders (``useGuestSignIn.ts:100``): a value that differs only in
+    surrounding whitespace changes nothing on the portal and must not
+    trip the length validator. ``None`` and ``""`` are both "no splash
+    string" and are equivalent here for the same reason.
+    """
+    def _norm(value: object) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    return _norm(incoming) != _norm(stored)
+
+
 def _config_to_cache_payload(config: CaptivePortalConfig) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": str(config.id),
@@ -452,6 +470,12 @@ class CaptivePortalService:
             privacy_policy_text, privacy_policy_url, field_label=PRIVACY_POLICY_LABEL
         )
         validate_default_scope(is_default=is_default, location_id=location_id)
+        # v7 §Part 2 (W2). Unconditional on create -- there is no existing
+        # value to grandfather, so a brand-new config never gets to start
+        # life over the limit. See update_config for why the same check is
+        # conditional there.
+        validate_splash_text_length("splash_headline", splash_headline)
+        validate_splash_text_length("splash_welcome_message", splash_welcome_message)
 
         organization = await self.organization_lookup.get_organization(organization_id)
         if (
@@ -610,6 +634,33 @@ class CaptivePortalService:
             field_name = f"background_focal_{axis}"
             if field_name in update_data:
                 validate_background_focal_point(axis, update_data[field_name])
+
+        # v7 §Part 2 (W2). Deliberately fires only when the value is
+        # actually *changing*, not merely present in the payload.
+        #
+        # There are live rows over these ceilings -- the fields shipped
+        # with no validation anywhere in the chain, `splash_welcome_message`
+        # as an unbounded `Text` column. Rejecting on any write that
+        # mentions the field would mean a venue with a long existing
+        # message could not change their logo without first rewriting
+        # their copy, and the dashboard PUTs its whole form, so it mentions
+        # the field on every save. Rejecting on *change* grandfathers those
+        # rows: the venue keeps rendering exactly what they wrote, and the
+        # limit binds the moment they next edit that string -- which is
+        # also the only moment a live character counter is in front of
+        # them to explain it.
+        #
+        # The trade-off, stated rather than hidden: an over-limit legacy
+        # value survives indefinitely if never edited. Surfacing those rows
+        # is a dashboard warning and a backfill report, not a write-path
+        # rejection.
+        for splash_field in SPLASH_TEXT_MAX_LENGTHS:
+            if splash_field not in update_data:
+                continue
+            incoming = update_data[splash_field]
+            if not _splash_text_changed(incoming, getattr(config, splash_field)):
+                continue
+            validate_splash_text_length(splash_field, incoming)
 
         if merged_is_default and not config.is_default:
             await self._clear_existing_default(

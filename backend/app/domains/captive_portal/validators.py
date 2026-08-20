@@ -18,6 +18,8 @@ from .constants import (
     MAX_BACKGROUND_OVERLAY_STRENGTH,
     MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
+    SPLASH_HEADLINE_MAX_LENGTH,
+    SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
     GuestFontChoice,
 )
 from .exceptions import (
@@ -28,6 +30,7 @@ from .exceptions import (
     InvalidGuestFontChoiceError,
     InvalidHexColorError,
     InvalidPortalContentSourceError,
+    SplashTextTooLongError,
 )
 
 _WEEKDAYS = (
@@ -125,6 +128,41 @@ def validate_background_focal_point(axis: str, value: object) -> None:
         raise InvalidBackgroundFocalPointError(axis, value)
 
 
+# The two venue-authored splash strings and their ceilings, so the service
+# layer never has to remember which constant belongs to which field.
+SPLASH_TEXT_MAX_LENGTHS: dict[str, int] = {
+    "splash_headline": SPLASH_HEADLINE_MAX_LENGTH,
+    "splash_welcome_message": SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
+}
+
+
+def validate_splash_text_length(field_name: str, value: object) -> None:
+    """Raises ``SplashTextTooLongError`` if ``value`` is longer than
+    ``field_name``'s rendered-line budget -- v7 design spec §Part 2 (W2).
+    See ``constants.py`` for how each ceiling was derived.
+
+    ``None`` and blank pass: clearing a splash string is always legal, and
+    v5 §3.2 requires a venue with no welcome message to render no line at
+    all rather than filler.
+
+    Length is counted over the **stripped** value in Unicode code points,
+    because that is exactly the string the guest sees -- the frontend
+    renders ``config.splashWelcomeMessage?.trim()``
+    (``useGuestSignIn.ts:100``). Charging a venue for trailing whitespace
+    that costs no rendered width would be a validator disagreeing with
+    the renderer it exists to protect.
+
+    A ``field_name`` with no ceiling is a no-op rather than an error, so
+    this can be called unconditionally from the write path.
+    """
+    max_length = SPLASH_TEXT_MAX_LENGTHS.get(field_name)
+    if max_length is None or not isinstance(value, str):
+        return
+    actual = len(value.strip())
+    if actual > max_length:
+        raise SplashTextTooLongError(field_name, actual, max_length)
+
+
 def validate_default_scope(*, is_default: bool, location_id: uuid.UUID | None) -> None:
     """Raises ``InvalidDefaultConfigScopeError`` if ``is_default=True`` is
     requested alongside a non-null ``location_id`` -- ``is_default`` only
@@ -217,6 +255,8 @@ def is_open_now(
 __all__ = [
     "validate_hex_color",
     "validate_single_content_source",
+    "validate_splash_text_length",
+    "SPLASH_TEXT_MAX_LENGTHS",
     "validate_default_scope",
     "validate_business_hours_timezone",
     "validate_business_hours_schedule",

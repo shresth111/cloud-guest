@@ -29,6 +29,8 @@ from app.domains.captive_portal.constants import (
     DEFAULT_BACKGROUND_FOCAL_Y,
     DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
     DEFAULT_GUEST_FONT_CHOICE,
+    SPLASH_HEADLINE_MAX_LENGTH,
+    SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
     TERMS_AND_CONDITIONS_LABEL,
     GuestFontChoice,
 )
@@ -43,6 +45,7 @@ from app.domains.captive_portal.exceptions import (
     InvalidHexColorError,
     InvalidPortalContentSourceError,
     MissingPortalResolutionParamsError,
+    SplashTextTooLongError,
 )
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import CaptivePortalService
@@ -53,6 +56,7 @@ from app.domains.captive_portal.validators import (
     validate_guest_font_choice,
     validate_hex_color,
     validate_single_content_source,
+    validate_splash_text_length,
 )
 from app.domains.location.exceptions import (
     CrossOrganizationLocationAccessError,
@@ -376,6 +380,8 @@ async def _create_config(
     privacy_policy_url: str | None = None,
     social_login_enabled: bool = False,
     social_login_providers: list[str] | None = None,
+    splash_headline: str | None = None,
+    splash_welcome_message: str | None = None,
     # True (the real, standard "OTP once, then a saved password" baseline
     # -- see CaptivePortalConfig.username_password_enabled's own
     # docstring) mirrors this helper's own otp_sms_enabled/voucher_enabled
@@ -412,8 +418,8 @@ async def _create_config(
         terms_and_conditions_url=terms_and_conditions_url,
         privacy_policy_text=privacy_policy_text,
         privacy_policy_url=privacy_policy_url,
-        splash_headline=None,
-        splash_welcome_message=None,
+        splash_headline=splash_headline,
+        splash_welcome_message=splash_welcome_message,
         redirect_url=None,
         otp_sms_enabled=True,
         otp_email_enabled=False,
@@ -1696,3 +1702,291 @@ class TestResolveSurfacesBackgroundImageMetrics:
 
         assert data["background_focal_x"] == 35
         assert data["background_focal_y"] == 15
+
+
+# ============================================================================
+# v7 §Part 2 (W2) -- splash text length limits
+# ============================================================================
+
+
+# Realistic venue copy, one string per script, sized to sit exactly on each
+# side of the limit. Written out rather than generated from "x" * N so the
+# per-script cases are genuinely per-script: the whole point of the limit is
+# that the same character count renders as a different number of lines in
+# different scripts, and a test that only ever measures `len()` of ASCII
+# would pass even if the constant were derived from the wrong script.
+_WELCOME_AT_LIMIT = {
+    "en": (
+        "Welcome to The Grand Palace Hotel. Enjoy complimentary WiFi"
+        " during your stay with us today."
+    ),
+    "hi": (
+        "ग्रैंड पैलेस होटल में आपका स्वागत है।"
+        " प्रवास के दौरान निःशुल्क वाईफाई का आनंद लें।"
+    ),
+    "ta": (
+        "கிராண்ட் பேலஸ் ஹோட்டலுக்கு வரவேற்கிறோம்."
+        " இலவச வைஃபையை அனுபவியுங்கள்."
+    ),
+    "ml": (
+        "ഗ്രാൻഡ് പാലസിലേക്ക് സ്വാഗതം."
+        " സൗജന്യ വൈഫൈ ആസ്വദിക്കൂ. നന്ദി."
+    ),
+    "ar": (
+        "مرحبًا بكم في فندق جراند بالاس."
+        " استمتعوا بإنترنت لاسلكي مجاني وعالي السرعة طوال إقامتكم."
+    ),
+}
+
+
+class TestSplashTextLengthConstants:
+    """The limits are load-bearing numbers with a written derivation
+    (constants.py). Pin them so a casual edit to either is a failing test
+    and not a silently-shipped layout regression."""
+
+    def test_limits_are_the_derived_values(self) -> None:
+        assert SPLASH_WELCOME_MESSAGE_MAX_LENGTH == 92
+        assert SPLASH_HEADLINE_MAX_LENGTH == 26
+
+    def test_headline_limit_is_tighter_than_the_welcome_limit(self) -> None:
+        # pg-title is 26px against pg-body's 15px -- the same character
+        # count buys far fewer headline lines, so one limit cannot cover
+        # both fields.
+        assert SPLASH_HEADLINE_MAX_LENGTH < SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+
+    def test_headline_limit_is_inside_the_stored_column(self) -> None:
+        # splash_headline is String(200); the domain limit must stay
+        # strictly tighter or the validator stops being the thing that
+        # rejects over-length input.
+        column = CaptivePortalConfig.__table__.columns["splash_headline"]
+        assert column.type.length > SPLASH_HEADLINE_MAX_LENGTH
+
+
+class TestSplashTextLengthValidator:
+    def test_accepts_value_exactly_at_the_limit(self) -> None:
+        validate_splash_text_length(
+            "splash_welcome_message", "x" * SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+        )
+
+    def test_rejects_one_character_over_the_limit(self) -> None:
+        with pytest.raises(SplashTextTooLongError) as exc:
+            validate_splash_text_length(
+                "splash_welcome_message",
+                "x" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 1),
+            )
+        assert exc.value.status_code == 400
+
+    def test_error_carries_the_limit_and_the_actual_length(self) -> None:
+        # The dashboard has to be able to render "94 of 92" next to a live
+        # counter; a bare "string too long" would be worse than the render
+        # truncation this replaces.
+        over = SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 2
+        with pytest.raises(SplashTextTooLongError) as exc:
+            validate_splash_text_length("splash_welcome_message", "x" * over)
+        assert exc.value.data == {
+            "field": "splash_welcome_message",
+            "max_length": SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
+            "actual_length": over,
+        }
+
+    def test_counts_the_stripped_value(self) -> None:
+        # The frontend renders `splashWelcomeMessage?.trim()`, so leading
+        # and trailing whitespace costs zero rendered width and must not
+        # be charged against the venue.
+        padded = "   " + "x" * SPLASH_WELCOME_MESSAGE_MAX_LENGTH + "   "
+        validate_splash_text_length("splash_welcome_message", padded)
+
+    def test_counts_code_points_not_utf16_units(self) -> None:
+        # An emoji is one code point to Python and two UTF-16 units to
+        # JavaScript's `.length`. The backend counts code points, so the
+        # dashboard counter must use `[...value].length` to agree.
+        value = "\U0001f60a" * SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+        assert len(value) == SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+        validate_splash_text_length("splash_welcome_message", value)
+
+    def test_none_and_blank_always_pass(self) -> None:
+        # Clearing a splash string is always legal; v5 §3.2 requires a
+        # venue with no welcome message to render no line at all.
+        validate_splash_text_length("splash_welcome_message", None)
+        validate_splash_text_length("splash_welcome_message", "")
+        validate_splash_text_length("splash_welcome_message", "     ")
+
+    def test_unknown_field_is_a_no_op(self) -> None:
+        validate_splash_text_length("primary_color", "x" * 5000)
+
+    @pytest.mark.parametrize("language", sorted(_WELCOME_AT_LIMIT))
+    def test_realistic_copy_at_the_limit_passes_in_every_script(
+        self, language: str
+    ) -> None:
+        sample = _WELCOME_AT_LIMIT[language]
+        assert len(sample) <= SPLASH_WELCOME_MESSAGE_MAX_LENGTH, (
+            f"{language} sample is {len(sample)} chars, over the limit"
+        )
+        validate_splash_text_length("splash_welcome_message", sample)
+
+    @pytest.mark.parametrize("language", sorted(_WELCOME_AT_LIMIT))
+    def test_realistic_copy_over_the_limit_is_rejected_in_every_script(
+        self, language: str
+    ) -> None:
+        # Same real sentence in each script, extended past the ceiling --
+        # the limit is a single global number, so it must bite identically
+        # whichever script the venue writes in.
+        sample = _WELCOME_AT_LIMIT[language]
+        padding = "०" if language in {"hi"} else "a"
+        over = sample + padding * (
+            SPLASH_WELCOME_MESSAGE_MAX_LENGTH - len(sample) + 1
+        )
+        with pytest.raises(SplashTextTooLongError) as exc:
+            validate_splash_text_length("splash_welcome_message", over)
+        assert exc.value.data["actual_length"] == len(over)
+
+
+class TestSplashTextLengthOnCreate:
+    async def test_over_limit_welcome_message_is_rejected(self) -> None:
+        fx = make_service()
+        with pytest.raises(SplashTextTooLongError):
+            await _create_config(
+                fx,
+                splash_welcome_message="x" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 1),
+            )
+
+    async def test_over_limit_headline_is_rejected(self) -> None:
+        fx = make_service()
+        with pytest.raises(SplashTextTooLongError) as exc:
+            await _create_config(
+                fx, splash_headline="x" * (SPLASH_HEADLINE_MAX_LENGTH + 1)
+            )
+        assert exc.value.data["field"] == "splash_headline"
+
+    async def test_at_limit_values_are_accepted(self) -> None:
+        fx = make_service()
+        config = await _create_config(
+            fx,
+            splash_headline="x" * SPLASH_HEADLINE_MAX_LENGTH,
+            splash_welcome_message="x" * SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
+        )
+        assert len(config.splash_welcome_message) == SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+
+
+class TestSplashTextLengthOnUpdate:
+    async def test_over_limit_edit_is_rejected(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, splash_welcome_message="Short and sweet.")
+        with pytest.raises(SplashTextTooLongError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={
+                    "splash_welcome_message": "y"
+                    * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 1)
+                },
+            )
+
+    async def test_existing_over_limit_row_can_still_be_edited_elsewhere(self) -> None:
+        # The grandfathering case, and the reason the check fires on change
+        # rather than on presence: there are live rows over the ceiling
+        # (these fields shipped with no validation at all), and a venue
+        # with a long legacy message must not be blocked from changing
+        # their logo until they rewrite their copy. The dashboard PUTs its
+        # whole form, so the field is present on every save.
+        fx = make_service()
+        legacy = "z" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 40)
+        config = await _create_config(fx)
+        config.splash_welcome_message = legacy  # simulate a pre-validation row
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={
+                "logo_url": "https://cdn.example.com/logo.png",
+                "splash_welcome_message": legacy,
+            },
+        )
+        assert updated.logo_url == "https://cdn.example.com/logo.png"
+        assert updated.splash_welcome_message == legacy
+
+    async def test_whitespace_only_difference_is_not_a_change(self) -> None:
+        # The renderer trims, so a value differing only in surrounding
+        # whitespace changes nothing on the portal and must not trip the
+        # validator on a grandfathered row.
+        fx = make_service()
+        legacy = "z" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 10)
+        config = await _create_config(fx)
+        config.splash_welcome_message = legacy
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"splash_welcome_message": f"  {legacy}  "},
+        )
+        assert updated.splash_welcome_message == f"  {legacy}  "
+
+    async def test_grandfathered_row_editing_the_field_is_rejected(self) -> None:
+        # The limit binds the moment the venue next touches that string --
+        # which is also the only moment a live counter is in front of them.
+        fx = make_service()
+        legacy = "z" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 40)
+        config = await _create_config(fx)
+        config.splash_welcome_message = legacy
+
+        with pytest.raises(SplashTextTooLongError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"splash_welcome_message": legacy + " and one more sentence."},
+            )
+
+    async def test_grandfathered_row_can_be_brought_under_the_limit(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        config.splash_welcome_message = "z" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 40)
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"splash_welcome_message": "Free WiFi, on us."},
+        )
+        assert updated.splash_welcome_message == "Free WiFi, on us."
+
+    async def test_clearing_an_over_limit_value_is_allowed(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        config.splash_welcome_message = "z" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 40)
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"splash_welcome_message": None},
+        )
+        assert updated.splash_welcome_message is None
+
+    async def test_headline_and_welcome_are_validated_independently(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        # A value legal for the welcome message is over the headline's own,
+        # much tighter, ceiling.
+        between = "x" * (SPLASH_HEADLINE_MAX_LENGTH + 1)
+        assert len(between) <= SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"splash_welcome_message": between},
+        )
+        assert updated.splash_welcome_message == between
+
+        with pytest.raises(SplashTextTooLongError) as exc:
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"splash_headline": between},
+            )
+        assert exc.value.data["field"] == "splash_headline"

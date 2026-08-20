@@ -23,6 +23,8 @@ from .constants import (
     DEFAULT_SECONDARY_COLOR,
     DEFAULT_SUPPORTED_LANGUAGES,
     DEFAULT_THEME,
+    SPLASH_HEADLINE_MAX_LENGTH,
+    SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
 )
 
 __all__ = [
@@ -73,8 +75,30 @@ class CaptivePortalConfigCreateRequest(BaseModel):
     terms_and_conditions_url: str | None = Field(default=None, max_length=500)
     privacy_policy_text: str | None = Field(default=None)
     privacy_policy_url: str | None = Field(default=None, max_length=500)
-    splash_headline: str | None = Field(default=None, max_length=200)
-    splash_welcome_message: str | None = Field(default=None)
+    splash_headline: str | None = Field(
+        default=None,
+        description=(
+            "Venue-authored portal headline. Capped at "
+            f"{SPLASH_HEADLINE_MAX_LENGTH} characters (v7 design spec "
+            "§Part 2 / W2) -- a 2-rendered-line budget measured on a "
+            "360x640 device in the widest supported script. Over-limit "
+            "values are rejected with a 400 carrying `max_length` and "
+            "`actual_length`, never truncated. Counted over the stripped "
+            "value in Unicode code points."
+        ),
+    )
+    splash_welcome_message: str | None = Field(
+        default=None,
+        description=(
+            "Venue-authored portal welcome message. Capped at "
+            f"{SPLASH_WELCOME_MESSAGE_MAX_LENGTH} characters (v7 design "
+            "spec §Part 2 / W2) -- a 3-rendered-line budget, beyond which "
+            "the primary 'Connect' button is pushed below the fold. "
+            "Over-limit values are rejected with a 400 carrying "
+            "`max_length` and `actual_length`, never truncated. Counted "
+            "over the stripped value in Unicode code points."
+        ),
+    )
     redirect_url: str | None = Field(default=None, max_length=500)
     otp_sms_enabled: bool = Field(default=True)
     otp_email_enabled: bool = Field(default=False)
@@ -170,8 +194,30 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     terms_and_conditions_url: str | None = Field(default=None, max_length=500)
     privacy_policy_text: str | None = Field(default=None)
     privacy_policy_url: str | None = Field(default=None, max_length=500)
-    splash_headline: str | None = Field(default=None, max_length=200)
-    splash_welcome_message: str | None = Field(default=None)
+    splash_headline: str | None = Field(
+        default=None,
+        description=(
+            "Venue-authored portal headline. Capped at "
+            f"{SPLASH_HEADLINE_MAX_LENGTH} characters (v7 design spec "
+            "§Part 2 / W2) -- a 2-rendered-line budget measured on a "
+            "360x640 device in the widest supported script. Over-limit "
+            "values are rejected with a 400 carrying `max_length` and "
+            "`actual_length`, never truncated. Counted over the stripped "
+            "value in Unicode code points."
+        ),
+    )
+    splash_welcome_message: str | None = Field(
+        default=None,
+        description=(
+            "Venue-authored portal welcome message. Capped at "
+            f"{SPLASH_WELCOME_MESSAGE_MAX_LENGTH} characters (v7 design "
+            "spec §Part 2 / W2) -- a 3-rendered-line budget, beyond which "
+            "the primary 'Connect' button is pushed below the fold. "
+            "Over-limit values are rejected with a 400 carrying "
+            "`max_length` and `actual_length`, never truncated. Counted "
+            "over the stripped value in Unicode code points."
+        ),
+    )
     redirect_url: str | None = Field(default=None, max_length=500)
     otp_sms_enabled: bool | None = Field(default=None)
     otp_email_enabled: bool | None = Field(default=None)
