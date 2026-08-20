@@ -85,6 +85,14 @@ class WanVerificationOverall(StrEnum):
     DISABLED = "DISABLED"
 
 
+class FinalVerificationOverall(StrEnum):
+    """Aggregate post-provisioning verification result (P19)."""
+
+    ROUTER_ONLINE = "ROUTER_ONLINE"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+
+
 class VerificationCheckStatus(StrEnum):
     PASS = "PASS"
     WARNING = "WARNING"
@@ -172,6 +180,7 @@ __all__ = [
     "CompatibilityCheckStatus",
     "VerificationScope",
     "WanVerificationOverall",
+    "FinalVerificationOverall",
     "VerificationCheckStatus",
     "PlanStatus",
     "InterfaceAvailabilityStatus",

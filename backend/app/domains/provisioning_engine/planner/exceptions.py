@@ -19,6 +19,8 @@ __all__ = [
     "ConfigurationPlanNotApprovableError",
     "ConfigurationPlanNotRenderableError",
     "ConfigurationPlanNotPreparableError",
+    "ConfigurationPlanNotAppliableError",
+    "ConfigurationPlanNotVerifiableError",
 ]
 
 
@@ -106,6 +108,23 @@ class ConfigurationPlanNotPreparableError(PlannerError):
     def __init__(self, plan_id: uuid.UUID, current_status: str) -> None:
         super().__init__(
             f"Configuration plan '{plan_id}' cannot be prepared from status "
+            f"'{current_status}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ConfigurationPlanNotAppliableError(PlannerError):
+    def __init__(self, plan_id: uuid.UUID, detail: str) -> None:
+        super().__init__(
+            f"Configuration plan '{plan_id}' cannot be applied: {detail}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ConfigurationPlanNotVerifiableError(PlannerError):
+    def __init__(self, plan_id: uuid.UUID, current_status: str) -> None:
+        super().__init__(
+            f"Configuration plan '{plan_id}' cannot be final-verified from status "
             f"'{current_status}'",
             status_code=status.HTTP_400_BAD_REQUEST,
         )

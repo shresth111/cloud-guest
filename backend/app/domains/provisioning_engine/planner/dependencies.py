@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.session import get_db_session
 from app.domains.isp.dependencies import get_isp_service
 from app.domains.isp.service import IspService
+from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 
@@ -100,6 +102,7 @@ def get_configuration_plan_service(
     ),
     router_service: RouterService = Depends(get_router_service),
     isp_service: IspService = Depends(get_isp_service),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ) -> ConfigurationPlanService:
     return ConfigurationPlanService(
         plan_repository,
@@ -108,6 +111,7 @@ def get_configuration_plan_service(
         managed_resource_repository,
         router_service,
         isp_service,
+        audit_repository,
     )
 
 

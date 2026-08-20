@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
 
+from .constants import ManagedResourceStatus
 from .managed_resource_models import ManagedRouterResource
 
 
@@ -20,6 +22,10 @@ class ManagedRouterResourceRepositoryProtocol(Protocol):
     async def list_for_plan(
         self, plan_id: uuid.UUID, *, router_id: uuid.UUID | None = None
     ) -> list[ManagedRouterResource]: ...
+
+    async def mark_applied_for_plan(
+        self, plan_id: uuid.UUID, *, router_id: uuid.UUID
+    ) -> None: ...
 
 
 class ManagedRouterResourceRepository:
@@ -42,6 +48,19 @@ class ManagedRouterResourceRepository:
         if router_id is not None:
             filters["router_id"] = router_id
         return await self.resources.get_all(filters=filters, limit=500)
+
+    async def mark_applied_for_plan(
+        self, plan_id: uuid.UUID, *, router_id: uuid.UUID
+    ) -> None:
+        rows = await self.list_for_plan(plan_id, router_id=router_id)
+        for row in rows:
+            await self.resources.update(
+                row,
+                {
+                    "status": ManagedResourceStatus.APPLIED.value,
+                    "applied_at": datetime.now(UTC),
+                },
+            )
 
 
 __all__ = [
