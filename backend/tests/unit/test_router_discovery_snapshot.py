@@ -37,8 +37,12 @@ from app.domains.provisioning_engine.planner.compatibility import (
 from app.domains.provisioning_engine.planner.constants import (
     CompatibilityCheckStatus,
     CompatibilityOverall,
+    ManagedResourceStatus,
     SnapshotStatus,
     SnapshotTrigger,
+)
+from app.domains.provisioning_engine.planner.managed_resources import (
+    build_managed_resource_backfill_rows,
 )
 from app.domains.provisioning_engine.planner.models import RouterSnapshot
 from app.domains.provisioning_engine.planner.service import DiscoveryService
@@ -503,3 +507,74 @@ async def test_discovery_service_persists_snapshot_and_compatibility() -> None:
 
     compat = await service.get_compatibility(router.id)
     assert compat.overall == CompatibilityOverall.PASS
+
+
+# ============================================================================
+# Live-venue Phase B — managed resource backfill on discover
+# ============================================================================
+
+
+def test_build_managed_resource_backfill_rows_from_snapshot() -> None:
+    capture = _canned_capture()
+    fields = collect_snapshot_fields(capture)
+    router_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    loc_id = uuid.uuid4()
+    applied_at = _now()
+    rows = build_managed_resource_backfill_rows(
+        fields,
+        capture,
+        router_id=router_id,
+        organization_id=org_id,
+        location_id=loc_id,
+        applied_at=applied_at,
+    )
+    tags = {row["comment_tag"] for row in rows}
+    assert "WYFYGUEST-guest-bridge" in tags
+    assert "cloudguest-vlan-100" in tags
+    assert "WYFYGUEST-dhcp" in tags
+    assert "WYFYGUEST-hotspot" in tags
+    assert "WYFYGUEST-accept-guest" in tags
+    assert "WYFYGUEST-masq" in tags
+    assert all(row["plan_id"] is None for row in rows)
+    assert all(row["status"] == ManagedResourceStatus.APPLIED.value for row in rows)
+    assert all(row["router_id"] == router_id for row in rows)
+
+
+@dataclass
+class FakeManagedResourceRepository:
+    replaced: list[tuple[uuid.UUID, list[dict[str, object]]]] = field(
+        default_factory=list
+    )
+
+    async def replace_discovery_backfill(
+        self, router_id: uuid.UUID, rows: list[dict[str, object]]
+    ) -> list[object]:
+        self.replaced.append((router_id, rows))
+        return rows
+
+
+@pytest.mark.asyncio
+async def test_discovery_service_backfills_managed_resources_on_success() -> None:
+    router = _make_router()
+    capture = _canned_capture()
+    repo = FakeSnapshotRepository()
+    lookup = FakeRouterLookup(router=router)
+    managed_repo = FakeManagedResourceRepository()
+
+    def reader_factory(creds: object) -> FakeReader:
+        return FakeReader(creds, capture)
+
+    service = DiscoveryService(
+        repo,
+        lookup,
+        managed_resource_repository=managed_repo,
+        reader_factory=reader_factory,
+    )
+    await service.discover_router(router.id, trigger=SnapshotTrigger.MANUAL)
+
+    assert len(managed_repo.replaced) == 1
+    router_id, rows = managed_repo.replaced[0]
+    assert router_id == router.id
+    assert len(rows) >= 5
+    assert all(row["plan_id"] is None for row in rows)
