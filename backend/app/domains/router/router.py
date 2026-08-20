@@ -89,14 +89,22 @@ from app.domains.wireguard.exceptions import WireGuardPeerNotFoundError
 from app.domains.wireguard.service import WireGuardService
 
 from app.domains.provisioning_engine.planner.constants import SnapshotTrigger
-from app.domains.provisioning_engine.planner.dependencies import get_discovery_service
+from app.domains.provisioning_engine.planner.dependencies import (
+    get_discovery_service,
+    get_wan_verification_service,
+)
 from app.domains.provisioning_engine.planner.schemas import (
     CompatibilityReport,
     DiscoverRouterResponse,
     RouterSnapshotListResponse,
     RouterSnapshotResponse,
+    WanVerificationGateResponse,
+    WanVerificationResponse,
 )
 from app.domains.provisioning_engine.planner.service import DiscoveryService
+from app.domains.provisioning_engine.planner.verification_service import (
+    WanVerificationService,
+)
 
 from .dependencies import get_router_service
 from .device_adapters import (
@@ -1089,6 +1097,62 @@ async def get_router_compatibility(
     return build_response(
         success=True,
         message="Router compatibility evaluated",
+        data=result.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/verify/wan",
+    response_model=ApiResponse[WanVerificationResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def verify_router_wan(
+    request: Request,
+    router_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    verification_service: WanVerificationService = Depends(get_wan_verification_service),
+):
+    """Run structured WAN verification (P7) for every enabled ISP link.
+
+    Persists one ``verification_runs`` row per link. If ``gate_passes`` is
+    false, downstream planner steps must not continue (R8).
+    """
+    result = await verification_service.verify_wan(
+        router_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="WAN verification completed",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/verify/wan/gate",
+    response_model=ApiResponse[WanVerificationGateResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.read"))],
+)
+async def get_router_wan_verification_gate(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    verification_service: WanVerificationService = Depends(get_wan_verification_service),
+):
+    """Hard gate check: did the latest WAN verification pass for all links?"""
+    result = await verification_service.get_wan_gate(
+        router_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="WAN verification gate evaluated",
         data=result.model_dump(),
         request_id=_request_id(request),
     )

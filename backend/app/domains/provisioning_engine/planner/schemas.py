@@ -17,6 +17,8 @@ from .constants import (
     CompatibilityOverall,
     SnapshotStatus,
     SnapshotTrigger,
+    VerificationCheckStatus,
+    WanVerificationOverall,
 )
 
 
@@ -157,6 +159,46 @@ class DiscoverRouterResponse(BaseModel):
     compatibility: CompatibilityReport
 
 
+class VerificationCheck(BaseModel):
+    name: str
+    status: VerificationCheckStatus
+    observed: str | None = None
+    expected: str | None = None
+    detail: str | None = None
+    duration_ms: int = 0
+
+
+class WanLinkVerificationResponse(BaseModel):
+    isp_link_id: str
+    slot: int
+    overall: WanVerificationOverall
+    checks: list[VerificationCheck]
+
+
+class WanVerificationRunResponse(BaseModel):
+    id: str
+    run_group_id: str
+    isp_link_id: str | None
+    overall: WanVerificationOverall
+    checks: list[VerificationCheck]
+    started_at: datetime
+    completed_at: datetime | None
+
+
+class WanVerificationResponse(BaseModel):
+    router_id: str
+    run_group_id: str
+    gate_passes: bool
+    links: list[WanLinkVerificationResponse]
+
+
+class WanVerificationGateResponse(BaseModel):
+    router_id: str
+    passes: bool
+    run_group_id: str | None = None
+    message: str | None = None
+
+
 __all__ = [
     "InterfaceSnapshot",
     "BridgeSnapshot",
@@ -174,4 +216,9 @@ __all__ = [
     "RouterSnapshotResponse",
     "RouterSnapshotListResponse",
     "DiscoverRouterResponse",
+    "VerificationCheck",
+    "WanLinkVerificationResponse",
+    "WanVerificationRunResponse",
+    "WanVerificationResponse",
+    "WanVerificationGateResponse",
 ]
