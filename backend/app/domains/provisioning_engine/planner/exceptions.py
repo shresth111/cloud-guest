@@ -17,6 +17,7 @@ __all__ = [
     "NoWanLinksToVerifyError",
     "ConfigurationPlanNotFoundError",
     "ConfigurationPlanNotApprovableError",
+    "ConfigurationPlanNotRenderableError",
 ]
 
 
@@ -86,6 +87,15 @@ class ConfigurationPlanNotApprovableError(PlannerError):
     def __init__(self, plan_id: uuid.UUID, current_status: str) -> None:
         super().__init__(
             f"Configuration plan '{plan_id}' cannot be approved from status "
+            f"'{current_status}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ConfigurationPlanNotRenderableError(PlannerError):
+    def __init__(self, plan_id: uuid.UUID, current_status: str) -> None:
+        super().__init__(
+            f"Configuration plan '{plan_id}' cannot be rendered from status "
             f"'{current_status}'",
             status_code=status.HTTP_400_BAD_REQUEST,
         )

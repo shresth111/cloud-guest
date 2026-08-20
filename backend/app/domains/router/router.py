@@ -92,6 +92,7 @@ from app.domains.provisioning_engine.planner.plan_service import (
 from app.domains.provisioning_engine.planner.schemas import (
     BuildConfigurationPlanRequest,
     CompatibilityReport,
+    ConfigurationPlanRenderResponse,
     ConfigurationPlanResponse,
     DiscoverRouterResponse,
     GuestInterfaceAvailabilityResponse,
@@ -112,6 +113,8 @@ from app.domains.rbac.dependencies import (
 from app.domains.rbac.enums import ScopeType
 from app.domains.router_agent.dependencies import get_router_agent_service
 from app.domains.router_agent.service import RouterAgentService
+from app.domains.router_provisioning.dependencies import get_router_provisioning_service
+from app.domains.router_provisioning.service import RouterProvisioningService
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.exceptions import WireGuardPeerNotFoundError
 from app.domains.wireguard.service import WireGuardService
@@ -1277,6 +1280,39 @@ async def approve_router_configuration_plan(
     return build_response(
         success=True,
         message="Configuration plan approved",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/plans/{plan_id}/render",
+    response_model=ApiResponse[ConfigurationPlanRenderResponse],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def render_router_configuration_plan(
+    request: Request,
+    router_id: uuid.UUID,
+    plan_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    plan_service: ConfigurationPlanService = Depends(get_configuration_plan_service),
+    provisioning_service: RouterProvisioningService = Depends(
+        get_router_provisioning_service
+    ),
+):
+    """Compile an approved plan into a draft ``config_versions`` row."""
+    result = await plan_service.render_plan(
+        router_id,
+        plan_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+        config_version_creator=provisioning_service,
+    )
+    return build_response(
+        success=True,
+        message="Configuration plan rendered",
         data=result.model_dump(mode="json"),
         request_id=_request_id(request),
     )
