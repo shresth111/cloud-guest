@@ -50,6 +50,17 @@ class IspLinkCreateRequest(BaseModel):
     role: str
     priority: int = Field(default=0, ge=0)
     interface: str | None = None
+    physical_interface: str | None = None
+    routing_interface: str | None = None
+    pppoe_username: str | None = None
+    pppoe_password: str | None = Field(
+        default=None,
+        description=(
+            "PPPoE dial-out password, stored Fernet-encrypted -- never "
+            "returned by any endpoint once submitted."
+        ),
+    )
+    dns_override: list[str] | None = None
     gateway_ip_address: str | None = None
     dns_primary: str | None = None
     dns_secondary: str | None = None
@@ -71,6 +82,16 @@ class IspLinkUpdateRequest(BaseModel):
     role: str | None = None
     priority: int | None = Field(default=None, ge=0)
     interface: str | None = None
+    physical_interface: str | None = None
+    routing_interface: str | None = None
+    pppoe_username: str | None = None
+    pppoe_password: str | None = Field(
+        default=None,
+        description=(
+            "PPPoE dial-out password, stored Fernet-encrypted -- write-only."
+        ),
+    )
+    dns_override: list[str] | None = None
     gateway_ip_address: str | None = None
     dns_primary: str | None = None
     dns_secondary: str | None = None
@@ -95,6 +116,11 @@ class IspLinkResponse(BaseModel):
     is_enabled: bool
     priority: int
     interface: str | None
+    physical_interface: str | None
+    routing_interface: str | None
+    pppoe_username: str | None
+    has_pppoe_credentials: bool
+    dns_override: list[str] | None
     gateway_ip_address: str | None
     dns_primary: str | None
     dns_secondary: str | None

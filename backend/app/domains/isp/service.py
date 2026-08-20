@@ -59,6 +59,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
+from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router.models import Router
 
 from .constants import (
@@ -106,6 +107,7 @@ from .repository import IspRepositoryProtocol
 from .validators import (
     classify_health_status,
     is_failover_threshold_reached,
+    normalize_isp_link_interfaces,
     validate_wan_routing_weights,
 )
 
@@ -125,6 +127,22 @@ class _RedisProtocol(Protocol):
     async def delete(self, *names: str) -> object: ...
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_wan_slot(existing_link_count: int) -> int:
+    """1-based WAN slot for ``pppoe-wanN`` naming on a router."""
+    return max(1, existing_link_count + 1)
+
+
+def _has_pppoe_password(link: IspLink) -> bool:
+    return link.pppoe_password_encrypted is not None
+
+
+def get_decrypted_pppoe_password(link: IspLink) -> str | None:
+    """Decrypt a link's stored PPPoE password, if any."""
+    if link.pppoe_password_encrypted is None:
+        return None
+    return decrypt_secret(link.pppoe_password_encrypted)
 
 
 def _event_extra(event: object) -> dict[str, object]:
@@ -297,6 +315,11 @@ class IspService:
         role: IspLinkRole,
         priority: int = 0,
         interface: str | None = None,
+        physical_interface: str | None = None,
+        routing_interface: str | None = None,
+        pppoe_username: str | None = None,
+        pppoe_password: str | None = None,
+        dns_override: list[str] | None = None,
         gateway_ip_address: str | None = None,
         dns_primary: str | None = None,
         dns_secondary: str | None = None,
@@ -322,6 +345,21 @@ class IspService:
         # health checks warrant it.
         existing_links = await self.repository.list_links_for_router(router.id)
         is_first_link = len(existing_links) == 0
+        wan_slot = _resolve_wan_slot(len(existing_links))
+
+        physical, routing, legacy_interface = normalize_isp_link_interfaces(
+            connection_mode=connection_mode,
+            interface=interface,
+            physical_interface=physical_interface,
+            routing_interface=routing_interface,
+            pppoe_username=pppoe_username,
+            has_pppoe_password=bool(pppoe_password),
+            wan_slot=wan_slot,
+            is_create=True,
+        )
+        pppoe_password_encrypted = (
+            encrypt_secret(pppoe_password) if pppoe_password else None
+        )
 
         link = await self.repository.create_link(
             router_id=router.id,
@@ -335,7 +373,12 @@ class IspService:
             auto_failback=auto_failback,
             is_enabled=True,
             priority=priority,
-            interface=interface,
+            interface=legacy_interface,
+            physical_interface=physical,
+            routing_interface=routing,
+            pppoe_username=pppoe_username,
+            pppoe_password_encrypted=pppoe_password_encrypted,
+            dns_override=dns_override,
             gateway_ip_address=gateway_ip_address,
             dns_primary=dns_primary,
             dns_secondary=dns_secondary,
@@ -372,6 +415,11 @@ class IspService:
         role: IspLinkRole,
         priority: int = 0,
         interface: str | None,
+        physical_interface: str | None = None,
+        routing_interface: str | None = None,
+        pppoe_username: str | None = None,
+        pppoe_password: str | None = None,
+        dns_override: list[str] | None = None,
         gateway_ip_address: str | None = None,
         dns_primary: str | None = None,
         dns_secondary: str | None = None,
@@ -413,15 +461,21 @@ class IspService:
         payload). Callers that want a real update path already have
         ``update_link`` for that.
         """
-        if not interface:
+        if not interface and not physical_interface:
             raise IspLinkInterfaceRequiredError(router_id)
 
+        dedupe_key = (physical_interface or interface or "").strip()
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
         existing_links = await self.repository.list_links_for_router(router.id)
         existing = next(
-            (link for link in existing_links if link.interface == interface), None
+            (
+                link
+                for link in existing_links
+                if (link.physical_interface or link.interface) == dedupe_key
+            ),
+            None,
         )
         if existing is not None:
             logger.info(
@@ -429,7 +483,7 @@ class IspService:
                 extra={
                     "link_id": str(existing.id),
                     "router_id": str(router.id),
-                    "interface": interface,
+                    "interface": dedupe_key,
                 },
             )
             return existing, False
@@ -444,6 +498,11 @@ class IspService:
             role=role,
             priority=priority,
             interface=interface,
+            physical_interface=physical_interface or interface,
+            routing_interface=routing_interface,
+            pppoe_username=pppoe_username,
+            pppoe_password=pppoe_password,
+            dns_override=dns_override,
             gateway_ip_address=gateway_ip_address,
             dns_primary=dns_primary,
             dns_secondary=dns_secondary,
@@ -503,6 +562,55 @@ class IspService:
             )
             if existing_primary is not None and existing_primary.id != link.id:
                 raise IspPrimaryLinkAlreadyExistsError(link.router_id)
+
+        pppoe_password = fields.pop("pppoe_password", None)
+        if pppoe_password is not None:
+            fields["pppoe_password_encrypted"] = encrypt_secret(str(pppoe_password))
+
+        interface_keys = {
+            "interface",
+            "physical_interface",
+            "routing_interface",
+            "connection_mode",
+            "pppoe_username",
+        }
+        should_normalize = bool(interface_keys & fields.keys()) or pppoe_password is not None
+        if should_normalize:
+            siblings = await self.repository.list_links_for_router(link.router_id)
+            wan_slot = _resolve_wan_slot(
+                max(0, len([row for row in siblings if row.id != link.id]))
+            )
+            connection_mode = str(
+                fields.get("connection_mode", link.connection_mode)
+            )
+            merged_interface = fields.get("interface", link.interface)
+            merged_physical = fields.get("physical_interface", link.physical_interface)
+            merged_routing = fields.get("routing_interface", link.routing_interface)
+            if (
+                merged_interface is None
+                and merged_physical is None
+                and merged_routing is None
+                and connection_mode != IspConnectionMode.PPPOE.value
+                and pppoe_password is None
+                and "pppoe_username" not in fields
+            ):
+                pass
+            else:
+                physical, routing, legacy_interface = normalize_isp_link_interfaces(
+                    connection_mode=connection_mode,
+                    interface=merged_interface,
+                    physical_interface=merged_physical,
+                    routing_interface=merged_routing,
+                    pppoe_username=fields.get("pppoe_username", link.pppoe_username),
+                    has_pppoe_password=bool(pppoe_password)
+                    or _has_pppoe_password(link),
+                    wan_slot=wan_slot,
+                    is_create=False,
+                )
+                fields["physical_interface"] = physical
+                fields["routing_interface"] = routing
+                fields["interface"] = legacy_interface
+
         # Deliberately NOT cross-link-validated here (unlike
         # set_wan_routing_mode, which does enforce "every enabled link or
         # none" via validate_wan_routing_weights): an admin sets one

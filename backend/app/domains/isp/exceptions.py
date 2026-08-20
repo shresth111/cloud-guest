@@ -29,6 +29,7 @@ __all__ = [
     "IspSpeedTestCooldownError",
     "MixedWanRoutingWeightsError",
     "IspLinkInterfaceRequiredError",
+    "IspLinkInterfaceInvariantError",
 ]
 
 
@@ -206,6 +207,15 @@ class IspLinkInterfaceRequiredError(IspError):
             "interface is genuinely unknown",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+
+class IspLinkInterfaceInvariantError(IspError):
+    """Raised when physical/routing interface fields or PPPoE credentials
+    violate the WAN split invariants enforced in
+    ``validators.normalize_isp_link_interfaces``."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
 
 
 class MixedWanRoutingWeightsError(IspError):

@@ -76,7 +76,7 @@ from sqlalchemy import (
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
@@ -157,6 +157,26 @@ class IspLink(BaseModel):
     # here degrades gracefully rather than hard-failing -- see that
     # adapter method's own single-candidate-fallback docstring.
     interface: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Wave 1 WAN split -- the real RouterOS port this uplink terminates on
+    # (e.g. ``ether1``). For static/DHCP links ``routing_interface`` below
+    # is always the same value; for PPPoE it names the physical port while
+    # ``routing_interface`` names the virtual dial-out client.
+    physical_interface: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # The interface used for routing, NAT, and health-check traffic on this
+    # uplink. Static/DHCP: identical to ``physical_interface``. PPPoE:
+    # ``pppoe-wanN`` (derived at create time). The legacy ``interface``
+    # column above is kept in sync with this value for existing code paths.
+    routing_interface: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # PPPoE dial-out credentials -- username plaintext (mirrors
+    # ``routers.api_username``); password Fernet-encrypted via
+    # ``app.domains.router.crypto``. Only meaningful when
+    # ``connection_mode`` is ``pppoe``.
+    pppoe_username: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    pppoe_password_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Optional per-WAN DNS override -- a JSON list of server addresses
+    # (e.g. ``["8.8.8.8", "1.1.1.1"]``). When null the router's own DNS
+    # settings apply.
+    dns_override: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     # STATIC mode only -- the manually-entered ping target. Never read for
     # DHCP (re-resolved live every check from the router's own current
     # dynamic default route) or PPPOE (no gateway concept at all) -- see

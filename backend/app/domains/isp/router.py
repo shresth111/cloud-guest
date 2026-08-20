@@ -56,7 +56,7 @@ from .schemas import (
     WanRoutingModeRequest,
     WanRoutingModeResponse,
 )
-from .service import IspService
+from .service import IspService, _has_pppoe_password
 
 router = APIRouter(prefix="/isp", tags=["ISP Management"])
 
@@ -98,6 +98,11 @@ def _link_response(
         is_enabled=link.is_enabled,
         priority=link.priority,
         interface=link.interface,
+        physical_interface=link.physical_interface,
+        routing_interface=link.routing_interface,
+        pppoe_username=link.pppoe_username,
+        has_pppoe_credentials=_has_pppoe_password(link),
+        dns_override=link.dns_override,
         gateway_ip_address=link.gateway_ip_address,
         dns_primary=link.dns_primary,
         dns_secondary=link.dns_secondary,
@@ -173,6 +178,11 @@ async def create_isp_link(
         role=IspLinkRole(payload.role),
         priority=payload.priority,
         interface=payload.interface,
+        physical_interface=payload.physical_interface,
+        routing_interface=payload.routing_interface,
+        pppoe_username=payload.pppoe_username,
+        pppoe_password=payload.pppoe_password,
+        dns_override=payload.dns_override,
         gateway_ip_address=payload.gateway_ip_address,
         dns_primary=payload.dns_primary,
         dns_secondary=payload.dns_secondary,
@@ -218,6 +228,11 @@ async def get_or_create_isp_link(
         role=IspLinkRole(payload.role),
         priority=payload.priority,
         interface=payload.interface,
+        physical_interface=payload.physical_interface,
+        routing_interface=payload.routing_interface,
+        pppoe_username=payload.pppoe_username,
+        pppoe_password=payload.pppoe_password,
+        dns_override=payload.dns_override,
         gateway_ip_address=payload.gateway_ip_address,
         dns_primary=payload.dns_primary,
         dns_secondary=payload.dns_secondary,
