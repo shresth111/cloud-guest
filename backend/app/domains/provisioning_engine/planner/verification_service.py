@@ -17,7 +17,7 @@ from app.domains.isp.exceptions import (
 from app.domains.isp.models import IspLink
 from app.domains.router.models import Router
 
-from .constants import VerificationScope, WanVerificationOverall
+from .constants import VerificationScope
 from .exceptions import NoWanLinksToVerifyError
 from .schemas import (
     WanLinkVerificationResponse,
@@ -167,7 +167,7 @@ class WanVerificationService:
         *,
         requesting_organization_id: uuid.UUID | None,
     ) -> WanVerificationGateResponse:
-        router = await self.router_lookup.get_router(
+        await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
         links, _meta = await self.isp_link_lookup.list_links(
@@ -197,7 +197,11 @@ class WanVerificationService:
         passes = wan_verification_gate_passes(
             enabled_link_ids=enabled_ids, runs=runs
         )
-        message = None if passes else "Latest WAN verification did not pass for all links"
+        message = (
+            None
+            if passes
+            else "Latest WAN verification did not pass for all links"
+        )
         return WanVerificationGateResponse(
             router_id=str(router_id),
             passes=passes,

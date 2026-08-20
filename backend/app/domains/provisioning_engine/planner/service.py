@@ -43,9 +43,9 @@ from .schemas import (
     InterfaceSnapshot,
     IpAddressSnapshot,
     PackageSnapshot,
-    RouteSnapshot,
     RouterSnapshotListResponse,
     RouterSnapshotResponse,
+    RouteSnapshot,
     RuleSummary,
     ServiceSnapshot,
     VlanSnapshot,
@@ -103,7 +103,9 @@ def snapshot_to_response(row: RouterSnapshot) -> RouterSnapshotResponse:
         total_memory_bytes=row.total_memory_bytes,
         free_memory_bytes=row.free_memory_bytes,
         free_storage_bytes=row.free_storage_bytes,
-        interfaces=[InterfaceSnapshot.model_validate(i) for i in (row.interfaces or [])],
+        interfaces=[
+            InterfaceSnapshot.model_validate(i) for i in (row.interfaces or [])
+        ],
         bridges=[BridgeSnapshot.model_validate(b) for b in (row.bridges or [])],
         ip_addresses=[
             IpAddressSnapshot.model_validate(a) for a in (row.ip_addresses or [])

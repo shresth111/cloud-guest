@@ -414,7 +414,10 @@ def collect_snapshot_fields(
         "services": collect_services(capture),
         "packages": collect_packages(capture),
         "error_detail": (
-            "; ".join(f"{section}: {detail}" for section, detail in capture.errors.items())
+            "; ".join(
+                f"{section}: {detail}"
+                for section, detail in capture.errors.items()
+            )
             if capture.errors
             else None
         ),

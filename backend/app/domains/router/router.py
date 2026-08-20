@@ -76,18 +76,6 @@ from app.domains.auth.models import AuthUser
 from app.domains.guest.dependencies import get_radius_service
 from app.domains.guest.router import deregister_radius_nas_client
 from app.domains.guest.service import RadiusService
-from app.domains.rbac.dependencies import (
-    CurrentOrganization,
-    CurrentUser,
-    RequirePermission,
-)
-from app.domains.rbac.enums import ScopeType
-from app.domains.router_agent.dependencies import get_router_agent_service
-from app.domains.router_agent.service import RouterAgentService
-from app.domains.wireguard.dependencies import get_wireguard_service
-from app.domains.wireguard.exceptions import WireGuardPeerNotFoundError
-from app.domains.wireguard.service import WireGuardService
-
 from app.domains.provisioning_engine.planner.constants import SnapshotTrigger
 from app.domains.provisioning_engine.planner.dependencies import (
     get_discovery_service,
@@ -105,6 +93,17 @@ from app.domains.provisioning_engine.planner.service import DiscoveryService
 from app.domains.provisioning_engine.planner.verification_service import (
     WanVerificationService,
 )
+from app.domains.rbac.dependencies import (
+    CurrentOrganization,
+    CurrentUser,
+    RequirePermission,
+)
+from app.domains.rbac.enums import ScopeType
+from app.domains.router_agent.dependencies import get_router_agent_service
+from app.domains.router_agent.service import RouterAgentService
+from app.domains.wireguard.dependencies import get_wireguard_service
+from app.domains.wireguard.exceptions import WireGuardPeerNotFoundError
+from app.domains.wireguard.service import WireGuardService
 
 from .dependencies import get_router_service
 from .device_adapters import (
@@ -1113,7 +1112,9 @@ async def verify_router_wan(
     router_id: uuid.UUID,
     actor: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    verification_service: WanVerificationService = Depends(get_wan_verification_service),
+    verification_service: WanVerificationService = Depends(
+        get_wan_verification_service
+    ),
 ):
     """Run structured WAN verification (P7) for every enabled ISP link.
 
@@ -1143,7 +1144,9 @@ async def get_router_wan_verification_gate(
     request: Request,
     router_id: uuid.UUID,
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    verification_service: WanVerificationService = Depends(get_wan_verification_service),
+    verification_service: WanVerificationService = Depends(
+        get_wan_verification_service
+    ),
 ):
     """Hard gate check: did the latest WAN verification pass for all links?"""
     result = await verification_service.get_wan_gate(

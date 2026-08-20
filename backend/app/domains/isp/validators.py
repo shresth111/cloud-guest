@@ -134,14 +134,16 @@ def normalize_isp_link_interfaces(
     routing = (routing_interface or "").strip() or None
 
     if not physical and not routing and not legacy_interface:
-        if mode is IspConnectionMode.PPPOE and is_create:
-            if pppoe_username or has_pppoe_password:
-                raise IspLinkInterfaceInvariantError(
-                    "PPPoE links require physical_interface (or interface) "
-                    "when credentials are supplied"
-                )
+        if (
+            mode is IspConnectionMode.PPPOE
+            and is_create
+            and (pppoe_username or has_pppoe_password)
+        ):
+            raise IspLinkInterfaceInvariantError(
+                "PPPoE links require physical_interface (or interface) "
+                "when credentials are supplied"
+            )
         return None, None, None
-
     if mode in (IspConnectionMode.STATIC, IspConnectionMode.DHCP):
         resolved_physical = physical or legacy_interface
         if not resolved_physical:
@@ -178,7 +180,9 @@ def normalize_isp_link_interfaces(
                 )
         return physical, routing, legacy
 
-    raise IspLinkInterfaceInvariantError(f"Unsupported connection_mode: {connection_mode}")
+    raise IspLinkInterfaceInvariantError(
+        f"Unsupported connection_mode: {connection_mode}"
+    )
 
 
 def is_failover_threshold_reached(
