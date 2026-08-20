@@ -12,6 +12,10 @@ from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 
 from .guest_input_service import GuestInputService
+from .managed_resource_repository import (
+    ManagedRouterResourceRepository,
+    ManagedRouterResourceRepositoryProtocol,
+)
 from .plan_repository import (
     ConfigurationPlanRepository,
     ConfigurationPlanRepositoryProtocol,
@@ -75,6 +79,12 @@ def get_configuration_plan_repository(
     return ConfigurationPlanRepository(db)
 
 
+def get_managed_router_resource_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> ManagedRouterResourceRepositoryProtocol:
+    return ManagedRouterResourceRepository(db)
+
+
 def get_configuration_plan_service(
     plan_repository: ConfigurationPlanRepositoryProtocol = Depends(
         get_configuration_plan_repository
@@ -85,6 +95,9 @@ def get_configuration_plan_service(
     verification_repository: VerificationRunRepositoryProtocol = Depends(
         get_verification_run_repository
     ),
+    managed_resource_repository: ManagedRouterResourceRepositoryProtocol = Depends(
+        get_managed_router_resource_repository
+    ),
     router_service: RouterService = Depends(get_router_service),
     isp_service: IspService = Depends(get_isp_service),
 ) -> ConfigurationPlanService:
@@ -92,6 +105,7 @@ def get_configuration_plan_service(
         plan_repository,
         snapshot_repository,
         verification_repository,
+        managed_resource_repository,
         router_service,
         isp_service,
     )
@@ -104,5 +118,6 @@ __all__ = [
     "get_wan_verification_service",
     "get_guest_input_service",
     "get_configuration_plan_repository",
+    "get_managed_router_resource_repository",
     "get_configuration_plan_service",
 ]

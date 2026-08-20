@@ -143,6 +143,25 @@ class RuleId(StrEnum):
     R10 = "R10"
 
 
+class ManagedResourceOp(StrEnum):
+    CREATED = "created"
+    MODIFIED = "modified"
+    REMOVED = "removed"
+
+
+class ManagedResourceStatus(StrEnum):
+    PENDING = "pending"
+    APPLIED = "applied"
+    VERIFY_FAILED = "verify_failed"
+    DRIFTED = "drifted"
+    ORPHANED = "orphaned"
+
+
+SAFETY_REVERT_SCHEDULER_COMMENT = "WYFYGUEST-safety-revert"
+SAFETY_REVERT_INTERVAL = "10m"
+PROVISIONING_ENGINE_BACKUP_NAME = "cloudguest-backup"
+
+
 __all__ = [
     "MANAGED_COMMENT_PREFIXES",
     "PLAN_ENGINE_VERSION",
@@ -159,4 +178,9 @@ __all__ = [
     "PlanActionType",
     "PlanRisk",
     "RuleId",
+    "ManagedResourceOp",
+    "ManagedResourceStatus",
+    "SAFETY_REVERT_SCHEDULER_COMMENT",
+    "SAFETY_REVERT_INTERVAL",
+    "PROVISIONING_ENGINE_BACKUP_NAME",
 ]

@@ -119,6 +119,29 @@ def test_compile_r2_dhcp_cleanup() -> None:
     assert "bridgeLocal" in result.script
 
 
+def test_compile_includes_safety_net_for_management_risk() -> None:
+    snapshot = FakeSnapshot(
+        interfaces=[
+            InterfaceSnapshot(name="ether1", type="ether"),
+            InterfaceSnapshot(name="ether2", type="ether"),
+        ],
+        bridges=[BridgeSnapshot(name="bridgeLocal", ports=["ether1"])],
+        routes=[RouteSnapshot(dst_address="0.0.0.0/0", gateway="ether1", active=True)],
+    )
+    preview = build_configuration_plan(
+        snapshot=snapshot,
+        snapshot_id="snap-1",
+        router_id="router-1",
+        request=GuestNetworkRequest(guest_interfaces=["ether2"]),
+        wan_interfaces={"ether1"},
+        wan_gate_passes=True,
+    )
+    preview.status = PlanStatus.APPROVED
+    result = compile_configuration_plan(preview)
+    assert "safety_revert_scheduler" in result.profiles_used
+    assert "WYFYGUEST-safety-revert" in result.script
+
+
 def test_compile_skips_blocked_conflicts_in_preview() -> None:
     snapshot = FakeSnapshot(
         ip_addresses=[

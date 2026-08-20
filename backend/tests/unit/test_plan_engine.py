@@ -163,6 +163,7 @@ def test_r10_flags_management_risk_for_r1_actions() -> None:
         wan_interfaces={"ether1"},
         wan_gate_passes=True,
     )
-    safety = [a for a in plan.actions if a.rule_id == RuleId.R10.value]
-    assert safety
-    assert safety[0].risk is PlanRisk.MANAGEMENT_CONNECTIVITY
+    r1 = [a for a in plan.actions if a.rule_id == RuleId.R1.value]
+    assert r1
+    assert r1[0].risk is PlanRisk.MANAGEMENT_CONNECTIVITY
+    assert r1[0].details.get("management_risk_reason")

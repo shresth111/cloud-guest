@@ -13,6 +13,7 @@ class ProfileId(StrEnum):
     GUEST_BRIDGE_PORT_REMOVE = "guest_bridge_port_remove"
     GUEST_DHCP_CLIENT_CLEANUP = "guest_dhcp_client_cleanup"
     GUEST_BRIDGE_PORTS = "guest_bridge_ports"
+    SAFETY_REVERT_SCHEDULER = "safety_revert_scheduler"
 
 
 _ACTION_PROFILES: dict[tuple[str, PlanActionType], ProfileId] = {

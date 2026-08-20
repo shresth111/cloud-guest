@@ -13,8 +13,12 @@ from app.domains.network_config.profiles.guest import (
     render_remove_bridge_port,
 )
 from app.domains.network_config.profiles.registry import ProfileId, profile_for_action
+from app.domains.network_config.profiles.safety_net import (
+    render_safety_revert_scheduler,
+)
 
 from .constants import PlanActionType, PlanStatus
+from .management_safety import plan_requires_safety_net
 from .schemas import ConfigurationPlanResponse, PlanAction
 
 _SECRET_REF_PATTERN = re.compile(
@@ -51,6 +55,10 @@ def compile_configuration_plan(plan: ConfigurationPlanResponse) -> CompileResult
     """Map approved plan actions to profile renderers and assemble script text."""
     lines: list[str] = ["# --- WyFyGuest configuration plan (managed) ---"]
     profiles_used: list[str] = []
+
+    if plan_requires_safety_net(plan.actions):
+        lines.extend(render_safety_revert_scheduler())
+        profiles_used.append(ProfileId.SAFETY_REVERT_SCHEDULER.value)
 
     for action in sorted(plan.actions, key=lambda item: item.seq):
         profile_id = profile_for_action(action)

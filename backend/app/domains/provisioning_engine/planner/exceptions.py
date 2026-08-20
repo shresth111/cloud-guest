@@ -18,6 +18,7 @@ __all__ = [
     "ConfigurationPlanNotFoundError",
     "ConfigurationPlanNotApprovableError",
     "ConfigurationPlanNotRenderableError",
+    "ConfigurationPlanNotPreparableError",
 ]
 
 
@@ -96,6 +97,15 @@ class ConfigurationPlanNotRenderableError(PlannerError):
     def __init__(self, plan_id: uuid.UUID, current_status: str) -> None:
         super().__init__(
             f"Configuration plan '{plan_id}' cannot be rendered from status "
+            f"'{current_status}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ConfigurationPlanNotPreparableError(PlannerError):
+    def __init__(self, plan_id: uuid.UUID, current_status: str) -> None:
+        super().__init__(
+            f"Configuration plan '{plan_id}' cannot be prepared from status "
             f"'{current_status}'",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
