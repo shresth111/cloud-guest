@@ -71,6 +71,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from redis.asyncio import Redis
 
 from app.common.responses import ApiResponse, build_response
+from app.core.config import Settings, get_settings
 from app.database.redis import get_redis_client
 from app.domains.auth.models import AuthUser
 from app.domains.guest.dependencies import get_radius_service
@@ -133,6 +134,7 @@ from .device_adapters import (
 from .enums import RouterStatus
 from .models import Router
 from .schemas import (
+    BootstrapScriptPreviewResponse,
     DeviceConnectionResponse,
     DeviceInterfaceResponse,
     DeviceInterfacesResponse,
@@ -999,6 +1001,56 @@ async def regenerate_agent_credential(
             "shown again"
         ),
         data={"agent_credential": plaintext},
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/bootstrap/preview",
+    response_model=ApiResponse[BootstrapScriptPreviewResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("router_provisioning.create")),
+        Depends(RequirePermission("router_provisioning.approve")),
+    ],
+)
+async def preview_bootstrap_script(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    router_service: RouterService = Depends(get_router_service),
+    settings: Settings = Depends(get_settings),
+):
+    """Render the Step 0 zero-touch bootstrap script for a router that has
+    not yet joined the platform.
+
+    Mints a fresh one-time provisioning token (same approval gate as
+    ``POST /routers/{id}/provisioning-token``) and embeds it in the
+    server-rendered RouterOS lines from
+    ``render_bootstrap_script``. Paste once on the device via WinBox/SSH
+    before running the fleet wizard's discover step."""
+    location_code, lines, expires_at = await router_service.preview_bootstrap_script(
+        actor_user_id=uuid.UUID(user.id),
+        router_id=router_id,
+        requesting_organization_id=requesting_organization_id,
+        api_base_url=settings.api_public_base_url,
+    )
+    payload = BootstrapScriptPreviewResponse(
+        router_id=str(router_id),
+        location_code=location_code,
+        lines=lines,
+        script="\n".join(lines),
+        line_count=len(lines),
+        token_expires_at=expires_at,
+    )
+    return build_response(
+        success=True,
+        message=(
+            "Bootstrap script generated -- paste on the device now; the "
+            "embedded token will not be shown again"
+        ),
+        data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )
 

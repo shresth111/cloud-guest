@@ -29,11 +29,12 @@ by Wave 1.
 A factory-fresh router has **no tunnel and no API user**. The platform cannot discover
 or push until bootstrap completes.
 
-1. Open **Router Fleet** → select the router → **Advanced setup script** (or use the
-   legacy script panel if the wizard offers a bootstrap chunk).
-2. Generate and paste/run the **short bootstrap script** on the device (API user +
-   WireGuard peer + heartbeat scheduler — typically ~20 lines). This is the only step
-   that intentionally exposes credentials to a human operator.
+1. Open **Router Fleet** → select the router → **Wizard** step **Bootstrap** (or
+   `GET /api/v1/routers/{id}/bootstrap/preview` when the wizard step is not yet
+   available).
+2. Copy and paste/run the **short bootstrap script** on the device via WinBox/SSH
+   (API user + WireGuard peer + config pull — typically ~15 lines, server-rendered).
+   The legacy **Advanced setup script** remains as a fallback.
 3. Confirm the router checks in: status moves from **Awaiting check-in** toward
    **online**; WireGuard tunnel shows healthy on the full router screen
    (`/routers/$routerId`).

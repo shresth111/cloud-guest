@@ -803,6 +803,36 @@ class TestRouterProvisioning:
         assert checked_in.last_seen_at is not None
         assert any(e["action"] == "router_provisioned" for e in audit.entries)
 
+    async def test_preview_bootstrap_script_renders_step_zero_script(self) -> None:
+        service, _repo, location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        location.location_code = "HQ-001"
+        router_device = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(),
+        )
+
+        location_code, lines, expires_at = await service.preview_bootstrap_script(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            api_base_url="https://api.cloudguest.example",
+        )
+
+        script = "\n".join(lines)
+        assert location_code == "HQ-001"
+        assert len(lines) <= 15
+        assert '/system identity set name="HQ-001"' in script
+        assert "provisioning/check-in" in script
+        assert "/import file-name=cloudguest.rsc" in script
+        assert expires_at is not None
+        assert any(
+            e["action"] == "router_provisioning_token_generated" for e in audit.entries
+        )
+
     async def test_check_in_token_is_single_use(self) -> None:
         service, repo, location_lookup, org_lookup, _audit = make_service()
         organization = org_lookup.add()
