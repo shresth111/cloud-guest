@@ -243,6 +243,30 @@ class CaptivePortalConfig(BaseModel):
         Integer, default=DEFAULT_BACKGROUND_FOCAL_Y, nullable=False
     )
 
+    # Whether the guest-facing portal renders the "Powered by Wyfy Guest"
+    # attribution (v7 design spec Part 3, P4). Turning it *off* is
+    # white-label behaviour: the check lives in
+    # service.CaptivePortalService.update_config, gated on
+    # PlanFeatureKey.WHITE_LABEL, and fires only on the transition to
+    # False -- turning the mark back on is always free, or a tenant who
+    # downgraded would be stuck with a setting they could not revert.
+    #
+    # Deliberately NOT enforced through a RequireFeature router
+    # dependency: that would gate the whole PUT, so a non-entitled tenant
+    # could no longer change their logo or colours either. Equally
+    # deliberately not enforced on resolve, which is unauthenticated --
+    # a 402 there would break the portal outright for every non-entitled
+    # tenant.
+    #
+    # NOT NULL default True because every row predating this column has
+    # always rendered the mark, so True is the value meaning "unchanged"
+    # -- the same test guest_font_choice's 'system' and
+    # background_focal_x/y's 50/25 are chosen against. It is also the
+    # only default that cannot leak revenue on deploy.
+    powered_by_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False
+    )
+
     # -- content -----------------------------------------------------------------
     advertisement_banner_url: Mapped[str | None] = mapped_column(
         String(500), nullable=True

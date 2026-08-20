@@ -62,15 +62,20 @@ from app.core.config import get_settings
 # into the payload under a new top-level ``"branding"`` key, which
 # ``ResolvedPortalConfig.from_cache_payload`` likewise indexes unguarded
 # -- the identical KeyError-out-of-an-unauthenticated-endpoint hazard,
-# so the identical bump.
-_CACHE_KEY_TEMPLATE = "captive_portal:resolve:v4:{organization_id}:{location_id}"
+# so the identical bump. v5 is v7 Part 3's powered_by_enabled (P4), added
+# to that same tuple: two workstreams independently claimed v4 (branding
+# on main, powered_by on this branch), so the merged payload -- carrying
+# both -- takes a fresh version; without it the first resolve after
+# deploy reads a payload missing one of the two keys and 500s every
+# guest until the TTL expires.
+_CACHE_KEY_TEMPLATE = "captive_portal:resolve:v5:{organization_id}:{location_id}"
 
 # Redis SET of every resolve key currently written for one organization,
 # so an organization-scoped edit can fan out to *all* of them (see
 # ``invalidate_organization``). Deliberately versioned in lockstep with
 # ``_CACHE_KEY_TEMPLATE`` -- an index holding keys from a previous
 # payload version would fan a delete out to keys nothing reads anymore.
-_ORG_INDEX_KEY_TEMPLATE = "captive_portal:resolve:v4:org-index:{organization_id}"
+_ORG_INDEX_KEY_TEMPLATE = "captive_portal:resolve:v5:org-index:{organization_id}"
 
 # The index set must outlive the payloads it points at, or a payload
 # written at second 59 of the index's own TTL would be orphaned (indexed
@@ -79,7 +84,6 @@ _ORG_INDEX_KEY_TEMPLATE = "captive_portal:resolve:v4:org-index:{organization_id}
 # payload the set names expires no later than one TTL after the set's
 # own last write, which is what refreshes the set's expiry too.
 _ORG_INDEX_TTL_MULTIPLIER = 2
-
 _NONE_SENTINEL = "-"
 
 

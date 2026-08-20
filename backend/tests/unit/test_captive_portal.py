@@ -17,6 +17,7 @@ environment.
 
 from __future__ import annotations
 
+import inspect
 import asyncio
 import json
 import uuid
@@ -26,11 +27,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.domains.billing.constants import PlanFeatureKey
 from app.domains.captive_portal.constants import (
     DEFAULT_BACKGROUND_FOCAL_X,
     DEFAULT_BACKGROUND_FOCAL_Y,
     DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
     DEFAULT_GUEST_FONT_CHOICE,
+    SPLASH_HEADLINE_MAX_LENGTH,
+    SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
     TERMS_AND_CONDITIONS_LABEL,
     GuestFontChoice,
 )
@@ -45,6 +49,8 @@ from app.domains.captive_portal.exceptions import (
     InvalidHexColorError,
     InvalidPortalContentSourceError,
     MissingPortalResolutionParamsError,
+    PoweredByAttributionNotEntitledError,
+    SplashTextTooLongError,
 )
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import (
@@ -58,6 +64,7 @@ from app.domains.captive_portal.validators import (
     validate_guest_font_choice,
     validate_hex_color,
     validate_single_content_source,
+    validate_splash_text_length,
 )
 from app.domains.location.exceptions import (
     CrossOrganizationLocationAccessError,
@@ -443,6 +450,8 @@ async def _create_config(
     privacy_policy_url: str | None = None,
     social_login_enabled: bool = False,
     social_login_providers: list[str] | None = None,
+    splash_headline: str | None = None,
+    splash_welcome_message: str | None = None,
     # True (the real, standard "OTP once, then a saved password" baseline
     # -- see CaptivePortalConfig.username_password_enabled's own
     # docstring) mirrors this helper's own otp_sms_enabled/voucher_enabled
@@ -479,8 +488,8 @@ async def _create_config(
         terms_and_conditions_url=terms_and_conditions_url,
         privacy_policy_text=privacy_policy_text,
         privacy_policy_url=privacy_policy_url,
-        splash_headline=None,
-        splash_welcome_message=None,
+        splash_headline=splash_headline,
+        splash_welcome_message=splash_welcome_message,
         redirect_url=None,
         otp_sms_enabled=True,
         otp_email_enabled=False,
@@ -2061,7 +2070,7 @@ class TestResolveCacheKeyVersion:
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
 
         key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
-        assert key == "captive_portal:resolve:v4:org:loc"
+        assert key == "captive_portal:resolve:v5:org:loc"
 
     def test_org_index_key_is_versioned_in_lockstep_with_the_payload_key(self) -> None:
         """The index names payload keys. Left at an older version it
@@ -2074,7 +2083,7 @@ class TestResolveCacheKeyVersion:
 
         payload_version = _CACHE_KEY_TEMPLATE.split(":")[2]
         index_version = _ORG_INDEX_KEY_TEMPLATE.split(":")[2]
-        assert payload_version == index_version == "v4"
+        assert payload_version == index_version == "v5"
 
     def test_a_payload_from_the_previous_key_version_would_raise(self) -> None:
         """The mechanism §0.3 is actually about, asserted rather than
@@ -2103,6 +2112,7 @@ class TestResolveCacheKeyVersion:
         assert set(_CACHED_CONFIG_SCALAR_FIELDS) <= columns
         assert "background_focal_x" in _CACHED_CONFIG_SCALAR_FIELDS
         assert "background_focal_y" in _CACHED_CONFIG_SCALAR_FIELDS
+        assert "powered_by_enabled" in _CACHED_CONFIG_SCALAR_FIELDS
 
 
 # ============================================================================
@@ -2283,3 +2293,619 @@ class TestResolveSurfacesBackgroundImageMetrics:
 
         assert data["background_focal_x"] == 35
         assert data["background_focal_y"] == 15
+
+
+# ============================================================================
+# v7 §Part 2 (W2) -- splash text length limits
+# ============================================================================
+
+
+# Realistic venue copy, one string per script, sized to sit exactly on each
+# side of the limit. Written out rather than generated from "x" * N so the
+# per-script cases are genuinely per-script: the whole point of the limit is
+# that the same character count renders as a different number of lines in
+# different scripts, and a test that only ever measures `len()` of ASCII
+# would pass even if the constant were derived from the wrong script.
+_WELCOME_AT_LIMIT = {
+    "en": (
+        "Welcome to The Grand Palace Hotel. Enjoy complimentary WiFi"
+        " during your stay."
+    ),
+    "hi": (
+        "ग्रैंड पैलेस होटल में आपका स्वागत है।"
+        " निःशुल्क वाईफाई का आनंद लें।"
+    ),
+    "ta": (
+        "கிராண்ட் பேலஸ் ஹோட்டலுக்கு வரவேற்கிறோம்."
+        " இலவச வைஃபையை அனுபவியுங்கள்."
+    ),
+    "ml": (
+        "ഗ്രാൻഡ് പാലസിലേക്ക് സ്വാഗതം."
+        " സൗജന്യ വൈഫൈ ആസ്വദിക്കൂ. നന്ദി."
+    ),
+    "ar": (
+        "مرحبًا بكم في فندق جراند بالاس."
+        " استمتعوا بإنترنت لاسلكي مجاني طوال إقامتكم."
+    ),
+}
+
+
+class TestSplashTextLengthConstants:
+    """The limits are load-bearing numbers with a written derivation
+    (constants.py). Pin them so a casual edit to either is a failing test
+    and not a silently-shipped layout regression."""
+
+    def test_limits_are_the_derived_values(self) -> None:
+        assert SPLASH_WELCOME_MESSAGE_MAX_LENGTH == 78
+        assert SPLASH_HEADLINE_MAX_LENGTH == 26
+
+    def test_headline_limit_is_tighter_than_the_welcome_limit(self) -> None:
+        # pg-title is 26px against pg-body's 15px -- the same character
+        # count buys far fewer headline lines, so one limit cannot cover
+        # both fields.
+        assert SPLASH_HEADLINE_MAX_LENGTH < SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+
+    def test_headline_limit_is_inside_the_stored_column(self) -> None:
+        # splash_headline is String(200); the domain limit must stay
+        # strictly tighter or the validator stops being the thing that
+        # rejects over-length input.
+        column = CaptivePortalConfig.__table__.columns["splash_headline"]
+        assert column.type.length > SPLASH_HEADLINE_MAX_LENGTH
+
+
+class TestSplashTextLengthValidator:
+    def test_accepts_value_exactly_at_the_limit(self) -> None:
+        validate_splash_text_length(
+            "splash_welcome_message", "x" * SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+        )
+
+    def test_rejects_one_character_over_the_limit(self) -> None:
+        with pytest.raises(SplashTextTooLongError) as exc:
+            validate_splash_text_length(
+                "splash_welcome_message",
+                "x" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 1),
+            )
+        assert exc.value.status_code == 400
+
+    def test_error_carries_the_limit_and_the_actual_length(self) -> None:
+        # The dashboard has to be able to render "80 of 78" next to a live
+        # counter; a bare "string too long" would be worse than the render
+        # truncation this replaces.
+        over = SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 2
+        with pytest.raises(SplashTextTooLongError) as exc:
+            validate_splash_text_length("splash_welcome_message", "x" * over)
+        assert exc.value.data == {
+            "field": "splash_welcome_message",
+            "max_length": SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
+            "actual_length": over,
+        }
+
+    def test_counts_the_stripped_value(self) -> None:
+        # The frontend renders `splashWelcomeMessage?.trim()`, so leading
+        # and trailing whitespace costs zero rendered width and must not
+        # be charged against the venue.
+        padded = "   " + "x" * SPLASH_WELCOME_MESSAGE_MAX_LENGTH + "   "
+        validate_splash_text_length("splash_welcome_message", padded)
+
+    def test_counts_code_points_not_utf16_units(self) -> None:
+        # An emoji is one code point to Python and two UTF-16 units to
+        # JavaScript's `.length`. The backend counts code points, so the
+        # dashboard counter must use `[...value].length` to agree.
+        value = "\U0001f60a" * SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+        assert len(value) == SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+        validate_splash_text_length("splash_welcome_message", value)
+
+    def test_none_and_blank_always_pass(self) -> None:
+        # Clearing a splash string is always legal; v5 §3.2 requires a
+        # venue with no welcome message to render no line at all.
+        validate_splash_text_length("splash_welcome_message", None)
+        validate_splash_text_length("splash_welcome_message", "")
+        validate_splash_text_length("splash_welcome_message", "     ")
+
+    def test_unknown_field_is_a_no_op(self) -> None:
+        validate_splash_text_length("primary_color", "x" * 5000)
+
+    @pytest.mark.parametrize("language", sorted(_WELCOME_AT_LIMIT))
+    def test_realistic_copy_at_the_limit_passes_in_every_script(
+        self, language: str
+    ) -> None:
+        sample = _WELCOME_AT_LIMIT[language]
+        assert len(sample) <= SPLASH_WELCOME_MESSAGE_MAX_LENGTH, (
+            f"{language} sample is {len(sample)} chars, over the limit"
+        )
+        validate_splash_text_length("splash_welcome_message", sample)
+
+    @pytest.mark.parametrize("language", sorted(_WELCOME_AT_LIMIT))
+    def test_realistic_copy_over_the_limit_is_rejected_in_every_script(
+        self, language: str
+    ) -> None:
+        # Same real sentence in each script, extended past the ceiling --
+        # the limit is a single global number, so it must bite identically
+        # whichever script the venue writes in.
+        sample = _WELCOME_AT_LIMIT[language]
+        padding = "०" if language in {"hi"} else "a"
+        over = sample + padding * (
+            SPLASH_WELCOME_MESSAGE_MAX_LENGTH - len(sample) + 1
+        )
+        with pytest.raises(SplashTextTooLongError) as exc:
+            validate_splash_text_length("splash_welcome_message", over)
+        assert exc.value.data["actual_length"] == len(over)
+
+
+class TestSplashTextLengthOnCreate:
+    async def test_over_limit_welcome_message_is_rejected(self) -> None:
+        fx = make_service()
+        with pytest.raises(SplashTextTooLongError):
+            await _create_config(
+                fx,
+                splash_welcome_message="x" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 1),
+            )
+
+    async def test_over_limit_headline_is_rejected(self) -> None:
+        fx = make_service()
+        with pytest.raises(SplashTextTooLongError) as exc:
+            await _create_config(
+                fx, splash_headline="x" * (SPLASH_HEADLINE_MAX_LENGTH + 1)
+            )
+        assert exc.value.data["field"] == "splash_headline"
+
+    async def test_at_limit_values_are_accepted(self) -> None:
+        fx = make_service()
+        config = await _create_config(
+            fx,
+            splash_headline="x" * SPLASH_HEADLINE_MAX_LENGTH,
+            splash_welcome_message="x" * SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
+        )
+        assert len(config.splash_welcome_message) == SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+
+
+class TestSplashTextLengthOnUpdate:
+    async def test_over_limit_edit_is_rejected(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, splash_welcome_message="Short and sweet.")
+        with pytest.raises(SplashTextTooLongError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={
+                    "splash_welcome_message": "y"
+                    * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 1)
+                },
+            )
+
+    async def test_existing_over_limit_row_can_still_be_edited_elsewhere(self) -> None:
+        # The grandfathering case, and the reason the check fires on change
+        # rather than on presence: there are live rows over the ceiling
+        # (these fields shipped with no validation at all), and a venue
+        # with a long legacy message must not be blocked from changing
+        # their logo until they rewrite their copy. The dashboard PUTs its
+        # whole form, so the field is present on every save.
+        fx = make_service()
+        legacy = "z" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 40)
+        config = await _create_config(fx)
+        config.splash_welcome_message = legacy  # simulate a pre-validation row
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={
+                "logo_url": "https://cdn.example.com/logo.png",
+                "splash_welcome_message": legacy,
+            },
+        )
+        assert updated.logo_url == "https://cdn.example.com/logo.png"
+        assert updated.splash_welcome_message == legacy
+
+    async def test_whitespace_only_difference_is_not_a_change(self) -> None:
+        # The renderer trims, so a value differing only in surrounding
+        # whitespace changes nothing on the portal and must not trip the
+        # validator on a grandfathered row.
+        fx = make_service()
+        legacy = "z" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 10)
+        config = await _create_config(fx)
+        config.splash_welcome_message = legacy
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"splash_welcome_message": f"  {legacy}  "},
+        )
+        assert updated.splash_welcome_message == f"  {legacy}  "
+
+    async def test_grandfathered_row_editing_the_field_is_rejected(self) -> None:
+        # The limit binds the moment the venue next touches that string --
+        # which is also the only moment a live counter is in front of them.
+        fx = make_service()
+        legacy = "z" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 40)
+        config = await _create_config(fx)
+        config.splash_welcome_message = legacy
+
+        with pytest.raises(SplashTextTooLongError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"splash_welcome_message": legacy + " and one more sentence."},
+            )
+
+    async def test_grandfathered_row_can_be_brought_under_the_limit(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        config.splash_welcome_message = "z" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 40)
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"splash_welcome_message": "Free WiFi, on us."},
+        )
+        assert updated.splash_welcome_message == "Free WiFi, on us."
+
+    async def test_clearing_an_over_limit_value_is_allowed(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        config.splash_welcome_message = "z" * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH + 40)
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"splash_welcome_message": None},
+        )
+        assert updated.splash_welcome_message is None
+
+    async def test_headline_and_welcome_are_validated_independently(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        # A value legal for the welcome message is over the headline's own,
+        # much tighter, ceiling.
+        between = "x" * (SPLASH_HEADLINE_MAX_LENGTH + 1)
+        assert len(between) <= SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"splash_welcome_message": between},
+        )
+        assert updated.splash_welcome_message == between
+
+        with pytest.raises(SplashTextTooLongError) as exc:
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"splash_headline": between},
+            )
+        assert exc.value.data["field"] == "splash_headline"
+
+
+# ============================================================================
+# v7 §Part 3 (P4) -- powered_by_enabled as a white-label entitlement
+# ============================================================================
+
+
+@dataclass
+class FakeEntitlementSnapshot:
+    features: set[str] = field(default_factory=set)
+
+    def has_feature(self, feature_key: object) -> bool:
+        return str(getattr(feature_key, "value", feature_key)) in self.features
+
+
+@dataclass
+class FakeEntitlementChecker:
+    """Stand-in for ``billing.service.EntitlementChecker``. ``calls``
+    records every organization asked about, so a test can assert the gate
+    did *not* reach billing at all on the paths that must stay free."""
+
+    entitled: bool = True
+    calls: list[uuid.UUID] = field(default_factory=list)
+
+    async def get_snapshot(self, organization_id: uuid.UUID):
+        self.calls.append(organization_id)
+        return FakeEntitlementSnapshot(
+            features={PlanFeatureKey.WHITE_LABEL.value} if self.entitled else set()
+        )
+
+
+def make_entitled_service(*, entitled: bool) -> tuple[Fixture, FakeEntitlementChecker]:
+    fx = make_service()
+    checker = FakeEntitlementChecker(entitled=entitled)
+    fx.service.entitlement_checker = checker
+    return fx, checker
+
+
+class TestPoweredByEnabledDefaults:
+    async def test_defaults_to_true_on_create(self) -> None:
+        # Every row predating this column rendered the attribution, so True
+        # is the "unchanged" value -- and the only default that cannot leak
+        # revenue the moment the migration deploys.
+        fx = make_service()
+        config = await _create_config(fx)
+        assert config.powered_by_enabled is True
+
+    def test_column_is_not_nullable_and_defaults_true(self) -> None:
+        column = CaptivePortalConfig.__table__.columns["powered_by_enabled"]
+        assert column.nullable is False
+        assert column.default.arg is True
+
+    def test_is_part_of_the_resolve_cache_payload(self) -> None:
+        from app.domains.captive_portal.service import _CACHED_CONFIG_SCALAR_FIELDS
+
+        assert "powered_by_enabled" in _CACHED_CONFIG_SCALAR_FIELDS
+
+
+class TestPoweredByEntitlementOnUpdate:
+    async def test_turning_off_without_entitlement_is_402(self) -> None:
+        fx, checker = make_entitled_service(entitled=False)
+        config = await _create_config(fx)
+        with pytest.raises(PoweredByAttributionNotEntitledError) as exc:
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"powered_by_enabled": False},
+            )
+        # 402, not 403: the caller holds captive_portal.update and is
+        # allowed to make this request -- their plan just does not include
+        # the feature. A 403 would send an admin off to ask for a
+        # permission that would not help them.
+        assert exc.value.status_code == 402
+        assert exc.value.data == {
+            "field": "powered_by_enabled",
+            "required_feature": PlanFeatureKey.WHITE_LABEL.value,
+        }
+        assert config.powered_by_enabled is True
+
+    async def test_turning_off_with_entitlement_succeeds(self) -> None:
+        fx, checker = make_entitled_service(entitled=True)
+        config = await _create_config(fx)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": False},
+        )
+        assert updated.powered_by_enabled is False
+        assert checker.calls == [fx.organization.id]
+
+    async def test_turning_on_without_entitlement_succeeds(self) -> None:
+        # Turning attribution back ON must always be free, or a tenant who
+        # downgrades is stuck with a setting they cannot revert.
+        fx, checker = make_entitled_service(entitled=False)
+        config = await _create_config(fx)
+        config.powered_by_enabled = False
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": True},
+        )
+        assert updated.powered_by_enabled is True
+        assert checker.calls == [], "turning attribution on must not consult billing"
+
+    async def test_other_fields_are_not_gated(self) -> None:
+        # The check is service-layer and field-scoped precisely so it does
+        # not become a gate on the whole PUT: a non-entitled tenant must
+        # still be able to change their logo and their colours.
+        fx, checker = make_entitled_service(entitled=False)
+        config = await _create_config(fx)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={
+                "logo_url": "https://cdn.example.com/logo.png",
+                "primary_color": "#FF0000",
+            },
+        )
+        assert updated.logo_url == "https://cdn.example.com/logo.png"
+        assert updated.primary_color == "#FF0000"
+        assert checker.calls == []
+
+    async def test_absent_field_never_consults_billing(self) -> None:
+        fx, checker = make_entitled_service(entitled=False)
+        config = await _create_config(fx)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"name": "Renamed"},
+        )
+        assert checker.calls == []
+
+
+class TestPoweredByEntitlementAfterDowngrade:
+    """The downgrade path, which is the case with a revenue consequence."""
+
+    async def test_downgraded_tenant_can_still_edit_other_fields(self) -> None:
+        # The tenant turned the mark off while entitled, then lost the
+        # feature. The dashboard PUTs its whole form, so `powered_by_enabled:
+        # false` is present on every subsequent save. Re-asserting a value
+        # that is already false is not a new purchase -- gating it would
+        # lock a downgraded tenant out of every other field on the page.
+        fx, checker = make_entitled_service(entitled=True)
+        config = await _create_config(fx)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": False},
+        )
+        checker.entitled = False  # the downgrade
+        checker.calls.clear()
+
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={
+                "powered_by_enabled": False,
+                "logo_url": "https://cdn.example.com/new-logo.png",
+            },
+        )
+        assert updated.logo_url == "https://cdn.example.com/new-logo.png"
+        assert updated.powered_by_enabled is False
+        assert checker.calls == []
+
+    async def test_downgraded_tenant_who_turns_it_on_cannot_turn_it_off_again(
+        self,
+    ) -> None:
+        # The other half of the same policy: once they revert to attribution
+        # ON, turning it back off is a fresh purchase and is gated.
+        fx, checker = make_entitled_service(entitled=True)
+        config = await _create_config(fx)
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": False},
+        )
+        checker.entitled = False
+
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": True},
+        )
+        with pytest.raises(PoweredByAttributionNotEntitledError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"powered_by_enabled": False},
+            )
+
+    async def test_resolve_honours_the_stored_false_after_downgrade(self) -> None:
+        # POLICY, stated rather than left to the code: resolve returns what
+        # is stored and never consults billing. The read path is
+        # unauthenticated and a 402 there would break the portal outright
+        # for every non-entitled tenant, so it is not gated -- which means
+        # a tenant who turned the mark off while entitled keeps it off
+        # after downgrading. Closing that belongs on the licence-downgrade
+        # path, not on the guest hot path. See
+        # _enforce_powered_by_entitlement's docstring.
+        fx, checker = make_entitled_service(entitled=True)
+        await _create_config(fx, is_default=True)
+        config = next(iter(fx.repository.configs.values()))
+        await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": False},
+        )
+        checker.entitled = False
+        checker.calls.clear()
+
+        resolved = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert resolved.config.powered_by_enabled is False
+        assert checker.calls == [], "resolve must never consult billing"
+
+
+class TestPoweredByEntitlementOnCreate:
+    """Create is gated too. The spec names ``update_config`` only, but
+    leaving create open is a one-request bypass: POST a fresh config with
+    ``powered_by_enabled=false`` and the update gate is never consulted."""
+
+    async def test_creating_with_attribution_off_without_entitlement_is_402(
+        self,
+    ) -> None:
+        fx, _ = make_entitled_service(entitled=False)
+        with pytest.raises(PoweredByAttributionNotEntitledError):
+            await fx.service.create_config(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=fx.organization.id,
+                organization_id=fx.organization.id,
+                location_id=None,
+                name="Bypass Portal",
+                is_active=True,
+                is_default=False,
+                theme="light",
+                logo_url=None,
+                background_image_url=None,
+                primary_color="#1A73E8",
+                secondary_color="#FFFFFF",
+                default_language="en",
+                supported_languages=["en"],
+                advertisement_banner_url=None,
+                advertisement_banner_link=None,
+                terms_and_conditions_text=None,
+                terms_and_conditions_url=None,
+                privacy_policy_text=None,
+                privacy_policy_url=None,
+                splash_headline=None,
+                splash_welcome_message=None,
+                redirect_url=None,
+                otp_sms_enabled=True,
+                otp_email_enabled=False,
+                otp_whatsapp_enabled=False,
+                voucher_enabled=True,
+                username_password_enabled=True,
+                social_login_enabled=False,
+                social_login_providers=[],
+                powered_by_enabled=False,
+            )
+
+    async def test_creating_with_attribution_on_never_consults_billing(self) -> None:
+        fx, checker = make_entitled_service(entitled=False)
+        config = await _create_config(fx)
+        assert config.powered_by_enabled is True
+        assert checker.calls == []
+
+
+class TestPoweredByWithoutAnEntitlementChecker:
+    """``entitlement_checker=None`` disables the gate. That is the shape
+    the one pre-existing non-HTTP caller relies on --
+    ``location.provisioning_service`` creates configs during smart-location
+    provisioning and never sets this field."""
+
+    async def test_gate_is_inert_without_a_checker(self) -> None:
+        fx = make_service()
+        assert fx.service.entitlement_checker is None
+        config = await _create_config(fx)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"powered_by_enabled": False},
+        )
+        assert updated.powered_by_enabled is False
+
+
+class TestPoweredByRouterWiring:
+    def test_write_endpoints_use_the_entitlement_aware_service(self) -> None:
+        """The gate is only real if the write routes actually receive a
+        service that has a checker. Asserted structurally so a future
+        refactor that swaps the dependency back cannot pass silently."""
+        from app.domains.captive_portal import router as router_module
+
+        aware = router_module.get_entitlement_aware_captive_portal_service
+        for handler in (
+            router_module.create_captive_portal_config,
+            router_module.update_captive_portal_config,
+        ):
+            default = inspect.signature(handler).parameters["service"].default
+            assert default.dependency is aware, handler.__name__
+
+    def test_resolve_endpoint_does_not_get_a_checker(self) -> None:
+        """The read path must stay unauthenticated and ungated -- a 402
+        there would break the portal for every non-entitled tenant."""
+        from app.domains.captive_portal import router as router_module
+
+        default = (
+            inspect.signature(router_module.resolve_captive_portal_config)
+            .parameters["service"]
+            .default
+        )
+        assert (
+            default.dependency
+            is not router_module.get_entitlement_aware_captive_portal_service
+        )

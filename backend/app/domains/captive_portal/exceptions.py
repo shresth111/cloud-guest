@@ -36,6 +36,8 @@ __all__ = [
     "InvalidGuestFontChoiceError",
     "InvalidBackgroundOverlayStrengthError",
     "InvalidBackgroundFocalPointError",
+    "SplashTextTooLongError",
+    "PoweredByAttributionNotEntitledError",
 ]
 
 
@@ -202,4 +204,74 @@ class InvalidBackgroundFocalPointError(CaptivePortalError):
             f"background_focal_{axis} must be an integer between "
             f"{MIN_BACKGROUND_FOCAL} and {MAX_BACKGROUND_FOCAL}, got '{value}'",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class SplashTextTooLongError(CaptivePortalError):
+    """A venue-authored splash string (``splash_headline`` /
+    ``splash_welcome_message``) exceeds its authoring-time length ceiling
+    -- v7 design spec §Part 2 (W2).
+
+    The ceilings and their full derivation live in ``constants.py``; the
+    short version is that they are rendered-line budgets, measured on a
+    360x640 device against the widest supported script, converted to
+    characters. Enforced here rather than truncated at render because
+    truncating would silently hide copy the venue deliberately wrote.
+
+    Carries ``max_length``/``actual_length`` in ``data`` on purpose. The
+    dashboard has to be able to say "27 of 26 characters -- 1 over" next
+    to a live counter; a bare "string too long" would be a worse
+    experience than the render truncation this replaces, which is the
+    entire argument for validating at authoring time. 400, not 422: this
+    is the same domain-validation class as every other error in this
+    module (``InvalidHexColorError`` and friends), reached through the
+    service layer, not through Pydantic.
+    """
+
+    def __init__(self, field_name: str, actual_length: int, max_length: int) -> None:
+        self.field_name = field_name
+        self.actual_length = actual_length
+        self.max_length = max_length
+        super().__init__(
+            f"{field_name} must be at most {max_length} characters, got "
+            f"{actual_length}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={
+                "field": field_name,
+                "max_length": max_length,
+                "actual_length": actual_length,
+            },
+        )
+
+
+class PoweredByAttributionNotEntitledError(CaptivePortalError):
+    """An organization without the ``white_label`` plan feature tried to
+    turn ``powered_by_enabled`` **off** -- v7 design spec §Part 3 (P4).
+
+    402, not 403, and the distinction is the whole point: the caller holds
+    ``captive_portal.update`` and is perfectly allowed to make this
+    request, their *plan* just does not include the feature. A 403 would
+    tell an admin to go ask for a permission that would not help them.
+    Semantically identical to ``app.domains.billing.exceptions
+    .FeatureNotEntitledError``; raised as a captive-portal error so the
+    response carries the offending field and the feature key the caller
+    would need to buy, which the billing exception does not.
+
+    Deliberately raised only on the *transition* to ``False``. Turning
+    attribution back **on** is always free, and re-submitting an already-
+    ``False`` value (what a dashboard that PUTs its whole form does) is
+    not a new purchase -- otherwise a tenant who downgraded could no
+    longer change their own logo.
+    """
+
+    def __init__(self, organization_id: uuid.UUID, feature_key: str) -> None:
+        super().__init__(
+            f"Organization {organization_id}'s plan does not include the "
+            f"'{feature_key}' feature, which is required to turn off the "
+            "'Powered by Wyfy Guest' attribution",
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            data={
+                "field": "powered_by_enabled",
+                "required_feature": feature_key,
+            },
         )

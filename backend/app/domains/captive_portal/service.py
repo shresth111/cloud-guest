@@ -69,6 +69,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
+from app.domains.billing.constants import PlanFeatureKey
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
@@ -86,10 +87,12 @@ from .exceptions import (
     CaptivePortalConfigNotFoundError,
     CrossOrganizationCaptivePortalConfigAccessError,
     MissingPortalResolutionParamsError,
+    PoweredByAttributionNotEntitledError,
 )
 from .models import CaptivePortalConfig
 from .repository import CaptivePortalRepositoryProtocol
 from .validators import (
+    SPLASH_TEXT_MAX_LENGTHS,
     validate_background_focal_point,
     validate_background_overlay_strength,
     validate_business_hours_schedule,
@@ -98,6 +101,7 @@ from .validators import (
     validate_guest_font_choice,
     validate_hex_color,
     validate_single_content_source,
+    validate_splash_text_length,
 )
 
 logger = logging.getLogger(__name__)
@@ -174,6 +178,32 @@ class AuditLogWriter(Protocol):
     shape every other domain's service already defines for itself."""
 
     async def create_audit_log_entry(self, **fields: object) -> object: ...
+
+
+class EntitlementSnapshotProtocol(Protocol):
+    """The one question this service asks of billing."""
+
+    def has_feature(self, feature_key: object) -> bool: ...
+
+
+class EntitlementCheckerProtocol(Protocol):
+    """The minimal surface the ``powered_by_enabled`` white-label gate
+    needs from ``app.domains.billing.service.EntitlementChecker`` -- kept
+    structural for the same reason ``CaptivePortalResolveCacheProtocol``
+    below is, so this module never imports billing's concrete class.
+
+    Optional on the service (``None`` disables the gate). The dependency
+    wiring in ``dependencies.py`` always supplies the real checker for
+    every request that reaches the router; ``None`` is for the one
+    pre-existing non-HTTP caller,
+    ``app.domains.location.provisioning_service``, which creates configs
+    during smart-location provisioning and never sets this field, and for
+    unit tests that are not exercising the gate.
+    """
+
+    async def get_snapshot(
+        self, organization_id: uuid.UUID
+    ) -> EntitlementSnapshotProtocol: ...
 
 
 class CaptivePortalResolveCacheProtocol(Protocol):
@@ -412,6 +442,7 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "background_overlay_strength",
     "background_focal_x",
     "background_focal_y",
+    "powered_by_enabled",
 )
 
 
@@ -465,6 +496,23 @@ class _CachedCaptivePortalConfig:
     background_overlay_strength: int
     background_focal_x: int
     background_focal_y: int
+    powered_by_enabled: bool
+
+
+def _splash_text_changed(incoming: object, stored: object) -> bool:
+    """Whether an incoming splash value is a real change to what the guest
+    already sees.
+
+    Compares the **stripped** forms because that is what the frontend
+    renders (``useGuestSignIn.ts:100``): a value that differs only in
+    surrounding whitespace changes nothing on the portal and must not
+    trip the length validator. ``None`` and ``""`` are both "no splash
+    string" and are equivalent here for the same reason.
+    """
+    def _norm(value: object) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    return _norm(incoming) != _norm(stored)
 
 
 def _config_to_cache_payload(config: CaptivePortalConfig) -> dict[str, Any]:
@@ -552,6 +600,7 @@ class CaptivePortalService:
         *,
         audit_writer: AuditLogWriter | None = None,
         resolve_cache: CaptivePortalResolveCacheProtocol | None = None,
+        entitlement_checker: EntitlementCheckerProtocol | None = None,
         branding_lookup: BrandingLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
@@ -559,6 +608,7 @@ class CaptivePortalService:
         self.location_lookup = location_lookup
         self.audit_writer = audit_writer
         self.resolve_cache = resolve_cache
+        self.entitlement_checker = entitlement_checker
         self.branding_lookup = branding_lookup
 
     # ========================================================================
@@ -609,6 +659,12 @@ class CaptivePortalService:
         # already establishes, without either needing to know this
         # parameter exists at all.
         pin_login_enabled: bool = False,
+        # Defaults True for the same reason pin_login_enabled defaults
+        # above: the smart-location provisioning flow in
+        # app.domains.location.provisioning_service, and this domain's
+        # own tests, never pass it. True is also the only default that
+        # cannot leak revenue -- see the column's own docstring.
+        powered_by_enabled: bool = True,
     ) -> CaptivePortalConfig:
         validate_hex_color(primary_color, field_name="primary_color")
         validate_hex_color(secondary_color, field_name="secondary_color")
@@ -621,6 +677,12 @@ class CaptivePortalService:
             privacy_policy_text, privacy_policy_url, field_label=PRIVACY_POLICY_LABEL
         )
         validate_default_scope(is_default=is_default, location_id=location_id)
+        # v7 §Part 2 (W2). Unconditional on create -- there is no existing
+        # value to grandfather, so a brand-new config never gets to start
+        # life over the limit. See update_config for why the same check is
+        # conditional there.
+        validate_splash_text_length("splash_headline", splash_headline)
+        validate_splash_text_length("splash_welcome_message", splash_welcome_message)
 
         organization = await self.organization_lookup.get_organization(organization_id)
         if (
@@ -632,6 +694,12 @@ class CaptivePortalService:
             await self.location_lookup.get_location(
                 location_id, requesting_organization_id=organization.id
             )
+
+        await self._enforce_powered_by_entitlement(
+            organization_id=organization.id,
+            current=None,
+            requested=powered_by_enabled,
+        )
 
         if is_default:
             await self._clear_existing_default(organization.id)
@@ -666,6 +734,7 @@ class CaptivePortalService:
             pin_login_enabled=pin_login_enabled,
             social_login_enabled=social_login_enabled,
             social_login_providers=list(social_login_providers),
+            powered_by_enabled=powered_by_enabled,
             created_by=actor_user_id,
         )
         event = CaptivePortalConfigCreated(
@@ -780,6 +849,40 @@ class CaptivePortalService:
             if field_name in update_data:
                 validate_background_focal_point(axis, update_data[field_name])
 
+        # v7 §Part 2 (W2). Deliberately fires only when the value is
+        # actually *changing*, not merely present in the payload.
+        #
+        # There are live rows over these ceilings -- the fields shipped
+        # with no validation anywhere in the chain, `splash_welcome_message`
+        # as an unbounded `Text` column. Rejecting on any write that
+        # mentions the field would mean a venue with a long existing
+        # message could not change their logo without first rewriting
+        # their copy, and the dashboard PUTs its whole form, so it mentions
+        # the field on every save. Rejecting on *change* grandfathers those
+        # rows: the venue keeps rendering exactly what they wrote, and the
+        # limit binds the moment they next edit that string -- which is
+        # also the only moment a live character counter is in front of
+        # them to explain it.
+        #
+        # The trade-off, stated rather than hidden: an over-limit legacy
+        # value survives indefinitely if never edited. Surfacing those rows
+        # is a dashboard warning and a backfill report, not a write-path
+        # rejection.
+        for splash_field in SPLASH_TEXT_MAX_LENGTHS:
+            if splash_field not in update_data:
+                continue
+            incoming = update_data[splash_field]
+            if not _splash_text_changed(incoming, getattr(config, splash_field)):
+                continue
+            validate_splash_text_length(splash_field, incoming)
+
+        if "powered_by_enabled" in update_data:
+            await self._enforce_powered_by_entitlement(
+                organization_id=config.organization_id,
+                current=config.powered_by_enabled,
+                requested=update_data["powered_by_enabled"],
+            )
+
         if merged_is_default and not config.is_default:
             await self._clear_existing_default(
                 config.organization_id, exclude_config_id=config.id
@@ -800,6 +903,65 @@ class CaptivePortalService:
             updated.organization_id, updated.location_id
         )
         return updated
+
+    async def _enforce_powered_by_entitlement(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        current: bool | None,
+        requested: object,
+    ) -> None:
+        """v7 design spec Part 3 (P4). Turning off "Powered by Wyfy Guest"
+        is ``PlanFeatureKey.WHITE_LABEL`` behaviour, but
+        ``captive_portal.update`` is granted to roles holding no
+        ``white_label.*`` permission at all -- so without this any admin
+        could switch the founder's attribution off across every guest at
+        their venue for free.
+
+        ``current`` is the value the row already carries, or ``None`` on
+        create (where there is no prior value and any ``False`` is
+        therefore a real turn-off). Gating create as well as update is not
+        in the spec's literal wording, which names ``update_config`` only,
+        but leaving it out would be a one-request bypass: POST a fresh
+        config with ``powered_by_enabled=false`` and the update gate is
+        never consulted.
+
+        Three deliberate narrownesses, each with a failure mode behind it:
+
+        * **Service layer, not a ``RequireFeature`` router dependency.**
+          That dependency gates the whole ``PUT``, which would stop a
+          non-entitled tenant changing their logo or their colours too.
+        * **Only on the transition to ``False``.** Turning attribution
+          back *on* must always be free, or a tenant who downgrades is
+          stuck with a setting they cannot revert. And re-submitting an
+          already-``False`` value is not a new purchase: the dashboard
+          PUTs its whole form, so a downgraded tenant would otherwise be
+          locked out of every other field on the page -- the same trap the
+          splash-length check above avoids the same way.
+        * **Write path only.** ``resolve`` is unauthenticated; a 402 there
+          would break the portal outright for every non-entitled tenant.
+
+        Known, accepted consequence, stated rather than left to the code:
+        a tenant who turns the mark off while entitled and then downgrades
+        keeps it off, because resolve honours the stored value and this
+        check never fires again for them. Closing that needs a reset on
+        the licence-downgrade path (``LicenseService.downgrade_license``),
+        not a check on the guest hot path -- putting an entitlement lookup
+        on the most critical unauthenticated request in the product buys a
+        new failure mode there to recover revenue that is better recovered
+        at the moment the plan actually changes.
+        """
+        if requested is not False:
+            return
+        if current is False:
+            return
+        if self.entitlement_checker is None:
+            return
+        snapshot = await self.entitlement_checker.get_snapshot(organization_id)
+        if not snapshot.has_feature(PlanFeatureKey.WHITE_LABEL):
+            raise PoweredByAttributionNotEntitledError(
+                organization_id, PlanFeatureKey.WHITE_LABEL.value
+            )
 
     async def activate_config(
         self,
