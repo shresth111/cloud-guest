@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 
 from app.domains.isp.constants import IspConnectionMode, WanRoutingMode

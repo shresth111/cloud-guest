@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from app.domains.isp.constants import IspConnectionMode, WanRoutingMode
 
-from .context import WanRenderContext, WanRenderLink
+from .context import WanRenderContext
 from .pcc import build_weighted_pcc_plan
 
 WAN_RENAME_WARNING = (

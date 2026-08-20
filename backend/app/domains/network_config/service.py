@@ -74,7 +74,6 @@ from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
 
 from .exceptions import (
     EmptyNetworkConfigError,
-    MissingStaticWanAddressError,
     NetwatchIntegrationUnavailableError,
     NoNetwatchTargetsError,
     NoWanLinksError,
