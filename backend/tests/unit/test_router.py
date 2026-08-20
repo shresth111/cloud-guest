@@ -1097,45 +1097,15 @@ class FakeCredentialRotator:
 
 
 class TestCredentialRotatorWiring:
-    """Production DI only wires a live-push rotator when the (retired)
-    config-agent bridge is explicitly configured via Settings; otherwise
-    ``credential_rotator=None`` selects the documented persist-only
-    fallback in ``RouterService._rotate_live_device_credential``."""
+    """Production DI always wires the gateway-backed rotator singleton."""
 
-    def test_unconfigured_bridge_builds_no_rotator(self) -> None:
-        from app.core.config import Settings
-        from app.domains.router.dependencies import _build_credential_rotator
-
-        settings = Settings(_env_file=None, config_agent_url="", config_agent_secret="")
-        assert _build_credential_rotator(settings) is None
-
-    def test_partially_configured_bridge_builds_no_rotator(self) -> None:
-        from app.core.config import Settings
-        from app.domains.router.dependencies import _build_credential_rotator
-
-        settings = Settings(
-            _env_file=None,
-            config_agent_url="http://bridge.internal:9093/config/apply",
-            config_agent_secret="",
-        )
-        assert _build_credential_rotator(settings) is None
-
-    def test_configured_bridge_builds_rotator_with_settings_values(self) -> None:
-        from app.core.config import Settings
-        from app.domains.router.dependencies import _build_credential_rotator
+    def test_get_router_service_builds_gateway_rotator(self) -> None:
+        from app.domains.router.dependencies import _credential_rotator
         from app.domains.router.device_credential_rotator import (
-            ConfigAgentBridgeCredentialRotator,
+            GatewayDeviceCredentialRotator,
         )
 
-        settings = Settings(
-            _env_file=None,
-            config_agent_url="http://bridge.internal:9093/config/apply",
-            config_agent_secret="test-secret",
-        )
-        rotator = _build_credential_rotator(settings)
-        assert isinstance(rotator, ConfigAgentBridgeCredentialRotator)
-        assert rotator._agent_url == "http://bridge.internal:9093/config/apply"
-        assert rotator._agent_secret == "test-secret"
+        assert isinstance(_credential_rotator, GatewayDeviceCredentialRotator)
 
 
 class TestRouterLiveCredentialRotation:

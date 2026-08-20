@@ -365,13 +365,10 @@ class RouterService:
         Deliberately a no-op (falls through to the old "just persist it"
         behavior) in three cases, each for a different reason:
 
-        * ``self.credential_rotator`` is unset -- most test harnesses and
-          any caller that hasn't opted into live-push wiring. Production
-          DI (``app.domains.router.dependencies.get_router_service``)
-          always configures a real rotator, so this only matters for
-          call sites that intentionally haven't (e.g. this test suite's
-          own ``make_service``, which passes no rotator by default so
-          existing update-router tests keep passing unchanged).
+        * ``self.credential_rotator`` is unset -- test harnesses that pass
+          no rotator to ``make_service`` (most tests in this module).
+          Production DI (``app.domains.router.dependencies.get_router_service``)
+          always configures the gateway-backed rotator singleton.
         * The router has no existing ``management_ip_address``/
           ``public_ip_address``, ``api_username``, or
           ``api_credentials_encrypted`` on file yet -- this *is* the

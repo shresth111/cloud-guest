@@ -1527,35 +1527,91 @@ class TestRollbackAndApply:
 
 
 class TestConfigAgentBridgeRetirement:
-    """The SSH config-agent bridge is a retired transport (router-fleet
-    plan section A1). Its coordinates -- previously hardcoded module
-    constants, i.e. a live shared secret committed to source -- must come
-    from Settings and default to disabled."""
+    """Regression guards for the retired config-agent HTTP bridge (router-
+    fleet plan section A1). Live pushes now go through wyfy_device_gateway."""
 
-    async def test_apply_live_reports_bridge_disabled_when_unconfigured(
-        self,
-    ) -> None:
+    async def test_apply_live_reports_missing_connection_details(self) -> None:
         from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
 
-        from app.core.config import Settings
         from app.domains.network_config.router import apply_network_config_live
 
         fake_request = SimpleNamespace(state=SimpleNamespace(request_id="req-1"))
+        version = SimpleNamespace(rendered_content="/ip address add ...")
+        provisioning_service = AsyncMock()
+        provisioning_service.get_version = AsyncMock(return_value=version)
+        router_service = MagicMock()
+        router_service.reveal_credentials = AsyncMock(
+            return_value=SimpleNamespace(
+                management_ip_address=None,
+                public_ip_address=None,
+                api_username=None,
+            )
+        )
+        router_service.get_decrypted_api_secret.return_value = None
+
         result = await apply_network_config_live(
             request=fake_request,  # type: ignore[arg-type]
             router_id=uuid.uuid4(),
             version_id=uuid.uuid4(),
-            user=None,  # type: ignore[arg-type]  # unused on the gated path
+            user=SimpleNamespace(id=str(uuid.uuid4())),  # type: ignore[arg-type]
             requesting_organization_id=None,
-            provisioning_service=None,  # type: ignore[arg-type]  # unused
-            router_service=None,  # type: ignore[arg-type]  # unused
-            settings=Settings(
-                _env_file=None, config_agent_url="", config_agent_secret=""
-            ),
+            provisioning_service=provisioning_service,
+            router_service=router_service,
         )
         assert result["success"] is True
         assert result["data"]["applied"] is False
-        assert "disabled" in (result["data"]["detail"] or "")
+        assert "connection details" in (result["data"]["detail"] or "")
+
+    async def test_apply_live_pushes_via_gateway(self, monkeypatch) -> None:  # noqa: ANN001
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.domains.network_config.router import apply_network_config_live
+
+        pushed: list[dict[str, str]] = []
+
+        async def fake_push_live_config(**kwargs: str) -> None:
+            pushed.append(kwargs)
+
+        monkeypatch.setattr(
+            "app.domains.network_config.router.push_live_config",
+            fake_push_live_config,
+        )
+
+        fake_request = SimpleNamespace(state=SimpleNamespace(request_id="req-1"))
+        version = SimpleNamespace(rendered_content="/ip address add ...")
+        provisioning_service = AsyncMock()
+        provisioning_service.get_version = AsyncMock(return_value=version)
+        router_service = MagicMock()
+        router_service.reveal_credentials = AsyncMock(
+            return_value=SimpleNamespace(
+                management_ip_address="10.20.0.41",
+                public_ip_address=None,
+                api_username="cloudguest-api",
+            )
+        )
+        router_service.get_decrypted_api_secret.return_value = "secret-123"
+
+        result = await apply_network_config_live(
+            request=fake_request,  # type: ignore[arg-type]
+            router_id=uuid.uuid4(),
+            version_id=uuid.uuid4(),
+            user=SimpleNamespace(id=str(uuid.uuid4())),  # type: ignore[arg-type]
+            requesting_organization_id=None,
+            provisioning_service=provisioning_service,
+            router_service=router_service,
+        )
+        assert result["success"] is True
+        assert result["data"]["applied"] is True
+        assert pushed == [
+            {
+                "host": "10.20.0.41",
+                "username": "cloudguest-api",
+                "password": "secret-123",
+                "config_content": "/ip address add ...",
+            }
+        ]
 
     def test_no_hardcoded_bridge_coordinates_in_source(self) -> None:
         """Regression guard for the leaked ``configagent-*`` secret: no
