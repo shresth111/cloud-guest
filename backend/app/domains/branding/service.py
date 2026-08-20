@@ -173,7 +173,12 @@ def _process_logo(content: bytes) -> tuple[bytes, str, str] | None:
         return None
 
     width, height = img.size
-    if width == 0 or height == 0 or width > _LOGO_MAX_PROCESS_DIM or height > _LOGO_MAX_PROCESS_DIM:
+    if (
+        width == 0
+        or height == 0
+        or width > _LOGO_MAX_PROCESS_DIM
+        or height > _LOGO_MAX_PROCESS_DIM
+    ):
         return None
 
     img = img.convert("RGBA")
@@ -201,7 +206,9 @@ def _process_logo(content: bytes) -> tuple[bytes, str, str] | None:
     cropped = img.crop(bbox)
     content_w, content_h = cropped.size
     margin = max(4, round(max(content_w, content_h) * _LOGO_MARGIN_FRACTION))
-    canvas = Image.new("RGBA", (content_w + margin * 2, content_h + margin * 2), (0, 0, 0, 0))
+    canvas = Image.new(
+        "RGBA", (content_w + margin * 2, content_h + margin * 2), (0, 0, 0, 0)
+    )
     canvas.paste(cropped, (margin, margin), cropped)
 
     buf = io.BytesIO()
@@ -507,6 +514,24 @@ class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
 
+class PortalResolveCacheProtocol(Protocol):
+    """The single method this service needs from
+    ``app.domains.captive_portal.cache.CaptivePortalResolveCache`` --
+    structural, so the branding domain never imports that concrete class.
+
+    Design spec §5 S7 folds this organization's ``brandings`` row into
+    the guest-facing captive-portal resolve cache. That cache is keyed
+    per ``(organization_id, location_id)`` pair, so a *single* branding
+    row now backs an arbitrary number of cached entries -- one per
+    location that falls back to it. Without this fan-out an admin
+    uploading a new logo would stay invisible to every already-cached
+    location for up to a full TTL, which would be a real regression
+    against the per-request, uncached fetch S7 replaces.
+    """
+
+    async def invalidate_organization(self, organization_id: uuid.UUID) -> None: ...
+
+
 class BrandingService:
     def __init__(
         self,
@@ -514,10 +539,12 @@ class BrandingService:
         *,
         audit_writer: AuditLogWriter | None = None,
         object_storage: ObjectStorageProtocol | None = None,
+        portal_resolve_cache: PortalResolveCacheProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.audit_writer = audit_writer
         self.object_storage = object_storage
+        self.portal_resolve_cache = portal_resolve_cache
 
     async def get_branding(self, organization_id: uuid.UUID) -> BrandingResponse:
         branding = await self.repository.get_by_organization(organization_id)
@@ -544,6 +571,7 @@ class BrandingService:
             description=f"Branding updated for organization {organization_id}",
             organization_id=organization_id,
         )
+        await self._invalidate_portal_resolve_cache(organization_id)
         return await self._to_response(branding)
 
     async def upload_background_image(
@@ -650,6 +678,7 @@ class BrandingService:
             ),
             organization_id=organization_id,
         )
+        await self._invalidate_portal_resolve_cache(organization_id)
         return await self._to_response(branding)
 
     async def delete_background_image(
@@ -680,6 +709,7 @@ class BrandingService:
             description=f"Background image removed for organization {organization_id}",
             organization_id=organization_id,
         )
+        await self._invalidate_portal_resolve_cache(organization_id)
         return await self._to_response(branding)
 
     async def upload_logo(
@@ -745,6 +775,7 @@ class BrandingService:
             ),
             organization_id=organization_id,
         )
+        await self._invalidate_portal_resolve_cache(organization_id)
         return await self._to_response(branding)
 
     async def delete_logo(
@@ -767,6 +798,7 @@ class BrandingService:
             description=f"Logo removed for organization {organization_id}",
             organization_id=organization_id,
         )
+        await self._invalidate_portal_resolve_cache(organization_id)
         return await self._to_response(branding)
 
     async def get_default_branding(self) -> DefaultBrandingResponse:
@@ -860,6 +892,26 @@ class BrandingService:
         if branding.logo_key:
             return LOGO_RAW_PATH, True
         return branding.logo_url, False
+
+    async def _invalidate_portal_resolve_cache(
+        self, organization_id: uuid.UUID
+    ) -> None:
+        """Best-effort fan-out to the guest-facing captive-portal resolve
+        cache -- see ``PortalResolveCacheProtocol``'s own docstring.
+
+        Never raises. A branding upload must not fail because Redis is
+        momentarily unreachable; the resolve cache's own TTL is the
+        backstop, exactly as it already is for every other missed
+        invalidation this platform tolerates."""
+        if self.portal_resolve_cache is None:
+            return
+        try:
+            await self.portal_resolve_cache.invalidate_organization(organization_id)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "branding_portal_resolve_cache_invalidation_failed",
+                extra={"organization_id": str(organization_id), "error": str(exc)},
+            )
 
     async def _audit(
         self,

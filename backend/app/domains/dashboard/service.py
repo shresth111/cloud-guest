@@ -7,25 +7,26 @@ services — no new database tables.
 
 from __future__ import annotations
 
-import uuid
 import logging
+import uuid
 
-from app.domains.analytics.dashboard_service import DashboardService as AnalyticsDashboardService
-from app.domains.monitoring.service import PlatformDashboardService
+from app.domains.analytics.dashboard_service import (
+    DashboardService as AnalyticsDashboardService,
+)
 from app.domains.billing.service import SuperAdminBillingDashboardService
-from app.domains.rbac.service import RBACService
+from app.domains.monitoring.service import PlatformDashboardService
 from app.domains.organization.service import OrganizationService
-from app.domains.rbac.enums import PermissionModule
+from app.domains.rbac.service import RBACService
 
 from .schemas import (
+    DashboardModulesResponse,
     DashboardOverview,
     DashboardResponse,
     DashboardSidebarResponse,
     DashboardWidgetsResponse,
-    DashboardModulesResponse,
+    ModuleInfo,
     SidebarNavItem,
     WidgetConfig,
-    ModuleInfo,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,31 +64,132 @@ class DashboardService:
         perm_set = set(permissions)
 
         items: list[SidebarNavItem] = [
-            SidebarNavItem(id="dashboard", label="Dashboard", icon="layout-dashboard", path="/dashboard", module="dashboard"),
-            SidebarNavItem(id="locations", label="Locations", icon="map-pin", path="/locations", module="locations"),
-            SidebarNavItem(id="routers", label="Routers", icon="router", path="/routers", module="routers"),
-            SidebarNavItem(id="guests", label="Guests", icon="wifi", path="/guests", module="guest_wifi"),
-            SidebarNavItem(id="sessions", label="Live Sessions", icon="activity", path="/sessions", module="guest_sessions"),
-            SidebarNavItem(id="analytics", label="Analytics", icon="bar-chart-3", path="/analytics", module="analytics"),
-            SidebarNavItem(id="monitoring", label="Monitoring", icon="shield", path="/monitoring", module="monitoring"),
-            SidebarNavItem(id="billing", label="Billing", icon="credit-card", path="/billing", module="billing"),
-            SidebarNavItem(id="network", label="Network", icon="network", path="/network/vlan", module="dhcp", children=[
-                SidebarNavItem(id="vlan", label="VLAN", path="/network/vlan", module="vlan"),
-                SidebarNavItem(id="dhcp", label="DHCP", path="/network/dhcp", module="dhcp"),
-                SidebarNavItem(id="dns", label="DNS", path="/network/dns", module="dns"),
-                SidebarNavItem(id="firewall", label="Firewall", path="/network/firewall", module="firewall"),
-            ]),
-            SidebarNavItem(id="policies", label="Policies", icon="shield-check", path="/policies/authentication", module="bandwidth"),
-            SidebarNavItem(id="portal", label="Portal", icon="palette", path="/portals", module="captive_portal"),
-            SidebarNavItem(id="rbac", label="Users & Roles", icon="users", path="/rbac", module="users"),
-            SidebarNavItem(id="settings", label="Settings", icon="settings", path="/settings", module="white_label"),
+            SidebarNavItem(
+                id="dashboard",
+                label="Dashboard",
+                icon="layout-dashboard",
+                path="/dashboard",
+                module="dashboard",
+            ),
+            SidebarNavItem(
+                id="locations",
+                label="Locations",
+                icon="map-pin",
+                path="/locations",
+                module="locations",
+            ),
+            SidebarNavItem(
+                id="routers",
+                label="Routers",
+                icon="router",
+                path="/routers",
+                module="routers",
+            ),
+            SidebarNavItem(
+                id="guests",
+                label="Guests",
+                icon="wifi",
+                path="/guests",
+                module="guest_wifi",
+            ),
+            SidebarNavItem(
+                id="sessions",
+                label="Live Sessions",
+                icon="activity",
+                path="/sessions",
+                module="guest_sessions",
+            ),
+            SidebarNavItem(
+                id="analytics",
+                label="Analytics",
+                icon="bar-chart-3",
+                path="/analytics",
+                module="analytics",
+            ),
+            SidebarNavItem(
+                id="monitoring",
+                label="Monitoring",
+                icon="shield",
+                path="/monitoring",
+                module="monitoring",
+            ),
+            SidebarNavItem(
+                id="billing",
+                label="Billing",
+                icon="credit-card",
+                path="/billing",
+                module="billing",
+            ),
+            SidebarNavItem(
+                id="network",
+                label="Network",
+                icon="network",
+                path="/network/vlan",
+                module="dhcp",
+                children=[
+                    SidebarNavItem(
+                        id="vlan",
+                        label="VLAN",
+                        path="/network/vlan",
+                        module="vlan",
+                    ),
+                    SidebarNavItem(
+                        id="dhcp",
+                        label="DHCP",
+                        path="/network/dhcp",
+                        module="dhcp",
+                    ),
+                    SidebarNavItem(
+                        id="dns",
+                        label="DNS",
+                        path="/network/dns",
+                        module="dns",
+                    ),
+                    SidebarNavItem(
+                        id="firewall",
+                        label="Firewall",
+                        path="/network/firewall",
+                        module="firewall",
+                    ),
+                ],
+            ),
+            SidebarNavItem(
+                id="policies",
+                label="Policies",
+                icon="shield-check",
+                path="/policies/authentication",
+                module="bandwidth",
+            ),
+            SidebarNavItem(
+                id="portal",
+                label="Portal",
+                icon="palette",
+                path="/portals",
+                module="captive_portal",
+            ),
+            SidebarNavItem(
+                id="rbac",
+                label="Users & Roles",
+                icon="users",
+                path="/rbac",
+                module="users",
+            ),
+            SidebarNavItem(
+                id="settings",
+                label="Settings",
+                icon="settings",
+                path="/settings",
+                module="white_label",
+            ),
         ]
 
         allowed: list[SidebarNavItem] = []
         for item in items:
-            if item.module and any(f"{item.module}." in p for p in perm_set):
-                allowed.append(item)
-            elif item.module == "dashboard":
+            if (
+                item.module
+                and any(f"{item.module}." in p for p in perm_set)
+                or item.module == "dashboard"
+            ):
                 allowed.append(item)
 
         return DashboardSidebarResponse(items=allowed)
@@ -119,7 +221,11 @@ class DashboardService:
             # Try to get unified dashboard data
             dash = await self.analytics_dashboard.get_super_admin_dashboard(user_id)
             total_locs = dash.total_locations if hasattr(dash, "total_locations") else 0
-            total_routers = dash.total_routers_online + dash.total_routers_offline if hasattr(dash, "total_routers_online") else 0
+            total_routers = (
+                dash.total_routers_online + dash.total_routers_offline
+                if hasattr(dash, "total_routers_online")
+                else 0
+            )
         except Exception:
             total_locs = 0
             total_routers = 0
@@ -134,14 +240,29 @@ class DashboardService:
         self, user_id: uuid.UUID, organization_id: uuid.UUID | None = None
     ) -> list[WidgetConfig]:
         return [
-            WidgetConfig(id="kpi-overview", type="kpi-grid", title="Overview", size="full"),
-            WidgetConfig(id="active-guests", type="stat", title="Active Guests", size="small"),
-            WidgetConfig(id="routers-online", type="stat", title="Routers Online", size="small"),
+            WidgetConfig(
+                id="kpi-overview", type="kpi-grid", title="Overview", size="full"
+            ),
+            WidgetConfig(
+                id="active-guests", type="stat", title="Active Guests", size="small"
+            ),
+            WidgetConfig(
+                id="routers-online", type="stat", title="Routers Online", size="small"
+            ),
             WidgetConfig(id="revenue-mrr", type="stat", title="MRR", size="small"),
             WidgetConfig(id="alerts", type="stat", title="Active Alerts", size="small"),
-            WidgetConfig(id="guest-trend", type="chart", title="Guest Trend", size="medium"),
-            WidgetConfig(id="router-health", type="chart", title="Router Health", size="medium"),
-            WidgetConfig(id="recent-activity", type="table", title="Recent Activity", size="large"),
+            WidgetConfig(
+                id="guest-trend", type="chart", title="Guest Trend", size="medium"
+            ),
+            WidgetConfig(
+                id="router-health", type="chart", title="Router Health", size="medium"
+            ),
+            WidgetConfig(
+                id="recent-activity",
+                type="table",
+                title="Recent Activity",
+                size="large",
+            ),
         ]
 
     async def _get_modules(

@@ -1484,7 +1484,9 @@ def render_network_config(
         sections.extend(
             _idempotent_lines(
                 render_radius_client(
-                    radius_nas_client, wireguard_peer.tunnel_ip_address, radius_server_host
+                    radius_nas_client,
+                    wireguard_peer.tunnel_ip_address,
+                    radius_server_host,
                 )
             )
         )

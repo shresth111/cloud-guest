@@ -126,21 +126,28 @@ CHECKLIST_ITEMS: tuple[ChecklistItemDefinition, ...] = (
     ChecklistItemDefinition(
         key=ChecklistItemKey.WIREGUARD,
         label="WireGuard tunnel",
-        description="The management tunnel has a recent handshake, if one is configured.",
+        description=(
+            "The management tunnel has a recent handshake, if one is configured."
+        ),
         detection_mode=DetectionMode.AUTO,
         category=ChecklistCategory.CONNECTIVITY,
     ),
     ChecklistItemDefinition(
         key=ChecklistItemKey.API_REACHABILITY,
         label="API reachability",
-        description="The platform's most recent reachability check against this router's own API succeeded.",
+        description=(
+            "The platform's most recent reachability check against this "
+            "router's own API succeeded."
+        ),
         detection_mode=DetectionMode.AUTO,
         category=ChecklistCategory.CONNECTIVITY,
     ),
     ChecklistItemDefinition(
         key=ChecklistItemKey.GUEST_SIGN_IN,
         label="Guest sign-in",
-        description="A test device can join the guest network and complete sign-in end to end.",
+        description=(
+            "A test device can join the guest network and complete sign-in end to end."
+        ),
         detection_mode=DetectionMode.MANUAL,
         category=ChecklistCategory.GUEST_EXPERIENCE,
     ),
@@ -154,7 +161,9 @@ CHECKLIST_ITEMS: tuple[ChecklistItemDefinition, ...] = (
     ChecklistItemDefinition(
         key=ChecklistItemKey.CAPTIVE_PORTAL,
         label="Captive portal",
-        description="The captive portal page loads and redirects correctly on a fresh device.",
+        description=(
+            "The captive portal page loads and redirects correctly on a fresh device."
+        ),
         detection_mode=DetectionMode.MANUAL,
         category=ChecklistCategory.GUEST_EXPERIENCE,
     ),
@@ -168,7 +177,9 @@ CHECKLIST_ITEMS: tuple[ChecklistItemDefinition, ...] = (
     ChecklistItemDefinition(
         key=ChecklistItemKey.FIREWALL,
         label="Firewall rules present",
-        description="The expected guest-isolation firewall rules are in place on the device.",
+        description=(
+            "The expected guest-isolation firewall rules are in place on the device."
+        ),
         detection_mode=DetectionMode.MANUAL,
         category=ChecklistCategory.SECURITY,
     ),
@@ -189,14 +200,19 @@ CHECKLIST_ITEMS: tuple[ChecklistItemDefinition, ...] = (
     ChecklistItemDefinition(
         key=ChecklistItemKey.DOH_DOT_BLOCKING,
         label="DoH/DoT blocking",
-        description="DNS-over-HTTPS/TLS bypass is blocked, keeping content filtering effective.",
+        description=(
+            "DNS-over-HTTPS/TLS bypass is blocked, keeping content filtering "
+            "effective."
+        ),
         detection_mode=DetectionMode.MANUAL,
         category=ChecklistCategory.SECURITY,
     ),
     ChecklistItemDefinition(
         key=ChecklistItemKey.REBOOT_PERSISTENCE,
         label="Reboot persistence",
-        description="Configuration survives a reboot -- confirmed after a real power cycle.",
+        description=(
+            "Configuration survives a reboot -- confirmed after a real power cycle."
+        ),
         detection_mode=DetectionMode.MANUAL,
         category=ChecklistCategory.RESILIENCE,
     ),

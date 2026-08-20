@@ -12,7 +12,6 @@ from fastapi import APIRouter, Depends, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.rbac.dependencies import RequirePermission
-from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_feature_entitlement_service
 from .schemas import (

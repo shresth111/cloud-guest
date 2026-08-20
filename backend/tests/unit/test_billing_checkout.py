@@ -641,7 +641,9 @@ class TestWebhookCheckoutOrderCorrelation:
         payload = {
             "event": "payment.captured",
             "payload": {
-                "payment": {"entity": {"id": "pay_illegal", "order_id": "order_illegal"}}
+                "payment": {
+                    "entity": {"id": "pay_illegal", "order_id": "order_illegal"}
+                }
             },
             "_event_id": "evt_illegal",
         }

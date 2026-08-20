@@ -28,7 +28,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-from .constants import ChecklistItemStatus, DetectionMode
+from .constants import ChecklistItemStatus
 
 
 class RouterChecklistItem(BaseModel):
@@ -52,7 +52,9 @@ class RouterChecklistItem(BaseModel):
     # the WAN link's own health_status/last_checked_at for
     # wan_connectivity, or the peer's last_handshake_at for wireguard) --
     # shown in the UI as "why this result", never branched on in code.
-    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    evidence: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, nullable=False
+    )
     last_checked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

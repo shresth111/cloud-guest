@@ -77,7 +77,10 @@ from typing import Protocol
 
 from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
 from wyfy_device_gateway.contract import DeviceVendor
-from wyfy_device_gateway.mikrotik_adapter import MikroTikConnectionError, MikroTikDeviceError
+from wyfy_device_gateway.mikrotik_adapter import (
+    MikroTikConnectionError,
+    MikroTikDeviceError,
+)
 from wyfy_device_gateway.registry import get_adapter
 
 from .exceptions import (
@@ -212,7 +215,9 @@ class MikroTikDiagnosticsAdapter:
                 creds, target=target, count=count, timeout_seconds=timeout_seconds
             )
         except MikroTikConnectionError as exc:
-            raise DiagnosticsDeviceConnectionError(credentials.host, exc.detail) from exc
+            raise DiagnosticsDeviceConnectionError(
+                credentials.host, exc.detail
+            ) from exc
         except MikroTikDeviceError as exc:
             raise DiagnosticsDeviceOperationError("ping", exc.detail) from exc
         return PingResult(
@@ -236,7 +241,9 @@ class MikroTikDiagnosticsAdapter:
                 creds, target=target, max_hops=max_hops, timeout_seconds=timeout_seconds
             )
         except MikroTikConnectionError as exc:
-            raise DiagnosticsDeviceConnectionError(credentials.host, exc.detail) from exc
+            raise DiagnosticsDeviceConnectionError(
+                credentials.host, exc.detail
+            ) from exc
         except MikroTikDeviceError as exc:
             raise DiagnosticsDeviceOperationError("traceroute", exc.detail) from exc
         return TracerouteResult(

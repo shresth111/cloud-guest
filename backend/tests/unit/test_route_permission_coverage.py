@@ -18,7 +18,7 @@ list of routers -- so it can never silently miss a newly-added domain.
 
 ## The allowlist is the actual security review
 
-``_ALLOWED_UNAUTHENTICATED_PATHS`` is not a suppression list -- every
+``_ALLOWED_UNAUTHENTICATED_ROUTES`` is not a suppression list -- every
 entry documents, in one line, *why* that specific route has no
 platform-identity check (pre-identity auth flows, genuinely guest-facing
 endpoints with no platform user at all, health checks, webhook
@@ -192,6 +192,49 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/webhooks/razorpay"): (
         "Payment gateway webhook -- verified by Razorpay request signature."
     ),
+    ("GET", "/api/v1/agent/authorized-macs"): (
+        "Router agent -- CurrentAgent device credential. Reports the MACs "
+        "of this router's own currently-ACTIVE guest sessions for the "
+        "hotspot ip-binding sync; same class as the /agent/* entries above."
+    ),
+    # -- Guest device OS, pre-identity ---------------------------------
+    ("GET", "/api/v1/captive-portal/rfc8908"): (
+        "RFC 8908 Captive Portal API discovery document, fetched by an "
+        "unauthenticated guest device's OS via the RFC 8910 DHCP Option "
+        "114 URI -- same pre-identity guest category as GET "
+        "/captive-portal/resolve, which is allowlisted by prefix above."
+    ),
+    # -- Self-service data-masking step-up: CurrentUser establishes
+    # identity and the OTP is always sent to the caller's *own* phone/
+    # email (never a client-supplied identifier), so the authorization
+    # model is "prove you are yourself", not an RBAC permission. Same
+    # category as the /auth/mfa/* self-service entries above. ----------
+    ("POST", "/api/v1/me/data-masking/otp"): (
+        "Self-service -- CurrentUser only; OTP is sent to the caller's own "
+        "phone/email, derived server-side from their own account."
+    ),
+    ("POST", "/api/v1/me/data-masking"): (
+        "Self-service -- CurrentUser only; flips the caller's own "
+        "data-masking preference, gated by the OTP step-up above."
+    ),
+    # -- WebFig reverse proxy: an <iframe src> navigation cannot carry a
+    # Bearer header, so these cannot sit behind CurrentUser/
+    # RequirePermission. Authorization really happens at POST
+    # /routers/{router_id}/webfig-session (RequirePermission
+    # "routers.manage" + tenant scoping), which mints a short-lived,
+    # single-router-scoped capability token; the proxy 401s unless that
+    # token is present and still maps to this exact router in Redis.
+    # See app.domains.router.router.proxy_webfig's docstring. ----------
+    **{
+        (method, "/api/v1/routers/{router_id}/webfig/{path:path}"): (
+            "WebFig reverse proxy -- validated by the short-lived, "
+            "router-scoped session token minted by the "
+            "RequirePermission-gated POST /routers/{router_id}/"
+            "webfig-session, not RBAC (iframe navigation cannot send a "
+            "Bearer header)."
+        )
+        for method in ("GET", "POST", "PUT", "PATCH", "DELETE")
+    },
 }
 
 # Path *prefixes* that are entirely guest-facing (no platform identity at

@@ -8,12 +8,20 @@ from fastapi import APIRouter, Depends, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
-from app.domains.rbac.dependencies import CurrentOrganization, CurrentUser, RequirePermission
+from app.domains.rbac.dependencies import (
+    CurrentOrganization,
+    CurrentUser,
+    RequirePermission,
+)
 
 from .constants import CHECKLIST_ITEMS_BY_KEY
 from .dependencies import get_readiness_service
 from .models import RouterChecklistItem
-from .schemas import ChecklistItemResponse, ChecklistResponse, ConfirmChecklistItemRequest
+from .schemas import (
+    ChecklistItemResponse,
+    ChecklistResponse,
+    ConfirmChecklistItemRequest,
+)
 from .service import ReadinessService
 
 router = APIRouter(prefix="/readiness", tags=["Router Readiness Checklist"])
@@ -35,7 +43,9 @@ def _item_response(row: RouterChecklistItem) -> ChecklistItemResponse:
         detail=row.detail,
         evidence=row.evidence or {},
         last_checked_at=row.last_checked_at,
-        checked_by_user_id=str(row.checked_by_user_id) if row.checked_by_user_id else None,
+        checked_by_user_id=(
+            str(row.checked_by_user_id) if row.checked_by_user_id else None
+        ),
     )
 
 

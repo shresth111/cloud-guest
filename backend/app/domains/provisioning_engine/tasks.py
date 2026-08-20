@@ -395,7 +395,9 @@ def run_router_health_poll_sweep() -> dict[str, object]:
     return result
 
 
-async def _poll_single_router_health_async(router_id: uuid.UUID) -> HealthPollSweepSummary:
+async def _poll_single_router_health_async(
+    router_id: uuid.UUID,
+) -> HealthPollSweepSummary:
     """The real per-router fan-out leaf task's own async body -- a fresh
     session *and* a fresh Redis client per invocation (this task runs once
     per router, potentially many times concurrently across worker slots),

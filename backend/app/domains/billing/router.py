@@ -176,8 +176,6 @@ from app.domains.rbac.dependencies import (
 from app.domains.rbac.enums import ScopeType
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
-logger = logging.getLogger(__name__)
-
 from .constants import DiscountType, InvoiceStatus, PaymentStatus, PlanType
 from .dependencies import (
     get_billing_profile_service,
@@ -299,6 +297,8 @@ from .webhooks import (
     verify_razorpay_signature,
     verify_stripe_event,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Billing"])
 
@@ -2092,7 +2092,9 @@ def _get_invoice_email_provider(settings: Settings) -> EmailProviderProtocol:
         username=settings.invoice_smtp_username,
         password=settings.invoice_smtp_password,
         use_tls=settings.invoice_smtp_use_tls,
-        from_address=settings.invoice_smtp_from_address or settings.invoice_smtp_username,
+        from_address=(
+            settings.invoice_smtp_from_address or settings.invoice_smtp_username
+        ),
     )
 
 

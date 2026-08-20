@@ -6,17 +6,15 @@ existing health checks and domain services.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
-import uuid
-import logging
 
 from app.core.config import get_settings
-from app.domains.organization.service import OrganizationService
 from app.domains.location.service import LocationService
+from app.domains.organization.service import OrganizationService
 from app.domains.router.service import RouterService
-from app.domains.analytics.service import AnalyticsService
 
 from .schemas import (
     DependencyStatus,
@@ -54,7 +52,6 @@ class SystemService:
             if dep.status == "degraded":
                 overall = "degraded"
 
-        settings = get_settings()
         return SystemHealthResponse(
             status=overall,
             version=self._get_version(),

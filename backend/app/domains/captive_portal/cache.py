@@ -57,24 +57,54 @@ from app.core.config import get_settings
 # background_focal_y (design spec §1.4 C4), added to
 # _CACHED_CONFIG_SCALAR_FIELDS by the same change -- the spec calls this
 # bump out explicitly in §0.3 because skipping it is exactly the
-# guest-facing 500 the versioning exists to prevent. v4 is v7 Part 3's
-# powered_by_enabled (P4), added to that same tuple: without this bump the
-# first resolve after that deploy reads a v3 payload written by the
-# previous build, `payload["powered_by_enabled"]` raises KeyError, and
-# every guest joining WiFi gets a 500 until the TTL expires.
-_CACHE_KEY_TEMPLATE = (
-    "captive_portal:resolve:v4:{organization_id}:{location_id}"
-)
+# guest-facing 500 the versioning exists to prevent. v4 is design spec
+# §5 S7: the resolved organization's own ``brandings`` row is now folded
+# into the payload under a new top-level ``"branding"`` key, which
+# ``ResolvedPortalConfig.from_cache_payload`` likewise indexes unguarded
+# -- the identical KeyError-out-of-an-unauthenticated-endpoint hazard,
+# so the identical bump. v5 is v7 Part 3's powered_by_enabled (P4), added
+# to that same tuple: two workstreams independently claimed v4 (branding
+# on main, powered_by on this branch), so the merged payload -- carrying
+# both -- takes a fresh version; without it the first resolve after
+# deploy reads a payload missing one of the two keys and 500s every
+# guest until the TTL expires.
+_CACHE_KEY_TEMPLATE = "captive_portal:resolve:v5:{organization_id}:{location_id}"
+
+# Redis SET of every resolve key currently written for one organization,
+# so an organization-scoped edit can fan out to *all* of them (see
+# ``invalidate_organization``). Deliberately versioned in lockstep with
+# ``_CACHE_KEY_TEMPLATE`` -- an index holding keys from a previous
+# payload version would fan a delete out to keys nothing reads anymore.
+_ORG_INDEX_KEY_TEMPLATE = "captive_portal:resolve:v5:org-index:{organization_id}"
+
+# The index set must outlive the payloads it points at, or a payload
+# written at second 59 of the index's own TTL would be orphaned (indexed
+# by a set that expires before it does) and survive an
+# ``invalidate_organization`` call. One extra window is enough: every
+# payload the set names expires no later than one TTL after the set's
+# own last write, which is what refreshes the set's expiry too.
+_ORG_INDEX_TTL_MULTIPLIER = 2
 _NONE_SENTINEL = "-"
 
 
 class CaptivePortalResolveCache:
     """Thin async wrapper around Redis for captive-portal resolve caching."""
 
-    def __init__(self, redis: Redis, *, ttl_seconds: int | None = None) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        *,
+        ttl_seconds: int | None = None,
+        negative_ttl_seconds: int | None = None,
+    ) -> None:
+        settings = get_settings()
         self._redis = redis
         self._ttl_seconds = (
-            ttl_seconds or get_settings().captive_portal_resolve_cache_ttl_seconds
+            ttl_seconds or settings.captive_portal_resolve_cache_ttl_seconds
+        )
+        self._negative_ttl_seconds = (
+            negative_ttl_seconds
+            or settings.captive_portal_resolve_negative_cache_ttl_seconds
         )
 
     @staticmethod
@@ -101,16 +131,45 @@ class CaptivePortalResolveCache:
             # than fail the request.
             return None
 
+    @staticmethod
+    def _org_index_key(organization_id: uuid.UUID) -> str:
+        return _ORG_INDEX_KEY_TEMPLATE.format(organization_id=organization_id)
+
     async def set(
         self,
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
         payload: dict[str, Any],
+        *,
+        index_organization_id: uuid.UUID | None = None,
+        negative: bool = False,
     ) -> None:
-        await self._redis.set(
-            self._key(organization_id, location_id),
-            json.dumps(payload, default=str),
-            ex=self._ttl_seconds,
+        """Writes the payload, and -- when ``index_organization_id`` is
+        given -- records this key in that organization's own index set so
+        ``invalidate_organization`` can later find it.
+
+        ``index_organization_id`` is the **resolved** organization, not
+        the ``organization_id`` argument: the common real-world call shape
+        is a location's QR code encoding only ``location_id``, which
+        caches under an ``(None, location_id)`` key whose own organization
+        is not knowable from the key alone. Passing it explicitly is what
+        lets an organization-scoped edit (a branding upload, an org-level
+        default config change) fan out to that key too.
+
+        ``negative`` selects the much shorter negative TTL -- see
+        ``Settings.captive_portal_resolve_negative_cache_ttl_seconds`` for
+        why a "not configured" answer must not be held as long as a real
+        one.
+        """
+        key = self._key(organization_id, location_id)
+        ttl = self._negative_ttl_seconds if negative else self._ttl_seconds
+        await self._redis.set(key, json.dumps(payload, default=str), ex=ttl)
+        if index_organization_id is None:
+            return
+        index_key = self._org_index_key(index_organization_id)
+        await self._redis.sadd(index_key, key)
+        await self._redis.expire(
+            index_key, self._ttl_seconds * _ORG_INDEX_TTL_MULTIPLIER
         )
 
     async def invalidate(
@@ -124,6 +183,27 @@ class CaptivePortalResolveCache:
         not fan out to other locations falling back to an org-level
         default."""
         await self._redis.delete(self._key(organization_id, location_id))
+
+    async def invalidate_organization(self, organization_id: uuid.UUID) -> None:
+        """Deletes *every* resolve key currently indexed for this
+        organization -- the fan-out the per-pair ``invalidate`` above
+        deliberately does not do.
+
+        Closes the one gap this module's docstring documents as
+        TTL-backstopped only: an organization-level edit reaching every
+        *other* location that falls back to it. Design spec §5 S7 makes
+        this load-bearing rather than merely nice -- once the
+        organization's ``brandings`` row is folded into the cached
+        payload, an admin uploading a logo would otherwise stay invisible
+        to every already-cached location for up to a full TTL, which is a
+        real regression against the uncached per-request fetch it
+        replaces.
+        """
+        index_key = self._org_index_key(organization_id)
+        keys = await self._redis.smembers(index_key)
+        if keys:
+            await self._redis.delete(*keys)
+        await self._redis.delete(index_key)
 
 
 __all__ = ["CaptivePortalResolveCache"]

@@ -37,8 +37,6 @@ Follows this project's plain-``assert``/native-``async def`` style;
 
 from __future__ import annotations
 
-import itertools
-
 import librouteros
 import pytest
 

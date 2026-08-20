@@ -10,26 +10,24 @@ wireguard services — no new database tables.
 
 from __future__ import annotations
 
-import uuid
 import logging
+import uuid
 
-from app.domains.organization.service import OrganizationService
-from app.domains.organization.repository import OrganizationRepositoryProtocol
 from app.domains.location.service import LocationService
+from app.domains.organization.enums import OrganizationType
+from app.domains.organization.service import OrganizationService
+from app.domains.rbac.enums import ScopeType
+from app.domains.rbac.exceptions import RoleNotFoundError
+from app.domains.rbac.service import RBACService
 from app.domains.router.service import RouterService
 from app.domains.router_provisioning.service import RouterProvisioningService
 from app.domains.wireguard.service import WireGuardService
-from app.domains.guest.service import RadiusService
-from app.domains.rbac.service import RBACService
-from app.domains.rbac.enums import ScopeType
-from app.domains.rbac.exceptions import RoleNotFoundError
-from app.domains.organization.enums import OrganizationType
 
 from .schemas import (
+    GenerateNasResponse,
+    GenerateScriptResponse,
     OnboardRequest,
     OnboardResponse,
-    GenerateScriptResponse,
-    GenerateNasResponse,
     WireguardConfigResponse,
 )
 
@@ -138,8 +136,8 @@ class CustomerProvisioningService:
     async def generate_wireguard(
         self, customer_id: uuid.UUID
     ) -> WireguardConfigResponse:
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
         from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
         private_key_obj = X25519PrivateKey.generate()
         private_key = private_key_obj.private_bytes(
@@ -160,6 +158,6 @@ class CustomerProvisioningService:
             peer_id=str(uuid.uuid4()),
             private_key=priv_b64,
             public_key=pub_b64,
-            endpoint=f"wg.cloudguest.io:51820",
+            endpoint="wg.cloudguest.io:51820",
             message="WireGuard configuration generated",
         )

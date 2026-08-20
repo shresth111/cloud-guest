@@ -56,7 +56,7 @@ class BrandingRepository(BrandingRepositoryProtocol):
     async def get_by_organization(self, organization_id: uuid.UUID) -> Branding | None:
         stmt = select(Branding).where(
             Branding.organization_id == organization_id,
-            Branding.is_deleted == False,
+            Branding.is_deleted.is_(False),
         )
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()

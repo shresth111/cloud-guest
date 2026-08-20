@@ -65,11 +65,6 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.database.redis import create_redis_client
 from app.database.session import SessionLocal
-from app.domains.otp.service import (
-    get_configured_email_provider,
-    get_configured_sms_provider,
-)
-
 from app.domains.location.repository import (
     LocationCodeCounterRepository,
     LocationRepository,
@@ -79,6 +74,10 @@ from app.domains.monitored_hardware.repository import MonitoredHardwareRepositor
 from app.domains.monitored_hardware.service import MonitoredHardwareService
 from app.domains.organization.repository import OrganizationRepository
 from app.domains.organization.service import OrganizationService
+from app.domains.otp.service import (
+    get_configured_email_provider,
+    get_configured_sms_provider,
+)
 from app.domains.router.repository import RouterRepository
 from app.domains.router.service import RouterService
 

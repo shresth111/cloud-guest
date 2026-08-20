@@ -359,6 +359,35 @@ TASK_RUN_QUOTA_RESET_SWEEP = "app.domains.guest.tasks.run_quota_reset_sweep"
 QUOTA_RESET_SWEEP_INTERVAL_SECONDS = 3600.0
 
 # ============================================================================
+# Dynamic bandwidth-queue assignment, off the login request path
+# ============================================================================
+# Design spec §5 S9. Unlike every other task name above, this one is not
+# Beat-scheduled -- it is enqueued per guest login by
+# ``GuestService._assign_guest_queue``.
+#
+# The work it defers is a real TCP connection to the venue's MikroTik,
+# which ``queue_management.device_adapters`` opens fresh (no pooling) with
+# a 10-second timeout. Awaited inline, that put a router round trip --
+# over the venue's own uplink, to a device that may be rebooting,
+# saturated, or simply unreachable -- between a guest entering a correct
+# OTP and seeing they are online. It was already exception-swallowed, so a
+# failure never blocked the login; but a *swallowed 10-second timeout* is
+# still 10 seconds of spinner, which is the part being fixed here.
+#
+# Bandwidth shaping is a quality-of-service concern, not an authorization
+# one (see ``QueueAssignmentProtocol``'s own docstring), so it is
+# correct for it to land a moment after the session rather than before it.
+TASK_ASSIGN_GUEST_QUEUE = "app.domains.guest.tasks.assign_guest_queue"
+
+# Retries exist for the transient half of "the router did not answer" -- a
+# reboot, a flapping uplink. They are deliberately few and widely spaced:
+# nothing downstream is waiting on this, and a venue whose router is
+# genuinely offline should not have every login that happened during the
+# outage pile retries onto it.
+ASSIGN_GUEST_QUEUE_MAX_RETRIES = 3
+ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS = 30
+
+# ============================================================================
 # FreeRADIUS ``rlm_rest``-style integration -- see ``service.py``'s module
 # docstring for the full architectural write-up on why HTTP (rlm_rest), not
 # raw RADIUS-UDP.
@@ -500,6 +529,9 @@ __all__ = [
     "TASK_RUN_FUP_TIME_ACCRUAL_SWEEP",
     "FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_QUOTA_RESET_SWEEP",
+    "TASK_ASSIGN_GUEST_QUEUE",
+    "ASSIGN_GUEST_QUEUE_MAX_RETRIES",
+    "ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS",
     "QUOTA_RESET_SWEEP_INTERVAL_SECONDS",
     "RADIUS_NAS_IDENTIFIER_HEADER",
     "RADIUS_SHARED_SECRET_HEADER",
