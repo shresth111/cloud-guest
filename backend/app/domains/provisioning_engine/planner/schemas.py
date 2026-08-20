@@ -319,6 +319,15 @@ class ConfigurationPlanRenderResponse(BaseModel):
     profiles_used: list[str]
     secret_refs: list[str]
     line_count: int
+    requires_safety_net: bool = False
+
+
+class ConfigurationPlanPrepareResponse(BaseModel):
+    plan_id: str
+    pre_apply_backup_version_id: str
+    pre_apply_backup_version_number: int
+    status: PlanStatus
+    requires_safety_net: bool
 
 
 __all__ = [
@@ -358,4 +367,5 @@ __all__ = [
     "BuildConfigurationPlanRequest",
     "ConfigurationPlanResponse",
     "ConfigurationPlanRenderResponse",
+    "ConfigurationPlanPrepareResponse",
 ]

@@ -92,6 +92,7 @@ from app.domains.provisioning_engine.planner.plan_service import (
 from app.domains.provisioning_engine.planner.schemas import (
     BuildConfigurationPlanRequest,
     CompatibilityReport,
+    ConfigurationPlanPrepareResponse,
     ConfigurationPlanRenderResponse,
     ConfigurationPlanResponse,
     DiscoverRouterResponse,
@@ -1313,6 +1314,39 @@ async def render_router_configuration_plan(
     return build_response(
         success=True,
         message="Configuration plan rendered",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/routers/{router_id}/plans/{plan_id}/prepare",
+    response_model=ApiResponse[ConfigurationPlanPrepareResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.manage"))],
+)
+async def prepare_router_configuration_plan(
+    request: Request,
+    router_id: uuid.UUID,
+    plan_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    plan_service: ConfigurationPlanService = Depends(get_configuration_plan_service),
+    provisioning_service: RouterProvisioningService = Depends(
+        get_router_provisioning_service
+    ),
+):
+    """Capture pre-apply backup marker before plan apply (Wave 1 Step 11)."""
+    result = await plan_service.prepare_plan(
+        router_id,
+        plan_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+        backup_creator=provisioning_service,
+    )
+    return build_response(
+        success=True,
+        message="Configuration plan prepared",
         data=result.model_dump(mode="json"),
         request_id=_request_id(request),
     )

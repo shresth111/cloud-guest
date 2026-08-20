@@ -13,6 +13,7 @@ from .constants import (
     PlanRisk,
     RuleId,
 )
+from .management_safety import assess_management_risk
 from .plan_builder import PlanBuilder
 from .schemas import GuestNetworkRequest, PlanConflict, PlanDecision
 from .subnet_conflicts import detect_subnet_conflicts
@@ -240,23 +241,21 @@ def rule_r9_default_route_gate(ctx: PlanContext) -> None:
 
 
 def rule_r10_management_safety(ctx: PlanContext) -> None:
-    # Wave 1: flag guest actions touching management paths for later safety net.
     if not ctx.request.guest_interfaces:
         return
     for action in list(ctx.builder.actions):
-        if action.resource_kind in {"bridge_port", "dhcp_client"}:
-            ctx.builder.add_action(
-                rule_id=RuleId.R10.value,
-                action_type=PlanActionType.NOOP,
-                resource_kind="safety_review",
-                routeros_path="management",
-                resource_ref=action.resource_ref,
-                summary=(
-                    f"Review management connectivity risk for {action.resource_ref}"
-                ),
-                risk=PlanRisk.MANAGEMENT_CONNECTIVITY,
-                details={"related_action_seq": action.seq},
-            )
+        assessment = assess_management_risk(
+            action,
+            snapshot=ctx.snapshot,
+            wan_interfaces=ctx.wan_interfaces,
+        )
+        if not assessment.risky:
+            continue
+        ctx.builder.upgrade_action_risk(
+            action.seq,
+            PlanRisk.MANAGEMENT_CONNECTIVITY,
+            reason=assessment.reason or "Management connectivity risk",
+        )
 
 
 RULE_REGISTRY: tuple[Callable[[PlanContext], None], ...] = (

@@ -53,6 +53,23 @@ class PlanBuilder:
     def add_decision(self, decision: PlanDecision) -> None:
         self.decisions.append(decision)
 
+    def upgrade_action_risk(
+        self,
+        seq: int,
+        risk: PlanRisk,
+        *,
+        reason: str,
+    ) -> None:
+        for index, action in enumerate(self.actions):
+            if action.seq != seq:
+                continue
+            details = dict(action.details)
+            details["management_risk_reason"] = reason
+            self.actions[index] = action.model_copy(
+                update={"risk": risk, "details": details}
+            )
+            return
+
     def resolve_status(self) -> PlanStatus:
         if self.blocked:
             return PlanStatus.BLOCKED

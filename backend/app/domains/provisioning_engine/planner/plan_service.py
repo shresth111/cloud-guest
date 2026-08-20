@@ -15,15 +15,20 @@ from .constants import PlanStatus, VerificationScope
 from .exceptions import (
     ConfigurationPlanNotApprovableError,
     ConfigurationPlanNotFoundError,
+    ConfigurationPlanNotPreparableError,
     ConfigurationPlanNotRenderableError,
     NoRouterSnapshotError,
     RouterSnapshotNotFoundError,
 )
+from .managed_resource_repository import ManagedRouterResourceRepositoryProtocol
+from .managed_resources import build_managed_resource_rows
+from .management_safety import plan_requires_safety_net
 from .plan_engine import build_configuration_plan, plan_to_persist_dict
 from .plan_repository import ConfigurationPlanRepositoryProtocol
 from .repository import RouterSnapshotRepositoryProtocol
 from .schemas import (
     BuildConfigurationPlanRequest,
+    ConfigurationPlanPrepareResponse,
     ConfigurationPlanRenderResponse,
     ConfigurationPlanResponse,
     GuestNetworkRequest,
@@ -54,6 +59,17 @@ class IspLinkLookupProtocol(Protocol):
 
 class ConfigVersionCreatorProtocol(Protocol):
     async def create_version_from_content(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        rendered_content: str,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> ConfigVersion: ...
+
+
+class PreApplyBackupCreatorProtocol(Protocol):
+    async def create_pre_apply_backup_from_content(
         self,
         *,
         actor_user_id: uuid.UUID | None,
@@ -105,12 +121,14 @@ class ConfigurationPlanService:
         plan_repository: ConfigurationPlanRepositoryProtocol,
         snapshot_repository: RouterSnapshotRepositoryProtocol,
         verification_repository: VerificationRunRepositoryProtocol,
+        managed_resource_repository: ManagedRouterResourceRepositoryProtocol,
         router_lookup: RouterLookupProtocol,
         isp_link_lookup: IspLinkLookupProtocol,
     ) -> None:
         self.plan_repository = plan_repository
         self.snapshot_repository = snapshot_repository
         self.verification_repository = verification_repository
+        self.managed_resource_repository = managed_resource_repository
         self.router_lookup = router_lookup
         self.isp_link_lookup = isp_link_lookup
 
@@ -254,6 +272,18 @@ class ConfigurationPlanService:
             rendered_content=compiled.script,
             requesting_organization_id=requesting_organization_id,
         )
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        await self.managed_resource_repository.create_many(
+            build_managed_resource_rows(
+                plan,
+                plan_id=plan_id,
+                router_id=router.id,
+                organization_id=router.organization_id,
+                location_id=router.location_id,
+            )
+        )
         updated = await self.plan_repository.update(
             row,
             {
@@ -269,6 +299,55 @@ class ConfigurationPlanService:
             profiles_used=compiled.profiles_used,
             secret_refs=compiled.secret_refs,
             line_count=compiled.line_count,
+            requires_safety_net=plan_requires_safety_net(plan.actions),
+        )
+
+    async def prepare_plan(
+        self,
+        router_id: uuid.UUID,
+        plan_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        backup_creator: PreApplyBackupCreatorProtocol,
+    ) -> ConfigurationPlanPrepareResponse:
+        await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        row = await self.plan_repository.get_by_id(plan_id, router_id=router_id)
+        if row is None:
+            raise ConfigurationPlanNotFoundError(plan_id)
+        if row.status not in {
+            PlanStatus.APPROVED.value,
+            PlanStatus.RENDERING.value,
+        }:
+            raise ConfigurationPlanNotPreparableError(plan_id, row.status)
+        if row.pre_apply_backup_version_id is not None:
+            raise ConfigurationPlanNotPreparableError(plan_id, row.status)
+
+        plan = self._row_to_response(row)
+        from app.domains.network_config.profiles.safety_net import (
+            render_pre_apply_export_marker,
+        )
+
+        backup = await backup_creator.create_pre_apply_backup_from_content(
+            actor_user_id=actor_user_id,
+            router_id=router_id,
+            rendered_content=render_pre_apply_export_marker(
+                snapshot_id=str(row.snapshot_id)
+            ),
+            requesting_organization_id=requesting_organization_id,
+        )
+        updated = await self.plan_repository.update(
+            row,
+            {"pre_apply_backup_version_id": backup.id},
+        )
+        return ConfigurationPlanPrepareResponse(
+            plan_id=str(updated.id),
+            pre_apply_backup_version_id=str(backup.id),
+            pre_apply_backup_version_number=int(backup.version_number),
+            status=PlanStatus(updated.status),
+            requires_safety_net=plan_requires_safety_net(plan.actions),
         )
 
     def _row_to_response(self, row: object) -> ConfigurationPlanResponse:

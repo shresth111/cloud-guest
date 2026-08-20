@@ -313,6 +313,7 @@ class ProvisionTemplate(BaseModel):
 # Wave 1 discovery snapshots live in planner.models; re-exported here so
 # alembic/env.py's single ``provisioning_engine.models`` import registers
 # the table on ``Base.metadata`` alongside the job/step/log/template set.
+from .planner.managed_resource_models import ManagedRouterResource  # noqa: E402
 from .planner.models import RouterSnapshot  # noqa: E402
 from .planner.plan_models import ConfigurationPlan  # noqa: E402
 from .planner.verification_models import VerificationRun  # noqa: E402
@@ -324,5 +325,6 @@ __all__ = [
     "ProvisionTemplate",
     "RouterSnapshot",
     "ConfigurationPlan",
+    "ManagedRouterResource",
     "VerificationRun",
 ]

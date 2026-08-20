@@ -708,6 +708,42 @@ class RouterProvisioningService:
         )
         return version
 
+    async def create_pre_apply_backup_from_content(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        rendered_content: str,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> ConfigVersion:
+        """Persist a pre-apply ``/export`` marker as an ``is_backup`` version."""
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        validate_router_can_receive_config(router)
+        version_number = await self.repository.get_next_version_number(router.id)
+        version = await self.repository.create_version(
+            router_id=router.id,
+            profile_id=None,
+            version_number=version_number,
+            rendered_content=rendered_content,
+            status=ConfigVersionStatus.APPLIED.value,
+            created_by_user_id=actor_user_id,
+            applied_at=datetime.now(UTC),
+            rollback_of_version_id=None,
+            is_backup=True,
+            created_by=actor_user_id,
+        )
+        await self._record_event(
+            router,
+            RouterEventType.BACKUP_CREATED,
+            message=(
+                f"Pre-apply backup marker version {version.version_number} created"
+            ),
+            metadata={"version_id": str(version.id), "pre_apply": True},
+        )
+        return version
+
     # ========================================================================
     # Config versions: read / diff / rollback / apply
     # ========================================================================
