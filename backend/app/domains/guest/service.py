@@ -4619,10 +4619,40 @@ class RadiusService:
                 else:
                     session = result.session
 
+        # The Authorize decision is otherwise invisible server-side: this
+        # endpoint answers HTTP 200 for both Accept and Reject (the verdict
+        # rides in ``control:Auth-Type``), so without this line an
+        # operator cannot tell "the NAS never asked" from "the NAS asked
+        # and we said no" without device-side RADIUS debugging. Field
+        # names follow this module's ``event_``-prefixed convention;
+        # ``event_identifier`` is the same raw value ``guest_logged_in``
+        # already logs, which is what makes the two lines correlatable.
+        decision_extra: dict[str, object] = {
+            "event_identifier": username,
+            "event_nas_identifier": nas_client.nas_identifier,
+            "event_router_id": str(router.id),
+            "event_calling_station_id": calling_station_id,
+        }
         if session is None:
+            logger.info(
+                "radius_authorize_decision",
+                extra={
+                    **decision_extra,
+                    "event_authorized": False,
+                    "event_session_id": None,
+                },
+            )
             return RadiusAuthorizeResult(
                 authorized=False, session_timeout_seconds=None, data_limit_mb=None
             )
+        logger.info(
+            "radius_authorize_decision",
+            extra={
+                **decision_extra,
+                "event_authorized": True,
+                "event_session_id": str(session.id),
+            },
+        )
         return RadiusAuthorizeResult(
             authorized=True,
             session_timeout_seconds=(
