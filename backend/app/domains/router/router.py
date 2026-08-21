@@ -1068,6 +1068,7 @@ async def preview_bootstrap_script(
         ),
         lines=lines,
         script="\n".join(lines),
+        script_single_line="; ".join(lines),
         line_count=len(lines),
         token_expires_at=expires_at,
     )
