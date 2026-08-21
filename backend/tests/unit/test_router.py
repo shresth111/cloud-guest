@@ -29,6 +29,7 @@ from app.domains.location.exceptions import (
     LocationNotFoundError,
 )
 from app.domains.location.models import Location
+from app.domains.network_config.constants import BootstrapMode
 from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
@@ -44,6 +45,7 @@ from app.domains.router.exceptions import (
     ProvisioningTokenGenerationNotAllowedError,
     ProvisioningTokenNotFoundError,
     ProvisioningTokenRouterStateError,
+    RemoteBootstrapNeverEnrolledError,
     RouterDecommissionedError,
     RouterLiveCredentialRotationFailedError,
     RouterNotFoundError,
@@ -835,6 +837,132 @@ class TestRouterProvisioning:
         assert any(
             e["action"] == "router_provisioning_token_generated" for e in audit.entries
         )
+
+    async def test_preview_remote_mode_refuses_never_checked_in_router(
+        self,
+    ) -> None:
+        service, _repo, location_lookup, org_lookup, _audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        location.location_code = "LOC-2026-000039"
+        router_device = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(),
+        )
+
+        # Never checked in: last_seen_at is NULL -- there is no live tunnel
+        # to protect and none to deliver the script through.
+        with pytest.raises(RemoteBootstrapNeverEnrolledError):
+            await service.preview_bootstrap_script(
+                actor_user_id=uuid.uuid4(),
+                router_id=router_device.id,
+                requesting_organization_id=None,
+                api_base_url="https://api.cloudguest.example",
+                mode=BootstrapMode.REMOTE,
+            )
+
+    async def test_preview_remote_mode_rewinds_live_router_and_stages(
+        self,
+    ) -> None:
+        service, repo, location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        location.location_code = "LOC-2026-000039"
+        router_device = await make_router(
+            repo,
+            location_id=location.id,
+            organization_id=organization.id,
+            status=RouterStatus.ONLINE,
+        )
+        await repo.update_router(
+            router_device, {"last_seen_at": datetime.now(UTC)}
+        )
+
+        location_code, lines, expires_at = await service.preview_bootstrap_script(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            api_base_url="https://api.cloudguest.example",
+            mode=BootstrapMode.REMOTE,
+        )
+
+        script = "\n".join(lines)
+        assert location_code == "LOC-2026-000039"
+        # The remote rendering, not the on-site one: staged schedulers, no
+        # in-session teardown.
+        assert "/system scheduler add name=cloudguest-bootstrap-revert" in script
+        assert "/system scheduler add name=cloudguest-bootstrap-cutover" in script
+        assert not any(
+            line.startswith("/interface wireguard remove") for line in lines
+        )
+        assert expires_at is not None
+        # The live router was rewound through the transition graph's
+        # re-provision edge (so the eventual device check-in is legal),
+        # audited with the dedicated remote-reprovision action, and a
+        # token was minted.
+        refreshed = await repo.get_by_id(router_device.id)
+        assert refreshed is not None
+        assert refreshed.status == RouterStatus.PENDING_PROVISIONING.value
+        assert any(
+            e["action"] == "router_remote_reprovision_started"
+            for e in audit.entries
+        )
+        assert any(
+            e["action"] == "router_provisioning_token_generated"
+            for e in audit.entries
+        )
+
+    async def test_preview_remote_mode_rejects_suspended_router(self) -> None:
+        service, repo, location_lookup, org_lookup, _audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        location.location_code = "LOC-2026-000039"
+        router_device = await make_router(
+            repo,
+            location_id=location.id,
+            organization_id=organization.id,
+            status=RouterStatus.SUSPENDED,
+        )
+        await repo.update_router(
+            router_device, {"last_seen_at": datetime.now(UTC)}
+        )
+
+        with pytest.raises(ProvisioningTokenGenerationNotAllowedError):
+            await service.preview_bootstrap_script(
+                actor_user_id=uuid.uuid4(),
+                router_id=router_device.id,
+                requesting_organization_id=None,
+                api_base_url="https://api.cloudguest.example",
+                mode=BootstrapMode.REMOTE,
+            )
+
+    async def test_preview_onsite_mode_never_touches_router_status(self) -> None:
+        # On-site remains exactly the pre-split behavior: a live router is
+        # NOT silently rewound -- token minting refuses it, same as before
+        # the mode split.
+        service, repo, location_lookup, org_lookup, _audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        location.location_code = "LOC-2026-000039"
+        router_device = await make_router(
+            repo,
+            location_id=location.id,
+            organization_id=organization.id,
+            status=RouterStatus.ONLINE,
+        )
+
+        with pytest.raises(ProvisioningTokenGenerationNotAllowedError):
+            await service.preview_bootstrap_script(
+                actor_user_id=uuid.uuid4(),
+                router_id=router_device.id,
+                requesting_organization_id=None,
+                api_base_url="https://api.cloudguest.example",
+            )
+        refreshed = await repo.get_by_id(router_device.id)
+        assert refreshed is not None
+        assert refreshed.status == RouterStatus.ONLINE.value
 
     async def test_check_in_token_is_single_use(self) -> None:
         service, repo, location_lookup, org_lookup, _audit = make_service()

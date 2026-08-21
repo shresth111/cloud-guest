@@ -363,14 +363,24 @@ class WebfigSessionResponse(BaseModel):
 
 
 class BootstrapScriptPreviewResponse(BaseModel):
-    """Server-rendered Step 0 bootstrap script for a not-yet-enrolled router.
+    """Server-rendered Step 1 bootstrap script.
 
     The one-time provisioning token is embedded in ``script``/``lines`` only
     -- it is minted by this call and never retrievable again afterward.
+
+    ``mode`` echoes which rendering was produced (``onsite`` -- the
+    cleanup-first fresh-enrollment paste, the default -- or ``remote`` --
+    the validate-first, scheduler-staged live re-provision; see
+    ``app.domains.network_config.constants.BootstrapMode``).
+    ``revert_window_minutes`` is populated for ``remote`` only: how long
+    the on-device automatic revert stays armed before restoring the
+    previous tunnel if the cutover never confirms itself.
     """
 
     router_id: str
     location_code: str
+    mode: str
+    revert_window_minutes: int | None = None
     lines: list[str]
     script: str
     line_count: int

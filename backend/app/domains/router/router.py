@@ -77,6 +77,10 @@ from app.domains.auth.models import AuthUser
 from app.domains.guest.dependencies import get_radius_service
 from app.domains.guest.router import deregister_radius_nas_client
 from app.domains.guest.service import RadiusService
+from app.domains.network_config.constants import (
+    REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES,
+    BootstrapMode,
+)
 from app.domains.provisioning_engine.planner.constants import SnapshotTrigger
 from app.domains.provisioning_engine.planner.dependencies import (
     get_configuration_plan_service,
@@ -1017,39 +1021,71 @@ async def regenerate_agent_credential(
 async def preview_bootstrap_script(
     request: Request,
     router_id: uuid.UUID,
+    mode: BootstrapMode = Query(
+        BootstrapMode.ONSITE,
+        description=(
+            "Which Step 1 rendering to produce. 'onsite' (default): "
+            "cleanup-first fresh-enrollment paste for a technician at the "
+            "router. 'remote': validate-first, scheduler-staged cutover "
+            "with a timed automatic revert, for re-provisioning a live "
+            "router over its own management tunnel -- refused (409) for a "
+            "router that has never checked in."
+        ),
+    ),
     user: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     router_service: RouterService = Depends(get_router_service),
     settings: Settings = Depends(get_settings),
 ):
-    """Render the Step 0 zero-touch bootstrap script for a router that has
-    not yet joined the platform.
+    """Render the Step 1 zero-touch bootstrap script in either mode --
+    see ``RouterService.preview_bootstrap_script`` for the mode-selection
+    reasoning (explicit caller intent, server refuses only the provably
+    unsafe combination) and
+    ``app.domains.network_config.renderers.render_bootstrap_script`` for
+    both scripts' full design write-ups.
 
     Mints a fresh one-time provisioning token (same approval gate as
     ``POST /routers/{id}/provisioning-token``) and embeds it in the
-    server-rendered RouterOS lines from
-    ``render_bootstrap_script``. Paste once on the device via WinBox/SSH
-    before running the fleet wizard's discover step."""
+    server-rendered RouterOS lines. On-site: paste once on the device via
+    WinBox/SSH before running the fleet wizard's discover step. Remote: a
+    live re-provision that stages a detached cutover plus automatic
+    revert; deliverable over the gateway or any console session because
+    the in-session lines never touch the existing tunnel."""
     location_code, lines, expires_at = await router_service.preview_bootstrap_script(
         actor_user_id=uuid.UUID(user.id),
         router_id=router_id,
         requesting_organization_id=requesting_organization_id,
         api_base_url=settings.api_public_base_url,
+        mode=mode,
     )
+    remote = mode is BootstrapMode.REMOTE
     payload = BootstrapScriptPreviewResponse(
         router_id=str(router_id),
         location_code=location_code,
+        mode=mode.value,
+        revert_window_minutes=(
+            REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES if remote else None
+        ),
         lines=lines,
         script="\n".join(lines),
         line_count=len(lines),
         token_expires_at=expires_at,
     )
-    return build_response(
-        success=True,
-        message=(
+    if remote:
+        message = (
+            "Remote bootstrap script generated -- run on the device now; "
+            "it stages the tunnel cutover with an automatic "
+            f"{REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES}-minute revert, and "
+            "the embedded token will not be shown again"
+        )
+    else:
+        message = (
             "Bootstrap script generated -- paste on the device now; the "
             "embedded token will not be shown again"
-        ),
+        )
+    return build_response(
+        success=True,
+        message=message,
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )
