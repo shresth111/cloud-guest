@@ -153,6 +153,22 @@ class BootstrapLocationCodeMissingError(RouterError):
         )
 
 
+class RemoteBootstrapNeverEnrolledError(RouterError):
+    """Remote-mode bootstrap re-provisions a *live* tunnel -- a router that
+    has never checked in (``last_seen_at IS NULL``) has no tunnel to
+    protect, no transport to deliver the script through, and the remote
+    script's own on-device guards would refuse it anyway. The on-site
+    script is the only correct path for first enrollment."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router {router_id} has never checked in -- remote bootstrap "
+            "re-provisions a live tunnel; use the on-site (default) "
+            "bootstrap script for first enrollment",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class ProvisioningTokenGenerationNotAllowedError(RouterError):
     """A provisioning token may only be generated while a router is still
     ``pending_provisioning`` -- see ``docs/router/ROUTER_ARCHITECTURE.md``

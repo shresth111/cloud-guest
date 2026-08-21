@@ -57,6 +57,7 @@ from app.database.utils.pagination import PaginationMeta
 from app.domains.location.enums import LocationStatus
 from app.domains.location.exceptions import LocationArchivedError
 from app.domains.location.models import Location
+from app.domains.network_config.constants import BootstrapMode
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 
@@ -77,6 +78,7 @@ from .exceptions import (
     ProvisioningTokenGenerationNotAllowedError,
     ProvisioningTokenNotFoundError,
     ProvisioningTokenRouterStateError,
+    RemoteBootstrapNeverEnrolledError,
     RouterDecommissionedError,
     RouterLiveCredentialRotationFailedError,
     RouterNotFoundError,
@@ -638,8 +640,40 @@ class RouterService:
         router_id: uuid.UUID,
         requesting_organization_id: uuid.UUID | None,
         api_base_url: str,
+        mode: BootstrapMode = BootstrapMode.ONSITE,
     ) -> tuple[str, list[str], datetime]:
-        """Mint a provisioning token and render the Step 0 bootstrap script.
+        """Mint a provisioning token and render the Step 1 bootstrap script
+        in the requested mode (see ``BootstrapMode``'s own docstring for
+        the two orderings and why they exist).
+
+        **Why an explicit ``mode`` parameter rather than deriving it from
+        ``last_seen_at``/status/peer state:** the safety property the split
+        exists for -- "is a human physically at the router, holding a
+        recovery path the tunnel does not provide?" -- is a fact about the
+        operator, not about any database row. ``last_seen_at`` says the
+        router *was* reachable, never where the technician is standing; a
+        stale row would silently select the destructive ordering for a
+        live router (this fleet's own history includes exactly that class
+        of stale-state incident). So the caller declares intent, and this
+        method refuses only the *provably unsafe* combination: remote mode
+        for a router that has never checked in
+        (``RemoteBootstrapNeverEnrolledError`` -- nothing to protect, no
+        tunnel to deliver through, and the remote script's own on-device
+        guards would refuse anyway). On-site remains valid for any
+        token-eligible router, live or not, because a technician with
+        console access may legitimately choose aggressive teardown.
+
+        Remote mode on a live (``ONLINE``/``OFFLINE``) router first rewinds
+        it to ``PENDING_PROVISIONING`` through the transition graph's
+        existing re-provision edge (audited as
+        ``ROUTER_REMOTE_REPROVISION_STARTED``, not ``ROUTER_FACTORY_RESET``
+        -- nothing was wiped), because ``check_in`` only accepts
+        ``PENDING_PROVISIONING`` and ``generate_provisioning_token`` only
+        mints from ``PENDING_PROVISIONING``/``PROVISIONING``. Server-side,
+        the eventual check-in **rotates** the existing peer in place --
+        same tunnel IP, fresh platform keypair
+        (``WireGuardService.ensure_tunnel_for_check_in``) -- which is what
+        makes the staged cutover a key rotation rather than a re-plumbing.
 
         Returns ``(location_code, lines, token_expires_at)``. See
         ``app.domains.network_config.renderers.render_bootstrap_script``."""
@@ -648,6 +682,30 @@ class RouterService:
         router = await self.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        if mode is BootstrapMode.REMOTE:
+            if router.last_seen_at is None:
+                raise RemoteBootstrapNeverEnrolledError(router_id)
+            if router.status in (
+                RouterStatus.ONLINE.value,
+                RouterStatus.OFFLINE.value,
+            ):
+                router = await self._set_status(
+                    actor_user_id=actor_user_id,
+                    router_id=router_id,
+                    requesting_organization_id=requesting_organization_id,
+                    new_status=RouterStatus.PENDING_PROVISIONING,
+                    action=AuditAction.ROUTER_REMOTE_REPROVISION_STARTED,
+                )
+            elif router.status not in (
+                RouterStatus.PENDING_PROVISIONING.value,
+                RouterStatus.PROVISIONING.value,
+            ):
+                # SUSPENDED/DECOMMISSIONED: same refusal token minting
+                # would produce, raised here so the message points at the
+                # actual blocker before any state is touched.
+                raise ProvisioningTokenGenerationNotAllowedError(
+                    router_id, router.status
+                )
         location = await self.location_lookup.get_location(
             router.location_id,
             requesting_organization_id=requesting_organization_id,
@@ -664,6 +722,7 @@ class RouterService:
             location_code=location.location_code,
             provisioning_token=plaintext,
             api_base_url=api_base_url,
+            mode=mode,
         )
         return location.location_code, lines, token.expires_at
 

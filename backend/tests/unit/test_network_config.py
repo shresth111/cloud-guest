@@ -41,7 +41,12 @@ from app.domains.network_config.constants import (
     NETWATCH_SECTION_HEADER,
     PORT_FORWARDING_SECTION_HEADER,
     QOS_SECTION_HEADER,
+    REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS,
+    REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS,
+    REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS,
+    REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES,
     VLAN_SECTION_HEADER,
+    BootstrapMode,
 )
 from app.domains.network_config.exceptions import (
     EmptyNetworkConfigError,
@@ -848,6 +853,309 @@ class TestRenderBootstrapScript:
             wireguard_listen_port=13231,
         )
         assert any("listen-port=13231" in line for line in lines)
+
+
+class TestRenderRemoteBootstrapScript:
+    """Remote mode: validate-first, scheduler-staged cutover with a timed
+    revert -- the two hard properties under test are (a) nothing is ever
+    torn down before every replacement value validated, and (b) no teardown
+    executes in the delivering session at all (it is all staged into
+    detached ``/system scheduler`` jobs)."""
+
+    @staticmethod
+    def _render() -> list[str]:
+        return render_bootstrap_script(
+            location_code="LOC-2026-000039",
+            provisioning_token="one-time-token-abc",
+            api_base_url="https://api.cloudguest.example",
+            mode=BootstrapMode.REMOTE,
+        )
+
+    @staticmethod
+    def _onsite() -> list[str]:
+        return render_bootstrap_script(
+            location_code="LOC-2026-000039",
+            provisioning_token="one-time-token-abc",
+            api_base_url="https://api.cloudguest.example",
+        )
+
+    def _cut_line(self) -> str:
+        return next(
+            line for line in self._render() if line.startswith(":local cut ")
+        )
+
+    def _rvt_line(self) -> str:
+        return next(
+            line for line in self._render() if line.startswith(":local rvt ")
+        )
+
+    def test_rejects_non_https_base_url(self) -> None:
+        with pytest.raises(ValueError, match="https://"):
+            render_bootstrap_script(
+                location_code="HQ-001",
+                provisioning_token="tok",
+                api_base_url="http://api.cloudguest.example",
+                mode=BootstrapMode.REMOTE,
+            )
+
+    def test_default_mode_is_onsite(self) -> None:
+        default = render_bootstrap_script(
+            location_code="LOC-2026-000039",
+            provisioning_token="one-time-token-abc",
+            api_base_url="https://api.cloudguest.example",
+        )
+        explicit = render_bootstrap_script(
+            location_code="LOC-2026-000039",
+            provisioning_token="one-time-token-abc",
+            api_base_url="https://api.cloudguest.example",
+            mode=BootstrapMode.ONSITE,
+        )
+        assert default == explicit
+
+    def test_the_two_orders_are_actually_different(self) -> None:
+        onsite = self._onsite()
+        remote = self._render()
+        assert onsite != remote
+
+        # On-site: teardown BEFORE the first network call (cleanup-first).
+        onsite_iface_remove = onsite.index(
+            '/interface wireguard remove [find where name="wg-cloudguard"]'
+        )
+        onsite_check_in = next(
+            i for i, line in enumerate(onsite) if "provisioning/check-in" in line
+        )
+        assert onsite_iface_remove < onsite_check_in
+
+        # Remote: the same teardown command NEVER executes in-session -- no
+        # top-level line removes the interface, its addresses, or its
+        # peers. (The teardown text exists only inside the two staged
+        # scheduler strings.)
+        for line in remote:
+            assert not line.startswith("/interface wireguard remove")
+            assert not line.startswith("/interface wireguard peers remove")
+            assert not line.startswith("/ip address remove")
+
+    def test_shared_enrollment_block_is_identical_across_modes(self) -> None:
+        onsite = self._onsite()
+        remote = self._render()
+
+        def block(lines: list[str]) -> list[str]:
+            start = next(
+                i for i, line in enumerate(lines) if line.startswith(":local body")
+            )
+            end = next(
+                i
+                for i, line in enumerate(lines)
+                if "empty peer_private_key" in line
+            )
+            return lines[start : end + 1]
+
+        assert block(onsite) == block(remote)
+
+    def test_guards_and_capture_precede_check_in_and_spend_no_token(self) -> None:
+        remote = self._render()
+        check_in = next(
+            i for i, line in enumerate(remote) if "provisioning/check-in" in line
+        )
+        # All three refuse-unless-intact guards direct to the on-site
+        # script and run before the one-time token is ever spent.
+        guard_indexes = [
+            i
+            for i, line in enumerate(remote)
+            if "use the on-site script instead" in line
+        ]
+        assert len(guard_indexes) == 3
+        assert all(i < check_in for i in guard_indexes)
+        # Every captured revert value is read before check-in too, so a
+        # capture failure can never burn the token either.
+        for capture in (
+            ":local oldkey ",
+            ":local oldport ",
+            ":local oldaddr ",
+            ":local oldpub ",
+            ":local oldephost ",
+            ":local oldepport ",
+            ":local oldallowed ",
+            ":local oldka ",
+        ):
+            index = next(
+                i for i, line in enumerate(remote) if line.startswith(capture)
+            )
+            assert index < check_in
+
+    def test_no_removal_before_successful_validation(self) -> None:
+        """Hard property (a): a stale token, unreachable platform, or
+        missing/empty field must fail with the live tunnel untouched --
+        so no line up to and including the last validation line may
+        remove anything."""
+        remote = self._render()
+        last_validation = next(
+            i for i, line in enumerate(remote) if "empty peer_private_key" in line
+        )
+        for line in remote[: last_validation + 1]:
+            assert " remove " not in line
+        # The staged-script builders and every scheduler mutation come
+        # strictly after validation.
+        for prefix in (":local cut ", ":local rvt ", "/system scheduler"):
+            index = next(
+                i for i, line in enumerate(remote) if line.startswith(prefix)
+            )
+            assert index > last_validation
+
+    def test_revert_is_armed_before_cutover_is_staged(self) -> None:
+        remote = self._render()
+        revert_add = next(
+            i
+            for i, line in enumerate(remote)
+            if line.startswith("/system scheduler add name=cloudguest-bootstrap-revert")
+        )
+        cutover_add = next(
+            i
+            for i, line in enumerate(remote)
+            if line.startswith(
+                "/system scheduler add name=cloudguest-bootstrap-cutover"
+            )
+        )
+        assert revert_add < cutover_add
+        assert (
+            f"interval={REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES}m"
+            in remote[revert_add]
+        )
+        assert 'comment="CGBOOT-revert"' in remote[revert_add]
+        assert "on-event=$rvt" in remote[revert_add]
+        assert (
+            f"interval={REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS}s"
+            in remote[cutover_add]
+        )
+        assert 'comment="CGBOOT-cutover"' in remote[cutover_add]
+        assert "on-event=$cut" in remote[cutover_add]
+        # Stale entries from a previous failed attempt are cleared first.
+        stale_removes = [
+            i
+            for i, line in enumerate(remote)
+            if line.startswith("/system scheduler remove")
+        ]
+        assert len(stale_removes) == 2
+        assert all(i < revert_add for i in stale_removes)
+
+    def test_cutover_script_construction(self) -> None:
+        cut = self._cut_line()
+        # Run-once: self-removal is the very first staged command, and the
+        # cutover aborts if the revert window has already closed.
+        self_remove = cut.index(
+            '/system scheduler remove [find where comment=\\"CGBOOT-cutover\\"]'
+        )
+        revert_guard = cut.index("revert window closed")
+        first_teardown = cut.index('/ip address remove')
+        assert self_remove < revert_guard < first_teardown
+        # Teardown is a superset of on-site\'s: by CGBOOT comment (orphaned
+        # rows) AND by interface (live rows predating the tag).
+        for fragment in (
+            '/ip address remove [find where comment=\\"CGBOOT\\"]',
+            '/ip address remove [find where interface=\\"wg-cloudguard\\"]',
+            '/interface wireguard peers remove [find where comment=\\"CGBOOT\\"]',
+            '/interface wireguard peers remove '
+            '[find where interface=\\"wg-cloudguard\\"]',
+            '/interface wireguard remove [find where name=\\"wg-cloudguard\\"]',
+        ):
+            assert fragment in cut
+        # The replacement is built from the validated staged values --
+        # runtime concatenation splices, never literals.
+        for splice in (
+            'private-key=\\"" . ($wgcfg->"peer_private_key") . "\\"',
+            'address=\\"" . $tunaddr . "\\"',
+            'public-key=\\"" . ($enroll->"wireguard_server_public_key") . "\\"',
+            'endpoint-address=\\"" . ($enroll->"wireguard_endpoint_host") . "\\"',
+            'endpoint-port=" . ($enroll->"wireguard_endpoint_port") . "',
+            'allowed-address=\\"" . ($enroll->"wireguard_hub_tunnel_address")'
+            ' . "/32\\"',
+        ):
+            assert splice in cut
+        # Create -> verify -> confirm ordering inside the staged script.
+        create = cut.index("/interface wireguard add name=wg-cloudguard")
+        verify_addr = cut.index("tunnel address is not attached")
+        ping = cut.index(":set ok [/ping")
+        assert create < verify_addr < ping
+
+    def test_cutover_confirms_end_to_end_before_disarming_revert(self) -> None:
+        cut = self._cut_line()
+        # Confirmation is a real round-trip to the hub over the new
+        # tunnel, polled within the revert window -- local existence never
+        # disarms the revert.
+        assert (
+            f"\\$tries < {REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS}" in cut
+        )
+        assert f":delay {REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS}s" in cut
+        assert (
+            ':set ok [/ping \\"" . ($enroll->"wireguard_hub_tunnel_address") . "\\"'
+            " count=2]" in cut
+        )
+        success = cut.index(
+            ':if (\\$ok > 0) do={ /system scheduler remove '
+            '[find where comment=\\"CGBOOT-revert\\"]'
+        )
+        assert success > cut.index(":set ok [/ping")
+        assert "automatic revert stays armed" in cut
+        # Poll budget stays well inside the revert window.
+        poll_seconds = (
+            REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS
+            * REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS
+        )
+        assert (
+            REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS + poll_seconds
+            < (REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES * 60) // 2
+        )
+
+    def test_revert_script_construction(self) -> None:
+        rvt = self._rvt_line()
+        # NO self-removal up front: a failed revert stays scheduled and
+        # retries; it disarms only after the restored state re-verifies.
+        restore = rvt.index("/interface wireguard add name=wg-cloudguard")
+        disarm_cutover = rvt.index(
+            '/system scheduler remove [find where comment=\\"CGBOOT-cutover\\"]'
+        )
+        disarm_self = rvt.index(
+            '/system scheduler remove [find where comment=\\"CGBOOT-revert\\"]'
+        )
+        verify = rvt.index("previous tunnel address is not attached")
+        assert restore < verify < disarm_cutover < disarm_self
+        # Every captured value is restored -- the previous tunnel comes
+        # back exactly as it was.
+        for splice in (
+            'private-key=\\"" . $oldkey . "\\"',
+            'listen-port=" . $oldport . "',
+            'address=\\"" . $oldaddr . "\\"',
+            'public-key=\\"" . $oldpub . "\\"',
+            'endpoint-address=\\"" . $oldephost . "\\"',
+            'endpoint-port=" . $oldepport . "',
+            'allowed-address=\\"" . $oldallowed . "\\"',
+            'persistent-keepalive=" . $oldka . "',
+        ):
+            assert splice in rvt
+        assert "previous tunnel configuration restored" in rvt
+
+    def test_staged_message_is_gated_on_both_schedulers(self) -> None:
+        remote = self._render()
+        final = remote[-1]
+        assert final.startswith(":if (")
+        assert '/system scheduler find where comment="CGBOOT-cutover"' in final
+        assert '/system scheduler find where comment="CGBOOT-revert"' in final
+        assert "CloudGuest remote bootstrap staged" in final
+        assert f"~{REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS}s" in final
+        assert f"{REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES}m" in final
+
+    def test_no_literals_comment_lines_or_newlines(self) -> None:
+        remote = self._render()
+        script = "\n".join(remote)
+        assert not re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script)
+        assert not any(line.lstrip().startswith("#") for line in remote)
+        assert not any("\n" in line for line in remote)
+        assert "one-time-token-abc" in script
+        assert remote[0] == '/system identity set name="LOC-2026-000039"'
+        # Staged-script variables are escaped for storage (\\$) so they
+        # execute at cutover/revert time, not at staging time.
+        cut = self._cut_line()
+        assert "\\$ok" in cut and "\\$tries" in cut
 
 
 class TestRenderAgentHeartbeatScheduler:

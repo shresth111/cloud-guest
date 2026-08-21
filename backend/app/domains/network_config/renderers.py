@@ -654,8 +654,13 @@ from .constants import (
     PORT_FORWARDING_SECTION_HEADER,
     QOS_SECTION_HEADER,
     RADIUS_SECTION_HEADER,
+    REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS,
+    REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS,
+    REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS,
+    REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES,
     VLAN_SECTION_HEADER,
     WIREGUARD_SECTION_HEADER,
+    BootstrapMode,
 )
 
 # The rendered RouterOS interface name for a router's own WireGuard
@@ -1271,6 +1276,16 @@ def render_isp_netwatch_config(
 # tag could ever collide with.
 _BOOTSTRAP_MGMT_TAG = "CGBOOT"
 
+# Comment tags + fixed names for the two remote-mode ``/system scheduler``
+# entries (the detached cutover and its timed revert safety net) --
+# suffixed off the same base tag exactly like
+# ``render_agent_heartbeat_scheduler``'s ``CGBOOT-hb``, and removed by
+# comment (never by name) following that same established convention.
+_BOOTSTRAP_CUTOVER_TAG = f"{_BOOTSTRAP_MGMT_TAG}-cutover"
+_BOOTSTRAP_REVERT_TAG = f"{_BOOTSTRAP_MGMT_TAG}-revert"
+_BOOTSTRAP_CUTOVER_SCHEDULER_NAME = "cloudguest-bootstrap-cutover"
+_BOOTSTRAP_REVERT_SCHEDULER_NAME = "cloudguest-bootstrap-revert"
+
 # Real, already-mounted platform API paths this addition's two device
 # -facing calls target -- see module docstring's Bootstrap section for why
 # these are read from the real routers/router_agent modules, not invented.
@@ -1324,54 +1339,239 @@ def _require_https(api_base_url: str, *, caller: str) -> None:
         )
 
 
+def _embed_literal(text: str) -> str:
+    """Escapes one literal RouterOS snippet for embedding inside a
+    double-quoted RouterOS string (the remote mode's runtime-concatenated
+    ``on-event`` values): ``"`` becomes ``\\"`` and ``$`` becomes ``\\$``
+    -- both straight from RouterOS's own scripting escape table ("Insert
+    double quote" / "Output $ character. Otherwise, $ is used to link the
+    variable"), and the ``\\"`` form is the exact one
+    :func:`render_agent_heartbeat_scheduler` already confirmed live
+    against a real CHR. Backslashes never occur in the snippets this
+    module embeds (asserted, so a future snippet containing one fails
+    loudly here instead of silently rendering a broken escape)."""
+    if "\\" in text:
+        raise ValueError(
+            "_embed_literal: snippet contains a backslash, which this "
+            "escaper deliberately does not handle -- extend it consciously"
+        )
+    return text.replace('"', '\\"').replace("$", "\\$")
+
+
+def _ros_string_expr(pieces: list[tuple[str, str]]) -> str:
+    """Builds one RouterOS string-concatenation expression -- e.g.
+    ``("lit" . ($enroll->"x") . "lit")`` -- from ``("lit", text)`` /
+    ``("expr", routeros_expression)`` pieces. Literal pieces are escaped
+    via :func:`_embed_literal` (they end up inside a double-quoted
+    RouterOS string); expression pieces are runtime RouterOS code,
+    evaluated at *staging* time so their values are baked into the stored
+    scheduler ``on-event`` text. Adjacent literals are merged so the
+    rendered expression stays readable -- the founder reads this text."""
+    merged: list[tuple[str, str]] = []
+    for kind, value in pieces:
+        if kind == "lit" and merged and merged[-1][0] == "lit":
+            merged[-1] = ("lit", merged[-1][1] + value)
+        else:
+            merged.append((kind, value))
+    rendered = [
+        f'"{_embed_literal(value)}"' if kind == "lit" else value
+        for kind, value in merged
+    ]
+    return "(" + " . ".join(rendered) + ")"
+
+
+def _join_embedded_commands(
+    commands: list[list[tuple[str, str]]],
+) -> list[tuple[str, str]]:
+    """Joins per-command piece lists with ``"; "`` separators -- the
+    embedded script executes as ONE detached scheduler job, where ``;``
+    separates statements exactly as it does on a single console line."""
+    joined: list[tuple[str, str]] = []
+    for index, command in enumerate(commands):
+        if index:
+            joined.append(("lit", "; "))
+        joined.extend(command)
+    return joined
+
+
+# Shared between both modes: the tunnel address handed back by check-in is
+# a bare host IP; the /32 it carries on-interface is appended on-device.
+_TUNNEL_ADDRESS_LOCAL_LINE = ':local tunaddr (($enroll->"tunnel_ip_address") . "/32")'
+
+
+def _render_enrollment_lines(
+    *, provisioning_token: str, check_in_url: str, wg_config_url: str
+) -> list[str]:
+    """The enrollment + key-delivery + full-validation block both modes
+    share verbatim: one-time-token check-in (``:do {} on-error={}``
+    wrapped, ``http-code`` guarded), per-field presence checks on every
+    ``_CHECK_IN_REQUIRED_FIELDS`` member, the credentialed
+    wireguard-config pull, and the missing/empty ``peer_private_key``
+    checks. In on-site mode this block runs after the cleanup; in remote
+    mode it runs *before anything is touched at all* -- that ordering
+    difference lives entirely in the two callers, never in this block."""
+    return [
+        ':local body ("{\\"token\\":\\"" . "' + provisioning_token + '" . "\\"}")',
+        ":local resp; :do { :set resp "
+        f'[/tool fetch url="{check_in_url}" http-method=post '
+        'http-header-field="Content-Type: application/json" http-data=$body '
+        "output=user as-value] } on-error={ :error "
+        '"CloudGuest bootstrap: check-in request failed -- the platform '
+        "rejected the call or is unreachable; generate a fresh bootstrap "
+        'script and re-run it" }',
+        ':if (($resp->"http-code") != "200") do={ '
+        ':error ("check-in failed: " . ($resp->"data")) }',
+        ':local enroll [:deserialize from=json value=($resp->"data")]',
+        *(
+            _render_json_field_check("enroll", field, "check-in")
+            for field in _CHECK_IN_REQUIRED_FIELDS
+        ),
+        ":local wgresp; :do { :set wgresp "
+        f'[/tool fetch url="{wg_config_url}" '
+        'http-header-field=("X-Agent-Credential: " . ($enroll->"agent_credential")) '
+        "output=user as-value] } on-error={ :error "
+        '"CloudGuest bootstrap: wireguard-config request failed -- the '
+        'platform rejected the agent credential or is unreachable" }',
+        ':if (($wgresp->"http-code") != "200") do={ '
+        ':error ("wireguard-config failed: " . ($wgresp->"data")) }',
+        ':local wgcfg [:deserialize from=json value=($wgresp->"data")]',
+        _render_json_field_check("wgcfg", "peer_private_key", "wireguard-config"),
+        ':if ([:len ($wgcfg->"peer_private_key")] = 0) do={ :error '
+        '"CloudGuest bootstrap: wireguard-config response has an empty '
+        'peer_private_key" }',
+    ]
+
+
 def render_bootstrap_script(
     *,
     location_code: str,
     provisioning_token: str,
     api_base_url: str,
     wireguard_listen_port: int = DEFAULT_WIREGUARD_PORT,
+    mode: BootstrapMode = BootstrapMode.ONSITE,
 ) -> list[str]:
-    """Renders the "Step 0"/"Step 1" zero-touch enrollment script -- see
-    module docstring's Bootstrap section for the full reasoning behind
-    every decision below (why ~25 lines, why the platform generates the
-    keypair and the script fetches the private half at run time, why
-    ``/system identity`` gets the location code rather than the RADIUS NAS
-    identifier, the cleanup-first comment-tag idempotency convention, the
-    line-by-line console-paste semantics the final verified-success gate
-    exists for, and why HTTPS is enforced). The base command vocabulary
-    (``:deserialize from=json``, ``/tool fetch ... output=user as-value``,
-    comment-tagged ``remove [find ...]`` as a first-run no-op) was
-    confirmed against a real MikroTik CHR (RouterOS 7.21.5); the
-    ``:do {} on-error={}`` wrappers exist because ``/tool fetch`` *throws*
-    on a non-2xx response rather than returning (per MikroTik's own Fetch
-    documentation), so without them a burned/expired token surfaces as a
-    cryptic ``failure:`` line instead of the actionable message rendered
-    here. The ``http-code`` guards are kept as belt-and-braces for any
-    build where fetch returns instead of throwing.
+    """Renders the Step 1 enrollment script in one of two modes -- one
+    generator, two orderings, shared blocks (identity line, the entire
+    enrollment/validation block via :func:`_render_enrollment_lines`, the
+    same create/verify command shapes).
 
-    The script is safe to re-run on the same router: it opens by removing
-    its own previously-created state (the CGBOOT-tagged ``/ip address``
-    row *by comment* -- an orphaned row on a deleted interface shows
-    ``interface=*10`` and is unfindable by interface name -- then
-    CGBOOT-tagged peers, then the ``wg-cloudguard`` interface by name),
-    and each re-paste is expected to carry a freshly-minted one-time token
-    (``RouterService.preview_bootstrap_script`` rewinds and re-mints;
-    server-side, check-in rotates the existing peer in place -- see
-    ``WireGuardService.ensure_tunnel_for_check_in``).
+    **ONSITE (default -- fresh enrollment, technician present).** Exactly
+    the previously-shipped cleanup-first script: identity, tear down any
+    stale CGBOOT-tagged state and the ``wg-cloudguard`` interface *before*
+    contacting the platform, then check-in, key pull, create, verify,
+    gated success line. Correct precisely because nothing valuable exists
+    yet, the prior state is unknown, and the technician holds
+    console/WinBox access if anything goes sideways. See this module's
+    docstring Bootstrap section for every rationale (key handling, HTTPS
+    enforcement, comment-tag idempotency, the orphaned ``interface=*10``
+    address row, line-by-line console-paste semantics).
 
-    Raises ``ValueError`` if ``api_base_url`` is not ``https://`` -- see
-    :func:`_require_https`.
+    **REMOTE (re-provision of a live, already-enrolled router).** On a
+    provisioned router the WireGuard tunnel *is* the management path, so
+    cleanup-first would saw off the branch being sat on. Two inversions:
 
-    ``provisioning_token``/``location_code`` are trusted, platform-
-    generated/validated values by the time this function is called (a
-    freshly-issued ``RouterProvisioningToken`` plaintext, a real
-    ``Location.location_code``) -- like every other renderer in this file
-    (e.g. ``render_dns_record``'s ``comment=``), they are interpolated
-    as-is, not re-escaped for RouterOS quoting, matching this module's
-    existing convention throughout."""
+    1. *Never destroy before you can replace.* Order: refuse unless the
+       existing tunnel state is intact (interface + attached address + hub
+       peer -- checked before the one-time token is ever spent), capture
+       every value needed to restore it (``private-key`` is readable via
+       ``get`` per the RouterOS WireGuard docs, marked sensitive --
+       captured in-session under the delivering admin session's own
+       policy), then run the shared enrollment/validation block. A
+       stale/burned token, unreachable platform, or missing field
+       ``:error``s out with the live tunnel completely untouched.
+    2. *The script executes over the very tunnel it replaces.* When
+       delivered through the gateway (``push_live_config`` /
+       ``execute_live_command``), removing ``wg-cloudguard`` mid-script
+       would kill the transport and orphan every remaining line. So the
+       in-session part performs **no teardown at all**: it stages the
+       whole cleanup -> create -> verify -> confirm sequence as a one-shot
+       ``/system scheduler`` entry (RouterOS auto-stamps ``start-time`` at
+       add time; an interval-only entry first fires one interval later and
+       "will not run at startup" per the Scheduler docs), whose job is
+       detached from any session, plus a second timed **revert** entry
+       that restores the captured previous tunnel if the cutover has not
+       confirmed itself. Scheduler jobs read their script text before
+       executing, so the cutover's opening self-removal (the standard
+       RouterOS run-once idiom) and the success path's revert-removal are
+       ordinary comment-tag-scoped removes.
+
+    Remote-mode choreography (all values baked at staging time via
+    :func:`_ros_string_expr` -- reboot-safe, no reliance on globals):
+
+    * ``cloudguest-bootstrap-revert`` (comment ``CGBOOT-revert``) is armed
+      FIRST, ``interval={REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES}m``.
+    * ``cloudguest-bootstrap-cutover`` (comment ``CGBOOT-cutover``),
+      ``interval={REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS}s``: self-removes,
+      aborts unless the revert is still armed (so a cutover can never run
+      after a revert has already restored the old tunnel), tears down both
+      by-comment AND by-interface (a live router's rows may predate the
+      CGBOOT tag -- ``render_wireguard_peer``'s documented untagged-rows
+      gap), creates the replacement from the validated staged values,
+      re-verifies all three resources (address attached specifically to
+      ``wg-cloudguard``), then **confirms end-to-end** by pinging the
+      hub's tunnel address (up to ``{REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS}``
+      x ``{REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS}s`` -- decided well
+      inside the revert window). Only a successful ping disarms the
+      revert and logs success; local existence alone never does, because
+      a locally-perfect config whose key the hub rejects is exactly the
+      failure the revert exists for.
+    * The revert entry restores the captured interface/address/peer,
+      re-verifies, and only then disarms the (possibly never-run) cutover
+      and itself -- so a *failed* revert stays scheduled and retries every
+      window until it succeeds or a human intervenes; it never gives up
+      silently.
+
+    Verification provenance, stated honestly: ``\\"``/``\\$`` string
+    escapes, ``:while``/``:delay``, ``[:pick <array> 0]``, and the
+    WireGuard peer property names (``endpoint-address``,
+    ``persistent-keepalive``, readable ``private-key``) were checked
+    against MikroTik's current RouterOS 7 documentation this session;
+    inline ``on-event`` script text and the scheduler comment-tag removal
+    idiom were confirmed live on a real CHR by
+    :func:`render_agent_heartbeat_scheduler`'s earlier work. Two
+    constructs rest on long-established RouterOS behavior that the current
+    docs do not spell out and that was NOT re-confirmed on a live 7.23.3
+    device this session: ``[/ping <addr> count=N]`` returning the received
+    count to a script, and a scheduler job surviving its own entry's
+    removal. Both deserve a live pass on LOC-2026-000039's bench twin
+    before first production use -- the same explicit "not confirmed live"
+    discipline this module's Netwatch section already follows.
+
+    Both modes: HTTPS-only (``ValueError`` otherwise), nothing hardcoded
+    (every device-specific value dereferences the platform's JSON at run
+    time), no ``#`` comment lines and no newline-dependent constructs
+    (single-line ``;``-join safe), and every success line gated on real
+    re-queries."""
     _require_https(api_base_url, caller="render_bootstrap_script")
     check_in_url = f"{api_base_url}{_CHECK_IN_PATH}"
     wg_config_url = f"{api_base_url}{_AGENT_WIREGUARD_CONFIG_PATH}"
+    if mode is BootstrapMode.REMOTE:
+        return _render_remote_bootstrap_lines(
+            location_code=location_code,
+            provisioning_token=provisioning_token,
+            check_in_url=check_in_url,
+            wg_config_url=wg_config_url,
+            wireguard_listen_port=wireguard_listen_port,
+        )
+    return _render_onsite_bootstrap_lines(
+        location_code=location_code,
+        provisioning_token=provisioning_token,
+        check_in_url=check_in_url,
+        wg_config_url=wg_config_url,
+        wireguard_listen_port=wireguard_listen_port,
+    )
+
+
+def _render_onsite_bootstrap_lines(
+    *,
+    location_code: str,
+    provisioning_token: str,
+    check_in_url: str,
+    wg_config_url: str,
+    wireguard_listen_port: int,
+) -> list[str]:
+    """The on-site (fresh-enrollment) rendering -- byte-identical to the
+    pre-split script; see :func:`render_bootstrap_script`."""
     success_message = (
         "CloudGuest bootstrap successful: WireGuard tunnel configured and verified"
     )
@@ -1402,45 +1602,18 @@ def render_bootstrap_script(
         "/interface wireguard peers remove "
         f'[find where comment="{_BOOTSTRAP_MGMT_TAG}"]',
         f'/interface wireguard remove [find where name="{WIREGUARD_INTERFACE_NAME}"]',
-        # -- enrollment: one-time token -> agent credential + tunnel facts -
-        ':local body ("{\\"token\\":\\"" . "'
-        + provisioning_token
-        + '" . "\\"}")',
-        ":local resp; :do { :set resp "
-        f'[/tool fetch url="{check_in_url}" http-method=post '
-        'http-header-field="Content-Type: application/json" http-data=$body '
-        "output=user as-value] } on-error={ :error "
-        '"CloudGuest bootstrap: check-in request failed -- the platform '
-        "rejected the call or is unreachable; generate a fresh bootstrap "
-        'script and re-run it" }',
-        ':if (($resp->"http-code") != "200") do={ '
-        ':error ("check-in failed: " . ($resp->"data")) }',
-        ':local enroll [:deserialize from=json value=($resp->"data")]',
-        *(
-            _render_json_field_check("enroll", field, "check-in")
-            for field in _CHECK_IN_REQUIRED_FIELDS
+        # -- enrollment + key delivery + validation (shared with remote) ---
+        *_render_enrollment_lines(
+            provisioning_token=provisioning_token,
+            check_in_url=check_in_url,
+            wg_config_url=wg_config_url,
         ),
-        # -- key delivery: the private key travels HTTPS at run time, never
-        #    inside this paste ---------------------------------------------
-        ":local wgresp; :do { :set wgresp "
-        f'[/tool fetch url="{wg_config_url}" '
-        'http-header-field=("X-Agent-Credential: " . ($enroll->"agent_credential")) '
-        "output=user as-value] } on-error={ :error "
-        '"CloudGuest bootstrap: wireguard-config request failed -- the '
-        'platform rejected the agent credential or is unreachable" }',
-        ':if (($wgresp->"http-code") != "200") do={ '
-        ':error ("wireguard-config failed: " . ($wgresp->"data")) }',
-        ':local wgcfg [:deserialize from=json value=($wgresp->"data")]',
-        _render_json_field_check("wgcfg", "peer_private_key", "wireguard-config"),
-        ':if ([:len ($wgcfg->"peer_private_key")] = 0) do={ :error '
-        '"CloudGuest bootstrap: wireguard-config response has an empty '
-        'peer_private_key" }',
         # -- create: interface, tunnel address, hub peer -------------------
         f"/interface wireguard add name={WIREGUARD_INTERFACE_NAME} "
         'private-key=($wgcfg->"peer_private_key") '
         f"listen-port={wireguard_listen_port} "
         f'comment="{_BOOTSTRAP_MGMT_TAG}"',
-        ':local tunaddr (($enroll->"tunnel_ip_address") . "/32")',
+        _TUNNEL_ADDRESS_LOCAL_LINE,
         "/ip address add address=$tunaddr "
         f'interface={WIREGUARD_INTERFACE_NAME} comment="{_BOOTSTRAP_MGMT_TAG}"',
         f"/interface wireguard peers add interface={WIREGUARD_INTERFACE_NAME} "
@@ -1466,6 +1639,318 @@ def render_bootstrap_script(
         f":if ({interface_exists} > 0 && {address_attached} > 0 && "
         f"{peer_exists} > 0) do={{ "
         f':log info "{success_message}"; :put "{success_message}" }}',
+    ]
+
+
+def _render_remote_bootstrap_lines(
+    *,
+    location_code: str,
+    provisioning_token: str,
+    check_in_url: str,
+    wg_config_url: str,
+    wireguard_listen_port: int,
+) -> list[str]:
+    """The remote (live re-provision) rendering -- see
+    :func:`render_bootstrap_script` for the full design write-up. Ordering
+    invariant this function exists for: not one teardown command executes
+    in-session; every removal lives inside the staged cutover/revert
+    scheduler scripts, built only after the shared enrollment block has
+    validated every replacement value."""
+    iface = WIREGUARD_INTERFACE_NAME
+    tag = _BOOTSTRAP_MGMT_TAG
+
+    # Teardown shared by cutover and revert: by COMMENT for orphaned rows
+    # (the interface=*10 sighting) AND by INTERFACE for live rows that
+    # predate the CGBOOT tag (render_wireguard_peer's documented
+    # untagged-rows gap) -- peers before the interface, so the
+    # by-interface find still resolves.
+    cleanup_commands: list[list[tuple[str, str]]] = [
+        [("lit", f'/ip address remove [find where comment="{tag}"]')],
+        [("lit", f'/ip address remove [find where interface="{iface}"]')],
+        [("lit", f'/interface wireguard peers remove [find where comment="{tag}"]')],
+        [
+            (
+                "lit",
+                f'/interface wireguard peers remove [find where interface="{iface}"]',
+            )
+        ],
+        [("lit", f'/interface wireguard remove [find where name="{iface}"]')],
+    ]
+
+    cutover_success = (
+        "CloudGuest remote bootstrap successful: replacement tunnel verified "
+        "against the hub"
+    )
+    cutover_commands: list[list[tuple[str, str]]] = [
+        # Run-once: self-removal first (standard RouterOS idiom -- the job
+        # already holds its script text), so a failed cutover never retries
+        # blindly; recovery belongs to the revert entry alone.
+        [
+            (
+                "lit",
+                "/system scheduler remove "
+                f'[find where comment="{_BOOTSTRAP_CUTOVER_TAG}"]',
+            )
+        ],
+        # A cutover must never run after the revert has already fired and
+        # restored the previous tunnel (e.g. both pending across a long
+        # power loss): the revert disarms this entry, and this guard closes
+        # the remaining ordering race.
+        [
+            (
+                "lit",
+                ":if ([:len [/system scheduler find where "
+                f'comment="{_BOOTSTRAP_REVERT_TAG}"]] = 0) do={{ :error '
+                '"CloudGuest remote bootstrap: revert window closed; '
+                'aborting staged cutover" }',
+            )
+        ],
+        *cleanup_commands,
+        [
+            ("lit", f"/interface wireguard add name={iface} private-key=\""),
+            ("expr", '($wgcfg->"peer_private_key")'),
+            (
+                "lit",
+                f'" listen-port={wireguard_listen_port} comment="{tag}"',
+            ),
+        ],
+        [
+            ("lit", '/ip address add address="'),
+            ("expr", "$tunaddr"),
+            ("lit", f'" interface={iface} comment="{tag}"'),
+        ],
+        [
+            ("lit", f'/interface wireguard peers add interface={iface} public-key="'),
+            ("expr", '($enroll->"wireguard_server_public_key")'),
+            ("lit", '" endpoint-address="'),
+            ("expr", '($enroll->"wireguard_endpoint_host")'),
+            ("lit", '" endpoint-port='),
+            ("expr", '($enroll->"wireguard_endpoint_port")'),
+            ("lit", ' allowed-address="'),
+            ("expr", '($enroll->"wireguard_hub_tunnel_address")'),
+            (
+                "lit",
+                f'/32" persistent-keepalive={DEFAULT_PERSISTENT_KEEPALIVE_SECONDS}s '
+                f'comment="{tag}"',
+            ),
+        ],
+        [
+            (
+                "lit",
+                f':if ([:len [/interface wireguard find where name="{iface}"]] = 0) '
+                "do={ :error "
+                '"CloudGuest remote cutover failed: interface '
+                f'{iface} does not exist" }}',
+            )
+        ],
+        [
+            (
+                "lit",
+                f':if ([:len [/ip address find where interface="{iface}" && '
+                'address="',
+            ),
+            ("expr", "$tunaddr"),
+            (
+                "lit",
+                '"]] = 0) do={ :error "CloudGuest remote cutover failed: '
+                f'tunnel address is not attached to {iface}" }}',
+            ),
+        ],
+        [
+            (
+                "lit",
+                ":if ([:len [/interface wireguard peers find where "
+                f'interface="{iface}" && comment="{tag}"]] = 0) do={{ :error '
+                '"CloudGuest remote cutover failed: hub peer is missing on '
+                f'{iface}" }}',
+            )
+        ],
+        # End-to-end confirmation: only a real round-trip to the hub's
+        # tunnel address proves the hub accepted the new key -- local
+        # existence never disarms the revert.
+        [("lit", ":local ok 0")],
+        [("lit", ":local tries 0")],
+        [
+            (
+                "lit",
+                f":while ($ok = 0 && $tries < {REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS}) "
+                f"do={{ :delay {REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS}s; "
+                ':set tries ($tries + 1); :set ok [/ping "',
+            ),
+            ("expr", '($enroll->"wireguard_hub_tunnel_address")'),
+            ("lit", '" count=2] }'),
+        ],
+        [
+            (
+                "lit",
+                ":if ($ok > 0) do={ /system scheduler remove "
+                f'[find where comment="{_BOOTSTRAP_REVERT_TAG}"]; '
+                f':log info "{cutover_success}" }} else={{ :log error '
+                '"CloudGuest remote bootstrap: hub unreachable over the '
+                'replacement tunnel; automatic revert stays armed" }',
+            )
+        ],
+    ]
+
+    revert_restored = (
+        "CloudGuest remote bootstrap: cutover was not confirmed in time -- "
+        "previous tunnel configuration restored"
+    )
+    revert_commands: list[list[tuple[str, str]]] = [
+        # Deliberately NO self-removal up front: a revert that fails midway
+        # stays scheduled and retries every window (the whole sequence is
+        # remove-then-add idempotent), disarming itself only after the
+        # restored state re-verifies.
+        *cleanup_commands,
+        [
+            ("lit", f"/interface wireguard add name={iface} private-key=\""),
+            ("expr", "$oldkey"),
+            ("lit", '" listen-port='),
+            ("expr", "$oldport"),
+            ("lit", f' comment="{tag}"'),
+        ],
+        [
+            ("lit", '/ip address add address="'),
+            ("expr", "$oldaddr"),
+            ("lit", f'" interface={iface} comment="{tag}"'),
+        ],
+        [
+            ("lit", f'/interface wireguard peers add interface={iface} public-key="'),
+            ("expr", "$oldpub"),
+            ("lit", '" endpoint-address="'),
+            ("expr", "$oldephost"),
+            ("lit", '" endpoint-port='),
+            ("expr", "$oldepport"),
+            ("lit", ' allowed-address="'),
+            ("expr", "$oldallowed"),
+            ("lit", '" persistent-keepalive='),
+            ("expr", "$oldka"),
+            ("lit", f' comment="{tag}"'),
+        ],
+        [
+            (
+                "lit",
+                f':if ([:len [/interface wireguard find where name="{iface}"]] = 0) '
+                "do={ :error "
+                '"CloudGuest remote revert failed: interface '
+                f'{iface} does not exist" }}',
+            )
+        ],
+        [
+            (
+                "lit",
+                f':if ([:len [/ip address find where interface="{iface}" && '
+                'address="',
+            ),
+            ("expr", "$oldaddr"),
+            (
+                "lit",
+                '"]] = 0) do={ :error "CloudGuest remote revert failed: '
+                f'previous tunnel address is not attached to {iface}" }}',
+            ),
+        ],
+        [
+            (
+                "lit",
+                ":if ([:len [/interface wireguard peers find where "
+                f'interface="{iface}" && comment="{tag}"]] = 0) do={{ :error '
+                '"CloudGuest remote revert failed: previous hub peer is '
+                f'missing on {iface}" }}',
+            )
+        ],
+        # Disarm the (possibly never-run) cutover FIRST, then self-disarm
+        # -- after this line a cutover can never fire against the restored
+        # tunnel.
+        [
+            (
+                "lit",
+                "/system scheduler remove "
+                f'[find where comment="{_BOOTSTRAP_CUTOVER_TAG}"]',
+            )
+        ],
+        [
+            (
+                "lit",
+                "/system scheduler remove "
+                f'[find where comment="{_BOOTSTRAP_REVERT_TAG}"]',
+            )
+        ],
+        [("lit", f':log error "{revert_restored}"')],
+    ]
+
+    staged_message = (
+        "CloudGuest remote bootstrap staged: cutover in "
+        f"~{REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS}s, automatic revert armed "
+        f"for {REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES}m"
+    )
+    cutover_staged = (
+        "[:len [/system scheduler find where "
+        f'comment="{_BOOTSTRAP_CUTOVER_TAG}"]]'
+    )
+    revert_staged = (
+        "[:len [/system scheduler find where "
+        f'comment="{_BOOTSTRAP_REVERT_TAG}"]]'
+    )
+    return [
+        # -- identity (same invariant as on-site) --------------------------
+        f'/system identity set name="{location_code}"',
+        # -- refuse unless the live tunnel state is intact -- BEFORE the
+        #    one-time token is spent, so a half-broken router never burns
+        #    it. A router in this state needs the on-site script (and a
+        #    human who can reach the device some other way).
+        f':if ([:len [/interface wireguard find where name="{iface}"]] = 0) '
+        "do={ :error "
+        '"CloudGuest remote bootstrap: no existing '
+        f"{iface} interface -- remote mode re-provisions a live tunnel; "
+        'use the on-site script instead" }',
+        f':if ([:len [/ip address find where interface="{iface}"]] = 0) '
+        "do={ :error "
+        '"CloudGuest remote bootstrap: no tunnel address attached to '
+        f"{iface} -- existing tunnel state is incomplete; use the on-site "
+        'script instead" }',
+        ":if ([:len [/interface wireguard peers find where "
+        f'interface="{iface}"]] = 0) do={{ :error '
+        '"CloudGuest remote bootstrap: no hub peer on '
+        f"{iface} -- existing tunnel state is incomplete; use the on-site "
+        'script instead" }',
+        # -- capture everything the revert needs, still touching nothing --
+        f':local wgid [:pick [/interface wireguard find where name="{iface}"] 0]',
+        ":local oldkey [/interface wireguard get $wgid private-key]",
+        ":local oldport [/interface wireguard get $wgid listen-port]",
+        ":local oldaddr [/ip address get "
+        f'[:pick [/ip address find where interface="{iface}"] 0] address]',
+        ":local peerid [:pick [/interface wireguard peers find where "
+        f'interface="{iface}"] 0]',
+        ":local oldpub [/interface wireguard peers get $peerid public-key]",
+        ":local oldephost [/interface wireguard peers get $peerid endpoint-address]",
+        ":local oldepport [/interface wireguard peers get $peerid endpoint-port]",
+        ":local oldallowed [/interface wireguard peers get $peerid allowed-address]",
+        ":local oldka [/interface wireguard peers get $peerid persistent-keepalive]",
+        # -- enrollment + key delivery + validation (shared with on-site);
+        #    any failure from here back means the tunnel was never touched -
+        *_render_enrollment_lines(
+            provisioning_token=provisioning_token,
+            check_in_url=check_in_url,
+            wg_config_url=wg_config_url,
+        ),
+        _TUNNEL_ADDRESS_LOCAL_LINE,
+        # -- stage: bake validated values into the two detached scripts ----
+        f":local cut {_ros_string_expr(_join_embedded_commands(cutover_commands))}",
+        f":local rvt {_ros_string_expr(_join_embedded_commands(revert_commands))}",
+        "/system scheduler remove "
+        f'[find where comment="{_BOOTSTRAP_CUTOVER_TAG}"]',
+        "/system scheduler remove "
+        f'[find where comment="{_BOOTSTRAP_REVERT_TAG}"]',
+        # Revert is armed BEFORE the cutover exists -- there is no instant
+        # at which the cutover could fire unprotected.
+        f"/system scheduler add name={_BOOTSTRAP_REVERT_SCHEDULER_NAME} "
+        f"interval={REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES}m on-event=$rvt "
+        f'comment="{_BOOTSTRAP_REVERT_TAG}"',
+        f"/system scheduler add name={_BOOTSTRAP_CUTOVER_SCHEDULER_NAME} "
+        f"interval={REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS}s on-event=$cut "
+        f'comment="{_BOOTSTRAP_CUTOVER_TAG}"',
+        f":if ({cutover_staged} > 0 && {revert_staged} > 0) do={{ "
+        f':log info "{staged_message}"; :put "{staged_message}" }}',
     ]
 
 
@@ -1654,6 +2139,7 @@ __all__ = [
     "render_wireguard_peer",
     "render_radius_client",
     "render_bootstrap_script",
+    "BootstrapMode",
     "render_agent_heartbeat_scheduler",
     "render_network_config",
     "NETWATCH_CHECK_INTERVAL",

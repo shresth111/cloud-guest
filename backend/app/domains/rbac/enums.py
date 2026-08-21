@@ -270,6 +270,15 @@ class AuditAction(StrEnum):
     ROUTER_ENROLLMENT_REJECTED = "router_enrollment_rejected"
     ROUTER_SECRET_ROTATED = "router_secret_rotated"
     ROUTER_FACTORY_RESET = "router_factory_reset"
+    # A live (ONLINE/OFFLINE) router was rewound to PENDING_PROVISIONING by
+    # the remote-mode bootstrap preview (RouterService
+    # .preview_bootstrap_script with BootstrapMode.REMOTE) so a fresh
+    # provisioning token could be minted for a scheduler-staged tunnel
+    # cutover. Deliberately NOT reusing ROUTER_FACTORY_RESET: nothing was
+    # wiped on the device -- the same "wrong semantics" concern
+    # app.domains.router.router.regenerate_agent_credential's docstring
+    # already documents for that action.
+    ROUTER_REMOTE_REPROVISION_STARTED = "router_remote_reprovision_started"
     ROUTER_CONFIG_VERSION_APPLIED = "router_config_version_applied"
     ROUTER_CONFIG_VERSION_ROLLED_BACK = "router_config_version_rolled_back"
     ROUTER_BACKUP_CREATED = "router_backup_created"
