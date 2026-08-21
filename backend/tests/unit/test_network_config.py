@@ -11,6 +11,7 @@ every route carries a permission dependency.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -651,42 +652,186 @@ class TestRenderBootstrapScript:
                 api_base_url="http://api.cloudguest.example",
             )
 
-    def test_renders_identity_keypair_enrollment_and_config_pull(self) -> None:
-        lines = render_bootstrap_script(
-            location_code="HQ-001",
+    # The six check-in response fields the rendered script must refuse to
+    # proceed without -- mirrors renderers._CHECK_IN_REQUIRED_FIELDS, spelled
+    # out here so a renderer-side edit to that tuple breaks this test loudly.
+    CHECK_IN_FIELDS = (
+        "agent_credential",
+        "tunnel_ip_address",
+        "wireguard_server_public_key",
+        "wireguard_endpoint_host",
+        "wireguard_endpoint_port",
+        "wireguard_hub_tunnel_address",
+    )
+
+    @staticmethod
+    def _render() -> list[str]:
+        return render_bootstrap_script(
+            location_code="LOC-2026-000039",
             provisioning_token="one-time-token-abc",
             api_base_url="https://api.cloudguest.example",
         )
+
+    def test_renders_identity_enrollment_and_key_pull(self) -> None:
+        lines = self._render()
         script = "\n".join(lines)
 
-        # Roughly 15 lines, not a full config dump -- see module docstring.
-        assert len(lines) <= 15
+        # Still a thin paste, not a config dump -- see module docstring.
+        assert len(lines) <= 30
 
-        assert '/system identity set name="HQ-001"' in lines
-        assert any(
-            line.startswith("/interface wireguard add name=wg-cloudguard")
-            for line in lines
-        )
-        # The device's own public key is read locally, never a
-        # platform-generated one.
-        assert ":local pub [/interface wireguard get" in script
-        # The provisioning token is embedded, the private key never is.
+        assert lines[0] == '/system identity set name="LOC-2026-000039"'
+        # The provisioning token is embedded (the one deliberate, one-time,
+        # short-TTL secret); the private key is fetched at run time from
+        # the real device-facing endpoint, never read from a local keypair.
         assert "one-time-token-abc" in script
-        assert "private-key" not in script
-        # Enrollment POST hits the real check-in endpoint over HTTPS.
+        assert ":local pub" not in script
         assert (
             "https://api.cloudguest.example/api/v1/routers/provisioning/check-in"
             in script
         )
         assert "http-method=post" in script
-        # Idempotent remove-then-add, comment-tagged.
-        assert '/ip address remove [find comment="CGBOOT"]' in lines
-        assert '/interface wireguard peers remove [find comment="CGBOOT"]' in lines
-        assert script.count('comment="CGBOOT"') >= 2
-        # Full config pull over HTTPS + import -- the real config-pull
-        # endpoint, not an invented one.
-        assert "https://api.cloudguest.example/api/v1/agent/config" in script
-        assert "/import file-name=cloudguest.rsc" in lines
+        assert (
+            "https://api.cloudguest.example/api/v1/agent/wireguard-config" in script
+        )
+        assert '"X-Agent-Credential: " . ($enroll->"agent_credential")' in script
+        # The interface is created from the platform-delivered key, tagged
+        # like everything else this script creates.
+        add_line = next(
+            line
+            for line in lines
+            if line.startswith("/interface wireguard add name=wg-cloudguard")
+        )
+        assert 'private-key=($wgcfg->"peer_private_key")' in add_line
+        assert 'comment="CGBOOT"' in add_line
+        # The old fetch-and-import handoff is gone from Step 1.
+        assert "/import" not in script
+        assert "cloudguest.rsc" not in script
+
+    def test_cleanup_is_comment_based_ordered_and_before_check_in(self) -> None:
+        lines = self._render()
+
+        ip_remove = lines.index('/ip address remove [find where comment="CGBOOT"]')
+        peers_remove = lines.index(
+            '/interface wireguard peers remove [find where comment="CGBOOT"]'
+        )
+        iface_remove = lines.index(
+            '/interface wireguard remove [find where name="wg-cloudguard"]'
+        )
+        check_in = next(
+            i
+            for i, line in enumerate(lines)
+            if "/routers/provisioning/check-in" in line
+        )
+        # Address first (an orphaned row on a deleted interface is only
+        # findable by comment), then peers, then the interface itself --
+        # and all of it before any network call.
+        assert ip_remove < peers_remove < iface_remove < check_in
+        # Removal is NEVER keyed by interface name for /ip address or peers:
+        # a deleted interface leaves rows pointing at an internal id (*10)
+        # an interface-name match cannot see.
+        assert "interface=" not in lines[ip_remove]
+        assert "interface=" not in lines[peers_remove]
+
+    def test_check_in_fields_are_each_presence_checked(self) -> None:
+        lines = self._render()
+        script = "\n".join(lines)
+        deserialize = lines.index(
+            ':local enroll [:deserialize from=json value=($resp->"data")]'
+        )
+        wg_fetch = next(
+            i for i, line in enumerate(lines) if "wireguard-config" in line
+        )
+        for field_name in self.CHECK_IN_FIELDS:
+            check = next(
+                i
+                for i, line in enumerate(lines)
+                if f"check-in response missing {field_name}" in line
+            )
+            assert deserialize < check < wg_fetch
+            assert f'[:typeof ($enroll->"{field_name}")]' in lines[check]
+        # An HTTP-failure guard precedes the deserialize.
+        assert ':if (($resp->"http-code") != "200")' in script
+        assert "on-error={" in lines[deserialize - 2]
+
+    def test_private_key_is_validated_before_use(self) -> None:
+        lines = self._render()
+        missing = next(
+            i
+            for i, line in enumerate(lines)
+            if "wireguard-config response missing peer_private_key" in line
+        )
+        empty = next(
+            i for i, line in enumerate(lines) if "empty peer_private_key" in line
+        )
+        add = next(
+            i
+            for i, line in enumerate(lines)
+            if line.startswith("/interface wireguard add")
+        )
+        assert missing < add
+        assert empty < add
+        assert '[:len ($wgcfg->"peer_private_key")] = 0' in lines[empty]
+
+    def test_verification_asserts_attachment_not_mere_existence(self) -> None:
+        lines = self._render()
+        peer_add = next(
+            i
+            for i, line in enumerate(lines)
+            if line.startswith("/interface wireguard peers add")
+        )
+        iface_check = next(
+            i
+            for i, line in enumerate(lines)
+            if "verification failed: interface wg-cloudguard does not exist" in line
+        )
+        addr_check = next(
+            i
+            for i, line in enumerate(lines)
+            if "verification failed: tunnel address is not attached" in line
+        )
+        peer_check = next(
+            i
+            for i, line in enumerate(lines)
+            if "verification failed: hub peer is missing" in line
+        )
+        # All verification runs after every create.
+        assert peer_add < iface_check < addr_check < peer_check
+        # The address check requires the address ON wg-cloudguard, not
+        # anywhere -- the exact regression the orphaned interface=*10 row
+        # produced in production.
+        assert (
+            '/ip address find where interface="wg-cloudguard" && address=$tunaddr'
+            in lines[addr_check]
+        )
+        # The success line is gated on the same three re-queries (console
+        # pastes execute line by line, so an unconditional final :put could
+        # otherwise fire after an earlier :error).
+        success = lines[-1]
+        assert "CloudGuest bootstrap successful" in success
+        assert success.startswith(":if (")
+        for fragment in (
+            '/interface wireguard find where name="wg-cloudguard"',
+            '/ip address find where interface="wg-cloudguard" && address=$tunaddr',
+            '/interface wireguard peers find where interface="wg-cloudguard"',
+        ):
+            assert fragment in success
+
+    def test_no_literal_ips_keys_or_comment_lines(self) -> None:
+        lines = self._render()
+        script = "\n".join(lines)
+        # Nothing hardcoded: no IP literals, no key material -- every
+        # device-specific value dereferences the JSON the platform returned.
+        assert not re.findall(
+            r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script
+        )
+        for needle in ("tunnel_ip_address", "wireguard_server_public_key"):
+            for line in lines:
+                if needle in line and "missing" not in line:
+                    assert f'($enroll->"{needle}")' in line
+        assert 'private-key=($wgcfg->"peer_private_key")' in script
+        # No '#' comment lines: the dashboard's single-line ';'-joined copy
+        # export would silently swallow every command after one.
+        assert not any(line.lstrip().startswith("#") for line in lines)
 
     def test_default_wireguard_port_used_unless_overridden(self) -> None:
         lines = render_bootstrap_script(

@@ -388,30 +388,35 @@ platform, then lets every subsequent step happen over the API, the exact
 zero-touch pattern real ISP/WISP tooling (Splynx/UISP/Powercode) already
 uses for the identical CGNAT problem.
 
-**Deliberately ~15 lines, not a full config dump.** A long WinBox terminal
+**Deliberately ~25 lines, not a full config dump.** A long WinBox terminal
 paste both drops characters in practice (a real, common failure mode of
 pasting many lines into a RouterOS terminal) and has no atomicity -- a
 mid-script failure on line 40 of a 200-line paste leaves a half-configured
 device with no signal anything went wrong, and no easy way for a
 non-network-engineer site technician to tell which half actually applied.
-This script does only the minimum: set identity, generate a keypair,
-bring up one interface, enroll, then hand off to the platform's own,
-already-real config-pull machinery (``GET /agent/config``,
-``app.domains.router_agent.router.agent_pull_config``) for everything
-else -- one already-atomic-per-category, server-rendered ``.rsc`` fetched
-and ``/import``-ed in a single step, not re-typed by hand.
+This script does only the minimum: set identity, clear any stale state a
+previous run left behind, enroll, pull this peer's own key material, bring
+up one interface, then *verify* what it just created and say so out loud.
+Everything else (VLANs, hotspot, RADIUS -- the remaining wizard steps)
+stays in the platform's own, already-real config machinery, never in this
+paste.
 
-**The device generates its own keypair; only the public half is ever
-POSTed.** See ``app.domains.router.schemas.ProvisioningCheckInRequest
-.wireguard_public_key``'s own docstring for the full reasoning -- in
-short, a real security risk unique to *this* delivery mechanism: unlike an
-admin-triggered tunnel created through the authenticated dashboard, a
-bootstrap script is a pasted-once, site-technician-handled artifact
-routinely forwarded over WhatsApp/email between site techs in practice. A
-server-generated private key embedded in that blob would turn it into a
-bearer credential for the tunnel itself; RouterOS's own
-``/interface wireguard add`` already generates a real keypair locally with
-no extra step, so there is no reason to do otherwise.
+**The platform generates the keypair; the private key is fetched at run
+time, never embedded in the paste.** A bootstrap script is a pasted-once,
+site-technician-handled artifact routinely forwarded over WhatsApp/email
+between site techs in practice -- so no key material may appear in the
+rendered text itself (the one embedded secret is the one-time, short-TTL
+provisioning token, which check-in burns on first use). Instead the script
+exchanges that token for the router's persistent agent credential
+(``POST /routers/provisioning/check-in``, which allocates the tunnel and
+a platform-held keypair), then immediately pulls ``peer_private_key`` over
+HTTPS from ``GET /agent/wireguard-config``
+(``app.domains.wireguard.router.agent_pull_wireguard_config``),
+authenticated with that just-issued credential. The forwarded blob
+therefore never becomes a bearer credential for the tunnel itself, and the
+platform's ``WireGuardPeer`` row holds the real key both sides agree on --
+which is also what makes a re-run rotate cleanly (see
+``WireGuardService.ensure_tunnel_for_check_in``).
 
 **``/system identity`` is set to the location code, not
 ``RadiusNasClient.nas_identifier``.** These are two different,
@@ -433,17 +438,29 @@ even though it is not literally the RADIUS NAS-Identifier RouterOS's own
 RADIUS client would separately send once that section of the full config
 is later applied.
 
-**Idempotency via a comment-tag remove-then-add.** Every entry this
-script itself creates (the tunnel's ``/ip address`` and its
-``/interface wireguard peers`` line) is tagged ``comment="CGBOOT"`` and
-removed-then-re-added rather than blindly re-added, confirmed live this
-session against the real MikroTik CHR test VM (RouterOS 7.21.5) -- so
-re-running this exact script (e.g. a technician pastes it twice by
-mistake) never duplicates entries. **Known, flagged gap, deliberately not
+**Idempotency via comment-tagged cleanup-first, then verify.** Every
+entry this script itself creates (the ``wg-cloudguard`` interface, the
+tunnel's ``/ip address`` and its ``/interface wireguard peers`` line) is
+tagged ``comment="CGBOOT"``, and the script *opens* by removing all three
+-- the ``/ip address`` row **by comment, never by interface name**: when a
+previous run's interface has been deleted, RouterOS keeps its orphaned
+address row pointing at an internal id (a real production sighting:
+``address=10.8.0.6/32 interface=*10 comment=CGBOOT``), which an
+interface-name match can never find but which still blocks re-adding the
+same address on the fresh interface. ``remove [find where ...]`` with no
+matches is a no-op in RouterOS 7 (the committed pre-fix script already
+relied on exactly that on first runs, confirmed live against the CHR test
+VM, RouterOS 7.21.5), so no ``[:len ...]`` guards wrap the cleanup lines.
+After creating, the script re-queries all three resources -- including
+that the tunnel address is attached *specifically to* ``wg-cloudguard``,
+not merely present -- and only that combined re-query prints the success
+line, so a paste whose earlier line failed (RouterOS console executes a
+paste line by line; ``:error`` aborts only its own line) can never end on
+a false "successful". **Known, flagged gap, deliberately not
 fixed here**: neither ``render_wireguard_peer`` nor ``render_radius_client``
 (built earlier this session, both above) tag *their own* ``/ip address``/
 ``/interface wireguard peers``/``/radius`` lines with any comment at all,
-so if the full ``.rsc`` this script fetches at its own last line is ever
+so if the full ``.rsc`` the later wizard steps deliver is ever
 re-applied a second time (e.g. a config-drift correction re-push), those
 two renderers' lines would duplicate rather than idempotently replace.
 Retrofitting that onto those two functions is a real, separate, small fix
@@ -461,15 +478,15 @@ HTTPS at all). ``api_base_url`` is therefore asserted to start with
 ``https://`` -- a caller passing a bare host or an ``http://`` URL gets a
 clear ``ValueError`` here rather than a silently-insecure rendered script.
 This constraint is specific to the bootstrap's *own* two calls back to the
-platform (enrollment POST, config-pull ``/tool fetch``); it says nothing
+platform (enrollment POST, wireguard-config ``/tool fetch``); it says nothing
 about, and does not change, the WireGuard/RADIUS device-to-device traffic
 ``render_wireguard_peer``/``render_radius_client`` above already render.
 
 **Real endpoint paths, not invented ones.** ``/api/v1/routers/provisioning
 /check-in`` (``app.domains.router.router.provisioning_check_in``) and
-``/api/v1/agent/config`` (``app.domains.router_agent.router
-.agent_pull_config`` -- confirmed, by reading that module's own docstring,
-to be the "config-pull" surface it names) are this platform's real,
+``/api/v1/agent/wireguard-config`` (``app.domains.wireguard.router
+.agent_pull_wireguard_config`` -- confirmed, by reading that module's own
+docstring, to be the device-facing key-delivery surface) are this platform's real,
 already-mounted routes (``app.api.v1.router``, ``app.core.config
 .Settings.api_v1_prefix``), not speculative ones invented for this
 addition.
@@ -1261,7 +1278,38 @@ _BOOTSTRAP_MGMT_TAG = "CGBOOT"
 # a caller supplies.
 _CHECK_IN_PATH = "/api/v1/routers/provisioning/check-in"
 _AGENT_CONFIG_PATH = "/api/v1/agent/config"
+_AGENT_WIREGUARD_CONFIG_PATH = "/api/v1/agent/wireguard-config"
 _AGENT_HEARTBEAT_PATH = "/api/v1/agent/heartbeat"
+
+# Every check-in response field the bootstrap script dereferences -- each
+# one gets its own presence check in the rendered script (a missing field
+# must stop the run *naming that field*, not surface later as a cryptic
+# RouterOS expression error), and ``ProvisioningCheckInResponse`` declares
+# each one required so a platform regression fails loudly server-side
+# before any router ever sees it.
+_CHECK_IN_REQUIRED_FIELDS = (
+    "agent_credential",
+    "tunnel_ip_address",
+    "wireguard_server_public_key",
+    "wireguard_endpoint_host",
+    "wireguard_endpoint_port",
+    "wireguard_hub_tunnel_address",
+)
+
+
+def _render_json_field_check(var: str, field: str, source: str) -> str:
+    """One RouterOS line asserting a deserialized JSON field is present.
+
+    ``[:typeof ...]`` is ``"nothing"`` for a missing array member and
+    ``"nil"`` for an explicit JSON ``null`` -- both mean the platform did
+    not send a usable value, and the ``:error`` message names the exact
+    field so the technician (and the founder reading over their shoulder)
+    sees *which* contract broke, not a downstream expression error."""
+    ref = f'(${var}->"{field}")'
+    return (
+        f':if ([:typeof {ref}] = "nothing" || [:typeof {ref}] = "nil") '
+        f'do={{ :error "CloudGuest bootstrap: {source} response missing {field}" }}'
+    )
 
 
 def _require_https(api_base_url: str, *, caller: str) -> None:
@@ -1283,16 +1331,33 @@ def render_bootstrap_script(
     api_base_url: str,
     wireguard_listen_port: int = DEFAULT_WIREGUARD_PORT,
 ) -> list[str]:
-    """Renders the "Step 0" zero-touch enrollment script -- see module
-    docstring's Bootstrap section for the full reasoning behind every
-    decision below (why ~15 lines, why the device generates its own
-    keypair, why ``/system identity`` gets the location code rather than
-    the RADIUS NAS identifier, the comment-tag idempotency convention, and
-    why HTTPS is enforced). Every command here was confirmed, fragment by
-    fragment, against a real MikroTik CHR (RouterOS 7.21.5) this session --
-    including the ``:deserialize from=json`` call, which is what actually
-    lets a RouterOS script parse this platform's own JSON response body
-    without a second round-trip or a hand-rolled parser.
+    """Renders the "Step 0"/"Step 1" zero-touch enrollment script -- see
+    module docstring's Bootstrap section for the full reasoning behind
+    every decision below (why ~25 lines, why the platform generates the
+    keypair and the script fetches the private half at run time, why
+    ``/system identity`` gets the location code rather than the RADIUS NAS
+    identifier, the cleanup-first comment-tag idempotency convention, the
+    line-by-line console-paste semantics the final verified-success gate
+    exists for, and why HTTPS is enforced). The base command vocabulary
+    (``:deserialize from=json``, ``/tool fetch ... output=user as-value``,
+    comment-tagged ``remove [find ...]`` as a first-run no-op) was
+    confirmed against a real MikroTik CHR (RouterOS 7.21.5); the
+    ``:do {} on-error={}`` wrappers exist because ``/tool fetch`` *throws*
+    on a non-2xx response rather than returning (per MikroTik's own Fetch
+    documentation), so without them a burned/expired token surfaces as a
+    cryptic ``failure:`` line instead of the actionable message rendered
+    here. The ``http-code`` guards are kept as belt-and-braces for any
+    build where fetch returns instead of throwing.
+
+    The script is safe to re-run on the same router: it opens by removing
+    its own previously-created state (the CGBOOT-tagged ``/ip address``
+    row *by comment* -- an orphaned row on a deleted interface shows
+    ``interface=*10`` and is unfindable by interface name -- then
+    CGBOOT-tagged peers, then the ``wg-cloudguard`` interface by name),
+    and each re-paste is expected to carry a freshly-minted one-time token
+    (``RouterService.preview_bootstrap_script`` rewinds and re-mints;
+    server-side, check-in rotates the existing peer in place -- see
+    ``WireGuardService.ensure_tunnel_for_check_in``).
 
     Raises ``ValueError`` if ``api_base_url`` is not ``https://`` -- see
     :func:`_require_https`.
@@ -1306,24 +1371,78 @@ def render_bootstrap_script(
     existing convention throughout."""
     _require_https(api_base_url, caller="render_bootstrap_script")
     check_in_url = f"{api_base_url}{_CHECK_IN_PATH}"
-    config_url = f"{api_base_url}{_AGENT_CONFIG_PATH}"
+    wg_config_url = f"{api_base_url}{_AGENT_WIREGUARD_CONFIG_PATH}"
+    success_message = (
+        "CloudGuest bootstrap successful: WireGuard tunnel configured and verified"
+    )
+    # The three re-queries below back both the named verification lines and
+    # the final success gate -- built once so the two can never drift.
+    interface_exists = (
+        f'[:len [/interface wireguard find where name="{WIREGUARD_INTERFACE_NAME}"]]'
+    )
+    address_attached = (
+        "[:len [/ip address find where "
+        f'interface="{WIREGUARD_INTERFACE_NAME}" && address=$tunaddr]]'
+    )
+    peer_exists = (
+        "[:len [/interface wireguard peers find where "
+        f'interface="{WIREGUARD_INTERFACE_NAME}" && comment="{_BOOTSTRAP_MGMT_TAG}"]]'
+    )
     return [
+        # -- identity (unchanged behavior) ---------------------------------
         f'/system identity set name="{location_code}"',
-        f"/interface wireguard add name={WIREGUARD_INTERFACE_NAME} "
-        f"listen-port={wireguard_listen_port}",
-        ":local pub [/interface wireguard get "
-        f"[find name={WIREGUARD_INTERFACE_NAME}] public-key]",
+        # -- stale-state cleanup, before anything else ---------------------
+        # The /ip address row goes first and is matched BY COMMENT: after a
+        # previous run's interface was deleted, its address row lingers
+        # pointing at an internal id (interface=*10), unfindable by
+        # interface name but still blocking the same address from being
+        # re-added on the fresh interface. All three removes are first-run
+        # no-ops (empty [find] -> nothing to remove).
+        f'/ip address remove [find where comment="{_BOOTSTRAP_MGMT_TAG}"]',
+        "/interface wireguard peers remove "
+        f'[find where comment="{_BOOTSTRAP_MGMT_TAG}"]',
+        f'/interface wireguard remove [find where name="{WIREGUARD_INTERFACE_NAME}"]',
+        # -- enrollment: one-time token -> agent credential + tunnel facts -
         ':local body ("{\\"token\\":\\"" . "'
-        f'{provisioning_token}" . "\\",\\"wireguard_public_key\\":\\"" '
-        '. $pub . "\\"}")',
-        f':local resp [/tool fetch url="{check_in_url}" http-method=post '
+        + provisioning_token
+        + '" . "\\"}")',
+        ":local resp; :do { :set resp "
+        f'[/tool fetch url="{check_in_url}" http-method=post '
         'http-header-field="Content-Type: application/json" http-data=$body '
-        "output=user as-value]",
+        "output=user as-value] } on-error={ :error "
+        '"CloudGuest bootstrap: check-in request failed -- the platform '
+        "rejected the call or is unreachable; generate a fresh bootstrap "
+        'script and re-run it" }',
+        ':if (($resp->"http-code") != "200") do={ '
+        ':error ("check-in failed: " . ($resp->"data")) }',
         ':local enroll [:deserialize from=json value=($resp->"data")]',
-        f'/ip address remove [find comment="{_BOOTSTRAP_MGMT_TAG}"]',
-        '/ip address add address=(($enroll->"tunnel_ip_address") . "/32") '
+        *(
+            _render_json_field_check("enroll", field, "check-in")
+            for field in _CHECK_IN_REQUIRED_FIELDS
+        ),
+        # -- key delivery: the private key travels HTTPS at run time, never
+        #    inside this paste ---------------------------------------------
+        ":local wgresp; :do { :set wgresp "
+        f'[/tool fetch url="{wg_config_url}" '
+        'http-header-field=("X-Agent-Credential: " . ($enroll->"agent_credential")) '
+        "output=user as-value] } on-error={ :error "
+        '"CloudGuest bootstrap: wireguard-config request failed -- the '
+        'platform rejected the agent credential or is unreachable" }',
+        ':if (($wgresp->"http-code") != "200") do={ '
+        ':error ("wireguard-config failed: " . ($wgresp->"data")) }',
+        ':local wgcfg [:deserialize from=json value=($wgresp->"data")]',
+        _render_json_field_check("wgcfg", "peer_private_key", "wireguard-config"),
+        ':if ([:len ($wgcfg->"peer_private_key")] = 0) do={ :error '
+        '"CloudGuest bootstrap: wireguard-config response has an empty '
+        'peer_private_key" }',
+        # -- create: interface, tunnel address, hub peer -------------------
+        f"/interface wireguard add name={WIREGUARD_INTERFACE_NAME} "
+        'private-key=($wgcfg->"peer_private_key") '
+        f"listen-port={wireguard_listen_port} "
+        f'comment="{_BOOTSTRAP_MGMT_TAG}"',
+        ':local tunaddr (($enroll->"tunnel_ip_address") . "/32")',
+        "/ip address add address=$tunaddr "
         f'interface={WIREGUARD_INTERFACE_NAME} comment="{_BOOTSTRAP_MGMT_TAG}"',
-        f'/interface wireguard peers remove [find comment="{_BOOTSTRAP_MGMT_TAG}"]',
         f"/interface wireguard peers add interface={WIREGUARD_INTERFACE_NAME} "
         'public-key=($enroll->"wireguard_server_public_key") '
         'endpoint-address=($enroll->"wireguard_endpoint_host") '
@@ -1331,10 +1450,22 @@ def render_bootstrap_script(
         'allowed-address=(($enroll->"wireguard_hub_tunnel_address") . "/32") '
         f"persistent-keepalive={DEFAULT_PERSISTENT_KEEPALIVE_SECONDS}s "
         f'comment="{_BOOTSTRAP_MGMT_TAG}"',
-        f'/tool fetch url="{config_url}" '
-        'http-header-field=("X-Agent-Credential: " . ($enroll->"agent_credential")) '
-        "dst-path=cloudguest.rsc",
-        "/import file-name=cloudguest.rsc",
+        # -- verify what was actually created, then (and only then) declare
+        #    success. The address check asserts attachment to the real
+        #    interface, not mere existence -- the exact failure the orphaned
+        #    interface=*10 row produced.
+        f":if ({interface_exists} = 0) do={{ :error "
+        '"CloudGuest bootstrap verification failed: interface '
+        f'{WIREGUARD_INTERFACE_NAME} does not exist" }}',
+        f":if ({address_attached} = 0) do={{ :error "
+        '"CloudGuest bootstrap verification failed: tunnel address is not '
+        f'attached to {WIREGUARD_INTERFACE_NAME}" }}',
+        f":if ({peer_exists} = 0) do={{ :error "
+        '"CloudGuest bootstrap verification failed: hub peer is missing on '
+        f'{WIREGUARD_INTERFACE_NAME}" }}',
+        f":if ({interface_exists} > 0 && {address_attached} > 0 && "
+        f"{peer_exists} > 0) do={{ "
+        f':log info "{success_message}"; :put "{success_message}" }}',
     ]
 
 
