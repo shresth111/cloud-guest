@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from wyfy_device_gateway.mikrotik_adapter import MikroTikConnectionError
 from wyfy_device_gateway.read_only_reader import ReadOnlyStateCapture
 
 from app.domains.provisioning_engine.planner.collector import (
@@ -35,11 +36,15 @@ from app.domains.provisioning_engine.planner.compatibility import (
     evaluate_compatibility_from_fields,
 )
 from app.domains.provisioning_engine.planner.constants import (
+    SNAPSHOT_SCHEMA_VERSION,
     CompatibilityCheckStatus,
     CompatibilityOverall,
     ManagedResourceStatus,
     SnapshotStatus,
     SnapshotTrigger,
+)
+from app.domains.provisioning_engine.planner.exceptions import (
+    DiscoveryDeviceConnectionError,
 )
 from app.domains.provisioning_engine.planner.managed_resources import (
     build_managed_resource_backfill_rows,
@@ -286,6 +291,7 @@ def test_collect_snapshot_fields_builds_complete_payload() -> None:
     capture = _canned_capture()
     fields = collect_snapshot_fields(capture)
     assert fields["status"] == SnapshotStatus.COMPLETE.value
+    assert fields["snapshot_version"] == SNAPSHOT_SCHEMA_VERSION
     assert fields["model"] == "RB4011iGS+"
     assert fields["routeros_version"] == "7.15.3 (stable)"
     assert fields["architecture"] == "arm"
@@ -497,6 +503,8 @@ async def test_discovery_service_persists_snapshot_and_compatibility() -> None:
 
     assert len(repo.rows) == 1
     assert result.snapshot.status == SnapshotStatus.COMPLETE
+    assert repo.rows[0].snapshot_version == SNAPSHOT_SCHEMA_VERSION
+    assert result.snapshot.snapshot_version == SNAPSHOT_SCHEMA_VERSION
     assert result.snapshot.model == "RB4011iGS+"
     assert result.compatibility.overall == CompatibilityOverall.PASS
     assert any(i.is_wyfy_managed for i in result.snapshot.interfaces)
@@ -507,6 +515,34 @@ async def test_discovery_service_persists_snapshot_and_compatibility() -> None:
 
     compat = await service.get_compatibility(router.id)
     assert compat.overall == CompatibilityOverall.PASS
+
+
+@pytest.mark.asyncio
+async def test_discovery_service_stamps_version_on_failed_snapshot() -> None:
+    """A connection failure still persists an audit-trail row -- and that
+    row must carry the collector schema version like any other snapshot."""
+    router = _make_router()
+    repo = FakeSnapshotRepository()
+    lookup = FakeRouterLookup(router=router)
+
+    class ExplodingReader:
+        def __init__(self, creds: object) -> None:
+            self.creds = creds
+
+        async def read_all(self, sections: object = None) -> ReadOnlyStateCapture:
+            raise MikroTikConnectionError("203.0.113.7", "connection refused")
+
+    service = DiscoveryService(repo, lookup, reader_factory=ExplodingReader)
+    with pytest.raises(DiscoveryDeviceConnectionError):
+        await service.discover_router(
+            router.id, trigger=SnapshotTrigger.WIZARD_DISCOVERY
+        )
+
+    assert len(repo.rows) == 1
+    failed = repo.rows[0]
+    assert failed.status == SnapshotStatus.FAILED.value
+    assert failed.snapshot_version == SNAPSHOT_SCHEMA_VERSION
+    assert failed.error_detail
 
 
 # ============================================================================

@@ -24,7 +24,11 @@ from wyfy_device_gateway.read_only_reader import (
     ReadOnlyStateCapture,
 )
 
-from .constants import MANAGED_COMMENT_PREFIXES, SnapshotStatus
+from .constants import (
+    MANAGED_COMMENT_PREFIXES,
+    SNAPSHOT_SCHEMA_VERSION,
+    SnapshotStatus,
+)
 
 # Extra keys that look secret even if the transport layer missed them.
 _SECRET_KEY_FRAGMENTS: frozenset[str] = frozenset(
@@ -400,6 +404,7 @@ def collect_snapshot_fields(
     return {
         **identity,
         "status": resolve_snapshot_status(capture).value,
+        "snapshot_version": SNAPSHOT_SCHEMA_VERSION,
         "interfaces": collect_interfaces(capture),
         "bridges": collect_bridges(capture),
         "ip_addresses": collect_ip_addresses(capture),

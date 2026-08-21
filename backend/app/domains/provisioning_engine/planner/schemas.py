@@ -13,6 +13,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .constants import (
+    SNAPSHOT_SCHEMA_VERSION,
     CompatibilityCheckStatus,
     CompatibilityOverall,
     FinalVerificationOverall,
@@ -154,6 +155,7 @@ class RouterSnapshotResponse(BaseModel):
     captured_at: datetime
     trigger: SnapshotTrigger
     status: SnapshotStatus
+    snapshot_version: str = SNAPSHOT_SCHEMA_VERSION
     model: str | None = None
     routeros_version: str | None = None
     architecture: str | None = None
