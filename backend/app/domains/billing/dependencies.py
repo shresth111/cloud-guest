@@ -30,6 +30,13 @@ from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.analytics.dependencies import get_analytics_repository
 from app.domains.analytics.repository import AnalyticsRepositoryProtocol
+from app.domains.captive_portal.cache import CaptivePortalResolveCache
+from app.domains.captive_portal.dependencies import (
+    get_captive_portal_repository,
+    get_captive_portal_resolve_cache,
+)
+from app.domains.captive_portal.repository import CaptivePortalRepositoryProtocol
+from app.domains.captive_portal.service import PoweredByAttributionResetService
 from app.domains.guest.dependencies import get_guest_analytics_service
 from app.domains.guest.service import GuestAnalyticsService
 from app.domains.notification.dependencies import get_notification_service
@@ -140,6 +147,30 @@ def get_entitlement_cache(redis: Redis = Depends(get_redis_client)) -> Entitleme
     return EntitlementCache(redis)
 
 
+def get_powered_by_reset_service(
+    captive_portal_repository: CaptivePortalRepositoryProtocol = Depends(
+        get_captive_portal_repository
+    ),
+    resolve_cache: CaptivePortalResolveCache = Depends(
+        get_captive_portal_resolve_cache
+    ),
+    audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> PoweredByAttributionResetService:
+    """The Captive Portal domain's system-side ``powered_by_enabled``
+    reset, composed here for ``LicenseService``'s downgrade path via the
+    narrow ``WhiteLabelResetProtocol`` shape -- built from the captive
+    portal domain's own already-wired repository/cache dependency
+    functions, never a second construction path. Deliberately *not* the
+    full ``CaptivePortalService``: the reset is a system action, and this
+    class carries no entitlement checker or tenant-scope check for the 402
+    write gate to fire through (see its docstring)."""
+    return PoweredByAttributionResetService(
+        captive_portal_repository,
+        resolve_cache=resolve_cache,
+        audit_writer=audit_repository,
+    )
+
+
 def get_license_service(
     repository: LicenseRepositoryProtocol = Depends(get_license_repository),
     plan_repository: PlanRepositoryProtocol = Depends(get_plan_repository),
@@ -147,6 +178,9 @@ def get_license_service(
     usage_service: UsageService = Depends(get_usage_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     entitlement_cache: EntitlementCache = Depends(get_entitlement_cache),
+    powered_by_reset: PoweredByAttributionResetService = Depends(
+        get_powered_by_reset_service
+    ),
 ) -> LicenseService:
     return LicenseService(
         repository,
@@ -155,6 +189,7 @@ def get_license_service(
         usage_validator=usage_service,
         audit_writer=audit_repository,
         entitlement_cache=entitlement_cache,
+        white_label_reset=powered_by_reset,
     )
 
 

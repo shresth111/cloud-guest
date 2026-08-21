@@ -58,6 +58,19 @@ class CaptivePortalConfigDeleted:
     occurred_at: datetime = field(default_factory=_now)
 
 
+@dataclass(frozen=True, slots=True)
+class CaptivePortalPoweredByRestored:
+    """A license downgrade removed the white-label entitlement, and the
+    system flipped this organization's ``powered_by_enabled=False`` configs
+    back to ``True`` -- see
+    ``service.PoweredByAttributionResetService``. One event per reset
+    sweep, not per config; the per-config record is the audit entry."""
+
+    organization_id: uuid.UUID
+    reset_config_count: int
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "CaptivePortalConfigCreated",
     "CaptivePortalConfigUpdated",

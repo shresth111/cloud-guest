@@ -60,6 +60,10 @@ class CaptivePortalRepositoryProtocol(Protocol):
         self, organization_id: uuid.UUID
     ) -> CaptivePortalConfig | None: ...
 
+    async def list_powered_by_disabled(
+        self, organization_id: uuid.UUID
+    ) -> list[CaptivePortalConfig]: ...
+
     async def find_active_for_location(
         self, organization_id: uuid.UUID, location_id: uuid.UUID
     ) -> CaptivePortalConfig | None: ...
@@ -138,6 +142,24 @@ class CaptivePortalRepository:
         )
         result = await self.session.execute(statement)
         return result.scalars().first()
+
+    async def list_powered_by_disabled(
+        self, organization_id: uuid.UUID
+    ) -> list[CaptivePortalConfig]:
+        """Every non-deleted config in the organization currently hiding
+        the "Powered by Wyfy Guest" attribution -- the rows
+        ``PoweredByAttributionResetService`` flips back on when a license
+        downgrade removes the white-label entitlement. Includes inactive
+        rows deliberately: a downgraded tenant re-activating a dormant
+        config must not resurrect a ``powered_by_enabled=False`` value
+        their plan no longer includes."""
+        statement = select(CaptivePortalConfig).where(
+            CaptivePortalConfig.organization_id == organization_id,
+            CaptivePortalConfig.powered_by_enabled.is_(False),
+            CaptivePortalConfig.is_deleted.is_(False),
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def find_active_for_location(
         self, organization_id: uuid.UUID, location_id: uuid.UUID

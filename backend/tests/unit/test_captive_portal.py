@@ -55,6 +55,7 @@ from app.domains.captive_portal.exceptions import (
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import (
     CaptivePortalService,
+    PoweredByAttributionResetService,
     ResolvedPortalConfig,
 )
 from app.domains.captive_portal.validators import (
@@ -225,6 +226,17 @@ class FakeCaptivePortalRepository:
         config.is_deleted = True
         config.deleted_at = _now()
         return config
+
+    async def list_powered_by_disabled(
+        self, organization_id: uuid.UUID
+    ) -> list[CaptivePortalConfig]:
+        return [
+            config
+            for config in self.configs.values()
+            if config.organization_id == organization_id
+            and config.powered_by_enabled is False
+            and not config.is_deleted
+        ]
 
     async def list_configs(
         self,
@@ -2909,3 +2921,192 @@ class TestPoweredByRouterWiring:
             default.dependency
             is not router_module.get_entitlement_aware_captive_portal_service
         )
+
+
+class TestPoweredByAttributionReset:
+    """``PoweredByAttributionResetService`` -- the system-side reset the
+    ``_enforce_powered_by_entitlement`` docstring names as the right place
+    to recover the white-label revenue: at the moment the plan changes,
+    never on the guest hot path."""
+
+    def _reset_service(self, fx: Fixture) -> PoweredByAttributionResetService:
+        return PoweredByAttributionResetService(
+            fx.repository,
+            resolve_cache=fx.resolve_cache,
+            audit_writer=fx.audit_writer,
+        )
+
+    async def _seed_org_cache(self, fx: Fixture) -> None:
+        await fx.resolve_cache.set(
+            fx.organization.id,
+            None,
+            {"cached": True},
+            index_organization_id=fx.organization.id,
+        )
+
+    async def test_reset_flips_configs_invalidates_cache_and_audits(self) -> None:
+        fx = make_service(with_cache=True)
+        hidden = await _create_config(fx, name="Hidden")
+        hidden.powered_by_enabled = False
+        untouched = await _create_config(fx, name="Untouched")
+        await self._seed_org_cache(fx)
+        fx.audit_writer.entries.clear()
+
+        count = await self._reset_service(fx).restore_powered_by_attribution(
+            fx.organization.id
+        )
+
+        assert count == 1
+        assert hidden.powered_by_enabled is True
+        assert untouched.powered_by_enabled is True
+        assert await fx.resolve_cache.get(fx.organization.id, None) is None
+        [entry] = fx.audit_writer.entries
+        assert entry["action"] == "captive_portal_powered_by_restored"
+        assert entry["entity_id"] == hidden.id
+        assert entry["entity_type"] == "captive_portal_config"
+        assert entry["organization_id"] == fx.organization.id
+        assert entry["actor_user_id"] is None
+
+    async def test_inactive_configs_are_reset_too(self) -> None:
+        # A dormant config must not resurrect a False value the plan no
+        # longer includes when it is later re-activated.
+        fx = make_service(with_cache=True)
+        dormant = await _create_config(fx, name="Dormant", is_active=False)
+        dormant.powered_by_enabled = False
+
+        count = await self._reset_service(fx).restore_powered_by_attribution(
+            fx.organization.id
+        )
+
+        assert count == 1
+        assert dormant.powered_by_enabled is True
+
+    async def test_deleted_configs_are_left_alone(self) -> None:
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx, name="Gone")
+        config.powered_by_enabled = False
+        await fx.repository.soft_delete_config(config)
+        fx.audit_writer.entries.clear()
+
+        count = await self._reset_service(fx).restore_powered_by_attribution(
+            fx.organization.id
+        )
+
+        assert count == 0
+        assert config.powered_by_enabled is False
+        assert fx.audit_writer.entries == []
+
+    async def test_nothing_to_reset_is_a_pure_noop(self) -> None:
+        fx = make_service(with_cache=True)
+        await _create_config(fx, name="Fine")
+        await self._seed_org_cache(fx)
+        fx.audit_writer.entries.clear()
+
+        count = await self._reset_service(fx).restore_powered_by_attribution(
+            fx.organization.id
+        )
+
+        assert count == 0
+        # No pointless fan-out: the cached entry survives untouched.
+        assert await fx.resolve_cache.get(fx.organization.id, None) == {
+            "cached": True
+        }
+        assert fx.audit_writer.entries == []
+
+    async def test_reset_is_idempotent(self) -> None:
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx, name="Once")
+        config.powered_by_enabled = False
+        reset = self._reset_service(fx)
+
+        assert await reset.restore_powered_by_attribution(fx.organization.id) == 1
+        fx.audit_writer.entries.clear()
+        assert await reset.restore_powered_by_attribution(fx.organization.id) == 0
+        assert fx.audit_writer.entries == []
+
+    async def test_reset_bypasses_the_402_gate_end_to_end(self) -> None:
+        # The full wiring: a LicenseService downgrade drives the real
+        # PoweredByAttributionResetService for an organization that no
+        # longer holds white_label -- the flip must go through the
+        # repository layer and never raise
+        # PoweredByAttributionNotEntitledError, because it is a system
+        # action, not a tenant write.
+        from decimal import Decimal
+
+        from app.domains.billing.constants import (
+            BillingCycle,
+            PlanFeatureType,
+            PlanType,
+        )
+        from app.domains.billing.service import LicenseService, PlanService
+        from tests.unit.test_billing_plans_licenses_usage import (
+            FakeLicenseRepository,
+            FakeOrganizationComposer,
+            FakePlanRepository,
+            _FakeOrganization,
+        )
+
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx, name="Downgraded venue")
+        config.powered_by_enabled = False
+        await self._seed_org_cache(fx)
+        fx.audit_writer.entries.clear()
+
+        org_id = fx.organization.id
+        plan_repository = FakePlanRepository()
+        plan_service = PlanService(plan_repository)
+
+        async def _plan(slug: str, features: list[dict[str, object]]):
+            return await plan_service.create_plan(
+                actor_user_id=None,
+                name=slug.title(),
+                slug=slug,
+                plan_type=PlanType.STARTER.value,
+                description=None,
+                billing_cycle=BillingCycle.MONTHLY.value,
+                base_price=Decimal("49.99"),
+                currency="USD",
+                is_active=True,
+                is_public=True,
+                sort_order=0,
+                features=features,
+            )
+
+        pro = await _plan(
+            "pro-e2e",
+            [
+                {
+                    "feature_key": PlanFeatureKey.WHITE_LABEL.value,
+                    "feature_type": PlanFeatureType.BOOLEAN.value,
+                    "is_enabled": True,
+                }
+            ],
+        )
+        starter = await _plan("starter-e2e", [])
+
+        license_service = LicenseService(
+            FakeLicenseRepository(),
+            plan_repository,
+            organization_sync=FakeOrganizationComposer(
+                organizations={org_id: _FakeOrganization(id=org_id)}
+            ),
+            white_label_reset=self._reset_service(fx),
+        )
+        license_ = await license_service.assign_license(
+            actor_user_id=None, organization_id=org_id, plan_id=pro.id
+        )
+        await license_service.activate_license(
+            actor_user_id=None, license_id=license_.id
+        )
+
+        await license_service.downgrade_license(
+            actor_user_id=None, license_id=license_.id, new_plan_id=starter.id
+        )
+
+        assert config.powered_by_enabled is True
+        assert await fx.resolve_cache.get(org_id, None) is None
+        assert [
+            e["action"]
+            for e in fx.audit_writer.entries
+            if e["action"] == "captive_portal_powered_by_restored"
+        ] == ["captive_portal_powered_by_restored"]

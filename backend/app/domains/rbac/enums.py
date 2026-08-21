@@ -363,6 +363,18 @@ class AuditAction(StrEnum):
     CAPTIVE_PORTAL_CONFIG_ACTIVATED = "captive_portal_config_activated"
     CAPTIVE_PORTAL_CONFIG_DEACTIVATED = "captive_portal_config_deactivated"
     CAPTIVE_PORTAL_CONFIG_DELETED = "captive_portal_config_deleted"
+    # System-side counterpart to the ``powered_by_enabled`` white-label
+    # write gate: a license downgrade to a plan without
+    # ``PlanFeatureKey.WHITE_LABEL`` flips every ``powered_by_enabled=
+    # False`` config in the organization back to ``True`` (see
+    # ``app.domains.captive_portal.service
+    # .PoweredByAttributionResetService``). Written with
+    # ``actor_user_id=None`` when the downgrade itself was system-driven,
+    # mirroring ``LICENSE_EXPIRED``'s "a real system-side event with no
+    # human actor" convention -- deliberately *not* reusing
+    # ``CAPTIVE_PORTAL_CONFIG_UPDATED``, so a tenant reading their audit
+    # trail can tell an admin's edit from an entitlement-driven reset.
+    CAPTIVE_PORTAL_POWERED_BY_RESTORED = "captive_portal_powered_by_restored"
 
     # Guest domain events (Module 010 Part 4, the final BE-010 module) --
     # written through this same table by
