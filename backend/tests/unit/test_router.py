@@ -1462,3 +1462,50 @@ class TestRbacRouterFkFollowUp:
 
         column = UserRole.__table__.columns["msp_id"]
         assert len(column.foreign_keys) == 0
+
+
+class TestBootstrapSingleLineCopy:
+    """A multi-line paste of the bootstrap script cannot work: RouterOS
+    executes each pasted line as its own command with its own scope, so
+    the ``:local enroll`` set by the check-in line is already gone by the
+    time the next line dereferences it. Confirmed on a real RouterOS
+    7.23.3 device -- every field check reported "check-in response
+    missing ..." while the platform had in fact returned every field.
+    ``script_single_line`` is the form a human pastes."""
+
+    def test_single_line_join_keeps_every_command(self) -> None:
+        from app.domains.network_config.renderers import render_bootstrap_script
+
+        lines = render_bootstrap_script(
+            location_code="LOC-2026-000039",
+            provisioning_token="TOKEN",
+            api_base_url="https://api.example.com",
+        )
+        joined = "; ".join(lines)
+        assert joined.count(";") >= len(lines) - 1
+        assert "\n" not in joined
+
+    def test_no_hash_comments_would_swallow_the_join(self) -> None:
+        """A ``#`` comment anywhere would eat every command after it once
+        the script is joined onto one line -- silently, with no error."""
+        from app.domains.network_config.renderers import render_bootstrap_script
+
+        lines = render_bootstrap_script(
+            location_code="LOC-2026-000039",
+            provisioning_token="TOKEN",
+            api_base_url="https://api.example.com",
+        )
+        assert not any(line.lstrip().startswith("#") for line in lines)
+
+    def test_local_vars_and_their_uses_share_one_joined_scope(self) -> None:
+        from app.domains.network_config.renderers import render_bootstrap_script
+
+        lines = render_bootstrap_script(
+            location_code="LOC-2026-000039",
+            provisioning_token="TOKEN",
+            api_base_url="https://api.example.com",
+        )
+        joined = "; ".join(lines)
+        for var in ("enroll", "wgcfg", "tunaddr"):
+            assert f":local {var}" in joined
+            assert f"${var}" in joined

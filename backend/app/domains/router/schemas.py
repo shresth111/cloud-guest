@@ -383,6 +383,20 @@ class BootstrapScriptPreviewResponse(BaseModel):
     revert_window_minutes: int | None = None
     lines: list[str]
     script: str
+    script_single_line: str = Field(
+        description=(
+            "The same script joined with ';' instead of newlines -- this is "
+            "what a human must paste. RouterOS runs each pasted line as its "
+            "own command with its own scope, so a ``:local`` set on one line "
+            "is already gone by the next: a multi-line paste makes every "
+            "field check fail with 'check-in response missing ...' even "
+            "though the platform returned every field (confirmed on a real "
+            "RouterOS 7.23.3 device). Joined with ';' the whole script runs "
+            "in one scope, and ``:error`` aborts the remainder instead of "
+            "letting later lines run against half-built state. Clients copy "
+            "THIS field; ``script`` is for on-screen display only."
+        ),
+    )
     line_count: int
     token_expires_at: datetime
 
