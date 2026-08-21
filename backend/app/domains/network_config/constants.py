@@ -2,6 +2,61 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
+
+class BootstrapMode(StrEnum):
+    """Which of the two Step 1 bootstrap-script renderings a caller wants
+    -- see ``renderers.render_bootstrap_script``'s docstring for the full
+    design write-up of each.
+
+    * ``ONSITE`` -- fresh enrollment with a technician physically at the
+      router (console/WinBox access in hand). Cleanup-first: any stale
+      tunnel state is torn down *before* the platform is ever contacted,
+      because nothing valuable exists yet and unknown prior state is the
+      enemy. This is the default, and the only correct mode for a router
+      that has never checked in.
+    * ``REMOTE`` -- re-provision of a live, already-enrolled router whose
+      existing WireGuard tunnel *is* the management path being used to
+      reach it. Validate-first, then a detached, scheduler-staged cutover
+      with a timed automatic revert -- nothing is destroyed until every
+      replacement value is validated, and the teardown/recreate never runs
+      inside the session that delivered it.
+
+    Defined here (an import-free module) rather than in ``renderers`` so
+    the router domain's API layer can import it without triggering
+    ``renderers``'s heavy cross-domain import graph.
+    """
+
+    ONSITE = "onsite"
+    REMOTE = "remote"
+
+
+# Remote-mode timing (see ``renderers.render_bootstrap_script``'s remote
+# section). The cutover fires one scheduler interval after staging --
+# RouterOS auto-stamps ``start-time`` at add time and an interval-only
+# entry first fires one interval later ("if the interval is set to value
+# other than 0 scheduler will not run at startup", RouterOS Scheduler
+# docs) -- long enough for the staging paste/import to finish, short
+# enough that the freshly-minted check-in facts cannot go stale.
+REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS = 30
+
+# How long the previous tunnel's automatic restore stays armed before it
+# fires (and its retry cadence if the restore itself fails). Matches the
+# 10-minute scheduled-revert convention the fleet plan's §D3 safety-net
+# design already fixed ("interval=10m comment=...safety-revert"): long
+# enough to cover hub-side peer sync plus WireGuard handshake latency
+# (persistent-keepalive is 25s, so a working tunnel proves itself within
+# a minute or two), short enough to bound a fleet router's worst-case
+# management outage after a failed cutover.
+REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES = 10
+
+# The cutover's post-create confirmation loop: up to ATTEMPTS pings of the
+# hub's tunnel address, DELAY seconds apart (~2 minutes total) -- decided
+# well inside the revert window above, never racing it.
+REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS = 20
+REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS = 6
+
 # Human-readable section headers written into the rendered RouterOS
 # script ahead of each category's own commands -- purely cosmetic (a
 # comment line, never parsed back), but real value for anyone reading a
@@ -24,6 +79,11 @@ NETWATCH_SECTION_HEADER = "# --- ISP Link Netwatch (CloudGuest-managed) ---"
 CONTENT_FILTER_SECTION_HEADER = "# --- Content Filtering (CloudGuest-managed) ---"
 
 __all__ = [
+    "BootstrapMode",
+    "REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS",
+    "REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES",
+    "REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS",
+    "REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS",
     "DHCP_SECTION_HEADER",
     "VLAN_SECTION_HEADER",
     "PORT_FORWARDING_SECTION_HEADER",
