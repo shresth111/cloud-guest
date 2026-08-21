@@ -1763,6 +1763,16 @@ class SubscriptionService:
             raise SubscriptionNotFoundError(organization_id)
         return subscription
 
+    async def find_subscription_for_organization(
+        self, organization_id: uuid.UUID
+    ) -> Subscription | None:
+        """Returns the org's subscription when one exists, otherwise ``None``.
+
+        Used by Smart Location Provisioning when adding a location to an
+        existing customer -- those orgs already have a subscription and must
+        not go through ``create_subscription`` again."""
+        return await self.repository.get_by_organization_id(organization_id)
+
     async def create_subscription(
         self,
         *,
