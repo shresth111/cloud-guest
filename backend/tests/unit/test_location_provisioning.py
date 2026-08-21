@@ -322,6 +322,9 @@ class ProvisioningFakes:
     features_by_plan_id: dict[uuid.UUID, list[FakePlanFeature]] = field(
         default_factory=dict
     )
+    subscriptions_by_org: dict[uuid.UUID, FakeSubscription] = field(
+        default_factory=dict
+    )
     system_templates: list[FakeConfigTemplate] = field(default_factory=list)
     audit_entries: list[dict[str, object]] = field(default_factory=list)
     emails_sent: list[tuple[str, str, str]] = field(default_factory=list)
@@ -535,15 +538,21 @@ class ProvisioningFakes:
 
     # -- SubscriptionProvisioningProtocol -------------------------------------
 
+    async def find_subscription_for_organization(self, organization_id):
+        self._maybe_fail("subscription.find")
+        return self.subscriptions_by_org.get(organization_id)
+
     async def create_subscription(
         self, *, actor_user_id, organization_id, plan_id, coupon_code=None
     ):
         self._maybe_fail("subscription.create")
         self.session.flush("subscription.create")
         self.calls.append("subscription.create")
-        return FakeSubscription(
+        subscription = FakeSubscription(
             id=uuid.uuid4(), organization_id=organization_id, plan_id=plan_id
         )
+        self.subscriptions_by_org[organization_id] = subscription
+        return subscription
 
     # -- CaptivePortalProvisioningProtocol -------------------------------------
 
@@ -1107,6 +1116,50 @@ class TestOrganizationConditional:
         assert "organization.create" not in fakes.calls
         assert result.organization_id == existing.id
         assert result.organization_name == "Existing Co"
+
+    async def test_reuses_existing_subscription_when_adding_location_to_existing_org(
+        self,
+    ) -> None:
+        service, fakes, base_plan_id = make_service()
+        existing = Organization(
+            **_base_fields(
+                name="Existing Co",
+                slug="existing-co",
+                legal_name=None,
+                org_type=OrganizationType.STANDARD.value,
+                status=OrganizationStatus.ACTIVE.value,
+                parent_organization_id=None,
+                contact_email="existing@example.com",
+                contact_phone=None,
+                timezone="UTC",
+                default_locale="en",
+                settings={},
+                subscription_tier=None,
+            )
+        )
+        fakes.organizations[existing.id] = existing
+        existing_plan_id = uuid.uuid4()
+        fakes.plans_by_id[existing_plan_id] = FakePlan(
+            id=existing_plan_id,
+            name="Existing Plan",
+            slug="existing-plan",
+        )
+        fakes.features_by_plan_id[existing_plan_id] = fakes.features_by_plan_id[
+            base_plan_id
+        ]
+        fakes.subscriptions_by_org[existing.id] = FakeSubscription(
+            id=uuid.uuid4(),
+            organization_id=existing.id,
+            plan_id=existing_plan_id,
+        )
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(existing_organization_id=existing.id, plan_id=base_plan_id),
+        )
+
+        assert "subscription.create" not in fakes.calls
+        assert result.plan_id == existing_plan_id
 
     async def test_requires_exactly_one_of_existing_or_new_organization(self) -> None:
         service, _fakes, base_plan_id = make_service()

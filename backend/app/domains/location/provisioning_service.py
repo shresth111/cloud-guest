@@ -435,6 +435,10 @@ class PlanProvisioningProtocol(Protocol):
 
 
 class SubscriptionProvisioningProtocol(Protocol):
+    async def find_subscription_for_organization(
+        self, organization_id: uuid.UUID
+    ) -> Subscription | None: ...
+
     async def create_subscription(
         self,
         *,
@@ -983,20 +987,31 @@ class LocationProvisioningService:
         # SubscriptionService.create_subscription itself -- see module
         # docstring) -----------------------------------------------------------
         base_plan = await self.plan_service.get_plan(data.plan_id)
-        effective_plan_id = base_plan.id
-        if data.feature_overrides:
-            effective_plan_id = await self._create_overridden_plan(
-                actor_user_id=actor_user_id,
-                base_plan=base_plan,
-                organization=organization,
-                overrides=data.feature_overrides,
+        existing_subscription = (
+            await self.subscription_service.find_subscription_for_organization(
+                organization.id
             )
-        await self.subscription_service.create_subscription(
-            actor_user_id=actor_user_id,
-            organization_id=organization.id,
-            plan_id=effective_plan_id,
-            coupon_code=data.coupon_code,
         )
+        if existing_subscription is None:
+            effective_plan_id = base_plan.id
+            if data.feature_overrides:
+                effective_plan_id = await self._create_overridden_plan(
+                    actor_user_id=actor_user_id,
+                    base_plan=base_plan,
+                    organization=organization,
+                    overrides=data.feature_overrides,
+                )
+            await self.subscription_service.create_subscription(
+                actor_user_id=actor_user_id,
+                organization_id=organization.id,
+                plan_id=effective_plan_id,
+                coupon_code=data.coupon_code,
+            )
+        else:
+            # Adding a location to an existing customer reuses the org's
+            # current subscription -- a second create_subscription call would
+            # raise DuplicateSubscriptionError and roll back the whole flow.
+            effective_plan_id = existing_subscription.plan_id
 
         # -- h. Apply Feature Flags + Plan Limits (resolved from whichever
         # plan -- base or overridden-custom -- the subscription now points
