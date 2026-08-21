@@ -824,10 +824,13 @@ class TestRouterProvisioning:
 
         script = "\n".join(lines)
         assert location_code == "HQ-001"
-        assert len(lines) <= 15
+        assert len(lines) <= 30
         assert '/system identity set name="HQ-001"' in script
         assert "provisioning/check-in" in script
-        assert "/import file-name=cloudguest.rsc" in script
+        # Step 1 ends at a verified tunnel + success line; the full config
+        # import belongs to the later wizard steps, not this paste.
+        assert "/agent/wireguard-config" in script
+        assert "CloudGuest bootstrap successful" in script
         assert expires_at is not None
         assert any(
             e["action"] == "router_provisioning_token_generated" for e in audit.entries

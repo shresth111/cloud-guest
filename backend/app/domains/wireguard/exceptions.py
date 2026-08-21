@@ -21,6 +21,7 @@ __all__ = [
     "WireGuardPeerNotFoundError",
     "WireGuardPeerAlreadyExistsError",
     "WireGuardPeerRevokedError",
+    "WireGuardPrivateKeyUnavailableError",
     "InvalidPeerStatusTransitionError",
     "WireGuardRouterNotEligibleError",
     "TunnelIPPoolExhaustedError",
@@ -88,6 +89,27 @@ class WireGuardPeerRevokedError(WireGuardError):
     def __init__(self, router_id: uuid.UUID) -> None:
         super().__init__(
             f"Router {router_id}'s WireGuard tunnel has been revoked",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class WireGuardPrivateKeyUnavailableError(WireGuardError):
+    """The peer's keypair is device-managed (its stored "private key" is
+    ``service.EXTERNALLY_MANAGED_KEY_SENTINEL``, from the legacy
+    device-generated-keypair enrollment) -- the platform never held a real
+    private key for it, so the device-facing config pull has nothing
+    genuine to deliver. Without this guard, ``GET /agent/wireguard-config``
+    would serve the literal sentinel string as though it were a key and the
+    device would install it as an invalid ``private-key=``. Re-running the
+    current bootstrap script clears the condition: its check-in rotates the
+    peer to a platform-generated pair first (see
+    ``WireGuardService.ensure_tunnel_for_check_in``)."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router {router_id}'s WireGuard keypair is device-managed -- "
+            "the platform holds no private key to deliver; re-run the "
+            "bootstrap script to rotate to a platform-generated pair",
             status_code=status.HTTP_409_CONFLICT,
         )
 
