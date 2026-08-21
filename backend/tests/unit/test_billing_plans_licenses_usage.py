@@ -379,6 +379,26 @@ class FakeAuditWriter:
         self.entries.append(fields)
 
 
+@dataclass
+class FakeWhiteLabelReset:
+    """Records every call ``LicenseService._reset_white_label_on_downgrade``
+    makes through ``WhiteLabelResetProtocol`` -- the paths that must stay
+    silent (upgrades, downgrades that keep ``WHITE_LABEL``) assert
+    ``calls == []``."""
+
+    reset_count: int = 1
+    calls: list[tuple[uuid.UUID, uuid.UUID | None]] = field(default_factory=list)
+
+    async def restore_powered_by_attribution(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> int:
+        self.calls.append((organization_id, actor_user_id))
+        return self.reset_count
+
+
 # ============================================================================
 # Service fixtures
 # ============================================================================
@@ -451,6 +471,7 @@ class LicenseFixture:
     usage_service: UsageService
     usage_fixture: UsageFixture
     service: LicenseService
+    white_label_reset: FakeWhiteLabelReset | None = None
 
 
 def make_license_service(
@@ -459,6 +480,7 @@ def make_license_service(
     organization_composer: FakeOrganizationComposer | None = None,
     guest_analytics: FakeGuestAnalytics | None = None,
     active_session_lookup: FakeActiveSessionLookup | None = None,
+    white_label_reset: FakeWhiteLabelReset | object | None = None,
 ) -> LicenseFixture:
     license_repository = FakeLicenseRepository()
     plan_repository = plan_repository or FakePlanRepository()
@@ -479,6 +501,7 @@ def make_license_service(
         organization_sync=organization_composer,
         usage_validator=usage_fixture.service,
         audit_writer=audit_writer,
+        white_label_reset=white_label_reset,
     )
     return LicenseFixture(
         license_repository,
@@ -488,6 +511,7 @@ def make_license_service(
         usage_fixture.service,
         usage_fixture,
         service,
+        white_label_reset,
     )
 
 
@@ -1237,3 +1261,146 @@ class TestTenantIsolation:
         assert locations_b.value == Decimal(99)
         assert locations_a.organization_id == org_a
         assert locations_b.organization_id == org_b
+
+
+# ============================================================================
+# White-label attribution reset on downgrade
+# ============================================================================
+
+
+def _white_label_feature() -> dict[str, object]:
+    return {
+        "feature_key": PlanFeatureKey.WHITE_LABEL.value,
+        "feature_type": PlanFeatureType.BOOLEAN.value,
+        "is_enabled": True,
+    }
+
+
+class TestWhiteLabelResetOnDowngrade:
+    """``LicenseService._reset_white_label_on_downgrade`` -- the license-
+    side half of the ``powered_by_enabled`` white-label policy (see
+    ``app.domains.captive_portal.service.PoweredByAttributionResetService``
+    for the captive-portal half and
+    ``CaptivePortalService._enforce_powered_by_entitlement``'s docstring
+    for the design that names this exact hook)."""
+
+    async def _active_license(
+        self,
+        fx: LicenseFixture,
+        org_id: uuid.UUID,
+        plan_id: uuid.UUID,
+    ) -> License:
+        license_ = await fx.service.assign_license(
+            actor_user_id=None, organization_id=org_id, plan_id=plan_id
+        )
+        return await fx.service.activate_license(
+            actor_user_id=None, license_id=license_.id
+        )
+
+    def _fixture_with_org(
+        self, org_id: uuid.UUID, reset: FakeWhiteLabelReset
+    ) -> LicenseFixture:
+        organization_composer = FakeOrganizationComposer(
+            organizations={org_id: _FakeOrganization(id=org_id, msp=False)}
+        )
+        return make_license_service(
+            organization_composer=organization_composer,
+            white_label_reset=reset,
+        )
+
+    async def test_downgrade_losing_white_label_triggers_reset(self) -> None:
+        org_id = uuid.uuid4()
+        actor = uuid.uuid4()
+        reset = FakeWhiteLabelReset()
+        fx = self._fixture_with_org(org_id, reset)
+        pro = await _create_plan(
+            fx.plan_repository, slug="pro", features=[_white_label_feature()]
+        )
+        starter = await _create_plan(fx.plan_repository, slug="starter-basic")
+        license_ = await self._active_license(fx, org_id, pro.id)
+
+        await fx.service.downgrade_license(
+            actor_user_id=actor, license_id=license_.id, new_plan_id=starter.id
+        )
+
+        assert reset.calls == [(org_id, actor)]
+
+    async def test_downgrade_keeping_white_label_is_untouched(self) -> None:
+        org_id = uuid.uuid4()
+        reset = FakeWhiteLabelReset()
+        fx = self._fixture_with_org(org_id, reset)
+        enterprise = await _create_plan(
+            fx.plan_repository, slug="enterprise", features=[_white_label_feature()]
+        )
+        business = await _create_plan(
+            fx.plan_repository, slug="business", features=[_white_label_feature()]
+        )
+        license_ = await self._active_license(fx, org_id, enterprise.id)
+
+        await fx.service.downgrade_license(
+            actor_user_id=None, license_id=license_.id, new_plan_id=business.id
+        )
+
+        assert reset.calls == []
+
+    async def test_disabled_white_label_feature_row_counts_as_lost(self) -> None:
+        # A plan carrying the feature row with is_enabled=False is not
+        # entitled -- exactly how get_entitlement_snapshot reads it.
+        org_id = uuid.uuid4()
+        reset = FakeWhiteLabelReset()
+        fx = self._fixture_with_org(org_id, reset)
+        pro = await _create_plan(
+            fx.plan_repository, slug="pro2", features=[_white_label_feature()]
+        )
+        crippled = await _create_plan(
+            fx.plan_repository,
+            slug="crippled",
+            features=[
+                {
+                    "feature_key": PlanFeatureKey.WHITE_LABEL.value,
+                    "feature_type": PlanFeatureType.BOOLEAN.value,
+                    "is_enabled": False,
+                }
+            ],
+        )
+        license_ = await self._active_license(fx, org_id, pro.id)
+
+        await fx.service.downgrade_license(
+            actor_user_id=None, license_id=license_.id, new_plan_id=crippled.id
+        )
+
+        assert reset.calls == [(org_id, None)]
+
+    async def test_upgrade_never_triggers_reset(self) -> None:
+        org_id = uuid.uuid4()
+        reset = FakeWhiteLabelReset()
+        fx = self._fixture_with_org(org_id, reset)
+        starter = await _create_plan(fx.plan_repository, slug="starter-up")
+        pro = await _create_plan(fx.plan_repository, slug="pro-up")
+        license_ = await self._active_license(fx, org_id, starter.id)
+
+        await fx.service.upgrade_license(
+            actor_user_id=None, license_id=license_.id, new_plan_id=pro.id
+        )
+
+        assert reset.calls == []
+
+    async def test_downgrade_without_wired_reset_still_succeeds(self) -> None:
+        # Deployments (and older tests) that construct LicenseService
+        # without the hook keep working -- same optional-collaborator
+        # convention as organization_sync/usage_validator.
+        org_id = uuid.uuid4()
+        organization_composer = FakeOrganizationComposer(
+            organizations={org_id: _FakeOrganization(id=org_id, msp=False)}
+        )
+        fx = make_license_service(organization_composer=organization_composer)
+        pro = await _create_plan(
+            fx.plan_repository, slug="pro3", features=[_white_label_feature()]
+        )
+        starter = await _create_plan(fx.plan_repository, slug="starter3")
+        license_ = await self._active_license(fx, org_id, pro.id)
+
+        downgraded = await fx.service.downgrade_license(
+            actor_user_id=None, license_id=license_.id, new_plan_id=starter.id
+        )
+        assert downgraded.plan_id == starter.id
