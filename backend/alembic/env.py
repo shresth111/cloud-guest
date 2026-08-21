@@ -1,6 +1,6 @@
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import Connection, engine_from_config, inspect, pool, text
 
 from alembic import context
 from app.core.config import get_settings
@@ -65,6 +65,65 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+# This project's revision ids are long, descriptive slugs (e.g.
+# ``0004_add_organization_fk_to_rbac_tables`` -- 39 chars), but the
+# ``alembic_version.version_num`` column Alembic auto-creates on a brand-new
+# database is ``VARCHAR(32)`` (and the installed Alembic, 1.14.0, exposes no
+# ``context.configure()`` knob to widen it -- only the third-party-dialect
+# ``version_table_impl`` hook). On a fresh database ``upgrade head``
+# therefore dies with ``StringDataRightTruncation`` the moment revision 0004
+# is stamped, and the whole single-transaction run rolls back to an empty
+# schema. Long-lived environments were widened by hand long ago, so
+# this bites exactly the from-scratch bootstraps (CI, new dev machines, DR
+# restores) that have no human around to widen it.
+_VERSION_TABLE = "alembic_version"
+_VERSION_NUM_WIDTH = 255
+
+
+def _prepare_version_table(connection: Connection) -> None:
+    """Make ``alembic_version.version_num`` wide enough *before* Alembic
+    touches it: pre-create the table with a wide column on a fresh database
+    (Alembic's own creation is ``checkfirst=True``, so it then leaves ours
+    alone), and widen it in place on a database still carrying the old
+    ``VARCHAR(32)`` shape. Databases already widened (every long-lived
+    environment) match neither condition and are untouched.
+
+    PostgreSQL-only by design: SQLite and friends don't enforce VARCHAR
+    lengths, so there is nothing to fix elsewhere. Runs on its own
+    short-lived connection, committed before the migration transaction
+    opens; a leftover empty ``alembic_version`` table from a later-failed
+    run is indistinguishable from no table as far as Alembic is concerned.
+    """
+    if connection.dialect.name != "postgresql":
+        return
+    inspector = inspect(connection)
+    if not inspector.has_table(_VERSION_TABLE):
+        connection.execute(
+            text(
+                f"CREATE TABLE {_VERSION_TABLE} ("
+                f"version_num VARCHAR({_VERSION_NUM_WIDTH}) NOT NULL, "
+                f"CONSTRAINT {_VERSION_TABLE}_pkc PRIMARY KEY (version_num))"
+            )
+        )
+        return
+    version_num = next(
+        (
+            column
+            for column in inspector.get_columns(_VERSION_TABLE)
+            if column["name"] == "version_num"
+        ),
+        None,
+    )
+    length = getattr(version_num["type"], "length", None) if version_num else None
+    if length is not None and length < _VERSION_NUM_WIDTH:
+        connection.execute(
+            text(
+                f"ALTER TABLE {_VERSION_TABLE} ALTER COLUMN version_num "
+                f"TYPE VARCHAR({_VERSION_NUM_WIDTH})"
+            )
+        )
+
+
 def run_migrations_online() -> None:
     configuration = config.get_section(config.config_ini_section, {})
     url = str(settings.database_url).replace("+asyncpg", "")
@@ -74,6 +133,10 @@ def run_migrations_online() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
+
+    with connectable.connect() as connection:
+        _prepare_version_table(connection)
+        connection.commit()
 
     with connectable.connect() as connection:
         context.configure(
