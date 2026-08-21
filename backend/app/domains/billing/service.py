@@ -229,6 +229,24 @@ class OrganizationSyncProtocol(Protocol):
     ) -> object: ...
 
 
+class WhiteLabelResetProtocol(Protocol):
+    """The single, narrow method this module needs from
+    ``app.domains.captive_portal.service.PoweredByAttributionResetService``
+    -- the system-side "recover revenue at the moment the plan changes"
+    half of the ``powered_by_enabled`` white-label policy, whose write gate
+    and deliberately-unchecked resolve path live in that domain (see that
+    class's docstring). ``LicenseService`` calls it exactly once per
+    downgrade that lands on a plan without ``PlanFeatureKey.WHITE_LABEL``;
+    upgrades and white-label-preserving downgrades never touch it."""
+
+    async def restore_powered_by_attribution(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> int: ...
+
+
 class OrganizationLookupProtocol(Protocol):
     """Satisfied by the real ``app.domains.organization.service
     .OrganizationService`` directly -- reused, never reimplemented, for the
@@ -685,6 +703,7 @@ class LicenseService:
         usage_validator: UsageValidatorProtocol | None = None,
         audit_writer: AuditLogWriter | None = None,
         entitlement_cache: EntitlementCacheProtocol | None = None,
+        white_label_reset: WhiteLabelResetProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.plan_repository = plan_repository
@@ -692,6 +711,7 @@ class LicenseService:
         self.usage_validator = usage_validator
         self.audit_writer = audit_writer
         self.entitlement_cache = entitlement_cache
+        self.white_label_reset = white_label_reset
 
     async def get_license(self, license_id: uuid.UUID) -> License:
         license_ = await self.repository.get_by_id(license_id)
@@ -1015,7 +1035,59 @@ class LicenseService:
             ),
         )
         logger.info(f"billing_{action.value}", extra=_event_extra(event))
+        if change_type == LicenseChangeType.DOWNGRADED:
+            await self._reset_white_label_on_downgrade(
+                organization_id=updated.organization_id,
+                new_plan_id=new_plan.id,
+                actor_user_id=actor_user_id,
+            )
         return updated
+
+    async def _reset_white_label_on_downgrade(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        new_plan_id: uuid.UUID,
+        actor_user_id: uuid.UUID | None,
+    ) -> None:
+        """The moment the ``powered_by_enabled`` white-label policy names
+        for recovering its revenue: ``CaptivePortalService
+        ._enforce_powered_by_entitlement`` gates turning the attribution
+        *off* at write time, the unauthenticated resolve path honours the
+        stored value with no per-request check, and this hook -- not the
+        guest hot path -- is where a downgrade that removes
+        ``PlanFeatureKey.WHITE_LABEL`` flips the stored values back.
+
+        Feature membership is read the same way
+        ``get_entitlement_snapshot`` reads it (a ``BOOLEAN`` feature row,
+        enabled), so this check can never disagree with the write gate's
+        own entitlement view. A downgrade to a plan that *keeps*
+        ``WHITE_LABEL`` is untouched -- the tenant paid for the setting
+        and keeps it.
+        """
+        if self.white_label_reset is None:
+            return
+        features = await self.plan_repository.list_plan_features(new_plan_id)
+        still_entitled = any(
+            feature.feature_key == PlanFeatureKey.WHITE_LABEL.value
+            and feature.feature_type == PlanFeatureType.BOOLEAN.value
+            and feature.is_enabled
+            for feature in features
+        )
+        if still_entitled:
+            return
+        reset_count = await self.white_label_reset.restore_powered_by_attribution(
+            organization_id, actor_user_id=actor_user_id
+        )
+        if reset_count:
+            logger.info(
+                "billing_white_label_attribution_reset",
+                extra={
+                    "organization_id": str(organization_id),
+                    "new_plan_id": str(new_plan_id),
+                    "reset_config_count": reset_count,
+                },
+            )
 
     async def _get_active_plan(self, plan_id: uuid.UUID) -> Plan:
         plan = await self.plan_repository.get_by_id(plan_id)

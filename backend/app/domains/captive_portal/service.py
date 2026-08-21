@@ -81,6 +81,7 @@ from .events import (
     CaptivePortalConfigDeactivated,
     CaptivePortalConfigDeleted,
     CaptivePortalConfigUpdated,
+    CaptivePortalPoweredByRestored,
 )
 from .exceptions import (
     CaptivePortalConfigNotConfiguredError,
@@ -1395,10 +1396,105 @@ class CaptivePortalService:
         )
 
 
+class PoweredByAttributionResetService:
+    """The second half of the ``powered_by_enabled`` white-label policy.
+
+    ``CaptivePortalService._enforce_powered_by_entitlement`` gates the
+    tenant-facing write path (402 without ``PlanFeatureKey.WHITE_LABEL``),
+    and the unauthenticated resolve path deliberately honours the stored
+    value with no per-request entitlement check -- which that gate's own
+    docstring documents as leaving one gap open: a tenant who turns the
+    attribution off while entitled and then downgrades keeps it off. This
+    service closes the gap at the moment the plan actually changes:
+    ``app.domains.billing.service.LicenseService`` calls
+    ``restore_powered_by_attribution`` on a downgrade to a plan without
+    ``WHITE_LABEL`` (via the narrow ``WhiteLabelResetProtocol`` shape this
+    class satisfies structurally), flipping every ``powered_by_enabled=
+    False`` config in the organization back to ``True``.
+
+    Deliberately a separate, minimal class rather than a method on
+    ``CaptivePortalService``: this is a system-side entitlement action, not
+    a tenant request, so it must go straight through the repository --
+    constructing it without an entitlement checker *by shape* makes it
+    impossible for the 402 gate (or any tenant-scope check) to fire on the
+    reset itself. Nothing guest-facing is emitted: the guest simply sees
+    the attribution again on their next resolve, once the organization's
+    cache entries are invalidated.
+    """
+
+    def __init__(
+        self,
+        repository: CaptivePortalRepositoryProtocol,
+        *,
+        resolve_cache: CaptivePortalResolveCacheProtocol | None = None,
+        audit_writer: AuditLogWriter | None = None,
+    ) -> None:
+        self.repository = repository
+        self.resolve_cache = resolve_cache
+        self.audit_writer = audit_writer
+
+    async def restore_powered_by_attribution(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> int:
+        """Flip every ``powered_by_enabled=False`` config the organization
+        owns back to ``True``, invalidate the organization's resolve-cache
+        fan-out, and write one audit entry per flipped config. Idempotent:
+        an organization with nothing to reset is a pure no-op (no cache
+        invalidation, no audit noise). Returns the number of configs
+        flipped.
+
+        ``actor_user_id`` is whoever drove the plan change, or ``None``
+        for a system-driven downgrade -- the same convention
+        ``LICENSE_EXPIRED`` established for system events.
+        """
+        configs = await self.repository.list_powered_by_disabled(organization_id)
+        if not configs:
+            return 0
+        for config in configs:
+            updated = await self.repository.update_config(
+                config, {"powered_by_enabled": True, "updated_by": actor_user_id}
+            )
+            await self._audit(actor_user_id, updated)
+        if self.resolve_cache is not None:
+            await self.resolve_cache.invalidate_organization(organization_id)
+        event = CaptivePortalPoweredByRestored(
+            organization_id=organization_id, reset_config_count=len(configs)
+        )
+        logger.info("captive_portal_powered_by_restored", extra=_event_extra(event))
+        return len(configs)
+
+    async def _audit(
+        self, actor_user_id: uuid.UUID | None, config: CaptivePortalConfig
+    ) -> None:
+        if self.audit_writer is None:
+            return
+        await self.audit_writer.create_audit_log_entry(
+            actor_user_id=actor_user_id,
+            action=AuditAction.CAPTIVE_PORTAL_POWERED_BY_RESTORED.value,
+            entity_type="captive_portal_config",
+            entity_id=config.id,
+            description=(
+                f"Captive portal config '{config.name}': 'Powered by' "
+                "attribution restored by license downgrade (white_label "
+                "entitlement removed)"
+            ),
+            event_metadata={
+                "is_active": config.is_active,
+                "is_default": config.is_default,
+            },
+            organization_id=config.organization_id,
+            location_id=config.location_id,
+        )
+
+
 __all__ = [
     "BrandingLookupProtocol",
     "BrandingRowProtocol",
     "CaptivePortalService",
+    "PoweredByAttributionResetService",
     "OrganizationLookupProtocol",
     "LocationLookupProtocol",
     "AuditLogWriter",
