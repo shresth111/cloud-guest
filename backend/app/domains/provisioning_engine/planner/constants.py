@@ -22,6 +22,14 @@ MANAGED_COMMENT_PREFIXES: tuple[str, ...] = (
 PLAN_ENGINE_VERSION = "wave1-1"
 DEFAULT_GUEST_BRIDGE_NAME = "WYFYGUEST-bridge-guest"
 
+# Version stamp for the *shape* of a persisted RouterSnapshot (the section
+# JSON layouts produced by ``collector.collect_snapshot_fields``). Bump when
+# the collector's output shape changes so downstream consumers (the Wave 2+
+# planner, the wizard UI) can branch on how to read an *old* snapshot row
+# instead of guessing. Plain string, mirrors ``PLAN_ENGINE_VERSION``'s
+# "version stamps are data, not migrations" posture.
+SNAPSHOT_SCHEMA_VERSION = "1"
+
 
 class SnapshotTrigger(StrEnum):
     """Why a snapshot was captured."""
@@ -173,6 +181,7 @@ PROVISIONING_ENGINE_BACKUP_NAME = "cloudguest-backup"
 __all__ = [
     "MANAGED_COMMENT_PREFIXES",
     "PLAN_ENGINE_VERSION",
+    "SNAPSHOT_SCHEMA_VERSION",
     "DEFAULT_GUEST_BRIDGE_NAME",
     "SnapshotTrigger",
     "SnapshotStatus",

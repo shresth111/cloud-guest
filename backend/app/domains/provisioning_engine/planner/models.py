@@ -22,7 +22,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-from .constants import SnapshotStatus, SnapshotTrigger
+from .constants import SNAPSHOT_SCHEMA_VERSION, SnapshotStatus, SnapshotTrigger
 
 
 class RouterSnapshot(BaseModel):
@@ -56,6 +56,15 @@ class RouterSnapshot(BaseModel):
     )
     status: Mapped[str] = mapped_column(
         String(20), default=SnapshotStatus.COMPLETE.value, nullable=False
+    )
+    # Shape version of the collector output stored in the JSONB sections --
+    # see ``constants.SNAPSHOT_SCHEMA_VERSION``. ``server_default`` matches
+    # migration 0095 so pre-existing rows read back as version "1".
+    snapshot_version: Mapped[str] = mapped_column(
+        String(20),
+        default=SNAPSHOT_SCHEMA_VERSION,
+        server_default="1",
+        nullable=False,
     )
     model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     routeros_version: Mapped[str | None] = mapped_column(String(50), nullable=True)

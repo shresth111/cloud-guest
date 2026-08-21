@@ -24,7 +24,7 @@ from app.domains.router.models import Router
 
 from .collector import collect_snapshot_fields
 from .compatibility import evaluate_compatibility
-from .constants import SnapshotStatus, SnapshotTrigger
+from .constants import SNAPSHOT_SCHEMA_VERSION, SnapshotStatus, SnapshotTrigger
 from .exceptions import (
     DiscoveryDeviceConnectionError,
     DiscoveryMissingCredentialsError,
@@ -101,6 +101,9 @@ def snapshot_to_response(row: RouterSnapshot) -> RouterSnapshotResponse:
         captured_at=row.captured_at,
         trigger=SnapshotTrigger(row.trigger),
         status=SnapshotStatus(row.status),
+        # ``or`` guard: an ORM object never flushed to Postgres (unit-test
+        # fakes) has no server_default applied yet.
+        snapshot_version=row.snapshot_version or SNAPSHOT_SCHEMA_VERSION,
         model=row.model,
         routeros_version=row.routeros_version,
         architecture=row.architecture,
@@ -205,6 +208,7 @@ class DiscoveryService:
                     "captured_at": captured_at,
                     "trigger": trigger.value,
                     "status": SnapshotStatus.FAILED.value,
+                    "snapshot_version": SNAPSHOT_SCHEMA_VERSION,
                     "interfaces": [],
                     "bridges": [],
                     "ip_addresses": [],
