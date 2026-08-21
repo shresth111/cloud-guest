@@ -105,6 +105,7 @@ from .exceptions import (
     WireGuardPeerAlreadyExistsError,
     WireGuardPeerNotFoundError,
     WireGuardPeerRevokedError,
+    WireGuardPrivateKeyUnavailableError,
     WireGuardServerNotFoundError,
 )
 from .models import WireGuardPeer, WireGuardServer
@@ -392,6 +393,54 @@ class WireGuardService:
         logger.info("wireguard_tunnel_created", extra=_event_extra(event))
         return TunnelDeliveryInfo(
             peer=peer, peer_private_key=private_key, server=server
+        )
+
+    async def ensure_tunnel_for_check_in(
+        self,
+        *,
+        router_id: uuid.UUID,
+        external_public_key: str | None = None,
+    ) -> TunnelDeliveryInfo:
+        """Device-enrollment (provisioning check-in) tunnel provisioning --
+        the idempotent, re-run-safe entry point ``provisioning_check_in``
+        composes with, so a technician re-pasting the bootstrap script is a
+        supported recovery path, not a 409.
+
+        First check-in behaves exactly like ``create_tunnel``. A repeat
+        check-in (each re-paste carries a freshly-minted one-time token --
+        ``RouterService.preview_bootstrap_script`` rewinds and re-mints)
+        finds the router's existing live peer and **rotates** it in place
+        via ``rotate_tunnel`` (fresh platform keypair, same tunnel IP,
+        ``rotation_count`` bumped) instead of raising
+        ``WireGuardPeerAlreadyExistsError``. That reject-over-recreate
+        stance is deliberately preserved on the *admin* surface, where an
+        explicit revoke must stay the one place a teardown is decided; a
+        device re-enrolling with a valid one-time provisioning token has
+        already proven exactly the authority a first enrollment proves, and
+        the bootstrap script it is running is about to recreate its local
+        interface against whatever this method returns.
+
+        The rotate path deliberately does not consult
+        ``external_public_key``: a device re-running the legacy
+        device-generated-keypair script never reaches check-in with a live
+        peer (its own ``/interface wireguard add`` line fails on the
+        duplicate interface name first), so a live peer plus a supplied
+        public key falls through to ``create_tunnel``'s existing, documented
+        ``WireGuardPeerAlreadyExistsError`` rather than silently rebinding
+        an admin-created tunnel to an unknown key."""
+        if external_public_key is None:
+            existing = await self.repository.get_peer_by_router_id(router_id)
+            if existing is not None and not existing.is_revoked():
+                return await self.rotate_tunnel(
+                    actor_user_id=None,
+                    router_id=router_id,
+                    requesting_organization_id=None,
+                )
+        return await self.create_tunnel(
+            actor_user_id=None,
+            router_id=router_id,
+            requesting_organization_id=None,
+            external_public_key=external_public_key,
         )
 
     async def register_agent_allocated_peer(
@@ -696,13 +745,20 @@ class WireGuardService:
         if peer is None or peer.is_revoked():
             raise WireGuardPeerNotFoundError(router.id)
 
+        private_key = decrypt_secret(peer.private_key_encrypted)
+        if private_key == EXTERNALLY_MANAGED_KEY_SENTINEL:
+            # The bootstrap script would otherwise install this literal
+            # sentinel string as its private-key= -- see the exception's
+            # own docstring. Checked before the pending -> active flip so a
+            # peer whose key was never deliverable is not marked delivered.
+            raise WireGuardPrivateKeyUnavailableError(router.id)
+
         server = await self.get_server(peer.server_id)
         if peer.status == PeerStatus.PENDING.value:
             peer = await self.repository.update_peer(
                 peer, {"status": PeerStatus.ACTIVE.value}
             )
 
-        private_key = decrypt_secret(peer.private_key_encrypted)
         return TunnelDeliveryInfo(
             peer=peer, peer_private_key=private_key, server=server
         )

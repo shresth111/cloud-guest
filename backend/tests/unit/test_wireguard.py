@@ -62,6 +62,7 @@ from app.domains.wireguard.exceptions import (
     WireGuardPeerAlreadyExistsError,
     WireGuardPeerNotFoundError,
     WireGuardPeerRevokedError,
+    WireGuardPrivateKeyUnavailableError,
     WireGuardRouterNotEligibleError,
 )
 from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
@@ -937,10 +938,18 @@ class TestProvisioningCheckInWireGuardComposition:
         assert delivery.server.endpoint_port == 51820
         assert credential.expires_at is not None
 
-    async def test_check_in_without_public_key_creates_no_peer(self) -> None:
-        """A device presenting only ``token`` (no ``wireguard_public_key``)
-        gets exactly today's pre-existing behavior -- no ``WireGuardPeer``
-        is created at check-in."""
+    async def test_check_in_without_public_key_platform_generates_tunnel(
+        self,
+    ) -> None:
+        """A device presenting only ``token`` -- the current bootstrap
+        script -- gets a platform-generated tunnel at check-in
+        (``provisioning_check_in`` now composes with
+        ``ensure_tunnel_for_check_in`` unconditionally): a real,
+        deliverable private key, never the externally-managed sentinel, so
+        the script's immediate ``GET /agent/wireguard-config`` can hand the
+        key straight to ``/interface wireguard add``."""
+        from app.domains.wireguard.service import EXTERNALLY_MANAGED_KEY_SENTINEL
+
         fx = make_services()
         await make_hub(fx)
         organization = fx.org_lookup.add()
@@ -961,10 +970,106 @@ class TestProvisioningCheckInWireGuardComposition:
         )
         checked_in = await fx.router_service.check_in(plaintext_token=plaintext_token)
 
-        # No create_tunnel call at all -- mirrors provisioning_check_in's
-        # own ``if payload.wireguard_public_key:`` gate.
+        delivery = await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=checked_in.id,
+        )
+
         peer = await fx.wireguard_repo.get_peer_by_router_id(checked_in.id)
-        assert peer is None
+        assert peer is not None
+        assert delivery.peer_private_key != EXTERNALLY_MANAGED_KEY_SENTINEL
+        assert decrypt_secret(peer.private_key_encrypted) == delivery.peer_private_key
+        # Everything the (now-required) check-in response fields carry.
+        assert delivery.peer.tunnel_ip_address
+        assert delivery.server.public_key
+        assert delivery.server.endpoint_host
+        assert delivery.server.endpoint_port
+
+
+class TestEnsureTunnelForCheckIn:
+    """``ensure_tunnel_for_check_in`` is what makes re-pasting the bootstrap
+    script a supported recovery path: the second check-in (with its fresh
+    one-time token) must rotate the existing peer in place, never 409."""
+
+    async def _enrolled_router(self, fx):  # noqa: ANN001, ANN202 -- test helper
+        await make_hub(fx)
+        organization = fx.org_lookup.add()
+        return await make_router(fx, organization)
+
+    async def test_first_check_in_creates_a_platform_keyed_peer(self) -> None:
+        fx = make_services()
+        router_device = await self._enrolled_router(fx)
+
+        delivery = await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+        )
+
+        assert delivery.peer.rotation_count == 0
+        assert delivery.peer.status == PeerStatus.PENDING.value
+        assert decrypt_secret(delivery.peer.private_key_encrypted) == (
+            delivery.peer_private_key
+        )
+
+    async def test_second_check_in_rotates_in_place_same_tunnel_ip(self) -> None:
+        fx = make_services()
+        router_device = await self._enrolled_router(fx)
+        first = await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+        )
+        # Snapshot before the re-run: the in-memory fake updates the same
+        # peer object in place, so post-hoc comparisons through first.peer
+        # would compare the row with itself.
+        first_peer_id = first.peer.id
+        first_tunnel_ip = first.peer.tunnel_ip_address
+        first_public_key = first.peer.public_key
+        first_private_key = first.peer_private_key
+        first_rotation_count = first.peer.rotation_count
+
+        second = await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+        )
+
+        # Never WireGuardPeerAlreadyExistsError; one peer row, rotated.
+        assert second.peer.id == first_peer_id
+        assert second.peer.tunnel_ip_address == first_tunnel_ip
+        assert second.peer.public_key != first_public_key
+        assert second.peer_private_key != first_private_key
+        assert second.peer.rotation_count == first_rotation_count + 1
+        assert second.peer.status == PeerStatus.PENDING.value
+
+    async def test_revoked_peer_is_recreated_not_rotated(self) -> None:
+        fx = make_services()
+        router_device = await self._enrolled_router(fx)
+        await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+        )
+        await fx.wireguard_service.revoke_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+        )
+
+        delivery = await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+        )
+
+        assert delivery.peer.status == PeerStatus.PENDING.value
+        assert not delivery.peer.is_revoked()
+
+    async def test_live_peer_plus_external_key_still_rejects(self) -> None:
+        """A live peer + a device-supplied public key is the one corner that
+        keeps ``create_tunnel``'s documented reject-over-recreate stance --
+        see ``ensure_tunnel_for_check_in``'s own docstring."""
+        fx = make_services()
+        router_device = await self._enrolled_router(fx)
+        await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+        )
+
+        with pytest.raises(WireGuardPeerAlreadyExistsError):
+            await fx.wireguard_service.ensure_tunnel_for_check_in(
+                router_id=router_device.id,
+                external_public_key="ZGV2aWNlLXB1YmxpYy1rZXk=",
+            )
 
 
 class TestAllocationConflictRetry:
@@ -1342,6 +1447,32 @@ class TestDeviceFacingConfigPull:
         )
         with pytest.raises(WireGuardPeerNotFoundError):
             await fx.wireguard_service.get_config_for_agent(router=identity.router)
+
+    async def test_pull_config_for_device_managed_peer_refuses_sentinel(
+        self,
+    ) -> None:
+        """A legacy device-generated-keypair peer stores only the sentinel
+        -- serving it as ``peer_private_key`` would have the bootstrap
+        script install a literal placeholder string as the interface's
+        private key. The pull must refuse loudly instead, and must not
+        flip the peer to ``active`` (nothing was delivered)."""
+        fx = make_services()
+        await make_hub(fx)
+        organization = fx.org_lookup.add()
+        router_device = await make_router(fx, organization)
+        await fx.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+            external_public_key="ZGV2aWNlLXB1YmxpYy1rZXk=",
+        )
+
+        with pytest.raises(WireGuardPrivateKeyUnavailableError):
+            await fx.wireguard_service.get_config_for_agent(router=router_device)
+
+        peer = await fx.wireguard_repo.get_peer_by_router_id(router_device.id)
+        assert peer is not None
+        assert peer.status == PeerStatus.PENDING.value
 
     async def test_pull_config_never_leaks_hub_private_key(self) -> None:
         """The device only ever receives its own private key plus the hub's
