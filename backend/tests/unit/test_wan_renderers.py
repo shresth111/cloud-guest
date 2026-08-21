@@ -146,3 +146,112 @@ def test_static_link_requires_address_override() -> None:
         static_addresses={link.id: "203.0.113.5/24"},
     )
     assert ctx.links[0].static_address == "203.0.113.5/24"
+
+
+class TestWanGatewayRaceGuard:
+    """Regression tests for the 2026-08-21 ``/import`` DHCP race.
+
+    The WAN script adds a ``/ip dhcp-client`` and reads its ``gateway`` a
+    few lines later. Pasted chunk by chunk that gap is seconds and the
+    lease has bound; under ``/import`` it is microseconds and it has not,
+    so the read yielded ``0.0.0.0`` and the old ``!= ""`` guard let it
+    through into a real ``/ip route``, which RouterOS accepts and flags
+    ``Is`` (Inactive) -- "no route to host" on every ping, silently.
+    """
+
+    @staticmethod
+    def _dhcp_script(interface: str = "ether1") -> str:
+        return render_basic_wan_config(
+            WanRenderContext(
+                links=[
+                    WanRenderLink(
+                        link_id=uuid.uuid4(),
+                        slot=1,
+                        connection_mode=IspConnectionMode.DHCP,
+                        physical_interface=interface,
+                        effective_interface=interface,
+                    )
+                ]
+            )
+        )
+
+    def test_dhcp_gateway_read_is_retried_not_read_once(self) -> None:
+        script = self._dhcp_script()
+        assert ":for wan1Try from=1 to=30 do={" in script
+        assert ":delay 1s" in script
+
+    def test_zero_gateway_is_rejected(self) -> None:
+        script = self._dhcp_script()
+        assert '$wan1Gw != "0.0.0.0"' in script
+
+    def test_unresolved_gateway_aborts_the_import(self) -> None:
+        """``:put``/``:log`` do not stop ``/import`` -- only ``:error``."""
+        script = self._dhcp_script()
+        abort = next(
+            line for line in script.splitlines() if "never obtained a usable" in line
+        )
+        assert abort.lstrip().startswith(":if (!$wan1Ok) do={ :error ")
+
+    def test_routes_are_gated_on_the_validated_flag(self) -> None:
+        script = self._dhcp_script()
+        assert ":if ($wan1Ok) do={" in script
+        assert ':if ($wan1Gw != "") do={' not in script
+
+    def test_pppoe_gateway_waits_and_aborts_too(self) -> None:
+        """Same defect class, same fix -- PPPoE previously only warned."""
+        script = render_basic_wan_config(
+            WanRenderContext(
+                links=[
+                    WanRenderLink(
+                        link_id=uuid.uuid4(),
+                        slot=1,
+                        connection_mode=IspConnectionMode.PPPOE,
+                        physical_interface="ether1",
+                        effective_interface="cloudguest-pppoe-wan1",
+                        pppoe_username="u",
+                        pppoe_password="p",
+                    )
+                ]
+            )
+        )
+        assert ":for wan1Try from=1 to=30 do={" in script
+        assert "never obtained a usable gateway" in script
+        assert "gateway not resolved yet" not in script
+
+    def test_static_link_without_gateway_aborts(self) -> None:
+        script = render_basic_wan_config(
+            WanRenderContext(
+                links=[
+                    WanRenderLink(
+                        link_id=uuid.uuid4(),
+                        slot=1,
+                        connection_mode=IspConnectionMode.STATIC,
+                        physical_interface="ether1",
+                        effective_interface="ether1",
+                        static_address="10.0.0.2/24",
+                        gateway=None,
+                    )
+                ]
+            )
+        )
+        assert "is configured STATIC but has no gateway" in script
+
+    def test_each_link_gets_its_own_wait_loop(self) -> None:
+        script = render_basic_wan_config(
+            WanRenderContext(
+                links=[
+                    WanRenderLink(
+                        link_id=uuid.uuid4(),
+                        slot=n,
+                        connection_mode=IspConnectionMode.DHCP,
+                        physical_interface=f"ether{n}",
+                        effective_interface=f"ether{n}",
+                    )
+                    for n in (1, 2)
+                ],
+                wan_routing_mode=WanRoutingMode.LOAD_BALANCE,
+            )
+        )
+        for n in (1, 2):
+            assert f":for wan{n}Try from=1 to=30 do={{" in script
+            assert f":if (!$wan{n}Ok) do={{ :error " in script

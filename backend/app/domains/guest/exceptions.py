@@ -37,6 +37,7 @@ __all__ = [
     "RadiusNasClientNotFoundError",
     "RadiusNasAuthenticationError",
     "RadiusNasAlreadyRegisteredError",
+    "RadiusNasSecretUnrecoverableError",
     "RadiusNasNotFoundError",
     "CrossOrganizationNasAccessError",
     "InvalidNasStatusTransitionError",
@@ -199,6 +200,27 @@ class RadiusNasAuthenticationError(GuestError):
     def __init__(self) -> None:
         super().__init__(
             "RADIUS NAS authentication failed", status_code=status.HTTP_401_UNAUTHORIZED
+        )
+
+
+class RadiusNasSecretUnrecoverableError(GuestError):
+    """``shared_secret_encrypted`` could not be decrypted, so this NAS's
+    existing secret cannot be reused and the caller must rotate instead.
+
+    Practically this means the Fernet key changed since the row was
+    written. Deliberately a 409 rather than a 500: nothing is broken
+    server-side, the caller simply has to take the (destructive, explicit)
+    rotate path -- and must then re-push the ``/radius`` line to the
+    device, because it is still holding the old secret."""
+
+    def __init__(self, nas_id: uuid.UUID | str) -> None:
+        super().__init__(
+            (
+                f"RADIUS NAS client {nas_id}'s stored shared secret cannot be "
+                "decrypted -- rotate it (and re-apply the router's /radius "
+                "configuration) instead of reusing it"
+            ),
+            status_code=status.HTTP_409_CONFLICT,
         )
 
 

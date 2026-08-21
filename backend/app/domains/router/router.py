@@ -74,7 +74,9 @@ from app.common.responses import ApiResponse, build_response
 from app.core.config import Settings, get_settings
 from app.database.redis import get_redis_client
 from app.domains.auth.models import AuthUser
-from app.domains.guest.dependencies import get_radius_service
+from app.domains.guest.constants import GuestSessionStatus
+from app.domains.guest.dependencies import get_guest_repository, get_radius_service
+from app.domains.guest.repository import GuestRepositoryProtocol
 from app.domains.guest.router import deregister_radius_nas_client
 from app.domains.guest.service import RadiusService
 from app.domains.network_config.constants import (
@@ -136,12 +138,19 @@ from .device_adapters import (
     reboot_device,
 )
 from .enums import RouterStatus
+from .guided_setup import (
+    GUIDED_SETUP_SESSION_SAMPLE,
+    GuidedSetupFacts,
+    build_guided_setup_checks,
+    overall_status,
+)
 from .models import Router
 from .schemas import (
     BootstrapScriptPreviewResponse,
     DeviceConnectionResponse,
     DeviceInterfaceResponse,
     DeviceInterfacesResponse,
+    GuidedSetupVerifyResponse,
     HeartbeatRequest,
     MessageResponse,
     ProvisioningCheckInRequest,
@@ -689,9 +698,7 @@ async def proxy_webfig(
     body = await request.body()
     excluded_headers = {"host", "authorization", "content-length"}
     forward_headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in excluded_headers
+        k: v for k, v in request.headers.items() if k.lower() not in excluded_headers
     }
     # WebFig establishes its own router-side session via a Set-Cookie on a
     # successful request; that cookie must round-trip (browser -> proxy ->
@@ -946,8 +953,7 @@ async def generate_provisioning_token(
     return build_response(
         success=True,
         message=(
-            "Provisioning token generated -- store it now, it will not be "
-            "shown again"
+            "Provisioning token generated -- store it now, it will not be shown again"
         ),
         data=payload.model_dump(),
         request_id=_request_id(request),
@@ -1001,8 +1007,7 @@ async def regenerate_agent_credential(
     return build_response(
         success=True,
         message=(
-            "Agent credential regenerated -- store it now, it will not be "
-            "shown again"
+            "Agent credential regenerated -- store it now, it will not be shown again"
         ),
         data={"agent_credential": plaintext},
         request_id=_request_id(request),
@@ -1087,6 +1092,84 @@ async def preview_bootstrap_script(
     return build_response(
         success=True,
         message=message,
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/routers/{router_id}/guided-setup/verify",
+    response_model=ApiResponse[GuidedSetupVerifyResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.read"))],
+)
+async def verify_guided_setup(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    router_service: RouterService = Depends(get_router_service),
+    radius_service: RadiusService = Depends(get_radius_service),
+    wireguard_service: WireGuardService = Depends(get_wireguard_service),
+    guest_repository: GuestRepositoryProtocol = Depends(get_guest_repository),
+):
+    """Report what the platform can actually observe about this router,
+    split into "configured" / "reachable" / "a guest really got online".
+
+    Strictly read-only -- no device I/O, no probes, nothing minted. Safe to
+    poll while an operator works. See
+    ``app.domains.router.guided_setup`` for why each check says what it
+    says, and in particular why RADIUS is reported as an *observation*
+    rather than a live authentication test.
+    """
+    router_row = await router_service.get_router(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+
+    nas_clients, _meta = await radius_service.list_nas_clients(
+        requesting_organization_id=requesting_organization_id,
+        router_id=router_id,
+        page=1,
+        page_size=1,
+    )
+    nas_client = nas_clients[0] if nas_clients else None
+
+    peer = await wireguard_service.find_live_peer(
+        router_id=router_id, requesting_organization_id=requesting_organization_id
+    )
+
+    sessions, session_meta = await guest_repository.list_sessions(
+        page=1,
+        page_size=GUIDED_SETUP_SESSION_SAMPLE,
+        filters={"router_id": router_id},
+    )
+    accounted = sum(
+        1 for s in sessions if (s.bytes_uploaded or 0) + (s.bytes_downloaded or 0) > 0
+    )
+    active = sum(1 for s in sessions if s.status == GuestSessionStatus.ACTIVE.value)
+
+    facts = GuidedSetupFacts(
+        nas_identifier=nas_client.nas_identifier if nas_client else None,
+        nas_status=nas_client.status if nas_client else None,
+        nas_tunnel_ip=peer.tunnel_ip_address if peer is not None else None,
+        peer_present=peer is not None,
+        peer_revoked=False,
+        peer_tunnel_ip=peer.tunnel_ip_address if peer is not None else None,
+        last_handshake_at=peer.last_handshake_at if peer is not None else None,
+        router_last_seen_at=router_row.last_seen_at,
+        total_session_count=session_meta.total_items,
+        active_session_count=active,
+        accounted_session_count=accounted,
+    )
+    checks = build_guided_setup_checks(facts)
+    payload = GuidedSetupVerifyResponse(
+        router_id=str(router_id),
+        overall=overall_status(checks).value,
+        checks=checks,
+        guest_can_get_online=accounted > 0,
+    )
+    return build_response(
+        success=True,
+        message="Guided setup verification complete",
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )

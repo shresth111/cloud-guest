@@ -6003,6 +6003,46 @@ class TestNasLifecycle:
                 shared_secret="s3cr3t",
             )
 
+    async def test_recover_shared_secret_reuses_and_mints_nothing(self) -> None:
+        """Re-generating a setup script must not invalidate the secret the
+        router is already using -- the 2026-08-21 failure class."""
+        fx = make_fixture()
+        result = await self._register(fx, shared_secret="original-secret")
+
+        recovered = await fx.radius_service.recover_shared_secret(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+        )
+        assert recovered.shared_secret == "original-secret"
+
+        # ...and the router's own secret still authenticates afterwards.
+        authenticated = await fx.radius_service.authenticate_nas(
+            nas_identifier=result.nas_client.nas_identifier,
+            shared_secret="original-secret",
+        )
+        assert authenticated.id == result.nas_client.id
+
+    async def test_recover_shared_secret_is_repeatable(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx, shared_secret="original-secret")
+        seen = set()
+        for _ in range(3):
+            recovered = await fx.radius_service.recover_shared_secret(
+                nas_id=result.nas_client.id,
+                requesting_organization_id=fx.organization_id,
+            )
+            seen.add(recovered.shared_secret)
+        assert seen == {"original-secret"}
+
+    async def test_recover_shared_secret_enforces_tenant_scope(self) -> None:
+        fx = make_fixture()
+        result = await self._register(fx)
+        with pytest.raises(CrossOrganizationNasAccessError):
+            await fx.radius_service.recover_shared_secret(
+                nas_id=result.nas_client.id,
+                requesting_organization_id=uuid.uuid4(),
+            )
+
     async def test_regenerate_secret_invalidates_old_one(self) -> None:
         fx = make_fixture()
         result = await self._register(fx, shared_secret="original-secret")

@@ -20,6 +20,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.domains.auth.schemas import MessageResponse
+from app.domains.provisioning_engine.planner.schemas import VerificationCheck
 
 from .enums import RouterStatus
 
@@ -360,6 +361,27 @@ class WebfigSessionResponse(BaseModel):
 
     session_token: str
     expires_in: int
+
+
+class GuidedSetupVerifyResponse(BaseModel):
+    """``GET /routers/{id}/guided-setup/verify`` payload.
+
+    ``checks`` reuses the fleet wizard's own ``VerificationCheck`` shape so
+    the Guided Setup module renders it with the same component Step 5 and
+    Step 11 already use. Read-only: this reports what the platform has
+    observed, it never touches the device."""
+
+    router_id: str
+    overall: str
+    checks: list[VerificationCheck]
+    guest_can_get_online: bool = Field(
+        description=(
+            "True only when RADIUS accounting has actually been observed "
+            "for this router -- the one check that proves a real guest "
+            "completed the whole path, as opposed to the platform merely "
+            "holding the right rows."
+        )
+    )
 
 
 class BootstrapScriptPreviewResponse(BaseModel):

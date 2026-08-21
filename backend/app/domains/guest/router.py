@@ -1171,6 +1171,19 @@ async def register_radius_nas(
 async def register_external_radius_nas(
     request: Request,
     router_id: uuid.UUID,
+    rotate: bool = Query(
+        default=False,
+        description=(
+            "Mint a brand-new shared secret, invalidating the one this "
+            "router is currently using. Defaults to false: re-running this "
+            "call reuses the existing secret and simply re-pushes it to "
+            "FreeRADIUS, so regenerating a setup script is safe to repeat. "
+            "Pass true ONLY when you will also re-apply the router's "
+            "/radius configuration -- the device-side chunk is "
+            "add-if-missing, so a rotated secret that is not re-pushed "
+            "silently breaks every guest login on this router."
+        ),
+    ),
     user: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RadiusService = Depends(get_radius_service),
@@ -1196,7 +1209,17 @@ async def register_external_radius_nas(
         page=1,
         page_size=1,
     )
-    if existing:
+    if existing and not rotate:
+        # Reuse, do not re-mint. See RadiusService.recover_shared_secret
+        # for the full write-up: this branch used to rotate, so every
+        # "regenerate the setup script" click invalidated the secret the
+        # router was still using, and re-pasting the script did not repair
+        # it because the device-side /radius chunk is add-if-missing.
+        result = await service.recover_shared_secret(
+            nas_id=existing[0].id,
+            requesting_organization_id=requesting_organization_id,
+        )
+    elif existing:
         result = await service.regenerate_secret(
             nas_id=existing[0].id,
             requesting_organization_id=requesting_organization_id,
@@ -1232,7 +1255,12 @@ async def register_external_radius_nas(
 
     return build_response(
         success=True,
-        message="RADIUS NAS client registered",
+        message=(
+            "RADIUS NAS client registered with a new shared secret -- "
+            "re-apply this router's /radius configuration now"
+            if rotate
+            else "RADIUS NAS client registered"
+        ),
         data=RadiusNasCreatedResponse(
             **_nas_response(result.nas_client).model_dump(),
             shared_secret=result.shared_secret,

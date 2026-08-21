@@ -340,6 +340,7 @@ from .exceptions import (
     RadiusNasAlreadyRegisteredError,
     RadiusNasAuthenticationError,
     RadiusNasNotFoundError,
+    RadiusNasSecretUnrecoverableError,
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
     TooManyDeviceIdsError,
@@ -4399,6 +4400,45 @@ class RadiusService:
             description=description,
         )
         return updated
+
+    async def recover_shared_secret(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> RadiusNasSecretRegenerationResult:
+        """Return this NAS's **existing** shared secret, minting nothing.
+
+        The counterpart to :meth:`regenerate_secret`, and the reason
+        re-rendering a router's setup script is no longer destructive.
+        ``shared_secret_encrypted`` is Fernet-encrypted, not hashed, so
+        the plaintext the device was originally given is genuinely
+        recoverable -- ``app.domains.network_config.renderers
+        .render_radius_client`` already decrypts exactly this column on
+        every config render, so returning it here exposes nothing a
+        caller holding ``radius.create`` cannot already obtain from a
+        config preview.
+
+        Why this exists: ``register_external_radius_nas`` used to call
+        ``regenerate_secret`` whenever a NAS row already existed, so every
+        "generate the setup script again" click silently invalidated the
+        secret the router was still using. The device-side ``/radius``
+        chunk is add-if-missing with no ``else``, so re-pasting the new
+        script did not repair it either -- the router kept the old secret
+        and every guest silently failed to authenticate. Reuse is the
+        correct default; rotation is a real, separate, explicitly-
+        requested operation.
+        """
+        nas_client = await self.get_nas_client(
+            nas_id, requesting_organization_id=requesting_organization_id
+        )
+        try:
+            plaintext = decrypt_secret(nas_client.shared_secret_encrypted)
+        except RouterCredentialDecryptionError as exc:
+            raise RadiusNasSecretUnrecoverableError(nas_client.id) from exc
+        return RadiusNasSecretRegenerationResult(
+            nas_client=nas_client, shared_secret=plaintext
+        )
 
     async def regenerate_secret(
         self,

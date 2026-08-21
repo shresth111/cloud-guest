@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from app.domains.isp.constants import IspConnectionMode, WanRoutingMode
+from app.domains.network_config.constants import (
+    WAN_GATEWAY_WAIT_ATTEMPTS,
+    WAN_GATEWAY_WAIT_DELAY_SECONDS,
+    WAN_UNRESOLVED_GATEWAY,
+)
 
 from .context import WanRenderContext
 from .pcc import build_weighted_pcc_plan
@@ -141,31 +146,95 @@ def render_wan_addressing_section(ctx: WanRenderContext) -> list[str]:
     return lines
 
 
+def _gateway_wait_lines(n: int, probe: str, label: str) -> list[str]:
+    """Poll ``probe`` until it yields a real gateway, then hard-fail if it
+    never does.
+
+    ``probe`` is a RouterOS expression evaluating to a gateway address.
+    It is retried because the caller has, a few lines earlier in the same
+    script, *just created* the DHCP/PPPoE client it reads from: pasted by
+    hand the lease has always bound by now, but under ``/import`` the two
+    statements run microseconds apart and it has not. See
+    ``constants.WAN_GATEWAY_WAIT_ATTEMPTS`` for the full write-up.
+
+    Two properties this block must have, and the previous inline version
+    had neither:
+
+    * **``0.0.0.0`` is not a gateway.** An unbound DHCP client reports it,
+      and the old ``!= ""`` guard let it straight through into
+      ``/ip route add gateway=$wanNGw`` -- which RouterOS accepts and then
+      flags ``Is`` (Inactive), producing "no route to host" on every ping
+      with no error anywhere.
+    * **Failure must ``:error``, not warn.** ``/import`` does not stop for
+      ``:put``/``:log``, so a warn-only branch means the script continues
+      and builds a hotspot on a router that has no internet. Aborting
+      leaves exactly the state a warn-only run would have left, minus the
+      false success.
+
+    Sets ``$wan{n}Gw`` and ``$wan{n}Ok`` for the caller to consume.
+    """
+    return [
+        f':local wan{n}Gw ""',
+        f":local wan{n}Ok false",
+        f":for wan{n}Try from=1 to={WAN_GATEWAY_WAIT_ATTEMPTS} do={{",
+        f"  :if (!$wan{n}Ok) do={{",
+        f'    :do {{ :set wan{n}Gw [:tostr {probe}] }} on-error={{ :set wan{n}Gw "" }}',
+        f'    :if ([:len $wan{n}Gw] > 0 && $wan{n}Gw != "{WAN_UNRESOLVED_GATEWAY}") do={{',
+        f"      :set wan{n}Ok true",
+        f"    }} else={{ :delay {WAN_GATEWAY_WAIT_DELAY_SECONDS}s }}",
+        "  }",
+        "}",
+        f":if (!$wan{n}Ok) do={{ :error "
+        f'"cloudguest-setup: WAN{n} ({label}) never obtained a usable gateway '
+        f"within {WAN_GATEWAY_WAIT_ATTEMPTS}s. The link is down, the cable is "
+        f"unplugged, or the ISP is not serving a lease. Fix the WAN and re-run "
+        f'this script." }}',
+    ]
+
+
 def render_wan_routing_section(ctx: WanRenderContext) -> list[str]:
     lines: list[str] = []
     for link in ctx.links:
         n = link.slot
         if link.connection_mode is IspConnectionMode.STATIC:
+            # Known at render time -- no device-side wait to do, but the
+            # same "is this actually a gateway" bar applies.
             gw = _escape_routeros_string(link.gateway or "")
             lines.append(f':local wan{n}Gw "{gw}"')
+            lines.append(
+                f":local wan{n}Ok ([:len $wan{n}Gw] > 0 && "
+                f'$wan{n}Gw != "{WAN_UNRESOLVED_GATEWAY}")'
+            )
+            lines.append(
+                f":if (!$wan{n}Ok) do={{ :error "
+                f'"cloudguest-setup: WAN{n} is configured STATIC but has no '
+                f'gateway address. Set one in WyFyGuest and re-generate." }}'
+            )
         elif link.connection_mode is IspConnectionMode.PPPOE:
             eff = _escape_routeros_string(link.effective_interface)
-            lines.append(f':local wan{n}Gw ""')
-            lines.append(
-                f':if ([:len [/interface pppoe-client find where name="{eff}"]] > 0) do={{ :do {{ :set wan{n}Gw ([/interface pppoe-client monitor [find name="{eff}"] once as-value]->"remote-address") }} on-error={{ :log warning "cloudguest: PPPoE WAN{n} gateway not resolved yet" }} }}'
+            lines.extend(
+                _gateway_wait_lines(
+                    n,
+                    f'([/interface pppoe-client monitor [find name="{eff}"] '
+                    'once as-value]->"remote-address")',
+                    link.effective_interface,
+                )
             )
         else:
             phys = _escape_routeros_string(link.physical_interface)
-            lines.append(f':local wan{n}Gw ""')
-            lines.append(
-                f':if ([:len [/ip dhcp-client find where interface="{phys}"]] > 0) do={{ :set wan{n}Gw [/ip dhcp-client get [find interface="{phys}"] gateway] }}'
+            lines.extend(
+                _gateway_wait_lines(
+                    n,
+                    f'[/ip dhcp-client get [find where interface="{phys}"] gateway]',
+                    link.physical_interface,
+                )
             )
 
     multi = len(ctx.links) > 1
     load_balance = ctx.wan_routing_mode is WanRoutingMode.LOAD_BALANCE
     for link in ctx.links:
         n = link.slot
-        lines.append(f":if ($wan{n}Gw != \"\") do={{")
+        lines.append(f":if ($wan{n}Ok) do={{")
         lines.append(
             f'  :local plainRoute{n} [/ip route find where comment="cloudguest-plain-wan{n}"]'
         )

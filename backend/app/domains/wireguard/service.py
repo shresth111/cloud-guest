@@ -303,6 +303,28 @@ class WireGuardService:
             raise WireGuardPeerNotFoundError(router_id)
         return peer
 
+    async def find_live_peer(
+        self,
+        *,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> WireGuardPeer | None:
+        """This router's peer if it has a usable one, else ``None``.
+
+        "Usable" means present and not revoked -- the same bar
+        :meth:`create_tunnel` applies before it refuses to create a second
+        tunnel. Unlike :meth:`get_peer` this never raises for a router that
+        simply has no tunnel yet, because the caller's question is "may I
+        allocate one?", not "give me the one that exists".
+        """
+        await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        peer = await self.repository.get_peer_by_router_id(router_id)
+        if peer is None or peer.is_revoked():
+            return None
+        return peer
+
     def compute_health_status(
         self, peer: WireGuardPeer, *, now: datetime | None = None
     ) -> HealthStatus:

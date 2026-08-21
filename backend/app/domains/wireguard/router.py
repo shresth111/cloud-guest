@@ -50,7 +50,7 @@ from __future__ import annotations
 import uuid
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
@@ -63,6 +63,7 @@ from app.domains.rbac.enums import ScopeType
 from app.domains.router_agent.dependencies import AgentIdentity, CurrentAgent
 
 from .dependencies import get_wireguard_service
+from .exceptions import WireGuardPeerAlreadyExistsError
 from .models import WireGuardPeer
 from .schemas import (
     AgentWireGuardConfigResponse,
@@ -246,6 +247,18 @@ async def register_external_wireguard_peer(
 async def allocate_external_wireguard_peer(
     request: Request,
     router_id: uuid.UUID,
+    rotate: bool = Query(
+        default=False,
+        description=(
+            "Replace this router's existing tunnel with a brand-new "
+            "keypair and tunnel IP. Defaults to false, in which case a "
+            "router that already has a live tunnel is refused with 409 "
+            "rather than silently re-allocated -- re-running a setup-script "
+            "generation must never burn a new tunnel IP under a router that "
+            "is working. Pass true only when you will also re-apply the "
+            "device's WireGuard configuration."
+        ),
+    ),
     user: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: WireGuardService = Depends(get_wireguard_service),
@@ -262,6 +275,23 @@ async def allocate_external_wireguard_peer(
     bridge, then ``register-external``) into one, returning the same
     "everything needed to configure the device" bundle
     ``POST .../wireguard-peer`` does."""
+    # Idempotency guard. Without it, every "regenerate the setup script"
+    # click called the hub bridge again and
+    # ``register_agent_allocated_peer`` overwrote the row in place with a
+    # fresh keypair *and* a fresh tunnel IP -- while the device-side
+    # WireGuard chunk is add-if-missing with no ``else``, so the router
+    # kept the old interface and re-pasting the script did not repair it.
+    # The platform's own copy of the private key is replaced by the
+    # externally-managed sentinel on this path, so a reused peer genuinely
+    # cannot re-emit ``peer_private_key`` -- which is why this refuses
+    # rather than returning a partial bundle. The device can always re-pull
+    # its own key from ``GET /agent/wireguard-config``.
+    existing = await service.find_live_peer(
+        router_id=router_id, requesting_organization_id=requesting_organization_id
+    )
+    if existing is not None and not rotate:
+        raise WireGuardPeerAlreadyExistsError(router_id)
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(

@@ -57,6 +57,29 @@ REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES = 10
 REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS = 20
 REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS = 6
 
+# How long a rendered WAN script waits for a DHCP lease / PPPoE dial to
+# actually produce a gateway before giving up and aborting the import.
+#
+# Why this exists: the WAN script adds the ``/ip dhcp-client`` and then
+# reads its ``gateway`` property a few lines later. Pasted chunk by chunk
+# by a technician that gap is seconds and the lease has always bound; run
+# as a single ``/import`` it is microseconds and the lease has not. The
+# read then yields an unbound value, and a ``/ip route`` built from it
+# lands with ``gateway=0.0.0.0`` flagged ``Is`` (Inactive) -- every ping
+# says "no route to host" while the script sails on and builds a hotspot
+# on a router with no internet. Confirmed live 2026-08-21.
+#
+# 30 x 1s: a normal ISP DHCP lease binds in under 5s and a PPPoE dial
+# completes well inside 20s, so this clears both by a wide margin while
+# bounding a genuinely-dead-WAN import to half a minute per link.
+WAN_GATEWAY_WAIT_ATTEMPTS = 30
+WAN_GATEWAY_WAIT_DELAY_SECONDS = 1
+
+# The one value a RouterOS gateway property reports when a DHCP client
+# exists but has not yet bound a lease. Must be rejected exactly like an
+# empty string -- treating it as a real gateway is the bug above.
+WAN_UNRESOLVED_GATEWAY = "0.0.0.0"
+
 # Human-readable section headers written into the rendered RouterOS
 # script ahead of each category's own commands -- purely cosmetic (a
 # comment line, never parsed back), but real value for anyone reading a
@@ -84,6 +107,9 @@ __all__ = [
     "REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES",
     "REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS",
     "REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS",
+    "WAN_GATEWAY_WAIT_ATTEMPTS",
+    "WAN_GATEWAY_WAIT_DELAY_SECONDS",
+    "WAN_UNRESOLVED_GATEWAY",
     "DHCP_SECTION_HEADER",
     "VLAN_SECTION_HEADER",
     "PORT_FORWARDING_SECTION_HEADER",
