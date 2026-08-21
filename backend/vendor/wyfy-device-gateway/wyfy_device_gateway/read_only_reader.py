@@ -85,6 +85,7 @@ READ_ONLY_SECTION_PATHS: MappingProxyType[str, tuple[str, ...]] = MappingProxyTy
         "system_routerboard": ("system", "routerboard"),
         "system_identity": ("system", "identity"),
         "system_clock": ("system", "clock"),
+        "system_ntp_client": ("system", "ntp", "client"),
         "system_packages": ("system", "package"),
         "system_schedulers": ("system", "scheduler"),
         # B. interfaces (dynamic -- never assume etherN)

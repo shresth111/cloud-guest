@@ -31,6 +31,19 @@ def secret_placeholder(ref: str) -> str:
     return SECRET_PLACEHOLDER_PREFIX + ref + "}}"
 
 
+def escape_routeros_string(value: str) -> str:
+    """Escape a value for interpolation inside a double-quoted RouterOS string.
+
+    Shared rather than re-declared per module. Three renderer modules already
+    carry a private ``_escape_routeros_string`` with this exact body
+    (``wan/renderers.py``, ``profiles/guest.py``, ``profiles/safety_net.py``);
+    new modules import this one instead of adding a fourth copy. The existing
+    three are deliberately left alone -- they are working, pushed code, and
+    re-pointing them is a separate change with its own review.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 __all__ = [
     "EMIT_COMMENT_PREFIX",
     "RECOGNIZE_COMMENT_PREFIXES",
@@ -38,4 +51,5 @@ __all__ = [
     "wyfy_comment",
     "is_managed_comment",
     "secret_placeholder",
+    "escape_routeros_string",
 ]
