@@ -53,6 +53,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.core.config import get_settings
 from app.domains.auth.models import AuthUser
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
@@ -78,13 +79,15 @@ from .validators import hub_reserved_ip
 
 router = APIRouter(tags=["WireGuard"])
 
-# Same single-tenant hub bridge the Master console's Setup Script panel
-# calls directly from the browser -- duplicated here (not read from
-# settings) to match that existing convention exactly, see
-# RouterSetupScriptPanel's own comment on why these are constants rather
-# than per-router secrets today.
-_WG_AGENT_URL = "http://20.219.72.235:9091/wg/peer"
-_WG_AGENT_SECRET = "wgagent-7a647fb42b822aa44cb2da2092a4b79a"
+# The single-tenant hub bridge (ops/hub-agents/wg_agent.py, port 9091).
+# These WERE module constants hardcoded to the old hub's public IP with the
+# shared secret in cleartext in this file. Both are now Settings fields
+# (CLOUDGUEST_HUB_WG_AGENT_URL / _SECRET), read per call rather than at
+# import time so a value can be changed without a code change OR an image
+# rebuild -- the old constants were baked into the running image, so moving
+# the hub cost a full rebuild and every venue provisioning hung to timeout
+# in the meantime. Default target is the hub's VNet-private address: the
+# transport is plain HTTP and the secret must not cross the internet.
 
 
 def _request_id(request: Request) -> str:
@@ -264,8 +267,10 @@ async def allocate_external_wireguard_peer(
     ``POST .../wireguard-peer`` does."""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
+            _settings = get_settings()
             resp = await client.post(
-                _WG_AGENT_URL, headers={"X-Agent-Secret": _WG_AGENT_SECRET}
+                _settings.hub_wg_agent_url,
+                headers={"X-Agent-Secret": _settings.hub_wg_agent_secret},
             )
             resp.raise_for_status()
             wg = resp.json()

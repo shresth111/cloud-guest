@@ -1,0 +1,12 @@
+[Unit]
+Description=Firewall rules restricting radius-agent.service (port 9092) to WG tunnel + known callers
+Before=radius-agent.service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/radius-agent-firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

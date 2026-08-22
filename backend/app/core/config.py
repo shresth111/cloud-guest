@@ -221,6 +221,52 @@ class Settings(BaseSettings):
         ),
     )
 
+    hub_wg_agent_url: str = Field(
+        default="http://10.30.2.10:9091/wg/peer",
+        description=(
+            "Absolute URL of the hub's WireGuard peer-provisioning agent "
+            "(ops/hub-agents/wg_agent.py, port 9091), called by "
+            "app.domains.wireguard.router.allocate_external_wireguard_peer. "
+            "Was a module-level constant hardcoded to the OLD hub's public "
+            "IP (20.219.72.235); that host was deleted with its subscription "
+            "and every venue provisioning hung to timeout until this moved "
+            "here. Defaults to the hub's VNET-PRIVATE address so the call "
+            "and its shared secret never leave the VNet -- the transport is "
+            "plain HTTP. Do not point this at a public IP or hostname."
+        ),
+    )
+    hub_wg_agent_secret: str = Field(
+        default="",
+        description=(
+            "Shared secret sent as the X-Agent-Secret header to "
+            "hub_wg_agent_url. Must equal WG_AGENT_SECRET in the hub's "
+            "/etc/wyfy/hub-agents.env -- the agent compares with !=, so any "
+            "skew is a hard 401, never a degraded mode; rotate both sides "
+            "together. Empty = unconfigured: the agent also rejects an empty "
+            "secret, so a blank value fails closed rather than open. The "
+            "previous value was committed in cleartext in this repo and has "
+            "been rotated."
+        ),
+    )
+    hub_radius_agent_url: str = Field(
+        default="http://10.30.2.10:9092/radius/client",
+        description=(
+            "Absolute URL of the hub's FreeRADIUS client-provisioning agent "
+            "(ops/hub-agents/radius_agent.py, port 9092), called by "
+            "app.domains.guest.router.register_external_radius_nas. See "
+            "hub_wg_agent_url for why this is private-address-by-default and "
+            "why it stopped being a constant."
+        ),
+    )
+    hub_radius_agent_secret: str = Field(
+        default="",
+        description=(
+            "Shared secret sent as the X-Agent-Secret header to "
+            "hub_radius_agent_url. See hub_wg_agent_secret -- same rotation "
+            "and fail-closed rules."
+        ),
+    )
+
     snmp_default_community: str = Field(
         default="",
         description=(

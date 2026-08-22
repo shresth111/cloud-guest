@@ -1,0 +1,22 @@
+[Unit]
+Description=CloudGuest WireGuard peer provisioning agent
+# Requires= (not just After=) -- next_free_ip() allocates by scanning live
+# kernel state, so a down wg0 makes it re-issue 10.20.0.2 to live routers.
+Requires=wg-quick@wg0.service
+After=network-online.target wg-quick@wg0.service wyfy-agent-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Secret lives in a 0600 root-only EnvironmentFile, NOT inline Environment=
+# -- inline values are world-readable via `systemctl show`.
+EnvironmentFile=/etc/wyfy/hub-agents.env
+Environment=AGENT_BIND_ADDR=10.30.2.10
+ExecStartPre=/usr/local/sbin/wg-agent-preflight.sh
+ExecStart=/usr/bin/python3 /usr/local/sbin/wg_agent.py
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
