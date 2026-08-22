@@ -72,6 +72,7 @@ from .dependencies import (
 )
 from .exceptions import (
     RadiusAccountingUnsupportedStatusTypeError,
+    RadiusNasBridgeDeregistrationError,
     RadiusNasNotFoundError,
 )
 from .models import Guest, GuestDevice, GuestLoginHistory, GuestSession, RadiusNasClient
@@ -149,33 +150,34 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
 
 
-async def _deregister_nas_from_radius_bridge(nas_identifier: str) -> None:
-    """Best-effort removal of ``nas_identifier``'s live entry from the real
-    FreeRADIUS server's ``clients.conf`` -- the exact symmetric counterpart
-    ``register_external_radius_nas``'s own bridge ``POST`` never had.
-    Confirmed gap: neither this NAS-delete path nor a decommissioned
-    router's cascade ever called the bridge to remove the entry it added at
-    registration time, so a stale entry could silently collide with a later
-    router that ends up sharing the same physical public IP (a decommission
-    -then-re-provision at the same site, same ISP connection, is the
-    plausible real case). Deliberately never raises -- a bridge outage at
-    delete time must not block the DB-level soft-delete this always follows
-    (or the router decommission it's a part of), mirroring
-    ``app.domains.router_agent.router.agent_heartbeat``'s identical "a
-    failure to record this additive side effect is not a reason to fail the
-    call" reasoning; a failure is logged instead, for the same manual-SSH
-    cleanup this replaces to fall back on.
+async def _deregister_nas_from_radius_bridge(nas_identifier: str) -> int:
+    """Remove ``nas_identifier``'s live entry from the real FreeRADIUS
+    server's ``clients.conf`` via the hub agent, returning how many
+    ``client{}`` stanzas the hub reports it removed.
 
-    The bridge process itself is external infrastructure -- not part of
-    this repository, so its actual handler for this ``DELETE`` cannot be
-    inspected or deployed from here. This call assumes it exposes a
-    ``DELETE`` counterpart to the ``POST`` it already answers at the same
-    URL, keyed by ``nas_identifier`` (the one stable identifier a NAS
-    client keeps for its whole lifetime, unlike ``tunnel_ip``, which a
-    WireGuard rotation could change). **Whoever owns that bridge script
-    needs to confirm/add a matching handler and verify this live** -- this
-    closes only the platform-side half of the gap (the call that was
-    previously never made at all)."""
+    Raises ``RadiusNasBridgeDeregistrationError`` on any failure. This
+    function used to catch ``httpx.HTTPError``, log a WARNING and return
+    normally, and that swallowing was the actual bug, not the transport
+    error underneath it: the agent (``ops/hub-agents/radius_agent.py``)
+    had no ``DELETE`` handler at all, so every single call in production
+    got back ``501 Unsupported method ('DELETE')`` and every single delete
+    was still reported to the operator as complete. The live hub ended up
+    with 21 ``client{}`` stanzas against 0 active NAS rows -- five of them
+    belonging to NAS clients an operator had deleted through the console
+    minutes earlier, each still holding a valid shared secret the RADIUS
+    server would still accept.
+
+    The stanza count is returned rather than discarded because ``0``
+    ("this NAS was not on the RADIUS server") is a genuinely different
+    outcome from ``2`` ("two live credentials just got revoked"), and the
+    delete endpoint says which one happened. ``0`` is still a success: it
+    is the honest report of an already-consistent state, and it is what a
+    retry after a partial failure must be able to return.
+
+    Keyed on ``nas_identifier`` -- the one identifier a NAS keeps for its
+    whole lifetime, unlike ``tunnel_ip``, which a WireGuard reallocation
+    changes (and has changed, repeatedly, on the live fleet).
+    """
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             _settings = get_settings()
@@ -189,11 +191,55 @@ async def _deregister_nas_from_radius_bridge(nas_identifier: str) -> None:
                 json={"nas_identifier": nas_identifier},
             )
             resp.raise_for_status()
-    except httpx.HTTPError:
+            body = resp.json()
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "radius_nas_bridge_deregister_failed",
+            extra={
+                "nas_identifier": nas_identifier,
+                "status_code": exc.response.status_code,
+            },
+        )
+        raise RadiusNasBridgeDeregistrationError(
+            nas_identifier, f"the RADIUS agent returned HTTP {exc.response.status_code}"
+        ) from exc
+    except httpx.HTTPError as exc:
         logger.warning(
             "radius_nas_bridge_deregister_failed",
             extra={"nas_identifier": nas_identifier},
         )
+        raise RadiusNasBridgeDeregistrationError(
+            nas_identifier, "the RADIUS agent could not be reached"
+        ) from exc
+    except ValueError as exc:
+        # A 200 whose body is not JSON is not a confirmed removal. The
+        # agent that answered this call for months returned a plain-text
+        # 501 error page; anything that is not the agent's real JSON
+        # contract must fail, not be optimistically read as success.
+        logger.warning(
+            "radius_nas_bridge_deregister_unparseable_response",
+            extra={"nas_identifier": nas_identifier},
+        )
+        raise RadiusNasBridgeDeregistrationError(
+            nas_identifier, "the RADIUS agent returned an unreadable response"
+        ) from exc
+
+    removed = body.get("removed") if isinstance(body, dict) else None
+    if not isinstance(removed, int) or removed < 0:
+        # No `removed` count means this is not the deregistration handler
+        # answering -- an older agent build, or some other service on the
+        # port. Treating an unrecognised 200 as a completed revocation is
+        # exactly the assumption that produced this bug in the first
+        # place.
+        logger.warning(
+            "radius_nas_bridge_deregister_uncorroborated",
+            extra={"nas_identifier": nas_identifier},
+        )
+        raise RadiusNasBridgeDeregistrationError(
+            nas_identifier,
+            "the RADIUS agent did not confirm how many client stanzas it removed",
+        )
+    return removed
 
 
 async def deregister_radius_nas_client(
@@ -202,20 +248,36 @@ async def deregister_radius_nas_client(
     nas_id: uuid.UUID,
     requesting_organization_id: uuid.UUID | None,
     actor_user_id: uuid.UUID | None,
-) -> RadiusNasClient:
-    """Soft-deletes ``nas_id`` (DB) *and* removes its live entry from the
-    real FreeRADIUS server (bridge) -- the one place both halves of a NAS's
-    deletion happen together, so every caller (the explicit admin endpoint
-    below, and ``app.domains.router.router.decommission_router``'s
-    composition of this same function) gets the fix, not just one of
-    them."""
+) -> tuple[RadiusNasClient, int]:
+    """Removes ``nas_id``'s live entry from the real FreeRADIUS server
+    (bridge) *and then* soft-deletes it (DB) -- the one place both halves
+    of a NAS's deletion happen together, so every caller (the explicit
+    admin endpoint below, and ``app.domains.router.router
+    .decommission_router``'s composition of this same function) gets the
+    same guarantee, not just one of them.
+
+    Returns the deleted row and the number of hub stanzas removed.
+
+    **Bridge first, database second, and no exception swallowed between
+    them.** The previous order (soft-delete, then best-effort bridge call)
+    is what let the two sides drift: the DB row disappeared, the bridge
+    call 501'd, the warning went to a log nobody reads, and the console
+    said "deleted". Doing the revocation first means the only two states
+    reachable are "neither happened, and the caller was told why" and
+    "both happened". A NAS that is still in the database is still
+    visible, still listed, and still deletable on a retry; a NAS that has
+    silently kept a live RADIUS credential is none of those things.
+    """
+    nas_client = await service.get_nas_client(
+        nas_id, requesting_organization_id=requesting_organization_id
+    )
+    removed = await _deregister_nas_from_radius_bridge(nas_client.nas_identifier)
     nas_client = await service.delete_nas(
         nas_id=nas_id,
         requesting_organization_id=requesting_organization_id,
         actor_user_id=actor_user_id,
     )
-    await _deregister_nas_from_radius_bridge(nas_client.nas_identifier)
-    return nas_client
+    return nas_client, removed
 
 
 def _device_response(device: GuestDevice) -> dict[str, object]:
@@ -1351,15 +1413,31 @@ async def delete_radius_nas(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RadiusService = Depends(get_radius_service),
 ):
-    nas_client = await deregister_radius_nas_client(
+    nas_client, removed = await deregister_radius_nas_client(
         service,
         nas_id=nas_id,
         requesting_organization_id=requesting_organization_id,
         actor_user_id=uuid.UUID(user.id),
     )
+    # The message states what happened on the RADIUS server, not just in
+    # this database. "Deleted" on its own is what an operator saw while
+    # the hub silently kept the credential (see
+    # ``_deregister_nas_from_radius_bridge``); a bridge failure now never
+    # reaches this line at all, and a zero-stanza removal says so rather
+    # than reading as a revocation that occurred.
+    if removed:
+        message = (
+            f"RADIUS NAS client deleted and removed from the RADIUS server "
+            f"({removed} client stanza{'s' if removed != 1 else ''})"
+        )
+    else:
+        message = (
+            "RADIUS NAS client deleted; it had no client stanza on the "
+            "RADIUS server to remove"
+        )
     return build_response(
         success=True,
-        message="RADIUS NAS client deleted",
+        message=message,
         data=_nas_response(nas_client).model_dump(),
         request_id=_request_id(request),
     )
@@ -1626,6 +1704,12 @@ async def radius_accounting(
             username=payload.username,
             bytes_uploaded_delta=payload.bytes_uploaded_delta,
             bytes_downloaded_delta=payload.bytes_downloaded_delta,
+            # A real NAS sends running totals, never deltas -- see
+            # ``RadiusService.accounting_interim_update``. The delta
+            # fields stay wired up for the non-RADIUS callers that
+            # already use them; totals win when both are present.
+            bytes_uploaded_total=payload.bytes_uploaded_total,
+            bytes_downloaded_total=payload.bytes_downloaded_total,
         )
     elif payload.status_type == RADIUS_ACCT_STATUS_STOP:
         session = await service.accounting_stop(

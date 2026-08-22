@@ -15,6 +15,7 @@ from app.database.session import get_db_session
 from app.domains.otp.service import (
     EmailProviderNotConfiguredError,
     EmailProviderProtocol,
+    MailIdentity,
     get_configured_email_provider,
 )
 
@@ -37,9 +38,16 @@ def _resolve_email_provider(settings: Settings) -> EmailProviderProtocol | None:
     already treats ``None`` as "no real provider available" and records a
     graceful ``FAILED``/``email_error`` outcome instead (see that class's
     own docstring), the same "a send failure is never a rollback of the
-    already-created document" posture billing's own router documents."""
+    already-created document" posture billing's own router documents.
+
+    Identity: ``MailIdentity.DEFAULT`` -- the general ``smtp_*`` mailbox,
+    ``sales@wyfyguest.com`` in production. A quotation is commercial
+    correspondence and a reply to one must land with sales, not in the
+    admin inbox. This is the identity quotations already used; it is named
+    explicitly here so the sales half of the admin@/sales@ split is
+    readable at the call site instead of being an unstated default."""
     try:
-        return get_configured_email_provider(settings)
+        return get_configured_email_provider(settings, identity=MailIdentity.DEFAULT)
     except EmailProviderNotConfiguredError:
         return None
 

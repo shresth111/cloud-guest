@@ -106,6 +106,10 @@ class FakeMonitoringRepository:
     audit_entries: list[AuditLogEntry] = field(default_factory=list)
     router_events: list[RouterEvent] = field(default_factory=list)
     active_nas_count: int = 0
+    #  ``None`` means "mirror active_nas_count", so every pre-existing test
+    #  that only cares about the active count keeps its original meaning:
+    #  active_nas_count=0 stays the never-set-up platform it always was.
+    ever_nas_count: int | None = None
     latest_guest_activity: datetime | None = None
     wireguard_peers: list[WireGuardPeer] = field(default_factory=list)
 
@@ -195,6 +199,11 @@ class FakeMonitoringRepository:
 
     async def count_active_radius_nas_clients(self) -> int:
         return self.active_nas_count
+
+    async def count_radius_nas_clients_ever(self) -> int:
+        if self.ever_nas_count is None:
+            return self.active_nas_count
+        return self.ever_nas_count
 
     async def get_latest_guest_accounting_activity(self) -> datetime | None:
         return self.latest_guest_activity
@@ -555,6 +564,68 @@ async def test_check_freeradius_health_never_any_activity_is_degraded():
     service, _ = _make_service(repository=repo)
     result = await service.check_freeradius_health()
     assert result.status == HealthStatus.DEGRADED
+
+
+# ----------------------------------------------------------------------------
+# "Never set up" vs "was set up, now has nothing active"
+#
+# Both are zero active NAS clients and both reported the identical UNKNOWN
+# with the identical "No RADIUS NAS clients are registered yet" message,
+# which is actively misleading in the second case: on 2026-08-22 an operator
+# deleted five NAS clients through the console and the dashboard went on
+# describing a fleet that had been live for weeks as a fresh install.
+#
+# Both stay UNKNOWN on purpose. This check cannot see the FreeRADIUS daemon
+# -- it infers from platform rows -- so it has no standing to call either
+# case DEGRADED, and a NAS row only ever leaves the active set because an
+# operator deactivated or deleted it, which makes zero active NAS clients an
+# intended administrative state at least as often as a fault. What differs
+# is the sentence a human reads and the evidence behind it.
+# ----------------------------------------------------------------------------
+
+
+async def test_freeradius_never_configured_says_so():
+    repo = FakeMonitoringRepository(active_nas_count=0, ever_nas_count=0)
+    service, _ = _make_service(repository=repo)
+    result = await service.check_freeradius_health()
+    assert result.status == HealthStatus.UNKNOWN
+    assert "never been set up" in result.error_message
+    assert result.details["nas_clients_ever_registered"] == 0
+
+
+async def test_freeradius_all_nas_clients_removed_is_not_reported_as_a_fresh_install():
+    repo = FakeMonitoringRepository(active_nas_count=0, ever_nas_count=6)
+    service, _ = _make_service(repository=repo)
+    result = await service.check_freeradius_health()
+    assert result.status == HealthStatus.UNKNOWN
+    assert "never been set up" not in result.error_message
+    assert "set up previously" in result.error_message
+    assert "6" in result.error_message
+    assert result.details["nas_clients_ever_registered"] == 6
+
+
+async def test_freeradius_zero_active_nas_is_never_promoted_past_unknown():
+    """Guard against a future "make the dashboard decisive" edit. Neither
+    zero-active state is observable enough to justify DEGRADED, and
+    inventing one would be worse than the UNKNOWN it replaced."""
+    for ever in (0, 1, 6, 100):
+        repo = FakeMonitoringRepository(active_nas_count=0, ever_nas_count=ever)
+        service, _ = _make_service(repository=repo)
+        result = await service.check_freeradius_health()
+        assert result.status == HealthStatus.UNKNOWN, ever
+
+
+async def test_freeradius_details_carry_the_evidence_for_the_message():
+    """The message asserts something; ``details`` has to show the counts it
+    asserts it from, or an operator has no way to check it."""
+    repo = FakeMonitoringRepository(
+        active_nas_count=0, ever_nas_count=6, latest_guest_activity=None
+    )
+    service, _ = _make_service(repository=repo)
+    result = await service.check_freeradius_health()
+    assert result.details["active_nas_clients"] == 0
+    assert result.details["nas_clients_ever_registered"] == 6
+    assert result.details["proxy_signal"] is True
 
 
 # ============================================================================

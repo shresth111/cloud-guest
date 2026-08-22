@@ -38,6 +38,7 @@ __all__ = [
     "RadiusNasAuthenticationError",
     "RadiusNasAlreadyRegisteredError",
     "RadiusNasNotFoundError",
+    "RadiusNasBridgeDeregistrationError",
     "CrossOrganizationNasAccessError",
     "InvalidNasStatusTransitionError",
     "InvalidAnalyticsDateRangeError",
@@ -223,6 +224,34 @@ class RadiusNasNotFoundError(GuestError):
         super().__init__(
             f"RADIUS NAS client not found: {nas_id}",
             status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class RadiusNasBridgeDeregistrationError(GuestError):
+    """The hub's FreeRADIUS agent did not confirm removal of this NAS's
+    live ``clients.conf`` stanza, so its shared secret may still be
+    accepted by the real RADIUS server.
+
+    Raised instead of logged-and-swallowed, which is what this path used
+    to do. Deleting a NAS is a credential revocation: until the hub has
+    confirmed the stanza is gone, the router can still authenticate
+    guests, and telling an operator the delete succeeded is a lie with
+    security consequences. Observed live on 2026-08-22 -- the agent had no
+    ``DELETE`` handler at all and answered every request ``501 Unsupported
+    method``, leaving 21 stanzas on the hub against 0 active NAS rows in
+    the database, all five of the freshly "deleted" ones included.
+
+    502 rather than 500: the failure is in a downstream dependency this
+    service called, exactly as ``register_external_radius_nas`` already
+    reports its own bridge failures.
+    """
+
+    def __init__(self, nas_identifier: str, reason: str) -> None:
+        super().__init__(
+            f"RADIUS NAS client '{nas_identifier}' was NOT removed from the "
+            f"RADIUS server and has not been deleted: {reason}. Its shared "
+            f"secret may still be live -- retry once the hub is reachable.",
+            status_code=status.HTTP_502_BAD_GATEWAY,
         )
 
 

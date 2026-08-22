@@ -162,6 +162,7 @@ from app.domains.otp.service import (
     EmailProviderProtocol,
     LoggingEmailProvider,
     SmtpEmailProvider,
+    SmtpIdentity,
     get_configured_email_provider,
 )
 from app.domains.rbac.authorization import AccessValidator
@@ -2079,22 +2080,34 @@ async def create_manual_invoice(
 
 def _get_invoice_email_provider(settings: Settings) -> EmailProviderProtocol:
     """Invoices go out from their own dedicated mailbox (finance/accounts),
-    independent of whichever account ``email_delivery_provider``/`smtp_*`
-    above is configured to use for everything else (OTP, password reset,
-    ...). Falls back to the shared provider when no invoice-specific
-    mailbox has been configured, so this is a no-op until
-    ``invoice_smtp_host`` is actually set."""
+    independent of both named identities in
+    ``app.domains.otp.service.MailIdentity`` (``admin@`` for guest OTP/
+    password reset/new-location welcome, the general ``smtp_*`` block for
+    everything else). It is deliberately NOT a ``MailIdentity`` member --
+    it predates that split, serves a different department, and folding it
+    in would make one of the two settings lie about itself. It does share
+    the :class:`SmtpIdentity` value object, so it gets the same
+    "never send as a mailbox you did not authenticate as" guarantee for
+    free rather than a second copy of the rule.
+
+    Falls back to the shared provider when no invoice-specific mailbox has
+    been configured, so this is a no-op until ``invoice_smtp_host`` is
+    actually set. A ``MailIdentityMismatchError`` from a half-configured
+    invoice mailbox surfaces to the caller, which already records it as
+    ``email_sent=False``/``email_error`` rather than rolling back a real
+    invoice or claiming a send that did not happen."""
     if not settings.invoice_smtp_host:
         return get_configured_email_provider(settings)
     return SmtpEmailProvider(
-        host=settings.invoice_smtp_host,
-        port=settings.invoice_smtp_port,
-        username=settings.invoice_smtp_username,
-        password=settings.invoice_smtp_password,
-        use_tls=settings.invoice_smtp_use_tls,
-        from_address=(
-            settings.invoice_smtp_from_address or settings.invoice_smtp_username
-        ),
+        SmtpIdentity.from_settings_block(
+            host=settings.invoice_smtp_host,
+            port=settings.invoice_smtp_port,
+            username=settings.invoice_smtp_username,
+            password=settings.invoice_smtp_password,
+            use_tls=settings.invoice_smtp_use_tls,
+            from_address=settings.invoice_smtp_from_address,
+            label="invoice_smtp",
+        )
     )
 
 

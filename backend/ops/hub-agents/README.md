@@ -14,7 +14,8 @@ deploy — do not hand-edit the VM.
 | Port | Service | Endpoint | Status |
 |---|---|---|---|
 | 9091 | `wg_agent.py` | `POST /wg/peer` | **live** — allocates a WireGuard peer + `/32`, returns keypair and endpoint |
-| 9092 | `radius_agent.py` | `POST /radius/client` | **live** — appends a `client { }` stanza to `clients.conf`, validates, restarts FreeRADIUS |
+| 9092 | `radius_agent.py` | `POST /radius/client` | **live** — writes a `client { }` stanza into `clients.conf`, validates, restarts FreeRADIUS. Since 2026-08-22 it *replaces* any existing stanza for the same `shortname` instead of appending (see below) |
+| 9092 | `radius_agent.py` | `DELETE /radius/client` | **in repo, NOT YET DEPLOYED** — removes every `client { }` stanza whose `shortname` matches, validates, restarts, re-reads the file to confirm. Body `{"nas_identifier": "..."}`, replies `{"status": "ok", "removed": N}` |
 | 9093 | `config_agent.py` | `POST /config/apply` | **RETIRED** — see below |
 
 All three run as `User=root` and authenticate with a single static shared
@@ -82,9 +83,11 @@ needs its own tested change:
 * **`next_free_ip()` is a TOCTOU race.** `ThreadingHTTPServer` with no lock:
   two concurrent `POST /wg/peer` calls can read the same free IP and both
   allocate it. The unlocked `open(wg0.conf, "a")` appends can also interleave.
-* **No deallocation path.** No `DELETE`, no peer removal. Every
-  re-registration burns a fresh IP permanently. 60 of 253 are gone; exhaustion
-  is a foreseeable outage.
+* **No deallocation path in `wg_agent.py`.** No `DELETE`, no peer removal.
+  Every re-registration burns a fresh IP permanently. 60 of 253 are gone;
+  exhaustion is a foreseeable outage. (`radius_agent.py`'s equivalent gap was
+  closed on 2026-08-22 — see below. `wg_agent.py`'s is still open and is out
+  of scope for that change.)
 * **`radius_agent.add_client()` does a full `systemctl restart freeradius` per
   call**, synchronously, inside the request handler. That drops the listening
   sockets for *every* router in the fleet to add *one* client. The journal
@@ -93,14 +96,19 @@ needs its own tested change:
   `flock`, which is what `ops/freeradius/sync_radius_clients.sh` already does
   correctly — the right behaviour exists in the repo and the wrong one is what
   is deployed.
-* **`add_client()` is a blind append with no upsert.** Re-registering a router
-  adds another stanza rather than updating. `clients.conf` currently holds 5
+* ~~**`add_client()` is a blind append with no upsert.**~~ **Fixed in this
+  directory 2026-08-22, not yet deployed.** Re-registering a router used to add
+  another stanza rather than updating: `clients.conf` on the live hub holds 5
   stanzas named `cg-cg-04f81868` and 7 named `cg-cg-11462682`, each with a
   *different* secret. FreeRADIUS keys clients by IP/CIDR, not name, so these
   all load without error — but a router whose tunnel IP shifts onto a stale
   stanza authenticates with a dead secret and 401s with no useful log.
   "Duplicate stanzas are harmless" is true of config parsing and false of
-  authentication.
+  authentication. `add_client` now strips every stanza with the same
+  `shortname` before writing the new one. **The 12 pre-existing duplicates are
+  still on the hub** — deploying the agent does not retroactively clean them;
+  they clear the next time each router re-registers, or via a
+  `DELETE /radius/client` per identifier.
 * **Backup filename collision.** `clients.conf.bak-{int(time.time())}` — two
   adds in the same second overwrite each other's backup, and the failure path
   restores it, silently erasing a concurrent add.
@@ -169,3 +177,49 @@ leaving a client stanza on the hub with **no matching `radius_nas_clients` row**
 in the platform DB. Observed live on 2026-08-22 with `Requires=` briefly set.
 `After=` only, as the captured original had. Fixing defect 3 (restart -> reload
 under flock) would remove the hazard at its root.
+
+### An eighth defect: the deregistration that never existed (fixed 2026-08-22)
+
+`app.domains.guest.router._deregister_nas_from_radius_bridge` had been sending
+`DELETE /radius/client` to this agent since it was written. `radius_agent.py`
+implemented only `do_POST`, so Python's `http.server` answered every one of
+them `501 Unsupported method ('DELETE')`. The backend caught the `HTTPError`,
+logged a WARNING, and **returned success to the operator anyway**.
+
+Measured on the live hub before the fix: **21 `client{}` stanzas in
+`clients.conf` against 0 active `radius_nas_clients` rows**, including the five
+an operator had deleted through the master console minutes earlier. Each still
+carried a valid shared secret the RADIUS server would still accept. Deleting a
+NAS is a credential revocation, so "reported deleted, still live" is a security
+bug, not a tidiness one.
+
+Three things changed:
+
+1. **`do_DELETE` exists**, keyed on `shortname`. Never on the `client <label>`:
+   `add_client` writes the label as `cg-<nas_identifier>` while the identifier
+   already begins with `cg-`, so live labels read `cg-cg-5d3a509e`, and they
+   are **not unique** — the hub carried seven separate stanzas all labelled
+   `cg-cg-11462682`, one per tunnel IP that router has been reallocated over
+   its lifetime. `shortname` is what the database holds and what
+   `%{client:shortname}` sends, so it is the only correct key. The doubled
+   label is cosmetic and deliberately left alone: FreeRADIUS indexes clients by
+   IP/CIDR, not by label.
+2. **`add_client` replaces instead of appending.** Appending is how one NAS
+   accumulated seven stanzas: each secret rotation left the previous one live,
+   bound to a tunnel IP WireGuard is free to hand to a different router. A
+   superseded stanza's `require_message_authenticator = yes` is carried over so
+   a re-registration cannot silently un-harden a router (BlastRADIUS,
+   CVE-2024-3596); `no` remains the default for a genuinely new NAS.
+3. **The backend fails loudly.** `_deregister_nas_from_radius_bridge` raises
+   `RadiusNasBridgeDeregistrationError` (502) on any transport error, non-JSON
+   body, or 200 that does not carry a `removed` count, and
+   `deregister_radius_nas_client` now calls the bridge **before** the DB
+   soft-delete. Only two outcomes are reachable: nothing happened and the
+   caller was told why, or both halves happened. Same for
+   `decommission_router`, which used to wrap the whole thing in
+   `except Exception: log a warning`.
+
+**Deployment ordering matters.** Ship the agent first, then the backend. With
+the new backend against the old agent, every NAS delete correctly but
+unhelpfully 502s, because the hub genuinely cannot confirm the removal. The
+reverse order (new agent, old backend) is harmless.

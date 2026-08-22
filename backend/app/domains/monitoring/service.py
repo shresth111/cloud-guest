@@ -676,22 +676,53 @@ class MonitoringService:
         driven session activity was recorded."""
         started = time.perf_counter()
         active_nas_count = await self.repository.count_active_radius_nas_clients()
+        ever_nas_count = await self.repository.count_radius_nas_clients_ever()
         latest_activity = await self.repository.get_latest_guest_accounting_activity()
         elapsed_ms = (time.perf_counter() - started) * 1000
         details: dict[str, object] = {
             "active_nas_clients": active_nas_count,
+            "nas_clients_ever_registered": ever_nas_count,
             "latest_accounting_activity_at": (
                 latest_activity.isoformat() if latest_activity else None
             ),
             "proxy_signal": True,
         }
         if active_nas_count == 0:
+            # Zero active NAS clients has two causes that look identical
+            # in the count and need opposite things from a human: nobody
+            # has set RADIUS up yet, or it was set up and every NAS client
+            # has since been deactivated or deleted. ``ever_nas_count``
+            # separates them from a real row count rather than a guess.
+            #
+            # BOTH stay UNKNOWN, and that is the point. This check cannot
+            # see the FreeRADIUS daemon (see the docstring above) -- it
+            # infers from platform state -- so it has no standing to call
+            # either case DEGRADED. It especially has none here: a
+            # ``RadiusNasClient`` row only ever leaves the active set
+            # because an operator deactivated or deleted it, so zero
+            # active NAS clients is by construction an intended
+            # administrative state at least as often as it is a fault.
+            # Reporting it as an outage would be inventing a reading. What
+            # changes between the two branches is the sentence a human
+            # reads, and the evidence in ``details`` behind it.
+            if ever_nas_count == 0:
+                message = (
+                    "RADIUS has never been set up: no NAS client has ever "
+                    "been registered on this platform"
+                )
+            else:
+                message = (
+                    f"RADIUS was set up previously but has no active NAS "
+                    f"clients left: all {ever_nas_count} ever registered are "
+                    f"now deactivated or deleted, so no router can "
+                    f"authenticate guests"
+                )
             return HealthCheckResult(
                 component=HealthComponent.FREERADIUS,
                 status=HealthStatus.UNKNOWN,
                 response_time_ms=round(elapsed_ms, 3),
                 details=details,
-                error_message="No RADIUS NAS clients are registered yet",
+                error_message=message,
             )
         if latest_activity is None:
             return HealthCheckResult(

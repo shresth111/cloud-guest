@@ -17,6 +17,11 @@ entirely by RBAC's ``RequirePermission`` in ``router.py``.
 defaulting to the honest interim ``LoggingSmsProvider``/
 ``LoggingEmailProvider``/``LoggingWhatsAppProvider`` (see ``service.py``'s
 module docstring) when unset.
+
+Email OTP is the one provider here that names a specific sending mailbox:
+``MailIdentity.ADMIN`` (``admin@wyfyguest.com``). See ``service.py``'s
+``MailIdentity`` for the full split and what happens when that mailbox is
+not configured.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .repository import OtpRepository, OtpRepositoryProtocol
 from .service import (
+    MailIdentity,
     OtpService,
     get_configured_email_provider,
     get_configured_sms_provider,
@@ -57,7 +63,16 @@ def get_otp_service(
         redis,
         audit_writer=audit_repository,
         sms_provider=get_configured_sms_provider(settings),
-        email_provider=get_configured_email_provider(settings),
+        # Verification codes go out from admin@wyfyguest.com
+        # (`Settings.admin_smtp_*`), not the general sales@ identity. This
+        # covers every OTP this service sends: the guest captive-portal
+        # code (`app.domains.guest`, the highest-volume mail on the
+        # platform) and the account data-masking code
+        # (`app.domains.user.router`) alike -- they are the same kind of
+        # message and there is no reason to split them.
+        email_provider=get_configured_email_provider(
+            settings, identity=MailIdentity.ADMIN
+        ),
         whatsapp_provider=get_configured_whatsapp_provider(settings),
         code_length=settings.otp_code_length,
         expiry_seconds=settings.otp_expiry_seconds,

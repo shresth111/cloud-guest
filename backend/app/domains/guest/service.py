@@ -4730,8 +4730,46 @@ class RadiusService:
         username: str,
         bytes_uploaded_delta: int,
         bytes_downloaded_delta: int,
+        bytes_uploaded_total: int | None = None,
+        bytes_downloaded_total: int | None = None,
     ) -> GuestSession:
+        """Prefers the NAS's cumulative counters over caller-supplied
+        deltas, converting them to a delta against what this session has
+        already recorded.
+
+        RADIUS has no delta attribute. ``Acct-Input-Octets``/
+        ``Acct-Output-Octets`` are running totals for the NAS's session
+        (RFC 2866 §5.3-5.4), so the wire can only ever report totals --
+        which is why ``ops/freeradius`` sends
+        ``bytes_uploaded_total``/``bytes_downloaded_total``, reassembled
+        from the 32-bit octet counter plus its ``Acct-*-Gigawords`` high
+        word. Feeding those totals into the delta parameters (the shape
+        the ``rest`` module was previously configured to send) makes every
+        interim update re-add the whole session to date: a session that
+        has moved 1 GB reports 1 GB on its first interim, 2 GB after two,
+        3 GB after three. Data caps and FUP quotas would then fire against
+        a number that grows quadratically with uptime.
+
+        ``max(0, total - recorded)`` is also what makes this idempotent.
+        RADIUS accounting retransmits are routine -- the NAS repeats an
+        unacknowledged packet, and the hub's own config deliberately
+        withholds the Accounting-Response while the backend is unreachable
+        so that it does. A repeated total yields a zero delta and changes
+        nothing; a delta-based protocol would double-count every one.
+
+        A total *below* what is already recorded means the NAS's counter
+        restarted (reboot, or a new NAS-side session mapped onto the same
+        ``GuestSession``). Clamping at 0 keeps usage monotonic rather than
+        crediting a guest back their quota, which is the safer direction
+        to be wrong in for a cap that exists to be enforced.
+        """
         session = await self._get_session_for_nas(nas_client, username)
+        if bytes_uploaded_total is not None:
+            bytes_uploaded_delta = max(0, bytes_uploaded_total - session.bytes_uploaded)
+        if bytes_downloaded_total is not None:
+            bytes_downloaded_delta = max(
+                0, bytes_downloaded_total - session.bytes_downloaded
+            )
         return await self.guest_service.record_usage(
             session_id=session.id,
             bytes_uploaded_delta=bytes_uploaded_delta,

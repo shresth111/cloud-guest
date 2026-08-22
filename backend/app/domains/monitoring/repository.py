@@ -130,6 +130,8 @@ class MonitoringRepositoryProtocol(Protocol):
     # -- FreeRADIUS proxy signal (composes with app.domains.guest) ------------
     async def count_active_radius_nas_clients(self) -> int: ...
 
+    async def count_radius_nas_clients_ever(self) -> int: ...
+
     async def get_latest_guest_accounting_activity(self) -> datetime | None: ...
 
     # -- WireGuard proxy signal (composes with app.domains.wireguard) --------
@@ -564,6 +566,22 @@ class MonitoringRepository:
                 RadiusNasClient.is_deleted.is_(False),
             )
         )
+        result = await self.session.execute(statement)
+        return int(result.scalar_one())
+
+    async def count_radius_nas_clients_ever(self) -> int:
+        """Every ``RadiusNasClient`` row that has ever existed --
+        deactivated, soft-deleted, all of them.
+
+        Deliberately unfiltered, and deliberately separate from
+        ``count_active_radius_nas_clients``. It is the one clean signal
+        that separates "this platform has never had RADIUS set up" from
+        "this platform had RADIUS set up and no longer has any active NAS
+        client", which are the same number (zero active) but need
+        completely different things from whoever is reading the dashboard.
+        See ``MonitoringService.check_freeradius_health``.
+        """
+        statement = select(func.count()).select_from(RadiusNasClient)
         result = await self.session.execute(statement)
         return int(result.scalar_one())
 
