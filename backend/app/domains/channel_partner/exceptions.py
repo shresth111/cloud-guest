@@ -18,6 +18,8 @@ __all__ = [
     "ChannelPartnerError",
     "ChannelPartnerNotFoundError",
     "DuplicateGstNumberError",
+    "ChannelPartnerEmailMissingError",
+    "ChannelPartnerNotActiveError",
 ]
 
 
@@ -42,5 +44,44 @@ class DuplicateGstNumberError(ChannelPartnerError):
     def __init__(self, gst_number: str) -> None:
         super().__init__(
             f"A partner with GSTIN {gst_number} is already onboarded.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class ChannelPartnerEmailMissingError(ChannelPartnerError):
+    """``resend_welcome_message`` was asked to resend the email channel for
+    a partner whose ``email`` is ``NULL`` (it is optional at onboarding --
+    see ``schemas.ChannelPartnerCreateRequest``).
+
+    A refusal, deliberately, rather than a silently-skipped channel: the
+    operator explicitly asked for the email to go out, and reporting
+    anything other than "there is no address to send it to" would be the
+    "reported success while doing nothing" failure this domain exists to
+    avoid. ``409`` (not ``422``) for the same reason
+    ``app.domains.location.provisioning_service.OwnerNotProvisionedError``
+    uses it: the request is well-formed, the *row* is in the wrong state
+    for the action."""
+
+    def __init__(self, channel_partner_id: uuid.UUID | str) -> None:
+        super().__init__(
+            f"Channel partner {channel_partner_id} has no email address on "
+            "record, so the welcome email cannot be resent.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class ChannelPartnerNotActiveError(ChannelPartnerError):
+    """``resend_welcome_message`` was called for a partner that is not
+    ``ACTIVE`` -- see ``service.ChannelPartnerService.resend_welcome_message``'s
+    own docstring for why a revoked partner is refused rather than
+    re-welcomed."""
+
+    def __init__(
+        self, channel_partner_id: uuid.UUID | str, current_status: str
+    ) -> None:
+        super().__init__(
+            f"Channel partner {channel_partner_id} is {current_status}, not "
+            "active -- reactivate the partner before resending its welcome "
+            "message.",
             status_code=status.HTTP_409_CONFLICT,
         )

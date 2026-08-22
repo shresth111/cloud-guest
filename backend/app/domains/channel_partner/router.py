@@ -22,11 +22,18 @@ from app.domains.rbac.dependencies import CurrentUser, RequirePermission
 from .dependencies import get_channel_partner_service
 from .models import ChannelPartner
 from .schemas import (
+    ChannelPartnerChannelDeliveryResult,
     ChannelPartnerCreateRequest,
     ChannelPartnerListResponse,
+    ChannelPartnerResendWelcomeRequest,
+    ChannelPartnerResendWelcomeResponse,
     ChannelPartnerResponse,
 )
-from .service import ChannelPartnerService
+from .service import (
+    ChannelPartnerResendResult,
+    ChannelPartnerService,
+    WelcomeChannelOutcome,
+)
 
 router = APIRouter(prefix="/channel-partners", tags=["Channel Partners"])
 
@@ -66,6 +73,51 @@ def _onboard_message(partner: ChannelPartner) -> str:
             else " and the welcome email could not be sent either"
         )
     return message
+
+
+def _resend_message(result: ChannelPartnerResendResult) -> str:
+    """Same "the message reflects the real per-channel outcome" contract
+    ``_onboard_message`` above and ``app.domains.billing.router
+    ._send_invoice_email_and_build_response`` both hold to.
+
+    The word "resent" appears only for a channel whose send was positively
+    verified (``WelcomeChannelOutcome.sent``, not merely "didn't raise" --
+    see ``ChannelPartnerService._channel_outcome``). An attempted channel
+    that cannot be verified reports the failure, with the recorded reason
+    when there is one, so an operator reading only this line is never told
+    something went out when it didn't."""
+    partner = result.partner
+    parts: list[str] = []
+    if result.sms.attempted:
+        parts.append(
+            f"welcome SMS resent to {partner.phone}"
+            if result.sms.sent
+            else (
+                "the welcome SMS could not be sent"
+                + (f" ({result.sms.error})" if result.sms.error else "")
+            )
+        )
+    if result.email.attempted:
+        parts.append(
+            f"welcome email resent to {partner.email}"
+            if result.email.sent
+            else (
+                "the welcome email could not be sent"
+                + (f" ({result.email.error})" if result.email.error else "")
+            )
+        )
+    return f"{partner.name}: " + ", ".join(parts)
+
+
+def _build_channel_result(
+    outcome: WelcomeChannelOutcome,
+) -> ChannelPartnerChannelDeliveryResult:
+    return ChannelPartnerChannelDeliveryResult(
+        attempted=outcome.attempted,
+        sent=outcome.sent,
+        error=outcome.error,
+        sent_at=outcome.sent_at,
+    )
 
 
 @router.post(
@@ -148,6 +200,64 @@ async def get_channel_partner(
     return build_response(
         success=True,
         message="Channel partner retrieved",
+        data=response_payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/{channel_partner_id}/resend-welcome-message",
+    response_model=ApiResponse[ChannelPartnerResendWelcomeResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("channel_partners.manage"))],
+)
+async def resend_channel_partner_welcome_message(
+    request: Request,
+    channel_partner_id: uuid.UUID,
+    payload: ChannelPartnerResendWelcomeRequest,
+    user: AuthUser = Depends(CurrentUser),
+    service: ChannelPartnerService = Depends(get_channel_partner_service),
+):
+    """Re-sends the welcome message for an existing partner, on the
+    channels named in the body -- the console's "Send welcome message
+    again" action, and the only thing that fixes a partner whose first
+    send failed (re-running onboarding would create a duplicate row, and
+    against a real GSTIN just ``409``s).
+
+    ``POST .../resend-welcome-message`` matches this codebase's one
+    existing resend action, ``app.domains.location.router
+    .resend_welcome_email`` (``POST /locations/{id}/resend-welcome-email``,
+    gated on ``locations.manage``, re-entering the provisioning service's
+    own private ``_send_welcome_email``) -- only pluralised across the two
+    channels this domain has. Gated on ``channel_partners.manage``, the
+    same permission ``revoke_channel_partner`` below uses and for the same
+    reason: this is a mutation with a real-world, un-recallable side effect
+    on a third party, not a read. ``.manage`` is also already seeded as the
+    module's catch-all for exactly this kind of action (see
+    ``app.domains.rbac.seed.MODULE_ACTIONS``'s own comment on
+    ``CHANNEL_PARTNERS``); no new permission is introduced.
+
+    Always ``200`` when the partner exists and is active -- a failed or
+    unconfigured send is not a failed request, it is reported in the
+    per-channel ``sms``/``email`` results (and re-recorded on the row).
+    ``sent`` is true only for a verified send; the envelope's ``success``
+    never stands in for delivery. ``409`` when the partner is not active,
+    or when ``send_email`` is asked for a partner with no email on record;
+    ``422`` when neither channel is selected."""
+    result = await service.resend_welcome_message(
+        channel_partner_id,
+        actor_user_id=uuid.UUID(user.id),
+        send_sms=payload.send_sms,
+        send_email=payload.send_email,
+    )
+    response_payload = ChannelPartnerResendWelcomeResponse(
+        partner=_build_partner_response(result.partner),
+        sms=_build_channel_result(result.sms),
+        email=_build_channel_result(result.email),
+    )
+    return build_response(
+        success=True,
+        message=_resend_message(result),
         data=response_payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )
