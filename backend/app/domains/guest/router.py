@@ -43,6 +43,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.core.config import get_settings
 from app.domains.auth.models import AuthUser
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
@@ -135,11 +136,11 @@ nas_router = APIRouter(prefix="/radius/nas", tags=["RADIUS NAS Admin"])
 nas_cross_reference_router = APIRouter(tags=["RADIUS NAS Admin"])
 analytics_router = APIRouter(prefix="/guest-analytics", tags=["Guest Analytics"])
 
-# Same single-tenant FreeRADIUS bridge the Master console's Setup Script
-# panel calls directly from the browser -- duplicated here (not read from
-# settings) to match that existing convention exactly.
-_RADIUS_AGENT_URL = "http://20.219.72.235:9092/radius/client"
-_RADIUS_AGENT_SECRET = "radiusagent-f37ae8fca1db9695975657196ea19b2e"
+# The single-tenant FreeRADIUS bridge (ops/hub-agents/radius_agent.py,
+# port 9092). These WERE module constants hardcoded to the old hub's public
+# IP with the shared secret in cleartext in this file; both are now
+# Settings fields (CLOUDGUEST_HUB_RADIUS_AGENT_URL / _SECRET) read per
+# call. See app.domains.wireguard.router's identical note for why.
 
 logger = logging.getLogger(__name__)
 
@@ -177,11 +178,12 @@ async def _deregister_nas_from_radius_bridge(nas_identifier: str) -> None:
     previously never made at all)."""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
+            _settings = get_settings()
             resp = await client.request(
                 "DELETE",
-                _RADIUS_AGENT_URL,
+                _settings.hub_radius_agent_url,
                 headers={
-                    "X-Agent-Secret": _RADIUS_AGENT_SECRET,
+                    "X-Agent-Secret": _settings.hub_radius_agent_secret,
                     "Content-Type": "application/json",
                 },
                 json={"nas_identifier": nas_identifier},
@@ -1212,10 +1214,11 @@ async def register_external_radius_nas(
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
+            _settings = get_settings()
             resp = await client.post(
-                _RADIUS_AGENT_URL,
+                _settings.hub_radius_agent_url,
                 headers={
-                    "X-Agent-Secret": _RADIUS_AGENT_SECRET,
+                    "X-Agent-Secret": _settings.hub_radius_agent_secret,
                     "Content-Type": "application/json",
                 },
                 json={

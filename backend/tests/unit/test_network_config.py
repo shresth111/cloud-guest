@@ -2072,13 +2072,26 @@ class TestConfigAgentBridgeRetirement:
         to hardcode them."""
         import inspect
 
+        from app.domains.guest import router as guest_router_module
         from app.domains.network_config import router as nc_router
         from app.domains.router import device_credential_rotator
+        from app.domains.wireguard import router as wg_router_module
 
-        for module in (nc_router, device_credential_rotator):
+        for module in (
+            nc_router,
+            device_credential_rotator,
+            # Added after the hub migration: these two hardcoded the 9091 /
+            # 9092 bridge URLs AND their shared secrets in cleartext until
+            # both moved to Settings. The secrets have been rotated, so the
+            # committed ones are dead -- this stops a new one appearing.
+            wg_router_module,
+            guest_router_module,
+        ):
             source = inspect.getsource(module)
             assert "configagent-" not in source
             assert "20.219.72.235" not in source
+            assert "wgagent-" not in source
+            assert "radiusagent-" not in source
 
 
 class TestEveryRouteRequiresPermission:

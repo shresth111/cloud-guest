@@ -1,0 +1,25 @@
+[Unit]
+Description=CloudGuest RADIUS per-router client provisioning agent
+# Deliberately NOT Requires=freeradius.service. add_client() shells out to
+# `systemctl restart freeradius` inside the request handler (a known defect,
+# see ops/hub-agents/README.md), and with Requires= that restart propagates
+# back and STOPS this agent mid-request -- the client stanza gets written and
+# FreeRADIUS comes back up, but the caller's connection is dropped and the
+# backend reports a 502 for work that actually succeeded. Observed live
+# 2026-08-22. After= only, exactly as the captured original had it.
+After=network-online.target freeradius.service wyfy-agent-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Secret lives in a 0600 root-only EnvironmentFile, NOT inline Environment=
+# -- inline values are world-readable via `systemctl show`.
+EnvironmentFile=/etc/wyfy/hub-agents.env
+Environment=AGENT_BIND_ADDR=10.30.2.10
+ExecStart=/usr/bin/python3 /usr/local/sbin/radius_agent.py
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

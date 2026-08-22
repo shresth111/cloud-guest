@@ -1,0 +1,12 @@
+[Unit]
+Description=Host firewall restricting Wyfy hub agents (9091/9092) to the app subnet; 9093 closed
+Before=wg-agent.service radius-agent.service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wyfy-agent-firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
