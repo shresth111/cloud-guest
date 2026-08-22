@@ -169,3 +169,7 @@ jobs:
             echo ""
             echo "Deploy with: \`./scripts/deploy-app.sh --api ${{ github.sha }} --frontend keep\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+# Verified end to end on 2026-08-22: this job published a SHA-tagged
+# image that wyfy-infra/scripts/deploy-app.sh deployed and then rolled back
+# on the isolated rehearsal stack. See that repo for the transcript.
