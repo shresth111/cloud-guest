@@ -69,13 +69,39 @@ def render_client_block(
     still needs to authenticate; ``main()`` counts and logs how many rows
     hit this fallback so a recurrence is visible in
     ``/var/log/wyfy-radius-sync.log`` rather than silently repeating this
-    same incident once a second such NAS exists."""
+    same incident once a second such NAS exists.
+
+    **2026-08-22: ``backend_secret`` is mandatory, do not remove it.** The
+    live ``sites-enabled/default`` on the hub identifies the calling NAS to
+    the backend with
+
+        REST-HTTP-Header += "X-RADIUS-NAS-Identifier: %{client:shortname}"
+        REST-HTTP-Header += "X-RADIUS-Shared-Secret: %{client:backend_secret}"
+
+    ``%{client:ATTR}`` reads arbitrary named items back off whichever
+    ``client { }`` stanza matched this packet's source IP -- but *only*
+    items that stanza actually declares. This generator emitted no
+    ``backend_secret``, so the xlat expanded to the empty string, the
+    backend saw a blank ``X-RADIUS-Shared-Secret`` and 401'd **every**
+    authorize call: a total fleet outage, and precisely the 2026-08-18
+    incident's signature. Verified live on wyfy-prod-hub-vm 2026-08-22 with
+    ``freeradius -X`` + ``radclient``: with the field present the header
+    arrives populated; with it absent the header arrives empty and the
+    request is rejected. The live ``/usr/local/sbin/radius_agent.py`` (the
+    only thing writing NAS stanzas in production today, and whose source
+    lives in ``ops/hub-agents/``) has always emitted it -- this generator
+    was the odd one out.
+
+    Note this file writes ``clients.wyfy.conf``, which is a DIFFERENT file
+    from the ``clients.conf`` the live agent appends to, and which nothing
+    currently ``$INCLUDE``s. See ``ops/hub-agents/README.md``."""
     safe_name = f"nas_{str(nas_id).replace('-', '_')}"
     ipaddr = f"{tunnel_ip}/32" if tunnel_ip else "0.0.0.0/0"
     return (
         f"client {safe_name} {{\n"
         f"    ipaddr = {ipaddr}\n"
         f'    secret = "{secret}"\n'
+        f'    backend_secret = "{secret}"\n'
         f"    nas_type = other\n"
         f'    shortname = "{identifier}"\n'
         f"}}\n"

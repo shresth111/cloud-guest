@@ -1,0 +1,14 @@
+[Unit]
+Description=CloudGuest WireGuard peer provisioning agent
+After=network.target wg-quick@wg0.service
+
+[Service]
+Type=simple
+Environment=WG_AGENT_SECRET=__REDACTED_SEE_README__
+ExecStart=/usr/bin/python3 /usr/local/sbin/wg_agent.py
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

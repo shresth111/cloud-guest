@@ -1,0 +1,14 @@
+[Unit]
+Description=CloudGuest RADIUS per-router client provisioning agent
+After=network.target freeradius.service
+
+[Service]
+Type=simple
+Environment=RADIUS_AGENT_SECRET=__REDACTED_SEE_README__
+ExecStart=/usr/bin/python3 /usr/local/sbin/radius_agent.py
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
