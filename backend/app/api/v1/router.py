@@ -21,6 +21,7 @@ from app.domains.customer_provisioning.router import (
     router as customer_provisioning_router,
 )
 from app.domains.dashboard.router import router as dashboard_router
+from app.domains.demo_booking.router import router as demo_booking_router
 from app.domains.demo_request.router import router as demo_request_router
 from app.domains.device_sync.router import router as device_sync_router
 from app.domains.dhcp.router import router as dhcp_router
@@ -132,6 +133,7 @@ api_v1_router.include_router(system_router)
 api_v1_router.include_router(branding_router)
 api_v1_router.include_router(support_tickets_router)
 api_v1_router.include_router(demo_request_router)
+api_v1_router.include_router(demo_booking_router)
 api_v1_router.include_router(quotation_router)
 api_v1_router.include_router(assistant_router)
 api_v1_router.include_router(readiness_router)

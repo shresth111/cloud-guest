@@ -1086,6 +1086,159 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ======================================================================
+    # Demo booking calendar (app.domains.demo_booking)
+    # ======================================================================
+    # The availability rules behind the public "pick a time" calendar.
+    # Configuration rather than hardcoding, but deliberately NOT a
+    # scheduling admin UI -- the founder asked for a booking calendar, not
+    # Calendly. Changing the sales team's working week is a deploy-time
+    # decision here, which is the right weight for something that happens
+    # once a year.
+    #
+    # EVERY field in this block that names a time, a day or a date is
+    # expressed in `demo_booking_timezone`, never in UTC. See
+    # app.domains.demo_booking.availability's module docstring for the full
+    # convention and why it is written that way round.
+    #
+    # The list-shaped fields are plain comma-separated strings, not
+    # `list[str]`: pydantic-settings parses a list field from the
+    # environment as JSON, which would make
+    # `CLOUDGUEST_DEMO_BOOKING_BLACKOUT_DATES=2026-10-02` a startup crash
+    # instead of the obvious thing. They are parsed -- loudly, naming the
+    # offending token -- by `availability.parse_*`.
+
+    demo_booking_timezone: str = Field(
+        default="Asia/Kolkata",
+        description=(
+            "IANA zone every availability rule below is defined in, and "
+            "the zone slot times are displayed in. IST: the founder, the "
+            "sales team and effectively every visitor are in it. Instants "
+            "are always stored and returned in UTC regardless; this "
+            "governs which wall-clock hours those instants land on."
+        ),
+    )
+    demo_booking_workday_start: str = Field(
+        default="10:00",
+        description=(
+            "First slot start of the day, HH:MM in demo_booking_timezone."
+        ),
+    )
+    demo_booking_workday_end: str = Field(
+        default="18:00",
+        description=(
+            "Close of business, HH:MM in demo_booking_timezone. A slot must "
+            "fit entirely before this, so with a 30-minute slot the last "
+            "start is 17:30, not 18:00."
+        ),
+    )
+    demo_booking_slot_minutes: int = Field(
+        default=30,
+        ge=5,
+        le=480,
+        description=(
+            "Length of one demo. 30 minutes is what the sales team already "
+            "books manually. Changing this changes the published grid; it "
+            "does NOT move meetings already booked (DemoBooking.ends_at is "
+            "stored, not derived) -- see that model's own docstring for the "
+            "one overlap case this leaves open."
+        ),
+    )
+    demo_booking_buffer_minutes: int = Field(
+        default=0,
+        ge=0,
+        le=240,
+        description=(
+            "Gap between the end of one slot and the start of the next. "
+            "Default 0 -- back-to-back 30-minute calls on a 30-minute grid "
+            "is what sales does today; raise it if calls start running "
+            "over."
+        ),
+    )
+    demo_booking_lead_time_minutes: int = Field(
+        default=120,
+        ge=0,
+        le=10_080,
+        description=(
+            "Minimum notice: a slot starting sooner than this is neither "
+            "listed nor bookable. Two hours gives sales time to see the "
+            "booking before the call. Even at 0 a slot is never bookable "
+            "at or after its own start instant -- see "
+            "availability.BookingWindow.is_bookable."
+        ),
+    )
+    demo_booking_horizon_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        description=(
+            "How far ahead the calendar opens, in local calendar days from "
+            "today. 30 keeps the published calendar to something the team "
+            "can actually honour."
+        ),
+    )
+    demo_booking_working_days: str = Field(
+        default="0,1,2,3,4",
+        description=(
+            "Comma-separated Python weekday numbers (Monday 0 ... Sunday 6) "
+            "the team takes demos on. Default Mon-Fri."
+        ),
+    )
+    demo_booking_blackout_dates: str = Field(
+        default="",
+        description=(
+            "Comma-separated YYYY-MM-DD local dates on which nothing is "
+            "bookable -- public holidays, offsites. Reported to the UI as "
+            "its own day status ('blackout'), distinct from a weekend, "
+            "because 'we're closed for Diwali' and 'it's Sunday' are "
+            "different things to tell a visitor."
+        ),
+    )
+    demo_booking_max_active_per_email: int = Field(
+        default=2,
+        ge=0,
+        le=100,
+        description=(
+            "Hard cap on how many FUTURE confirmed slots one email address "
+            "may hold at once, checked against the database. This is the "
+            "guard that actually bounds 'someone scripts 500 bookings and "
+            "fills the calendar' -- a Redis counter can be flushed or "
+            "expire, held rows cannot. 0 disables the cap."
+        ),
+    )
+    demo_booking_max_attempts_per_window: int = Field(
+        default=10,
+        ge=1,
+        le=1000,
+        description=(
+            "Per-email booking attempts allowed inside "
+            "demo_booking_attempt_window_minutes, enforced with the same "
+            "Redis INCR+EXPIRE+TTL pattern as otp_max_requests_per_window. "
+            "Counts attempts, not successes, so a script losing race after "
+            "race is still throttled."
+        ),
+    )
+    demo_booking_attempt_window_minutes: int = Field(
+        default=60,
+        ge=1,
+        le=1440,
+        description=(
+            "Rolling window demo_booking_max_attempts_per_window applies to."
+        ),
+    )
+    demo_booking_lead_dedupe_minutes: int = Field(
+        default=60,
+        ge=0,
+        le=1440,
+        description=(
+            "How recently an unbooked lead from the same email may have "
+            "been created for a new booking attempt to reuse it instead of "
+            "creating a second queue entry. Covers the real case -- a "
+            "visitor who lost a slot race and immediately picked another "
+            "time. 0 disables reuse (every attempt is its own lead)."
+        ),
+    )
+
     sms_delivery_provider: str = Field(
         default="logging",
         description=(

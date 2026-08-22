@@ -79,6 +79,15 @@ RATE_LIMITED_PATH_PREFIXES: tuple[str, ...] = (
     # endpoints, matching every other prefix entry above's own
     # "whole-domain prefix, not method-specific" grain.
     "/api/v1/demo-requests",
+    # Public demo-booking calendar -- availability, book, cancel,
+    # reschedule. Unauthenticated for the same reason the form above is
+    # (see app.domains.demo_booking.router's module docstring), and this
+    # per-IP throttle is the first of the three layers that keep a script
+    # from filling the sales team's calendar; the other two (per-email
+    # attempts, and a hard cap on slots one address may hold) live in that
+    # domain. The prefix also covers the RBAC-gated console GET/PATCH,
+    # matching every other entry above's whole-domain grain.
+    "/api/v1/demo-bookings",
 )
 
 _RATE_LIMIT_KEY_TEMPLATE = "rate_limit:{client_ip}:{path}"
