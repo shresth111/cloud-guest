@@ -359,7 +359,44 @@ async def decommission_router(
     radius_service: RadiusService = Depends(get_radius_service),
     wireguard_service: WireGuardService = Depends(get_wireguard_service),
 ):
-    # Confirmed gap, same shape as the RadiusNasClient one below: a
+    # RADIUS first, before anything else is touched. A decommissioned
+    # router's RadiusNasClient row used to outlive decommissioning
+    # untouched -- ``ondelete="CASCADE"`` on that table's router_id FK
+    # never fires, since decommissioning only soft-deletes the Router row,
+    # and even a real DB-level delete would still never have told the live
+    # FreeRADIUS server to drop its clients.conf entry. Left uncleaned,
+    # that stanza keeps a valid shared secret for a router this call has
+    # just retired, and can collide with a future router re-provisioned
+    # onto the same tunnel IP.
+    #
+    # Ordering and error handling both changed on 2026-08-22. This block
+    # used to run last, wrapped in a bare ``except Exception: log a
+    # warning``, which meant a hub that refused the deregistration (it
+    # answered ``501`` to every one -- see
+    # ``app.domains.guest.router._deregister_nas_from_radius_bridge``)
+    # produced a fully "successful" decommission with the router's RADIUS
+    # credential still live. Running it first, and letting
+    # ``RadiusNasBridgeDeregistrationError`` propagate as a 502, means the
+    # only reachable outcomes are "the router still exists exactly as it
+    # did, and the caller was told why" or "the credential is genuinely
+    # revoked and the decommission proceeded". Retrying is safe: nothing
+    # before this point has been mutated. Routers that never registered a
+    # NAS -- most of them -- do not reach the bridge at all.
+    existing_nas, _nas_meta = await radius_service.list_nas_clients(
+        requesting_organization_id=None,
+        router_id=router_id,
+        page=1,
+        page_size=1,
+    )
+    if existing_nas:
+        await deregister_radius_nas_client(
+            radius_service,
+            nas_id=existing_nas[0].id,
+            requesting_organization_id=None,
+            actor_user_id=uuid.UUID(user.id),
+        )
+
+    # Confirmed gap, same shape as the RadiusNasClient one above: a
     # decommissioned router's WireGuardPeer row was never revoked here --
     # ``WireGuardService.revoke_tunnel`` exists (releases the tunnel IP
     # back to the pool and marks the peer REVOKED) but nothing ever called
@@ -390,39 +427,6 @@ async def decommission_router(
         router_id=router_id,
         requesting_organization_id=requesting_organization_id,
     )
-    # Confirmed gap: this router's RadiusNasClient row (if it ever
-    # registered one) previously outlived decommissioning untouched --
-    # ``ondelete="CASCADE"`` on that table's router_id FK never fires,
-    # since decommissioning only soft-deletes the Router row rather than
-    # actually deleting it, and even a real DB-level delete would still
-    # never have told the live FreeRADIUS server to drop its
-    # clients.conf entry. Left uncleaned, that stale entry can collide
-    # with a future router re-provisioned onto the same physical public
-    # IP (same site, ISP just handed the connection to a new device
-    # registration) -- see ``deregister_radius_nas_client``'s own
-    # docstring for the full write-up. Best-effort and non-fatal: most
-    # routers never register a NAS at all, and a RADIUS-side failure here
-    # must not block the decommission itself, which has already
-    # succeeded by this point.
-    try:
-        existing, _meta = await radius_service.list_nas_clients(
-            requesting_organization_id=None,
-            router_id=router_id,
-            page=1,
-            page_size=1,
-        )
-        if existing:
-            await deregister_radius_nas_client(
-                radius_service,
-                nas_id=existing[0].id,
-                requesting_organization_id=None,
-                actor_user_id=uuid.UUID(user.id),
-            )
-    except Exception:
-        logger.warning(
-            "router_decommission_radius_nas_cleanup_failed",
-            extra={"router_id": str(router_id)},
-        )
     return build_response(
         success=True,
         message="Router decommissioned",

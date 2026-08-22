@@ -104,6 +104,93 @@ investigating: no router ever had more than one non-deleted
 router's own `wireguard_peers.tunnel_ip_address` (`/32`) instead of the
 shared catch-all -- see `gen_clients_conf.py`'s module docstring.
 
+## 2026-08-22 — `accounting{}` was never wired up at all
+
+Until this date the string `rest` appeared **exactly once** in
+`/etc/freeradius/3.0/sites-available/default`, inside `authorize{}`. The
+`accounting{}` section was stock Ubuntu:
+
+```
+accounting {
+    detail
+    unix
+    -sql
+    exec
+    attr_filter.accounting_response
+}
+```
+
+So no Accounting-Start / Interim-Update / Stop packet has **ever** reached
+`POST /api/v1/radius/accounting` from a real router, on either estate. Every
+`GuestSession.bytes_uploaded`/`bytes_downloaded` on the live platform is 0,
+which means **data caps and FUP quotas did not enforce at all** and every usage
+figure on the customer dashboard was zero. Not migration damage — the old hub
+was identical. (The ~19 GB / 181 GB of session bytes visible in the live
+database is seeded demo data: 221 of 299 non-zero rows are exact multiples of
+1 MiB and all 318 rows share 55 distinct microsecond values.)
+
+Fixed by inserting the block in `sites-default.snippets.conf` into the live
+`accounting{}`, immediately **after** stock `detail`, plus the `accounting{}`
+rewrite in `rest.conf`. Three things are worth knowing before touching it:
+
+1. **Totals, not deltas.** RADIUS has no delta attribute — `Acct-Input-Octets`
+   / `Acct-Output-Octets` are running session totals (RFC 2866 §5.3-5.4). The
+   pre-existing `rest.conf` mapped them onto the backend's
+   `bytes_uploaded_delta`/`bytes_downloaded_delta`, which would have made every
+   interim update re-add the entire session to date. It now sends
+   `bytes_*_total` and `RadiusService.accounting_interim_update` converts to a
+   delta against what it already recorded — which also makes a RADIUS
+   retransmit a no-op instead of a double count.
+2. **`Acct-*-Gigawords` is not optional.** The octet counters are 32-bit and
+   wrap every 4 GiB; the high word lives in a separate attribute (RFC 2869
+   §5.1-5.2). Sending `Acct-Input-Octets` alone truncates every session past
+   4 GiB back to near zero — on a data cap that reads as "this guest has used
+   nothing" exactly when they have used the most.
+3. **Deliberate asymmetry in the `rest` rcode handling.** 4xx continues to an
+   `ok` so the NAS is acknowledged (resending a rejected packet cannot change
+   the answer, and an unacknowledged NAS retransmits until it gives up). 5xx
+   and connection failures are *not* overridden: `fail` keeps its default
+   `return`, no Accounting-Response is sent, and the NAS retransmits — which is
+   what a transient backend outage needs. Acking a packet the backend could not
+   record would destroy the usage data silently.
+
+### How this was verified before touching the live server
+
+An isolated FreeRADIUS instance was built on the hub itself (`/opt/frtest`,
+loopback-only on 18220/18230, same 3.2.1 binary, its own log/run dirs) with a
+purpose-built loopback client carrying `shortname`/`backend_secret`. Confirmed
+there, then removed:
+
+* All five `Acct-Status-Type` values produce **valid JSON** and the exact five
+  lowercase strings the backend dispatches on.
+* `%{expr:(%{Acct-Input-Gigawords} * 4294967296) + %{Acct-Input-Octets}}`
+  reassembles correctly: `3 GiB + 100` → `12884901988`.
+* `X-RADIUS-NAS-Identifier`/`X-RADIUS-Shared-Secret` resolve per-client from
+  the matched stanza.
+* Backend 200 → Accounting-Response. Backend 404 → Accounting-Response anyway.
+  Backend unreachable → **no** Accounting-Response, and the packet is in
+  `radacct/.../detail-<date>` for replay.
+
+After applying to the live server, the same rig was re-synced from the live
+files and pointed at the **real** backend (`10.30.1.10:8000`). It sent
+`{"status_type": "interim-update", ..., "bytes_uploaded_total": 12884901988,
+"bytes_downloaded_total": 4294967496, "disconnect_reason": ""}` and received the
+backend's genuine `401 {"success":false,"message":"RADIUS NAS authentication
+failed",...}` — expected, since the rig's NAS is not registered, and proof that
+the whole chain now runs.
+
+**Note on the older FreeRADIUS parser bugs below.** Bug #1 (single-quoted
+`data` never xlat-expands) still holds. Bug #2 (no nested `%{...}` inside
+`data`) was **not** reproduced on this hub's FreeRADIUS 3.2.1 — but the
+structural fix is kept anyway, because computing values in `unlang` first is
+required regardless for the unset-attribute guards, and reverting it buys
+nothing.
+
+**Never re-apply `sites-available/default` wholesale from this repo.** The live
+file is ahead of git: the 2026-08-18 dynamic-xlat and Message-Authenticator
+fixes were applied on the box and never committed.
+`sites-default.snippets.conf` is a diff, not a drop-in.
+
 ## Manual verification commands (matches what was actually run 2026-08-10)
 
 ```bash
