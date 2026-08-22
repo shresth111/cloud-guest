@@ -58,7 +58,12 @@ target-version = "py313"
 # Docker build context (see the commit that added vendor/wyfy-device-gateway)
 # -- lint this team's own code against these rules, not an upstream
 # package's own style.
-exclude = ["vendor"]
+# ops/hub-agents/ is a byte-for-byte capture of the three services running
+# on the WireGuard/RADIUS hub. Their source existed in no repository at all
+# until it was rescued from a VM that has since been deallocated. Reformatting
+# it would make this copy differ from what is actually deployed, which defeats
+# the point of capturing it -- so lint this team's own code, not the capture.
+exclude = ["vendor", "ops/hub-agents"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
