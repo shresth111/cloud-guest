@@ -28,6 +28,13 @@ class NotificationEventType(StrEnum):
     USER_INVITED = "user_invited"
     DEMO_REQUEST_RECEIVED = "demo_request_received"
     LOCATION_WELCOME_EMAIL = "location_welcome_email"
+    # app.domains.demo_booking -- the calendar behind "Book a Demo".
+    # DEMO_BOOKING_CONFIRMED is addressed to the *visitor*; the other two
+    # are addressed to the internal sales inbox
+    # (Settings.demo_request_notify_email).
+    DEMO_BOOKING_CONFIRMED = "demo_booking_confirmed"
+    DEMO_BOOKING_TEAM_NOTIFICATION = "demo_booking_team_notification"
+    DEMO_BOOKING_CANCELLED = "demo_booking_cancelled"
 
 
 # ============================================================================
@@ -60,6 +67,17 @@ MAIL_IDENTITY_BY_EVENT_TYPE: Mapping[NotificationEventType, MailIdentity] = (
             # already used; it is listed explicitly so the sales half of
             # the split is visible here rather than being an absence.
             NotificationEventType.DEMO_REQUEST_RECEIVED: MailIdentity.DEFAULT,
+            # A demo booking is the same commercial conversation as the
+            # demo request above -- the visitor's confirmation should come
+            # from, and be replyable to, the mailbox that will actually run
+            # the call. Listed explicitly for the same reason
+            # DEMO_REQUEST_RECEIVED is: the sales half of the split stays
+            # visible as a presence rather than an absence.
+            NotificationEventType.DEMO_BOOKING_CONFIRMED: MailIdentity.DEFAULT,
+            NotificationEventType.DEMO_BOOKING_TEAM_NOTIFICATION: (
+                MailIdentity.DEFAULT
+            ),
+            NotificationEventType.DEMO_BOOKING_CANCELLED: MailIdentity.DEFAULT,
         }
     )
 )

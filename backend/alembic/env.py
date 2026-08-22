@@ -13,6 +13,16 @@ from app.domains.api_keys import models as api_keys_models  # noqa: F401
 from app.domains.auth import models as auth_models  # noqa: F401
 from app.domains.billing import models as billing_models  # noqa: F401
 from app.domains.captive_portal import models as captive_portal_models  # noqa: F401
+
+# demo_request is imported alongside demo_booking, not for its own sake:
+# DemoBooking.demo_request_id is a ForeignKey("demo_requests.id"), and
+# SQLAlchemy resolves that target by table name at mapper-configuration
+# time -- with only one of the pair registered, Base.metadata would hold a
+# dangling reference. (demo_requests was previously absent from this list
+# entirely, along with several other domains -- a pre-existing gap in
+# autogenerate coverage, not something this migration introduced.)
+from app.domains.demo_booking import models as demo_booking_models  # noqa: F401
+from app.domains.demo_request import models as demo_request_models  # noqa: F401
 from app.domains.dns import models as dns_models  # noqa: F401
 from app.domains.firewall import models as firewall_models  # noqa: F401
 from app.domains.guest import models as guest_models  # noqa: F401

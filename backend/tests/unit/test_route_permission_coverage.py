@@ -186,6 +186,32 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "RateLimitMiddleware, not RBAC (see "
         "app.domains.demo_request.router's module docstring)."
     ),
+    # -- Public demo-booking calendar: same pre-identity category as the
+    # "Book a Demo" form above. A prospective customer picking a slot has
+    # no platform-user identity, so there is no RBAC permission they could
+    # be granted. See app.domains.demo_booking.router's module docstring
+    # for the four-layer abuse protection that stands in for RBAC here.
+    ("GET", "/api/v1/demo-bookings/availability"): (
+        "Public booking calendar -- read-only slot availability for a "
+        "prospective customer with no platform identity; protected by "
+        "RateLimitMiddleware, not RBAC."
+    ),
+    ("POST", "/api/v1/demo-bookings"): (
+        "Public 'Book a Demo' slot reservation -- a prospective customer "
+        "has no platform-user identity yet; protected by "
+        "RateLimitMiddleware plus a per-email attempt limiter and a hard "
+        "cap on slots one address may hold (see "
+        "app.domains.demo_booking.router's module docstring)."
+    ),
+    ("POST", "/api/v1/demo-bookings/{booking_id}/cancel"): (
+        "Gated by the per-booking opaque manage token in the request body "
+        "(SHA-256-compared in DemoBookingService._load_for_visitor), not "
+        "RBAC -- same category as POST /routers/provisioning/check-in."
+    ),
+    ("POST", "/api/v1/demo-bookings/{booking_id}/reschedule"): (
+        "Gated by the per-booking opaque manage token in the request body "
+        "-- see the cancel entry above."
+    ),
     ("POST", "/api/v1/webhooks/stripe"): (
         "Payment gateway webhook -- verified by Stripe request signature."
     ),
