@@ -37,4 +37,30 @@ jobs:
         run: ruff check .
 
       - name: Pytest
-        run: pytest --cov=app --cov-report=term-missing
+        run: pytest --cov=app --cov-report=term-missing --junitxml=junit.xml
+
+      # The suite has always gone green on every PR, which is exactly why
+      # nobody noticed a branch drop from 2,924 collected tests to 2,868 --
+      # 56 tests vanished and 29 of the survivors failed, while the summary
+      # kept the shape it always had. Green-but-smaller is the failure mode
+      # this repo actually has, so assert the count, not just the exit code.
+      #
+      # Raise MIN_TESTS when the real count moves up. It is a ratchet, not a
+      # target -- a floor that drifts down with the suite protects nothing.
+      - name: Assert the suite did not shrink
+        env:
+          MIN_TESTS: "2900"
+        run: |
+          total=$(python - <<'EOF'
+          import xml.etree.ElementTree as ET
+          r = ET.parse("junit.xml").getroot()
+          s = r if r.tag == "testsuite" else r.find("testsuite")
+          print(int(s.get("tests", 0)))
+          EOF
+          )
+          echo "collected: $total (floor: $MIN_TESTS)"
+          if [ "$total" -lt "$MIN_TESTS" ]; then
+            echo "::error::Test count fell to $total, below the floor of $MIN_TESTS."
+            echo "Either tests were deleted, or collection failed silently for part of the suite."
+            exit 1
+          fi
