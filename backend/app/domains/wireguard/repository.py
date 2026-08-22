@@ -45,7 +45,7 @@ class WireGuardRepositoryProtocol(Protocol):
     ) -> WireGuardPeer | None: ...
 
     async def get_peer_by_router_id(
-        self, router_id: uuid.UUID
+        self, router_id: uuid.UUID, *, include_deleted: bool = False
     ) -> WireGuardPeer | None: ...
 
     async def list_occupied_tunnel_ips(
@@ -102,7 +102,17 @@ class WireGuardRepository:
     ) -> WireGuardPeer | None:
         return await self.peers.get_by_id(peer_id, include_deleted=include_deleted)
 
-    async def get_peer_by_router_id(self, router_id: uuid.UUID) -> WireGuardPeer | None:
+    async def get_peer_by_router_id(
+        self, router_id: uuid.UUID, *, include_deleted: bool = False
+    ) -> WireGuardPeer | None:
+        if include_deleted:
+            statement = (
+                select(WireGuardPeer)
+                .where(WireGuardPeer.router_id == router_id)
+                .limit(1)
+            )
+            result = await self.session.execute(statement)
+            return result.scalar_one_or_none()
         results = await self.peers.get_all(filters={"router_id": router_id}, limit=1)
         return results[0] if results else None
 

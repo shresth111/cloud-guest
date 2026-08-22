@@ -366,8 +366,10 @@ class WireGuardService:
         validate_router_eligible_for_wireguard(router)
 
         server = await self.get_active_server()
-        existing = await self.repository.get_peer_by_router_id(router.id)
-        if existing is not None and not existing.is_revoked():
+        existing = await self.repository.get_peer_by_router_id(
+            router.id, include_deleted=True
+        )
+        if existing is not None and not existing.is_revoked() and not existing.is_deleted:
             raise WireGuardPeerAlreadyExistsError(router.id)
 
         peer, private_key = await self._allocate_and_persist(
@@ -482,9 +484,10 @@ class WireGuardService:
         external_public_key: str | None = None,
     ) -> tuple[WireGuardPeer, str]:
         exclude_id = existing.id if existing is not None else None
+        server_id = server.id
         for attempt in range(_MAX_ALLOCATION_ATTEMPTS):
             occupied = await self.repository.list_occupied_tunnel_ips(
-                server.id, exclude_peer_id=exclude_id
+                server_id, exclude_peer_id=exclude_id
             )
             tunnel_ip = allocate_tunnel_ip(server.tunnel_network_cidr, occupied)
             if external_public_key is not None:
@@ -499,10 +502,8 @@ class WireGuardService:
                 private_key, public_key = generate_wireguard_keypair()
             try:
                 if existing is not None:
-                    peer = await self.repository.update_peer(
-                        existing,
-                        {
-                            "server_id": server.id,
+                    update_fields: dict[str, object] = {
+                            "server_id": server_id,
                             "tunnel_ip_address": tunnel_ip,
                             "public_key": public_key,
                             "private_key_encrypted": encrypt_secret(private_key),
@@ -510,12 +511,18 @@ class WireGuardService:
                             "rotation_count": existing.rotation_count + 1,
                             "last_handshake_at": None,
                             "revoked_at": None,
-                        },
+                        }
+                    if existing.is_deleted:
+                        update_fields["is_deleted"] = False
+                        update_fields["deleted_at"] = None
+                    peer = await self.repository.update_peer(
+                        existing,
+                        update_fields,
                     )
                 else:
                     peer = await self.repository.create_peer(
                         router_id=router_id,
-                        server_id=server.id,
+                        server_id=server_id,
                         tunnel_ip_address=tunnel_ip,
                         public_key=public_key,
                         private_key_encrypted=encrypt_secret(private_key),
@@ -547,6 +554,12 @@ class WireGuardService:
                 # to make hitting this branch at all rare going forward. See
                 # request_id ef092a85-0ff0-49b8-801f-327b733288f5 for a live
                 # repro of the pre-fix crash.
+                server = await self.get_active_server()
+                server_id = server.id
+                if existing is not None:
+                    existing = await self.repository.get_peer_by_id(
+                        existing.id, include_deleted=True
+                    )
                 logger.warning(
                     "wireguard_tunnel_ip_allocation_conflict",
                     extra={"attempt": attempt + 1, "tunnel_ip": tunnel_ip},

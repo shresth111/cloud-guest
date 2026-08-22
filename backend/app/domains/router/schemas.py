@@ -325,6 +325,16 @@ class ProvisioningCheckInRequest(BaseModel):
     token: str = Field(..., min_length=1)
     wireguard_public_key: str | None = Field(default=None)
 
+    @field_validator("wireguard_public_key", mode="before")
+    @classmethod
+    def normalize_wireguard_public_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        return stripped or None
+
 
 class HeartbeatRequest(BaseModel):
     routeros_version: str | None = Field(default=None, max_length=50)

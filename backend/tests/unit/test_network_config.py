@@ -651,7 +651,7 @@ class TestRenderBootstrapScript:
                 api_base_url="http://api.cloudguest.example",
             )
 
-    def test_renders_identity_keypair_enrollment_and_config_pull(self) -> None:
+    def test_renders_identity_enrollment_and_wireguard_setup(self) -> None:
         lines = render_bootstrap_script(
             location_code="HQ-001",
             provisioning_token="one-time-token-abc",
@@ -659,34 +659,24 @@ class TestRenderBootstrapScript:
         )
         script = "\n".join(lines)
 
-        # Roughly 15 lines, not a full config dump -- see module docstring.
         assert len(lines) <= 15
 
         assert '/system identity set name="HQ-001"' in lines
-        assert any(
-            line.startswith("/interface wireguard add name=wg-cloudguard")
-            for line in lines
-        )
-        # The device's own public key is read locally, never a
-        # platform-generated one.
-        assert ":local pub [/interface wireguard get" in script
-        # The provisioning token is embedded, the private key never is.
         assert "one-time-token-abc" in script
-        assert "private-key" not in script
-        # Enrollment POST hits the real check-in endpoint over HTTPS.
+        assert "wireguard_public_key" not in script
+        assert "peer_private_key" in script
         assert (
             "https://api.cloudguest.example/api/v1/routers/provisioning/check-in"
             in script
         )
-        assert "http-method=post" in script
-        # Idempotent remove-then-add, comment-tagged.
-        assert '/ip address remove [find comment="CGBOOT"]' in lines
-        assert '/interface wireguard peers remove [find comment="CGBOOT"]' in lines
+        assert (
+            "https://api.cloudguest.example/api/v1/agent/wireguard-config"
+            in script
+        )
+        assert '($resp->"http-code") != "200"' in script
+        assert '($wgresp->"http-code") != "200"' in script
+        assert "/import file-name=cloudguest.rsc" not in script
         assert script.count('comment="CGBOOT"') >= 2
-        # Full config pull over HTTPS + import -- the real config-pull
-        # endpoint, not an invented one.
-        assert "https://api.cloudguest.example/api/v1/agent/config" in script
-        assert "/import file-name=cloudguest.rsc" in lines
 
     def test_default_wireguard_port_used_unless_overridden(self) -> None:
         lines = render_bootstrap_script(

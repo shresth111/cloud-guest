@@ -1261,6 +1261,7 @@ _BOOTSTRAP_MGMT_TAG = "CGBOOT"
 # a caller supplies.
 _CHECK_IN_PATH = "/api/v1/routers/provisioning/check-in"
 _AGENT_CONFIG_PATH = "/api/v1/agent/config"
+_AGENT_WIREGUARD_CONFIG_PATH = "/api/v1/agent/wireguard-config"
 _AGENT_HEARTBEAT_PATH = "/api/v1/agent/heartbeat"
 
 
@@ -1306,24 +1307,28 @@ def render_bootstrap_script(
     existing convention throughout."""
     _require_https(api_base_url, caller="render_bootstrap_script")
     check_in_url = f"{api_base_url}{_CHECK_IN_PATH}"
-    config_url = f"{api_base_url}{_AGENT_CONFIG_PATH}"
+    wg_config_url = f"{api_base_url}{_AGENT_WIREGUARD_CONFIG_PATH}"
     return [
         f'/system identity set name="{location_code}"',
-        f"/interface wireguard add name={WIREGUARD_INTERFACE_NAME} "
-        f"listen-port={wireguard_listen_port}",
-        ":local pub [/interface wireguard get "
-        f"[find name={WIREGUARD_INTERFACE_NAME}] public-key]",
+        f"/interface wireguard remove [find where name=\"{WIREGUARD_INTERFACE_NAME}\"]",
         ':local body ("{\\"token\\":\\"" . "'
-        f'{provisioning_token}" . "\\",\\"wireguard_public_key\\":\\"" '
-        '. $pub . "\\"}")',
+        + provisioning_token
+        + '" . "\\"}")',
         f':local resp [/tool fetch url="{check_in_url}" http-method=post '
         'http-header-field="Content-Type: application/json" http-data=$body '
         "output=user as-value]",
+        ':if (($resp->"http-code") != "200") do={ :error ("check-in failed: " . ($resp->"data")) }',
         ':local enroll [:deserialize from=json value=($resp->"data")]',
-        f'/ip address remove [find comment="{_BOOTSTRAP_MGMT_TAG}"]',
+        f':local wgresp [/tool fetch url="{wg_config_url}" '
+        'http-header-field=("X-Agent-Credential: " . ($enroll->"agent_credential")) '
+        "output=user as-value]",
+        ':if (($wgresp->"http-code") != "200") do={ :error ("wireguard-config failed: " . ($wgresp->"data")) }',
+        ':local wgcfg [:deserialize from=json value=($wgresp->"data")]',
+        f"/interface wireguard add name={WIREGUARD_INTERFACE_NAME} "
+        'private-key=($wgcfg->"peer_private_key") '
+        f"listen-port={wireguard_listen_port}",
         '/ip address add address=(($enroll->"tunnel_ip_address") . "/32") '
         f'interface={WIREGUARD_INTERFACE_NAME} comment="{_BOOTSTRAP_MGMT_TAG}"',
-        f'/interface wireguard peers remove [find comment="{_BOOTSTRAP_MGMT_TAG}"]',
         f"/interface wireguard peers add interface={WIREGUARD_INTERFACE_NAME} "
         'public-key=($enroll->"wireguard_server_public_key") '
         'endpoint-address=($enroll->"wireguard_endpoint_host") '
@@ -1331,10 +1336,6 @@ def render_bootstrap_script(
         'allowed-address=(($enroll->"wireguard_hub_tunnel_address") . "/32") '
         f"persistent-keepalive={DEFAULT_PERSISTENT_KEEPALIVE_SECONDS}s "
         f'comment="{_BOOTSTRAP_MGMT_TAG}"',
-        f'/tool fetch url="{config_url}" '
-        'http-header-field=("X-Agent-Credential: " . ($enroll->"agent_credential")) '
-        "dst-path=cloudguest.rsc",
-        "/import file-name=cloudguest.rsc",
     ]
 
 
