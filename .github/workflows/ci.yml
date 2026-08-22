@@ -10,6 +10,7 @@ on:
     paths:
       - "backend/**"
       - ".github/workflows/ci.yml"
+  workflow_dispatch:
 
 defaults:
   run:
@@ -64,3 +65,107 @@ jobs:
             echo "Either tests were deleted, or collection failed silently for part of the suite."
             exit 1
           fi
+
+  # ---------------------------------------------------------------------------
+  # Publish the api image to GHCR, tagged with the full commit SHA.
+  #
+  # This is a JOB IN THIS WORKFLOW, not a separate one, and it `needs` the
+  # gate above on purpose: an image that exists in the registry is a thing
+  # someone can deploy, so nothing that failed ruff/pytest/the test-count
+  # floor should ever get an image built for it.
+  #
+  # The tag is the FULL commit SHA and nothing else. There is deliberately
+  # no `latest` and no `main` tag: a moving tag cannot be a rollback target,
+  # because "roll back to latest" is not a statement about any particular
+  # build. Every deployable artifact here is addressable by exactly one
+  # immutable name.
+  #
+  # api, celery-worker and celery-beat all run FROM THIS ONE IMAGE (they
+  # differ only by `command:` in the prod compose file), so one image per
+  # commit covers all three and makes worker/api version skew impossible.
+  #
+  # Auth is the built-in GITHUB_TOKEN with `packages: write`. No PAT exists,
+  # so there is no long-lived registry credential to leak or rotate.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish api image to GHCR
+    needs: lint-and-test
+    # Publish from main (the real path), or from any ref via workflow_dispatch
+    # (so a deploy can be rehearsed against a branch build without merging).
+    # Either way the tag is the commit SHA, so a dispatch build is just as
+    # unambiguous as a main build.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          # Paths here are relative to the workspace root -- the
+          # `defaults.run.working-directory: backend` above applies only to
+          # `run:` steps, not to action inputs.
+          context: backend
+          file: backend/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}/api:${{ github.sha }}
+          # Stamp the commit into the image itself. Two reasons beyond
+          # tidiness: `docker inspect` on a running container then tells you
+          # which commit it is even if ~/deploy/versions.env is lost or wrong,
+          # and it guarantees every commit produces a distinct image digest --
+          # so deploy-app.sh's "is the container actually running the image I
+          # asked for" check cannot pass by coincidence.
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+          # Pinned, not left to the runner. The app VM is x86_64; a future
+          # arm64 runner would otherwise silently publish an image that
+          # cannot start there, and the failure would surface as a
+          # crash-looping container during a deploy rather than here.
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Keeps the package listing to one real manifest per tag instead of
+          # an extra unknown/unknown provenance entry, which makes
+          # `docker manifest inspect` in the deploy script unambiguous.
+          provenance: false
+
+      # `push: true` succeeding is not by itself evidence that the tag
+      # resolves -- pull it back by digest-bearing tag from a clean context.
+      - name: Verify the published tag actually resolves
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/api:${{ github.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker manifest inspect "$IMAGE" > /dev/null \
+            || { echo "::error::$IMAGE was pushed but does not resolve"; exit 1; }
+          echo "published: $IMAGE"
+          echo "digest:    $DIGEST"
+          {
+            echo "### api image published"
+            echo ""
+            echo '```'
+            echo "$IMAGE"
+            echo "$DIGEST"
+            echo '```'
+            echo ""
+            echo "Deploy with: \`./scripts/deploy-app.sh --api ${{ github.sha }} --frontend keep\`"
+          } >> "$GITHUB_STEP_SUMMARY"
