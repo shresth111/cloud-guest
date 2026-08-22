@@ -17,7 +17,14 @@ import re
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 # India's GSTIN is always exactly 15 characters:
 # [state code:2][PAN:10][entity code:1][default "Z":1][checksum:1].
@@ -34,8 +41,11 @@ __all__ = [
     "normalize_indian_phone",
     "normalize_gst_number",
     "ChannelPartnerCreateRequest",
+    "ChannelPartnerResendWelcomeRequest",
     "ChannelPartnerResponse",
     "ChannelPartnerListResponse",
+    "ChannelPartnerChannelDeliveryResult",
+    "ChannelPartnerResendWelcomeResponse",
 ]
 
 
@@ -93,6 +103,50 @@ class ChannelPartnerCreateRequest(BaseModel):
         return normalize_gst_number(value)
 
 
+class ChannelPartnerResendWelcomeRequest(BaseModel):
+    """The Master console's "Resend welcome message" action.
+
+    Both channels are opt-in and independently selectable, and both
+    default to ``False``: SMS and email fail independently and are recorded
+    independently (``welcome_sms_error``/``welcome_email_error``), so the
+    common real case -- the email bounced off an unauthenticated SMTP
+    account while the SMS went out fine -- must be fixable *without*
+    re-sending the SMS, which costs money and annoys the recipient. Boolean
+    per-channel opt-in mirrors
+    ``app.domains.location.provisioning_schemas.OwnerInputSchema
+    .send_welcome_sms``'s own shape.
+
+    Neither flag defaults to ``True``: an operator who omits the body
+    entirely gets a ``422`` telling them to name a channel, never a
+    surprise SMS.
+    """
+
+    send_sms: bool = Field(
+        default=False,
+        description=(
+            "Resend the welcome SMS to the partner's phone. Costs money "
+            "per send -- leave false unless the SMS is the channel that "
+            "failed."
+        ),
+    )
+    send_email: bool = Field(
+        default=False,
+        description=(
+            "Resend the welcome email. Requires the partner to have an "
+            "email address on record (it is optional at onboarding)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def require_at_least_one_channel(self) -> ChannelPartnerResendWelcomeRequest:
+        if not self.send_sms and not self.send_email:
+            raise ValueError(
+                "Select at least one channel to resend: set send_sms and/or "
+                "send_email to true."
+            )
+        return self
+
+
 # ============================================================================
 # Response schemas
 # ============================================================================
@@ -115,6 +169,60 @@ class ChannelPartnerResponse(BaseModel):
     welcome_email_error: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class ChannelPartnerChannelDeliveryResult(BaseModel):
+    """What actually happened on one channel during a resend.
+
+    ``attempted`` and ``sent`` are deliberately separate booleans. A
+    channel the caller didn't select is ``attempted=False`` (its ``error``/
+    ``sent_at`` still echo whatever the *previous* attempt left on the row,
+    so the console can render the full picture). A channel that was
+    attempted is ``sent=True`` only when the send was positively verified
+    -- see ``service.ChannelPartnerService._channel_outcome`` -- never
+    merely because nothing raised.
+    """
+
+    attempted: bool = Field(
+        description="Whether the caller asked for this channel this time."
+    )
+    sent: bool = Field(
+        description=(
+            "True only when this attempt was verified to have actually "
+            "delivered. Never true for an unattempted channel, and never "
+            "true on the strength of a previous attempt's success."
+        )
+    )
+    error: str | None = Field(
+        description=(
+            "The failure recorded on the row for this channel. For an "
+            "attempted channel this is this attempt's outcome; for an "
+            "unattempted one it is the stale error from before, left "
+            "untouched."
+        )
+    )
+    sent_at: datetime | None = Field(
+        description="The row's welcome_*_sent_at after this call."
+    )
+
+
+class ChannelPartnerResendWelcomeResponse(BaseModel):
+    """Dedicated response for the resend action -- mirrors
+    ``app.domains.location.provisioning_schemas.ResendWelcomeEmailResponse``'s
+    own "the resend endpoint gets its own response shape, not the bare
+    entity" precedent, and ``app.domains.billing.schemas
+    .InvoiceGenerateAndSendResponse``'s "entity + explicit per-send
+    outcome" split.
+
+    The envelope's own ``success`` means "the request was handled" (the
+    partner row is real and untouched by a delivery failure), exactly as it
+    does on onboarding and on invoice generate-and-send. Whether anything
+    *reached the partner* is these two per-channel results, never the
+    envelope."""
+
+    partner: ChannelPartnerResponse
+    sms: ChannelPartnerChannelDeliveryResult
+    email: ChannelPartnerChannelDeliveryResult
 
 
 class ChannelPartnerListResponse(BaseModel):

@@ -936,7 +936,18 @@ class AuditAction(StrEnum):
     # judgment call) -- only the later, destructive-ish status transition
     # is, the same "the mutation an operator can undo/needs a trail for" bar
     # ``ORGANIZATION_SUSPENDED``/``VOUCHER_BATCH_REVOKED`` are held to.
+    #
+    # ``CHANNEL_PARTNER_WELCOME_RESENT`` is the second such mutation: a
+    # deliberate operator-triggered re-delivery of the welcome message,
+    # which puts a real SMS/email in front of a third party (and, for SMS,
+    # spends money) -- exactly the bar above, and the same call
+    # ``LOCATION_WELCOME_EMAIL_SENT`` already makes for the location
+    # domain's own "resend welcome email" endpoint. Written whether or not
+    # the send actually succeeded: the *attempt* is what an operator
+    # chasing "did anyone already re-poke this partner?" needs the trail
+    # for, and the per-channel outcome rides along in ``event_metadata``.
     CHANNEL_PARTNER_REVOKED = "channel_partner_revoked"
+    CHANNEL_PARTNER_WELCOME_RESENT = "channel_partner_welcome_resent"
 
 
 # Actions that must never surface on an organization-scoped audit query --

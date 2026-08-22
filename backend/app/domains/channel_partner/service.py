@@ -21,6 +21,11 @@ attempted, and discarding it over an SMS/email hiccup would be worse than a
 manual follow-up. ``welcome_sms_error``/``welcome_email_error`` tell the
 operator plainly that the partner exists but a channel didn't go out, so
 they know to follow up manually.
+
+``resend_welcome_message`` is that follow-up's actual mechanism -- per
+channel, opt-in, re-entering the same private send helpers rather than a
+second send path. See its own docstring for the convention it follows and
+for why a revoked partner is refused.
 """
 
 from __future__ import annotations
@@ -50,7 +55,12 @@ from app.domains.otp.service import (
 from app.domains.rbac.enums import AuditAction
 
 from .constants import CHANNEL_PARTNER_PRODUCT_NAME, ChannelPartnerStatus
-from .exceptions import ChannelPartnerNotFoundError, DuplicateGstNumberError
+from .exceptions import (
+    ChannelPartnerEmailMissingError,
+    ChannelPartnerNotActiveError,
+    ChannelPartnerNotFoundError,
+    DuplicateGstNumberError,
+)
 from .models import ChannelPartner
 from .repository import ChannelPartnerRepositoryProtocol
 from .schemas import ChannelPartnerCreateRequest
@@ -79,6 +89,29 @@ class AuditLogWriter(Protocol):
 class ChannelPartnerListResult:
     items: list[ChannelPartner]
     meta: PaginationMeta
+
+
+@dataclass(frozen=True)
+class WelcomeChannelOutcome:
+    """One channel's outcome from a single ``resend_welcome_message`` call.
+
+    ``attempted`` and ``sent`` are kept apart on purpose. "We didn't try"
+    and "we tried and it didn't work" and "we tried and it worked" are
+    three different things an operator needs told apart, and collapsing
+    them into one boolean is precisely how an operation ends up reporting
+    success while having done nothing."""
+
+    attempted: bool
+    sent: bool
+    error: str | None
+    sent_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ChannelPartnerResendResult:
+    partner: ChannelPartner
+    sms: WelcomeChannelOutcome
+    email: WelcomeChannelOutcome
 
 
 class ChannelPartnerService:
@@ -259,6 +292,196 @@ class ChannelPartnerService:
         )
         return ChannelPartnerListResult(items=items, meta=meta)
 
+    # -- resend welcome message (Master console) ------------------------------
+
+    @staticmethod
+    def _channel_outcome(
+        *,
+        error: str | None,
+        sent_at: datetime | None,
+        previous_sent_at: datetime | None,
+    ) -> WelcomeChannelOutcome:
+        """Decides whether an attempted channel actually delivered.
+
+        Three conditions, all required, rather than the one that looks
+        sufficient:
+
+        * ``error is None`` -- ``_send_welcome_sms``/``_send_welcome_email``
+          clear the error column only on a real send, and set it on both
+          the provider-not-configured and the exception paths.
+        * ``sent_at is not None`` -- the timestamp was actually written.
+        * ``sent_at`` is *newer* than the value the row carried before this
+          attempt -- this is the load-bearing one. A row whose first
+          attempt succeeded and whose resend then failed keeps its old
+          ``welcome_*_sent_at`` (only the error column is written on
+          failure), so "there is a sent_at, therefore it sent" would report
+          a fresh success on the strength of a send that happened days ago.
+          That is exactly this project's recurring failure mode -- a check
+          that passes against stale/empty state and calls it success -- and
+          it is not going to be reintroduced here.
+
+        Anything that does not satisfy all three reads as not-verified,
+        which is the safe direction: an unverified real success is a
+        cosmetic annoyance, a fabricated one costs an operator a partner.
+        """
+        sent = (
+            error is None
+            and sent_at is not None
+            and (previous_sent_at is None or sent_at > previous_sent_at)
+        )
+        return WelcomeChannelOutcome(
+            attempted=True, sent=sent, error=error, sent_at=sent_at
+        )
+
+    async def resend_welcome_message(
+        self,
+        channel_partner_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        send_sms: bool = False,
+        send_email: bool = False,
+    ) -> ChannelPartnerResendResult:
+        """Re-attempts the welcome message on the channels the caller
+        selects, for a partner that already exists.
+
+        This is the follow-up mechanism this module's own docstring has
+        always assumed ("discarding it over an SMS/email hiccup would be
+        worse than a manual follow-up") but never provided: before this,
+        a partner whose welcome email failed -- e.g. the 2026-08 SMTP
+        ``(535, 'Authentication Failed')`` outage -- could only be
+        "retried" by onboarding them a second time, which just creates a
+        duplicate row (and, for a real GSTIN, doesn't even do that: it
+        409s).
+
+        Shape follows ``app.domains.location.provisioning_service
+        .LocationProvisioningService.resend_welcome_email`` -- this
+        codebase's one existing resend action -- which likewise re-enters
+        the *same* private send helper the original flow used, is gated on
+        its module's ``.manage`` permission, and writes a single audit
+        entry. It does not follow ``ProvisioningEngineService.retry_job``'s
+        "a retry is a new row" convention: that exists because a provision
+        job's per-attempt history is itself the product (``retry_of_job_id``
+        lineage, attempt numbers). A welcome message has no such history to
+        preserve -- the row carries exactly one outcome pair per channel,
+        by design -- so the retry updates it in place.
+
+        Channels are independent and opt-in (see
+        ``schemas.ChannelPartnerResendWelcomeRequest``). Each selected
+        channel goes through the *same* ``_send_welcome_sms``/
+        ``_send_welcome_email`` used at onboarding, so the
+        provider-not-configured guard, the ``Logging*Provider`` "that isn't
+        a real send" check, the error recording, and the sent-at/error
+        clearing can never drift between first attempt and retry.
+
+        Refuses a non-``ACTIVE`` partner (``ChannelPartnerNotActiveError``).
+        This is a deliberate decision, not an accident of ordering: the
+        message being resent is a *welcome* -- "You're onboarded as a
+        channel partner ... our team will be in touch shortly" -- and
+        sending that to someone whose partnership was revoked is worse
+        than sending nothing. Revoking is also the point at which an
+        operator has said "stop contacting this partner as a partner", and
+        a 409 that says "reactivate first" makes the contradiction visible
+        instead of quietly resolving it in favour of an outbound message.
+        (Reactivation has no endpoint yet -- see ``models.py``'s ``status``
+        comment -- so today this is a hard stop; that is the correct side
+        to fail on when the alternative is an un-recallable SMS/email.)
+        """
+        partner = await self.get_partner(channel_partner_id)
+
+        if partner.status != ChannelPartnerStatus.ACTIVE.value:
+            raise ChannelPartnerNotActiveError(partner.id, partner.status)
+
+        # Checked before anything is sent, so an operator asking for both
+        # channels on an email-less partner doesn't get a half-done action:
+        # nothing goes out and the response is unambiguous.
+        if send_email and not partner.email:
+            raise ChannelPartnerEmailMissingError(partner.id)
+
+        sms_sent_at_before = partner.welcome_sms_sent_at
+        email_sent_at_before = partner.welcome_email_sent_at
+
+        if send_sms:
+            partner = await self._send_welcome_sms(partner)
+            sms_outcome = self._channel_outcome(
+                error=partner.welcome_sms_error,
+                sent_at=partner.welcome_sms_sent_at,
+                previous_sent_at=sms_sent_at_before,
+            )
+        else:
+            sms_outcome = WelcomeChannelOutcome(
+                attempted=False,
+                sent=False,
+                error=partner.welcome_sms_error,
+                sent_at=partner.welcome_sms_sent_at,
+            )
+
+        if send_email:
+            partner = await self._send_welcome_email(partner)
+            email_outcome = self._channel_outcome(
+                error=partner.welcome_email_error,
+                sent_at=partner.welcome_email_sent_at,
+                previous_sent_at=email_sent_at_before,
+            )
+        else:
+            email_outcome = WelcomeChannelOutcome(
+                attempted=False,
+                sent=False,
+                error=partner.welcome_email_error,
+                sent_at=partner.welcome_email_sent_at,
+            )
+
+        logger.info(
+            "channel_partner_welcome_resent",
+            extra={
+                "channel_partner_id": str(partner.id),
+                "sms_attempted": sms_outcome.attempted,
+                "sms_sent": sms_outcome.sent,
+                "email_attempted": email_outcome.attempted,
+                "email_sent": email_outcome.sent,
+            },
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.CHANNEL_PARTNER_WELCOME_RESENT,
+            partner,
+            self._resend_audit_description(partner, sms_outcome, email_outcome),
+            event_metadata={
+                "sms": {
+                    "attempted": sms_outcome.attempted,
+                    "sent": sms_outcome.sent,
+                    "error": sms_outcome.error,
+                },
+                "email": {
+                    "attempted": email_outcome.attempted,
+                    "sent": email_outcome.sent,
+                    "error": email_outcome.error,
+                },
+            },
+        )
+        return ChannelPartnerResendResult(
+            partner=partner, sms=sms_outcome, email=email_outcome
+        )
+
+    @staticmethod
+    def _resend_audit_description(
+        partner: ChannelPartner,
+        sms: WelcomeChannelOutcome,
+        email: WelcomeChannelOutcome,
+    ) -> str:
+        """Names the real outcome per attempted channel -- an audit line
+        reading "welcome message resent" for an attempt that reached
+        nobody would be the same lie the response is careful not to
+        tell."""
+        parts = [
+            f"{label} {'sent' if outcome.sent else 'failed'}"
+            for label, outcome in (("SMS", sms), ("email", email))
+            if outcome.attempted
+        ]
+        return (
+            f"Welcome message resend attempted for channel partner "
+            f"'{partner.name}': {', '.join(parts)}"
+        )
+
     # -- revoke (Master console) ----------------------------------------------
 
     async def revoke_partner(
@@ -303,6 +526,8 @@ class ChannelPartnerService:
         action: AuditAction,
         partner: ChannelPartner,
         description: str,
+        *,
+        event_metadata: dict[str, object] | None = None,
     ) -> None:
         if self.audit_writer is None:
             return
@@ -312,7 +537,7 @@ class ChannelPartnerService:
             entity_type="channel_partner",
             entity_id=partner.id,
             description=description,
-            event_metadata={},
+            event_metadata=event_metadata or {},
             organization_id=None,
             location_id=None,
         )
@@ -321,6 +546,8 @@ class ChannelPartnerService:
 __all__ = [
     "ChannelPartnerService",
     "ChannelPartnerListResult",
+    "ChannelPartnerResendResult",
+    "WelcomeChannelOutcome",
     "AuditLogWriter",
     "SmsProviderProtocol",
     "EmailProviderProtocol",
