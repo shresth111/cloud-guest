@@ -5,7 +5,11 @@ See ``service.py``'s module docstring for the full outbox/dispatch design.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
+from types import MappingProxyType
+
+from app.domains.otp.service import MailIdentity
 
 
 class NotificationEventType(StrEnum):
@@ -24,6 +28,58 @@ class NotificationEventType(StrEnum):
     USER_INVITED = "user_invited"
     DEMO_REQUEST_RECEIVED = "demo_request_received"
     LOCATION_WELCOME_EMAIL = "location_welcome_email"
+
+
+# ============================================================================
+# Which mailbox each outbox event is sent FROM
+# ============================================================================
+# This is the answer to "which mailbox does a password reset come from?" --
+# one table, no tracing. Read it with app.domains.otp.service.MailIdentity,
+# which documents what each identity resolves to.
+#
+#   MailIdentity.ADMIN   -> Settings.admin_smtp_* -> admin@wyfyguest.com
+#   MailIdentity.DEFAULT -> Settings.smtp_*       -> sales@wyfyguest.com
+#
+# Only events that are deliberately routed appear here. Anything absent
+# uses MailIdentity.DEFAULT, i.e. exactly the identity it used before this
+# table existed -- adding an event to this table is the *only* way to move
+# it, so nothing moves by accident.
+#
+# The ADMIN entries below are the two outbox halves of the three-flow admin@
+# split; the third (guest OTP) is not an outbox event at all and names its
+# identity directly in app.domains.otp.dependencies.get_otp_service.
+MAIL_IDENTITY_BY_EVENT_TYPE: Mapping[NotificationEventType, MailIdentity] = (
+    MappingProxyType(
+        {
+            # admin@wyfyguest.com -- account security and onboarding mail
+            # addressed to a person using the product.
+            NotificationEventType.PASSWORD_RESET: MailIdentity.ADMIN,
+            NotificationEventType.LOCATION_WELCOME_EMAIL: MailIdentity.ADMIN,
+            # sales@wyfyguest.com -- a commercial lead landing in the
+            # mailbox that should reply to it. This is the identity it
+            # already used; it is listed explicitly so the sales half of
+            # the split is visible here rather than being an absence.
+            NotificationEventType.DEMO_REQUEST_RECEIVED: MailIdentity.DEFAULT,
+        }
+    )
+)
+
+
+def mail_identity_for_event(event_type: str) -> MailIdentity:
+    """Which mailbox ``event_type`` is sent from. Unknown/unrouted event
+    types get ``MailIdentity.DEFAULT`` -- the identity every outbox event
+    used before this table existed.
+
+    Takes a plain ``str`` because ``NotificationDelivery.event_type`` is a
+    persisted string column, and a row written before an enum member
+    existed (or after one was removed) must route somewhere sane instead of
+    raising inside the dispatch sweep.
+    """
+    try:
+        known = NotificationEventType(event_type)
+    except ValueError:
+        return MailIdentity.DEFAULT
+    return MAIL_IDENTITY_BY_EVENT_TYPE.get(known, MailIdentity.DEFAULT)
 
 
 class NotificationChannelType(StrEnum):

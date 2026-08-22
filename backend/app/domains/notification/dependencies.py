@@ -15,6 +15,7 @@ from app.core.storage import ObjectStorageProtocol, get_object_storage
 from app.database.session import get_db_session
 from app.domains.otp.service import (
     get_configured_email_provider,
+    get_configured_email_providers_by_identity,
     get_configured_sms_provider,
 )
 
@@ -37,6 +38,14 @@ def get_notification_service(
         repository,
         object_storage=object_storage,
         email_provider=get_configured_email_provider(settings),
+        # Per-mailbox providers: this domain's outbox carries both
+        # admin@-identity mail (password reset, new-location welcome) and
+        # sales@-identity mail (demo-request notifications), so the
+        # identity is chosen per row at dispatch time from
+        # `constants.MAIL_IDENTITY_BY_EVENT_TYPE`, not once here.
+        email_providers_by_identity=get_configured_email_providers_by_identity(
+            settings
+        ),
         sms_provider=get_configured_sms_provider(settings),
         max_attempts=settings.notification_max_delivery_attempts,
         retry_backoff_seconds=settings.notification_retry_backoff_seconds,

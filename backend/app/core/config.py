@@ -1018,6 +1018,60 @@ class Settings(BaseSettings):
     invoice_smtp_use_tls: bool = Field(default=True)
     invoice_smtp_from_address: str = Field(default="")
 
+    # ------------------------------------------------------------------
+    # Second named sending identity: the admin mailbox
+    # ------------------------------------------------------------------
+    # Outgoing mail is deliberately split across two real mailboxes:
+    #
+    #   admin@wyfyguest.com  -- guest OTP, password reset, new-location
+    #                           welcome  (this `admin_smtp_*` block,
+    #                           `MailIdentity.ADMIN`)
+    #   sales@wyfyguest.com  -- demo-request notifications, channel-partner
+    #                           welcome, quotations  (the general `smtp_*`
+    #                           block above, `MailIdentity.DEFAULT`, which
+    #                           is also what every other sender -- alerts,
+    #                           invites, voucher exports -- keeps using)
+    #
+    # The routing table that decides which flow gets which identity is
+    # `app.domains.otp.service.MailIdentity` plus
+    # `app.domains.notification.constants.MAIL_IDENTITY_BY_EVENT_TYPE`;
+    # read those two to answer "which mailbox does X come from?".
+    #
+    # This is a NEW, separately named block rather than a reuse of
+    # `invoice_smtp_*` above on purpose: `invoice_smtp_*` means "the
+    # finance/accounts mailbox" and nothing else, so pointing OTP at it
+    # would make both settings lie about themselves. Both blocks resolve
+    # through the same `SmtpIdentity` value object, so the host/username/
+    # password/From pairing rule is written once, not twice.
+    #
+    # Empty `admin_smtp_host` (the default) means "no second mailbox
+    # configured" -- every ADMIN-routed flow then falls back to the
+    # general `smtp_*` identity and says so in a log
+    # (`email_identity_fallback`), which is exactly today's behavior.
+    admin_smtp_host: str = Field(
+        default="",
+        description=(
+            "SMTP server hostname for the admin@ sending identity (guest "
+            "OTP, password reset, new-location welcome). Empty = fall back "
+            "to the general smtp_* identity."
+        ),
+    )
+    admin_smtp_port: int = Field(default=587, ge=1, le=65_535)
+    admin_smtp_username: str = Field(default="")
+    admin_smtp_password: str = Field(default="")
+    admin_smtp_use_tls: bool = Field(default=True)
+    admin_smtp_from_address: str = Field(
+        default="",
+        description=(
+            "From address for the admin@ identity. Empty defaults to "
+            "admin_smtp_username -- an identity always sends as the account "
+            "it authenticated as unless deliberately told otherwise, and "
+            "SmtpIdentity rejects a From that belongs to a different "
+            "account (Zoho answers that mismatch with '553 Sender is not "
+            "allowed to relay emails')."
+        ),
+    )
+
     demo_request_notify_email: str = Field(
         default="",
         description=(

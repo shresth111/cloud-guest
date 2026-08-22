@@ -54,6 +54,7 @@ from app.domains.otp.service import (
     EmailProviderProtocol,
     LoggingEmailProvider,
     LoggingSmsProvider,
+    MailIdentity,
     SmsProviderProtocol,
 )
 from app.domains.router_provisioning.service import render_template
@@ -63,6 +64,7 @@ from .constants import (
     NotificationChannelType,
     NotificationDeliveryStatus,
     NotificationEventType,
+    mail_identity_for_event,
 )
 from .events import (
     NotificationDelivered,
@@ -103,6 +105,9 @@ class NotificationService:
         *,
         object_storage: ObjectStorageProtocol | None = None,
         email_provider: EmailProviderProtocol | None = None,
+        email_providers_by_identity: (
+            Mapping[MailIdentity, EmailProviderProtocol] | None
+        ) = None,
         sms_provider: SmsProviderProtocol | None = None,
         max_attempts: int = 5,
         retry_backoff_seconds: int = 300,
@@ -112,9 +117,29 @@ class NotificationService:
         self.email_provider: EmailProviderProtocol = (
             email_provider or LoggingEmailProvider()
         )
+        # One already-built provider per named mailbox (see
+        # `constants.MAIL_IDENTITY_BY_EVENT_TYPE`). Each entry was resolved
+        # by `otp.service.get_configured_email_provider`, which is where an
+        # unconfigured identity has already fallen back to DEFAULT and
+        # logged it -- so a miss here just means "this deployment did not
+        # wire per-identity providers at all" and `email_provider` (the
+        # pre-existing single provider, unchanged) is used.
+        self.email_providers_by_identity: Mapping[
+            MailIdentity, EmailProviderProtocol
+        ] = dict(email_providers_by_identity or {})
         self.sms_provider: SmsProviderProtocol = sms_provider or LoggingSmsProvider()
         self.max_attempts = max_attempts
         self.retry_backoff_seconds = retry_backoff_seconds
+
+    def email_provider_for_event(self, event_type: str) -> EmailProviderProtocol:
+        """The email provider one outbox row is sent through, chosen by its
+        persisted ``event_type``. See
+        ``constants.MAIL_IDENTITY_BY_EVENT_TYPE`` for the routing table."""
+        identity = mail_identity_for_event(event_type)
+        provider = self.email_providers_by_identity.get(identity)
+        if provider is not None:
+            return provider
+        return self.email_provider
 
     # ========================================================================
     # Templates
@@ -351,7 +376,7 @@ class NotificationService:
     ) -> NotificationDeliveryStatus:
         try:
             if delivery.channel == NotificationChannelType.EMAIL.value:
-                await self.email_provider.send(
+                await self.email_provider_for_event(delivery.event_type).send(
                     delivery.recipient, delivery.subject or "", delivery.body
                 )
             else:

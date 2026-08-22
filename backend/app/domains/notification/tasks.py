@@ -27,6 +27,7 @@ from app.core.storage import get_object_storage
 from app.database.session import SessionLocal
 from app.domains.otp.service import (
     get_configured_email_provider,
+    get_configured_email_providers_by_identity,
     get_configured_sms_provider,
 )
 
@@ -48,6 +49,12 @@ async def _run_notification_dispatch_sweep_async() -> dict[str, int]:
             NotificationRepository(session),
             object_storage=get_object_storage(),
             email_provider=get_configured_email_provider(settings),
+            # This sweep is where outbox mail is actually sent, so this is
+            # the wiring that decides which mailbox each row leaves from --
+            # see `constants.MAIL_IDENTITY_BY_EVENT_TYPE`.
+            email_providers_by_identity=get_configured_email_providers_by_identity(
+                settings
+            ),
             sms_provider=get_configured_sms_provider(settings),
             max_attempts=settings.notification_max_delivery_attempts,
             retry_backoff_seconds=settings.notification_retry_backoff_seconds,

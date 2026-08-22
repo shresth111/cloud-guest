@@ -15,6 +15,7 @@ from app.database.session import get_db_session
 from app.domains.otp.service import (
     EmailProviderNotConfiguredError,
     EmailProviderProtocol,
+    MailIdentity,
     SmsProviderNotConfiguredError,
     SmsProviderProtocol,
     get_configured_email_provider,
@@ -41,9 +42,16 @@ def _resolve_email_provider(settings: Settings) -> EmailProviderProtocol | None:
     an unhandled 500 out of dependency resolution --
     ``ChannelPartnerService`` already treats ``None`` as "no real provider
     available" and records a graceful ``welcome_email_error`` outcome
-    instead (see that class's own docstring)."""
+    instead (see that class's own docstring).
+
+    Identity: ``MailIdentity.DEFAULT`` -- the general ``smtp_*`` mailbox,
+    ``sales@wyfyguest.com`` in production. A channel partner is a
+    commercial relationship and their reply belongs with sales. This is the
+    identity the welcome email already used; it is named explicitly here so
+    the sales half of the admin@/sales@ split is readable at the call site
+    instead of being an unstated default."""
     try:
-        return get_configured_email_provider(settings)
+        return get_configured_email_provider(settings, identity=MailIdentity.DEFAULT)
     except EmailProviderNotConfiguredError:
         return None
 

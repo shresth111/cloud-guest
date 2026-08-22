@@ -115,12 +115,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Protocol
 
 from redis.asyncio import Redis
@@ -363,6 +365,207 @@ class WhatsAppProviderNotConfiguredError(Exception):
     ``Settings.whatsapp_delivery_provider``."""
 
 
+class MailIdentityMismatchError(Exception):
+    """Raised when a :class:`SmtpIdentity` would be built with a ``From``
+    address belonging to a different account than the one its credentials
+    authenticate as.
+
+    This is not a theoretical guard. This platform has twice shipped a
+    configuration that authenticated as one Zoho mailbox while claiming to
+    send as another; Zoho answers that with ``553 Sender is not allowed to
+    relay emails``, which reads at a glance like a credential problem and
+    costs an evening to find. An identity is a username, a password and a
+    From address *together* -- so the only way to build one is through this
+    class, and this class refuses to hold a mismatched pair."""
+
+
+class MailIdentity(StrEnum):
+    """Which real mailbox a given outgoing message is sent from.
+
+    Outgoing mail on this platform is split across two mailboxes on
+    purpose. To answer "which mailbox does flow X come from?":
+
+    * flows sent directly by a service (guest OTP, quotations,
+      channel-partner welcome) name their identity at the point where
+      their ``EmailProviderProtocol`` is built -- grep for
+      ``get_configured_email_provider(`` and read the ``identity=``
+      argument;
+    * flows that go through the ``app.domains.notification`` outbox
+      (password reset, new-location welcome, demo-request notification)
+      are routed by event type in
+      ``app.domains.notification.constants.MAIL_IDENTITY_BY_EVENT_TYPE``.
+
+    Members:
+
+    ``DEFAULT``
+        The general ``Settings.smtp_*`` block. ``sales@wyfyguest.com`` in
+        production, which is where quotations, channel-partner welcomes and
+        demo-request notifications should come from -- and also, unchanged,
+        every other sender in this codebase that never asked for a specific
+        identity (monitoring alerts, user invites, voucher exports,
+        subscription reminders).
+
+    ``ADMIN``
+        The ``Settings.admin_smtp_*`` block. ``admin@wyfyguest.com`` in
+        production: guest OTP, password reset, new-location welcome. Falls
+        back to ``DEFAULT`` -- loudly, see
+        :func:`get_configured_email_provider` -- when that block is not
+        configured, so an unconfigured second mailbox degrades to exactly
+        today's behavior rather than failing.
+
+    Note there is no ``INVOICE`` member: invoice mail has its own
+    long-standing ``Settings.invoice_smtp_*`` block and its own selection
+    function in ``app.domains.billing.router``. It resolves through the
+    same :class:`SmtpIdentity` value object, so it gets the same
+    From/credentials guarantee, but it is not part of this routing table
+    and nothing here changes it.
+    """
+
+    DEFAULT = "default"
+    ADMIN = "admin"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SmtpIdentity:
+    """One complete SMTP sending identity: the server to connect to, the
+    account the connection authenticates as, and the address it sends as --
+    inseparable, by construction.
+
+    ``SmtpEmailProvider`` takes one of these and nothing else, so there is
+    no code path anywhere that can hand a provider a ``from_address`` from
+    one mailbox and a ``username``/``password`` from another: the two are
+    not separate arguments to begin with. See
+    :class:`MailIdentityMismatchError` for the production failures this
+    exists to make unrepresentable.
+
+    Build one with :meth:`from_settings_block`, never field-by-field from
+    scattered settings reads.
+    """
+
+    host: str
+    port: int
+    username: str
+    password: str
+    use_tls: bool
+    from_address: str
+    label: str = "smtp"
+
+    def __post_init__(self) -> None:
+        if not self.host:
+            raise MailIdentityMismatchError(
+                f"{self.label}: host is empty -- an identity with no server "
+                "cannot send."
+            )
+        if self.username and self.from_address != self.username:
+            raise MailIdentityMismatchError(
+                f"{self.label}: refusing to send as {self.from_address!r} "
+                f"while authenticating as {self.username!r}. A From address "
+                "must belong to the account whose credentials are used; "
+                "Zoho rejects the mismatch with '553 Sender is not allowed "
+                "to relay emails'. Configure both halves of one mailbox, or "
+                "leave the From empty to default to the username."
+            )
+        if not self.from_address:
+            raise MailIdentityMismatchError(
+                f"{self.label}: no From address and no username to derive "
+                "one from."
+            )
+
+    @classmethod
+    def from_settings_block(
+        cls,
+        *,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        use_tls: bool,
+        from_address: str,
+        label: str,
+    ) -> SmtpIdentity:
+        """Builds an identity from the six fields of **one**
+        ``Settings`` ``*_smtp_*`` block.
+
+        Every caller passes all six from the same block -- that is the
+        whole point, and why this is a classmethod on the value object
+        rather than six keyword arguments spread across each call site. An
+        empty ``from_address`` defaults to ``username``: an account sends
+        as itself unless deliberately told otherwise.
+        """
+        return cls(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            use_tls=use_tls,
+            from_address=from_address or username,
+            label=label,
+        )
+
+
+def smtp_host_setting_for(settings: Settings, identity: MailIdentity) -> str:
+    """The ``*_smtp_host`` setting backing ``identity`` -- the one field
+    that answers "was this mailbox configured at all?", as distinct from
+    "was it configured correctly?"."""
+    if identity is MailIdentity.ADMIN:
+        return settings.admin_smtp_host
+    return settings.smtp_host
+
+
+def resolve_smtp_identity(
+    settings: Settings, identity: MailIdentity
+) -> SmtpIdentity | None:
+    """The one place that maps a :class:`MailIdentity` onto its
+    ``Settings`` block. Returns ``None`` when that identity is not usable
+    -- either no server is configured for it, or its settings describe a
+    mailbox that cannot legally send as itself. The caller decides what
+    falling back means.
+
+    Each branch reads six fields from a single block and nothing else, so
+    a cross-mailbox mixture is not expressible here either.
+
+    A :class:`MailIdentityMismatchError` is caught and turned into
+    ``None``+ERROR rather than propagating: a hand-edited ``.env`` that
+    pairs ``admin@``'s username with ``sales@``'s From must not take down
+    guest OTP with a 500. Unusable means unusable; ADMIN then degrades to
+    the DEFAULT mailbox (which works) and DEFAULT raises
+    ``EmailProviderNotConfiguredError`` exactly as an empty ``smtp_host``
+    already does. Either way the misconfiguration is logged at ERROR with
+    the offending block named, and no mail is ever sent from a mailbox we
+    did not authenticate as.
+    """
+    try:
+        if identity is MailIdentity.ADMIN:
+            if not settings.admin_smtp_host:
+                return None
+            return SmtpIdentity.from_settings_block(
+                host=settings.admin_smtp_host,
+                port=settings.admin_smtp_port,
+                username=settings.admin_smtp_username,
+                password=settings.admin_smtp_password,
+                use_tls=settings.admin_smtp_use_tls,
+                from_address=settings.admin_smtp_from_address,
+                label="admin_smtp",
+            )
+        if not settings.smtp_host:
+            return None
+        return SmtpIdentity.from_settings_block(
+            host=settings.smtp_host,
+            port=settings.smtp_port,
+            username=settings.smtp_username,
+            password=settings.smtp_password,
+            use_tls=settings.smtp_use_tls,
+            from_address=settings.smtp_from_address,
+            label="smtp",
+        )
+    except MailIdentityMismatchError as exc:
+        logger.error(
+            "email_identity_invalid",
+            extra={"identity": identity.value, "error": str(exc)},
+        )
+        return None
+
+
 class SmtpEmailProvider:
     """Real ``EmailProviderProtocol`` implementation: sends via any
     standard SMTP server (SendGrid, Mailgun, Postmark, AWS SES's own SMTP
@@ -370,6 +573,11 @@ class SmtpEmailProvider:
     zero new dependencies. ``smtplib`` is synchronous; ``send`` bridges it
     through ``asyncio.to_thread``, the same sync-in-async bridge
     ``app.core.storage.S3ObjectStorage`` uses for boto3.
+
+    Takes exactly one argument -- a :class:`SmtpIdentity` -- deliberately.
+    It used to take ``host``/``port``/``username``/``password``/``use_tls``/
+    ``from_address`` as six independent keyword arguments, which made
+    "authenticate as A, send as B" a one-line typo away at every call site.
 
     ``body`` is expected to be the real, branded HTML every caller now
     builds via ``app.core.email_layout.render_email`` (see that module's
@@ -379,22 +587,38 @@ class SmtpEmailProvider:
     or requires plain text (and any scanner/preview that strips HTML)
     still gets a readable message, not a raw tag soup."""
 
-    def __init__(
-        self,
-        *,
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-        use_tls: bool,
-        from_address: str,
-    ) -> None:
-        self.host = host
-        self.port = port
-        self.username = username
-        self.password = password
-        self.use_tls = use_tls
-        self.from_address = from_address
+    def __init__(self, identity: SmtpIdentity) -> None:
+        self.identity = identity
+
+    # Read-only passthroughs. They exist so this class still reads like a
+    # plain SMTP client at the point of use (``self.host``, ``self.port``)
+    # while the only *writable* representation of "who am I sending as" is
+    # the single frozen identity above -- there is no setter, and no
+    # constructor argument, that can move `from_address` away from the
+    # credentials it was validated against.
+    @property
+    def host(self) -> str:
+        return self.identity.host
+
+    @property
+    def port(self) -> int:
+        return self.identity.port
+
+    @property
+    def username(self) -> str:
+        return self.identity.username
+
+    @property
+    def password(self) -> str:
+        return self.identity.password
+
+    @property
+    def use_tls(self) -> bool:
+        return self.identity.use_tls
+
+    @property
+    def from_address(self) -> str:
+        return self.identity.from_address
 
     def _send_sync(
         self,
@@ -678,27 +902,94 @@ class ExotelSmsProvider:
             response.raise_for_status()
 
 
-def get_configured_email_provider(settings: Settings) -> EmailProviderProtocol:
+@functools.lru_cache(maxsize=32)
+def warn_email_identity_fallback(
+    requested_identity: str, email_delivery_provider: str, reason: str
+) -> None:
+    """Logs, at WARNING, that a named mail identity was asked for and could
+    not be honoured, so its mail is going out from the ``DEFAULT`` mailbox
+    instead.
+
+    Memoized on purpose. Provider selection happens per request (it is a
+    FastAPI dependency), and a guest-OTP-per-warning firehose is how a
+    warning stops being read -- which is the exact failure mode that let
+    ``535 Authentication Failed`` run unnoticed for days here. One WARNING
+    per distinct (identity, provider, reason) per process: loud on the
+    first send after every restart, silent thereafter.
+
+    ``warn_email_identity_fallback.cache_clear()`` re-arms it (tests do
+    this; nothing in production needs to).
+    """
+    logger.warning(
+        "email_identity_fallback",
+        extra={
+            "requested_identity": requested_identity,
+            "fallback_identity": MailIdentity.DEFAULT.value,
+            "email_delivery_provider": email_delivery_provider,
+            "reason": reason,
+        },
+    )
+
+
+def get_configured_email_provider(
+    settings: Settings, *, identity: MailIdentity = MailIdentity.DEFAULT
+) -> EmailProviderProtocol:
     """Selects the real ``EmailProviderProtocol`` implementation
     ``Settings.email_delivery_provider`` names, or :class:`LoggingEmailProvider`
     if unset/``"logging"``. Shared by this domain's own ``dependencies.py``,
     ``app.domains.monitoring``'s ``NotificationService`` wiring, and
     ``app.domains.notification`` -- one place to add a new provider, not
-    three copies of the same selection logic."""
+    three copies of the same selection logic.
+
+    ``identity`` names which mailbox the caller sends as (see
+    :class:`MailIdentity`). It defaults to ``DEFAULT``, so every call site
+    that does not care keeps behaving exactly as it did before this
+    parameter existed.
+
+    ``MailIdentity.ADMIN`` resolves to its own ``admin_smtp_*`` mailbox
+    only when two things are true: ``email_delivery_provider`` is
+    ``'smtp'`` (a checkout in ``'logging'`` mode must not start sending
+    real mail just because a second mailbox happens to be configured, and
+    ``'ses'`` has no per-message credentials for a second identity to use),
+    and ``admin_smtp_host`` is set. Otherwise it falls back to the
+    ``DEFAULT`` identity and logs ``email_identity_fallback`` at WARNING --
+    the fallback is today's working behavior, so it must degrade quietly
+    for the guest and loudly for us. Silent is what let ``535
+    Authentication Failed`` run unnoticed for days.
+    """
     provider = settings.email_delivery_provider.lower()
-    if provider == "smtp":
-        if not settings.smtp_host:
-            raise EmailProviderNotConfiguredError(
-                "email_delivery_provider='smtp' but smtp_host is empty."
-            )
-        return SmtpEmailProvider(
-            host=settings.smtp_host,
-            port=settings.smtp_port,
-            username=settings.smtp_username,
-            password=settings.smtp_password,
-            use_tls=settings.smtp_use_tls,
-            from_address=settings.smtp_from_address,
+
+    if identity is not MailIdentity.DEFAULT:
+        named = (
+            resolve_smtp_identity(settings, identity) if provider == "smtp" else None
         )
+        if named is not None:
+            return SmtpEmailProvider(named)
+        if provider != "smtp":
+            reason = f"email_delivery_provider={provider!r} is not 'smtp'"
+        elif not smtp_host_setting_for(settings, identity):
+            reason = f"{identity.value}_smtp_host is empty"
+        else:
+            # The block exists but does not describe a mailbox that can
+            # send as itself. `resolve_smtp_identity` has already logged
+            # `email_identity_invalid` with the specific fault; don't
+            # restate it here and risk the two drifting apart.
+            reason = (
+                f"{identity.value}_smtp_* is configured but unusable -- see "
+                "the preceding email_identity_invalid log line"
+            )
+        warn_email_identity_fallback(identity.value, provider, reason)
+
+    if provider == "smtp":
+        default_identity = resolve_smtp_identity(settings, MailIdentity.DEFAULT)
+        if default_identity is None:
+            raise EmailProviderNotConfiguredError(
+                "email_delivery_provider='smtp' but smtp_host is empty, or "
+                "smtp_from_address belongs to a different account than "
+                "smtp_username (see the preceding email_identity_invalid "
+                "log line for which)."
+            )
+        return SmtpEmailProvider(default_identity)
     if provider == "ses":
         if not settings.ses_access_key_id or not settings.ses_from_address:
             raise EmailProviderNotConfiguredError(
@@ -712,6 +1003,25 @@ def get_configured_email_provider(settings: Settings) -> EmailProviderProtocol:
             from_address=settings.ses_from_address,
         )
     return LoggingEmailProvider()
+
+
+def get_configured_email_providers_by_identity(
+    settings: Settings,
+) -> dict[MailIdentity, EmailProviderProtocol]:
+    """One built provider per :class:`MailIdentity`, for callers that route
+    between mailboxes at send time rather than picking one up front --
+    ``app.domains.notification``'s outbox dispatch is the only such caller
+    today (see its ``constants.MAIL_IDENTITY_BY_EVENT_TYPE``).
+
+    Every entry goes through :func:`get_configured_email_provider`, so an
+    unconfigured identity has already fallen back to ``DEFAULT`` and logged
+    it by the time it lands in this dict -- callers never see a hole and
+    never have to implement fallback a second time.
+    """
+    return {
+        member: get_configured_email_provider(settings, identity=member)
+        for member in MailIdentity
+    }
 
 
 def get_configured_sms_provider(settings: Settings) -> SmsProviderProtocol:
@@ -1078,6 +1388,10 @@ __all__ = [
     "LoggingEmailProvider",
     "LoggingWhatsAppProvider",
     "SmtpEmailProvider",
+    "SmtpIdentity",
+    "MailIdentity",
+    "MailIdentityMismatchError",
+    "resolve_smtp_identity",
     "SesEmailProvider",
     "TwilioSmsProvider",
     "TwilioWhatsAppProvider",
@@ -1086,6 +1400,8 @@ __all__ = [
     "SmsProviderNotConfiguredError",
     "WhatsAppProviderNotConfiguredError",
     "get_configured_email_provider",
+    "get_configured_email_providers_by_identity",
+    "warn_email_identity_fallback",
     "get_configured_sms_provider",
     "get_configured_whatsapp_provider",
     "AuditLogWriter",
