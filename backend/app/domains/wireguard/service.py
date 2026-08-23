@@ -217,6 +217,22 @@ class TunnelDeliveryInfo:
         self.server = server
 
 
+class HubPeerDeregistrar(Protocol):
+    """Removes a peer from the hub itself.
+
+    The hub is a second, independent record of the fleet: `wg0` plus
+    `wg0.conf` on the tunnel box. Marking a peer REVOKED in the database
+    frees its address for reuse HERE, while the hub keeps handing the old
+    peer that same address -- so the next router provisioned gets an address
+    another peer still claims, and WireGuard routes by allowed-ips.
+
+    Measured 2026-08-23: 72 peers on the hub against 1 in the database, 68 of
+    which had never completed a handshake.
+    """
+
+    async def __call__(self, public_key: str) -> None: ...
+
+
 class WireGuardService:
     """Core WireGuard business logic."""
 
@@ -227,11 +243,20 @@ class WireGuardService:
         *,
         audit_writer: AuditLogWriter | None = None,
         handshake_stale_after_minutes: int = 5,
+        hub_peer_deregistrar: HubPeerDeregistrar | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
         self.handshake_stale_after = timedelta(minutes=handshake_stale_after_minutes)
+        # INJECTED, and it lives on the SERVICE rather than at the two call
+        # sites on purpose. `revoke_tunnel` is reached from two places -- the
+        # WireGuard DELETE endpoint and router decommission -- and "remember
+        # to also tell the hub at every caller" is precisely the shape that
+        # produced this bug: one side updated, the other not, nothing
+        # reporting the difference. Injected rather than imported so the
+        # in-memory test suite can drive it without HTTP.
+        self.hub_peer_deregistrar = hub_peer_deregistrar
 
     # ========================================================================
     # Hub (WireGuardServer) management -- service-layer only in this
@@ -638,6 +663,25 @@ class WireGuardService:
         # ``nullable=False`` column and can never again collide with a real
         # allocated address.
         released_tunnel_ip = peer.tunnel_ip_address
+        revoked_public_key = peer.public_key
+
+        # THE HUB FIRST, AND ITS FAILURE IS FATAL.
+        #
+        # Order matters. Freeing the address in the database while the hub
+        # still holds it is the exact state that produced 68 orphaned peers:
+        # the allocator then hands that address to the next router while the
+        # old peer still claims it, and WireGuard routes by allowed-ips, so
+        # both break in a way that reads as "the tunnel is flaky".
+        #
+        # RAISES rather than logging a warning and carrying on. The
+        # RadiusNasClient deregistration made exactly that choice and the
+        # result was a database with zero NAS clients and a hub with 21
+        # stanzas, reported to the operator as success. A revoke that could
+        # not reach the hub has not revoked anything; saying otherwise is
+        # worse than failing.
+        if self.hub_peer_deregistrar is not None:
+            await self.hub_peer_deregistrar(revoked_public_key)
+
         updated = await self.repository.update_peer(
             peer,
             {
