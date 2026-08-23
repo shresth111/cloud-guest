@@ -54,9 +54,17 @@ POST   /routers/{id}/plans/{plan_id}/prepare
 POST   /routers/{id}/plans/{plan_id}/apply
 POST   /routers/{id}/plans/{plan_id}/verify/final
 
-GET    /routers/{id}/wan/basic/preview          # network_config domain
-POST   /routers/{id}/wan/basic/apply
+GET    /network-config/routers/{id}/wan/basic/preview   # network_config domain
+POST   /network-config/routers/{id}/wan/basic/apply
 ```
+
+> The `/network-config` prefix on those last two is load-bearing and is
+> not shown on the others because they really do live under `/routers`.
+> This table previously omitted it, and the frontend's
+> `router-fleet-wizard.service.ts` was written to match the table rather
+> than the router — so the wizard's WAN Apply step 404'd from the day it
+> shipped, and the server-side WAN renderer it calls went four frontend
+> PRs stale without anyone noticing, because nothing was consuming it.
 
 Implementation plan and architecture grounding:
 `~/wyfy-specs/router-fleet-implementation-plan.md`,

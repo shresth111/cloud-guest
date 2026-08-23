@@ -56,7 +56,7 @@ The wizard has **12 steps**. Status badges use `PASS` / `WARNING` / `ERROR` /
 | 1 | **Discover** | `POST /routers/{id}/discover` — read-only RouterOS sweep via `ReadOnlyDeviceReader`; persists sanitized `router_snapshots` row |
 | 2 | **Compatibility** | Model/firmware/memory checks against compatibility matrix (`GET /compatibility` or bundled in discover response) |
 | 3 | **WAN input** | Technician sets ISP link modes (DHCP/static/PPPoE), physical interfaces, optional DNS override |
-| 4 | **WAN apply** | Preview + push basic WAN profile (`GET/POST .../wan/basic/preview|apply`) |
+| 4 | **WAN apply** | Preview + push basic WAN profile (`GET/POST /network-config/routers/{id}/wan/basic/preview\|apply` — the `/network-config` prefix is required; omitting it 404s) |
 | 5 | **WAN verify** | `POST .../verify/wan` — per-link checks; **hard gate** (`gate_passes`) must be true before guest planning |
 | 6 | **Topology review** | Human review of bridges, WAN-in-bridge findings, addressing from snapshot (recommendations only — no device writes) |
 | 7 | **Guest input** | Select guest ports/VLAN intent; `GET .../guest/interfaces/availability` |
