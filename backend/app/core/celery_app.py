@@ -156,7 +156,9 @@ from app.domains.queue_management.constants import (
 )
 from app.domains.router.constants import (
     PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS,
+    STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP,
+    TASK_RUN_STALE_HEARTBEAT_SWEEP,
 )
 
 _settings = get_settings()
@@ -492,6 +494,28 @@ celery_app.conf.update(
         "router-provisioning-token-cleanup-sweep": {
             "task": TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP,
             "schedule": PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS,
+        },
+        # THE MISSING WRITER. Nothing on this platform ever moved a router
+        # out of ONLINE: `heartbeat()` wrote it and no beat task, service or
+        # endpoint ever wrote it back. A router that died weeks ago read as
+        # online to every consumer of `Router.status` -- both dashboards,
+        # analytics, exports, and any future alert rule.
+        #
+        # Every-60-seconds, far more often than anything else in this
+        # schedule, and deliberately: the THRESHOLD is 15 minutes
+        # (`ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`), so this interval only
+        # sets how much later than that the truth arrives. Hourly would mean
+        # a router could read online for 75 minutes after it stopped
+        # answering, and "offline" would mean something different depending
+        # on when you looked. The cost is one indexed query that usually
+        # returns nothing.
+        #
+        # See RouterService.sweep_stale_heartbeats for why PROVISIONING is
+        # deliberately NOT swept (a router mid-install has never sent a
+        # heartbeat by definition) and for the per-router isolation contract.
+        "router-stale-heartbeat-sweep": {
+            "task": TASK_RUN_STALE_HEARTBEAT_SWEEP,
+            "schedule": STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS,
         },
         # Monitoring domain: the Alert Engine's evaluation sweep -- the real
         # background job behind an already-fully-built-but-previously-

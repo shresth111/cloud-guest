@@ -822,6 +822,12 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "campaigns-sweep-status-transitions",
         "provisioning-engine-router-health-poll-sweep",
         "router-provisioning-token-cleanup-sweep",
+        # The only writer of ONLINE -> OFFLINE on the platform. Before it
+        # existed, `heartbeat()` wrote ONLINE and nothing ever wrote it
+        # back, so a router that died weeks ago read as online to every
+        # consumer of `Router.status`. Its absence from this set is not a
+        # missing schedule entry, it is a fleet whose status is fiction.
+        "router-stale-heartbeat-sweep",
         "notification-dispatch-sweep",
         "monitoring-alert-rule-evaluation-sweep",
         "provisioning-engine-router-snmp-metrics-poll-sweep",

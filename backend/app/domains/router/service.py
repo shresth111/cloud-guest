@@ -57,6 +57,7 @@ from app.database.utils.pagination import PaginationMeta
 from app.domains.location.enums import LocationStatus
 from app.domains.location.exceptions import LocationArchivedError
 from app.domains.location.models import Location
+from app.domains.monitoring.constants import ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES
 from app.domains.network_config.constants import BootstrapMode
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
@@ -423,9 +424,7 @@ class RouterService:
                 new_password=new_secret,
             )
         except DeviceCredentialRotationError as exc:
-            raise RouterLiveCredentialRotationFailedError(
-                router.id, str(exc)
-            ) from exc
+            raise RouterLiveCredentialRotationFailedError(router.id, str(exc)) from exc
 
     async def decommission_router(
         self,
@@ -811,6 +810,81 @@ class RouterService:
                     extra={"token_id": str(token.id), "error": str(exc)},
                 )
         return cleaned
+
+    async def sweep_stale_heartbeats(self) -> dict[str, int]:
+        """Beat-scheduled sweep (see
+        ``app.domains.router.tasks.run_stale_heartbeat_sweep``): moves every
+        ``ONLINE`` router whose last heartbeat is older than
+        ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`` to ``OFFLINE``.
+
+        THIS WRITER DID NOT EXIST. ``heartbeat()`` was the only thing that
+        ever wrote ``ONLINE`` and nothing ever wrote it back, so a router
+        that stopped answering weeks ago still read as online -- on the
+        customer dashboard, in Master console, and to every consumer of
+        ``Router.status`` including analytics and alerting. The frontend now
+        derives liveness from ``last_seen_at`` staleness itself, which fixes
+        what a person SEES; this fixes what the platform BELIEVES. Both are
+        needed: the frontend fix cannot help a report, an export, or a
+        future alert rule.
+
+        THE THRESHOLD IS THE ONE ALREADY IN USE, not a new one.
+        ``compute_lifecycle_stage`` and ``compute_internet_availability``
+        have always read staleness at
+        ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES``; the frontend's
+        ``location-liveness`` module uses the same number. A second,
+        slightly different definition of "offline" is how two screens start
+        disagreeing about one router.
+
+        ONLY ``ONLINE`` ROUTERS ARE TOUCHED. ``PROVISIONING`` is deliberately
+        left alone: a router mid-setup has never sent a heartbeat by
+        definition (the only transition out of ``PROVISIONING`` is
+        ``heartbeat``), so sweeping it would mark every router being
+        installed right now as offline. ``PENDING_PROVISIONING``,
+        ``SUSPENDED`` and ``DECOMMISSIONED`` are administrative states that a
+        missed heartbeat has no business overriding -- and
+        ``ROUTER_STATUS_TRANSITIONS`` does not permit those edges anyway.
+
+        Per-router failure isolation, mirroring
+        ``sweep_expired_provisioning_tokens`` above and every other
+        Beat-scheduled sweep here: one router's transition failing is logged
+        and skipped, never aborting the sweep for the rest.
+
+        AUDITED, unlike the token sweep. An expired token aging out is
+        routine housekeeping; a router being declared offline is a
+        statement about a venue's service that someone may later have to
+        account for -- with a null actor, because no human performed it.
+        Returns counts rather than a bare int so a run that swept nothing is
+        distinguishable from a run that failed on everything."""
+        cutoff = datetime.now(UTC) - timedelta(
+            minutes=ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES
+        )
+        stale = await self.repository.list_online_routers_with_stale_heartbeat(
+            cutoff=cutoff
+        )
+        marked = 0
+        failed = 0
+        for router in stale:
+            try:
+                updated = await self.repository.update_router(
+                    router, {"status": RouterStatus.OFFLINE.value}
+                )
+                await self._audit(
+                    None,
+                    AuditAction.ROUTER_MARKED_OFFLINE,
+                    router=updated,
+                    description=(
+                        f"Router '{updated.name}' marked offline -- no heartbeat for "
+                        f"more than {ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES} minutes"
+                    ),
+                )
+                marked += 1
+            except Exception as exc:  # noqa: BLE001 -- per-router isolation, see docstring
+                failed += 1
+                logger.warning(
+                    "router_stale_heartbeat_sweep_router_failed",
+                    extra={"router_id": str(router.id), "error": str(exc)},
+                )
+        return {"considered": len(stale), "marked_offline": marked, "failed": failed}
 
     # -- credential access ---------------------------------------------------------
 

@@ -28,7 +28,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 
+from .enums import RouterStatus
 from .models import Router, RouterProvisioningToken
+
+
+def stale_heartbeat_statement(*, cutoff: datetime):
+    """The ``ONLINE`` + stale-heartbeat query, built outside the repository
+    so it can be read without a database.
+
+    EXTRACTED DELIBERATELY. The suite drives ``RouterService`` through an
+    in-memory fake repository, so a predicate living only inside the real
+    method is executed by no test -- and this one carries a guarantee that
+    matters: ``PROVISIONING`` routers must NEVER be swept, because a router
+    mid-install has by definition never sent a heartbeat (the only
+    transition out of ``PROVISIONING`` is ``heartbeat``). Widening this to
+    include it would mark every router being installed right now as
+    offline. Measured, not assumed: doing exactly that left the entire
+    suite green, which is why this is no longer inlined.
+
+    ``last_seen_at IS NULL`` IS INCLUDED, deliberately. ``heartbeat()`` is
+    the only path into ``ONLINE`` and it always stamps ``last_seen_at``, so
+    a NULL here means the row came from somewhere else. Excluding it would
+    create a permanently unsweepable state -- the same bug in a smaller box.
+    """
+    return select(Router).where(
+        Router.is_deleted.is_(False),
+        Router.status == RouterStatus.ONLINE.value,
+        or_(Router.last_seen_at.is_(None), Router.last_seen_at < cutoff),
+    )
 
 
 class RouterRepositoryProtocol(Protocol):
@@ -73,6 +100,10 @@ class RouterRepositoryProtocol(Protocol):
     async def list_expired_unused_provisioning_tokens(
         self, *, now: datetime
     ) -> list[RouterProvisioningToken]: ...
+
+    async def list_online_routers_with_stale_heartbeat(
+        self, *, cutoff: datetime
+    ) -> list[Router]: ...
 
     async def soft_delete_provisioning_token(
         self, token: RouterProvisioningToken
@@ -186,6 +217,25 @@ class RouterRepository:
             RouterProvisioningToken.expires_at < now,
         )
         result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_online_routers_with_stale_heartbeat(
+        self, *, cutoff: datetime
+    ) -> list[Router]:
+        """Every live router still marked ``ONLINE`` whose last heartbeat is
+        older than ``cutoff`` -- for ``service.sweep_stale_heartbeats``.
+
+        This query had no caller and no equivalent anywhere, which is the
+        whole defect: ``ONLINE`` was written by ``heartbeat()`` and NOTHING
+        ever wrote it back. ``RouterStatus.OFFLINE``'s own docstring has
+        always described it as "was previously ``ONLINE`` but missed its
+        expected heartbeat window", and the ``ONLINE -> OFFLINE`` edge has
+        always been in ``ROUTER_STATUS_TRANSITIONS``. Only the writer was
+        missing, so a router that died weeks ago read as online for ever.
+
+        The predicate itself lives in ``stale_heartbeat_statement`` -- see
+        its docstring for why it is not inlined here."""
+        result = await self.session.execute(stale_heartbeat_statement(cutoff=cutoff))
         return list(result.scalars().all())
 
     async def soft_delete_provisioning_token(

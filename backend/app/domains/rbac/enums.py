@@ -247,6 +247,13 @@ class AuditAction(StrEnum):
     ROUTER_DECOMMISSIONED = "router_decommissioned"
     ROUTER_SUSPENDED = "router_suspended"
     ROUTER_REINSTATED = "router_reinstated"
+    # THE MISSING WRITER. `OFFLINE` has always been documented as "was
+    # previously ONLINE but missed its expected heartbeat window", and the
+    # ONLINE -> OFFLINE edge has always been allowed -- but nothing ever
+    # made that transition, so a router that stopped answering stayed
+    # `online` for ever. Written only by the heartbeat sweep, and audited
+    # with a null actor because no human performed it.
+    ROUTER_MARKED_OFFLINE = "router_marked_offline"
     ROUTER_PROVISIONING_TOKEN_GENERATED = "router_provisioning_token_generated"
     ROUTER_PROVISIONED = "router_provisioned"
 

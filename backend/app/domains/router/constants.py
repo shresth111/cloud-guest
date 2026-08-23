@@ -35,7 +35,25 @@ TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP = (
 # cleanup.
 PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS = 3600.0
 
+TASK_RUN_STALE_HEARTBEAT_SWEEP = "app.domains.router.tasks.run_stale_heartbeat_sweep"
+
+# Every 60 seconds, which is far more often than any other sweep here, and
+# deliberately so. This is the ONLY thing that ever moves a router out of
+# ``ONLINE``; until it runs, the platform believes a dead router is alive.
+# The threshold it enforces is 15 minutes
+# (``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES``), so the interval sets how
+# much LATER than 15 minutes the truth arrives -- at hourly, a router could
+# read online for 75 minutes after it stopped answering, and "offline" would
+# mean something different depending on when you looked.
+#
+# The cost is a single indexed query against ``ix_routers_status`` that in
+# the overwhelmingly common case returns nothing and writes nothing. That is
+# cheap in a way an hour of a wrong answer is not.
+STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS = 60.0
+
 __all__ = [
     "TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP",
     "PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_STALE_HEARTBEAT_SWEEP",
+    "STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS",
 ]
