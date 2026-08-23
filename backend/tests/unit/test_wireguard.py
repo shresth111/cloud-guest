@@ -468,6 +468,7 @@ def make_services(
     *,
     handshake_stale_after_minutes: int = 5,
     wireguard_repo: FakeWireGuardRepository | None = None,
+    hub_peer_deregistrar=None,
 ) -> Fixture:
     org_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup(organization_lookup=org_lookup)
@@ -490,6 +491,7 @@ def make_services(
         router_service,
         audit_writer=shared_audit,
         handshake_stale_after_minutes=handshake_stale_after_minutes,
+        hub_peer_deregistrar=hub_peer_deregistrar,
     )
 
     return Fixture(
@@ -1656,3 +1658,88 @@ class TestTenantIsolation:
             requesting_organization_id=organization.id,
         )
         assert peer.router_id == router_device.id
+
+
+class TestRevokeTellsTheHub:
+    """The database and the hub are two separate records of the same fleet.
+
+    Freeing an address here while the hub still hands it out is what left 68
+    orphaned peers on the tunnel box against 1 row in the database -- and it
+    means the next router provisioned is given an address another peer still
+    claims.
+    """
+
+    async def _peer(self, f):
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+        return router
+
+    async def test_revoke_removes_the_peer_from_the_hub(self) -> None:
+        called: list[str] = []
+
+        async def _dereg(public_key: str) -> None:
+            called.append(public_key)
+
+        f = make_services(hub_peer_deregistrar=_dereg)
+        router = await self._peer(f)
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        key = peer.public_key
+
+        await f.wireguard_service.revoke_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+
+        assert called == [key]
+
+    async def test_a_hub_that_cannot_be_reached_fails_the_revoke(self) -> None:
+        """NOT a warning. The RadiusNasClient deregistration logged and
+        carried on, and the result was a database with zero NAS clients, a
+        hub with 21 stanzas, and an operator told it had worked."""
+
+        async def _boom(public_key: str) -> None:
+            raise RuntimeError("hub bridge unreachable")
+
+        f = make_services(hub_peer_deregistrar=_boom)
+        router = await self._peer(f)
+
+        with pytest.raises(RuntimeError):
+            await f.wireguard_service.revoke_tunnel(
+                actor_user_id=uuid.uuid4(),
+                router_id=router.id,
+                requesting_organization_id=None,
+            )
+
+    async def test_a_failed_hub_call_leaves_the_address_still_taken(self) -> None:
+        """The ordering guarantee. If the hub still holds the peer, the
+        database must still consider that address occupied -- otherwise the
+        allocator hands it to the next router while the old peer keeps
+        claiming it, which is the whole failure."""
+
+        async def _boom(public_key: str) -> None:
+            raise RuntimeError("hub bridge unreachable")
+
+        f = make_services(hub_peer_deregistrar=_boom)
+        router = await self._peer(f)
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        held = peer.tunnel_ip_address
+
+        with pytest.raises(RuntimeError):
+            await f.wireguard_service.revoke_tunnel(
+                actor_user_id=uuid.uuid4(),
+                router_id=router.id,
+                requesting_organization_id=None,
+            )
+
+        after = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        assert after.status != PeerStatus.REVOKED.value
+        assert after.tunnel_ip_address == held
+        occupied = await f.wireguard_repo.list_occupied_tunnel_ips(peer.server_id)
+        assert held in occupied

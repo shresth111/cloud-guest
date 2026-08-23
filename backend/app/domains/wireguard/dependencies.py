@@ -18,9 +18,11 @@ cross-domain composition.
 
 from __future__ import annotations
 
+import httpx
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.common.exceptions import CloudGuestError
 from app.core.config import Settings, get_settings
 from app.database.session import get_db_session
 from app.domains.rbac.dependencies import get_rbac_repository
@@ -30,6 +32,58 @@ from app.domains.router.service import RouterService
 
 from .repository import WireGuardRepository, WireGuardRepositoryProtocol
 from .service import WireGuardService
+
+
+class HubBridgeUnavailableError(CloudGuestError):
+    """The hub's peer bridge could not be reached or refused the removal.
+
+    Deliberately its own error rather than a swallowed warning. A revoke
+    that never reached the hub has not revoked anything -- the address is
+    freed in the database while the hub still hands it out, which is the
+    state that left 68 orphaned peers on the tunnel box.
+    """
+
+    status_code = 502
+    error_code = "hub_bridge_unavailable"
+
+
+def make_hub_peer_deregistrar(settings: Settings):
+    """Builds the callable `WireGuardService` uses to remove a peer from the
+    hub, from the same settings the ALLOCATION path already uses.
+
+    Same URL and same shared secret as `allocate_external_wireguard_peer`'s
+    POST -- one bridge, two verbs. It is built here rather than imported
+    inside the service so the service stays drivable from the in-memory test
+    suite without HTTP.
+
+    A 404 from the bridge is SUCCESS, not failure: it means the hub does not
+    have this peer, which is the state we were trying to reach. Anything
+    else -- unreachable, 401, 500 -- raises, because those are all "we do
+    not know whether the hub still has it", and guessing is what produced
+    the drift.
+    """
+
+    async def _deregister(public_key: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.request(
+                    "DELETE",
+                    settings.hub_wg_agent_url,
+                    headers={"X-Agent-Secret": settings.hub_wg_agent_secret},
+                    json={"public_key": public_key},
+                )
+        except httpx.HTTPError as exc:
+            raise HubBridgeUnavailableError(
+                "Could not reach the WireGuard hub bridge to remove this peer"
+            ) from exc
+        if resp.status_code == 404:
+            return
+        if resp.status_code >= 400:
+            raise HubBridgeUnavailableError(
+                f"The WireGuard hub bridge refused the removal ({resp.status_code})"
+            )
+
+    return _deregister
 
 
 def get_wireguard_repository(
@@ -49,7 +103,13 @@ def get_wireguard_service(
         router_service,
         audit_writer=audit_repository,
         handshake_stale_after_minutes=settings.wireguard_handshake_stale_after_minutes,
+        hub_peer_deregistrar=make_hub_peer_deregistrar(settings),
     )
 
 
-__all__ = ["get_wireguard_repository", "get_wireguard_service"]
+__all__ = [
+    "get_wireguard_repository",
+    "get_wireguard_service",
+    "make_hub_peer_deregistrar",
+    "HubBridgeUnavailableError",
+]
