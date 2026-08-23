@@ -29,10 +29,12 @@ from app.domains.location.exceptions import (
     LocationNotFoundError,
 )
 from app.domains.location.models import Location
+from app.domains.monitoring.constants import ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES
 from app.domains.network_config.constants import BootstrapMode
 from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
+from app.domains.rbac.enums import AuditAction
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router.enums import RouterStatus
 from app.domains.router.exceptions import (
@@ -51,6 +53,7 @@ from app.domains.router.exceptions import (
     RouterNotFoundError,
 )
 from app.domains.router.models import Router, RouterProvisioningToken
+from app.domains.router.repository import stale_heartbeat_statement
 from app.domains.router.service import RouterService
 
 # ============================================================================
@@ -318,6 +321,20 @@ class FakeRouterRepository:
         token.is_deleted = True
         token.deleted_at = _now()
         return token
+
+    async def list_online_routers_with_stale_heartbeat(
+        self, *, cutoff: object
+    ) -> list[Router]:
+        """Mirrors the real query exactly, INCLUDING the `last_seen_at IS
+        NULL` arm. A fake that quietly narrows the real predicate is a test
+        that passes for a query nobody ships."""
+        return [
+            r
+            for r in self.routers.values()
+            if not r.is_deleted
+            and r.status == RouterStatus.ONLINE.value
+            and (r.last_seen_at is None or r.last_seen_at < cutoff)
+        ]
 
 
 def make_service(
@@ -876,9 +893,7 @@ class TestRouterProvisioning:
             organization_id=organization.id,
             status=RouterStatus.ONLINE,
         )
-        await repo.update_router(
-            router_device, {"last_seen_at": datetime.now(UTC)}
-        )
+        await repo.update_router(router_device, {"last_seen_at": datetime.now(UTC)})
 
         location_code, lines, expires_at = await service.preview_bootstrap_script(
             actor_user_id=uuid.uuid4(),
@@ -894,9 +909,7 @@ class TestRouterProvisioning:
         # in-session teardown.
         assert "/system scheduler add name=cloudguest-bootstrap-revert" in script
         assert "/system scheduler add name=cloudguest-bootstrap-cutover" in script
-        assert not any(
-            line.startswith("/interface wireguard remove") for line in lines
-        )
+        assert not any(line.startswith("/interface wireguard remove") for line in lines)
         assert expires_at is not None
         # The live router was rewound through the transition graph's
         # re-provision edge (so the eventual device check-in is legal),
@@ -906,12 +919,10 @@ class TestRouterProvisioning:
         assert refreshed is not None
         assert refreshed.status == RouterStatus.PENDING_PROVISIONING.value
         assert any(
-            e["action"] == "router_remote_reprovision_started"
-            for e in audit.entries
+            e["action"] == "router_remote_reprovision_started" for e in audit.entries
         )
         assert any(
-            e["action"] == "router_provisioning_token_generated"
-            for e in audit.entries
+            e["action"] == "router_provisioning_token_generated" for e in audit.entries
         )
 
     async def test_preview_remote_mode_rejects_suspended_router(self) -> None:
@@ -925,9 +936,7 @@ class TestRouterProvisioning:
             organization_id=organization.id,
             status=RouterStatus.SUSPENDED,
         )
-        await repo.update_router(
-            router_device, {"last_seen_at": datetime.now(UTC)}
-        )
+        await repo.update_router(router_device, {"last_seen_at": datetime.now(UTC)})
 
         with pytest.raises(ProvisioningTokenGenerationNotAllowedError):
             await service.preview_bootstrap_script(
@@ -1059,6 +1068,292 @@ class TestRouterProvisioning:
 # ============================================================================
 # Enrollment token expiry cleanup sweep
 # ============================================================================
+
+
+class TestStaleHeartbeatStatement:
+    """Reads the SHIPPED query, not the in-memory fake.
+
+    Every other test in this file drives the service through
+    `FakeRouterRepository`, whose `list_online_routers_with_stale_heartbeat`
+    is a hand-written reimplementation of the real predicate. That is fine
+    for the service's own logic and useless for the predicate itself:
+    measured, widening the real query to also sweep PROVISIONING routers
+    left the entire suite green. These read the compiled SQL instead."""
+
+    def _where(self) -> str:
+        """THE WHERE CLAUSE ONLY, not the whole statement.
+
+        `select(Router)` puts every column in the SELECT list, so
+        `"is_deleted" in sql` is satisfied by the projection and stays true
+        after the filter is deleted -- measured: removing
+        `Router.is_deleted.is_(False)` from the query left that assertion
+        green. Reading the whole statement tests what is being SELECTED
+        while claiming to test what is being FILTERED."""
+        compiled = str(
+            stale_heartbeat_statement(cutoff=_now()).compile(
+                compile_kwargs={"literal_binds": True}
+            )
+        ).lower()
+        # Whitespace-normalised first: SQLAlchemy puts WHERE on its own
+        # line, so a naive `" where "` search finds nothing and every
+        # assertion below would fail for a reason that has nothing to do
+        # with the query.
+        sql = " ".join(compiled.split())
+        assert " where " in sql
+        return sql.split(" where ", 1)[1]
+
+    def test_only_online_routers_are_selected(self) -> None:
+        where = self._where()
+        assert "'online'" in where
+        # The states a missed heartbeat has no business overriding. A router
+        # mid-install has never sent one BY DEFINITION; the other three are
+        # administrative facts, not reachability.
+        for never in ("provisioning", "suspended", "decommissioned"):
+            assert f"'{never}'" not in where
+
+    def test_a_router_with_no_timestamp_is_still_selected(self) -> None:
+        """Excluding NULL would create a permanently unsweepable state."""
+        assert "last_seen_at is null" in self._where()
+
+    def test_soft_deleted_routers_are_excluded(self) -> None:
+        assert "is_deleted" in self._where()
+
+    def test_the_comparison_is_a_cutoff_not_an_equality(self) -> None:
+        assert "last_seen_at <" in self._where()
+
+
+class TestSweepStaleHeartbeats:
+    """The writer that did not exist. `heartbeat()` wrote ONLINE and nothing
+    ever wrote it back, so a router that died weeks ago read as online to
+    every consumer of `Router.status`."""
+
+    async def _router(
+        self,
+        service,
+        location_lookup,
+        org_lookup,
+        *,
+        status: str,
+        last_seen_at,
+    ) -> Router:
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        router = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(
+                serial_number=f"SN-{uuid.uuid4()}",
+                mac_address=_unique_mac(),
+            ),
+        )
+        router.status = status
+        router.last_seen_at = last_seen_at
+        return router
+
+    async def test_a_router_that_stopped_answering_is_marked_offline(self) -> None:
+        service, repo, loc, org, _audit = make_service()
+        stale = await self._router(
+            service,
+            loc,
+            org,
+            status=RouterStatus.ONLINE.value,
+            last_seen_at=_now() - timedelta(hours=3),
+        )
+
+        result = await service.sweep_stale_heartbeats()
+
+        assert result["marked_offline"] == 1
+        assert repo.routers[stale.id].status == RouterStatus.OFFLINE.value
+
+    async def test_a_router_heard_from_recently_is_left_alone(self) -> None:
+        service, repo, loc, org, _audit = make_service()
+        fresh = await self._router(
+            service,
+            loc,
+            org,
+            status=RouterStatus.ONLINE.value,
+            last_seen_at=_now() - timedelta(minutes=1),
+        )
+
+        result = await service.sweep_stale_heartbeats()
+
+        assert result["marked_offline"] == 0
+        assert repo.routers[fresh.id].status == RouterStatus.ONLINE.value
+
+    async def test_the_boundary_is_the_shared_threshold_not_a_new_one(self) -> None:
+        """A second, slightly different definition of "offline" is how two
+        screens start disagreeing about one router. One router sits just
+        inside the shared threshold and one just outside it."""
+        service, repo, loc, org, _audit = make_service()
+        inside = await self._router(
+            service,
+            loc,
+            org,
+            status=RouterStatus.ONLINE.value,
+            last_seen_at=_now()
+            - timedelta(minutes=ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES - 1),
+        )
+        outside = await self._router(
+            service,
+            loc,
+            org,
+            status=RouterStatus.ONLINE.value,
+            last_seen_at=_now()
+            - timedelta(minutes=ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES + 1),
+        )
+
+        await service.sweep_stale_heartbeats()
+
+        assert repo.routers[inside.id].status == RouterStatus.ONLINE.value
+        assert repo.routers[outside.id].status == RouterStatus.OFFLINE.value
+
+    async def test_a_router_being_installed_right_now_is_never_swept(self) -> None:
+        """PROVISIONING routers have never sent a heartbeat BY DEFINITION --
+        the only transition out of PROVISIONING is `heartbeat`. Sweeping them
+        would mark every router currently being installed as offline, which
+        is the loudest possible way to be wrong."""
+        service, repo, loc, org, _audit = make_service()
+        installing = await self._router(
+            service,
+            loc,
+            org,
+            status=RouterStatus.PROVISIONING.value,
+            last_seen_at=_now() - timedelta(days=2),
+        )
+
+        result = await service.sweep_stale_heartbeats()
+
+        assert result["marked_offline"] == 0
+        assert repo.routers[installing.id].status == RouterStatus.PROVISIONING.value
+
+    async def test_administrative_states_are_never_overridden(self) -> None:
+        service, repo, loc, org, _audit = make_service()
+        held = []
+        for status in (
+            RouterStatus.SUSPENDED.value,
+            RouterStatus.DECOMMISSIONED.value,
+            RouterStatus.PENDING_PROVISIONING.value,
+        ):
+            held.append(
+                await self._router(
+                    service,
+                    loc,
+                    org,
+                    status=status,
+                    last_seen_at=_now() - timedelta(days=30),
+                )
+            )
+
+        result = await service.sweep_stale_heartbeats()
+
+        assert result["marked_offline"] == 0
+        for router in held:
+            assert repo.routers[router.id].status != RouterStatus.OFFLINE.value
+
+    async def test_online_with_no_timestamp_at_all_is_swept(self) -> None:
+        """`heartbeat()` is the only path into ONLINE and it always stamps
+        `last_seen_at`, so a NULL here means the row came from somewhere
+        else. Excluding it would create a permanently unsweepable state --
+        the same bug in a smaller box."""
+        service, repo, loc, org, _audit = make_service()
+        impossible = await self._router(
+            service, loc, org, status=RouterStatus.ONLINE.value, last_seen_at=None
+        )
+
+        result = await service.sweep_stale_heartbeats()
+
+        assert result["marked_offline"] == 1
+        assert repo.routers[impossible.id].status == RouterStatus.OFFLINE.value
+
+    async def test_one_router_failing_never_aborts_the_sweep(self) -> None:
+        service, repo, loc, org, _audit = make_service()
+        first = await self._router(
+            service,
+            loc,
+            org,
+            status=RouterStatus.ONLINE.value,
+            last_seen_at=_now() - timedelta(hours=3),
+        )
+        second = await self._router(
+            service,
+            loc,
+            org,
+            status=RouterStatus.ONLINE.value,
+            last_seen_at=_now() - timedelta(hours=3),
+        )
+
+        original_update = repo.update_router
+        exploded: list[uuid.UUID] = []
+
+        async def _boom(router: Router, data: dict[str, object]) -> Router:
+            if router.id == first.id and not exploded:
+                exploded.append(router.id)
+                raise RuntimeError("transient database error")
+            return await original_update(router, data)
+
+        repo.update_router = _boom  # type: ignore[method-assign]
+
+        result = await service.sweep_stale_heartbeats()
+
+        assert result["failed"] == 1
+        assert result["marked_offline"] == 1
+        assert repo.routers[second.id].status == RouterStatus.OFFLINE.value
+
+    async def test_the_sweep_preserves_the_evidence_it_acted_on(self) -> None:
+        """The sweep must NOT clear `last_seen_at`. That timestamp is the
+        only record of when the router was last heard from, and both the
+        dashboard and Master console render it -- wiping it would turn
+        "last check-in 3 hours ago", which tells an operator how long the
+        venue has been down, into "never heard from this router", which is
+        false and strictly less useful. Writing `status` and nothing else
+        is the whole point."""
+        service, repo, loc, org, _audit = make_service()
+        heard_at = _now() - timedelta(hours=3)
+        stale = await self._router(
+            service,
+            loc,
+            org,
+            status=RouterStatus.ONLINE.value,
+            last_seen_at=heard_at,
+        )
+
+        await service.sweep_stale_heartbeats()
+
+        assert repo.routers[stale.id].status == RouterStatus.OFFLINE.value
+        assert repo.routers[stale.id].last_seen_at == heard_at
+
+    async def test_the_transition_is_audited_with_no_human_actor(self) -> None:
+        """An expired token aging out is routine housekeeping and is
+        deliberately not audited. A router being declared offline is a
+        statement about a venue's service that someone may later have to
+        account for -- with a null actor, because no human performed it."""
+        service, _repo, loc, org, audit = make_service()
+        await self._router(
+            service,
+            loc,
+            org,
+            status=RouterStatus.ONLINE.value,
+            last_seen_at=_now() - timedelta(hours=3),
+        )
+
+        await service.sweep_stale_heartbeats()
+
+        entries = [
+            e
+            for e in audit.entries
+            if e.get("action") == AuditAction.ROUTER_MARKED_OFFLINE.value
+        ]
+        assert len(entries) == 1
+        assert entries[0]["actor_user_id"] is None
+        assert entries[0]["entity_type"] == "router"
+
+    async def test_a_quiet_run_is_distinguishable_from_a_failing_one(self) -> None:
+        service, _repo, _loc, _org, _audit = make_service()
+
+        result = await service.sweep_stale_heartbeats()
+
+        assert result == {"considered": 0, "marked_offline": 0, "failed": 0}
 
 
 class TestProvisioningTokenCleanupSweep:

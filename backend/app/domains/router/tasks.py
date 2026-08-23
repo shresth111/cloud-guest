@@ -41,7 +41,10 @@ from app.domains.organization.repository import OrganizationRepository
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.repository import RBACRepository
 
-from .constants import TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP
+from .constants import (
+    TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP,
+    TASK_RUN_STALE_HEARTBEAT_SWEEP,
+)
 from .repository import RouterRepository
 from .service import RouterService
 
@@ -88,4 +91,34 @@ def run_provisioning_token_cleanup_sweep() -> dict[str, int]:
     return result
 
 
-__all__ = ["run_provisioning_token_cleanup_sweep"]
+async def _run_stale_heartbeat_sweep_async() -> dict[str, int]:
+    async with SessionLocal() as session:
+        try:
+            router_service = _build_router_service(session)
+            result = await router_service.sweep_stale_heartbeats()
+            await session.commit()
+            return result
+        except Exception:
+            await session.rollback()
+            raise
+
+
+@celery_app.task(name=TASK_RUN_STALE_HEARTBEAT_SWEEP)
+def run_stale_heartbeat_sweep() -> dict[str, int]:
+    """Beat-scheduled periodic task (see ``app.core.celery_app``'s
+    ``beat_schedule`` -- runs every
+    ``constants.STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS``).
+
+    The only writer of ``ONLINE -> OFFLINE`` on the platform. Before this
+    existed, ``heartbeat()`` wrote ``ONLINE`` and nothing ever wrote it back,
+    so a router that stopped answering read as online indefinitely."""
+    result = run_celery_task(_run_stale_heartbeat_sweep_async())
+    # Logged at INFO every minute even when it marks nothing, on purpose: a
+    # sweep that silently stops running looks exactly like a fleet that is
+    # entirely healthy, and that is the failure this whole task exists to
+    # stop being invisible.
+    logger.info("router_task_run_stale_heartbeat_sweep_completed", extra=result)
+    return result
+
+
+__all__ = ["run_provisioning_token_cleanup_sweep", "run_stale_heartbeat_sweep"]
