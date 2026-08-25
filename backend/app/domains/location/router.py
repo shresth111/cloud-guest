@@ -32,6 +32,8 @@ from app.domains.audit.service import AuditService
 from app.domains.auth.models import AuthUser
 from app.domains.campaigns.dependencies import get_campaigns_service
 from app.domains.campaigns.service import CampaignsService
+from app.domains.captive_portal.dependencies import get_captive_portal_service
+from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.connected_devices.dependencies import get_connected_device_service
 from app.domains.connected_devices.service import ConnectedDeviceService
 from app.domains.rbac.dependencies import (
@@ -183,6 +185,7 @@ async def create_location(
     user: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     location_service: LocationService = Depends(get_location_service),
+    captive_portal_service: CaptivePortalService = Depends(get_captive_portal_service),
 ):
     location = await location_service.create_location(
         actor_user_id=uuid.UUID(user.id),
@@ -205,6 +208,77 @@ async def create_location(
         contact_phone=payload.contact_phone,
         contact_email=payload.contact_email,
         settings=payload.settings,
+    )
+    # This plain create-location path used to be the only one of the two
+    # location-creation paths that never provisioned a CaptivePortalConfig
+    # (see LocationProvisioningService's "smart" /locations/provision flow,
+    # step j, which always did). A real customer who used this ordinary
+    # self-serve flow and then separately uploaded branding via
+    # BrandAssetPage ended up with real logo/background assets in
+    # `brandings` but zero row in `captive_portal_configs` -- so
+    # `GET /captive-portal/resolve` returned "no active captive portal
+    # config is configured" and the guest portal never rendered anything at
+    # all, for any of that organization's real visitors. Confirmed live:
+    # every one of the 4 production organizations with branding uploaded is
+    # in exactly this state.
+    #
+    # Composed here at the router layer, not inside LocationService itself:
+    # CaptivePortalService already depends on LocationService (for its own
+    # location-hierarchy validation), so injecting CaptivePortalService into
+    # LocationService's constructor would be a circular dependency. Calling
+    # the real service here -- not CaptivePortalRepository directly --
+    # keeps every one of create_config's real validations (hex-color
+    # checks, single-content-source rules, default-scope validation,
+    # powered_by entitlement enforcement) intact rather than bypassed.
+    #
+    # is_default=False + a real location_id: a location-scoped config, not
+    # an organization-wide default -- same choice the smart-provisioning
+    # flow already makes for the identical reason (one location, one
+    # config). Field values mirror that flow's own step j defaults
+    # (LocationProvisioningService.provision_location) so a location
+    # created through either path starts from the same baseline guest-WiFi
+    # config. otp_email_enabled=True is the one login method turned on by
+    # default -- it needs no SMS/WhatsApp provider configured, so a fresh
+    # location is never left with zero working sign-in methods.
+    await captive_portal_service.create_config(
+        actor_user_id=uuid.UUID(user.id),
+        # None, not the endpoint's own `requesting_organization_id`:
+        # LocationService.create_location above already validated this
+        # caller's access to `organization_id` with its own MSP-aware
+        # check (a parent MSP may create a location under a child org it
+        # owns). CaptivePortalService.create_config's cross-org check is a
+        # strict equality against `requesting_organization_id`, which
+        # would incorrectly reject that exact MSP case a second time here.
+        # Mirrors LocationProvisioningService's identical step j call.
+        requesting_organization_id=None,
+        organization_id=organization_id,
+        location_id=location.id,
+        name=f"{location.name} Guest WiFi",
+        is_active=True,
+        is_default=False,
+        theme="default",
+        logo_url=None,
+        background_image_url=None,
+        primary_color="#2563EB",
+        secondary_color="#1E293B",
+        default_language="en",
+        supported_languages=["en"],
+        advertisement_banner_url=None,
+        advertisement_banner_link=None,
+        terms_and_conditions_text=None,
+        terms_and_conditions_url=None,
+        privacy_policy_text=None,
+        privacy_policy_url=None,
+        splash_headline=f"Welcome to {location.name}",
+        splash_welcome_message="Connect to continue.",
+        redirect_url=None,
+        otp_sms_enabled=False,
+        otp_email_enabled=True,
+        otp_whatsapp_enabled=False,
+        voucher_enabled=False,
+        username_password_enabled=False,
+        social_login_enabled=False,
+        social_login_providers=[],
     )
     return build_response(
         success=True,
