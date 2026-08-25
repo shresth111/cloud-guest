@@ -871,8 +871,7 @@ class TestProcessBackgroundImage:
         out = _decoded(result[0]).convert("RGB")
         assert getattr(out, "n_frames", 1) == 1
         r, g, b = out.resize((1, 1)).getpixel((0, 0))
-        # Frame 0 is red, frame 1 is blue. The blur and the tint shift
-        # the values but cannot invert which channel dominates.
+        # Frame 0 is red, frame 1 is blue.
         assert r > b, f"flattened to the wrong frame: {(r, g, b)}"
 
     def test_gif_is_still_an_accepted_upload_type(self) -> None:
@@ -946,8 +945,8 @@ class TestProcessBackgroundImage:
         assert result is not None
         out = _decoded(result[0]).convert("RGB")
         r, g, b = out.resize((1, 1)).getpixel((0, 0))
-        # Fully transparent red composited onto white, then tinted --
-        # near-white, and specifically *not* red.
+        # Fully transparent red composited onto white -- white, and
+        # specifically *not* red.
         assert r > 180 and g > 180 and b > 180, (r, g, b)
 
 

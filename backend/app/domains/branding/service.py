@@ -13,7 +13,6 @@ from typing import Protocol
 from PIL import (
     Image,
     ImageDraw,
-    ImageFilter,
     ImageOps,
     ImageStat,
     UnidentifiedImageError,
@@ -245,46 +244,19 @@ _BACKGROUND_MAX_PROCESS_PIXELS = 80_000_000
 # viewport and is ~2x the longest phone edge in real use, so `cover`
 # never upscales.
 _BACKGROUND_TARGET_LONG_EDGE = 2560
-# Blur radius as a fraction of the long edge, so a 6000px upload and a
-# 2560px upload come out looking the *same* rather than the 6000px one
-# looking sharper after the downscale. 0.0094 * 2560 ~= 24px, the middle
-# of the spec's "~20-28px equivalent" (§1.4 C2). Blur runs before the
-# downscale (spec order) -- that is also the higher-quality order, since
-# LANCZOS then resamples an already band-limited image.
-_BACKGROUND_BLUR_FRACTION = 0.0094
-_BACKGROUND_BLUR_MIN_RADIUS = 12.0
-_BACKGROUND_BLUR_MAX_RADIUS = 64.0
-# Baked-in neutral tint, composited under the frontend's own scrim.
-#
-# The spec (§1.4 C2) asks for "a base tint at alpha >= 0.45". Implemented
-# deliberately lower, and this is the one place this module knowingly
-# departs from the letter of Part 4 -- three reasons, all of them from
-# the spec's own text:
-#   * It double-counts. The frontend already ships a scrim whose peak
-#     opacity is `background_overlay_strength`, default 55 (PR #36).
-#     0.45 baked in *under* 0.55 composites to 1-(0.55*0.45) = 0.75
-#     effective darkening at the text zones. §1.3's own derivation puts
-#     the AA floor for white body text over *any* image at 0.535, so
-#     0.75 buys no compliance at all.
-#   * §0.1 item 1 records what that looks like shipped: PR #81's single
-#     heavy wash "reduced a real venue's photo to a ghost" and was
-#     reverted by #82. Baking it into the stored bytes makes that
-#     version irreversible -- there is no revert, only a re-upload.
-#   * It contradicts C3. C3 wants the scrim's *polarity* chosen at
-#     render time from `background_luminance` (light scrim over a dark
-#     photo, dark scrim over a light one). A dark tint burned in at
-#     upload removes that choice permanently, and skews the very
-#     luminance value C3 reads.
-# What the tint is genuinely for is unifying an image so the blur reads
-# as a deliberate surface rather than a smeared photo. 0.18 does that
-# and leaves the photo recognisably the venue's. Safety comes from the
-# §1.3 floor at render time, which this does not and should not replace.
-_BACKGROUND_TINT_ALPHA = 0.18
-_BACKGROUND_TINT_RGB = (17, 24, 39)
+# Deliberately NOT blurred or tinted at upload time anymore. Spec §1.4 C2
+# asked for a baked-in ~20-28px blur plus a >=0.45-alpha tint, and an
+# earlier version of this function did exactly that -- confirmed live,
+# every uploaded photo came out permanently soft, with no way back short
+# of a re-upload (the pre-blur bytes are never kept once processing
+# succeeds). The frontend's own render-time scrim (v7 §1.4 C3) already
+# guarantees an AA-safe contrast floor independent of whatever the photo
+# looks like, which is the same reasoning the tint's own removed comment
+# used to argue against baking darkness in here -- that argument turns
+# out to apply to the blur too. A venue's photo now reaches storage (and
+# every guest's screen) exactly as sharp as they uploaded it.
 # WebP quality. ~82 is the standard "visually lossless for photographic
-# content" point, and the image is pre-blurred by the time it is encoded,
-# so there is very little high-frequency detail left for a higher
-# quality to preserve.
+# content" point for a real, unprocessed photo.
 _BACKGROUND_WEBP_QUALITY = 82
 # Fraction of the image height treated as "the top band" for
 # ``background_top_luminance`` -- the zone the portal's headline sits
@@ -314,13 +286,8 @@ class BackgroundImageMetrics:
     """What ``_process_background_image`` measured about the image, for
     the frontend's scrim decisions (v7 spec §1.4 C3 and C5).
 
-    All three are integers on a 0-100 scale, and all three describe the
-    **source** image as uploaded (post-EXIF-rotation, pre-blur,
-    pre-tint), per Part 4's own step ordering. That is the useful
-    definition: it stays correct if the blur radius or the tint constant
-    is ever retuned, whereas a measurement of the final bytes would
-    silently become wrong on the day someone changes
-    ``_BACKGROUND_TINT_ALPHA`` and would need a full backfill to fix.
+    All three are integers on a 0-100 scale, measured off the source
+    image as uploaded (post-EXIF-rotation), before any resize.
 
     ``luminance``/``top_luminance`` are ITU-R BT.601 luma
     (``Image.convert("L")``), **not** WCAG relative luminance -- no
@@ -486,16 +453,6 @@ def _process_background_image(
         img = flattened
     else:
         img = img.convert("RGB")
-
-    radius = min(
-        _BACKGROUND_BLUR_MAX_RADIUS,
-        max(_BACKGROUND_BLUR_MIN_RADIUS, max(img.size) * _BACKGROUND_BLUR_FRACTION),
-    )
-    img = img.filter(ImageFilter.GaussianBlur(radius=radius))
-
-    if _BACKGROUND_TINT_ALPHA > 0:
-        tint = Image.new("RGB", img.size, _BACKGROUND_TINT_RGB)
-        img = Image.blend(img, tint, _BACKGROUND_TINT_ALPHA)
 
     long_edge = max(img.size)
     if long_edge > _BACKGROUND_TARGET_LONG_EDGE:
