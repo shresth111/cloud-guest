@@ -259,8 +259,14 @@ async def create_location(
         theme="default",
         logo_url=None,
         background_image_url=None,
-        primary_color="#2563EB",
-        secondary_color="#1E293B",
+        # Same default pair as LocationProvisioningService's identical
+        # step (provisioning_service.py) -- #6366F1 matches the CSS-level
+        # fallback every portal component already falls back to when
+        # --pr-primary is unset, and #1E1B4B matches --pg-ink, the
+        # portal's own dark ink token. Every real venue overrides both
+        # via its own branding settings.
+        primary_color="#6366F1",
+        secondary_color="#1E1B4B",
         default_language="en",
         supported_languages=["en"],
         advertisement_banner_url=None,

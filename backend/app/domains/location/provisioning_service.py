@@ -1048,8 +1048,17 @@ class LocationProvisioningService:
             theme="default",
             logo_url=None,
             background_image_url=None,
-            primary_color="#2563EB",
-            secondary_color="#1E293B",
+            # #6366f1 is already the pervasive CSS-level fallback every
+            # portal component falls back to when --pr-primary is unset
+            # (e.g. AuthTabSwitcher.tsx's `var(--pr-primary,#6366f1)`) --
+            # this had drifted from that intended default to a different,
+            # more generic blue. #1E1B4B matches --pg-ink, the portal's
+            # own dark ink token, for the same "align with the existing
+            # intended default" reasoning. Every real venue overrides
+            # both via its own branding settings; this only changes what
+            # a freshly-provisioned, not-yet-customized venue looks like.
+            primary_color="#6366F1",
+            secondary_color="#1E1B4B",
             default_language="en",
             supported_languages=["en"],
             advertisement_banner_url=None,
