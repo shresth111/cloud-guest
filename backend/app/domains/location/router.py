@@ -260,12 +260,11 @@ async def create_location(
         logo_url=None,
         background_image_url=None,
         # Same default pair as LocationProvisioningService's identical
-        # step (provisioning_service.py) -- #6366F1 matches the CSS-level
-        # fallback every portal component already falls back to when
-        # --pr-primary is unset, and #1E1B4B matches --pg-ink, the
-        # portal's own dark ink token. Every real venue overrides both
-        # via its own branding settings.
-        primary_color="#6366F1",
+        # step (provisioning_service.py) -- #6D28D9 is wyfyguest.com's
+        # own violet-700 brand accent (--pg-brand-accent), and #1E1B4B
+        # matches --pg-ink, the portal's own dark ink token. Every real
+        # venue overrides both via its own branding settings.
+        primary_color="#6D28D9",
         secondary_color="#1E1B4B",
         default_language="en",
         supported_languages=["en"],

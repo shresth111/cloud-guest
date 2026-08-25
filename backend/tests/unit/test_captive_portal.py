@@ -1372,7 +1372,16 @@ class TestGuestFontChoiceAndOverlayStrengthDefaults:
         spec's documented constants."""
         table = CaptivePortalConfig.__table__
         assert table.c.guest_font_choice.default.arg == DEFAULT_GUEST_FONT_CHOICE.value
-        assert table.c.guest_font_choice.default.arg == "system"
+        # Was "system" -- that value reproduced the column's own migration-
+        # time behavior for pre-v6 rows, a one-time backfill-safety concern
+        # unrelated to what a *new* row should default to going forward.
+        # Deliberately changed: a freshly-provisioned venue now gets a
+        # real, distinctive heading face (self-hosted, Latin-subsetted,
+        # metric-matched) out of the box instead of the plain system
+        # stack, per direct product feedback that the guest portal needs
+        # a distinctive typeface. Every venue can still switch back to
+        # System via its own branding settings.
+        assert table.c.guest_font_choice.default.arg == "modern-sans"
         assert (
             table.c.background_overlay_strength.default.arg
             == DEFAULT_BACKGROUND_OVERLAY_STRENGTH

@@ -64,12 +64,28 @@ class GuestFontChoice(StrEnum):
 HEX_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 DEFAULT_THEME = PortalTheme.LIGHT
-DEFAULT_PRIMARY_COLOR = "#1A73E8"
-DEFAULT_SECONDARY_COLOR = "#FFFFFF"
+# #6D28D9 is wyfyguest.com's own real violet-700 brand accent (the same
+# value the frontend's --pg-brand-accent already uses for its eyebrow/
+# footer brand mark, per captive-portal-v7-design-spec.md Parts 2-3) --
+# this had been a plain, unrelated blue that never matched the site the
+# portal is otherwise deliberately brand-aligned with. #1E1B4B matches
+# --pg-ink, the portal's own dark ink token (also sourced from
+# wyfyguest.com). Every real venue overrides both via its own branding
+# settings; this only changes what a freshly-provisioned, not-yet-
+# customized venue looks like.
+DEFAULT_PRIMARY_COLOR = "#6D28D9"
+DEFAULT_SECONDARY_COLOR = "#1E1B4B"
 DEFAULT_LANGUAGE = "en"
 DEFAULT_SUPPORTED_LANGUAGES: tuple[str, ...] = ("en",)
 
-DEFAULT_GUEST_FONT_CHOICE = GuestFontChoice.SYSTEM
+# MODERN_SANS rather than SYSTEM: a freshly-provisioned venue now gets a
+# real, distinctive heading face out of the box (self-hosted, Latin-only
+# subset, metric-matched -- see portal-guest-fonts.ts's GUEST_FONT_FACES
+# in the cloudguest-foundation repo) instead of the plain system stack.
+# Body/UI text is unaffected either way. Every venue can still switch to
+# Editorial Serif, Bold Display, or back to System via its own branding
+# settings.
+DEFAULT_GUEST_FONT_CHOICE = GuestFontChoice.MODERN_SANS
 
 # Integer 0-100, the guest-facing scrim's peak opacity as a percentage --
 # v6 design spec §4.2. 55 is not arbitrary: it is defined to reproduce the
