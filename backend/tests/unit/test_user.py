@@ -18,6 +18,7 @@ live Postgres/Redis in this environment.
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -35,16 +36,35 @@ from app.domains.auth.service import EmailAlreadyExistsError, UsernameAlreadyExi
 from app.domains.organization.enums import MembershipStatus, OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization, OrganizationMember
+from app.domains.rbac.authorization import AccessValidator
 from app.domains.rbac.enums import ScopeType
+from app.domains.rbac.exceptions import PermissionDeniedError
 from app.domains.rbac.models import Role, UserRole
 from app.domains.user.exceptions import (
     CrossOrganizationUserAccessError,
+    ImpersonationTargetInactiveError,
     InitialRoleRequiresOrganizationError,
     SelfDeactivationNotAllowedError,
+    SelfImpersonationNotAllowedError,
+    StaffImpersonationNotAllowedError,
 )
+from app.domains.user.router import router as user_router
 from app.domains.user.service import UserService
 
+from .test_rbac import FakeRBACRepository
+
 STRONG_PASSWORD = "TempPass123!@#"
+
+
+def _permission_keys(route: object) -> list[str]:
+    """The permission strings a route's ``RequirePermission`` dependencies
+    actually enforce -- mirrors ``test_channel_partner.py``'s own helper of
+    the same name/shape (``RequirePermission`` is a closure factory, so the
+    key lives in ``_dependency``'s nonlocals)."""
+    return [
+        inspect.getclosurevars(dependency.dependency).nonlocals["permission_key"]
+        for dependency in route.dependencies  # type: ignore[attr-defined]
+    ]
 
 # ============================================================================
 # Test doubles
@@ -1018,3 +1038,184 @@ class TestDeactivateReactivate:
             )
 
         assert exc_info.value.status_code == 401
+
+
+# ============================================================================
+# Impersonation ("staff can impersonate a customer to view their
+# dashboard") -- see ``UserService.impersonate_user``'s own docstring for
+# the full validation/audit contract.
+# ============================================================================
+
+
+class TestImpersonation:
+    async def test_impersonate_mints_target_identity_token_and_audits(self) -> None:
+        service, *_rest, audit = make_service()
+        target = await service.create_user(**_create_kwargs())
+        actor_id = uuid.uuid4()
+        actor_email = "operator@wyfy.test"
+        before = datetime.now(UTC)
+
+        result = await service.impersonate_user(
+            actor_user_id=actor_id,
+            actor_email=actor_email,
+            user_id=target.id,
+            reason="Investigating a support ticket",
+        )
+
+        # -- response shape --------------------------------------------------
+        assert result.target_user.id == target.id
+        assert result.expires_at > before
+
+        # -- the minted token identifies the TARGET, not the actor ----------
+        payload = JWTManager.decode(result.access_token)
+        assert payload["sub"] == str(target.id)
+        assert payload["email"] == target.email
+        assert payload["type"] == "access"
+
+        # -- deliberately shorter than a normal login session ---------------
+        assert payload["exp"] - payload["iat"] == 30 * 60
+
+        # -- the impersonation claim identifies the real actor ---------------
+        claim = payload["impersonation"]
+        assert claim["actor_user_id"] == str(actor_id)
+        assert claim["actor_email"] == actor_email
+        assert "started_at" in claim
+
+        # -- every start is audited ------------------------------------------
+        entry = next(e for e in audit.entries if e["action"] == "impersonation_started")
+        assert entry["actor_user_id"] == actor_id
+        assert entry["entity_type"] == "user"
+        assert entry["entity_id"] == target.id
+        assert entry["event_metadata"]["reason"] == "Investigating a support ticket"
+        assert entry["event_metadata"]["target_email"] == target.email
+        assert "expires_at" in entry["event_metadata"]
+
+    async def test_impersonate_with_no_reason_audits_a_null_reason(self) -> None:
+        service, *_rest, audit = make_service()
+        target = await service.create_user(**_create_kwargs())
+
+        await service.impersonate_user(
+            actor_user_id=uuid.uuid4(),
+            actor_email="operator@wyfy.test",
+            user_id=target.id,
+            reason=None,
+        )
+
+        entry = next(e for e in audit.entries if e["action"] == "impersonation_started")
+        assert entry["event_metadata"]["reason"] is None
+
+    async def test_rejects_impersonating_an_inactive_user(self) -> None:
+        service, *_rest = make_service()
+        target = await service.create_user(**_create_kwargs())
+        await service.deactivate_user(
+            actor_user_id=uuid.uuid4(),
+            user_id=target.id,
+            requesting_organization_id=None,
+        )
+
+        with pytest.raises(ImpersonationTargetInactiveError) as exc_info:
+            await service.impersonate_user(
+                actor_user_id=uuid.uuid4(),
+                actor_email="operator@wyfy.test",
+                user_id=target.id,
+                reason=None,
+            )
+        assert exc_info.value.status_code == 409
+
+    async def test_rejects_impersonating_a_user_holding_a_global_role(self) -> None:
+        """The privilege-escalation-chain guard: a target holding ANY
+        active GLOBAL-scope role (a platform staff/operator account, not a
+        customer) can never be impersonated."""
+        service, _identity, _org, _assigner, role_resolver, _audit = make_service()
+        target = await service.create_user(**_create_kwargs())
+        role_resolver.add_role(
+            target.id,
+            name="Platform Support",
+            slug="platform-support",
+            scope_type=ScopeType.GLOBAL,
+        )
+
+        with pytest.raises(StaffImpersonationNotAllowedError) as exc_info:
+            await service.impersonate_user(
+                actor_user_id=uuid.uuid4(),
+                actor_email="operator@wyfy.test",
+                user_id=target.id,
+                reason=None,
+            )
+        assert exc_info.value.status_code == 403
+
+    async def test_org_scoped_role_does_not_block_impersonation(self) -> None:
+        """Contrast case for the guard above: an ordinary org/location-
+        scoped role on the target (a real customer with real roles in
+        their own organization) must NOT trip the "holds a global role"
+        rejection."""
+        service, _identity, _org, _assigner, role_resolver, _audit = make_service()
+        target = await service.create_user(**_create_kwargs())
+        role_resolver.add_role(
+            target.id,
+            name="Location Manager",
+            slug="location-manager",
+            scope_type=ScopeType.ORGANIZATION,
+        )
+
+        result = await service.impersonate_user(
+            actor_user_id=uuid.uuid4(),
+            actor_email="operator@wyfy.test",
+            user_id=target.id,
+            reason=None,
+        )
+        assert result.target_user.id == target.id
+
+    async def test_rejects_self_impersonation(self) -> None:
+        service, *_rest = make_service()
+        user = await service.create_user(**_create_kwargs())
+
+        with pytest.raises(SelfImpersonationNotAllowedError) as exc_info:
+            await service.impersonate_user(
+                actor_user_id=user.id,
+                actor_email=user.email,
+                user_id=user.id,
+                reason=None,
+            )
+        assert exc_info.value.status_code == 400
+
+
+class TestImpersonateRouteRequiresPermission:
+    """A genuine, executable 403 for the ``users.impersonate``-gated route,
+    the same "underlying AccessValidator.check logic is what's exercised"
+    convention ``test_channel_partner.py``'s own
+    ``TestRevokeRequiresManagePermission`` establishes."""
+
+    def _route(self):
+        return next(
+            route
+            for route in user_router.routes
+            if route.path.endswith("/impersonate")
+        )
+
+    def test_route_is_gated_by_users_impersonate(self) -> None:
+        route = self._route()
+        assert route.methods == {"POST"}
+        assert _permission_keys(route) == ["users.impersonate"]
+
+    def test_route_checks_global_scope_explicitly(self) -> None:
+        """The endpoint must only ever succeed for a caller holding a
+        genuinely platform-wide role -- checked via an explicit
+        ``scope=ScopeType.GLOBAL``, not left to be inferred from whatever
+        ``X-Organization-Id`` header happens to be on the request."""
+        route = self._route()
+        (dependency,) = route.dependencies
+        nonlocals = inspect.getclosurevars(dependency.dependency).nonlocals
+        assert nonlocals["scope"] == ScopeType.GLOBAL
+
+    async def test_actor_without_impersonate_permission_gets_403(self) -> None:
+        route = self._route()
+        (permission_key,) = _permission_keys(route)
+        validator = AccessValidator(FakeRBACRepository())
+
+        with pytest.raises(PermissionDeniedError) as exc_info:
+            await validator.check(
+                uuid.uuid4(), permission_key, scope_type=ScopeType.GLOBAL
+            )
+
+        assert exc_info.value.status_code == 403

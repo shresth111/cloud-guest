@@ -35,6 +35,9 @@ __all__ = [
     "CrossOrganizationUserAccessError",
     "InitialRoleRequiresOrganizationError",
     "SelfDeactivationNotAllowedError",
+    "ImpersonationTargetInactiveError",
+    "StaffImpersonationNotAllowedError",
+    "SelfImpersonationNotAllowedError",
 ]
 
 
@@ -90,6 +93,50 @@ class SelfDeactivationNotAllowedError(UserError):
     def __init__(self, user_id: uuid.UUID) -> None:
         super().__init__(
             f"User {user_id} cannot deactivate their own account",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ImpersonationTargetInactiveError(UserError):
+    """``POST /users/{id}/impersonate`` mints a real, working session as
+    the target user -- an inactive (``is_active=False``) account cannot be
+    impersonated, both because there is nothing legitimate to view on
+    behalf of a deactivated customer and because
+    ``auth.dependencies.get_current_user`` would otherwise reject the
+    impersonated session's very first request anyway (see
+    ``_resolve_user_from_jwt``'s own ``is_active`` check) -- reject this
+    up front with a clear error instead of a confusing downstream 401."""
+
+    def __init__(self, user_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Cannot impersonate user {user_id}: account is not active",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class StaffImpersonationNotAllowedError(UserError):
+    """A target user holding any active GLOBAL-scope role assignment (a
+    platform staff/operator account, not a customer) can never be
+    impersonated -- this is the privilege-escalation-chain guard: without
+    it, one operator's impersonation session could ride another
+    operator's own, possibly higher, platform-wide permissions."""
+
+    def __init__(self, user_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Cannot impersonate user {user_id}: holds a platform-staff "
+            "(global-scope) role",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class SelfImpersonationNotAllowedError(UserError):
+    """A caller cannot impersonate their own account through this
+    endpoint -- there is no session to distinguish; use the caller's own,
+    already-authenticated session directly."""
+
+    def __init__(self, user_id: uuid.UUID) -> None:
+        super().__init__(
+            f"User {user_id} cannot impersonate their own account",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 

@@ -61,6 +61,15 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.IMPORT,
         _A.ASSIGN,
         _A.MANAGE,
+        # IMPERSONATE is deliberately excluded from every generic
+        # ``GrantLevel`` expansion (see ``expand_grant_level`` below) --
+        # it is granted only to Super Admin, via that role's own
+        # ``extra_grants``, never through this module's ordinary
+        # OPERATE/FULL default/override machinery. It still belongs in
+        # this tuple (permission/permission_scope rows must exist for
+        # it, and ``test_role_grants_are_subsets_of_module_actions``
+        # requires every granted action to be a member of it).
+        _A.IMPERSONATE,
     ),
     PermissionModule.ROLES: (
         _A.CREATE,
@@ -663,6 +672,19 @@ class GrantLevel(StrEnum):
 def expand_grant_level(
     level: GrantLevel, actions: tuple[PermissionAction, ...]
 ) -> tuple[PermissionAction, ...]:
+    """Expand a module-wide grant level into the concrete actions it covers.
+
+    ``PermissionAction.IMPERSONATE`` is deliberately excluded from *every*
+    level here, including ``FULL`` -- it is the one action in this codebase
+    that is more sensitive than "full control over this module" implies
+    (it mints a real, working session as another user), so it must never
+    ride along automatically with a role's ordinary USERS grant. A role
+    gets it only via ``SystemRoleDefinition.extra_grants``, an explicit,
+    separate, additive grant -- today held only by Super Admin (see that
+    role's own definition below). Every other module has no
+    ``PermissionAction.IMPERSONATE`` member in its own actions tuple at
+    all, so this exclusion is a no-op everywhere except USERS.
+    """
     if level == GrantLevel.NONE:
         return ()
     if level == GrantLevel.READ:
@@ -673,9 +695,14 @@ def expand_grant_level(
         return tuple(
             a
             for a in actions
-            if a not in (PermissionAction.MANAGE, PermissionAction.DELETE)
+            if a
+            not in (
+                PermissionAction.MANAGE,
+                PermissionAction.DELETE,
+                PermissionAction.IMPERSONATE,
+            )
         )
-    return actions  # FULL
+    return tuple(a for a in actions if a != PermissionAction.IMPERSONATE)  # FULL
 
 
 @dataclass(frozen=True)
@@ -686,14 +713,28 @@ class SystemRoleDefinition:
     scope_type: ScopeType
     default_level: GrantLevel
     overrides: Mapping[PermissionModule, GrantLevel] = field(default_factory=dict)
+    # Explicit, additive per-action grants that bypass the generic
+    # GrantLevel/expand_grant_level machinery entirely -- today used for
+    # exactly one thing: handing Super Admin ``users.impersonate``, which
+    # ``expand_grant_level`` deliberately never includes in any level (see
+    # its own docstring). A module/action pair here is granted *in addition
+    # to* whatever ``overrides``/``default_level`` already resolves to for
+    # that module, never instead of it.
+    extra_grants: Mapping[PermissionModule, tuple[PermissionAction, ...]] = field(
+        default_factory=dict
+    )
 
     def grants(self) -> dict[PermissionModule, tuple[PermissionAction, ...]]:
         resolved: dict[PermissionModule, tuple[PermissionAction, ...]] = {}
         for module, actions in MODULE_ACTIONS.items():
             level = self.overrides.get(module, self.default_level)
             expanded = expand_grant_level(level, actions)
-            if expanded:
-                resolved[module] = expanded
+            extra = tuple(
+                a for a in self.extra_grants.get(module, ()) if a not in expanded
+            )
+            combined = expanded + extra
+            if combined:
+                resolved[module] = combined
         return resolved
 
 
@@ -719,6 +760,15 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         description="Unrestricted platform-wide access to every module and action.",
         scope_type=ScopeType.GLOBAL,
         default_level=_L.FULL,
+        extra_grants={
+            # users.impersonate: Super-Admin-exclusive, granted here rather
+            # than through this role's own FULL default because
+            # ``expand_grant_level`` deliberately never includes
+            # IMPERSONATE in FULL (see that function's own docstring) --
+            # every other GLOBAL-scoped role (Platform Admin, Platform
+            # Support, Billing Manager) stays without it.
+            _M.USERS: (_A.IMPERSONATE,),
+        },
     ),
     SystemRoleDefinition(
         name="Platform Admin",

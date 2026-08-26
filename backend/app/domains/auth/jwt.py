@@ -64,11 +64,25 @@ class JWTManager:
         user_id: str,
         email: str,
         additional_claims: dict[str, Any] | None = None,
+        *,
+        expires_in_minutes: int | None = None,
     ) -> tuple[str, str]:
-        """Create an access token. Returns ``(token, jti)``."""
+        """Create an access token. Returns ``(token, jti)``.
+
+        ``expires_in_minutes`` overrides ``settings.access_token_expire_minutes``
+        when supplied (``None``, the default, keeps today's settings-based
+        behavior unchanged for every existing caller). Used by
+        ``app.domains.user.service.UserService.impersonate_user`` to mint a
+        deliberately shorter-than-normal-login token for an impersonation
+        session -- see that method's own docstring."""
         settings = get_settings()
         now = datetime.now(UTC)
-        expires_at = now + timedelta(minutes=settings.access_token_expire_minutes)
+        minutes = (
+            expires_in_minutes
+            if expires_in_minutes is not None
+            else settings.access_token_expire_minutes
+        )
+        expires_at = now + timedelta(minutes=minutes)
         jti = str(uuid4())
 
         payload: dict[str, Any] = {

@@ -37,6 +37,9 @@ __all__ = [
     "InviteUserResponse",
     "UserUpdateRequest",
     "MeUpdateRequest",
+    "ImpersonateUserRequest",
+    "ImpersonationTargetUser",
+    "ImpersonateUserResponse",
 ]
 
 
@@ -277,6 +280,49 @@ class InviteUserResponse(BaseModel):
             "never retrievable again afterward."
         ),
     )
+
+
+class ImpersonateUserRequest(BaseModel):
+    """Body for ``POST /users/{id}/impersonate`` -- ``reason`` is an
+    optional free-text justification carried into the audit log entry
+    (``AuditAction.IMPERSONATION_STARTED``), never enforced/validated
+    beyond a length cap."""
+
+    reason: str | None = Field(
+        default=None,
+        max_length=500,
+        description=(
+            "Optional free-text justification, recorded in the audit log "
+            "entry for this impersonation session."
+        ),
+    )
+
+
+class ImpersonationTargetUser(BaseModel):
+    """The minimal identity fields the impersonating operator's UI needs
+    to render "you are now viewing X's dashboard" -- deliberately not the
+    full ``UserResponse`` shape."""
+
+    id: str
+    full_name: str
+    email: str
+    username: str
+
+
+class ImpersonateUserResponse(BaseModel):
+    """Response for ``POST /users/{id}/impersonate``. ``access_token`` is a
+    short-lived (~30 minute), target-identity JWT whose ``sub`` is the
+    target user -- every downstream permission/org-membership check
+    resolves exactly as if the target had logged in themselves. It also
+    carries an ``impersonation`` claim (``actor_user_id``/``actor_email``/
+    ``started_at``) identifying the real operator, so any code that
+    decodes the token's payload (including the frontend, for its
+    always-visible "impersonating" banner) can tell the session apart from
+    a real login. See ``UserService.impersonate_user``."""
+
+    access_token: str
+    expires_at: datetime
+    target_user: ImpersonationTargetUser
 
 
 class UserUpdateRequest(BaseModel):

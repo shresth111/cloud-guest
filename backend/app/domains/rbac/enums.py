@@ -59,6 +59,18 @@ class PermissionAction(StrEnum):
     MANAGE = "manage"
     EXECUTE = "execute"
     VIEW = "view"
+    # Staff impersonating a customer account to view their dashboard as
+    # them (``users.impersonate``, USERS module only). Deliberately never
+    # expanded into any generic ``GrantLevel`` (not even ``FULL``) --
+    # ``app.domains.rbac.seed``'s own ``expand_grant_level``/
+    # ``SystemRoleDefinition.extra_grants`` grant this action only to
+    # Super Admin, explicitly, since it is materially more sensitive than
+    # every other USERS action (it mints a real, working session as
+    # another account) and must never silently ride along with an
+    # otherwise-ordinary "full user management" grant held by Platform
+    # Admin/MSP Owner/Organization Owner/etc. See seed.py's own comment
+    # on ``expand_grant_level`` for the full reasoning.
+    IMPERSONATE = "impersonate"
 
 
 class PermissionModule(StrEnum):
@@ -227,6 +239,19 @@ class AuditAction(StrEnum):
     USER_DEACTIVATED = "user_deactivated"
     USER_REACTIVATED = "user_reactivated"
     USER_FORCE_LOGGED_OUT = "user_force_logged_out"
+    # A platform staff member (holding the Super-Admin-exclusive
+    # ``users.impersonate`` permission) started a time-limited session
+    # impersonating a customer account to view their dashboard as them --
+    # see ``UserService.impersonate_user``. Always audited, on every
+    # single start, regardless of outcome-of-session -- this is exactly
+    # the "who accessed a customer's account, when, and why" trail this
+    # genuinely sensitive capability exists to leave, the same
+    # "operator explicitly triggers something with real side effects, so
+    # every invocation is logged" posture ``ROUTER_CREDENTIALS_REVEALED``/
+    # ``DEVICE_CONSOLE_COMMAND_EXECUTED`` already establish elsewhere in
+    # this enum for other "a human deliberately did something powerful"
+    # actions.
+    IMPERSONATION_STARTED = "impersonation_started"
 
     # Router domain events (Module 008) -- written through this same table by
     # ``app.domains.router.service.RouterService`` via the same narrow

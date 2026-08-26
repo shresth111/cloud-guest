@@ -30,7 +30,7 @@ import secrets
 import string
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from app.common.exceptions import CloudGuestError
@@ -44,6 +44,7 @@ from app.core.email_layout import (
     render_email,
 )
 from app.database.utils.pagination import PaginationMeta
+from app.domains.auth.jwt import JWTManager
 from app.domains.auth.models import User
 from app.domains.auth.password import PasswordManager, PasswordStrengthError
 from app.domains.auth.service import EmailAlreadyExistsError, UsernameAlreadyExistsError
@@ -60,11 +61,22 @@ from app.domains.rbac.models import Role, UserRole
 from .enums import UserAccountStatus
 from .exceptions import (
     CrossOrganizationUserAccessError,
+    ImpersonationTargetInactiveError,
     InitialRoleRequiresOrganizationError,
     SelfDeactivationNotAllowedError,
+    SelfImpersonationNotAllowedError,
+    StaffImpersonationNotAllowedError,
     UserNotFoundError,
     UserPasswordTooWeakError,
 )
+
+# An impersonation session is deliberately shorter-lived than a normal
+# login session (``settings.access_token_expire_minutes``) -- staff acting
+# as a customer should have to re-mint the session to keep working, on
+# principle, regardless of how long a normal login token is configured
+# for. Hard-coded rather than a ``Settings`` field: this is a fixed
+# security property of the feature, not an operator-tunable knob.
+IMPERSONATION_ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +320,17 @@ class InviteUserResult:
 
     user: User
     temporary_password: str
+
+
+@dataclass(frozen=True, slots=True)
+class ImpersonationResult:
+    """Result of :meth:`UserService.impersonate_user` -- the minted
+    target-identity access token, its expiry, and the target user, for
+    ``POST /api/v1/users/{id}/impersonate`` to shape into its response."""
+
+    access_token: str
+    expires_at: datetime
+    target_user: User
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,6 +756,97 @@ class UserService:
         )
         return updated
 
+    async def impersonate_user(
+        self,
+        *,
+        actor_user_id: uuid.UUID,
+        actor_email: str,
+        user_id: uuid.UUID,
+        reason: str | None,
+    ) -> ImpersonationResult:
+        """Mint a short-lived, target-identity access token so a platform
+        staff member (holding the Super-Admin-exclusive
+        ``users.impersonate`` permission -- enforced by the router's own
+        ``RequirePermission`` dependency, not re-checked here) can view a
+        customer's dashboard exactly as that customer would see it.
+
+        Three checks, each with its own dedicated exception (see
+        ``exceptions.py``):
+
+        * the caller cannot impersonate themselves
+          (:class:`SelfImpersonationNotAllowedError`);
+        * the target must exist and be active
+          (:class:`UserNotFoundError` / :class:`ImpersonationTargetInactiveError`);
+        * the target must hold no active GLOBAL-scope role assignment of
+          their own (:class:`StaffImpersonationNotAllowedError`) -- staff
+          can never impersonate another staff/operator account, which
+          would otherwise let one operator's session quietly ride
+          another's platform-wide permissions (a privilege-escalation
+          chain). This mirrors ``app.domains.rbac.dependencies
+          .CurrentOrganization``'s own GLOBAL-scope-bypass check: any
+          active role whose own ``scope_type`` is GLOBAL.
+
+        The minted token's ``sub``/identity is the *target* user, deliberately
+        shorter-lived than a normal login session
+        (``IMPERSONATION_ACCESS_TOKEN_EXPIRE_MINUTES``, not
+        ``settings.access_token_expire_minutes``), and carries an
+        ``impersonation`` claim naming the real actor -- so every
+        downstream permission/org-membership check resolves as if the
+        target had logged in themselves, while the fact of impersonation
+        (and who is really behind it) is always recoverable straight from
+        the token, for both backend logic and the frontend's own
+        always-visible "impersonating" banner. Every call that reaches
+        this point (i.e. passes all three checks above) writes a real
+        ``AuditAction.IMPERSONATION_STARTED`` entry -- never skipped, the
+        same "every single invocation is logged" posture
+        ``DEVICE_CONSOLE_COMMAND_EXECUTED``/``ROUTER_CREDENTIALS_REVEALED``
+        already establish for other genuinely sensitive, human-triggered
+        actions."""
+        if actor_user_id == user_id:
+            raise SelfImpersonationNotAllowedError(user_id)
+
+        target = await self._get_user_or_raise(user_id)
+        if not target.is_active:
+            raise ImpersonationTargetInactiveError(user_id)
+
+        target_roles = await self.role_resolver.get_active_roles(user_id)
+        if any(role.scope_type == ScopeType.GLOBAL.value for role in target_roles):
+            raise StaffImpersonationNotAllowedError(user_id)
+
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(minutes=IMPERSONATION_ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token, _jti = JWTManager.create_access_token(
+            str(target.id),
+            target.email,
+            additional_claims={
+                "impersonation": {
+                    "actor_user_id": str(actor_user_id),
+                    "actor_email": actor_email,
+                    "started_at": now.isoformat(),
+                }
+            },
+            expires_in_minutes=IMPERSONATION_ACCESS_TOKEN_EXPIRE_MINUTES,
+        )
+
+        await self._audit(
+            actor_user_id,
+            AuditAction.IMPERSONATION_STARTED,
+            entity_id=target.id,
+            description=(
+                f"'{actor_email}' ({actor_user_id}) started impersonating "
+                f"'{target.email}' ({target.id})"
+            ),
+            organization_id=None,
+            metadata={
+                "reason": reason,
+                "target_email": target.email,
+                "expires_at": expires_at.isoformat(),
+            },
+        )
+        return ImpersonationResult(
+            access_token=access_token, expires_at=expires_at, target_user=target
+        )
+
     # -- internal helpers -------------------------------------------------------
 
     async def _get_user_or_raise(self, user_id: uuid.UUID) -> User:
@@ -849,6 +963,9 @@ __all__ = [
     "AuditLogWriter",
     "OrganizationMembershipView",
     "UserAggregate",
+    "InviteUserResult",
+    "ImpersonationResult",
+    "IMPERSONATION_ACCESS_TOKEN_EXPIRE_MINUTES",
     "ADMIN_EDITABLE_FIELDS",
     "SELF_EDITABLE_FIELDS",
     "CloudGuestError",

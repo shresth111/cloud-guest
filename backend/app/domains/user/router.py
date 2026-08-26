@@ -34,11 +34,15 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_user_service
 from .schemas import (
     DataMaskingOtpRequestResponse,
     DataMaskingVerifyRequest,
+    ImpersonateUserRequest,
+    ImpersonateUserResponse,
+    ImpersonationTargetUser,
     InviteUserRequest,
     InviteUserResponse,
     MeUpdateRequest,
@@ -50,7 +54,7 @@ from .schemas import (
     UserResponse,
     UserUpdateRequest,
 )
-from .service import UserAggregate, UserService
+from .service import ImpersonationResult, UserAggregate, UserService
 
 router = APIRouter(tags=["Users"])
 
@@ -370,6 +374,57 @@ async def activate_user(
         success=True,
         message="User activated",
         data=_user_response(updated).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+def _impersonation_response(result: ImpersonationResult) -> ImpersonateUserResponse:
+    return ImpersonateUserResponse(
+        access_token=result.access_token,
+        expires_at=result.expires_at,
+        target_user=ImpersonationTargetUser(
+            id=str(result.target_user.id),
+            full_name=result.target_user.full_name,
+            email=result.target_user.email,
+            username=result.target_user.username,
+        ),
+    )
+
+
+@router.post(
+    "/users/{user_id}/impersonate",
+    response_model=ApiResponse[ImpersonateUserResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("users.impersonate", scope=ScopeType.GLOBAL))
+    ],
+)
+async def impersonate_user(
+    request: Request,
+    user_id: uuid.UUID,
+    payload: ImpersonateUserRequest,
+    user: AuthUser = Depends(CurrentUser),
+    user_service: UserService = Depends(get_user_service),
+):
+    """Mint a short-lived (~30 minute) access token identifying ``user_id``
+    so a platform operator can view that customer's dashboard exactly as
+    they would see it themselves. Explicitly checked at GLOBAL scope
+    (``ScopeType.GLOBAL``, not scope-inferred from any ``X-Organization-Id``
+    header) -- this must only ever succeed for a caller holding a genuinely
+    platform-wide role, never an organization-scoped one, regardless of
+    what scope headers happen to be present on the request. See
+    ``UserService.impersonate_user`` for the full validation/audit
+    contract."""
+    result = await user_service.impersonate_user(
+        actor_user_id=uuid.UUID(user.id),
+        actor_email=user.email,
+        user_id=user_id,
+        reason=payload.reason,
+    )
+    return build_response(
+        success=True,
+        message=f"Impersonation session started for '{result.target_user.email}'",
+        data=_impersonation_response(result).model_dump(),
         request_id=_request_id(request),
     )
 
