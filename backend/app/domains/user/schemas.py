@@ -62,13 +62,26 @@ class UserResponse(BaseModel):
     embedded in ``UserDetailResponse``. Deliberately mirrors
     ``auth.schemas.UserResponse``'s field set rather than importing it, so
     this domain's response contract can evolve independently of auth's own
-    login/register response shape."""
+    login/register response shape.
+
+    ``email: str``, not ``EmailStr``: this field is serialized FROM an
+    already-persisted row, never validated as input here, and
+    ``email-validator`` (what ``EmailStr`` delegates to) rejects RFC 2606
+    special-use domains (``.invalid``/``.example``/``.test``/``.localhost``)
+    by design -- correct for a real signup, wrong for reading one back.
+    Live outage found via this exact failure: a demo/seed account's
+    ``demo-owner-brewline@demo.invalid`` address made pydantic raise on
+    response construction for the WHOLE list, 500ing ``GET /users`` (and
+    therefore the Master Console's Team & Access page) for every caller,
+    not just a request touching that one row. ``UserCreateRequest``/
+    ``InviteUserRequest`` below keep ``EmailStr`` -- validating a NEW
+    address on the way in is exactly the case that check is for."""
 
     id: str
     first_name: str
     last_name: str
     full_name: str
-    email: EmailStr
+    email: str
     username: str
     phone: str | None = None
     profile_photo: str | None = None

@@ -729,6 +729,64 @@ class TestListingAndScoping:
 
 
 # ============================================================================
+# Response schema -- serializing an already-persisted, non-`EmailStr`-
+# validating email
+# ============================================================================
+
+
+class TestUserResponseAcceptsAnyPersistedEmail:
+    """Live outage, reproduced: a demo/seed account's
+    ``demo-owner-brewline@demo.invalid`` address (created directly via
+    ``UserService.create_user``, not through the ``EmailStr``-validated
+    ``UserCreateRequest``/``InviteUserRequest`` HTTP schemas) made pydantic
+    raise while constructing the response for the whole ``GET /users`` list
+    -- one row with an RFC 2606 special-use domain 500'd every caller, not
+    just a request touching that row. ``UserResponse.email`` is `str`
+    for exactly this reason: it serializes what's already in the database,
+    it does not re-validate it."""
+
+    def test_user_schemas_user_response_accepts_special_use_domain(self) -> None:
+        from app.domains.user.schemas import UserResponse
+
+        now = datetime.now(UTC)
+        response = UserResponse(
+            id="00000000-0000-0000-0000-000000000000",
+            first_name="Demo",
+            last_name="Owner",
+            full_name="Demo Owner",
+            email="demo-owner-brewline@demo.invalid",
+            username="demo-owner-brewline",
+            timezone="UTC",
+            language="en",
+            status="active",
+            is_active=True,
+            is_verified=False,
+            data_masking_enabled=False,
+            created_at=now,
+            updated_at=now,
+        )
+        assert response.email == "demo-owner-brewline@demo.invalid"
+
+    def test_auth_schemas_user_response_accepts_special_use_domain(self) -> None:
+        from app.domains.auth.schemas import UserResponse as AuthUserResponse
+
+        now = datetime.now(UTC)
+        response = AuthUserResponse(
+            id="00000000-0000-0000-0000-000000000000",
+            first_name="Demo",
+            last_name="Owner",
+            email="demo-owner-brewline@demo.invalid",
+            username="demo-owner-brewline",
+            timezone="UTC",
+            language="en",
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        assert response.email == "demo-owner-brewline@demo.invalid"
+
+
+# ============================================================================
 # Aggregated user detail
 # ============================================================================
 

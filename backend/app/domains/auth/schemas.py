@@ -150,10 +150,15 @@ class LogoutRequest(BaseModel):
 
 
 class UserResponse(BaseModel):
+    # `str`, not `EmailStr`: this serializes an already-persisted row, never
+    # validates input -- see app.domains.user.schemas.UserResponse's own
+    # docstring for the live outage (a demo account's `@demo.invalid`
+    # address, an RFC 2606 special-use domain email-validator rejects by
+    # design) this exact pattern caused there.
     id: str = Field(..., description="User ID")
     first_name: str
     last_name: str
-    email: EmailStr
+    email: str
     username: str
     phone: str | None = None
     profile_photo: str | None = None
