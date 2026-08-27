@@ -27,6 +27,11 @@ __all__ = [
     "TunnelIPPoolExhaustedError",
     "TunnelIPAllocationConflictError",
     "InvalidWireGuardCidrError",
+    "HubPeerListerNotConfiguredError",
+    "HubCannotLearnPlatformKeyError",
+    "HubPeerRemovalUnsupportedError",
+    "HubPeerNotOnHubError",
+    "HubPeerClaimedByAnotherRouterError",
 ]
 
 
@@ -189,4 +194,104 @@ class InvalidWireGuardCidrError(WireGuardError):
         super().__init__(
             f"'{cidr}' is not a valid IPv4/IPv6 network CIDR",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class HubCannotLearnPlatformKeyError(WireGuardError):
+    """The operation would write a platform-generated public key that this
+    hub has no verb to be told about, so the tunnel it describes could
+    never come up.
+
+    This is the honest name for a gap that has been silently producing
+    broken tunnels. ``ops/hub-agents/wg_agent.py`` exposes ``POST
+    /wg/peer``, which *generates its own keypair* and returns it, and
+    ``GET /wg/peers``. There is no endpoint that accepts a public key the
+    caller already has. So ``create_tunnel``/``rotate_tunnel``'s
+    ``generate_wireguard_keypair()`` path writes a key that exists in
+    exactly one place -- this database -- and the hub goes on expecting the
+    old one.
+
+    Confirmed live 2026-08-27 on router 21e13913: three console
+    "Generate" clicks each ran ``POST /routers/provisioning/check-in``,
+    which rotated the peer to a fresh platform keypair
+    (``XdLGb1sx...``, ``rP4Bjge...``, ``Tytu4dAc...``), none of which ever
+    appeared in ``GET /wg/peers``. Each was then immediately superseded by
+    a hub-allocated peer, so the damage was masked -- but for the seconds
+    between them the platform's record of that router's identity was a key
+    no WireGuard implementation anywhere held.
+
+    Raised rather than logged because there is a real, correct action the
+    caller can take instead (allocate through the hub bridge, which is the
+    only path that produces a key both sides know), and silently writing
+    the unusable key is what hid this for months. Lifts automatically the
+    moment the hub gains a registration verb -- see
+    ``service.HubCapabilities``."""
+
+    def __init__(self, operation: str) -> None:
+        super().__init__(
+            f"{operation} would generate a WireGuard keypair on the platform "
+            "side, but the hub agent has no verb to be told a public key it "
+            "did not generate itself -- the resulting tunnel could never "
+            "establish. Allocate through the hub bridge instead "
+            "(POST /routers/{router_id}/wireguard-peer/allocate-external).",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class HubPeerRemovalUnsupportedError(WireGuardError):
+    """The hub cannot be told to drop a peer, and the caller needed it to.
+
+    Distinct from ``dependencies.HubBridgeUnavailableError`` on purpose,
+    and the distinction is the whole point: "the bridge could not be
+    reached" is transient and worth retrying, while "the bridge does not
+    implement this verb" is a permanent property of the deployed agent
+    that no retry will change. Collapsing the two is what let a ``501
+    Unsupported method ('DELETE')`` be logged, once per orphaned peer, as
+    though it were a blip.
+
+    Everything that can degrade honestly around this does so instead of
+    raising -- see ``WireGuardService.revoke_tunnel``, which now quarantines
+    the address rather than refusing to revoke at all. This exists for the
+    paths where continuing really would be a lie."""
+
+    def __init__(self, public_key: str) -> None:
+        super().__init__(
+            "The WireGuard hub agent has no peer-removal verb deployed, so "
+            f"peer {public_key[:16]}... cannot be removed from it. This is a "
+            "capability gap on the hub, not a transient failure -- see "
+            "ops/hub-agents/wg_agent.py's do_DELETE, which is written and "
+            "waiting on shell access to that host.",
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        )
+
+
+class HubPeerNotOnHubError(WireGuardError):
+    """Adoption was asked to record an identity the hub does not actually
+    have. Refused, because adoption's entire justification is that it
+    writes down something demonstrably true -- adopting a key ``GET
+    /wg/peers`` has never heard of would just be a differently-wrong row."""
+
+    def __init__(self, public_key: str) -> None:
+        super().__init__(
+            f"The hub has no peer with public key {public_key[:16]}... -- "
+            "there is nothing to adopt. Check GET /wireguard/fleet-status "
+            "for what the hub actually holds.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class HubPeerClaimedByAnotherRouterError(WireGuardError):
+    """The key being adopted is already this platform's record of a
+    *different* router's peer. Two routers sharing one WireGuard identity
+    is not a state worth reaching by accident: the hub routes by
+    ``allowed-ips``, so the second one silently steals the first one's
+    traffic."""
+
+    def __init__(self, public_key: str, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Public key {public_key[:16]}... is already recorded as router "
+            f"{router_id}'s peer -- adopting it here would give two routers "
+            "one tunnel identity. Revoke the other router's peer first if "
+            "this device has genuinely taken over its identity.",
+            status_code=status.HTTP_409_CONFLICT,
         )

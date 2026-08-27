@@ -654,14 +654,65 @@ class RadiusNasClient(BaseModel):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # The RADIUS NAS-IP-Address attribute value -- defaults to the
-    # router's own public_ip_address (falling back to
-    # management_ip_address) at registration time, but is its own column,
-    # not re-derived by join, since it can legitimately diverge later (a
-    # router's own IP changing does not necessarily mean FreeRADIUS's
-    # configured NAS-IP-Address should silently follow without an admin
-    # decision).
+    # THE ADDRESS THIS NAS IS IDENTIFIED AND REACHED BY -- the router's
+    # WireGuard tunnel address.
+    #
+    # This column was a trap and is being made honest rather than removed.
+    # It was documented as "the RADIUS NAS-IP-Address attribute value,
+    # defaulting to the router's own public_ip_address (falling back to
+    # management_ip_address)", and `register_nas` populated it exactly that
+    # way. Both halves were wrong in this deployment:
+    #
+    #  * Every router here sits behind carrier-grade NAT with no public IP,
+    #    so that expression resolves to NULL. Confirmed live 2026-08-27:
+    #    the single production NAS row (ae27588d, cg-21e13913) has an EMPTY
+    #    ip_address. Its one real consumer, `_send_coa`, early-returns on
+    #    `not nas_client.ip_address` -- so live CoA/Disconnect has been
+    #    silently disabled for the entire fleet since the column was added,
+    #    reported as "no response" rather than "never sent".
+    #  * More importantly it was never the address FreeRADIUS keys on.
+    #    `radius_agent.add_client` writes `ipaddr = <tunnel_ip>/32` from
+    #    whatever the caller passed, which `register_external_radius_nas`
+    #    takes from `peer.tunnel_ip_address`. So the value that decides
+    #    whether a guest's Access-Request is accepted or dropped as an
+    #    unknown client existed ONLY in the hub's clients.conf, with no
+    #    column anywhere recording it -- which is why a peer moving from
+    #    10.20.0.6 to 10.20.0.8 could break a venue with nothing in the
+    #    database looking wrong.
+    #
+    # It is now the tunnel address, maintained by
+    # `app.domains.hub_reconciliation` whenever the peer moves. One address,
+    # one column: the tunnel address is simultaneously what the client{}
+    # stanza is keyed on AND the only address at which this NAS is reachable
+    # from platform-side infrastructure, so splitting them would invent a
+    # distinction the deployment does not have.
+    #
+    # NOTE for the CoA path: setting this makes `_send_coa` start actually
+    # sending, which needs a route from the API container into the hub's
+    # 10.20.0.0/24. That route does not exist today, so CoA will report "no
+    # response" instead of silently not trying. That is the honest state and
+    # a routing change, not a data change, is what fixes it.
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    # WHAT THE HUB CONFIRMED IT WROTE, and when.
+    #
+    # Deliberately a second column rather than reusing `ip_address`, and
+    # the distinction is the entire lesson of the 2026-08-27 fault:
+    # `ip_address` is DESIRED state (where this NAS should be reachable),
+    # this is CONFIRMED state (what clients.conf actually contains, per the
+    # hub's own 200 response). Conflating "what we intend" with "what is
+    # deployed" is precisely how a stanza for 10.20.0.8 and a router on
+    # 10.20.0.6 coexisted while every row looked healthy.
+    #
+    # Kept separate is also what makes reconciliation possible at all: the
+    # two differing is a queryable, retryable condition, so a failed
+    # re-push converges on the next pass instead of needing a human to
+    # notice a log line.
+    hub_client_synced_ip: Mapped[str | None] = mapped_column(
+        String(45), nullable=True
+    )
+    hub_client_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Every Router in this codebase is a MikroTik RouterOS device today
     # (see app.domains.router.models.Router's own docstring) -- "MikroTik"
     # is a real, true default, not a fabricated placeholder value, and

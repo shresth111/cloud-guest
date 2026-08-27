@@ -4222,9 +4222,23 @@ class RadiusService:
         plaintext_secret = shared_secret or generate_shared_secret(
             shared_secret_length_bytes
         )
-        resolved_ip_address = (
-            ip_address or router.public_ip_address or router.management_ip_address
-        )
+        # ``ip_address`` is now the router's WireGuard TUNNEL address and
+        # nothing else -- see ``models.RadiusNasClient.ip_address``'s own
+        # comment for the full write-up.
+        #
+        # The removed fallback (``router.public_ip_address or
+        # router.management_ip_address``) was wrong twice over: every
+        # router in this fleet is behind carrier-grade NAT, so it resolved
+        # to NULL on the one production row that exists, and even when it
+        # resolved it named an address FreeRADIUS never keys on. It is not
+        # replaced with a tunnel-address lookup here because this method
+        # deliberately does not know about the WireGuard domain: the
+        # caller that HAS the peer (``register_external_radius_nas``, and
+        # ``hub_reconciliation`` after it) passes it in, and
+        # ``record_hub_client_sync`` keeps it current from then on. A NAS
+        # registered with no address is honestly address-less rather than
+        # confidently wrong.
+        resolved_ip_address = ip_address
 
         nas_client = await self.repository.create_nas_client(
             router_id=router.id,
@@ -4333,6 +4347,56 @@ class RadiusService:
             AuditAction.RADIUS_NAS_UPDATED,
             nas_client=updated,
             description=f"RADIUS NAS client '{self._nas_display(updated)}' updated",
+        )
+        return updated
+
+    async def record_hub_client_sync(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        tunnel_ip_address: str,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> RadiusNasClient:
+        """Records that the hub has CONFIRMED a ``client{}`` stanza for this
+        NAS at ``tunnel_ip_address``.
+
+        Called only after a 2xx from ``radius_bridge.push_nas_client`` --
+        never optimistically, never on the way in. That ordering is the
+        whole value of the column: ``hub_client_synced_ip`` is meant to
+        answer "what is in clients.conf right now", and a value written
+        before the write succeeded answers "what we hoped", which is the
+        question that already had an answer.
+
+        ``ip_address`` is set to the same value because for this
+        deployment they are one fact -- see
+        ``models.RadiusNasClient.ip_address``. Writing both here rather
+        than leaving ``ip_address`` to drift separately is what keeps the
+        CoA destination and the RADIUS client identity from becoming two
+        independently-wrong records of the same address.
+
+        No audit entry: this is the platform reconciling its own record of
+        an external system, not an operator decision, and one audit row per
+        reconciliation pass per NAS would bury the rows that are decisions.
+        The ``radius_nas_hub_client_synced`` log line plus the timestamp
+        column are the trail.
+        """
+        nas_client = await self.get_nas_client(
+            nas_id, requesting_organization_id=requesting_organization_id
+        )
+        updated = await self.repository.update_nas_client(
+            nas_client,
+            {
+                "ip_address": tunnel_ip_address,
+                "hub_client_synced_ip": tunnel_ip_address,
+                "hub_client_synced_at": datetime.now(UTC),
+            },
+        )
+        logger.info(
+            "radius_nas_hub_client_synced",
+            extra={
+                "nas_identifier": updated.nas_identifier,
+                "tunnel_ip_address": tunnel_ip_address,
+            },
         )
         return updated
 

@@ -91,7 +91,18 @@ class FleetPeerStatusResponse(BaseModel):
     router_id: str | None = None
     router_name: str | None = None
     tunnel_ip_address: str | None = None
+    # The address the HUB has in allowed-ips for this key. Reported next to
+    # `tunnel_ip_address` (this platform's belief), not instead of it: the
+    # two disagreeing IS the finding, and it is the specific disagreement
+    # that silently drops every guest login, because the RADIUS client
+    # stanza is keyed on the address.
+    hub_tunnel_ip_address: str | None = None
     last_handshake_at: datetime | None = None
+    # Why this row is classified the way it is, in plain English. Written
+    # for whoever is looking at seven peers on a hub trying to work out
+    # which ones matter -- an orphan that says why it is an orphan is not
+    # drift.
+    explanation: str | None = None
 
 
 class FleetStatusResponse(BaseModel):

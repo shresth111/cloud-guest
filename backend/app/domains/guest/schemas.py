@@ -505,6 +505,14 @@ class RadiusNasResponse(BaseModel):
     name: str | None
     description: str | None
     ip_address: str | None
+    # What the hub CONFIRMED it wrote into clients.conf, and when. Exposed
+    # alongside `ip_address` rather than instead of it because the two
+    # differing is the finding -- that is exactly the state in which every
+    # guest Access-Request from this router is being dropped as an unknown
+    # client, and it is invisible in any view that shows only one of them.
+    # See models.RadiusNasClient.hub_client_synced_ip.
+    hub_client_synced_ip: str | None = None
+    hub_client_synced_at: datetime | None = None
     vendor: str
     created_at: datetime
     updated_at: datetime

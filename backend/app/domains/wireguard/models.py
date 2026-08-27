@@ -209,4 +209,117 @@ class WireGuardPeer(BaseModel):
         )
 
 
-__all__ = ["WireGuardServer", "WireGuardPeer"]
+class WireGuardPeerIssuance(BaseModel):
+    """Append-only record of every (router, public key, tunnel address)
+    identity this platform has ever handed out for a WireGuard peer.
+
+    ## Why this table exists when ``WireGuardPeer`` deliberately has no history
+
+    ``WireGuardPeer``'s own module docstring argues, correctly, that a
+    superseded keypair "has no standalone value once superseded -- it is
+    dead key material pointing at an address no longer routed to that
+    peer." That reasoning holds for a hub that can be told to forget the
+    old peer. This one cannot: ``ops/hub-agents/wg_agent.py`` implements
+    ``POST /wg/peer`` (always allocates) and ``GET /wg/peers``, and nothing
+    else. So a superseded identity is not dead -- it stays live on the hub,
+    keeps its ``allowed-ips``, and keeps consuming an address out of a /24,
+    indefinitely.
+
+    That turns the discarded row into the single most valuable fact the
+    platform has, for two distinct jobs it could not do without it:
+
+    1. **Attribution.** On 2026-08-27 the hub held seven peers,
+       ``10.20.0.2`` through ``10.20.0.8``, and the device at "huda city
+       center" was handshaking on ``.6`` with a key the ``wireguard_peers``
+       row no longer held. ``get_fleet_status`` could only report six of
+       them as ``UNTRACKED_CONNECTED`` -- "no idea what this is" -- when in
+       fact the platform had allocated every single one, for that one
+       router, within twelve minutes. With this table, the same read says
+       "``.6`` is an identity we issued to router 21e13913 and the device
+       is demonstrably using it", which is enough to adopt automatically
+       and safely. Without it, adoption is a guess and must stay manual.
+    2. **Quarantine.** ``validators.allocate_tunnel_ip`` walks candidate
+       addresses in order and skips whatever ``list_occupied_tunnel_ips``
+       reports. That set is built from ``wireguard_peers``, which by
+       construction forgets every superseded address the moment it is
+       overwritten -- so the allocator is free to hand out an address the
+       hub still routes to a different peer. ``hub_lifecycle`` is what
+       makes those addresses visible to it.
+
+    ## Why append-only, and why not just an audit-log entry
+
+    ``audit_log_entries`` already records *that* a tunnel was created or
+    rotated, and this module writes one on every such event. What it does
+    not record is *which key and which address* -- its ``event_metadata``
+    carries ``router_id`` and nothing else, which is exactly why the seven
+    live orphans could not be attributed after the fact from the audit
+    trail alone. Widening the audit payload would make audit rows load-
+    bearing for a reconciliation query they are not indexed for and would
+    still leave nothing to write ``hub_lifecycle`` transitions onto. This
+    is a small, indexed, purpose-built table, not a second audit log.
+
+    Rows are never updated except for ``hub_lifecycle``/``superseded_at``
+    -- the identity triple itself is immutable once written, because the
+    thing being recorded is a historical fact about what was handed out.
+    """
+
+    __tablename__ = "wireguard_peer_issuances"
+
+    # Not a unique FK, unlike ``WireGuardPeer.router_id`` -- the entire
+    # point is many rows per router. ``CASCADE`` matches the peer table's
+    # own choice: if the router is genuinely deleted, its issuance history
+    # has no subject left. (The hub's copy of those peers survives that
+    # deletion regardless, which is why fleet status reports an orphan with
+    # ``router_id`` resolved to NULL rather than pretending it never
+    # existed -- see ``get_fleet_status``.)
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("wireguard_servers.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    public_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    tunnel_ip_address: Mapped[str] = mapped_column(String(45), nullable=False)
+    # ``constants.PeerIdentitySource`` -- assertion vs observation. See that
+    # enum's own docstring for why the difference decides who wins a
+    # disagreement.
+    source: Mapped[str] = mapped_column(String(30), nullable=False)
+    # ``constants.HubPeerLifecycle`` -- what the platform believes the hub
+    # still holds for this identity.
+    hub_lifecycle: Mapped[str] = mapped_column(String(30), nullable=False)
+    # Set when a later issuance for the same router replaces this one.
+    # NULL means "this is the identity the platform currently believes in",
+    # which is exactly one row per router by construction.
+    superseded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Free-text, operator-facing. Written by the adopt/annotate paths so an
+    # orphan that a human has already looked at reads as "explained" rather
+    # than as unexplained drift the next person has to re-investigate.
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        # NOT unique on ``public_key``: the same key can legitimately be
+        # recorded twice for one router (issued, then later adopted after
+        # the device proved it was using it), and those are two different
+        # facts worth keeping apart. Uniqueness lives on ``wireguard_peers``
+        # where it belongs.
+        Index("ix_wireguard_peer_issuances_router_id", "router_id"),
+        Index("ix_wireguard_peer_issuances_public_key", "public_key"),
+        Index("ix_wireguard_peer_issuances_server_id", "server_id"),
+        Index("ix_wireguard_peer_issuances_hub_lifecycle", "hub_lifecycle"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<WireGuardPeerIssuance(router_id={self.router_id}, "
+            f"tunnel_ip_address={self.tunnel_ip_address}, "
+            f"source={self.source}, hub_lifecycle={self.hub_lifecycle})>"
+        )
+
+
+__all__ = ["WireGuardServer", "WireGuardPeer", "WireGuardPeerIssuance"]
