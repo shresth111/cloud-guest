@@ -29,6 +29,17 @@
 # ~/deploy/cloud-guest/backend/.env, which is the stack's entire production
 # configuration and is not in git. Neither is a thing to automate.
 #
+# CORRECTION 2026-08-27, later the same day: both checkouts are CLEAN again --
+# they were tidied by a stash plus a deploy-branch checkout, which is also
+# where ~/deploy/frontend-worktree-backup-*.tgz came from. The dirty-tree
+# observation above was real but point-in-time, so do not cite it as current
+# state. It is not what carries this argument in any case: "clean right now"
+# is not a property a deploy pipeline can be built on, since the next person
+# to debug something on the box makes it false again without telling anyone.
+# The load-bearing half is the sentence about `.env`, and that is unchanged --
+# verified still present, 7019 bytes, mode 600, ubuntu-owned, untracked, and
+# with no other copy anywhere.
+#
 # Building here is also a bad trade on its own terms: m6i.large, 2 vCPU,
 # ~1 GB free RAM while serving live traffic. A bun/vite build and a pip
 # install alongside uvicorn and two celery workers is a latency incident.

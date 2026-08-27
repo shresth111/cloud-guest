@@ -20,7 +20,10 @@ name: CD
 # ----------------------------------------------
 # See deploy/remote-deploy.sh -- short version: the box is a 2 vCPU m6i.large
 # serving live traffic with ~1 GB free RAM, and both checkouts under ~/deploy
-# are dirty, so "git pull and build" ships whatever a human left behind.
+# can be dirty, so "git pull and build" ships whatever a human left behind.
+# (They were dirty when this was written and are clean again now -- see the
+# CORRECTION in deploy/remote-deploy.sh. The durable reason is `.env`, which
+# lives only on the box and which a `git checkout -f` deploy would delete.)
 #
 # MIGRATIONS
 # ----------
@@ -152,8 +155,20 @@ jobs:
       # dependency in requirements.txt, or a bad import shows up here as a
       # non-zero exit in seconds, instead of as a boot-looping container on
       # the production box three minutes later.
+      #
+      # Deliberately NOT gated on steps.exists.outputs.found. This step used to
+      # carry `if: steps.exists.outputs.found == 'false'`, which opened a hole:
+      # docker/build-push-action PUSHES as part of the build, so an image whose
+      # smoke test then FAILED is already in ECR under that SHA. Re-running the
+      # workflow for that SHA found it, skipped the build AND skipped this
+      # check, and shipped a known-bad image with nothing left to catch it but
+      # the on-box health gate.
+      #
+      # Running it unconditionally costs one `docker pull` on the reuse path
+      # (the ECR login above already authenticated the runner) and makes the
+      # rollback path prove the artifact starts, rather than assuming it does
+      # because it once got as far as being pushed.
       - name: Smoke-test the image imports
-        if: steps.exists.outputs.found == 'false'
         run: |
           docker run --rm --entrypoint python "${{ steps.meta.outputs.image }}" \
             -c "import app.main; print('app.main imported OK')"
