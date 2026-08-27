@@ -33,7 +33,6 @@ from types import SimpleNamespace
 import pytest
 
 from app.domains.auth.models import AuthUser
-from app.domains.location.number_generator import LocationCodeCounterRepositoryProtocol
 from app.domains.location.router import create_location
 from app.domains.location.schemas import LocationCreateRequest
 from app.domains.location.service import LocationService

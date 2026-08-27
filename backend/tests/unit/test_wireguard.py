@@ -30,7 +30,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.database.exceptions import DuplicateRecordError
-from app.domains.rbac.enums import ScopeType
 from app.domains.location.exceptions import (
     CrossOrganizationLocationAccessError,
     LocationNotFoundError,
@@ -39,6 +38,7 @@ from app.domains.location.models import Location
 from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
+from app.domains.rbac.enums import ScopeType
 from app.domains.router.crypto import decrypt_secret
 from app.domains.router.enums import RouterStatus
 from app.domains.router.exceptions import CrossOrganizationRouterAccessError
@@ -1861,7 +1861,8 @@ class TestFleetStatus:
             router_id=router.id,
             requesting_organization_id=None,
         )
-        peer_public_key = (await f.wireguard_repo.get_peer_by_router_id(router.id)).public_key
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        peer_public_key = peer.public_key
 
         result = await f.wireguard_service.get_fleet_status(now=now)
 
@@ -1874,7 +1875,8 @@ class TestFleetStatus:
         ghost_key = "ghost-public-key-not-in-db"
 
         async def _lister() -> list[dict]:
-            return [_hub_peer(ghost_key, handshake_epoch=int(datetime.now(UTC).timestamp()))]
+            handshake = int(datetime.now(UTC).timestamp())
+            return [_hub_peer(ghost_key, handshake_epoch=handshake)]
 
         f = make_services(hub_peer_lister=_lister)
 
