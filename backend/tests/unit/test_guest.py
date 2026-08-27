@@ -5821,7 +5821,30 @@ class TestSharedSecretGeneration:
         )
         assert result.shared_secret == "my-own-secret-123"
 
-    async def test_ip_address_defaults_from_router_public_ip(self) -> None:
+    async def test_ip_address_is_not_defaulted_from_the_routers_public_ip(
+        self,
+    ) -> None:
+        """``ip_address`` used to default to ``router.public_ip_address``
+        (falling back to ``management_ip_address``). That default was wrong
+        in two independent ways and this test pins its removal.
+
+        It never produced a usable value: every router in this fleet sits
+        behind carrier-grade NAT, so the expression resolves to NULL --
+        confirmed on the single production NAS row (cg-21e13913), whose
+        ``ip_address`` is empty, which silently disables live CoA/Disconnect
+        for that router (``_send_coa`` early-returns on a falsy address).
+
+        And it named the wrong address even when it resolved. FreeRADIUS
+        keys a ``client{}`` stanza on the router's WireGuard TUNNEL address
+        (``radius_agent.add_client`` writes ``ipaddr = <tunnel_ip>/32``),
+        not on its public IP. Defaulting to the public IP put a
+        confident-looking value in the column that no part of the RADIUS
+        path uses.
+
+        A NAS registered without one is now honestly address-less until a
+        caller that actually knows the tunnel address supplies it -- see
+        ``RadiusService.record_hub_client_sync``.
+        """
         fx = make_fixture()
         router_b = fx.router_service.add(
             organization_id=fx.organization_id, public_ip_address="203.0.113.5"
@@ -5829,7 +5852,36 @@ class TestSharedSecretGeneration:
         result = await fx.radius_service.register_nas(
             actor_user_id=uuid.uuid4(), router_id=router_b.id, nas_identifier="nas-y"
         )
-        assert result.nas_client.ip_address == "203.0.113.5"
+        assert result.nas_client.ip_address is None
+
+    async def test_record_hub_client_sync_writes_the_confirmed_address(
+        self,
+    ) -> None:
+        """``hub_client_synced_ip`` is what the hub CONFIRMED is in
+        clients.conf, as distinct from what this platform intended. The
+        column exists because that address previously lived nowhere in the
+        database -- derived at registration from ``peer.tunnel_ip_address``
+        and discarded -- so a peer moving from 10.20.0.6 to 10.20.0.8 broke
+        a venue with every row still looking healthy."""
+        fx = make_fixture()
+        result = await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=fx.router.id,
+            nas_identifier="nas-sync",
+        )
+        assert result.nas_client.hub_client_synced_ip is None
+        assert result.nas_client.hub_client_synced_at is None
+
+        synced = await fx.radius_service.record_hub_client_sync(
+            nas_id=result.nas_client.id,
+            tunnel_ip_address="10.20.0.6",
+        )
+
+        assert synced.hub_client_synced_ip == "10.20.0.6"
+        assert synced.hub_client_synced_at is not None
+        # Desired and confirmed are kept in step by the same writer -- for
+        # this deployment they are one fact (see the model's own comment).
+        assert synced.ip_address == "10.20.0.6"
 
     async def test_ip_address_explicit_override_wins(self) -> None:
         fx = make_fixture()

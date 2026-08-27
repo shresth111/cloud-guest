@@ -317,6 +317,60 @@ class Settings(BaseSettings):
             "and fail-closed rules."
         ),
     )
+    # ------------------------------------------------------------------
+    # WHAT THE DEPLOYED HUB AGENT CAN ACTUALLY DO.
+    #
+    # These are not feature toggles. They describe a property of the
+    # machine at hub_wg_agent_url, and they exist because the backend spent
+    # weeks writing rows and issuing requests on the assumption of a hub
+    # that could do things this one cannot -- silently, because "the code
+    # supports it" and "this deployment supports it" had no way to differ.
+    #
+    # Both default FALSE, which is the opposite of this file's usual
+    # posture, and deliberately so: the running agent
+    # (ops/hub-agents/wg_agent.py, captured verbatim in this repo)
+    # implements do_POST and do_GET and nothing else. A default of True
+    # would restore exactly the silent-breakage this pair was added to
+    # end, on any environment that forgets to set them.
+    #
+    # See app.domains.wireguard.service.HubCapabilities for what each one
+    # changes.
+    # ------------------------------------------------------------------
+    hub_wg_agent_supports_key_registration: bool = Field(
+        default=False,
+        description=(
+            "True only if the hub agent has a verb that accepts a WireGuard "
+            "public key the caller already holds. The deployed agent does "
+            "not: POST /wg/peer takes an empty body and generates its own "
+            "keypair. While False, WireGuardService refuses to write a "
+            "platform-generated keypair (create_tunnel's default path, "
+            "rotate_tunnel) with HubCannotLearnPlatformKeyError, because "
+            "the tunnel such a row describes could never establish -- the "
+            "hub goes on expecting the previous key and the only symptom is "
+            "a handshake that never happens. Confirmed live 2026-08-27: "
+            "three check-ins on router 21e13913 each rotated to a fresh "
+            "platform keypair that never appeared in GET /wg/peers."
+        ),
+    )
+    hub_wg_agent_supports_peer_removal: bool = Field(
+        default=False,
+        description=(
+            "True only if the hub agent implements DELETE /wg/peer. The "
+            "deployed one does not -- http.server answers 501 Unsupported "
+            "method -- so every superseded peer stays on the hub forever, "
+            "holding its tunnel address. While False, the backend stops "
+            "asking, records each superseded identity as "
+            "HubPeerLifecycle.ORPHANED in wireguard_peer_issuances (which "
+            "quarantines its address against reallocation and makes it "
+            "explicable in GET /wireguard/fleet-status), and revoke_tunnel "
+            "proceeds honestly instead of failing forever. A do_DELETE "
+            "handler is written in ops/hub-agents/wg_agent.py and is "
+            "undeployable only because that host has no shell access (no "
+            "key, no EC2 Instance Connect on its Debian AMI, no SSM agent, "
+            "no instance profile). Set this True the day it lands; nothing "
+            "else has to change."
+        ),
+    )
 
     snmp_default_community: str = Field(
         default="",

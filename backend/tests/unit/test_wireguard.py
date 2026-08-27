@@ -55,9 +55,19 @@ from app.domains.router_agent.exceptions import (
 )
 from app.domains.router_agent.models import RouterAgentCredential
 from app.domains.router_agent.service import RouterAgentService, hash_credential
-from app.domains.wireguard.constants import FleetPeerStatus, HealthStatus, PeerStatus
+from app.domains.wireguard.constants import (
+    FleetPeerStatus,
+    HealthStatus,
+    HubPeerLifecycle,
+    HubRemovalOutcome,
+    PeerIdentitySource,
+    PeerStatus,
+)
 from app.domains.wireguard.exceptions import (
+    HubCannotLearnPlatformKeyError,
+    HubPeerClaimedByAnotherRouterError,
     HubPeerListerNotConfiguredError,
+    HubPeerNotOnHubError,
     InvalidPeerStatusTransitionError,
     NoActiveWireGuardServerError,
     TunnelIPAllocationConflictError,
@@ -68,9 +78,17 @@ from app.domains.wireguard.exceptions import (
     WireGuardPrivateKeyUnavailableError,
     WireGuardRouterNotEligibleError,
 )
-from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
+from app.domains.wireguard.models import (
+    WireGuardPeer,
+    WireGuardPeerIssuance,
+    WireGuardServer,
+)
 from app.domains.wireguard.router import router as wireguard_router
-from app.domains.wireguard.service import WireGuardService, generate_wireguard_keypair
+from app.domains.wireguard.service import (
+    HubCapabilities,
+    WireGuardService,
+    generate_wireguard_keypair,
+)
 from app.domains.wireguard.validators import allocate_tunnel_ip, validate_cidr
 
 
@@ -298,6 +316,9 @@ class FakeWireGuardRepository:
     # `list_all_peers_with_router_names` needs) rather than wiring in a
     # second fake repository just to look up a name.
     router_names: dict[uuid.UUID, str] = field(default_factory=dict)
+    # Append-only, mirroring the real table. See the ledger methods below
+    # for why order matters here.
+    issuances: list[WireGuardPeerIssuance] = field(default_factory=list)
 
     async def get_server_by_id(self, server_id, *, include_deleted: bool = False):
         server = self.servers.get(server_id)
@@ -373,6 +394,17 @@ class FakeWireGuardRepository:
                 raise DuplicateRecordError("WireGuardPeer", "public_key")
 
     async def create_peer(self, **fields: object) -> WireGuardPeer:
+        # Mirror the column-level defaults the real table applies. Without
+        # these, a caller that legitimately omits an optional field (e.g.
+        # `register_agent_allocated_peer`, which leaves `rotation_count` to
+        # the column default on a first registration) gets None here and
+        # fails on arithmetic that works fine against Postgres -- a fake
+        # that is stricter than the schema, which is the wrong direction
+        # for a test double to be wrong in.
+        fields.setdefault("status", PeerStatus.PENDING.value)
+        fields.setdefault("rotation_count", 0)
+        fields.setdefault("last_handshake_at", None)
+        fields.setdefault("revoked_at", None)
         self._check_unique(
             server_id=fields["server_id"],
             tunnel_ip_address=fields["tunnel_ip_address"],
@@ -404,6 +436,54 @@ class FakeWireGuardRepository:
             for peer in self.peers.values()
             if not peer.is_deleted
         ]
+
+    # -- issuance ledger ------------------------------------------------
+    # Insertion-ordered, and every read that cares about recency reverses
+    # it -- the real ``GenericRepository.get_all`` sorts ``created_at``
+    # DESC, and several ledger reads ("the most recent issuance of this
+    # key") are only correct under that ordering. A fake that returned
+    # ascending order would let a wrong implementation pass here and fail
+    # against Postgres.
+
+    async def create_issuance(self, **fields: object) -> WireGuardPeerIssuance:
+        issuance = WireGuardPeerIssuance(**_base_fields(**fields))
+        self.issuances.append(issuance)
+        return issuance
+
+    async def update_issuance(
+        self, issuance, data: dict[str, object]
+    ) -> WireGuardPeerIssuance:
+        for key, value in data.items():
+            if hasattr(issuance, key):
+                setattr(issuance, key, value)
+        issuance.version += 1
+        return issuance
+
+    async def list_issuances_for_router(
+        self, router_id
+    ) -> list[WireGuardPeerIssuance]:
+        return [i for i in reversed(self.issuances) if i.router_id == router_id]
+
+    async def get_issuance_by_public_key(
+        self, public_key: str
+    ) -> WireGuardPeerIssuance | None:
+        return next(
+            (i for i in reversed(self.issuances) if i.public_key == public_key),
+            None,
+        )
+
+    async def list_all_issuances(self) -> list[WireGuardPeerIssuance]:
+        return list(reversed(self.issuances))
+
+    async def list_hub_held_tunnel_ips(self, server_id) -> set[str]:
+        return {
+            i.tunnel_ip_address
+            for i in self.issuances
+            if i.server_id == server_id
+            and not i.is_deleted
+            and i.hub_lifecycle
+            in (HubPeerLifecycle.LIVE.value, HubPeerLifecycle.ORPHANED.value)
+        }
 
 
 @dataclass
@@ -500,6 +580,8 @@ def make_services(
     wireguard_repo: FakeWireGuardRepository | None = None,
     hub_peer_deregistrar=None,
     hub_peer_lister=None,
+    hub_capabilities: HubCapabilities | None = None,
+    peer_address_listener=None,
 ) -> Fixture:
     org_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup(organization_lookup=org_lookup)
@@ -524,6 +606,12 @@ def make_services(
         handshake_stale_after_minutes=handshake_stale_after_minutes,
         hub_peer_deregistrar=hub_peer_deregistrar,
         hub_peer_lister=hub_peer_lister,
+        # Defaults to a fully-featured hub (HubCapabilities()'s own
+        # defaults) so every pre-existing test keeps exercising the
+        # unrestricted paths; the tests that care about today's degraded
+        # production hub opt in explicitly.
+        hub_capabilities=hub_capabilities,
+        peer_address_listener=peer_address_listener,
     )
 
     return Fixture(
@@ -1043,8 +1131,25 @@ class TestEnsureTunnelForCheckIn:
             delivery.peer_private_key
         )
 
-    async def test_second_check_in_rotates_in_place_same_tunnel_ip(self) -> None:
-        fx = make_services()
+    async def test_second_check_in_keeps_the_identity_the_hub_confirms(
+        self,
+    ) -> None:
+        """THE ACCEPTANCE TEST for the 2026-08-27 fault.
+
+        A device that enrolled and then checks in again must still be the
+        peer the platform believes in. This previously rotated to a fresh
+        platform keypair on every repeat check-in, which the Master
+        console's own Generate flow triggers (it mints a provisioning token
+        and burns it itself, ~50ms later, to get the agent credential it
+        bakes into the .rsc). Three Generates on router 21e13913 produced
+        three rotations to keys no WireGuard implementation anywhere held.
+        """
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        fx = make_services(hub_peer_lister=_lister)
         router_device = await self._enrolled_router(fx)
         first = await fx.wireguard_service.ensure_tunnel_for_check_in(
             router_id=router_device.id,
@@ -1057,18 +1162,82 @@ class TestEnsureTunnelForCheckIn:
         first_public_key = first.peer.public_key
         first_private_key = first.peer_private_key
         first_rotation_count = first.peer.rotation_count
+        # The hub now holds exactly this identity -- i.e. the device is
+        # configured and the platform's record is correct.
+        hub.append(
+            {
+                "public_key": first_public_key,
+                "endpoint": "203.0.113.9:51820",
+                "allowed_ips": f"{first_tunnel_ip}/32",
+                "latest_handshake_epoch": int(_now().timestamp()),
+                "transfer_rx_bytes": 3772,
+                "transfer_tx_bytes": 1092,
+            }
+        )
 
         second = await fx.wireguard_service.ensure_tunnel_for_check_in(
             router_id=router_device.id,
         )
 
-        # Never WireGuardPeerAlreadyExistsError; one peer row, rotated.
+        # Never WireGuardPeerAlreadyExistsError, and never a re-key.
         assert second.peer.id == first_peer_id
         assert second.peer.tunnel_ip_address == first_tunnel_ip
-        assert second.peer.public_key != first_public_key
-        assert second.peer_private_key != first_private_key
-        assert second.peer.rotation_count == first_rotation_count + 1
-        assert second.peer.status == PeerStatus.PENDING.value
+        assert second.peer.public_key == first_public_key
+        assert second.peer_private_key == first_private_key
+        assert second.peer.rotation_count == first_rotation_count
+
+    async def test_second_check_in_with_unreachable_hub_changes_nothing(
+        self,
+    ) -> None:
+        """"Cannot confirm" is not "gone". With no way to read the hub, the
+        safe answer is to leave the router exactly as it is -- rotating on
+        a guess is what breaks a venue that was working."""
+        fx = make_services()
+        router_device = await self._enrolled_router(fx)
+        first = await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+        )
+        first_public_key = first.peer.public_key
+        first_rotation_count = first.peer.rotation_count
+
+        second = await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+        )
+
+        assert second.peer.public_key == first_public_key
+        assert second.peer.rotation_count == first_rotation_count
+
+    async def test_check_in_rotation_is_refused_when_the_hub_cannot_learn_the_key(
+        self,
+    ) -> None:
+        """The hub has forgotten this peer, so rotation IS the right shape
+        of repair -- but ``POST /wg/peer`` generates its own keypair and
+        there is no verb to register one, so a platform-generated rotation
+        writes a key the hub will never expect. Refused, naming the action
+        that does work, instead of silently writing a dead tunnel."""
+
+        async def _lister() -> list[dict]:
+            return []  # a hub that has genuinely forgotten everything
+
+        fx = make_services(
+            hub_peer_lister=_lister,
+            hub_capabilities=HubCapabilities(
+                can_register_public_key=False, can_remove_peer=False
+            ),
+        )
+        router_device = await self._enrolled_router(fx)
+        # The first check-in has to be allowed through, so build the peer
+        # with a device-supplied key -- the only path a key-registration-
+        # less hub supports.
+        await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+            external_public_key="ZGV2aWNlLXB1YmxpYy1rZXktb25l",
+        )
+
+        with pytest.raises(HubCannotLearnPlatformKeyError):
+            await fx.wireguard_service.ensure_tunnel_for_check_in(
+                router_id=router_device.id,
+            )
 
     async def test_revoked_peer_is_recreated_not_rotated(self) -> None:
         fx = make_services()
@@ -1089,20 +1258,68 @@ class TestEnsureTunnelForCheckIn:
         assert delivery.peer.status == PeerStatus.PENDING.value
         assert not delivery.peer.is_revoked()
 
-    async def test_live_peer_plus_external_key_still_rejects(self) -> None:
-        """A live peer + a device-supplied public key is the one corner that
-        keeps ``create_tunnel``'s documented reject-over-recreate stance --
-        see ``ensure_tunnel_for_check_in``'s own docstring."""
-        fx = make_services()
+    async def test_live_peer_plus_device_reported_key_is_adopted(self) -> None:
+        """A live peer plus a device-supplied public key used to raise
+        ``WireGuardPeerAlreadyExistsError`` -- treating the device telling
+        us who it is as a conflict.
+
+        It is not a conflict, it is the best information available. The
+        device holds a private key nobody else has; no server-side action
+        can change which key it is using, so the only correct response is
+        to record it. Verified against the hub first: a key the hub does
+        not hold is not an observation, and adopting it would swap one
+        wrong row for another."""
+        device_key = "ZGV2aWNlLXB1YmxpYy1rZXktYWRvcHRlZA=="
+
+        async def _lister() -> list[dict]:
+            return [
+                {
+                    "public_key": device_key,
+                    "endpoint": "203.0.113.9:51820",
+                    "allowed_ips": "10.100.0.9/32",
+                    "latest_handshake_epoch": int(_now().timestamp()),
+                    "transfer_rx_bytes": 3772,
+                    "transfer_tx_bytes": 1092,
+                }
+            ]
+
+        fx = make_services(hub_peer_lister=_lister)
+        router_device = await self._enrolled_router(fx)
+        first = await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+        )
+        peer_id = first.peer.id
+
+        second = await fx.wireguard_service.ensure_tunnel_for_check_in(
+            router_id=router_device.id,
+            external_public_key=device_key,
+        )
+
+        assert second.peer.id == peer_id
+        assert second.peer.public_key == device_key
+        # The ADDRESS follows the key, because the hub's allowed-ips is
+        # what decides where packets for this peer actually go.
+        assert second.peer.tunnel_ip_address == "10.100.0.9"
+        assert second.peer.status == PeerStatus.ACTIVE.value
+        # Adoption mints no key material, so it must not claim a rotation.
+        assert second.peer.rotation_count == first.peer.rotation_count
+
+    async def test_device_reported_key_the_hub_does_not_hold_is_refused(
+        self,
+    ) -> None:
+        async def _lister() -> list[dict]:
+            return []
+
+        fx = make_services(hub_peer_lister=_lister)
         router_device = await self._enrolled_router(fx)
         await fx.wireguard_service.ensure_tunnel_for_check_in(
             router_id=router_device.id,
         )
 
-        with pytest.raises(WireGuardPeerAlreadyExistsError):
+        with pytest.raises(HubPeerNotOnHubError):
             await fx.wireguard_service.ensure_tunnel_for_check_in(
                 router_id=router_device.id,
-                external_public_key="ZGV2aWNlLXB1YmxpYy1rZXk=",
+                external_public_key="dW5rbm93bi1rZXktbm90LW9uLXRoZS1odWI=",
             )
 
 
@@ -1715,8 +1932,9 @@ class TestRevokeTellsTheHub:
     async def test_revoke_removes_the_peer_from_the_hub(self) -> None:
         called: list[str] = []
 
-        async def _dereg(public_key: str) -> None:
+        async def _dereg(public_key: str) -> HubRemovalOutcome:
             called.append(public_key)
+            return HubRemovalOutcome.REMOVED
 
         f = make_services(hub_peer_deregistrar=_dereg)
         router = await self._peer(f)
@@ -1787,14 +2005,21 @@ def _hub_peer(
     *,
     handshake_epoch: int,
     allowed_ips: str = "10.20.0.99/32",
+    tunnel_ip: str | None = None,
 ) -> dict:
+    """``tunnel_ip`` is the shorthand every "the two sides agree" test
+    wants: the hub reports allowed-ips as a CIDR, and a hub address that
+    disagrees with the peer row is now its own finding
+    (``TRACKED_KEY_MISMATCH``) rather than a detail the classifier ignores.
+    Tests that are not about that disagreement must not accidentally
+    produce it."""
     """One entry in the shape ``ops/hub-agents/wg_agent.py``'s
     ``list_peers()`` / ``HubPeerLister`` return -- see
     ``service.HubPeerLister``'s own docstring for the exact field set."""
     return {
         "public_key": public_key,
         "endpoint": "203.0.113.5:51820",
-        "allowed_ips": allowed_ips,
+        "allowed_ips": f"{tunnel_ip}/32" if tunnel_ip else allowed_ips,
         "latest_handshake_epoch": handshake_epoch,
         "transfer_rx_bytes": 1024,
         "transfer_tx_bytes": 2048,
@@ -1817,7 +2042,13 @@ class TestFleetStatus:
 
     async def test_tracked_and_recently_connected(self) -> None:
         async def _lister() -> list[dict]:
-            return [_hub_peer(peer_public_key, handshake_epoch=int(now.timestamp()))]
+            return [
+                _hub_peer(
+                    peer_public_key,
+                    handshake_epoch=int(now.timestamp()),
+                    tunnel_ip=peer_tunnel_ip,
+                )
+            ]
 
         f = make_services(hub_peer_lister=_lister)
         await make_hub(f)
@@ -1832,6 +2063,7 @@ class TestFleetStatus:
         )
         peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
         peer_public_key = peer.public_key
+        peer_tunnel_ip = peer.tunnel_ip_address
 
         result = await f.wireguard_service.get_fleet_status(now=now)
 
@@ -1850,7 +2082,13 @@ class TestFleetStatus:
         stale_epoch = int((now - timedelta(hours=2)).timestamp())
 
         async def _lister() -> list[dict]:
-            return [_hub_peer(peer_public_key, handshake_epoch=stale_epoch)]
+            return [
+                _hub_peer(
+                    peer_public_key,
+                    handshake_epoch=stale_epoch,
+                    tunnel_ip=peer_tunnel_ip,
+                )
+            ]
 
         f = make_services(hub_peer_lister=_lister, handshake_stale_after_minutes=5)
         await make_hub(f)
@@ -1861,9 +2099,9 @@ class TestFleetStatus:
             router_id=router.id,
             requesting_organization_id=None,
         )
-        peer_public_key = (
-            await f.wireguard_repo.get_peer_by_router_id(router.id)
-        ).public_key
+        _stale_peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        peer_public_key = _stale_peer.public_key
+        peer_tunnel_ip = _stale_peer.tunnel_ip_address
 
         result = await f.wireguard_service.get_fleet_status(now=now)
 
@@ -1930,9 +2168,11 @@ class TestFleetStatus:
             router_id=connected_router.id,
             requesting_organization_id=None,
         )
-        connected_key = (
-            await f.wireguard_repo.get_peer_by_router_id(connected_router.id)
-        ).public_key
+        _connected_peer = await f.wireguard_repo.get_peer_by_router_id(
+            connected_router.id
+        )
+        connected_key = _connected_peer.public_key
+        connected_ip = _connected_peer.tunnel_ip_address
 
         stale_router = await make_router(f, org)
         await f.wireguard_service.create_tunnel(
@@ -1940,9 +2180,9 @@ class TestFleetStatus:
             router_id=stale_router.id,
             requesting_organization_id=None,
         )
-        stale_key = (
-            await f.wireguard_repo.get_peer_by_router_id(stale_router.id)
-        ).public_key
+        _stale_peer = await f.wireguard_repo.get_peer_by_router_id(stale_router.id)
+        stale_key = _stale_peer.public_key
+        stale_ip = _stale_peer.tunnel_ip_address
 
         missing_router = await make_router(f, org)
         await f.wireguard_service.create_tunnel(
@@ -1953,10 +2193,15 @@ class TestFleetStatus:
 
         async def _lister() -> list[dict]:
             return [
-                _hub_peer(connected_key, handshake_epoch=int(now.timestamp())),
+                _hub_peer(
+                    connected_key,
+                    handshake_epoch=int(now.timestamp()),
+                    tunnel_ip=connected_ip,
+                ),
                 _hub_peer(
                     stale_key,
                     handshake_epoch=int((now - timedelta(hours=1)).timestamp()),
+                    tunnel_ip=stale_ip,
                 ),
                 _hub_peer(ghost_key, handshake_epoch=int(now.timestamp())),
             ]
@@ -1969,6 +2214,13 @@ class TestFleetStatus:
             FleetPeerStatus.TRACKED_STALE: 1,
             FleetPeerStatus.UNTRACKED_CONNECTED: 1,
             FleetPeerStatus.TRACKED_MISSING_FROM_HUB: 1,
+            # The three states added for the 2026-08-27 fault. Asserted as
+            # zero rather than dropped from the comparison: this test's
+            # value is that it pins the WHOLE classification, so a peer
+            # silently landing in a new bucket fails here.
+            FleetPeerStatus.ADOPTABLE_MISMATCH: 0,
+            FleetPeerStatus.KNOWN_ORPHAN: 0,
+            FleetPeerStatus.TRACKED_KEY_MISMATCH: 0,
         }
         assert len(result.peers) == 4
         by_status = {entry.status: entry for entry in result.peers}
@@ -2037,8 +2289,9 @@ class TestSupersededPeerIsRemovedFromHub:
     async def test_re_registration_deregisters_the_key_it_replaces(self) -> None:
         removed: list[str] = []
 
-        async def _dereg(public_key: str) -> None:
+        async def _dereg(public_key: str) -> HubRemovalOutcome:
             removed.append(public_key)
+            return HubRemovalOutcome.REMOVED
 
         f = make_services(hub_peer_deregistrar=_dereg)
         router, old_key = await self._router_with_peer(f)
@@ -2061,8 +2314,9 @@ class TestSupersededPeerIsRemovedFromHub:
         it is re-asserting -- that would take a working tunnel down."""
         removed: list[str] = []
 
-        async def _dereg(public_key: str) -> None:
+        async def _dereg(public_key: str) -> HubRemovalOutcome:
             removed.append(public_key)
+            return HubRemovalOutcome.REMOVED
 
         f = make_services(hub_peer_deregistrar=_dereg)
         router, same_key = await self._router_with_peer(f)
@@ -2104,3 +2358,737 @@ class TestSupersededPeerIsRemovedFromHub:
 
         assert peer.public_key == "NEWKEY"
         assert peer.tunnel_ip_address == "10.20.0.44"
+
+
+# ============================================================================
+# The 2026-08-27 "huda city center" fault: reconciliation, adoption, and
+# honest accounting for peers a hub with no DELETE verb can never shed.
+#
+# Every scenario below is the shape of a state measured on the production
+# hub that day, not an invented one -- the venue's device was handshaking
+# on 10.20.0.6 with a key the platform had overwritten, while the platform
+# recorded 10.20.0.8 and had pushed the RADIUS client stanza to match its
+# own wrong record.
+# ============================================================================
+
+
+class TestIssuanceLedger:
+    """``wireguard_peer_issuances`` is the record that makes adoption a
+    proof rather than a guess. Without it, six of the seven peers on the
+    production hub were unattributable -- despite the platform having
+    allocated every one of them, for one router, in twelve minutes."""
+
+    async def test_every_identity_handed_out_is_recorded(self) -> None:
+        f = make_services()
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+
+        ledger = await f.wireguard_repo.list_issuances_for_router(router.id)
+        assert len(ledger) == 1
+        assert ledger[0].public_key == peer.public_key
+        assert ledger[0].tunnel_ip_address == peer.tunnel_ip_address
+        assert ledger[0].source == PeerIdentitySource.PLATFORM_GENERATED.value
+        assert ledger[0].superseded_at is None
+
+    async def test_a_replaced_identity_is_superseded_not_forgotten(self) -> None:
+        f = make_services()
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        first = await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.6",
+            public_key="KEY-SIX",
+        )
+        assert first.tunnel_ip_address == "10.20.0.6"
+
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.8",
+            public_key="KEY-EIGHT",
+        )
+
+        ledger = await f.wireguard_repo.list_issuances_for_router(router.id)
+        assert len(ledger) == 2
+        current = [i for i in ledger if i.superseded_at is None]
+        assert [i.public_key for i in current] == ["KEY-EIGHT"]
+        superseded = next(i for i in ledger if i.public_key == "KEY-SIX")
+        # No deregistrar wired here, so nothing was ever pushed to a hub by
+        # this service and there is nothing to orphan -- see
+        # `_deregister_from_hub`'s own comment on why that is NOT the same
+        # answer as "a hub exists and cannot remove".
+        assert superseded.hub_lifecycle == HubPeerLifecycle.NEVER_REGISTERED.value
+
+
+class TestOrphanAccountingWhenTheHubCannotDelete:
+    """Production's actual configuration: a hub bridge that answers, and
+    answers 501. The peer is not removed and never will be, so the platform
+    has to account for it rather than keep asking."""
+
+    def _degraded(self, **kwargs):  # noqa: ANN001, ANN202 -- test helper
+        async def _dereg(public_key: str) -> HubRemovalOutcome:
+            return HubRemovalOutcome.UNSUPPORTED
+
+        return make_services(
+            hub_peer_deregistrar=_dereg,
+            hub_capabilities=HubCapabilities(
+                can_register_public_key=False, can_remove_peer=False
+            ),
+            **kwargs,
+        )
+
+    async def test_a_superseded_peer_becomes_a_recorded_orphan(self) -> None:
+        f = self._degraded()
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.6",
+            public_key="KEY-SIX",
+        )
+
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.8",
+            public_key="KEY-EIGHT",
+        )
+
+        orphan = await f.wireguard_repo.get_issuance_by_public_key("KEY-SIX")
+        assert orphan.hub_lifecycle == HubPeerLifecycle.ORPHANED.value
+
+    async def test_an_orphans_address_is_quarantined_from_reallocation(
+        self,
+    ) -> None:
+        """The hazard the old hard-failing revoke existed to prevent, closed
+        by different means. An address the hub still routes must never be
+        handed to another router: WireGuard routes by allowed-ips, so both
+        break in a way that reads as "the tunnel is flaky"."""
+        f = self._degraded()
+        await make_hub(f, cidr="10.20.0.0/29")
+        org = f.org_lookup.add()
+        first_router = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=first_router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.2",
+            public_key="KEY-TWO",
+        )
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=first_router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.3",
+            public_key="KEY-THREE",
+        )
+        # .2 is now superseded in `wireguard_peers` -- the table has one row
+        # per router and it points at .3 -- but the hub still holds it.
+        assert (
+            await f.wireguard_repo.get_peer_by_router_id(first_router.id)
+        ).tunnel_ip_address == "10.20.0.3"
+
+        second_router = await make_router(f, org)
+        info = await f.wireguard_service.create_tunnel(
+            actor_user_id=None,
+            router_id=second_router.id,
+            requesting_organization_id=None,
+            external_public_key="c2Vjb25kLXJvdXRlcnMtb3duLWtleQ==",
+        )
+
+        assert info.peer.tunnel_ip_address != "10.20.0.2"
+
+    async def test_revoke_proceeds_and_records_the_orphan(self) -> None:
+        """Revoke used to raise on a 501, which made it not merely degraded
+        but impossible -- every call, forever, against the deployed agent.
+        That left an operator with no way at all to stop serving a router,
+        which is worse than the hazard it was guarding against."""
+        f = self._degraded()
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.6",
+            public_key="KEY-SIX",
+        )
+
+        revoked = await f.wireguard_service.revoke_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+
+        assert revoked.is_revoked()
+        orphan = await f.wireguard_repo.get_issuance_by_public_key("KEY-SIX")
+        assert orphan.hub_lifecycle == HubPeerLifecycle.ORPHANED.value
+
+    async def test_an_unreachable_hub_still_fails_the_revoke(self) -> None:
+        """Unchanged, and it must stay unchanged. "We could not ask" is not
+        "we asked and it cannot" -- the first is transient and guessing is
+        what left 21 live client stanzas against 0 NAS rows."""
+
+        async def _boom(public_key: str) -> HubRemovalOutcome:
+            raise RuntimeError("hub bridge unreachable")
+
+        f = make_services(hub_peer_deregistrar=_boom)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+
+        with pytest.raises(RuntimeError):
+            await f.wireguard_service.revoke_tunnel(
+                actor_user_id=uuid.uuid4(),
+                router_id=router.id,
+                requesting_organization_id=None,
+            )
+
+
+class TestHubCannotLearnAPlatformGeneratedKey:
+    """``POST /wg/peer`` generates its own keypair and there is no verb to
+    register one, so a platform-generated key exists in exactly one place:
+    this database. Writing it produces a tunnel that cannot establish, with
+    no symptom but a handshake that never happens."""
+
+    def _no_registration(self):  # noqa: ANN202 -- test helper
+        return make_services(
+            hub_capabilities=HubCapabilities(
+                can_register_public_key=False, can_remove_peer=False
+            )
+        )
+
+    async def test_create_tunnel_refuses_to_generate_a_keypair(self) -> None:
+        f = self._no_registration()
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+
+        with pytest.raises(HubCannotLearnPlatformKeyError):
+            await f.wireguard_service.create_tunnel(
+                actor_user_id=uuid.uuid4(),
+                router_id=router.id,
+                requesting_organization_id=None,
+            )
+
+    async def test_a_device_supplied_key_is_still_allowed(self) -> None:
+        """The restriction is on keys the platform invents, not on the
+        enrollment path that works -- a device-generated key reaches the hub
+        by the device's own enrollment, not by this service pushing it."""
+        f = self._no_registration()
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+
+        info = await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+            external_public_key="ZGV2aWNlLWdlbmVyYXRlZC1wdWJsaWMta2V5",
+        )
+
+        assert info.peer.public_key == "ZGV2aWNlLWdlbmVyYXRlZC1wdWJsaWMta2V5"
+
+    async def test_rotate_refuses(self) -> None:
+        f = self._no_registration()
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+            external_public_key="ZGV2aWNlLWdlbmVyYXRlZC1wdWJsaWMta2V5",
+        )
+
+        with pytest.raises(HubCannotLearnPlatformKeyError):
+            await f.wireguard_service.rotate_tunnel(
+                actor_user_id=uuid.uuid4(),
+                router_id=router.id,
+                requesting_organization_id=None,
+            )
+
+
+class TestAutomaticAdoption:
+    """The exact production state: the hub shows the device handshaking on
+    a key the platform issued to that router and then overwrote."""
+
+    async def _diverged(self, f, *, hub):  # noqa: ANN001, ANN202 -- test helper
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        f.wireguard_repo.router_names[router.id] = router.name
+        # Issued .6, which the device imported and is using.
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.6",
+            public_key="KEY-SIX",
+        )
+        # Then a second Generate allocated .8, which no device ever saw.
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.8",
+            public_key="KEY-EIGHT",
+        )
+        hub.extend(
+            [
+                _hub_peer(
+                    "KEY-SIX",
+                    handshake_epoch=int(datetime.now(UTC).timestamp()),
+                    tunnel_ip="10.20.0.6",
+                ),
+                _hub_peer("KEY-EIGHT", handshake_epoch=0, tunnel_ip="10.20.0.8"),
+            ]
+        )
+        return router
+
+    async def test_a_plain_read_reports_the_mismatch_and_changes_nothing(
+        self,
+    ) -> None:
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_lister=_lister)
+        router = await self._diverged(f, hub=hub)
+
+        result = await f.wireguard_service.get_fleet_status()
+
+        assert result.adopted_public_keys == []
+        entry = next(e for e in result.peers if e.public_key == "KEY-SIX")
+        assert entry.status == FleetPeerStatus.ADOPTABLE_MISMATCH
+        # Attributed, not "untracked" -- this is the whole point of the
+        # ledger. The old classifier called this UNTRACKED_CONNECTED.
+        assert entry.router_id == router.id
+        assert entry.router_name == router.name
+        assert entry.explanation
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        assert peer.public_key == "KEY-EIGHT"
+
+    async def test_adopt_records_what_the_device_demonstrably_is(self) -> None:
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_lister=_lister)
+        router = await self._diverged(f, hub=hub)
+
+        result = await f.wireguard_service.get_fleet_status(adopt=True)
+
+        assert result.adopted_public_keys == ["KEY-SIX"]
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        assert peer.public_key == "KEY-SIX"
+        assert peer.tunnel_ip_address == "10.20.0.6"
+        assert peer.status == PeerStatus.ACTIVE.value
+        assert peer.last_handshake_at is not None
+        # The platform never held this key -- the hub generated it and did
+        # not keep it. Anything else here eventually gets rendered into a
+        # device's `private-key=`.
+        assert decrypt_secret(peer.private_key_encrypted) == (
+            "external:device-managed-key"
+        )
+
+    async def test_adoption_notifies_the_radius_binding(self) -> None:
+        """The WireGuard address and the FreeRADIUS client stanza keyed on
+        it are two halves of one fact. An adoption that moved the address
+        and left the stanza behind would fix the symptom the operator can
+        see and leave the one that actually blocks guests."""
+        hub: list[dict] = []
+        moves: list[tuple[str, str]] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        async def _listener(
+            *, router_id, previous_tunnel_ip_address, tunnel_ip_address
+        ) -> None:
+            moves.append((previous_tunnel_ip_address, tunnel_ip_address))
+
+        f = make_services(hub_peer_lister=_lister, peer_address_listener=_listener)
+        await self._diverged(f, hub=hub)
+
+        await f.wireguard_service.get_fleet_status(adopt=True)
+
+        assert moves == [("10.20.0.8", "10.20.0.6")]
+
+    async def test_a_failing_radius_rebind_does_not_undo_the_adoption(
+        self,
+    ) -> None:
+        """Converge, never roll back. The WireGuard record being correct is
+        strictly better than it being wrong, and the leftover mismatch is
+        exactly what the next reconciliation pass looks for."""
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        async def _listener(**kwargs: object) -> None:
+            raise RuntimeError("the RADIUS bridge is down")
+
+        f = make_services(hub_peer_lister=_lister, peer_address_listener=_listener)
+        router = await self._diverged(f, hub=hub)
+
+        await f.wireguard_service.get_fleet_status(adopt=True)
+
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        assert peer.public_key == "KEY-SIX"
+
+    async def test_two_live_identities_are_never_adopted_automatically(
+        self,
+    ) -> None:
+        """A router whose recorded peer has ALSO handshaked is genuinely
+        ambiguous -- a half-migrated device, or two routers behind one WAN.
+        Picking one automatically moves the RADIUS binding, so getting it
+        wrong takes a working venue down."""
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_lister=_lister)
+        router = await self._diverged(f, hub=hub)
+        current = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        await f.wireguard_repo.update_peer(
+            current, {"last_handshake_at": datetime.now(UTC)}
+        )
+        hub[1]["latest_handshake_epoch"] = int(datetime.now(UTC).timestamp())
+
+        result = await f.wireguard_service.get_fleet_status(adopt=True)
+
+        assert result.adopted_public_keys == []
+        entry = next(e for e in result.peers if e.public_key == "KEY-SIX")
+        assert entry.status == FleetPeerStatus.ADOPTABLE_MISMATCH
+        assert "TWO live identities" in entry.explanation
+
+    async def test_an_unattributable_key_stays_untracked(self) -> None:
+        """No issuance record means no proof of whose device this is. This
+        is the state of all seven peers on the production hub today, every
+        one of them allocated before the ledger existed -- they need an
+        operator's explicit adoption, not a background heuristic."""
+
+        async def _lister() -> list[dict]:
+            return [
+                _hub_peer(
+                    "KEY-FROM-BEFORE-THE-LEDGER",
+                    handshake_epoch=int(datetime.now(UTC).timestamp()),
+                    tunnel_ip="10.20.0.3",
+                )
+            ]
+
+        f = make_services(hub_peer_lister=_lister)
+        await make_hub(f)
+
+        result = await f.wireguard_service.get_fleet_status(adopt=True)
+
+        assert result.adopted_public_keys == []
+        (entry,) = result.peers
+        assert entry.status == FleetPeerStatus.UNTRACKED_CONNECTED
+        assert entry.router_id is None
+        assert "adopt" in entry.explanation
+
+
+class TestOperatorConfirmedAdoption:
+    """``adopt_hub_peer`` is the repair path for everything automatic
+    adoption deliberately will not touch."""
+
+    async def _router_and_hub(self, f, hub):  # noqa: ANN001, ANN202 -- helper
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.8",
+            public_key="KEY-EIGHT",
+        )
+        hub.append(
+            _hub_peer(
+                "PRE-LEDGER-KEY",
+                handshake_epoch=int(datetime.now(UTC).timestamp()),
+                tunnel_ip="10.20.0.6",
+            )
+        )
+        return router
+
+    async def test_binds_the_router_to_what_the_hub_holds(self) -> None:
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_lister=_lister)
+        router = await self._router_and_hub(f, hub)
+
+        peer = await f.wireguard_service.adopt_hub_peer(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+            public_key="PRE-LEDGER-KEY",
+            note="matched to the .rsc the technician actually imported",
+        )
+
+        assert peer.public_key == "PRE-LEDGER-KEY"
+        # The ADDRESS comes from the hub's allowed-ips, never from the
+        # caller: the hub's routing table is what decides where packets for
+        # this peer actually go.
+        assert peer.tunnel_ip_address == "10.20.0.6"
+        ledger = await f.wireguard_repo.get_issuance_by_public_key("PRE-LEDGER-KEY")
+        assert ledger.source == PeerIdentitySource.ADOPTED.value
+        assert ledger.note == "matched to the .rsc the technician actually imported"
+
+    async def test_refuses_a_key_the_hub_does_not_hold(self) -> None:
+        """Adoption's justification is that it writes down something
+        observed. A key `GET /wg/peers` has never seen is not an
+        observation, and adopting it would be a differently-wrong row."""
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_lister=_lister)
+        router = await self._router_and_hub(f, hub)
+
+        with pytest.raises(HubPeerNotOnHubError):
+            await f.wireguard_service.adopt_hub_peer(
+                actor_user_id=uuid.uuid4(),
+                router_id=router.id,
+                requesting_organization_id=None,
+                public_key="A-KEY-NOBODY-HAS",
+            )
+
+    async def test_refuses_a_key_another_router_already_records(self) -> None:
+        """Two routers on one WireGuard identity means the hub silently
+        delivers one's traffic to the other -- it routes by allowed-ips and
+        has no idea two rows disagree."""
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_lister=_lister)
+        first = await self._router_and_hub(f, hub)
+        org = f.org_lookup.add()
+        second = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=second.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.9",
+            public_key="SECOND-ROUTERS-KEY",
+        )
+        hub.append(
+            _hub_peer(
+                "SECOND-ROUTERS-KEY",
+                handshake_epoch=int(datetime.now(UTC).timestamp()),
+                tunnel_ip="10.20.0.9",
+            )
+        )
+
+        with pytest.raises(HubPeerClaimedByAnotherRouterError):
+            await f.wireguard_service.adopt_hub_peer(
+                actor_user_id=uuid.uuid4(),
+                router_id=first.id,
+                requesting_organization_id=None,
+                public_key="SECOND-ROUTERS-KEY",
+            )
+
+
+class TestAddressMismatchIsItsOwnFinding:
+    """Same key on both sides, different tunnel address. Reported
+    separately because the RADIUS client stanza is keyed on the address, so
+    this specific disagreement drops every guest login on that router --
+    silently, with no reply and nothing logged."""
+
+    async def test_reported_as_key_mismatch_not_as_connected(self) -> None:
+        async def _lister() -> list[dict]:
+            return [
+                _hub_peer(
+                    "KEY-SIX",
+                    handshake_epoch=int(datetime.now(UTC).timestamp()),
+                    tunnel_ip="10.20.0.6",
+                )
+            ]
+
+        f = make_services(hub_peer_lister=_lister)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.8",
+            public_key="KEY-SIX",
+        )
+
+        result = await f.wireguard_service.get_fleet_status()
+
+        (entry,) = result.peers
+        assert entry.status == FleetPeerStatus.TRACKED_KEY_MISMATCH
+        # Both addresses reported. The two disagreeing IS the finding, and
+        # a view showing only one of them hides it completely.
+        assert entry.tunnel_ip_address == "10.20.0.8"
+        assert entry.hub_tunnel_ip_address == "10.20.0.6"
+
+
+class TestLiveIdentityGuard:
+    """``resolve_live_identity_for_router`` is what stops a Generate click
+    from allocating over a device that is working.
+
+    The peer-reuse fix shipped 2026-08-27 did not stop it, because it is
+    gated on ``rotate`` and the Master console sends ``?rotate=true`` on
+    every Generate -- measured: four allocate-external calls for router
+    21e13913 in 24h, all four ``?rotate=true``, the last at 18:32 (AFTER
+    the fix deployed) allocating 10.20.0.9 while the device sat handshaking
+    on 10.20.0.6. The reuse branch was never entered once. A guard the
+    caller can switch off is not a guard.
+    """
+
+    async def _diverged_router(self, f, hub):  # noqa: ANN001, ANN202 -- helper
+        """The production shape: issued .6 (which the device imported and
+        is using), then superseded it with .8 (which no device ever saw)."""
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.6",
+            public_key="KEY-SIX",
+        )
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.8",
+            public_key="KEY-EIGHT",
+        )
+        hub.extend(
+            [
+                _hub_peer(
+                    "KEY-SIX",
+                    handshake_epoch=int(datetime.now(UTC).timestamp()),
+                    tunnel_ip="10.20.0.6",
+                ),
+                _hub_peer("KEY-EIGHT", handshake_epoch=0, tunnel_ip="10.20.0.8"),
+            ]
+        )
+        return router
+
+    async def test_finds_the_device_through_the_ledger_not_the_peer_row(
+        self,
+    ) -> None:
+        """Asking only "is the RECORDED key live?" answers no here -- .8 has
+        never handshaked -- and concludes the router needs a fresh
+        allocation, which is exactly the action that made things worse four
+        times. The ledger is what turns that no into the right answer."""
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_lister=_lister)
+        router = await self._diverged_router(f, hub)
+
+        live = await f.wireguard_service.resolve_live_identity_for_router(
+            router_id=router.id
+        )
+
+        assert live is not None
+        assert live["public_key"] == "KEY-SIX"
+        assert live["allowed_ips"] == "10.20.0.6/32"
+
+    async def test_a_router_that_has_never_connected_has_no_live_identity(
+        self,
+    ) -> None:
+        """The genuine "the device lost its config" case still allocates --
+        the guard only refuses what it can prove is working."""
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_lister=_lister)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.8",
+            public_key="KEY-EIGHT",
+        )
+        hub.append(_hub_peer("KEY-EIGHT", handshake_epoch=0, tunnel_ip="10.20.0.8"))
+
+        assert (
+            await f.wireguard_service.resolve_live_identity_for_router(
+                router_id=router.id
+            )
+            is None
+        )
+
+    async def test_a_stale_handshake_is_not_a_live_identity(self) -> None:
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_lister=_lister, handshake_stale_after_minutes=5)
+        router = await self._diverged_router(f, hub)
+        hub[0]["latest_handshake_epoch"] = int(
+            (datetime.now(UTC) - timedelta(hours=3)).timestamp()
+        )
+
+        assert (
+            await f.wireguard_service.resolve_live_identity_for_router(
+                router_id=router.id
+            )
+            is None
+        )
+
+    async def test_an_unreachable_hub_reports_no_live_identity(self) -> None:
+        """"Cannot confirm" must not read as "confirmed connected" either --
+        this returns None, and the CALLER's fallback (the pre-existing
+        reuse branch) is what keeps a bridge blip from costing a peer."""
+        f = make_services(hub_peer_lister=None)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+
+        assert (
+            await f.wireguard_service.resolve_live_identity_for_router(
+                router_id=router.id
+            )
+            is None
+        )

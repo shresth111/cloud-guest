@@ -19,7 +19,7 @@ cross-domain composition.
 from __future__ import annotations
 
 import httpx
-from fastapi import Depends
+from fastapi import Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.exceptions import CloudGuestError
@@ -30,8 +30,9 @@ from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 
+from .constants import HubRemovalOutcome
 from .repository import WireGuardRepository, WireGuardRepositoryProtocol
-from .service import WireGuardService
+from .service import HubCapabilities, WireGuardService
 
 
 class HubBridgeUnavailableError(CloudGuestError):
@@ -61,9 +62,20 @@ def make_hub_peer_deregistrar(settings: Settings):
     else -- unreachable, 401, 500 -- raises, because those are all "we do
     not know whether the hub still has it", and guessing is what produced
     the drift.
+
+    A **501** is the one status that is neither. It is not a failure to
+    retry and it is not success: it is the deployed agent saying it has no
+    such verb, which is a permanent fact about that host until someone
+    installs a new one. It is returned as ``HubRemovalOutcome.UNSUPPORTED``
+    so the caller can record an orphan instead of raising, once per
+    superseded peer, an exception whose stack trace says nothing an
+    operator can act on. ``ops/hub-agents/wg_agent.py`` as deployed
+    implements only ``do_POST``/``do_GET``, so ``http.server`` answers the
+    ``DELETE`` itself with ``501 Unsupported method``; the ``do_DELETE``
+    handler in that file is written and waiting on shell access to the hub.
     """
 
-    async def _deregister(public_key: str) -> None:
+    async def _deregister(public_key: str) -> HubRemovalOutcome:
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.request(
@@ -77,11 +89,24 @@ def make_hub_peer_deregistrar(settings: Settings):
                 "Could not reach the WireGuard hub bridge to remove this peer"
             ) from exc
         if resp.status_code == 404:
-            return
+            return HubRemovalOutcome.NOT_PRESENT
+        if resp.status_code == status.HTTP_501_NOT_IMPLEMENTED:
+            return HubRemovalOutcome.UNSUPPORTED
         if resp.status_code >= 400:
             raise HubBridgeUnavailableError(
                 f"The WireGuard hub bridge refused the removal ({resp.status_code})"
             )
+        # The deployed agent's own contract (`remove_peer`) distinguishes
+        # "removed 1" from "removed 0, it was not here" -- carry that
+        # through rather than flattening both into REMOVED, for the same
+        # reason `radius_agent.remove_client` bothers to return the count.
+        try:
+            removed = resp.json().get("removed")
+        except ValueError:
+            removed = None
+        if removed == 0:
+            return HubRemovalOutcome.NOT_PRESENT
+        return HubRemovalOutcome.REMOVED
 
     return _deregister
 
@@ -127,6 +152,24 @@ def get_wireguard_repository(
     return WireGuardRepository(db)
 
 
+def hub_capabilities_from_settings(settings: Settings) -> HubCapabilities:
+    """What the hub agent this deployment points at can actually be asked
+    to do -- see ``service.HubCapabilities`` for why both default to
+    ``False`` in production and ``True`` everywhere else.
+
+    Settings-driven, not hard-coded, because these are the two flags that
+    flip the day a new agent is installed on the hub. Landing
+    ``do_DELETE`` is then an env change
+    (``CLOUDGUEST_HUB_WG_AGENT_SUPPORTS_PEER_REMOVAL=true``) and a restart,
+    with no code path that has to be found and edited under pressure --
+    which is the whole point of separating "what the code can do" from
+    "what this hub can do"."""
+    return HubCapabilities(
+        can_register_public_key=settings.hub_wg_agent_supports_key_registration,
+        can_remove_peer=settings.hub_wg_agent_supports_peer_removal,
+    )
+
+
 def get_wireguard_service(
     repository: WireGuardRepositoryProtocol = Depends(get_wireguard_repository),
     router_service: RouterService = Depends(get_router_service),
@@ -140,12 +183,17 @@ def get_wireguard_service(
         handshake_stale_after_minutes=settings.wireguard_handshake_stale_after_minutes,
         hub_peer_deregistrar=make_hub_peer_deregistrar(settings),
         hub_peer_lister=make_hub_peer_lister(settings),
+        hub_capabilities=hub_capabilities_from_settings(settings),
+        # No `peer_address_listener` here on purpose: wiring it would mean
+        # importing `app.domains.guest`, which already imports this module.
+        # `app.domains.hub_reconciliation` builds the fully-wired service.
     )
 
 
 __all__ = [
     "get_wireguard_repository",
     "get_wireguard_service",
+    "hub_capabilities_from_settings",
     "make_hub_peer_deregistrar",
     "make_hub_peer_lister",
     "HubBridgeUnavailableError",

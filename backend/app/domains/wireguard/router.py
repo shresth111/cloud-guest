@@ -147,7 +147,9 @@ def _fleet_status_response(status_: FleetStatus) -> FleetStatusResponse:
                 router_id=str(entry.router_id) if entry.router_id else None,
                 router_name=entry.router_name,
                 tunnel_ip_address=entry.tunnel_ip_address,
+                hub_tunnel_ip_address=entry.hub_tunnel_ip_address,
                 last_handshake_at=entry.last_handshake_at,
+                explanation=entry.explanation,
             )
             for entry in status_.peers
         ],
@@ -314,13 +316,24 @@ async def allocate_external_wireguard_peer(
     rotate: bool = Query(
         default=False,
         description=(
-            "Allocate a BRAND NEW keypair and tunnel IP even if this router "
-            "already has a usable peer. Default false -- see the endpoint's "
-            "docstring: the hub agent has no delete or update verb, so every "
-            "allocation is permanent and unreclaimable. Tick this only when "
-            "the device has genuinely lost its WireGuard config (a reflash, "
-            "or straight after Guided Setup's recovery phase), because it is "
-            "the one case reuse cannot serve."
+            "Prefer a brand new keypair and tunnel IP over reusing this "
+            "router's existing peer. NO LONGER SUFFICIENT on its own to "
+            "allocate over a device that is demonstrably connected -- see "
+            "`force`. Kept because a caller asking for a fresh peer on a "
+            "router that has never connected is a legitimate, common "
+            "request (a reflash, or Guided Setup's recovery phase)."
+        ),
+    ),
+    force: bool = Query(
+        default=False,
+        description=(
+            "Allocate a new hub peer EVEN IF the hub reports this router "
+            "handshaking right now. This is destructive and unreclaimable: "
+            "the hub agent has no removal verb, so the peer it supersedes "
+            "stays on the hub holding its tunnel address forever, and the "
+            "device -- which keeps whatever key it already imported -- is "
+            "left on an address the RADIUS client stanza no longer names. "
+            "Only set this when you know the device has lost its config."
         ),
     ),
     user: AuthUser = Depends(CurrentUser),
@@ -374,6 +387,85 @@ async def allocate_external_wireguard_peer(
     # `private-key=` line rather than writing a sentinel over a working
     # interface.
     #
+    # A LIVE DEVICE IS NEVER ALLOCATED OVER. Added 2026-08-28.
+    #
+    # The reuse branch below shipped on 2026-08-27 and did not stop the
+    # bleeding, because it is gated on `rotate` and the Master console
+    # sends `?rotate=true` on every Generate. Measured over the 24 hours
+    # that followed: FOUR allocate-external calls for router 21e13913, all
+    # four `?rotate=true`, the last one at 18:32 -- after the reuse fix was
+    # deployed -- allocating 10.20.0.9 while the device sat handshaking on
+    # 10.20.0.6. The reuse branch was never entered once.
+    #
+    # So the guard cannot live behind a flag the caller controls. This one
+    # asks the hub instead: is this router handshaking RIGHT NOW, on the
+    # key we record OR on any key the issuance ledger says we issued it?
+    # If yes, allocating is provably the wrong action -- the device cannot
+    # be made to change key by anything the server does, so a new peer just
+    # moves the platform further from the device -- and it is refused
+    # regardless of `rotate`. `force=true` remains for the genuine "the
+    # device has lost its config" case, where no handshake will be found
+    # anyway.
+    #
+    # And it does not merely refuse. If the live identity differs from what
+    # this table records, it ADOPTS it: clicking Generate on a diverged
+    # router now repairs the divergence instead of deepening it, which is
+    # the behaviour an operator was reaching for when they clicked it four
+    # times.
+    if not force:
+        live = await service.resolve_live_identity_for_router(router_id=router_id)
+        if live is not None:
+            peer = await service.get_peer(
+                router_id=router_id,
+                requesting_organization_id=requesting_organization_id,
+            )
+            adopted = False
+            if peer.public_key != live["public_key"]:
+                peer = await service.adopt_hub_peer(
+                    actor_user_id=uuid.UUID(user.id),
+                    router_id=router_id,
+                    requesting_organization_id=requesting_organization_id,
+                    public_key=live["public_key"],
+                    note=(
+                        "adopted during allocate-external: the hub reported "
+                        "this router handshaking on a key this table did not "
+                        "hold, so a new allocation would have moved the "
+                        "platform further from the device"
+                    ),
+                )
+                adopted = True
+            server = await service.get_server(peer.server_id)
+            base = _peer_response(peer, service=service)
+            payload = WireGuardTunnelCreateResponse(
+                **base.model_dump(),
+                peer_private_key=None,
+                reused=True,
+                hub_public_key=server.public_key,
+                hub_endpoint_host=server.endpoint_host,
+                hub_endpoint_port=server.endpoint_port,
+                tunnel_network_cidr=server.tunnel_network_cidr,
+                hub_tunnel_ip_address=hub_reserved_ip(server.tunnel_network_cidr),
+            )
+            return build_response(
+                success=True,
+                message=(
+                    (
+                        "This router is already connected on "
+                        f"{peer.tunnel_ip_address} -- adopted that identity "
+                        "instead of allocating a new peer, because the device "
+                        "holds a private key no server-side action can change."
+                    )
+                    if adopted
+                    else (
+                        "Existing WireGuard tunnel reused -- the hub reports "
+                        "this router connected on it, so no new peer was "
+                        "allocated"
+                    )
+                ),
+                data=payload.model_dump(),
+                request_id=_request_id(request),
+            )
+
     # `rotate=true` is the escape hatch for the one case reuse cannot
     # serve -- a device that has genuinely lost its config -- mirroring the
     # explicit-opt-in shape the API-password path already uses.
