@@ -10,6 +10,10 @@ on:
     paths:
       - "backend/**"
       - ".github/workflows/ci.yml"
+  # cd.yml calls this instead of restating ruff/pytest/the test-count floor.
+  # The gates stay defined once, here, and a deploy cannot pass a version of
+  # them that has drifted from the one PRs run.
+  workflow_call:
 
 defaults:
   run:
