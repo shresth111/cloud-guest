@@ -1,0 +1,192 @@
+# Production stack for the app server (i-0cf9b79511abe6000, ap-south-1).
+#
+# This is the file that belongs at /home/ubuntu/deploy/docker-compose.yml. It
+# is a transcription of what was actually running there on 2026-08-27, with
+# exactly three deliberate changes -- everything else, including every
+# healthcheck and every comment, is unchanged:
+#
+#   1. `build:` -> `image: ${API_IMAGE}` / `${FRONTEND_IMAGE}`.
+#      The box no longer builds. Images are built in GitHub Actions and pulled
+#      from ECR, so what runs in prod is a specific immutable digest that a
+#      commit SHA points at, and a rollback is "point the var at the old tag".
+#      Building on the box meant prod ran whatever was in two checkouts that
+#      are (confirmed 2026-08-27) both dirty with uncommitted local edits.
+#
+#   2. The postgres and pgadmin passwords are no longer literals in this file,
+#      because this file is now in git. They come from ~/deploy/.deploy.env,
+#      which is not and must never be committed. `:?` rather than a default:
+#      an unset password must stop the deploy, not silently start postgres
+#      with a different one.
+#
+#   3. pgadmin is dropped. It is defined in the box's copy but has NOT been
+#      running (confirmed 2026-08-27: six containers up, no pgadmin), and a
+#      web UI onto the production database with a default password, brought
+#      back to life as a side effect of a compose file swap, is not a thing
+#      to do by accident. Re-add it deliberately if it is wanted.
+#
+# Everything that holds state -- postgres, redis -- is untouched by the deploy
+# pipeline: remote-deploy.sh passes --no-deps and never names them as targets.
+#
+# VITE_API_BASE_URL is baked into the client bundle at build time (Vite env
+# vars resolve at build, not runtime -- the bundle runs in the visitor's
+# browser, not inside this Docker network). It used to be hardcoded to a
+# VM's sslip.io hostname, which broke every real (non-demo) API call --
+# login, OTP requests, anything hitting the backend -- from every OTHER
+# hostname this stack serves (app.wyfyguest.com, portal.wyfyguest.com,
+# master.wyfyguest.com). A RELATIVE path (src/services/api.ts's own default
+# is "/api/v1" when this var is unset) always resolves against whatever
+# domain the browser is currently on -- and every one of those domains'
+# nginx server blocks already proxies /api/ to the same backend
+# (127.0.0.1:8000), so this one relative value works everywhere at once.
+# It now lives in the frontend repo's CD workflow as a build arg, since the
+# build has moved off this box.
+services:
+  frontend:
+    image: ${FRONTEND_IMAGE:?FRONTEND_IMAGE is unset -- see ~/deploy/.deploy.env}
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      - api
+
+  api:
+    image: ${API_IMAGE:?API_IMAGE is unset -- see ~/deploy/.deploy.env}
+    # Interpolated so the backend's production configuration can be moved out
+    # of the git checkout (to ~/deploy/backend.env) without another edit here.
+    # The default is where it lives today, so leaving BACKEND_ENV_FILE unset
+    # changes nothing.
+    env_file:
+      - ${BACKEND_ENV_FILE:-./cloud-guest/backend/.env}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - cloudguest_logs:/var/log/cloudguest
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  celery-worker:
+    # Same image as api by construction -- one backend build, three processes.
+    # remote-deploy.sh recreates all three together for that reason: a worker
+    # left on the old code after `alembic upgrade head` has already run is a
+    # worker executing against a schema it does not know.
+    image: ${API_IMAGE:?API_IMAGE is unset -- see ~/deploy/.deploy.env}
+    command: ["celery", "-A", "app.core.celery_app", "worker", "--loglevel=info", "-Q", "celery,device_io"]
+    env_file:
+      - ${BACKEND_ENV_FILE:-./cloud-guest/backend/.env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - cloudguest_logs:/var/log/cloudguest
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Overrides the Dockerfile's HTTP healthcheck (curls :8000/health/live,
+    # which only the `api` service listens on) -- without this, a worker
+    # process with no HTTP server was permanently reported "unhealthy" even
+    # while correctly processing real jobs (confirmed via notification_
+    # deliveries rows actually being sent). `celery inspect ping` is the
+    # standard worker liveness check.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+  celery-beat:
+    image: ${API_IMAGE:?API_IMAGE is unset -- see ~/deploy/.deploy.env}
+    command: ["celery", "-A", "app.core.celery_app", "beat", "--loglevel=info", "--pidfile=/tmp/celerybeat.pid"]
+    env_file:
+      - ${BACKEND_ENV_FILE:-./cloud-guest/backend/.env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - cloudguest_logs:/var/log/cloudguest
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Same issue as celery-worker above -- beat has no HTTP server and no
+    # `inspect ping` equivalent, so liveness is "is the pidfile's process
+    # still running" instead.
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/celerybeat.pid && kill -0 $$(cat /tmp/celerybeat.pid) || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: cloudguest
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is unset -- see ~/deploy/.deploy.env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is unset -- see ~/deploy/.deploy.env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d cloudguest"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+  redis_data:
+  cloudguest_logs:
