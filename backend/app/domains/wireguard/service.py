@@ -454,6 +454,46 @@ class WireGuardService:
                 )
                 continue
             peer, router_name = db_match
+            # RECONCILE THE HANDSHAKE WE JUST LEARNED ABOUT.
+            #
+            # `last_handshake_at` previously had exactly one writer --
+            # `record_handshake`, which only the ROUTER'S OWN AGENT can
+            # call. That is a circular dependency the moment anything is
+            # wrong: an agent whose credential has been rotated, or whose
+            # tunnel is the thing being diagnosed, cannot report the very
+            # handshake that would prove the tunnel is fine.
+            #
+            # Confirmed live 2026-08-27 on router 01c9171e: the hub showed a
+            # current handshake on 10.20.0.3 while this row held
+            # `status='pending'` and `last_handshake_at IS NULL`, so
+            # `compute_health_status` returned UNKNOWN and the WireGuard tab
+            # showed a tunnel that had "never connected" -- about a tunnel
+            # that was up at that moment.
+            #
+            # The hub is the authority on whether a handshake happened; we
+            # have just read it. Writing it here is not papering over the
+            # drift, it is closing the only gap that made the drift
+            # unobservable. Strictly monotonic -- we never move the
+            # timestamp backwards, so a fresher agent-reported value is
+            # never clobbered by a stale hub read.
+            if hub_last_handshake is not None and (
+                peer.last_handshake_at is None
+                or peer.last_handshake_at < hub_last_handshake
+            ):
+                reconciled: dict[str, object] = {
+                    "last_handshake_at": hub_last_handshake
+                }
+                # A peer the hub has genuinely handshaked with is ACTIVE by
+                # definition. PENDING means "recorded, never seen"; leaving
+                # it PENDING after observing a handshake is the same lie in
+                # a different column. REVOKED is deliberately untouched: a
+                # revoked peer still handshaking is a real security finding
+                # that must keep reporting as revoked, not be quietly
+                # resurrected by a background read.
+                if peer.status == PeerStatus.PENDING.value:
+                    reconciled["status"] = PeerStatus.ACTIVE.value
+                peer = await self.repository.update_peer(peer, reconciled)
+
             entries.append(
                 FleetPeerEntry(
                     status=(
@@ -616,6 +656,81 @@ class WireGuardService:
             external_public_key=external_public_key,
         )
 
+    async def get_peer_if_usable(
+        self,
+        *,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> WireGuardPeer | None:
+        """This router's existing peer, IF reusing it is actually safe --
+        otherwise ``None``, meaning "allocate a fresh one".
+
+        Exists because ``ops/hub-agents/wg_agent.py`` has no delete and no
+        update verb: `POST /wg/peer` always allocates, `GET /wg/peers`
+        lists, and nothing else. Every allocation is therefore permanent
+        and unreclaimable, so the caller must not make one it does not
+        need. See ``allocate_external_wireguard_peer``'s own note.
+
+        Three conditions, and the third is the one that matters:
+
+        1. A peer row exists for this router.
+        2. It is not REVOKED -- a revoked row keeps its id but its
+           ``tunnel_ip_address`` has been overwritten with a
+           ``revoked:<id>`` sentinel and its address freed for reuse, so
+           there is nothing left to reuse.
+        3. **The hub still has it.** Checked against ``GET /wg/peers``,
+           the only server-side truth this platform can read. A row whose
+           public key the hub has forgotten (a ``wg0.conf`` rebuilt from an
+           older backup, or a hub replaced during a migration) describes a
+           tunnel that cannot come up, and handing it back would leave the
+           operator re-pasting a script that can never work. That case
+           genuinely does need a fresh allocation.
+
+        A hub that cannot be reached at all is deliberately NOT treated as
+        "the peer is gone": that would turn a transient bridge blip into a
+        permanent, unreclaimable peer allocation, which is the exact cost
+        this method exists to avoid. Unreachable means "cannot confirm", and
+        the safe response to "cannot confirm" is to reuse what we have and
+        let the script's own on-device verification report the truth.
+        """
+        peer = await self.repository.get_peer_by_router_id(router_id)
+        if peer is None or peer.status == PeerStatus.REVOKED.value:
+            return None
+        await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        if self.hub_peer_lister is None:
+            return peer
+        try:
+            hub_keys = {p["public_key"] for p in await self.hub_peer_lister()}
+        except Exception:  # noqa: BLE001 -- see the docstring's last paragraph
+            logger.warning(
+                "wireguard_reuse_check_could_not_reach_hub",
+                extra={
+                    "router_id": str(router_id),
+                    "detail": (
+                        "reusing the recorded peer without confirming it against "
+                        "the hub -- allocating instead would permanently consume "
+                        "another tunnel IP that no API can reclaim"
+                    ),
+                },
+                exc_info=True,
+            )
+            return peer
+        if peer.public_key not in hub_keys:
+            logger.info(
+                "wireguard_recorded_peer_missing_from_hub",
+                extra={
+                    "router_id": str(router_id),
+                    "public_key": peer.public_key,
+                    "detail": (
+                        "allocating a fresh peer -- the hub has no record of this one"
+                    ),
+                },
+            )
+            return None
+        return peer
+
     async def register_agent_allocated_peer(
         self,
         *,
@@ -671,6 +786,73 @@ class WireGuardService:
             "revoked_at": None,
         }
         if existing is not None:
+            # REMOVE THE PEER WE ARE SUPERSEDING FROM THE HUB.
+            #
+            # !! CURRENTLY INERT IN PRODUCTION, ON PURPOSE. !!
+            # `make_hub_peer_deregistrar` issues `DELETE /wg/peer`, and
+            # `ops/hub-agents/wg_agent.py` as deployed implements only
+            # `do_POST` and `do_GET` -- a DELETE returns `501 Unsupported
+            # method`. So this call always fails today and always takes the
+            # best-effort branch below. It is kept, and kept first, because
+            # (a) it is the correct behaviour the moment the hub gains the
+            # verb -- a `do_DELETE` handler is written and waiting in
+            # `ops/hub-agents/wg_agent.py`, undeployable only because there
+            # is no shell access to that host -- and (b) the warning it logs
+            # is the only running record that peers are being orphaned.
+            # The fix that actually stops the bleeding today is upstream:
+            # `allocate_external_wireguard_peer` no longer calls the hub at
+            # all when a usable peer already exists.
+            #
+            # Without this, every Generate left the previous peer in place on
+            # the hub forever: the bridge allocates a fresh keypair and the
+            # next free tunnel IP on each call, this row is overwritten to
+            # point at the new one, and nothing ever told the hub to forget
+            # the old. Confirmed live 2026-08-27 on router 01c9171e --
+            # `GET /wg/peers` returned 10.20.0.2, 10.20.0.3 and 10.20.0.4 for
+            # a single router, with a handshake on .3 (the address the device
+            # was actually still using) while this table tracked .4.
+            #
+            # Three separate harms, all of which this closes:
+            #  1. A leaked peer still has `allowed_ips` on the hub, so the
+            #     hub will happily route to a tunnel IP no live device owns.
+            #  2. `next_free_ip()` scans live kernel state, so leaked peers
+            #     permanently consume addresses out of a /24 -- at the three
+            #     rotations this router accumulated, the fleet ceiling is
+            #     about 84 routers rather than 254.
+            #  3. `get_fleet_status` reports each orphan as
+            #     UNTRACKED_CONNECTED, which is exactly the drift that view
+            #     exists to surface -- self-inflicted, on every Generate.
+            #
+            # Deliberately best-effort, unlike `revoke_tunnel`'s hard-failing
+            # deregistration. The ordering is forced: the bridge has ALREADY
+            # created the new peer on the hub by the time this runs, so
+            # raising here would abort before the row is written and leave a
+            # hub peer with no DB row at all -- strictly worse drift than the
+            # stale peer we are trying to remove. A failure is logged and the
+            # registration continues.
+            if (
+                self.hub_peer_deregistrar is not None
+                and existing.public_key
+                and existing.public_key != public_key
+            ):
+                try:
+                    await self.hub_peer_deregistrar(existing.public_key)
+                except Exception:  # noqa: BLE001 -- see the note above
+                    logger.warning(
+                        "wireguard_superseded_peer_not_removed",
+                        extra={
+                            "router_id": str(router.id),
+                            "superseded_public_key": existing.public_key,
+                            "detail": (
+                                "the replacement peer is live and recorded, but "
+                                "the hub "
+                                "still holds the peer it replaced -- it will show as "
+                                "UNTRACKED_CONNECTED in fleet-status until removed"
+                            ),
+                        },
+                        exc_info=True,
+                    )
+
             fields["rotation_count"] = existing.rotation_count + 1
             fields["last_handshake_at"] = None
             peer = await self.repository.update_peer(existing, fields)

@@ -843,7 +843,10 @@ class TestRouterProvisioning:
 
         script = "\n".join(lines)
         assert location_code == "HQ-001"
-        assert len(lines) <= 30
+        # Raised 30 -> 36 on 2026-08-27 alongside the identical cap in
+        # tests/unit/test_network_config.py, for the clock/NTP block the
+        # bootstrap renderer now emits. See that file for the reasoning.
+        assert len(lines) <= 36
         assert '/system identity set name="HQ-001"' in script
         assert "provisioning/check-in" in script
         # Step 1 ends at a verified tunnel + success line; the full config
@@ -1165,6 +1168,42 @@ class TestSweepStaleHeartbeats:
 
         assert result["marked_offline"] == 1
         assert repo.routers[stale.id].status == RouterStatus.OFFLINE.value
+
+    async def test_being_marked_offline_also_clears_the_health_verdict(self) -> None:
+        """`status` and `health_status` must move together.
+
+        This sweep used to write `status` alone, so a router swept offline
+        kept whatever `health_status` its last successful heartbeat had
+        written -- permanently "healthy". Confirmed live 2026-08-27 on
+        router 01c9171e: `status='offline'` next to `health_status='healthy'`
+        in the same row, i.e. the console answering "is this router up?" two
+        different ways on two different screens from one record.
+
+        UNHEALTHY rather than None/"unknown": this is a positive finding,
+        not an absence of one. We know the router has not checked in past
+        the stale cutoff, and `RouterHealthStatus` defines this field as
+        "is this router currently reachable" -- which we have just
+        determined it is not. `None` would claim no health check had ever
+        run, a lie in the opposite direction.
+        """
+        service, repo, loc, org, _audit = make_service()
+        stale = await self._router(
+            service,
+            loc,
+            org,
+            status=RouterStatus.ONLINE.value,
+            last_seen_at=_now() - timedelta(hours=3),
+        )
+        repo.routers[stale.id].health_status = "healthy"
+
+        await service.sweep_stale_heartbeats()
+
+        swept = repo.routers[stale.id]
+        assert swept.status == RouterStatus.OFFLINE.value
+        assert (
+            swept.health_status == "unhealthy"
+        ), "a router the platform has just given up on cannot still be reported healthy"
+        assert swept.last_health_check_at is not None
 
     async def test_a_router_heard_from_recently_is_left_alone(self) -> None:
         service, repo, loc, org, _audit = make_service()

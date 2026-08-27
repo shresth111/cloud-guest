@@ -221,8 +221,34 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ------------------------------------------------------------------
+    # HUB AGENT URLS -- READ BEFORE CHANGING A DEFAULT HERE.
+    #
+    # Every default below is a HARDCODED INFRASTRUCTURE ADDRESS, and this
+    # platform has now been bitten by that twice:
+    #
+    #   1. 20.219.72.235 (the old hub's PUBLIC IP) was a module-level
+    #      constant. The subscription was deleted; every venue provision
+    #      hung to timeout. Fixed by moving it here.
+    #   2. 10.30.2.10 (the old Azure hub's PRIVATE IP) was the default
+    #      here. The 2026-08-22 AWS migration set CLOUDGUEST_HUB_WG_AGENT_URL
+    #      and CLOUDGUEST_HUB_RADIUS_AGENT_URL in the deploy env, but MISSED
+    #      hub_wg_agent_peers_url -- which therefore silently kept the dead
+    #      Azure default. Confirmed live 2026-08-27: GET
+    #      /api/v1/wireguard/fleet-status hung for exactly 15s (this
+    #      module's httpx timeout) and returned HTTP 500 on every call,
+    #      because it was connecting to a machine that no longer exists.
+    #      Nothing about the failure named the address, so it read as "the
+    #      hub is down" rather than "one setting was missed".
+    #
+    # A plausible-looking stale default is worse than no default: it fails
+    # slowly, at a distance, and blames the wrong component. If you move
+    # the hub, grep this file for the old address and set EVERY
+    # CLOUDGUEST_HUB_*_URL env var explicitly in the deploy environment --
+    # do not rely on these defaults being current.
+    # ------------------------------------------------------------------
     hub_wg_agent_url: str = Field(
-        default="http://10.30.2.10:9091/wg/peer",
+        default="http://172.31.40.230:9091/wg/peer",
         description=(
             "Absolute URL of the hub's WireGuard peer-provisioning agent "
             "(ops/hub-agents/wg_agent.py, port 9091), called by "
@@ -249,7 +275,13 @@ class Settings(BaseSettings):
         ),
     )
     hub_wg_agent_peers_url: str = Field(
-        default="http://10.30.2.10:9091/wg/peers",
+        # THE FIELD THE 2026-08-22 MIGRATION MISSED. See the block comment
+        # above `hub_wg_agent_url`: the deploy environment set
+        # CLOUDGUEST_HUB_WG_AGENT_URL and CLOUDGUEST_HUB_RADIUS_AGENT_URL to
+        # the new AWS hub and never set this one, so it silently kept the
+        # dead Azure default and every GET /wireguard/fleet-status hung for
+        # the full 15s httpx timeout and then 500'd.
+        default="http://172.31.40.230:9091/wg/peers",
         description=(
             "Absolute URL of the hub's GET /wg/peers endpoint (same "
             "ops/hub-agents/wg_agent.py process as hub_wg_agent_url, same "
@@ -268,7 +300,7 @@ class Settings(BaseSettings):
         ),
     )
     hub_radius_agent_url: str = Field(
-        default="http://10.30.2.10:9092/radius/client",
+        default="http://172.31.40.230:9092/radius/client",
         description=(
             "Absolute URL of the hub's FreeRADIUS client-provisioning agent "
             "(ops/hub-agents/radius_agent.py, port 9092), called by "

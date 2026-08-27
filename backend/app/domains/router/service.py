@@ -67,7 +67,7 @@ from .device_credential_rotator import (
     DeviceCredentialRotationError,
     DeviceCredentialRotatorProtocol,
 )
-from .enums import ROUTER_STATUS_TRANSITIONS, RouterStatus
+from .enums import ROUTER_STATUS_TRANSITIONS, RouterHealthStatus, RouterStatus
 from .exceptions import (
     BootstrapLocationCodeMissingError,
     CrossOrganizationRouterAccessError,
@@ -865,8 +865,32 @@ class RouterService:
         failed = 0
         for router in stale:
             try:
+                # `health_status` and `last_health_check_at` move WITH the
+                # status, never independently of it.
+                #
+                # This used to write `status` alone, so a router swept
+                # offline kept whatever `health_status` its last successful
+                # heartbeat had written -- permanently "healthy". Confirmed
+                # live 2026-08-27 on router 01c9171e: `status='offline'`
+                # alongside `health_status='healthy'`, i.e. the console
+                # answering "is this router up?" two different ways on two
+                # different screens, from one row.
+                #
+                # UNHEALTHY, not None/"unknown": this sweep is not an
+                # absence of information, it is a positive finding. We know
+                # the router has not checked in for longer than the stale
+                # cutoff, and `RouterHealthStatus`'s own docstring defines
+                # this field as "is this router currently reachable" --
+                # which we have just determined it is not. `None` would mean
+                # "no health check has ever run", which would be a lie in
+                # the opposite direction.
                 updated = await self.repository.update_router(
-                    router, {"status": RouterStatus.OFFLINE.value}
+                    router,
+                    {
+                        "status": RouterStatus.OFFLINE.value,
+                        "health_status": RouterHealthStatus.UNHEALTHY.value,
+                        "last_health_check_at": datetime.now(UTC),
+                    },
                 )
                 await self._audit(
                     None,

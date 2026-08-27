@@ -1276,6 +1276,83 @@ def render_isp_netwatch_config(
 # tag could ever collide with.
 _BOOTSTRAP_MGMT_TAG = "CGBOOT"
 
+# --- Clock / NTP -------------------------------------------------------
+# Mirrors the Master console generator's own `Clock + NTP` chunk
+# (`CLOCK_NTP_SERVERS`/`CLOCK_TIME_ZONE` in
+# `cloudguest-foundation/src/components/routers/RouterDetailTabs.tsx`).
+# The two generators are separate code in separate repos and had drifted:
+# the console chunk has set the clock since 2026-08-23, this one never
+# did, so a router enrolled through the Fleet Wizard got no NTP at all.
+_BOOTSTRAP_NTP_SERVERS = ("216.239.35.0", "162.159.200.1")
+_BOOTSTRAP_TIME_ZONE = "Asia/Kolkata"
+
+
+def _render_clock_lines() -> list[str]:
+    """Set the time zone, enable NTP, and REFUSE TO CONTINUE until the
+    clock is actually synchronised.
+
+    Why this belongs in the bootstrap script, before anything else runs:
+    every subsequent line of this script talks to the platform over
+    HTTPS (:func:`_require_https` guarantees it -- there are ten
+    ``/tool fetch`` calls in this module and the bootstrap flow's
+    check-in and key-pull are two of them). A MikroTik with no
+    battery-backed real-time clock boots at the RouterOS build date, and
+    TLS certificate validation fails closed against a wrong date. The
+    fetch is then rejected *before it is sent*, with RouterOS's own
+    generic failure text and nothing naming the clock as the cause.
+
+    That is the exact production failure this closes: the router serves
+    guests perfectly while never once checking in, so it shows OFFLINE
+    in Master console forever and every diagnostic points at the network
+    rather than the date. The Master console's own generator has emitted
+    an equivalent chunk since 2026-08-23; this renderer -- the Fleet
+    Wizard's path, and the only one used for zero-touch enrollment --
+    never did, so wizard-provisioned routers were the ones that could
+    still land in that state.
+
+    ``:error`` rather than a printed warning, matching the rest of this
+    module's fail-closed posture: the bootstrap script is delivered
+    non-interactively (pasted whole, or pushed through the gateway), so
+    a warning has no reader. Stopping here leaves a router with a
+    correct identity and no tunnel, which is honestly incomplete and
+    trivially retried; continuing produces one that looks enrolled and
+    silently never reports.
+
+    Single-line/``;``-join safe and free of ``#`` comments, per this
+    module's contract. Each ``do={}``/``on-error={}`` body holds exactly
+    one statement -- a multi-statement inline body is a confirmed live
+    syntax error on this hardware.
+    """
+    servers = ",".join(_BOOTSTRAP_NTP_SERVERS)
+    return [
+        "/system clock set time-zone-autodetect=no "
+        f"time-zone-name={_BOOTSTRAP_TIME_ZONE}",
+        # RouterOS 7 spells the list `servers=`; RouterOS 6 has no such
+        # property and wants `primary-ntp=`/`secondary-ntp=`. Try v7, fall
+        # back to v6, and fail loudly if neither is accepted rather than
+        # leaving the operator to infer it from the sync wait below.
+        f"/system ntp client set enabled=yes servers={servers}",
+        # Bounded wait: NTP needs a moment after being enabled, and the
+        # very next thing this script does is an HTTPS fetch. 15 x 2s.
+        ':local cgClk ""',
+        ":local cgTries 0",
+        (
+            ':while ($cgClk != "synchronized" && $cgTries < 15) do={'
+            " :do { :set cgClk [:tostr [/system ntp client get status]] }"
+            ' on-error={ :set cgClk "unreadable" }; :set cgTries ($cgTries + 1);'
+            " :delay 2s }"
+        ),
+        (
+            ':if ($cgClk != "synchronized") do={ :error "CloudGuest bootstrap'
+            " STOPPED: the clock is not NTP-synchronised (status=$cgClk). Every"
+            " platform call in this script is HTTPS and will be rejected before"
+            " it is sent, leaving this router permanently OFFLINE in Master"
+            " console while its WiFi works. Check outbound UDP 123 is not"
+            ' blocked at this venue, then re-run this script." }'
+        ),
+    ]
+
+
 # Comment tags + fixed names for the two remote-mode ``/system scheduler``
 # entries (the detached cutover and its timed revert safety net) --
 # suffixed off the same base tag exactly like
@@ -1591,6 +1668,13 @@ def _render_onsite_bootstrap_lines(
     return [
         # -- identity (unchanged behavior) ---------------------------------
         f'/system identity set name="{location_code}"',
+        # -- clock / NTP, BEFORE the first HTTPS call ----------------------
+        # A fresh MikroTik has no battery-backed clock and boots at its
+        # firmware build date, which fails TLS validation and so fails the
+        # check-in fetch below before it is even sent. See
+        # `_render_clock_lines`. This is the on-site path -- a genuinely
+        # fresh box -- so it is exactly where an unset clock is guaranteed.
+        *_render_clock_lines(),
         # -- stale-state cleanup, before anything else ---------------------
         # The /ip address row goes first and is matched BY COMMENT: after a
         # previous run's interface was deleted, its address row lingers
@@ -1707,7 +1791,7 @@ def _render_remote_bootstrap_lines(
         ],
         *cleanup_commands,
         [
-            ("lit", f"/interface wireguard add name={iface} private-key=\""),
+            ("lit", f'/interface wireguard add name={iface} private-key="'),
             ("expr", '($wgcfg->"peer_private_key")'),
             (
                 "lit",
@@ -1803,7 +1887,7 @@ def _render_remote_bootstrap_lines(
         # restored state re-verifies.
         *cleanup_commands,
         [
-            ("lit", f"/interface wireguard add name={iface} private-key=\""),
+            ("lit", f'/interface wireguard add name={iface} private-key="'),
             ("expr", "$oldkey"),
             ("lit", '" listen-port='),
             ("expr", "$oldport"),
@@ -1884,16 +1968,24 @@ def _render_remote_bootstrap_lines(
         f"for {REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES}m"
     )
     cutover_staged = (
-        "[:len [/system scheduler find where "
-        f'comment="{_BOOTSTRAP_CUTOVER_TAG}"]]'
+        "[:len [/system scheduler find where " f'comment="{_BOOTSTRAP_CUTOVER_TAG}"]]'
     )
     revert_staged = (
-        "[:len [/system scheduler find where "
-        f'comment="{_BOOTSTRAP_REVERT_TAG}"]]'
+        "[:len [/system scheduler find where " f'comment="{_BOOTSTRAP_REVERT_TAG}"]]'
     )
     return [
         # -- identity (same invariant as on-site) --------------------------
         f'/system identity set name="{location_code}"',
+        # -- clock / NTP -----------------------------------------------------
+        # Deliberately kept here too, even though a live re-provisioned
+        # router has usually been up long enough to have synced: "usually"
+        # is not an invariant, and this path's own fetches are HTTPS on the
+        # same terms. Re-asserting an already-correct clock is a no-op, and
+        # the bounded wait exits on the first poll when the status is
+        # already `synchronized`. Placed before the tunnel-integrity
+        # refusal below so that a wrong clock is reported as a wrong clock
+        # rather than as an unreachable platform.
+        *_render_clock_lines(),
         # -- refuse unless the live tunnel state is intact -- BEFORE the
         #    one-time token is spent, so a half-broken router never burns
         #    it. A router in this state needs the on-site script (and a
@@ -1937,10 +2029,8 @@ def _render_remote_bootstrap_lines(
         # -- stage: bake validated values into the two detached scripts ----
         f":local cut {_ros_string_expr(_join_embedded_commands(cutover_commands))}",
         f":local rvt {_ros_string_expr(_join_embedded_commands(revert_commands))}",
-        "/system scheduler remove "
-        f'[find where comment="{_BOOTSTRAP_CUTOVER_TAG}"]',
-        "/system scheduler remove "
-        f'[find where comment="{_BOOTSTRAP_REVERT_TAG}"]',
+        "/system scheduler remove " f'[find where comment="{_BOOTSTRAP_CUTOVER_TAG}"]',
+        "/system scheduler remove " f'[find where comment="{_BOOTSTRAP_REVERT_TAG}"]',
         # Revert is armed BEFORE the cutover exists -- there is no instant
         # at which the cutover could fire unprotected.
         f"/system scheduler add name={_BOOTSTRAP_REVERT_SCHEDULER_NAME} "

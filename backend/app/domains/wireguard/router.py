@@ -50,7 +50,7 @@ from __future__ import annotations
 import uuid
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
@@ -285,6 +285,20 @@ async def register_external_wireguard_peer(
     )
 
 
+def _bridge_error_detail(resp: httpx.Response) -> str:
+    """The hub agent's own explanation of a >=400. See the identically
+    named helper in ``app.domains.guest.router`` -- both hub agents share
+    the ``{"error": "<str(exception)>"}`` shape and the same silent-logging
+    behaviour, so both need the body carried through to the caller."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return (resp.text or "<empty response body>")[:600]
+    if isinstance(body, dict) and "error" in body:
+        return str(body["error"])[:600]
+    return str(body)[:600]
+
+
 @router.post(
     "/routers/{router_id}/wireguard-peer/allocate-external",
     response_model=ApiResponse[WireGuardTunnelCreateResponse],
@@ -297,6 +311,18 @@ async def register_external_wireguard_peer(
 async def allocate_external_wireguard_peer(
     request: Request,
     router_id: uuid.UUID,
+    rotate: bool = Query(
+        default=False,
+        description=(
+            "Allocate a BRAND NEW keypair and tunnel IP even if this router "
+            "already has a usable peer. Default false -- see the endpoint's "
+            "docstring: the hub agent has no delete or update verb, so every "
+            "allocation is permanent and unreclaimable. Tick this only when "
+            "the device has genuinely lost its WireGuard config (a reflash, "
+            "or straight after Guided Setup's recovery phase), because it is "
+            "the one case reuse cannot serve."
+        ),
+    ),
     user: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: WireGuardService = Depends(get_wireguard_service),
@@ -313,6 +339,77 @@ async def allocate_external_wireguard_peer(
     bridge, then ``register-external``) into one, returning the same
     "everything needed to configure the device" bundle
     ``POST .../wireguard-peer`` does."""
+    # REUSE BEFORE ALLOCATING. Added 2026-08-27.
+    #
+    # `ops/hub-agents/wg_agent.py` exposes exactly two verbs: `POST
+    # /wg/peer`, which ALWAYS calls `allocate_peer()` with no reuse branch
+    # and no idempotency key, and `GET /wg/peers`. There is no `do_DELETE`
+    # and no `do_PUT` -- an attempted DELETE returns `501 Unsupported
+    # method`. So on that hub, every allocation is PERMANENT AND
+    # UNRECLAIMABLE by construction.
+    #
+    # This endpoint called it unconditionally, on every click of Generate.
+    # The consequences compounded:
+    #   - the hub accumulated a peer per click and could never shed one;
+    #     router 01c9171e's tunnel IP reached 10.20.0.5 while the device was
+    #     still using .3, and orphans survive even the router row's deletion
+    #   - `next_free_ip()` scans live kernel state, so the orphans
+    #     permanently consume a /24
+    #   - `register_external_radius_nas` binds the FreeRADIUS `client{}`
+    #     stanza to the tunnel IP THIS TABLE holds, so the device -- still
+    #     on the previous address -- became an unknown client whose RADIUS
+    #     packets are dropped with no reply and nothing logged
+    #
+    # Reuse is the only half of this we can fix from here: a client-side
+    # "update the peer" script cannot repair a divergence whose server side
+    # has no update verb, and shipping one to the hub needs shell access
+    # this platform does not currently have.
+    #
+    # Correctness of returning no private key: an agent-allocated peer's
+    # key was generated ON THE HUB and stored here as
+    # EXTERNALLY_MANAGED_KEY_SENTINEL -- this platform has never held it.
+    # That is exactly why reuse is safe: the device already has the
+    # matching key. The response carries `reused=True` and a null
+    # `peer_private_key`, and the setup-script generator omits the
+    # `private-key=` line rather than writing a sentinel over a working
+    # interface.
+    #
+    # `rotate=true` is the escape hatch for the one case reuse cannot
+    # serve -- a device that has genuinely lost its config -- mirroring the
+    # explicit-opt-in shape the API-password path already uses.
+    if not rotate:
+        existing = await service.get_peer_if_usable(
+            router_id=router_id,
+            requesting_organization_id=requesting_organization_id,
+        )
+        if existing is not None:
+            base = _peer_response(existing, service=service)
+            server = await service.get_server(existing.server_id)
+            payload = WireGuardTunnelCreateResponse(
+                **base.model_dump(),
+                peer_private_key=None,
+                reused=True,
+                hub_public_key=server.public_key,
+                hub_endpoint_host=server.endpoint_host,
+                hub_endpoint_port=server.endpoint_port,
+                tunnel_network_cidr=server.tunnel_network_cidr,
+                hub_tunnel_ip_address=hub_reserved_ip(server.tunnel_network_cidr),
+            )
+            return build_response(
+                success=True,
+                message=(
+                    "Existing WireGuard tunnel reused -- no new peer was "
+                    "allocated on the hub"
+                ),
+                data=payload.model_dump(),
+                request_id=_request_id(request),
+            )
+
+    # Same reporting fix as `register_external_radius_nas` -- see the long
+    # note there. A bridge that answers with a real HTTP status is NOT
+    # "could not be reached", and its response body is the only description
+    # of the failure that exists anywhere (the agents' `log_message` is a
+    # deliberate no-op, so nothing reaches the hub's journal either).
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             _settings = get_settings()
@@ -320,12 +417,21 @@ async def allocate_external_wireguard_peer(
                 _settings.hub_wg_agent_url,
                 headers={"X-Agent-Secret": _settings.hub_wg_agent_secret},
             )
-            resp.raise_for_status()
-            wg = resp.json()
     except httpx.HTTPError as exc:
         raise HTTPException(
-            status_code=502, detail="Could not reach the WireGuard hub bridge"
+            status_code=502,
+            detail=f"Could not reach the WireGuard hub bridge: {exc!s}",
         ) from exc
+
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"The WireGuard hub bridge refused this allocation "
+                f"(HTTP {resp.status_code}): {_bridge_error_detail(resp)}"
+            ),
+        )
+    wg = resp.json()
 
     peer = await service.register_agent_allocated_peer(
         actor_user_id=uuid.UUID(user.id),

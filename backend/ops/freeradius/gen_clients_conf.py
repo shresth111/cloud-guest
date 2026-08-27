@@ -76,6 +76,23 @@ def render_client_block(
         f"client {safe_name} {{\n"
         f"    ipaddr = {ipaddr}\n"
         f'    secret = "{secret}"\n'
+        # `backend_secret` is NOT a FreeRADIUS built-in -- it is a custom
+        # per-client item that `sites-enabled/default` reads back out as
+        # `%{client:backend_secret}` when it builds each `rlm_rest` call,
+        # so that a router authenticates to the platform API as ITSELF
+        # rather than as whichever router happened to be hardcoded into
+        # the snippet. `ops/hub-agents/radius_agent.py`'s `add_client()`
+        # has always emitted it; this generator never did.
+        #
+        # That asymmetry is a live, silent divergence, not a cosmetic one:
+        # a NAS whose stanza comes from THIS file (every row the 60s
+        # `wyfy-radius-sync.timer` regenerates) resolves
+        # `%{client:backend_secret}` to the empty string, and the REST
+        # call it authenticates goes out with no credential at all. The
+        # router does not 401 -- it gets an `Auth-Type: Reject` over HTTP
+        # 200, with nothing logged anywhere. Emitting the same item the
+        # agent emits is what keeps the two write paths interchangeable.
+        f'    backend_secret = "{secret}"\n'
         f"    nas_type = other\n"
         f'    shortname = "{identifier}"\n'
         f"}}\n"

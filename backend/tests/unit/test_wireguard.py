@@ -30,7 +30,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.database.exceptions import DuplicateRecordError
-from app.domains.rbac.enums import ScopeType
 from app.domains.location.exceptions import (
     CrossOrganizationLocationAccessError,
     LocationNotFoundError,
@@ -39,6 +38,7 @@ from app.domains.location.models import Location
 from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
+from app.domains.rbac.enums import ScopeType
 from app.domains.router.crypto import decrypt_secret
 from app.domains.router.enums import RouterStatus
 from app.domains.router.exceptions import CrossOrganizationRouterAccessError
@@ -1861,7 +1861,9 @@ class TestFleetStatus:
             router_id=router.id,
             requesting_organization_id=None,
         )
-        peer_public_key = (await f.wireguard_repo.get_peer_by_router_id(router.id)).public_key
+        peer_public_key = (
+            await f.wireguard_repo.get_peer_by_router_id(router.id)
+        ).public_key
 
         result = await f.wireguard_service.get_fleet_status(now=now)
 
@@ -1874,7 +1876,9 @@ class TestFleetStatus:
         ghost_key = "ghost-public-key-not-in-db"
 
         async def _lister() -> list[dict]:
-            return [_hub_peer(ghost_key, handshake_epoch=int(datetime.now(UTC).timestamp()))]
+            return [
+                _hub_peer(ghost_key, handshake_epoch=int(datetime.now(UTC).timestamp()))
+            ]
 
         f = make_services(hub_peer_lister=_lister)
 
@@ -1997,3 +2001,106 @@ class TestFleetStatusRouteRequiresPermission:
         (dependency,) = route.dependencies
         nonlocals = inspect.getclosurevars(dependency.dependency).nonlocals
         assert nonlocals["scope"] == ScopeType.GLOBAL
+
+
+class TestSupersededPeerIsRemovedFromHub:
+    """Every Generate in the Master console's Setup Script panel calls the
+    hub bridge for a FRESH keypair and the NEXT FREE tunnel IP, then
+    overwrites this router's row to point at it. Nothing ever told the hub
+    to forget the peer it replaced.
+
+    Confirmed live 2026-08-27 on router 01c9171e: ``GET /wg/peers``
+    returned 10.20.0.2, 10.20.0.3 AND 10.20.0.4 for one router, with the
+    handshake on .3 -- the address the device was actually still using --
+    while this table tracked .4. Three harms: the hub routes to tunnel IPs
+    no live device owns; ``next_free_ip()`` scans live kernel state so
+    orphans permanently consume a /24 (three rotations each caps the fleet
+    near 84 routers, not 254); and ``get_fleet_status`` reports every
+    orphan as UNTRACKED_CONNECTED -- self-inflicted drift, on every click.
+    """
+
+    async def _router_with_peer(self, f):
+        """Seeds via ``create_tunnel``, the same helper every other class in
+        this file uses, and hands back the peer's real generated key --
+        which is what the re-registration below must supersede."""
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        return router, peer.public_key
+
+    async def test_re_registration_deregisters_the_key_it_replaces(self) -> None:
+        removed: list[str] = []
+
+        async def _dereg(public_key: str) -> None:
+            removed.append(public_key)
+
+        f = make_services(hub_peer_deregistrar=_dereg)
+        router, old_key = await self._router_with_peer(f)
+
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.44",
+            public_key="NEWKEY",
+        )
+
+        assert removed == [old_key], (
+            "the superseded peer was left on the hub -- this is exactly how one router "
+            "accumulated 10.20.0.2/.3/.4"
+        )
+
+    async def test_re_registering_the_same_key_removes_nothing(self) -> None:
+        """An idempotent re-registration must not deregister the very key
+        it is re-asserting -- that would take a working tunnel down."""
+        removed: list[str] = []
+
+        async def _dereg(public_key: str) -> None:
+            removed.append(public_key)
+
+        f = make_services(hub_peer_deregistrar=_dereg)
+        router, same_key = await self._router_with_peer(f)
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address=peer.tunnel_ip_address,
+            public_key=same_key,
+        )
+
+        assert removed == []
+
+    async def test_a_hub_that_refuses_the_removal_still_records_the_new_peer(
+        self,
+    ) -> None:
+        """Deliberately best-effort here, unlike ``revoke_tunnel`` which
+        fails hard. The ordering is forced: the bridge has ALREADY created
+        the replacement peer on the hub by the time this runs, so raising
+        would abort before the row is written and leave a hub peer with no
+        DB row at all -- strictly worse drift than the stale peer we were
+        trying to remove."""
+
+        async def _boom(public_key: str) -> None:
+            raise RuntimeError("hub bridge unreachable")
+
+        f = make_services(hub_peer_deregistrar=_boom)
+        router, _old_key = await self._router_with_peer(f)
+
+        peer = await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.20.0.44",
+            public_key="NEWKEY",
+        )
+
+        assert peer.public_key == "NEWKEY"
+        assert peer.tunnel_ip_address == "10.20.0.44"

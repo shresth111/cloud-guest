@@ -35,6 +35,7 @@ envelope).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime
@@ -1226,6 +1227,26 @@ async def register_radius_nas(
     )
 
 
+def _bridge_error_detail(resp: httpx.Response) -> str:
+    """The hub agent's own explanation of a >=400, in a form safe to put in
+    an API error detail.
+
+    ``ops/hub-agents/radius_agent.py`` answers every failure as
+    ``{"error": "<str(exception)>"}``. That string is the only description
+    of what went wrong that exists anywhere -- the agent's
+    ``log_message`` is a deliberate no-op, so nothing is written to the
+    hub's journal either. Truncated because ``_validate_and_restart``
+    embeds up to 2000 characters of ``freeradius -CX`` output in it.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return (resp.text or "<empty response body>")[:600]
+    if isinstance(body, dict) and "error" in body:
+        return str(body["error"])[:600]
+    return str(body)[:600]
+
+
 @nas_router.post(
     "/register-external/{router_id}",
     response_model=ApiResponse[RadiusNasCreatedResponse],
@@ -1274,26 +1295,118 @@ async def register_external_radius_nas(
             requesting_organization_id=requesting_organization_id,
         )
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            _settings = get_settings()
-            resp = await client.post(
-                _settings.hub_radius_agent_url,
-                headers={
-                    "X-Agent-Secret": _settings.hub_radius_agent_secret,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "tunnel_ip": peer.tunnel_ip_address,
+    # NOTE ON ERROR REPORTING (2026-08-27): this block used to collapse
+    # every possible failure -- connect timeout, DNS, 401, 500 -- into the
+    # single detail string "Could not reach the RADIUS server bridge",
+    # which is actively WRONG for the case that actually happens.
+    #
+    # Confirmed live on 2026-08-27 for router 01c9171e (the "lobby router"
+    # fresh provision): the bridge WAS reached, in 36ms, and answered
+    #     POST http://<hub>:9092/radius/client -> HTTP 500
+    # with a precise JSON diagnostic in its body -- `radius_agent.py`'s
+    # handler is `except Exception as e: self._json(500, {"error": str(e)})`,
+    # so that body is the actual Python exception from `add_client()`
+    # (permission denied, `freeradius -CX` output, systemctl failure, ...).
+    # `raise_for_status()` turned that into an `HTTPStatusError`, this
+    # handler discarded the body, and the operator was told the hub was
+    # unreachable. The Master console then dropped the RADIUS chunk from
+    # the generated setup script with no way for anyone to find out why.
+    # Losing that body cost a multi-hour investigation; it is the single
+    # most useful piece of information this endpoint ever has.
+    #
+    # So: keep 502 for a genuine transport failure, but report a real HTTP
+    # response from the bridge as its own case, with the bridge's own
+    # status and body carried through.
+    # RETRY A 5xx, ONCE-PLUS-TWO. Added 2026-08-27, after establishing that
+    # the failure which started all of this was TRANSIENT, not structural:
+    # the same call succeeded unchanged when replayed later.
+    #
+    # The bridge is a `ThreadingHTTPServer` with no lock around its
+    # read-modify-write of `clients.conf` and its `systemctl restart
+    # freeradius`, and a separate 60s `wyfy-radius-sync.timer` on the same
+    # host runs `systemctl reload freeradius`. So there is a recurring
+    # window in which a perfectly valid request loses a race, systemd
+    # returns non-zero, `_validate_and_restart` restores the backup and
+    # raises, and the caller sees an opaque 500. `ops/hub-agents/
+    # radius_agent.py` now takes a process-local lock, which closes the
+    # half of that window this codebase owns; the sync timer is outside it.
+    #
+    # Retrying is safe because `add_client` is idempotent on
+    # `nas_identifier`: it strips EVERY stanza with that shortname and
+    # writes exactly one. Re-sending the same payload converges to the same
+    # file, whether or not the previous attempt got part-way.
+    #
+    # 5xx ONLY. A 4xx from this bridge is deterministic -- 401 is a secret
+    # mismatch, 400 a malformed payload -- and retrying it just triples the
+    # latency before reporting the same thing.
+    #
+    # Why this matters more than it looks: without it, one momentary
+    # collision produced a setup script permanently missing its RADIUS
+    # chunk, which is how a router reaches a venue and rejects every guest
+    # login with nothing anywhere naming the cause.
+    _settings = get_settings()
+    _RETRY_DELAYS = (0.5, 2.0)
+    resp = None
+    last_transport_error: httpx.HTTPError | None = None
+    for attempt in range(len(_RETRY_DELAYS) + 1):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    _settings.hub_radius_agent_url,
+                    headers={
+                        "X-Agent-Secret": _settings.hub_radius_agent_secret,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "tunnel_ip": peer.tunnel_ip_address,
+                        "nas_identifier": result.nas_client.nas_identifier,
+                        "secret": result.shared_secret,
+                    },
+                )
+        except httpx.HTTPError as exc:
+            # A transport failure is also worth one more try -- the restart
+            # this races with drops connections as well as failing them.
+            last_transport_error = exc
+            resp = None
+        else:
+            last_transport_error = None
+            if resp.status_code < 500:
+                break
+        if attempt < len(_RETRY_DELAYS):
+            logger.warning(
+                "radius_bridge_retrying",
+                extra={
                     "nas_identifier": result.nas_client.nas_identifier,
-                    "secret": result.shared_secret,
+                    "attempt": attempt + 1,
+                    "status_code": None if resp is None else resp.status_code,
+                    "detail": (
+                        str(last_transport_error)
+                        if last_transport_error is not None
+                        else _bridge_error_detail(resp)
+                    ),
                 },
             )
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
+            await asyncio.sleep(_RETRY_DELAYS[attempt])
+
+    if last_transport_error is not None:
+        # Genuinely could not complete a request/response exchange.
         raise HTTPException(
-            status_code=502, detail="Could not reach the RADIUS server bridge"
-        ) from exc
+            status_code=502,
+            detail=(
+                f"Could not reach the RADIUS server bridge after "
+                f"{len(_RETRY_DELAYS) + 1} attempts: {last_transport_error!s}"
+            ),
+        ) from last_transport_error
+
+    assert resp is not None  # noqa: S101 -- both other paths raise above
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"The RADIUS server bridge refused this registration "
+                f"(HTTP {resp.status_code}): {_bridge_error_detail(resp)}"
+            ),
+        )
 
     return build_response(
         success=True,
