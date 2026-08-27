@@ -29,7 +29,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domains.auth.schemas import MessageResponse
 
-from .constants import DEFAULT_PERSISTENT_KEEPALIVE_SECONDS, HealthStatus, PeerStatus
+from .constants import (
+    DEFAULT_PERSISTENT_KEEPALIVE_SECONDS,
+    FleetPeerStatus,
+    HealthStatus,
+    PeerStatus,
+)
 
 __all__ = [
     "MessageResponse",
@@ -74,6 +79,29 @@ class WireGuardPeerResponse(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class FleetPeerStatusResponse(BaseModel):
+    """One peer's row in ``GET /wireguard/fleet-status`` -- a merge of this
+    table's own record (if any) and the hub's live ``wg show`` state (if
+    any) for one public key. See ``service.FleetPeerEntry``."""
+
+    status: FleetPeerStatus
+    public_key: str
+    router_id: str | None = None
+    router_name: str | None = None
+    tunnel_ip_address: str | None = None
+    last_handshake_at: datetime | None = None
+
+
+class FleetStatusResponse(BaseModel):
+    """Returned by ``GET /wireguard/fleet-status`` -- a summary count per
+    ``FleetPeerStatus`` plus the full per-peer detail list. See
+    ``service.WireGuardService.get_fleet_status``'s own docstring for why
+    this reads the hub live rather than trusting this table alone."""
+
+    summary: dict[FleetPeerStatus, int]
+    peers: list[FleetPeerStatusResponse]
 
 
 class WireGuardTunnelCreateResponse(WireGuardPeerResponse):

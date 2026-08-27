@@ -248,6 +248,25 @@ class Settings(BaseSettings):
             "been rotated."
         ),
     )
+    hub_wg_agent_peers_url: str = Field(
+        default="http://10.30.2.10:9091/wg/peers",
+        description=(
+            "Absolute URL of the hub's GET /wg/peers endpoint (same "
+            "ops/hub-agents/wg_agent.py process as hub_wg_agent_url, same "
+            "host/port, different path) -- the hub's own live `wg show wg0 "
+            "dump` ground truth, called by "
+            "app.domains.wireguard.service.WireGuardService.get_fleet_status "
+            "to detect drift between this table and what the hub is "
+            "actually doing. A separate explicit field rather than derived "
+            "by string-editing hub_wg_agent_url, matching this file's own "
+            "existing convention of one field per absolute URL (see "
+            "hub_radius_agent_url, which duplicates this same host rather "
+            "than being derived either) -- deriving one URL from another "
+            "would make a future path change on either endpoint a silent "
+            "two-place edit instead of an explicit one. Same private-VNet, "
+            "same-secret rules as hub_wg_agent_url."
+        ),
+    )
     hub_radius_agent_url: str = Field(
         default="http://10.30.2.10:9092/radius/client",
         description=(

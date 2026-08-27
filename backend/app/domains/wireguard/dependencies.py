@@ -86,6 +86,41 @@ def make_hub_peer_deregistrar(settings: Settings):
     return _deregister
 
 
+def make_hub_peer_lister(settings: Settings):
+    """Builds the callable `WireGuardService.get_fleet_status` uses to read
+    the hub's own live peer list (`GET /wg/peers`, see
+    `ops/hub-agents/wg_agent.py`'s module docstring) -- the same
+    private-VNet URL/secret pattern as `make_hub_peer_deregistrar`, just a
+    GET instead of a DELETE. Built here, not imported into the service,
+    for the identical reason: the in-memory test suite drives the service
+    with a fake lister, never real HTTP.
+
+    Raises on anything but a clean 200 -- a fleet-status view built on a
+    guess about the hub's state (rather than a clear "the hub could not be
+    reached" error) is worse than no view at all, the same reasoning
+    `HubBridgeUnavailableError`'s own docstring gives for the deregistrar.
+    """
+
+    async def _list_peers() -> list[dict]:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    settings.hub_wg_agent_peers_url,
+                    headers={"X-Agent-Secret": settings.hub_wg_agent_secret},
+                )
+        except httpx.HTTPError as exc:
+            raise HubBridgeUnavailableError(
+                "Could not reach the WireGuard hub bridge to list live peers"
+            ) from exc
+        if resp.status_code >= 400:
+            raise HubBridgeUnavailableError(
+                f"The WireGuard hub bridge refused the peer list ({resp.status_code})"
+            )
+        return resp.json()["peers"]
+
+    return _list_peers
+
+
 def get_wireguard_repository(
     db: AsyncSession = Depends(get_db_session),
 ) -> WireGuardRepositoryProtocol:
@@ -104,6 +139,7 @@ def get_wireguard_service(
         audit_writer=audit_repository,
         handshake_stale_after_minutes=settings.wireguard_handshake_stale_after_minutes,
         hub_peer_deregistrar=make_hub_peer_deregistrar(settings),
+        hub_peer_lister=make_hub_peer_lister(settings),
     )
 
 
@@ -111,5 +147,6 @@ __all__ = [
     "get_wireguard_repository",
     "get_wireguard_service",
     "make_hub_peer_deregistrar",
+    "make_hub_peer_lister",
     "HubBridgeUnavailableError",
 ]

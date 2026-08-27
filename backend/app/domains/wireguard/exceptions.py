@@ -58,6 +58,24 @@ class NoActiveWireGuardServerError(WireGuardError):
         )
 
 
+class HubPeerListerNotConfiguredError(WireGuardError):
+    """``get_fleet_status`` has no ``hub_peer_lister`` injected.
+
+    Unlike ``hub_peer_deregistrar`` (which `revoke_tunnel` silently skips
+    when absent -- the database-side revoke is still meaningful on its
+    own), a fleet-status read with no way to reach the hub has nothing
+    real to return: the entire point of this call is comparing this
+    table against the hub's own state, so a silent DB-only fallback would
+    quietly reintroduce the exact "trusted the database alone" blind spot
+    this feature exists to close."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The WireGuard hub bridge is not configured -- cannot read live fleet status",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
 class WireGuardPeerNotFoundError(WireGuardError):
     def __init__(self, router_id: uuid.UUID) -> None:
         super().__init__(

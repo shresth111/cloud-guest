@@ -11,6 +11,15 @@ POST /wg/peer  { }  (empty body)  -> allocates the next free /32 in
   keypair with `wg genkey`/`wg pubkey`, adds it live via `wg set` AND
   appends it to /etc/wireguard/wg0.conf so it survives a reboot, and
   returns everything the caller needs to configure the far end.
+
+GET /wg/peers -> the hub's own ground truth of who is actually tunneled in
+  right now, straight from `wg show wg0 dump` -- public key, tunnel IP,
+  last handshake, bytes transferred. Exists because the app's own
+  `wireguard_peers` table can drift from what the hub is really doing (a
+  peer added directly on the box, or a DB row that never got created,
+  never shows up in a DB-only view) -- this endpoint is what lets the
+  backend build a fleet-status view against reality instead of trusting
+  the database alone.
 """
 
 import http.server
@@ -62,6 +71,35 @@ def next_free_ip() -> str:
     raise RuntimeError("WireGuard subnet exhausted")
 
 
+def list_peers() -> list[dict]:
+    """One entry per line of `wg show wg0 dump` (the header/server line is
+    skipped -- it has only 4 fields where a real peer line has 8, so the
+    split-length check below is what tells them apart, the same way
+    `wg`'s own `--help` documents the two line shapes).
+
+    Field order per WireGuard's own dump format: public-key, preshared-key,
+    endpoint, allowed-ips, latest-handshake (unix epoch seconds, "0" if
+    never), transfer-rx, transfer-tx, persistent-keepalive."""
+    out = run(["wg", "show", WG_IFACE, "dump"])
+    peers = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 8:
+            continue  # the one 4-field line is the interface/server itself
+        public_key, _psk, endpoint, allowed_ips, latest_handshake, rx, tx, _keepalive = parts
+        peers.append(
+            {
+                "public_key": public_key,
+                "endpoint": endpoint if endpoint != "(none)" else None,
+                "allowed_ips": allowed_ips,
+                "latest_handshake_epoch": int(latest_handshake),
+                "transfer_rx_bytes": int(rx),
+                "transfer_tx_bytes": int(tx),
+            }
+        )
+    return peers
+
+
 def allocate_peer() -> dict:
     private_key = run(["wg", "genkey"])
     public_key = subprocess.run(
@@ -104,6 +142,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             result = allocate_peer()
             body = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:  # noqa: BLE001 -- single-purpose agent, log and 500
+            body = json.dumps({"error": str(e)}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path != "/wg/peers":
+            self.send_response(404)
+            self.end_headers()
+            return
+        if not SHARED_SECRET or self.headers.get("X-Agent-Secret") != SHARED_SECRET:
+            self._unauthorized()
+            return
+        try:
+            body = json.dumps({"peers": list_peers()}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

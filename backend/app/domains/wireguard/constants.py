@@ -126,6 +126,22 @@ class HealthStatus(StrEnum):
     REVOKED = "revoked"
 
 
+class FleetPeerStatus(StrEnum):
+    """Which of the two independent records of the fleet -- this table, or
+    the hub's own ``wg show`` -- a given peer's classification comes from
+    disagreeing about. See ``service.py``'s ``WireGuardService
+    .get_fleet_status``, added after a live incident where the hub's real
+    peer count (72, later 7 once partially reconciled) diverged sharply
+    from this table's (1) -- exactly the drift each of these four values
+    names.
+    """
+
+    TRACKED_CONNECTED = "tracked_connected"
+    TRACKED_STALE = "tracked_stale"
+    UNTRACKED_CONNECTED = "untracked_connected"
+    TRACKED_MISSING_FROM_HUB = "tracked_missing_from_hub"
+
+
 __all__ = [
     "WIREGUARD_KEY_RAW_BYTES",
     "HUB_RESERVED_HOST_COUNT",
@@ -134,4 +150,5 @@ __all__ = [
     "PeerStatus",
     "PEER_STATUS_TRANSITIONS",
     "HealthStatus",
+    "FleetPeerStatus",
 ]

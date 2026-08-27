@@ -22,6 +22,7 @@ tenant isolation and router-eligibility checks.
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -29,6 +30,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.database.exceptions import DuplicateRecordError
+from app.domains.rbac.enums import ScopeType
 from app.domains.location.exceptions import (
     CrossOrganizationLocationAccessError,
     LocationNotFoundError,
@@ -53,8 +55,9 @@ from app.domains.router_agent.exceptions import (
 )
 from app.domains.router_agent.models import RouterAgentCredential
 from app.domains.router_agent.service import RouterAgentService, hash_credential
-from app.domains.wireguard.constants import HealthStatus, PeerStatus
+from app.domains.wireguard.constants import FleetPeerStatus, HealthStatus, PeerStatus
 from app.domains.wireguard.exceptions import (
+    HubPeerListerNotConfiguredError,
     InvalidPeerStatusTransitionError,
     NoActiveWireGuardServerError,
     TunnelIPAllocationConflictError,
@@ -66,8 +69,21 @@ from app.domains.wireguard.exceptions import (
     WireGuardRouterNotEligibleError,
 )
 from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
+from app.domains.wireguard.router import router as wireguard_router
 from app.domains.wireguard.service import WireGuardService, generate_wireguard_keypair
 from app.domains.wireguard.validators import allocate_tunnel_ip, validate_cidr
+
+
+def _permission_keys(route: object) -> list[str]:
+    """The permission strings a route's ``RequirePermission`` dependencies
+    actually enforce -- mirrors ``test_user.py``'s own helper of the same
+    name/shape (``RequirePermission`` is a closure factory, so the key
+    lives in ``_dependency``'s nonlocals)."""
+    return [
+        inspect.getclosurevars(dependency.dependency).nonlocals["permission_key"]
+        for dependency in route.dependencies  # type: ignore[attr-defined]
+    ]
+
 
 # ============================================================================
 # Test doubles: BE-008 (Router domain) side -- mirrors test_router_agent.py
@@ -277,6 +293,11 @@ class FakeRouterRepository:
 class FakeWireGuardRepository:
     servers: dict[uuid.UUID, WireGuardServer] = field(default_factory=dict)
     peers: dict[uuid.UUID, WireGuardPeer] = field(default_factory=dict)
+    # Router names, keyed by router_id -- tests populate this directly
+    # (there's no fake Router object here, only the display label
+    # `list_all_peers_with_router_names` needs) rather than wiring in a
+    # second fake repository just to look up a name.
+    router_names: dict[uuid.UUID, str] = field(default_factory=dict)
 
     async def get_server_by_id(self, server_id, *, include_deleted: bool = False):
         server = self.servers.get(server_id)
@@ -375,6 +396,15 @@ class FakeWireGuardRepository:
         peer.version += 1
         return peer
 
+    async def list_all_peers_with_router_names(
+        self,
+    ) -> list[tuple[WireGuardPeer, str | None]]:
+        return [
+            (peer, self.router_names.get(peer.router_id))
+            for peer in self.peers.values()
+            if not peer.is_deleted
+        ]
+
 
 @dataclass
 class RacyWireGuardRepository(FakeWireGuardRepository):
@@ -469,6 +499,7 @@ def make_services(
     handshake_stale_after_minutes: int = 5,
     wireguard_repo: FakeWireGuardRepository | None = None,
     hub_peer_deregistrar=None,
+    hub_peer_lister=None,
 ) -> Fixture:
     org_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup(organization_lookup=org_lookup)
@@ -492,6 +523,7 @@ def make_services(
         audit_writer=shared_audit,
         handshake_stale_after_minutes=handshake_stale_after_minutes,
         hub_peer_deregistrar=hub_peer_deregistrar,
+        hub_peer_lister=hub_peer_lister,
     )
 
     return Fixture(
@@ -1743,3 +1775,225 @@ class TestRevokeTellsTheHub:
         assert after.tunnel_ip_address == held
         occupied = await f.wireguard_repo.list_occupied_tunnel_ips(peer.server_id)
         assert held in occupied
+
+
+# ============================================================================
+# Fleet status: this table vs. the hub's own live `wg show` state
+# ============================================================================
+
+
+def _hub_peer(
+    public_key: str,
+    *,
+    handshake_epoch: int,
+    allowed_ips: str = "10.20.0.99/32",
+) -> dict:
+    """One entry in the shape ``ops/hub-agents/wg_agent.py``'s
+    ``list_peers()`` / ``HubPeerLister`` return -- see
+    ``service.HubPeerLister``'s own docstring for the exact field set."""
+    return {
+        "public_key": public_key,
+        "endpoint": "203.0.113.5:51820",
+        "allowed_ips": allowed_ips,
+        "latest_handshake_epoch": handshake_epoch,
+        "transfer_rx_bytes": 1024,
+        "transfer_tx_bytes": 2048,
+    }
+
+
+class TestFleetStatus:
+    """``get_fleet_status`` is the live-``wg show``-vs-database comparison
+    that ``HubPeerLister``'s own docstring exists to make possible -- see
+    that class and ``TestRevokeTellsTheHub`` above for the same
+    "two independent records of the fleet" framing. Every state below is
+    exercised with a hub-reported peer list built by hand
+    (``_hub_peer``), never real HTTP."""
+
+    async def test_no_lister_configured_raises(self) -> None:
+        f = make_services(hub_peer_lister=None)
+
+        with pytest.raises(HubPeerListerNotConfiguredError):
+            await f.wireguard_service.get_fleet_status()
+
+    async def test_tracked_and_recently_connected(self) -> None:
+        async def _lister() -> list[dict]:
+            return [_hub_peer(peer_public_key, handshake_epoch=int(now.timestamp()))]
+
+        f = make_services(hub_peer_lister=_lister)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        f.wireguard_repo.router_names[router.id] = router.name
+        now = datetime.now(UTC)
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+        peer = await f.wireguard_repo.get_peer_by_router_id(router.id)
+        peer_public_key = peer.public_key
+
+        result = await f.wireguard_service.get_fleet_status(now=now)
+
+        assert result.summary[FleetPeerStatus.TRACKED_CONNECTED] == 1
+        assert result.summary[FleetPeerStatus.TRACKED_STALE] == 0
+        assert result.summary[FleetPeerStatus.UNTRACKED_CONNECTED] == 0
+        assert result.summary[FleetPeerStatus.TRACKED_MISSING_FROM_HUB] == 0
+        (entry,) = result.peers
+        assert entry.status == FleetPeerStatus.TRACKED_CONNECTED
+        assert entry.router_id == router.id
+        assert entry.router_name == router.name
+        assert entry.public_key == peer_public_key
+
+    async def test_tracked_but_stale_handshake(self) -> None:
+        now = datetime.now(UTC)
+        stale_epoch = int((now - timedelta(hours=2)).timestamp())
+
+        async def _lister() -> list[dict]:
+            return [_hub_peer(peer_public_key, handshake_epoch=stale_epoch)]
+
+        f = make_services(hub_peer_lister=_lister, handshake_stale_after_minutes=5)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+        peer_public_key = (await f.wireguard_repo.get_peer_by_router_id(router.id)).public_key
+
+        result = await f.wireguard_service.get_fleet_status(now=now)
+
+        assert result.summary[FleetPeerStatus.TRACKED_STALE] == 1
+        assert result.peers[0].status == FleetPeerStatus.TRACKED_STALE
+
+    async def test_untracked_connected_is_the_ghost_peer_case(self) -> None:
+        """The exact drift this feature was built to surface: the hub has a
+        real, live peer this table has never heard of."""
+        ghost_key = "ghost-public-key-not-in-db"
+
+        async def _lister() -> list[dict]:
+            return [_hub_peer(ghost_key, handshake_epoch=int(datetime.now(UTC).timestamp()))]
+
+        f = make_services(hub_peer_lister=_lister)
+
+        result = await f.wireguard_service.get_fleet_status()
+
+        assert result.summary[FleetPeerStatus.UNTRACKED_CONNECTED] == 1
+        (entry,) = result.peers
+        assert entry.status == FleetPeerStatus.UNTRACKED_CONNECTED
+        assert entry.public_key == ghost_key
+        assert entry.router_id is None
+        assert entry.router_name is None
+
+    async def test_tracked_missing_from_hub(self) -> None:
+        """A DB row the hub has completely forgotten -- the inverse drift,
+        surfaced rather than silently dropped."""
+
+        async def _lister() -> list[dict]:
+            return []
+
+        f = make_services(hub_peer_lister=_lister)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+
+        result = await f.wireguard_service.get_fleet_status()
+
+        assert result.summary[FleetPeerStatus.TRACKED_MISSING_FROM_HUB] == 1
+        assert result.peers[0].status == FleetPeerStatus.TRACKED_MISSING_FROM_HUB
+        assert result.peers[0].router_id == router.id
+
+    async def test_all_four_states_at_once(self) -> None:
+        """A realistic mixed fleet -- one of each state in a single call,
+        verifying classification doesn't leak between peers."""
+        now = datetime.now(UTC)
+        ghost_key = "ghost-public-key"
+
+        f = make_services(handshake_stale_after_minutes=5)
+        await make_hub(f)
+        org = f.org_lookup.add()
+
+        connected_router = await make_router(f, org)
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=connected_router.id,
+            requesting_organization_id=None,
+        )
+        connected_key = (
+            await f.wireguard_repo.get_peer_by_router_id(connected_router.id)
+        ).public_key
+
+        stale_router = await make_router(f, org)
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=stale_router.id,
+            requesting_organization_id=None,
+        )
+        stale_key = (
+            await f.wireguard_repo.get_peer_by_router_id(stale_router.id)
+        ).public_key
+
+        missing_router = await make_router(f, org)
+        await f.wireguard_service.create_tunnel(
+            actor_user_id=uuid.uuid4(),
+            router_id=missing_router.id,
+            requesting_organization_id=None,
+        )
+
+        async def _lister() -> list[dict]:
+            return [
+                _hub_peer(connected_key, handshake_epoch=int(now.timestamp())),
+                _hub_peer(
+                    stale_key,
+                    handshake_epoch=int((now - timedelta(hours=1)).timestamp()),
+                ),
+                _hub_peer(ghost_key, handshake_epoch=int(now.timestamp())),
+            ]
+
+        f.wireguard_service.hub_peer_lister = _lister
+        result = await f.wireguard_service.get_fleet_status(now=now)
+
+        assert result.summary == {
+            FleetPeerStatus.TRACKED_CONNECTED: 1,
+            FleetPeerStatus.TRACKED_STALE: 1,
+            FleetPeerStatus.UNTRACKED_CONNECTED: 1,
+            FleetPeerStatus.TRACKED_MISSING_FROM_HUB: 1,
+        }
+        assert len(result.peers) == 4
+        by_status = {entry.status: entry for entry in result.peers}
+        assert by_status[FleetPeerStatus.TRACKED_CONNECTED].public_key == connected_key
+        assert by_status[FleetPeerStatus.TRACKED_STALE].public_key == stale_key
+        assert by_status[FleetPeerStatus.UNTRACKED_CONNECTED].public_key == ghost_key
+
+
+class TestFleetStatusRouteRequiresPermission:
+    """A genuine, executable check for the ``wireguard.read``-gated,
+    GLOBAL-scope fleet-status route -- same convention
+    ``TestImpersonateRouteRequiresPermission`` (test_user.py) establishes
+    for asserting a route's ``RequirePermission`` key/scope directly off
+    its FastAPI dependency, rather than only through a live 403."""
+
+    def _route(self):
+        return next(
+            route
+            for route in wireguard_router.routes
+            if route.path == "/wireguard/fleet-status"
+        )
+
+    def test_route_is_gated_by_wireguard_read(self) -> None:
+        route = self._route()
+        assert route.methods == {"GET"}
+        assert _permission_keys(route) == ["wireguard.read"]
+
+    def test_route_checks_global_scope_explicitly(self) -> None:
+        route = self._route()
+        (dependency,) = route.dependencies
+        nonlocals = inspect.getclosurevars(dependency.dependency).nonlocals
+        assert nonlocals["scope"] == ScopeType.GLOBAL

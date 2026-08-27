@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
+from app.domains.router.models import Router
 
 from .constants import PeerStatus
 from .models import WireGuardPeer, WireGuardServer
@@ -51,6 +52,10 @@ class WireGuardRepositoryProtocol(Protocol):
     async def list_occupied_tunnel_ips(
         self, server_id: uuid.UUID, *, exclude_peer_id: uuid.UUID | None = None
     ) -> set[str]: ...
+
+    async def list_all_peers_with_router_names(
+        self,
+    ) -> list[tuple[WireGuardPeer, str | None]]: ...
 
     async def create_peer(self, **fields: object) -> WireGuardPeer: ...
 
@@ -124,6 +129,25 @@ class WireGuardRepository:
             for peer_id, tunnel_ip in result.all()
             if peer_id != exclude_peer_id
         }
+
+    async def list_all_peers_with_router_names(
+        self,
+    ) -> list[tuple[WireGuardPeer, str | None]]:
+        """Platform-wide, not tenant-scoped -- backs
+        ``WireGuardService.get_fleet_status``, which is itself only ever
+        reachable via a platform-level (GLOBAL scope) permission, the same
+        posture ``master.operators.tsx``'s own directory endpoint documents
+        for why an unscoped read is fine there. Hand-written (not
+        ``GenericRepository``) because the point is the router's ``name``
+        for display -- a plain peer list would leave the fleet-status view
+        with nothing to show a human besides a bare UUID."""
+        statement = (
+            select(WireGuardPeer, Router.name)
+            .outerjoin(Router, Router.id == WireGuardPeer.router_id)
+            .where(WireGuardPeer.is_deleted.is_(False))
+        )
+        result = await self.session.execute(statement)
+        return [(peer, name) for peer, name in result.all()]
 
     async def create_peer(self, **fields: object) -> WireGuardPeer:
         return await self.peers.create(fields)

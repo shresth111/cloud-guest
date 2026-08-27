@@ -97,9 +97,10 @@ from app.domains.rbac.enums import AuditAction
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router.models import Router
 
-from .constants import HealthStatus, PeerStatus
+from .constants import FleetPeerStatus, HealthStatus, PeerStatus
 from .events import TunnelCreated, TunnelHandshakeRecorded, TunnelRevoked, TunnelRotated
 from .exceptions import (
+    HubPeerListerNotConfiguredError,
     NoActiveWireGuardServerError,
     TunnelIPAllocationConflictError,
     WireGuardPeerAlreadyExistsError,
@@ -233,6 +234,51 @@ class HubPeerDeregistrar(Protocol):
     async def __call__(self, public_key: str) -> None: ...
 
 
+class HubPeerLister(Protocol):
+    """Reads the hub's own live peer list -- ``GET /wg/peers`` on
+    ``ops/hub-agents/wg_agent.py``, straight from ``wg show wg0 dump``.
+
+    This is the other half of the same drift ``HubPeerDeregistrar``'s own
+    docstring measures (72 peers on the hub against 1 in the database,
+    2026-08-23): that number could only ever be produced by comparing the
+    hub's real state against this table, which nothing did automatically
+    until ``WireGuardService.get_fleet_status`` below. Each dict matches
+    ``ops/hub-agents/wg_agent.py``'s ``list_peers()`` return shape exactly:
+    ``public_key``, ``endpoint``, ``allowed_ips``,
+    ``latest_handshake_epoch``, ``transfer_rx_bytes``,
+    ``transfer_tx_bytes``.
+    """
+
+    async def __call__(self) -> list[dict]: ...
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FleetPeerEntry:
+    """One row of ``WireGuardService.get_fleet_status``'s per-peer detail
+    list -- a merge of whatever this table knows (if anything) and what the
+    hub itself reports (if anything) for one WireGuard public key."""
+
+    status: FleetPeerStatus
+    public_key: str
+    router_id: uuid.UUID | None
+    router_name: str | None
+    tunnel_ip_address: str | None
+    last_handshake_at: datetime | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FleetStatus:
+    """Return shape of ``WireGuardService.get_fleet_status`` -- a summary
+    count per ``FleetPeerStatus`` plus the full per-peer detail list,
+    exactly what ``router.py``'s ``GET /wireguard/fleet-status`` needs to
+    answer "how many of the fleet are actually connected right now,
+    according to the hub itself" and to surface any drift as data a human
+    can act on rather than a number buried in a log line."""
+
+    summary: dict[FleetPeerStatus, int]
+    peers: list[FleetPeerEntry]
+
+
 class WireGuardService:
     """Core WireGuard business logic."""
 
@@ -244,6 +290,7 @@ class WireGuardService:
         audit_writer: AuditLogWriter | None = None,
         handshake_stale_after_minutes: int = 5,
         hub_peer_deregistrar: HubPeerDeregistrar | None = None,
+        hub_peer_lister: HubPeerLister | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
@@ -257,6 +304,9 @@ class WireGuardService:
         # reporting the difference. Injected rather than imported so the
         # in-memory test suite can drive it without HTTP.
         self.hub_peer_deregistrar = hub_peer_deregistrar
+        # Same injection reasoning as `hub_peer_deregistrar` -- see
+        # `get_fleet_status`, the only caller.
+        self.hub_peer_lister = hub_peer_lister
 
     # ========================================================================
     # Hub (WireGuardServer) management -- service-layer only in this
@@ -345,6 +395,104 @@ class WireGuardService:
         if moment - peer.last_handshake_at <= self.handshake_stale_after:
             return HealthStatus.HEALTHY
         return HealthStatus.STALE
+
+    async def get_fleet_status(self, *, now: datetime | None = None) -> FleetStatus:
+        """Merges this table's own record of the fleet against the hub's
+        live ``wg show`` state (via ``hub_peer_lister``), classifying every
+        peer found in EITHER source into exactly one of four
+        ``FleetPeerStatus`` values. Platform-wide, not tenant-scoped -- see
+        ``repository.list_all_peers_with_router_names``'s own docstring.
+
+        Correlated by ``public_key`` -- the one identifier both sides
+        genuinely share (this table's own unique constraint on it, and the
+        hub's ``wg show`` dump keys every line by it too). A peer present
+        on the hub but entirely absent from this table (``router_id`` is
+        therefore unknown) is exactly the ``UNTRACKED_CONNECTED`` case this
+        method exists to surface -- it is reported with ``router_id``/
+        ``router_name`` both ``None`` rather than dropped, since a silent
+        drop would recreate the exact blind spot ``HubPeerDeregistrar``'s
+        own docstring measured (72 peers on the hub, 1 in the database).
+
+        Raises ``HubPeerListerNotConfiguredError`` if no lister was
+        injected, and propagates ``HubBridgeUnavailableError`` (from
+        ``dependencies.make_hub_peer_lister``) if the hub is unreachable --
+        neither is swallowed into a DB-only fallback, for the reason each
+        exception's own docstring gives.
+        """
+        if self.hub_peer_lister is None:
+            raise HubPeerListerNotConfiguredError()
+
+        moment = now or datetime.now(UTC)
+        hub_peers = {p["public_key"]: p for p in await self.hub_peer_lister()}
+        db_rows = await self.repository.list_all_peers_with_router_names()
+        db_by_key = {peer.public_key: (peer, name) for peer, name in db_rows}
+
+        entries: list[FleetPeerEntry] = []
+
+        for public_key, hub_peer in hub_peers.items():
+            db_match = db_by_key.get(public_key)
+            handshake_epoch = hub_peer["latest_handshake_epoch"]
+            hub_last_handshake = (
+                datetime.fromtimestamp(handshake_epoch, tz=UTC)
+                if handshake_epoch > 0
+                else None
+            )
+            is_recent = (
+                hub_last_handshake is not None
+                and moment - hub_last_handshake <= self.handshake_stale_after
+            )
+            if db_match is None:
+                entries.append(
+                    FleetPeerEntry(
+                        status=FleetPeerStatus.UNTRACKED_CONNECTED,
+                        public_key=public_key,
+                        router_id=None,
+                        router_name=None,
+                        tunnel_ip_address=hub_peer.get("allowed_ips"),
+                        last_handshake_at=hub_last_handshake,
+                    )
+                )
+                continue
+            peer, router_name = db_match
+            entries.append(
+                FleetPeerEntry(
+                    status=(
+                        FleetPeerStatus.TRACKED_CONNECTED
+                        if is_recent
+                        else FleetPeerStatus.TRACKED_STALE
+                    ),
+                    public_key=public_key,
+                    router_id=peer.router_id,
+                    router_name=router_name,
+                    tunnel_ip_address=peer.tunnel_ip_address,
+                    last_handshake_at=hub_last_handshake,
+                )
+            )
+
+        # DB rows the hub has no record of at all -- a peer this platform
+        # believes it provisioned that the hub has completely forgotten
+        # (e.g. a `wg0.conf` rebuilt from an older backup). Not the drift
+        # this feature was built to catch, but a real 4th state worth
+        # surfacing rather than silently omitting.
+        for public_key, (peer, router_name) in db_by_key.items():
+            if public_key in hub_peers:
+                continue
+            entries.append(
+                FleetPeerEntry(
+                    status=FleetPeerStatus.TRACKED_MISSING_FROM_HUB,
+                    public_key=public_key,
+                    router_id=peer.router_id,
+                    router_name=router_name,
+                    tunnel_ip_address=peer.tunnel_ip_address,
+                    last_handshake_at=peer.last_handshake_at,
+                )
+            )
+
+        summary = {status: 0 for status in FleetPeerStatus}
+        for entry in entries:
+            summary[entry.status] += 1
+
+        return FleetStatus(summary=summary, peers=entries)
 
     # ========================================================================
     # Tunnel creation / re-creation

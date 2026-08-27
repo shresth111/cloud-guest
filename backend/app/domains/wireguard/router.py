@@ -68,13 +68,15 @@ from .models import WireGuardPeer
 from .schemas import (
     AgentWireGuardConfigResponse,
     AgentWireGuardHandshakeResponse,
+    FleetPeerStatusResponse,
+    FleetStatusResponse,
     MessageResponse,
     RegisterExternalWireGuardPeerRequest,
     WireGuardPeerResponse,
     WireGuardTunnelCreateResponse,
     WireGuardTunnelRotateResponse,
 )
-from .service import TunnelDeliveryInfo, WireGuardService
+from .service import FleetStatus, TunnelDeliveryInfo, WireGuardService
 from .validators import hub_reserved_ip
 
 router = APIRouter(tags=["WireGuard"])
@@ -133,6 +135,52 @@ def _tunnel_delivery_response(
 # ============================================================================
 # Admin-facing peer endpoints
 # ============================================================================
+
+
+def _fleet_status_response(status_: FleetStatus) -> FleetStatusResponse:
+    return FleetStatusResponse(
+        summary={s.value: count for s, count in status_.summary.items()},
+        peers=[
+            FleetPeerStatusResponse(
+                status=entry.status,
+                public_key=entry.public_key,
+                router_id=str(entry.router_id) if entry.router_id else None,
+                router_name=entry.router_name,
+                tunnel_ip_address=entry.tunnel_ip_address,
+                last_handshake_at=entry.last_handshake_at,
+            )
+            for entry in status_.peers
+        ],
+    )
+
+
+@router.get(
+    "/wireguard/fleet-status",
+    response_model=ApiResponse[FleetStatusResponse],
+    status_code=status.HTTP_200_OK,
+    # GLOBAL, same reasoning as GET /routers/{id}/wireguard-peer just below:
+    # this reads across the ENTIRE fleet, not one router, so it must never
+    # be reachable via an org-scoped role at all -- there is no
+    # organization an unscoped "how many of the fleet are connected"
+    # question could sensibly be answered for.
+    dependencies=[Depends(RequirePermission("wireguard.read", scope=ScopeType.GLOBAL))],
+)
+async def get_wireguard_fleet_status(
+    request: Request,
+    service: WireGuardService = Depends(get_wireguard_service),
+):
+    """Compares this platform's own ``wireguard_peers`` table against the
+    hub's own live ``wg show`` state and returns the merged, classified
+    result -- see ``WireGuardService.get_fleet_status`` for the full
+    per-peer classification. Built after a live incident where the two
+    had drifted sharply (72 peers on the hub, 1 in the database)."""
+    fleet_status = await service.get_fleet_status()
+    return build_response(
+        success=True,
+        message="Fleet status retrieved",
+        data=_fleet_status_response(fleet_status).model_dump(),
+        request_id=_request_id(request),
+    )
 
 
 @router.get(
