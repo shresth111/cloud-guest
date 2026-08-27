@@ -629,6 +629,11 @@ from app.domains.hotspot.models import HotspotProfile
 from app.domains.isp.constants import IspConnectionMode
 from app.domains.isp.models import IspLink
 from app.domains.mac_authorization.models import MacAuthorizationEntry
+from app.domains.network_config.wan.renderers import (
+    DISCOVERED_NAT_COMMENT,
+    DISCOVERED_WAN_LIST_COMMENT,
+    _uplink_discovery_statements,
+)
 from app.domains.port_forwarding.constants import PortForwardingProtocol
 from app.domains.port_forwarding.models import PortForwardingRule
 from app.domains.qos.identifiers import qos_packet_mark_identifier
@@ -1110,6 +1115,148 @@ def render_wireguard_peer(peer: WireGuardPeer, server: WireGuardServer) -> list[
         f"persistent-keepalive={DEFAULT_PERSISTENT_KEEPALIVE_SECONDS}s"
     )
     return lines
+
+
+# ============================================================================
+# Guest data path -- the NAT rule without which an authenticated guest has
+# nowhere to send a packet.
+# ============================================================================
+
+#: Header for the section emitted by :func:`render_guest_data_path`.
+GUEST_DATA_PATH_SECTION_HEADER = "# --- Guest Data Path (CloudGuest-managed) ---"
+
+
+def render_guest_data_path() -> list[str]:
+    """Assert that guest traffic leaving this router gets source-NAT'd onto
+    whatever interface is actually carrying the internet.
+
+    ## Why this exists as its own, link-independent section
+
+    Every piece of RouterOS below already existed. It lived inside
+    ``app.domains.network_config.wan.renderers.render_wan_routing_section``,
+    which ``wan.assembler.render_basic_wan_config`` short-circuits with
+    ``if not ctx.links: return ""`` -- and ``ctx.links`` is built from
+    *enabled ISP link rows*. So a router with no ISP link configured
+    received no masquerade at all, and nothing anywhere said so.
+
+    Confirmed live 2026-08-27/28, venue "huda city center", router
+    21e13913: zero ``isp_links`` rows, zero ``provisioning_jobs``, one
+    ``config_versions`` row still ``draft``, and no config push in 24h. The
+    guest at ``10.5.50.250`` authenticated cleanly -- OTP verified, RADIUS
+    ``authorized: true``, Accounting-Start received, WireGuard handshaking
+    -- and had no internet, because nothing had ever told the router to NAT
+    them. The ``bytes_uploaded``/``bytes_downloaded`` on that session were
+    portal and walled-garden traffic, which is exactly why byte counters
+    must never be read as proof that a guest reached the internet.
+
+    The masquerade needs no ISP-link data whatsoever -- it derives its
+    target from the device's own routing table -- so gating it on ISP links
+    was never anything but an accident of where the code happened to sit.
+    This function is that logic, reachable unconditionally.
+
+    ## The interface is DISCOVERED, never assumed
+
+    :func:`~app.domains.network_config.wan.renderers._uplink_discovery_statements`
+    resolves the out-interface from the router's own active default route
+    in the main routing table, verifies the result is a real interface, and
+    degrades to ``""`` rather than to a plausible-looking wrong name. That
+    matters more here than anywhere else it is used: this section ships to
+    every enrolled router, and a masquerade pointed at the wrong
+    out-interface on a venue that was working is a far worse outcome than
+    no masquerade at all. If nothing resolves, this emits a warning and
+    changes nothing.
+
+    ## Why this cannot disturb the tunnel, RADIUS, or an operator's rules
+
+    Three separate guarantees, none of them incidental:
+
+    1. **Scoped by out-interface, not by source.** The rule matches
+       ``out-interface=<the discovered uplink>``. Traffic to the WireGuard
+       hub egresses ``wg-cloudguard``, never the uplink, so RADIUS
+       continues to source from the router's tunnel address exactly as
+       before. A source-scoped rule (``src-address=10.5.50.0/24``) would
+       have needed an explicit tunnel exclusion to be equally safe; this
+       one needs none, which is one fewer thing to get wrong.
+    2. **Only ever touches its own marker.** Every read and every write is
+       filtered on ``comment="cloudguest-nat-live"``. A venue's own
+       masquerade, port forwards or hairpin rules carry no such comment and
+       are therefore never counted, re-pointed, or removed. Nothing here
+       removes anything at all.
+    3. **Idempotent by count, not by hope.** Absent -> add; present ->
+       re-point to the currently-live uplink inside ``:do {} on-error={}``.
+       Re-running converges; it never duplicates.
+
+    ## What this deliberately does NOT create
+
+    No hotspot server, no address pool, no DHCP server -- despite those
+    being part of the original brief. The evidence says they already work:
+    the guest received ``10.5.50.250`` by DHCP and loaded the captive
+    portal, which cannot happen without all three. They came from the
+    enrollment ``.rsc``, not from a platform push, so the platform's
+    ``hotspot_profiles`` table is empty while the device is correctly
+    configured. Creating objects that already exist and are working, on a
+    device this code cannot see, is the one change most likely to break a
+    venue that is currently fine. The missing piece was NAT; this fixes
+    NAT.
+    """
+    p = "cgDataPath"
+    if_resolved = f'${p}If != ""'
+    return [
+        "; ".join(
+            [
+                *_uplink_discovery_statements(p),
+                # Membership of the WAN interface list, so any
+                # `in-interface-list=WAN` firewall rule this platform or the
+                # operator relies on actually matches the live uplink.
+                f":local {p}InList 0",
+                f":if ({if_resolved}) do={{ :set {p}InList [:len [/interface list "
+                f'member find where interface=${p}If list="WAN"]] }}',
+                f":if ({if_resolved} && ${p}InList = 0) do={{ /interface list member "
+                f'add list="WAN" interface=${p}If '
+                f'comment="{DISCOVERED_WAN_LIST_COMMENT}" }}',
+                # The masquerade itself.
+                f':local {p}Nat [/ip firewall nat find where '
+                f'comment="{DISCOVERED_NAT_COMMENT}"]',
+                f":if ({if_resolved} && [:len ${p}Nat] = 0) do={{ /ip firewall nat add "
+                f"chain=srcnat out-interface=${p}If action=masquerade "
+                f'comment="{DISCOVERED_NAT_COMMENT}" }}',
+                f":if ({if_resolved} && [:len ${p}Nat] > 0) do={{ :do {{ /ip firewall "
+                f"nat set ${p}Nat chain=srcnat out-interface=${p}If "
+                f"action=masquerade }} on-error={{ :log warning "
+                f'("cloudguest: could not re-point the Wyfy-managed masquerade at " '
+                f'. ${p}If . " -- guests may not get NAT over the live uplink") }} }}',
+                f":if (!({if_resolved})) do={{ :log warning \"cloudguest: no uplink "
+                "interface resolved, so the Wyfy-managed WAN list membership and "
+                'masquerade were left exactly as they are -- nothing was guessed" }',
+            ]
+        ),
+    ]
+
+
+def render_guest_data_path_verification() -> list[str]:
+    """Fail loudly if the guest data path was not actually established.
+
+    Separate from :func:`render_guest_data_path` because asserting and
+    verifying are different claims, and this platform has just spent a day
+    learning what happens when they are conflated. The bootstrap script's
+    own success line has always been gated on re-queried WireGuard state
+    for exactly this reason; this extends the same discipline to the half
+    that was missing.
+
+    ``:error`` rather than ``:log warning``: a router that finished
+    enrollment without a NAT rule is a venue where every guest will
+    authenticate successfully and then have no internet -- silently, with
+    the platform reporting the router provisioned. Stopping the script with
+    a named reason is strictly better than completing and being wrong,
+    which is the exact failure this whole change exists to end."""
+    return [
+        f':if ([:len [/ip firewall nat find where comment="{DISCOVERED_NAT_COMMENT}"]] '
+        "= 0) do={ :error "
+        '"CloudGuest bootstrap verification failed: no guest NAT rule was '
+        "established, so an authenticated guest would have no route to the "
+        "internet. Usually this means no active default route was present "
+        'when this script ran -- check the WAN uplink and re-run." }',
+    ]
 
 
 def render_radius_client(
@@ -1650,7 +1797,8 @@ def _render_onsite_bootstrap_lines(
     """The on-site (fresh-enrollment) rendering -- byte-identical to the
     pre-split script; see :func:`render_bootstrap_script`."""
     success_message = (
-        "CloudGuest bootstrap successful: WireGuard tunnel configured and verified"
+        "CloudGuest bootstrap successful: WireGuard tunnel and guest data path "
+        "configured and verified"
     )
     # The three re-queries below back both the named verification lines and
     # the final success gate -- built once so the two can never drift.
@@ -1707,10 +1855,24 @@ def _render_onsite_bootstrap_lines(
         'allowed-address=(($enroll->"wireguard_hub_tunnel_address") . "/32") '
         f"persistent-keepalive={DEFAULT_PERSISTENT_KEEPALIVE_SECONDS}s "
         f'comment="{_BOOTSTRAP_MGMT_TAG}"',
+        # -- guest data path: NAT for the traffic this router is about to
+        #    start authenticating. Emitted here, on the ONE path every
+        #    enrolled router actually executes, because the platform's
+        #    other route to a masquerade (the WAN chunk) is gated on
+        #    enabled ISP link rows and a venue can be fully provisioned
+        #    without any. Safe at this point in the script: the device has
+        #    just completed several HTTPS calls, so it demonstrably has a
+        #    working uplink and an active default route for
+        #    render_guest_data_path to discover.
+        *render_guest_data_path(),
         # -- verify what was actually created, then (and only then) declare
         #    success. The address check asserts attachment to the real
         #    interface, not mere existence -- the exact failure the orphaned
-        #    interface=*10 row produced.
+        #    interface=*10 row produced. The data-path check is the newest
+        #    member and the reason the success line below no longer means
+        #    only "the tunnel is up": a router that reaches this point
+        #    without a NAT rule is a venue where every guest authenticates
+        #    and none of them gets online.
         f":if ({interface_exists} = 0) do={{ :error "
         '"CloudGuest bootstrap verification failed: interface '
         f'{WIREGUARD_INTERFACE_NAME} does not exist" }}',
@@ -1720,6 +1882,7 @@ def _render_onsite_bootstrap_lines(
         f":if ({peer_exists} = 0) do={{ :error "
         '"CloudGuest bootstrap verification failed: hub peer is missing on '
         f'{WIREGUARD_INTERFACE_NAME}" }}',
+        *render_guest_data_path_verification(),
         f":if ({interface_exists} > 0 && {address_attached} > 0 && "
         f"{peer_exists} > 0) do={{ "
         f':log info "{success_message}"; :put "{success_message}" }}',
@@ -2026,6 +2189,17 @@ def _render_remote_bootstrap_lines(
             wg_config_url=wg_config_url,
         ),
         _TUNNEL_ADDRESS_LOCAL_LINE,
+        # -- guest data path, asserted inline and WITHOUT a hard failure ---
+        #    Safe here: it only ever adds or re-points its own
+        #    comment-tagged NAT rule and WAN list member, touches nothing
+        #    belonging to the tunnel being re-provisioned, and removes
+        #    nothing at all. Deliberately NOT paired with
+        #    render_guest_data_path_verification(): this is a live,
+        #    already-serving router, and aborting a re-provision over a
+        #    missing NAT rule would be a worse outcome than the missing
+        #    rule. The on-site path -- a fresh box, technician present --
+        #    is where failing loudly is the right call.
+        *render_guest_data_path(),
         # -- stage: bake validated values into the two detached scripts ----
         f":local cut {_ros_string_expr(_join_embedded_commands(cutover_commands))}",
         f":local rvt {_ros_string_expr(_join_embedded_commands(revert_commands))}",
@@ -2196,6 +2370,25 @@ def render_network_config(
                 )
             )
         )
+    # THE GUEST DATA PATH RIDES ALONG WITH ANY REAL PUSH, but does not by
+    # itself make an empty push non-empty.
+    #
+    # Appended after the emptiness decision above deliberately. Emitting it
+    # unconditionally would mean `render_network_config` never returns "",
+    # which would silently retire `push_config`'s EmptyNetworkConfigError
+    # guard -- "you asked to push a configuration that configures nothing"
+    # is a real thing to tell an operator, and turning it into a no-op to
+    # smuggle in one NAT rule trades one honest signal for another.
+    #
+    # Nothing is lost by that restraint: the path that every enrolled
+    # router actually executes is the bootstrap script, and
+    # `render_guest_data_path` is unconditional THERE (see
+    # `_render_onsite_bootstrap_lines`). A router with zero enabled rows is
+    # not one anybody pushes to; a router with any real configuration gets
+    # the NAT assertion carried along with it, idempotently, on every push.
+    if sections:
+        sections.append(GUEST_DATA_PATH_SECTION_HEADER)
+        sections.extend(_idempotent_lines(render_guest_data_path()))
     return "\n".join(sections)
 
 

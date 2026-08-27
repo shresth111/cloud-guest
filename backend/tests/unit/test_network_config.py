@@ -62,6 +62,8 @@ from app.domains.network_config.renderers import (
     render_dhcp_pool,
     render_dns_record,
     render_firewall_rule,
+    render_guest_data_path,
+    render_guest_data_path_verification,
     render_hotspot_profile,
     render_isp_netwatch_config,
     render_isp_netwatch_entry,
@@ -851,7 +853,15 @@ class TestRenderBootstrapScript:
         #
         # Allow-listed by exact value, not by pattern, so this still fails
         # on any OTHER literal -- a hub address included.
-        allowed_literals = {"216.239.35.0", "162.159.200.1"}
+        # WIDENED 2026-08-28, on the same "categorically outside the rule"
+        # test: 0.0.0.0 appears only as `dst-address="0.0.0.0/0"`, the
+        # default-route selector `render_guest_data_path` uses to ask the
+        # device which interface is actually carrying the internet. It is
+        # not an address of anything -- it is the literal opposite of
+        # baking in an address, since it is how the script discovers the
+        # uplink instead of being told one. Still allow-listed by exact
+        # value, so a real hub address would still fail this.
+        allowed_literals = {"216.239.35.0", "162.159.200.1", "0.0.0.0"}
         found = set(
             re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script)
         )
@@ -1178,7 +1188,15 @@ class TestRenderRemoteBootstrapScript:
         script = "\n".join(remote)
         # Same narrow allow-list as TestRenderBootstrapScript's copy of
         # this invariant -- see the long note there.
-        allowed_literals = {"216.239.35.0", "162.159.200.1"}
+        # WIDENED 2026-08-28, on the same "categorically outside the rule"
+        # test: 0.0.0.0 appears only as `dst-address="0.0.0.0/0"`, the
+        # default-route selector `render_guest_data_path` uses to ask the
+        # device which interface is actually carrying the internet. It is
+        # not an address of anything -- it is the literal opposite of
+        # baking in an address, since it is how the script discovers the
+        # uplink instead of being told one. Still allow-listed by exact
+        # value, so a real hub address would still fail this.
+        allowed_literals = {"216.239.35.0", "162.159.200.1", "0.0.0.0"}
         found = set(
             re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script)
         )
@@ -2204,3 +2222,147 @@ class TestBootstrapSetsTheClock:
         for lines in (self._onsite(), self._remote()):
             script = "\n".join(lines)
             assert "$cgTries < 15" in script and ":delay 2s" in script
+
+
+# ============================================================================
+# Guest data path -- the NAT rule whose absence let a fully-provisioned
+# venue authenticate every guest and give none of them internet.
+# ============================================================================
+
+
+class TestRenderGuestDataPath:
+    def _script(self) -> str:
+        return "\n".join(render_guest_data_path())
+
+    def test_the_out_interface_is_discovered_never_named(self) -> None:
+        """This ships to every enrolled router, so a masquerade pointed at
+        a name the platform merely believes is a worse outcome than no
+        masquerade at all. The target is resolved from the device's own
+        active default route."""
+        script = self._script()
+        assert 'dst-address="0.0.0.0/0" active=yes' in script
+        assert "action=masquerade" in script
+        # The out-interface is a variable resolved on-device, never a
+        # literal interface name interpolated by the platform.
+        assert "out-interface=$cgDataPathIf" in script
+        for guessed in ("ether1", "sfp1", "pppoe-out1", "bridge"):
+            assert f"out-interface={guessed}" not in script
+
+    def test_nothing_untagged_is_ever_read_or_written(self) -> None:
+        """A venue's own masquerade, port forwards and hairpin rules are
+        the operator's. Every NAT statement here is filtered on our marker,
+        and nothing is removed at all."""
+        script = self._script()
+        for statement in script.split("; "):
+            if "/ip firewall nat" not in statement:
+                continue
+            assert (
+                "cloudguest-nat-live" in statement
+                or "$cgDataPathNat" in statement
+            ), statement
+        assert "/ip firewall nat remove" not in script
+
+    def test_it_cannot_match_tunnel_bound_traffic(self) -> None:
+        """RADIUS sources from the router's tunnel address and must keep
+        doing so. Scoping by out-interface rather than by source address is
+        what makes that true by construction: traffic to the hub egresses
+        wg-cloudguard, which is never the discovered default-route
+        interface. A src-address-scoped rule would have needed an explicit
+        tunnel exclusion to be equally safe."""
+        script = self._script()
+        assert "src-address=" not in script
+        assert "wg-cloudguard" not in script
+
+    def test_an_unresolved_uplink_changes_nothing_and_says_so(self) -> None:
+        """Every write is gated on the discovery having succeeded, so the
+        degraded outcome is 'nothing was guessed', not a plausible-looking
+        wrong interface."""
+        script = self._script()
+        assert 'no uplink interface resolved' in script
+        for statement in script.split("; "):
+            if "/ip firewall nat add" in statement or "/interface list member add" in (
+                statement
+            ):
+                assert '$cgDataPathIf != ""' in statement, statement
+
+    def test_re_running_converges_rather_than_duplicating(self) -> None:
+        script = self._script()
+        assert "[:len $cgDataPathNat] = 0" in script  # absent -> add
+        assert "[:len $cgDataPathNat] > 0" in script  # present -> re-point
+
+    def test_verification_fails_loudly_rather_than_reporting_success(
+        self,
+    ) -> None:
+        """The whole lesson of 2026-08-27: a router that finishes enrollment
+        without a NAT rule is a venue where every guest authenticates and
+        none gets online, silently, with the platform reporting success."""
+        line = "\n".join(render_guest_data_path_verification())
+        assert ":error" in line
+        assert "no guest NAT rule was established" in line
+
+
+class TestBootstrapAssertsTheGuestDataPath:
+    def test_onsite_asserts_and_gates_success_on_it(self) -> None:
+        lines = render_bootstrap_script(
+            location_code="LOC-2026-000053",
+            provisioning_token="tok",
+            api_base_url="https://api.example.com",
+        )
+        script = "\n".join(lines)
+        assert "cloudguest-nat-live" in script
+        # The success line no longer means only "the tunnel is up".
+        assert "no guest NAT rule was established" in script
+        success = [line for line in lines if "bootstrap successful" in line]
+        assert success and "guest data path" in success[0]
+
+    def test_the_assertion_precedes_the_verification(self) -> None:
+        """Asserting and verifying are different claims and the order
+        matters -- verifying first would always fail on a fresh box."""
+        lines = render_bootstrap_script(
+            location_code="L",
+            provisioning_token="t",
+            api_base_url="https://api.example.com",
+        )
+        assert_at = next(
+            i for i, line in enumerate(lines) if "/ip firewall nat add" in line
+        )
+        verify_at = next(
+            i
+            for i, line in enumerate(lines)
+            if "no guest NAT rule was established" in line
+        )
+        assert assert_at < verify_at
+
+    def test_remote_asserts_without_a_hard_failure(self) -> None:
+        """Remote re-provisions a live, already-serving router. Aborting
+        that over a missing NAT rule would be a worse outcome than the
+        missing rule; the on-site path is where failing loudly is right."""
+        lines = render_bootstrap_script(
+            location_code="L",
+            provisioning_token="t",
+            api_base_url="https://api.example.com",
+            mode=BootstrapMode.REMOTE,
+        )
+        script = "\n".join(lines)
+        assert "cloudguest-nat-live" in script
+        assert "no guest NAT rule was established" not in script
+
+
+class TestGuestDataPathOnThePushPath:
+    def test_a_real_config_carries_the_nat_assertion(self) -> None:
+        rendered = render_network_config(
+            dhcp_pools=[_make_pool()],
+            vlans=[],
+            port_forwarding_rules=[],
+        )
+        assert "cloudguest-nat-live" in rendered
+
+    def test_an_empty_config_stays_empty(self) -> None:
+        """Emitting the data path unconditionally here would mean this
+        function never returns "", silently retiring push_config's
+        EmptyNetworkConfigError guard. Nothing is lost by the restraint:
+        the bootstrap script asserts it on every enrolled router."""
+        assert (
+            render_network_config(dhcp_pools=[], vlans=[], port_forwarding_rules=[])
+            == ""
+        )

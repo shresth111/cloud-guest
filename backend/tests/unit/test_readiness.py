@@ -21,6 +21,7 @@ import pytest
 
 from app.domains.readiness.constants import (
     CHECKLIST_ITEMS,
+    FAILING_STATUSES,
     ChecklistItemKey,
     ChecklistItemStatus,
     DetectionMode,
@@ -221,15 +222,19 @@ def _build_service() -> tuple[
 
 
 class TestChecklistItemRegistry:
-    def test_fourteen_items_registered(self) -> None:
-        assert len(CHECKLIST_ITEMS) == 14
+    def test_fifteen_items_registered(self) -> None:
+        assert len(CHECKLIST_ITEMS) == 15
 
-    def test_five_items_are_auto_detected(self) -> None:
+    def test_six_items_are_auto_detected(self) -> None:
         auto = [i for i in CHECKLIST_ITEMS if i.detection_mode == DetectionMode.AUTO]
         assert {i.key for i in auto} == {
             ChecklistItemKey.HEARTBEAT,
             ChecklistItemKey.SAAS_PROVISIONING,
             ChecklistItemKey.WAN_CONNECTIVITY,
+            # Asks whether a data path was ever ASSERTED, which is a
+            # different question from WAN_CONNECTIVITY's "is the link
+            # healthy" -- and the one nothing was asking on 2026-08-27.
+            ChecklistItemKey.GUEST_DATA_PATH,
             ChecklistItemKey.WIREGUARD,
             ChecklistItemKey.API_REACHABILITY,
         }
@@ -462,12 +467,24 @@ class TestSummarize:
         )
         rows = await service.get_checklist(router.id, requesting_organization_id=None)
         summary = service.summarize(rows)
-        assert summary["total"] == 14
+        assert summary["total"] == 15
         # heartbeat, saas_provisioning, api_reachability pass; wan_connectivity
         # and wireguard are not_checked (nothing configured); the remaining
         # nine manual items are not_checked.
         assert summary["passing"] == 3
-        assert summary["failing"] == 0
+        # ONE FAILURE, AND ITS ARRIVAL IS THE POINT OF THIS CHANGE.
+        #
+        # This assertion read `failing == 0` until 2026-08-28: a router
+        # with no WAN link, no config version and no data path whatsoever
+        # summarised as nothing being wrong, because every check that could
+        # have noticed returned NOT_CHECKED and NOT_CHECKED is not in
+        # FAILING_STATUSES. That is the shape of the "huda city center"
+        # fault exactly -- a venue that passed every check it was given and
+        # could not put one guest on the internet.
+        #
+        # GUEST_DATA_PATH now fails it, and a fixture describing a router
+        # nobody has configured SHOULD produce a failure.
+        assert summary["failing"] == 1
         assert summary["not_checked"] == 11
 
 
@@ -483,3 +500,158 @@ class TestEveryRouteRequiresPermission:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+# ============================================================================
+# GUEST_DATA_PATH -- the item that would have caught the 2026-08-27 fault.
+# ============================================================================
+
+
+@dataclass
+class FakeConfigVersion:
+    status: str
+
+
+@dataclass
+class FakeConfigVersionLookup:
+    versions_by_router: dict[uuid.UUID, list[FakeConfigVersion]] = field(
+        default_factory=dict
+    )
+
+    async def list_versions(
+        self,
+        *,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[FakeConfigVersion], object]:
+        return self.versions_by_router.get(router_id, []), None
+
+
+def _build_service_with_config_versions():  # noqa: ANN202 -- test helper
+    repo = FakeReadinessRepository()
+    router_lookup = FakeRouterLookup()
+    isp_lookup = FakeIspLookup()
+    wg_lookup = FakeWireGuardLookup()
+    agent_lookup = FakeRouterAgentLookup()
+    version_lookup = FakeConfigVersionLookup()
+    service = ReadinessService(
+        repo, router_lookup, isp_lookup, wg_lookup, agent_lookup, version_lookup
+    )
+    return service, router_lookup, isp_lookup, version_lookup
+
+
+def _item(rows, key):  # noqa: ANN001, ANN202 -- test helper
+    return next(r for r in rows if r.item_key == key.value)
+
+
+class TestGuestDataPathCheck:
+    """The distinction this item exists for: every other check asks whether
+    something the platform configured is working. This asks whether it was
+    ever configured at all.
+
+    Router 21e13913 on 2026-08-27 passed heartbeat, SaaS provisioning,
+    WireGuard and API reachability; its guests authenticated cleanly and had
+    no internet, because no NAT rule had ever been asserted and nothing
+    anywhere said so.
+    """
+
+    async def test_a_router_with_no_data_path_at_all_fails(self) -> None:
+        service, router_lookup, _isp, _versions = (
+            _build_service_with_config_versions()
+        )
+        router = router_lookup.add(
+            _make_router(status="online", health_status="healthy")
+        )
+
+        rows = await service.get_checklist(
+            router.id, requesting_organization_id=None
+        )
+
+        row = _item(rows, ChecklistItemKey.GUEST_DATA_PATH)
+        assert row.status == ChecklistItemStatus.FAIL.value
+        # FAIL, never NOT_CHECKED. NOT_CHECKED is absent from
+        # FAILING_STATUSES, so it summarises as nothing-wrong -- which is
+        # precisely how a venue that could not serve one guest reported
+        # clean.
+        assert ChecklistItemStatus(row.status) in FAILING_STATUSES
+        assert "no enabled WAN link and no applied config version" in row.detail
+
+    async def test_an_enabled_wan_link_is_sufficient_evidence(self) -> None:
+        """An enabled ISP link is what makes wan.assembler emit anything at
+        all -- it short-circuits on `if not ctx.links` -- and with it the
+        discovered-uplink masquerade."""
+        service, router_lookup, isp_lookup, _versions = (
+            _build_service_with_config_versions()
+        )
+        router = router_lookup.add(_make_router(status="online"))
+        isp_lookup.links_by_router[router.id] = [
+            FakeIspLink(is_enabled=True, health_status="down")
+        ]
+
+        rows = await service.get_checklist(
+            router.id, requesting_organization_id=None
+        )
+
+        # PASSES even though the link is DOWN: this item is about whether a
+        # path was ever asserted, not whether it is up right now. That
+        # second question is WAN_CONNECTIVITY's, and conflating them would
+        # give one row two meanings and no clear remedy.
+        assert (
+            _item(rows, ChecklistItemKey.GUEST_DATA_PATH).status
+            == ChecklistItemStatus.PASS.value
+        )
+        assert (
+            _item(rows, ChecklistItemKey.WAN_CONNECTIVITY).status
+            == ChecklistItemStatus.FAIL.value
+        )
+
+    async def test_an_applied_config_version_is_sufficient_evidence(self) -> None:
+        service, router_lookup, _isp, versions = (
+            _build_service_with_config_versions()
+        )
+        router = router_lookup.add(_make_router(status="online"))
+        versions.versions_by_router[router.id] = [FakeConfigVersion(status="applied")]
+
+        rows = await service.get_checklist(
+            router.id, requesting_organization_id=None
+        )
+
+        assert (
+            _item(rows, ChecklistItemKey.GUEST_DATA_PATH).status
+            == ChecklistItemStatus.PASS.value
+        )
+
+    async def test_a_draft_config_version_is_not_evidence(self) -> None:
+        """Exactly the state router 21e13913 was in: one config_versions row,
+        status `draft`, never applied, zero provisioning jobs. A rendered
+        config that never reached the device asserts nothing."""
+        service, router_lookup, _isp, versions = (
+            _build_service_with_config_versions()
+        )
+        router = router_lookup.add(_make_router(status="online"))
+        versions.versions_by_router[router.id] = [FakeConfigVersion(status="draft")]
+
+        rows = await service.get_checklist(
+            router.id, requesting_organization_id=None
+        )
+
+        row = _item(rows, ChecklistItemKey.GUEST_DATA_PATH)
+        assert row.status == ChecklistItemStatus.FAIL.value
+        assert row.evidence["applied_config_version_count"] == 0
+
+    async def test_without_a_version_lookup_it_still_reports_honestly(self) -> None:
+        """The lookup is optional so existing constructions keep working.
+        Absent, it must fall back to ISP-link evidence and SAY so in the
+        evidence -- never pass by default because it could not look."""
+        service, _repo, router_lookup, _isp, _wg, _agent = _build_service()
+        router = router_lookup.add(_make_router(status="online"))
+
+        rows = await service.get_checklist(
+            router.id, requesting_organization_id=None
+        )
+
+        row = _item(rows, ChecklistItemKey.GUEST_DATA_PATH)
+        assert row.status == ChecklistItemStatus.FAIL.value
+        assert row.evidence["config_version_lookup_available"] is False

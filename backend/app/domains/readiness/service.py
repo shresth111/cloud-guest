@@ -79,6 +79,25 @@ class WireGuardLookupProtocol(Protocol):
     ) -> Any: ...
 
 
+class ConfigVersionLookupProtocol(Protocol):
+    """The one read this domain needs from ``router_provisioning``: has any
+    rendered configuration ever actually been applied to this router?
+
+    Narrow on purpose, and satisfied by the real
+    ``RouterProvisioningService.list_versions`` -- the same
+    "smallest interface the sibling already implements" convention every
+    other lookup in this module follows."""
+
+    async def list_versions(
+        self,
+        *,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        page: int = ...,
+        page_size: int = ...,
+    ) -> tuple[list[Any], object]: ...
+
+
 class RouterAgentCredentialLookupProtocol(Protocol):
     async def get_credential_for_router(self, router_id: uuid.UUID) -> Any | None: ...
 
@@ -93,12 +112,18 @@ class ReadinessService:
         isp_lookup: IspLinkLookupProtocol,
         wireguard_lookup: WireGuardLookupProtocol,
         router_agent_lookup: RouterAgentCredentialLookupProtocol,
+        config_version_lookup: ConfigVersionLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.isp_lookup = isp_lookup
         self.wireguard_lookup = wireguard_lookup
         self.router_agent_lookup = router_agent_lookup
+        # Optional so every existing construction of this service keeps
+        # working unchanged; when absent, the guest-data-path check falls
+        # back to the ISP-link evidence alone and says so rather than
+        # silently passing.
+        self.config_version_lookup = config_version_lookup
 
     # ========================================================================
     # Read path
@@ -218,6 +243,11 @@ class ReadinessService:
                 router, requesting_organization_id=requesting_organization_id
             )
         )
+        results[ChecklistItemKey.GUEST_DATA_PATH.value] = (
+            await self._check_guest_data_path(
+                router, requesting_organization_id=requesting_organization_id
+            )
+        )
         results[ChecklistItemKey.WIREGUARD.value] = await self._check_wireguard(
             router, requesting_organization_id=requesting_organization_id
         )
@@ -319,6 +349,84 @@ class ReadinessService:
         return (
             ChecklistItemStatus.FAIL,
             "No enabled WAN link is currently passing its health check.",
+            evidence,
+        )
+
+    async def _check_guest_data_path(
+        self, router: Any, *, requesting_organization_id: uuid.UUID | None
+    ) -> tuple[ChecklistItemStatus, str, dict[str, Any]]:
+        """Has the platform ever asserted a route to the internet for this
+        router's guests?
+
+        FAIL, not NOT_CHECKED, when the answer is no. That distinction is
+        the entire point of this item. ``_check_wan_connectivity`` above
+        returns NOT_CHECKED for a router with no enabled ISP link, which is
+        right for a question about link health and is why nothing caught
+        the 2026-08-27 fault: NOT_CHECKED is absent from FAILING_STATUSES,
+        so "this router has no data path whatsoever" was summarised as
+        nothing being wrong. A venue that cannot serve a single guest is
+        not an unanswered question, it is a failure.
+
+        Two independent kinds of evidence, either of which is enough:
+
+        * an **enabled ISP link**, which is what makes
+          ``wan.assembler.render_basic_wan_config`` emit anything at all
+          (it short-circuits on ``if not ctx.links``), and with it the
+          discovered-uplink masquerade; or
+        * an **applied config version**, which means a rendered script --
+          now always carrying ``render_guest_data_path`` -- actually
+          reached the device.
+
+        Deliberately does NOT count a completed bootstrap as evidence, even
+        though the bootstrap script now asserts the data path itself. The
+        platform records that a router checked in, not which revision of
+        the script it ran, so treating enrollment as proof would be
+        inferring a fact from something that does not carry it -- the same
+        move that produced every other failure this week. If that becomes
+        the common case, the honest fix is for the device to report the
+        assertion, not for this check to assume it.
+        """
+        links, _meta = await self.isp_lookup.list_links(
+            requesting_organization_id=requesting_organization_id,
+            router_id=router.id,
+            page=1,
+            page_size=50,
+        )
+        enabled_links = [
+            link for link in links if getattr(link, "is_enabled", False)
+        ]
+        applied_versions: list[Any] = []
+        lookup_available = self.config_version_lookup is not None
+        if lookup_available:
+            versions, _vmeta = await self.config_version_lookup.list_versions(
+                router_id=router.id,
+                requesting_organization_id=requesting_organization_id,
+                page=1,
+                page_size=50,
+            )
+            applied_versions = [
+                version
+                for version in versions
+                if getattr(version, "status", None) == "applied"
+            ]
+        evidence = {
+            "enabled_link_count": len(enabled_links),
+            "applied_config_version_count": len(applied_versions),
+            "config_version_lookup_available": lookup_available,
+        }
+        if enabled_links or applied_versions:
+            return (
+                ChecklistItemStatus.PASS,
+                "A guest data path has been asserted for this router.",
+                evidence,
+            )
+        return (
+            ChecklistItemStatus.FAIL,
+            (
+                "No guest data path has ever been asserted for this router: "
+                "it has no enabled WAN link and no applied config version. "
+                "Guests will authenticate successfully and have no internet."
+            ),
             evidence,
         )
 
