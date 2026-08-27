@@ -331,3 +331,256 @@ class TestReconcilePass:
         await service.reconcile(adopt=False)
 
         assert wireguard.adopt_calls == [False]
+
+
+# ============================================================================
+# The Beat-scheduled sweep.
+# ============================================================================
+
+
+class TestNoCollaboratorSentinel:
+    """``_NoCollaborator`` is what makes the narrowed dependency safe rather
+    than merely convenient: it turns "this is never used" from a comment
+    into something enforced at runtime."""
+
+    def test_any_attribute_access_raises_naming_the_cause(self) -> None:
+        from app.domains.hub_reconciliation.tasks import _NoCollaborator
+
+        sentinel = _NoCollaborator("guest_service")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            sentinel.get_guest_by_id  # noqa: B018 -- the access IS the test
+
+        message = str(excinfo.value)
+        # The message has to name the attribute, the collaborator, and the
+        # decision -- a bare AttributeError several frames from the cause is
+        # exactly what this exists to avoid.
+        assert "guest_service.get_guest_by_id" in message
+        assert "NasBindingStore" in message
+        assert "do not pass None" in message
+
+
+class TestTheNarrowContractHolds:
+    """The load-bearing claim behind ``_NoCollaborator``: the two methods
+    the sweep calls read only ``repository``.
+
+    This test is the reason the narrowing is safe to ship. It drives a REAL
+    ``RadiusService`` -- not a fake -- built exactly the way the Celery task
+    builds it, sentinels and all, and asserts both methods complete. If a
+    future change makes either path reach a collaborator, this fails here
+    with a clear message instead of at 3am in a venue.
+    """
+
+    def _real_radius_service(self, repository):  # noqa: ANN001, ANN202
+        from app.domains.guest.service import RadiusService
+        from app.domains.hub_reconciliation.tasks import _NoCollaborator
+
+        return RadiusService(
+            repository,
+            _NoCollaborator("guest_service"),
+            _NoCollaborator("router_lookup"),
+            _NoCollaborator("location_lookup"),
+            _NoCollaborator("nas_code_counter_repository"),
+        )
+
+    async def test_list_nas_clients_touches_no_collaborator(self) -> None:
+        from app.domains.guest.constants import NasStatus
+
+        router_id = uuid.uuid4()
+
+        class _Repo:
+            async def list_nas_clients(self, *, page, page_size, filters=None):
+                assert filters["router_id"] == router_id
+                return [], object()
+
+        service = self._real_radius_service(_Repo())
+
+        clients, _meta = await service.list_nas_clients(
+            requesting_organization_id=None,
+            router_id=router_id,
+            status=NasStatus.ACTIVE,
+            page=1,
+            page_size=1,
+        )
+        assert clients == []
+
+    async def test_record_hub_client_sync_touches_no_collaborator(self) -> None:
+        nas_id = uuid.uuid4()
+        stored = FakeNasClient(
+            id=nas_id,
+            router_id=uuid.uuid4(),
+            nas_identifier="cg-narrow",
+            shared_secret_encrypted=encrypt_secret("s"),
+        )
+        stored.organization_id = uuid.uuid4()
+
+        class _Repo:
+            async def get_nas_client_by_id(self, _id):
+                return stored
+
+            async def update_nas_client(self, client, data):
+                for key, value in data.items():
+                    setattr(client, key, value)
+                return client
+
+        service = self._real_radius_service(_Repo())
+
+        updated = await service.record_hub_client_sync(
+            nas_id=nas_id, tunnel_ip_address="10.20.0.10"
+        )
+
+        assert updated.hub_client_synced_ip == "10.20.0.10"
+        assert updated.ip_address == "10.20.0.10"
+
+
+class TestSweepFailureIsolationAndCap:
+    def _entry(self, router_id, **overrides):  # noqa: ANN001, ANN202
+        from app.domains.wireguard.constants import FleetPeerStatus
+        from app.domains.wireguard.service import FleetPeerEntry
+
+        fields = {
+            "status": FleetPeerStatus.TRACKED_CONNECTED,
+            "public_key": f"KEY-{router_id}",
+            "router_id": router_id,
+            "router_name": "venue",
+            "tunnel_ip_address": "10.20.0.6",
+            "hub_tunnel_ip_address": "10.20.0.6",
+            "last_handshake_at": None,
+        }
+        fields.update(overrides)
+        return FleetPeerEntry(**fields)
+
+    def _fleet(self, peers):  # noqa: ANN001, ANN202
+        from app.domains.wireguard.service import FleetStatus
+
+        return FleetStatus(summary={}, peers=peers, adopted_public_keys=[])
+
+    async def test_one_router_raising_does_not_abort_the_others(
+        self, monkeypatch, pushes
+    ) -> None:
+        """A single corrupt row must not stop reconciliation for the entire
+        fleet -- and the symptom of that would be silence."""
+        radius = FakeRadiusService()
+        good_id, bad_id = uuid.uuid4(), uuid.uuid4()
+        _nas(radius, good_id, hub_client_synced_ip="10.20.0.8")
+        bad = _nas(radius, bad_id, hub_client_synced_ip="10.20.0.8")
+
+        real_reveal = reconciliation_module.decrypt_secret
+
+        def _explode(value):
+            if value == bad.shared_secret_encrypted:
+                raise ValueError("this NAS row's secret will not decrypt")
+            return real_reveal(value)
+
+        monkeypatch.setattr(reconciliation_module, "decrypt_secret", _explode)
+        wireguard = FakeWireGuardService(
+            fleet=self._fleet([self._entry(bad_id), self._entry(good_id)])
+        )
+        service = HubReconciliationService(wireguard, radius)
+
+        report = await service.reconcile()
+
+        # The healthy router was still repaired.
+        assert [p["tunnel_ip"] for p in pushes] == ["10.20.0.6"]
+        # And the broken one is reported, not swallowed.
+        failed = [r for r in report.nas_rebinds if not r.pushed]
+        assert len(failed) == 1
+        assert "will not decrypt" in failed[0].reason
+
+    async def test_the_per_pass_cap_defers_rather_than_drops(
+        self, pushes
+    ) -> None:
+        """Every push restarts freeradius for the whole fleet, so an
+        uncapped backlog is an outage generator, not a repair. Deferred work
+        is still identified as stale on the next pass five minutes later."""
+        radius = FakeRadiusService()
+        entries = []
+        for _ in range(5):
+            router_id = uuid.uuid4()
+            _nas(radius, router_id, hub_client_synced_ip="10.20.0.99")
+            entries.append(self._entry(router_id))
+        wireguard = FakeWireGuardService(fleet=self._fleet(entries))
+        service = HubReconciliationService(wireguard, radius, max_rebinds_per_pass=2)
+
+        report = await service.reconcile()
+
+        assert len(pushes) == 2
+        assert report.rebinds_deferred == 3
+
+
+class TestSweepTask:
+    async def test_the_lock_stops_a_pass_overlapping_itself(
+        self, monkeypatch
+    ) -> None:
+        """Two passes at once would issue overlapping `systemctl restart
+        freeradius` calls through the RADIUS agent -- the exact race
+        `radius_agent.py`'s own _WRITE_LOCK docstring documents, where
+        systemd cancels one and a valid request fails for no visible
+        reason."""
+        from app.domains.hub_reconciliation import tasks as tasks_module
+
+        class _HeldRedis:
+            async def set(self, *args, **kwargs):
+                return None  # NX failed: another pass holds it
+
+            async def delete(self, *args):  # pragma: no cover - not reached
+                raise AssertionError("must not release a lock it never took")
+
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(tasks_module, "create_redis_client", lambda: _HeldRedis())
+
+        result = await tasks_module._run_hub_reconciliation_sweep_async(adopt=True)
+
+        assert result == {"skipped_locked": True}
+
+    def test_an_unreachable_hub_is_reported_not_raised(self, monkeypatch) -> None:
+        """A hub that cannot be read is a real, expected operational state
+        for an unattended task. Letting it propagate would bury a one-line
+        cause under a Celery traceback and a retry storm."""
+        from app.domains.hub_reconciliation import tasks as tasks_module
+        from app.domains.wireguard.exceptions import (
+            HubPeerListerNotConfiguredError,
+        )
+
+        def _boom(_coro):
+            _coro.close()
+            raise HubPeerListerNotConfiguredError()
+
+        monkeypatch.setattr(tasks_module, "run_celery_task", _boom)
+
+        result = tasks_module.run_hub_reconciliation_sweep()
+
+        assert result["hub_unreachable"] is True
+        assert "not configured" in result["error"]
+
+    def test_the_summary_is_json_serialisable_and_diagnostic(
+        self, monkeypatch
+    ) -> None:
+        """The log line has to say what the pass DID. A bare "completed" is
+        indistinguishable from a pass that silently found nothing because it
+        was broken."""
+        import json
+
+        from app.domains.hub_reconciliation import tasks as tasks_module
+
+        payload = {
+            "skipped_locked": False,
+            "hub_unreachable": False,
+            "peers_seen": 9,
+            "adopted": 1,
+            "rebound": 1,
+            "rebind_failed": 0,
+            "rebinds_deferred": 0,
+            "needs_operator": 6,
+            "orphaned": 6,
+            "unchanged": 7,
+        }
+        monkeypatch.setattr(tasks_module, "run_celery_task", lambda c: (
+            c.close(), payload)[1])
+
+        result = tasks_module.run_hub_reconciliation_sweep()
+
+        assert result == payload
+        json.dumps(result)  # must survive Celery's JSON-only serialization

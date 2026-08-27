@@ -9,15 +9,60 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
+from typing import Protocol
 
 from app.domains.guest.constants import NasStatus
 from app.domains.guest.radius_bridge import RadiusBridgePushError, push_nas_client
-from app.domains.guest.service import RadiusService
 from app.domains.router.crypto import decrypt_secret
 from app.domains.wireguard.constants import FleetPeerStatus
 from app.domains.wireguard.service import WireGuardService
 
+from .constants import MAX_NAS_REBINDS_PER_SWEEP
+
 logger = logging.getLogger(__name__)
+
+
+class NasBindingStore(Protocol):
+    """The only two things this package needs from ``RadiusService``.
+
+    Declared as a Protocol, and the reason is operational rather than
+    stylistic. The Celery task in ``tasks.py`` has no FastAPI DI container
+    to build a service graph for it, and hand-constructing the full
+    ``RadiusService`` tree there -- ``GuestService`` (itself needing OTP,
+    voucher, captive-portal, monitoring, guest-access, queue, policy, MAC
+    and Redis collaborators), ``RouterService``, ``LocationService``,
+    ``NasCodeCounterRepository`` -- would mean assembling nine services to
+    reach two methods that touch none of them.
+
+    That is not merely wasteful, it is the exact failure mode this whole
+    change exists to prevent: a subtly wrong collaborator deep in a tree
+    nothing on this path reads produces a task that runs, logs success, and
+    silently does the wrong thing. Narrowing the contract to what is
+    actually used means a mistake in the unused nine cannot exist, rather
+    than existing and being harmless until it isn't.
+
+    ``RadiusService`` satisfies this structurally and is what the HTTP
+    endpoints inject; nothing about the request path changes.
+    """
+
+    async def list_nas_clients(
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = ...,
+        router_id: uuid.UUID | None = ...,
+        status: object = ...,
+        page: int = ...,
+        page_size: int = ...,
+    ) -> tuple[list, object]: ...
+
+    async def record_hub_client_sync(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        tunnel_ip_address: str,
+        requesting_organization_id: uuid.UUID | None = ...,
+    ) -> object: ...
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -44,6 +89,10 @@ class ReconciliationReport:
     adopted_public_keys: list[str]
     nas_rebinds: list[NasRebindResult]
     drift_public_keys: list[str]
+    # Stale bindings this pass recognised but did not push, because the
+    # per-pass cap was reached. Non-zero means a backlog is draining, not
+    # that anything failed -- see ``constants.MAX_NAS_REBINDS_PER_SWEEP``.
+    rebinds_deferred: int = 0
 
 
 class HubReconciliationService:
@@ -58,10 +107,17 @@ class HubReconciliationService:
     def __init__(
         self,
         wireguard_service: WireGuardService,
-        radius_service: RadiusService,
+        radius_service: NasBindingStore,
+        *,
+        max_rebinds_per_pass: int = MAX_NAS_REBINDS_PER_SWEEP,
     ) -> None:
         self.wireguard_service = wireguard_service
         self.radius_service = radius_service
+        # Blast-radius bound, not a performance knob -- see
+        # ``constants.MAX_NAS_REBINDS_PER_SWEEP``. Every push restarts
+        # freeradius for the WHOLE fleet, so an uncapped pass is an outage
+        # generator the first time it meets a backlog.
+        self.max_rebinds_per_pass = max_rebinds_per_pass
 
     async def rebind_nas_for_router(
         self,
@@ -185,6 +241,7 @@ class HubReconciliationService:
         fleet = await self.wireguard_service.get_fleet_status(adopt=adopt)
         rebinds: list[NasRebindResult] = []
         drift: list[str] = []
+        deferred = 0
 
         for entry in fleet.peers:
             if entry.status in (
@@ -211,10 +268,50 @@ class HubReconciliationService:
                 continue
             if entry.hub_tunnel_ip_address is None:
                 continue
-            rebind = await self._rebind_if_stale(
-                router_id=entry.router_id,
-                tunnel_ip_address=entry.hub_tunnel_ip_address,
-            )
+            if len(rebinds) >= self.max_rebinds_per_pass:
+                # CAP REACHED -- deferred, not dropped. The condition that
+                # identified this binding as stale is still true in five
+                # minutes, so the backlog drains across passes instead of
+                # restarting freeradius for the whole fleet N times in a
+                # row. Counted so a backlog is visible rather than silent.
+                deferred += 1
+                continue
+            # PER-ROUTER FAILURE ISOLATION.
+            #
+            # One venue must never be able to abort the pass for every
+            # other venue. `rebind_nas_for_router` already converts the
+            # expected failure (`RadiusBridgePushError`) into a reported
+            # result, so anything reaching here is unexpected -- a bug, a
+            # decryption failure on one NAS row, a DB error on one record.
+            # Those are exactly the cases where continuing matters most:
+            # without this, a single corrupt row would stop reconciliation
+            # for the entire fleet, indefinitely, and the symptom would be
+            # silence.
+            try:
+                rebind = await self._rebind_if_stale(
+                    router_id=entry.router_id,
+                    tunnel_ip_address=entry.hub_tunnel_ip_address,
+                )
+            except Exception as exc:  # noqa: BLE001 -- see the note above
+                logger.warning(
+                    "hub_reconciliation_rebind_raised",
+                    extra={
+                        "router_id": str(entry.router_id),
+                        "tunnel_ip_address": entry.hub_tunnel_ip_address,
+                        "error": str(exc),
+                    },
+                    exc_info=True,
+                )
+                rebinds.append(
+                    NasRebindResult(
+                        router_id=entry.router_id,
+                        nas_identifier=None,
+                        tunnel_ip_address=entry.hub_tunnel_ip_address,
+                        pushed=False,
+                        reason=f"unexpected error: {exc}",
+                    )
+                )
+                continue
             if rebind is not None:
                 rebinds.append(rebind)
 
@@ -223,6 +320,7 @@ class HubReconciliationService:
             adopted_public_keys=list(fleet.adopted_public_keys),
             nas_rebinds=rebinds,
             drift_public_keys=drift,
+            rebinds_deferred=deferred,
         )
 
     async def _rebind_if_stale(

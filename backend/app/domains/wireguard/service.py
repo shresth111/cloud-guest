@@ -834,22 +834,67 @@ class WireGuardService:
                 )
                 if can_adopt and adopt:
                     assert current_peer is not None  # noqa: S101 -- guarded above
-                    await self._apply_adoption(
-                        actor_user_id=None,
-                        peer=current_peer,
-                        public_key=public_key,
-                        tunnel_ip_address=hub_address
-                        or current_peer.tunnel_ip_address,
-                        last_handshake_at=hub_last_handshake,
-                        source=PeerIdentitySource.ADOPTED,
-                        hub_peers=hub_peers,
-                        note=(
-                            "adopted automatically: the hub reports this key "
-                            "handshaking, the issuance ledger attributes it to "
-                            "this router, and the recorded peer had never "
-                            "handshaked"
-                        ),
-                    )
+                    # PER-PEER ISOLATION. One router's adoption failing --
+                    # a DB error on its row, a listener blowing up in a way
+                    # `_notify_address_changed` does not already swallow --
+                    # must not abort the classification of every other peer
+                    # on the hub. A fleet-wide read that dies on one bad
+                    # row is worse than useless: it reports nothing about
+                    # the routers that are fine, and the scheduled pass
+                    # that depends on it stops repairing anything at all.
+                    try:
+                        await self._apply_adoption(
+                            actor_user_id=None,
+                            peer=current_peer,
+                            public_key=public_key,
+                            tunnel_ip_address=(
+                                hub_address or current_peer.tunnel_ip_address
+                            ),
+                            last_handshake_at=hub_last_handshake,
+                            source=PeerIdentitySource.ADOPTED,
+                            hub_peers=hub_peers,
+                            note=(
+                                "adopted automatically: the hub reports this "
+                                "key handshaking, the issuance ledger "
+                                "attributes it to this router, and the "
+                                "recorded peer had never handshaked"
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- see above
+                        logger.warning(
+                            "wireguard_automatic_adoption_failed",
+                            extra={
+                                "router_id": str(issuance.router_id),
+                                "public_key": public_key,
+                                "error": str(exc),
+                                "detail": (
+                                    "left classified as ADOPTABLE_MISMATCH "
+                                    "for an operator; the rest of the fleet "
+                                    "is unaffected"
+                                ),
+                            },
+                            exc_info=True,
+                        )
+                        entries.append(
+                            FleetPeerEntry(
+                                status=FleetPeerStatus.ADOPTABLE_MISMATCH,
+                                public_key=public_key,
+                                router_id=issuance.router_id,
+                                router_name=router_name,
+                                tunnel_ip_address=(
+                                    current_peer.tunnel_ip_address
+                                    if current_peer is not None
+                                    else None
+                                ),
+                                hub_tunnel_ip_address=hub_address,
+                                last_handshake_at=hub_last_handshake,
+                                explanation=(
+                                    "Adoption was attempted and failed: "
+                                    f"{exc}. Retry, or adopt by hand."
+                                ),
+                            )
+                        )
+                        continue
                     adopted.append(public_key)
                     entries.append(
                         FleetPeerEntry(
