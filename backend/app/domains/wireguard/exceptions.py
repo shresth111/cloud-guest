@@ -71,7 +71,8 @@ class HubPeerListerNotConfiguredError(WireGuardError):
 
     def __init__(self) -> None:
         super().__init__(
-            "The WireGuard hub bridge is not configured -- cannot read live fleet status",
+            "The WireGuard hub bridge is not configured -- cannot read live "
+            "fleet status",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
