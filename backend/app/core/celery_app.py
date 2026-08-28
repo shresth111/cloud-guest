@@ -132,6 +132,10 @@ from app.domains.guest.constants import (
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
 )
+from app.domains.hub_reconciliation.constants import (
+    HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_HUB_RECONCILIATION_SWEEP,
+)
 from app.domains.isp.constants import (
     ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
@@ -203,6 +207,7 @@ celery_app = Celery(
         "app.domains.campaigns.tasks",
         "app.domains.connected_devices.tasks",
         "app.domains.guest.tasks",
+        "app.domains.hub_reconciliation.tasks",
         "app.domains.isp.tasks",
         "app.domains.monitoring.tasks",
         "app.domains.notification.tasks",
@@ -269,6 +274,32 @@ celery_app.conf.update(
         TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
     },
     beat_schedule={
+        # Hub reconciliation -- every 5 minutes, the shortest cadence in
+        # this schedule alongside the guest session-timeout sweep, and for
+        # a stronger reason than any of them: the state it repairs is one
+        # in which no guest at a venue can get online at all, and which
+        # NOTHING else on the platform can see. When a router's WireGuard
+        # identity and its FreeRADIUS client{} stanza disagree, FreeRADIUS
+        # drops that router's Access-Requests without replying -- no error,
+        # no log line, no degraded mode. Measured 2026-08-27: found only
+        # when someone at the venue complained, then recurred the same
+        # night from a different cause.
+        #
+        # See app.domains.hub_reconciliation.constants
+        # .HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS for why 5 minutes
+        # specifically (it matches the handshake staleness window the
+        # adoption decision itself reasons over), and that module's
+        # HUB_RECONCILIATION_SWEEP_ADOPTS for why the scheduled pass is
+        # allowed to adopt unattended.
+        #
+        # Deliberately NOT on DEVICE_IO_QUEUE_NAME: its I/O is two HTTP
+        # calls to the hub's own agents on the private network, not a
+        # per-router RouterOS round trip, and it is capped and
+        # overlap-locked. It belongs with the pure sweeps.
+        "hub-reconciliation-sweep": {
+            "task": TASK_RUN_HUB_RECONCILIATION_SWEEP,
+            "schedule": HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
+        },
         "analytics-rolling-today": {
             "task": TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS,
             "schedule": 900.0,  # every 15 minutes, in seconds

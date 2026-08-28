@@ -91,7 +91,18 @@ class FleetPeerStatusResponse(BaseModel):
     router_id: str | None = None
     router_name: str | None = None
     tunnel_ip_address: str | None = None
+    # The address the HUB has in allowed-ips for this key. Reported next to
+    # `tunnel_ip_address` (this platform's belief), not instead of it: the
+    # two disagreeing IS the finding, and it is the specific disagreement
+    # that silently drops every guest login, because the RADIUS client
+    # stanza is keyed on the address.
+    hub_tunnel_ip_address: str | None = None
     last_handshake_at: datetime | None = None
+    # Why this row is classified the way it is, in plain English. Written
+    # for whoever is looking at seven peers on a hub trying to work out
+    # which ones matter -- an orphan that says why it is an orphan is not
+    # drift.
+    explanation: str | None = None
 
 
 class FleetStatusResponse(BaseModel):
@@ -110,9 +121,28 @@ class WireGuardTunnelCreateResponse(WireGuardPeerResponse):
     WireGuard interface, for the (hopefully rare) case zero-touch delivery
     via ``GET /agent/wireguard-config`` cannot reach the device."""
 
-    peer_private_key: str = Field(
-        description="The peer's own private key, decrypted -- see service.py "
-        "docstring for why this remains retrievable, unlike a one-time token."
+    peer_private_key: str | None = Field(
+        default=None,
+        description=(
+            "The peer's own private key, decrypted -- see service.py "
+            "docstring for why this remains retrievable, unlike a one-time "
+            "token. NULL when `reused` is true: an agent-allocated peer's "
+            "private key was generated on the hub and never held by this "
+            "platform (stored as EXTERNALLY_MANAGED_KEY_SENTINEL), so there "
+            "is nothing to hand back. That is not a degraded response -- the "
+            "device already holds the matching key, which is precisely why "
+            "the peer was reused rather than replaced."
+        ),
+    )
+    reused: bool = Field(
+        default=False,
+        description=(
+            "True when this router already had a usable peer and it was "
+            "returned as-is rather than a new one being allocated. Callers "
+            "rendering a setup script MUST NOT emit a `private-key=` line "
+            "when this is true -- there is no key to emit, and the device's "
+            "existing one is already correct."
+        ),
     )
     hub_public_key: str
     hub_endpoint_host: str

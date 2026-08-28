@@ -828,6 +828,13 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # consumer of `Router.status`. Its absence from this set is not a
         # missing schedule entry, it is a fleet whose status is fiction.
         "router-stale-heartbeat-sweep",
+        # The only thing on the platform that can see a router's WireGuard
+        # identity and its FreeRADIUS client{} stanza disagreeing. When they
+        # do, FreeRADIUS drops that router's Access-Requests without
+        # replying -- no error, no log line, no degraded mode -- so its
+        # absence from this set is not a missing schedule entry, it is a
+        # venue that is silently down until someone there complains.
+        "hub-reconciliation-sweep",
         "notification-dispatch-sweep",
         "monitoring-alert-rule-evaluation-sweep",
         "provisioning-engine-router-snmp-metrics-poll-sweep",

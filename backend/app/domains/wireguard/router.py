@@ -50,7 +50,7 @@ from __future__ import annotations
 import uuid
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
@@ -147,7 +147,9 @@ def _fleet_status_response(status_: FleetStatus) -> FleetStatusResponse:
                 router_id=str(entry.router_id) if entry.router_id else None,
                 router_name=entry.router_name,
                 tunnel_ip_address=entry.tunnel_ip_address,
+                hub_tunnel_ip_address=entry.hub_tunnel_ip_address,
                 last_handshake_at=entry.last_handshake_at,
+                explanation=entry.explanation,
             )
             for entry in status_.peers
         ],
@@ -285,6 +287,20 @@ async def register_external_wireguard_peer(
     )
 
 
+def _bridge_error_detail(resp: httpx.Response) -> str:
+    """The hub agent's own explanation of a >=400. See the identically
+    named helper in ``app.domains.guest.router`` -- both hub agents share
+    the ``{"error": "<str(exception)>"}`` shape and the same silent-logging
+    behaviour, so both need the body carried through to the caller."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return (resp.text or "<empty response body>")[:600]
+    if isinstance(body, dict) and "error" in body:
+        return str(body["error"])[:600]
+    return str(body)[:600]
+
+
 @router.post(
     "/routers/{router_id}/wireguard-peer/allocate-external",
     response_model=ApiResponse[WireGuardTunnelCreateResponse],
@@ -297,6 +313,29 @@ async def register_external_wireguard_peer(
 async def allocate_external_wireguard_peer(
     request: Request,
     router_id: uuid.UUID,
+    rotate: bool = Query(
+        default=False,
+        description=(
+            "Prefer a brand new keypair and tunnel IP over reusing this "
+            "router's existing peer. NO LONGER SUFFICIENT on its own to "
+            "allocate over a device that is demonstrably connected -- see "
+            "`force`. Kept because a caller asking for a fresh peer on a "
+            "router that has never connected is a legitimate, common "
+            "request (a reflash, or Guided Setup's recovery phase)."
+        ),
+    ),
+    force: bool = Query(
+        default=False,
+        description=(
+            "Allocate a new hub peer EVEN IF the hub reports this router "
+            "handshaking right now. This is destructive and unreclaimable: "
+            "the hub agent has no removal verb, so the peer it supersedes "
+            "stays on the hub holding its tunnel address forever, and the "
+            "device -- which keeps whatever key it already imported -- is "
+            "left on an address the RADIUS client stanza no longer names. "
+            "Only set this when you know the device has lost its config."
+        ),
+    ),
     user: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: WireGuardService = Depends(get_wireguard_service),
@@ -313,6 +352,156 @@ async def allocate_external_wireguard_peer(
     bridge, then ``register-external``) into one, returning the same
     "everything needed to configure the device" bundle
     ``POST .../wireguard-peer`` does."""
+    # REUSE BEFORE ALLOCATING. Added 2026-08-27.
+    #
+    # `ops/hub-agents/wg_agent.py` exposes exactly two verbs: `POST
+    # /wg/peer`, which ALWAYS calls `allocate_peer()` with no reuse branch
+    # and no idempotency key, and `GET /wg/peers`. There is no `do_DELETE`
+    # and no `do_PUT` -- an attempted DELETE returns `501 Unsupported
+    # method`. So on that hub, every allocation is PERMANENT AND
+    # UNRECLAIMABLE by construction.
+    #
+    # This endpoint called it unconditionally, on every click of Generate.
+    # The consequences compounded:
+    #   - the hub accumulated a peer per click and could never shed one;
+    #     router 01c9171e's tunnel IP reached 10.20.0.5 while the device was
+    #     still using .3, and orphans survive even the router row's deletion
+    #   - `next_free_ip()` scans live kernel state, so the orphans
+    #     permanently consume a /24
+    #   - `register_external_radius_nas` binds the FreeRADIUS `client{}`
+    #     stanza to the tunnel IP THIS TABLE holds, so the device -- still
+    #     on the previous address -- became an unknown client whose RADIUS
+    #     packets are dropped with no reply and nothing logged
+    #
+    # Reuse is the only half of this we can fix from here: a client-side
+    # "update the peer" script cannot repair a divergence whose server side
+    # has no update verb, and shipping one to the hub needs shell access
+    # this platform does not currently have.
+    #
+    # Correctness of returning no private key: an agent-allocated peer's
+    # key was generated ON THE HUB and stored here as
+    # EXTERNALLY_MANAGED_KEY_SENTINEL -- this platform has never held it.
+    # That is exactly why reuse is safe: the device already has the
+    # matching key. The response carries `reused=True` and a null
+    # `peer_private_key`, and the setup-script generator omits the
+    # `private-key=` line rather than writing a sentinel over a working
+    # interface.
+    #
+    # A LIVE DEVICE IS NEVER ALLOCATED OVER. Added 2026-08-28.
+    #
+    # The reuse branch below shipped on 2026-08-27 and did not stop the
+    # bleeding, because it is gated on `rotate` and the Master console
+    # sends `?rotate=true` on every Generate. Measured over the 24 hours
+    # that followed: FOUR allocate-external calls for router 21e13913, all
+    # four `?rotate=true`, the last one at 18:32 -- after the reuse fix was
+    # deployed -- allocating 10.20.0.9 while the device sat handshaking on
+    # 10.20.0.6. The reuse branch was never entered once.
+    #
+    # So the guard cannot live behind a flag the caller controls. This one
+    # asks the hub instead: is this router handshaking RIGHT NOW, on the
+    # key we record OR on any key the issuance ledger says we issued it?
+    # If yes, allocating is provably the wrong action -- the device cannot
+    # be made to change key by anything the server does, so a new peer just
+    # moves the platform further from the device -- and it is refused
+    # regardless of `rotate`. `force=true` remains for the genuine "the
+    # device has lost its config" case, where no handshake will be found
+    # anyway.
+    #
+    # And it does not merely refuse. If the live identity differs from what
+    # this table records, it ADOPTS it: clicking Generate on a diverged
+    # router now repairs the divergence instead of deepening it, which is
+    # the behaviour an operator was reaching for when they clicked it four
+    # times.
+    if not force:
+        live = await service.resolve_live_identity_for_router(router_id=router_id)
+        if live is not None:
+            peer = await service.get_peer(
+                router_id=router_id,
+                requesting_organization_id=requesting_organization_id,
+            )
+            adopted = False
+            if peer.public_key != live["public_key"]:
+                peer = await service.adopt_hub_peer(
+                    actor_user_id=uuid.UUID(user.id),
+                    router_id=router_id,
+                    requesting_organization_id=requesting_organization_id,
+                    public_key=live["public_key"],
+                    note=(
+                        "adopted during allocate-external: the hub reported "
+                        "this router handshaking on a key this table did not "
+                        "hold, so a new allocation would have moved the "
+                        "platform further from the device"
+                    ),
+                )
+                adopted = True
+            server = await service.get_server(peer.server_id)
+            base = _peer_response(peer, service=service)
+            payload = WireGuardTunnelCreateResponse(
+                **base.model_dump(),
+                peer_private_key=None,
+                reused=True,
+                hub_public_key=server.public_key,
+                hub_endpoint_host=server.endpoint_host,
+                hub_endpoint_port=server.endpoint_port,
+                tunnel_network_cidr=server.tunnel_network_cidr,
+                hub_tunnel_ip_address=hub_reserved_ip(server.tunnel_network_cidr),
+            )
+            return build_response(
+                success=True,
+                message=(
+                    (
+                        "This router is already connected on "
+                        f"{peer.tunnel_ip_address} -- adopted that identity "
+                        "instead of allocating a new peer, because the device "
+                        "holds a private key no server-side action can change."
+                    )
+                    if adopted
+                    else (
+                        "Existing WireGuard tunnel reused -- the hub reports "
+                        "this router connected on it, so no new peer was "
+                        "allocated"
+                    )
+                ),
+                data=payload.model_dump(),
+                request_id=_request_id(request),
+            )
+
+    # `rotate=true` is the escape hatch for the one case reuse cannot
+    # serve -- a device that has genuinely lost its config -- mirroring the
+    # explicit-opt-in shape the API-password path already uses.
+    if not rotate:
+        existing = await service.get_peer_if_usable(
+            router_id=router_id,
+            requesting_organization_id=requesting_organization_id,
+        )
+        if existing is not None:
+            base = _peer_response(existing, service=service)
+            server = await service.get_server(existing.server_id)
+            payload = WireGuardTunnelCreateResponse(
+                **base.model_dump(),
+                peer_private_key=None,
+                reused=True,
+                hub_public_key=server.public_key,
+                hub_endpoint_host=server.endpoint_host,
+                hub_endpoint_port=server.endpoint_port,
+                tunnel_network_cidr=server.tunnel_network_cidr,
+                hub_tunnel_ip_address=hub_reserved_ip(server.tunnel_network_cidr),
+            )
+            return build_response(
+                success=True,
+                message=(
+                    "Existing WireGuard tunnel reused -- no new peer was "
+                    "allocated on the hub"
+                ),
+                data=payload.model_dump(),
+                request_id=_request_id(request),
+            )
+
+    # Same reporting fix as `register_external_radius_nas` -- see the long
+    # note there. A bridge that answers with a real HTTP status is NOT
+    # "could not be reached", and its response body is the only description
+    # of the failure that exists anywhere (the agents' `log_message` is a
+    # deliberate no-op, so nothing reaches the hub's journal either).
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             _settings = get_settings()
@@ -320,12 +509,21 @@ async def allocate_external_wireguard_peer(
                 _settings.hub_wg_agent_url,
                 headers={"X-Agent-Secret": _settings.hub_wg_agent_secret},
             )
-            resp.raise_for_status()
-            wg = resp.json()
     except httpx.HTTPError as exc:
         raise HTTPException(
-            status_code=502, detail="Could not reach the WireGuard hub bridge"
+            status_code=502,
+            detail=f"Could not reach the WireGuard hub bridge: {exc!s}",
         ) from exc
+
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"The WireGuard hub bridge refused this allocation "
+                f"(HTTP {resp.status_code}): {_bridge_error_detail(resp)}"
+            ),
+        )
+    wg = resp.json()
 
     peer = await service.register_agent_allocated_peer(
         actor_user_id=uuid.UUID(user.id),

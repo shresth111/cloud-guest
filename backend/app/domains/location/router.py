@@ -34,6 +34,7 @@ from app.domains.campaigns.dependencies import get_campaigns_service
 from app.domains.campaigns.service import CampaignsService
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
+from app.domains.captive_portal.validators import default_splash_headline
 from app.domains.connected_devices.dependencies import get_connected_device_service
 from app.domains.connected_devices.service import ConnectedDeviceService
 from app.domains.rbac.dependencies import (
@@ -274,7 +275,7 @@ async def create_location(
         terms_and_conditions_url=None,
         privacy_policy_text=None,
         privacy_policy_url=None,
-        splash_headline=f"Welcome to {location.name}",
+        splash_headline=default_splash_headline(location.name),
         splash_welcome_message="Connect to continue.",
         redirect_url=None,
         otp_sms_enabled=False,

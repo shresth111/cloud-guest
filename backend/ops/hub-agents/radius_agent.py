@@ -41,10 +41,13 @@ churn every live stanza for no behavioural gain.
 import http.server
 import ipaddress
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
 
 SHARED_SECRET = os.environ.get("RADIUS_AGENT_SECRET", "")
@@ -54,6 +57,37 @@ SHARED_SECRET = os.environ.get("RADIUS_AGENT_SECRET", "")
 BIND_ADDR = os.environ.get("AGENT_BIND_ADDR", "0.0.0.0")
 CLIENTS_CONF = "/etc/freeradius/3.0/clients.conf"
 BACKUP_DIR = "/root/freeradius-backups"
+
+# ONE WRITER AT A TIME.
+#
+# The server below is a `ThreadingHTTPServer`, so concurrent requests each
+# get their own thread and are NOT serialised -- and every mutating path
+# does read-modify-write on a single shared file and then shells out to
+# `systemctl restart freeradius`. Nothing guarded that.
+#
+# Two threads interleaving there is a real race with three distinct
+# outcomes, all of which surface identically as an opaque HTTP 500:
+# one thread reading `clients.conf` while the other is part-way through
+# rewriting it; two `systemctl restart` jobs colliding, where systemd
+# cancels one and returns non-zero; and `freeradius -CX` parsing the file
+# mid-write. The last two both make `_validate_and_restart` restore the
+# backup and raise, which is safe but looks like a hard failure to the
+# caller.
+#
+# This is not theoretical. On 2026-08-27 at 14:45:29.920 a single
+# `POST /radius/client` returned 500, 105ms after the preceding WireGuard
+# write; the same request succeeded when replayed later with nothing else
+# in flight. The 60s `wyfy-radius-sync.timer` also runs
+# `systemctl reload freeradius`, so there is a recurring external
+# collision window this lock alone cannot close -- see README -- but
+# serialising this agent's own writers removes the half we control.
+#
+# Held across the whole mutate-validate-restart sequence, not just the
+# file write: the restart is as much a part of the critical section as the
+# write is.
+_LOG = logging.getLogger("radius_agent")
+
+_WRITE_LOCK = threading.Lock()
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
 _CLIENT_OPEN_RE = re.compile(r"^\s*client\s+(\S+)\s*\{")
@@ -153,7 +187,9 @@ def _validate_and_restart(backup_path: str) -> None:
     )
     if check.returncode != 0 or "Configuration appears to be OK" not in check.stdout:
         shutil.copy2(backup_path, CLIENTS_CONF)
-        raise RuntimeError("config validation failed, reverted: " + check.stdout[-2000:])
+        raise RuntimeError(
+            "config validation failed, reverted: " + check.stdout[-2000:]
+        )
 
     restart = subprocess.run(
         ["systemctl", "restart", "freeradius"],
@@ -164,7 +200,9 @@ def _validate_and_restart(backup_path: str) -> None:
     if restart.returncode != 0:
         shutil.copy2(backup_path, CLIENTS_CONF)
         subprocess.run(["systemctl", "restart", "freeradius"], timeout=30)
-        raise RuntimeError("service restart failed, reverted: " + restart.stderr[-2000:])
+        raise RuntimeError(
+            "service restart failed, reverted: " + restart.stderr[-2000:]
+        )
 
 
 def _backup() -> str:
@@ -175,6 +213,11 @@ def _backup() -> str:
 
 
 def add_client(tunnel_ip: str, nas_identifier: str, secret: str) -> dict:
+    """Serialised against every other mutating call -- see `_WRITE_LOCK`.
+
+    Argument validation stays OUTSIDE the lock: it touches nothing shared
+    and a malformed request should not queue behind a live restart.
+    """
     if not valid_ip(tunnel_ip):
         raise ValueError("invalid tunnel_ip")
     if not _IDENTIFIER_RE.match(nas_identifier):
@@ -182,6 +225,11 @@ def add_client(tunnel_ip: str, nas_identifier: str, secret: str) -> dict:
     if not secret or len(secret) < 8:
         raise ValueError("secret too short")
 
+    with _WRITE_LOCK:
+        return _add_client_locked(tunnel_ip, nas_identifier, secret)
+
+
+def _add_client_locked(tunnel_ip: str, nas_identifier: str, secret: str) -> dict:
     backup_path = _backup()
 
     with open(CLIENTS_CONF) as f:
@@ -245,6 +293,11 @@ def remove_client(nas_identifier: str) -> dict:
     if not _IDENTIFIER_RE.match(nas_identifier):
         raise ValueError("invalid nas_identifier")
 
+    with _WRITE_LOCK:
+        return _remove_client_locked(nas_identifier)
+
+
+def _remove_client_locked(nas_identifier: str) -> dict:
     with open(CLIENTS_CONF) as f:
         current = f.read()
 
@@ -307,6 +360,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
             self._json(200, result)
         except Exception as e:  # noqa: BLE001 -- single-purpose agent
+            # Log BEFORE responding, with the traceback. The response body
+            # carries `str(e)`, which is all the caller can use, but the
+            # traceback is what distinguishes "PermissionError on
+            # /root/freeradius-backups" from "systemctl restart lost a race"
+            # -- and those want completely different fixes.
+            _LOG.warning("add_client failed: %s", e, exc_info=True)
             self._json(500, {"error": str(e)})
 
     def do_DELETE(self):
@@ -320,13 +379,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             self._json(200, remove_client(nas_identifier))
         except Exception as e:  # noqa: BLE001 -- single-purpose agent
+            _LOG.warning("remove_client failed: %s", e, exc_info=True)
             self._json(500, {"error": str(e)})
 
     def log_message(self, fmt, *args):
-        pass
+        # Was `pass`. That is why the 2026-08-27 outage cost a day: the
+        # agent returned a 500 with a precise reason in its body, the
+        # backend discarded the body, and this no-op meant the hub's own
+        # journal had no record either. There was literally nowhere left to
+        # look. Access lines go to the journal at DEBUG (quiet by default,
+        # available with `systemctl log-level debug`); real faults are
+        # logged at WARNING by the handlers below regardless.
+        _LOG.debug("%s - %s", self.address_string(), fmt % args)
 
 
 if __name__ == "__main__":
+    # systemd captures stderr into the journal, so this is all that is
+    # needed for `journalctl -u radius-agent` to become useful.
+    logging.basicConfig(
+        level=logging.DEBUG,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s radius-agent %(message)s",
+    )
     if not SHARED_SECRET:
         raise SystemExit("RADIUS_AGENT_SECRET env var must be set")
     http.server.ThreadingHTTPServer((BIND_ADDR, 9092), Handler).serve_forever()

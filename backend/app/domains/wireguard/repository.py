@@ -3,7 +3,7 @@
 Mirrors ``app.domains.router_agent.repository``'s shape: a ``Protocol``
 describing the operations the service layer needs
 (``WireGuardRepositoryProtocol``), and a concrete, ``GenericRepository``
--backed implementation (``WireGuardRepository``) for this module's two
+-backed implementation (``WireGuardRepository``) for this module's three
 tables. Hand-written queries are used only where ``GenericRepository``'s
 equality filters can't express the need (resolving "the" active hub,
 listing a hub's currently-occupied tunnel IPs).
@@ -20,8 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.repositories.generic import GenericRepository
 from app.domains.router.models import Router
 
-from .constants import PeerStatus
-from .models import WireGuardPeer, WireGuardServer
+from .constants import HubPeerLifecycle, PeerStatus
+from .models import WireGuardPeer, WireGuardPeerIssuance, WireGuardServer
 
 
 class WireGuardRepositoryProtocol(Protocol):
@@ -63,6 +63,25 @@ class WireGuardRepositoryProtocol(Protocol):
         self, peer: WireGuardPeer, data: dict[str, object]
     ) -> WireGuardPeer: ...
 
+    # -- issuance ledger --------------------------------------------------------
+    async def create_issuance(self, **fields: object) -> WireGuardPeerIssuance: ...
+
+    async def update_issuance(
+        self, issuance: WireGuardPeerIssuance, data: dict[str, object]
+    ) -> WireGuardPeerIssuance: ...
+
+    async def list_issuances_for_router(
+        self, router_id: uuid.UUID
+    ) -> list[WireGuardPeerIssuance]: ...
+
+    async def get_issuance_by_public_key(
+        self, public_key: str
+    ) -> WireGuardPeerIssuance | None: ...
+
+    async def list_all_issuances(self) -> list[WireGuardPeerIssuance]: ...
+
+    async def list_hub_held_tunnel_ips(self, server_id: uuid.UUID) -> set[str]: ...
+
 
 class WireGuardRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -72,6 +91,7 @@ class WireGuardRepository:
         self.session = session
         self.servers = GenericRepository(WireGuardServer, session)
         self.peers = GenericRepository(WireGuardPeer, session)
+        self.issuances = GenericRepository(WireGuardPeerIssuance, session)
 
     # -- servers (hubs) -----------------------------------------------------------
 
@@ -156,6 +176,67 @@ class WireGuardRepository:
         self, peer: WireGuardPeer, data: dict[str, object]
     ) -> WireGuardPeer:
         return await self.peers.update(peer, data)
+
+    # -- issuance ledger ------------------------------------------------------------
+
+    async def create_issuance(self, **fields: object) -> WireGuardPeerIssuance:
+        return await self.issuances.create(fields)
+
+    async def update_issuance(
+        self, issuance: WireGuardPeerIssuance, data: dict[str, object]
+    ) -> WireGuardPeerIssuance:
+        return await self.issuances.update(issuance, data)
+
+    async def list_issuances_for_router(
+        self, router_id: uuid.UUID
+    ) -> list[WireGuardPeerIssuance]:
+        return await self.issuances.get_all(filters={"router_id": router_id})
+
+    async def get_issuance_by_public_key(
+        self, public_key: str
+    ) -> WireGuardPeerIssuance | None:
+        """The most recent issuance recorded for ``public_key``.
+
+        ``get_all`` sorts by ``created_at`` descending by default
+        (``GenericRepository.DEFAULT_SORT_FIELD``/``SortOrder.DESC``), and
+        "most recent" is the right answer here: a key can appear twice for
+        one router (issued, then adopted once the device proved it was
+        using it), and the adoption is the fact a caller asking "who owns
+        this key" wants."""
+        results = await self.issuances.get_all(
+            filters={"public_key": public_key}, limit=1
+        )
+        return results[0] if results else None
+
+    async def list_all_issuances(self) -> list[WireGuardPeerIssuance]:
+        """Platform-wide, same unscoped posture (and same GLOBAL-permission-
+        only reachability) as ``list_all_peers_with_router_names`` -- backs
+        the fleet-status attribution join, which is a question about the
+        whole hub, not about one tenant."""
+        return await self.issuances.get_all()
+
+    async def list_hub_held_tunnel_ips(self, server_id: uuid.UUID) -> set[str]:
+        """Every address on ``server_id`` the platform believes the hub is
+        still routing, whether or not any live peer row claims it.
+
+        This is the quarantine set, and it exists because
+        ``list_occupied_tunnel_ips`` cannot answer the question: it reads
+        ``wireguard_peers``, which holds exactly one row per router and
+        therefore forgets a superseded address the instant it is
+        overwritten. Handing such an address to the next router is not a
+        theoretical hazard -- the hub routes by ``allowed-ips``, so two
+        peers claiming one address means the newer one's traffic is
+        delivered to whichever the kernel picked, and the symptom is "the
+        tunnel is flaky" on a router whose configuration is perfect."""
+        statement = select(WireGuardPeerIssuance.tunnel_ip_address).where(
+            WireGuardPeerIssuance.server_id == server_id,
+            WireGuardPeerIssuance.is_deleted.is_(False),
+            WireGuardPeerIssuance.hub_lifecycle.in_(
+                (HubPeerLifecycle.LIVE.value, HubPeerLifecycle.ORPHANED.value)
+            ),
+        )
+        result = await self.session.execute(statement)
+        return {row[0] for row in result.all()}
 
 
 __all__ = ["WireGuardRepositoryProtocol", "WireGuardRepository"]

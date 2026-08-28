@@ -163,6 +163,53 @@ def validate_splash_text_length(field_name: str, value: object) -> None:
         raise SplashTextTooLongError(field_name, actual, max_length)
 
 
+def default_splash_headline(location_name: str) -> str:
+    """The headline a venue gets before it has written one, guaranteed to
+    satisfy ``SPLASH_HEADLINE_MAX_LENGTH``.
+
+    This exists because it did not, and the omission blocked provisioning
+    outright. Both provisioning paths seeded the headline as
+    ``f"Welcome to {location.name}"`` and then handed it to
+    ``validate_splash_text_length`` like any venue-authored string. With
+    the ceiling at 26 and ``"Welcome to "`` costing 11, that left **15**
+    code points for the venue's own name -- so creating a location called
+    "Danda Cafe Haldwani" failed with a 400 naming ``splash_headline``, a
+    field the operator had never seen, let alone filled in. Observed live
+    on 2026-08-27: two `POST /api/v1/locations/provision` attempts, both
+    400, the second having already drafted a config version.
+
+    The ceiling itself is right and is deliberately not relaxed here --
+    see ``constants.py`` for the derivation (2 rendered lines at 360px,
+    bound by Noto Sans Tamil's ~0.745em advance). The bug was validating a
+    string the machine composed against a budget written for a string a
+    human composed. A generated default must fit by construction.
+
+    Three rungs, in preference order:
+
+    1. ``Welcome to <name>`` when it fits -- the friendly form, unchanged
+       for every venue whose name is <= 15 code points, which is most.
+    2. the bare ``<name>`` when the greeting is what overflowed -- a
+       26-character venue name is a perfectly good headline, and losing
+       the greeting is a smaller loss than losing the name.
+    3. the name hard-truncated with an ellipsis, for names longer than the
+       ceiling on their own.
+
+    Counted in code points over the stripped value, matching
+    ``validate_splash_text_length`` exactly, so rung 1 and rung 2 can
+    never emit something that function would then reject.
+    """
+    name = location_name.strip()
+    greeted = f"Welcome to {name}"
+    if len(greeted) <= SPLASH_HEADLINE_MAX_LENGTH:
+        return greeted
+    if len(name) <= SPLASH_HEADLINE_MAX_LENGTH:
+        return name
+    # Reserve one code point for the ellipsis rather than appending past
+    # the ceiling, and strip again so a truncation landing on a space does
+    # not render as "Some Venue …".
+    return name[: SPLASH_HEADLINE_MAX_LENGTH - 1].rstrip() + "…"
+
+
 def validate_default_scope(*, is_default: bool, location_id: uuid.UUID | None) -> None:
     """Raises ``InvalidDefaultConfigScopeError`` if ``is_default=True`` is
     requested alongside a non-null ``location_id`` -- ``is_default`` only
@@ -256,6 +303,7 @@ __all__ = [
     "validate_hex_color",
     "validate_single_content_source",
     "validate_splash_text_length",
+    "default_splash_headline",
     "SPLASH_TEXT_MAX_LENGTHS",
     "validate_default_scope",
     "validate_business_hours_timezone",

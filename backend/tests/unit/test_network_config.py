@@ -682,7 +682,15 @@ class TestRenderBootstrapScript:
         script = "\n".join(lines)
 
         # Still a thin paste, not a config dump -- see module docstring.
-        assert len(lines) <= 30
+        # Raised 30 -> 36 on 2026-08-27 for the clock/NTP block (5 lines):
+        # set time-zone, enable NTP, and a bounded sync wait that `:error`s
+        # if the clock never syncs. Not optional padding -- every platform
+        # call in this script is HTTPS, and TLS validation fails closed
+        # against the wrong date a battery-less MikroTik boots with, which
+        # is what leaves a router serving guests while showing OFFLINE
+        # forever. The cap exists to stop this becoming a config dump, not
+        # to stop it being correct.
+        assert len(lines) <= 36
 
         assert lines[0] == '/system identity set name="LOC-2026-000039"'
         # The provisioning token is embedded (the one deliberate, one-time,
@@ -826,8 +834,29 @@ class TestRenderBootstrapScript:
         script = "\n".join(lines)
         # Nothing hardcoded: no IP literals, no key material -- every
         # device-specific value dereferences the JSON the platform returned.
-        assert not re.findall(
-            r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script
+        # NARROWED 2026-08-27, deliberately and narrowly. The invariant
+        # here is "no PLATFORM/DEVICE-specific address is ever baked into a
+        # script" -- the rule whose violation put the old hub's literal
+        # 20.219.72.235 onto 64 field routers and stranded every one when
+        # that host was deleted.
+        #
+        # The two public NTP anycast addresses are categorically outside
+        # it: not device-specific, not Wyfy infrastructure, global
+        # constants owned by Google and Cloudflare that nothing this
+        # platform does can move. They are deliberately literals rather
+        # than hostnames -- "internet fine, DNS broken" is a confirmed live
+        # state on this hardware, and an NTP server that cannot be resolved
+        # is one that never syncs, which is the exact failure the clock
+        # block exists to prevent.
+        #
+        # Allow-listed by exact value, not by pattern, so this still fails
+        # on any OTHER literal -- a hub address included.
+        allowed_literals = {"216.239.35.0", "162.159.200.1"}
+        found = set(
+            re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script)
+        )
+        assert not (found - allowed_literals), (
+            f"unexpected IP literal(s): {found - allowed_literals}"
         )
         for needle in ("tunnel_ip_address", "wireguard_server_public_key"):
             for line in lines:
@@ -1147,7 +1176,15 @@ class TestRenderRemoteBootstrapScript:
     def test_no_literals_comment_lines_or_newlines(self) -> None:
         remote = self._render()
         script = "\n".join(remote)
-        assert not re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script)
+        # Same narrow allow-list as TestRenderBootstrapScript's copy of
+        # this invariant -- see the long note there.
+        allowed_literals = {"216.239.35.0", "162.159.200.1"}
+        found = set(
+            re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script)
+        )
+        assert not (found - allowed_literals), (
+            f"unexpected IP literal(s): {found - allowed_literals}"
+        )
         assert not any(line.lstrip().startswith("#") for line in remote)
         assert not any("\n" in line for line in remote)
         assert "one-time-token-abc" in script
@@ -2103,3 +2140,67 @@ class TestEveryRouteRequiresPermission:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+class TestBootstrapSetsTheClock:
+    """The bootstrap script is the Fleet Wizard's path, and it did not
+    touch the clock at all -- while the Master console's own generator has
+    set it since 2026-08-23. Two generators, two repos, one silently
+    missing the fix.
+
+    Every platform call in this script is HTTPS (``_require_https``
+    guarantees it). A MikroTik has no battery-backed clock and boots at its
+    firmware build date, and TLS validation fails closed against a wrong
+    date -- so the check-in fetch is rejected BEFORE it is sent, with
+    RouterOS's own generic failure text and nothing naming the clock. The
+    router then serves guests perfectly and shows OFFLINE in Master console
+    forever.
+    """
+
+    def _onsite(self) -> list[str]:
+        return render_bootstrap_script(
+            location_code="LOC-2026-000039",
+            provisioning_token="tok",
+            api_base_url="https://api.cloudguest.example",
+        )
+
+    def _remote(self) -> list[str]:
+        return render_bootstrap_script(
+            location_code="LOC-2026-000039",
+            provisioning_token="tok",
+            api_base_url="https://api.cloudguest.example",
+            mode=BootstrapMode.REMOTE,
+        )
+
+    def test_both_modes_enable_ntp_and_set_the_timezone(self) -> None:
+        for lines in (self._onsite(), self._remote()):
+            script = "\n".join(lines)
+            assert "/system ntp client set enabled=yes" in script
+            assert "time-zone-name=Asia/Kolkata" in script
+
+    def test_the_clock_is_set_before_the_first_https_call(self) -> None:
+        """Ordering is the whole point -- NTP configured after the fetch
+        that it exists to make possible would be decorative."""
+        for lines in (self._onsite(), self._remote()):
+            first_ntp = next(i for i, ln in enumerate(lines) if "ntp client set" in ln)
+            first_fetch = next(i for i, ln in enumerate(lines) if "/tool fetch" in ln)
+            assert first_ntp < first_fetch, (
+                "NTP is configured after the first HTTPS call -- the call it was "
+                "supposed to make possible has already failed by then"
+            )
+
+    def test_it_refuses_to_continue_on_an_unsynced_clock(self) -> None:
+        """``:error``, not a printed warning. This script is delivered
+        non-interactively -- pasted whole or pushed through the gateway --
+        so a warning has no reader, and continuing produces a router that
+        looks enrolled and silently never reports."""
+        for lines in (self._onsite(), self._remote()):
+            script = "\n".join(lines)
+            assert ':if ($cgClk != "synchronized") do={ :error ' in script
+
+    def test_the_sync_wait_is_bounded(self) -> None:
+        """An unbounded ``:while`` on a venue with UDP 123 blocked would
+        hang the provisioning session forever instead of failing it."""
+        for lines in (self._onsite(), self._remote()):
+            script = "\n".join(lines)
+            assert "$cgTries < 15" in script and ":delay 2s" in script

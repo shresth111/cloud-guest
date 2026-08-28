@@ -193,6 +193,7 @@ from app.domains.billing.constants import (
 )
 from app.domains.billing.models import Plan, PlanFeature, Subscription
 from app.domains.captive_portal.models import CaptivePortalConfig
+from app.domains.captive_portal.validators import default_splash_headline
 from app.domains.guest.nas_number_generator import preview_first_nas_code
 from app.domains.notification.constants import (
     NotificationChannelType,
@@ -1065,7 +1066,7 @@ class LocationProvisioningService:
             terms_and_conditions_url=None,
             privacy_policy_text=None,
             privacy_policy_url=None,
-            splash_headline=f"Welcome to {location.name}",
+            splash_headline=default_splash_headline(location.name),
             splash_welcome_message="Connect to continue.",
             redirect_url=None,
             otp_sms_enabled=login_methods.otp_sms_enabled,

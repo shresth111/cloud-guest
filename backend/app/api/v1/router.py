@@ -38,6 +38,7 @@ from app.domains.guest_access.router import router as guest_access_router
 from app.domains.guest_teams.router import admin_router as guest_teams_admin_router
 from app.domains.guest_teams.router import guest_router as guest_teams_guest_router
 from app.domains.hotspot.router import router as hotspot_router
+from app.domains.hub_reconciliation.router import router as hub_reconciliation_router
 from app.domains.isp.router import router as isp_router
 from app.domains.isp_routing.router import router as isp_routing_router
 from app.domains.live_sessions.router import router as live_sessions_router
@@ -81,6 +82,7 @@ api_v1_router.include_router(router_router)
 api_v1_router.include_router(router_provisioning_router)
 api_v1_router.include_router(router_agent_router)
 api_v1_router.include_router(wireguard_router)
+api_v1_router.include_router(hub_reconciliation_router)
 api_v1_router.include_router(otp_router)
 api_v1_router.include_router(voucher_router)
 api_v1_router.include_router(captive_portal_router)

@@ -221,8 +221,34 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ------------------------------------------------------------------
+    # HUB AGENT URLS -- READ BEFORE CHANGING A DEFAULT HERE.
+    #
+    # Every default below is a HARDCODED INFRASTRUCTURE ADDRESS, and this
+    # platform has now been bitten by that twice:
+    #
+    #   1. 20.219.72.235 (the old hub's PUBLIC IP) was a module-level
+    #      constant. The subscription was deleted; every venue provision
+    #      hung to timeout. Fixed by moving it here.
+    #   2. 10.30.2.10 (the old Azure hub's PRIVATE IP) was the default
+    #      here. The 2026-08-22 AWS migration set CLOUDGUEST_HUB_WG_AGENT_URL
+    #      and CLOUDGUEST_HUB_RADIUS_AGENT_URL in the deploy env, but MISSED
+    #      hub_wg_agent_peers_url -- which therefore silently kept the dead
+    #      Azure default. Confirmed live 2026-08-27: GET
+    #      /api/v1/wireguard/fleet-status hung for exactly 15s (this
+    #      module's httpx timeout) and returned HTTP 500 on every call,
+    #      because it was connecting to a machine that no longer exists.
+    #      Nothing about the failure named the address, so it read as "the
+    #      hub is down" rather than "one setting was missed".
+    #
+    # A plausible-looking stale default is worse than no default: it fails
+    # slowly, at a distance, and blames the wrong component. If you move
+    # the hub, grep this file for the old address and set EVERY
+    # CLOUDGUEST_HUB_*_URL env var explicitly in the deploy environment --
+    # do not rely on these defaults being current.
+    # ------------------------------------------------------------------
     hub_wg_agent_url: str = Field(
-        default="http://10.30.2.10:9091/wg/peer",
+        default="http://172.31.40.230:9091/wg/peer",
         description=(
             "Absolute URL of the hub's WireGuard peer-provisioning agent "
             "(ops/hub-agents/wg_agent.py, port 9091), called by "
@@ -249,7 +275,13 @@ class Settings(BaseSettings):
         ),
     )
     hub_wg_agent_peers_url: str = Field(
-        default="http://10.30.2.10:9091/wg/peers",
+        # THE FIELD THE 2026-08-22 MIGRATION MISSED. See the block comment
+        # above `hub_wg_agent_url`: the deploy environment set
+        # CLOUDGUEST_HUB_WG_AGENT_URL and CLOUDGUEST_HUB_RADIUS_AGENT_URL to
+        # the new AWS hub and never set this one, so it silently kept the
+        # dead Azure default and every GET /wireguard/fleet-status hung for
+        # the full 15s httpx timeout and then 500'd.
+        default="http://172.31.40.230:9091/wg/peers",
         description=(
             "Absolute URL of the hub's GET /wg/peers endpoint (same "
             "ops/hub-agents/wg_agent.py process as hub_wg_agent_url, same "
@@ -268,7 +300,7 @@ class Settings(BaseSettings):
         ),
     )
     hub_radius_agent_url: str = Field(
-        default="http://10.30.2.10:9092/radius/client",
+        default="http://172.31.40.230:9092/radius/client",
         description=(
             "Absolute URL of the hub's FreeRADIUS client-provisioning agent "
             "(ops/hub-agents/radius_agent.py, port 9092), called by "
@@ -283,6 +315,60 @@ class Settings(BaseSettings):
             "Shared secret sent as the X-Agent-Secret header to "
             "hub_radius_agent_url. See hub_wg_agent_secret -- same rotation "
             "and fail-closed rules."
+        ),
+    )
+    # ------------------------------------------------------------------
+    # WHAT THE DEPLOYED HUB AGENT CAN ACTUALLY DO.
+    #
+    # These are not feature toggles. They describe a property of the
+    # machine at hub_wg_agent_url, and they exist because the backend spent
+    # weeks writing rows and issuing requests on the assumption of a hub
+    # that could do things this one cannot -- silently, because "the code
+    # supports it" and "this deployment supports it" had no way to differ.
+    #
+    # Both default FALSE, which is the opposite of this file's usual
+    # posture, and deliberately so: the running agent
+    # (ops/hub-agents/wg_agent.py, captured verbatim in this repo)
+    # implements do_POST and do_GET and nothing else. A default of True
+    # would restore exactly the silent-breakage this pair was added to
+    # end, on any environment that forgets to set them.
+    #
+    # See app.domains.wireguard.service.HubCapabilities for what each one
+    # changes.
+    # ------------------------------------------------------------------
+    hub_wg_agent_supports_key_registration: bool = Field(
+        default=False,
+        description=(
+            "True only if the hub agent has a verb that accepts a WireGuard "
+            "public key the caller already holds. The deployed agent does "
+            "not: POST /wg/peer takes an empty body and generates its own "
+            "keypair. While False, WireGuardService refuses to write a "
+            "platform-generated keypair (create_tunnel's default path, "
+            "rotate_tunnel) with HubCannotLearnPlatformKeyError, because "
+            "the tunnel such a row describes could never establish -- the "
+            "hub goes on expecting the previous key and the only symptom is "
+            "a handshake that never happens. Confirmed live 2026-08-27: "
+            "three check-ins on router 21e13913 each rotated to a fresh "
+            "platform keypair that never appeared in GET /wg/peers."
+        ),
+    )
+    hub_wg_agent_supports_peer_removal: bool = Field(
+        default=False,
+        description=(
+            "True only if the hub agent implements DELETE /wg/peer. The "
+            "deployed one does not -- http.server answers 501 Unsupported "
+            "method -- so every superseded peer stays on the hub forever, "
+            "holding its tunnel address. While False, the backend stops "
+            "asking, records each superseded identity as "
+            "HubPeerLifecycle.ORPHANED in wireguard_peer_issuances (which "
+            "quarantines its address against reallocation and makes it "
+            "explicable in GET /wireguard/fleet-status), and revoke_tunnel "
+            "proceeds honestly instead of failing forever. A do_DELETE "
+            "handler is written in ops/hub-agents/wg_agent.py and is "
+            "undeployable only because that host has no shell access (no "
+            "key, no EC2 Instance Connect on its Debian AMI, no SSM agent, "
+            "no instance profile). Set this True the day it lands; nothing "
+            "else has to change."
         ),
     )
 

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -350,3 +352,117 @@ class TestRemovalIsVerifiedOnDisk:
         monkeypatch.setattr(radius_agent.subprocess, "run", _clobbering_run)
         with pytest.raises(RuntimeError, match="still.*present"):
             radius_agent.remove_client("cg-5d3a509e")
+
+
+class TestWriteSerialisation:
+    """The agent is a ``ThreadingHTTPServer``, so concurrent requests each
+    get their own thread and are NOT serialised by the server. Every
+    mutating path does read-modify-write on one shared ``clients.conf`` and
+    then shells out to ``systemctl restart freeradius``. Before
+    ``_WRITE_LOCK`` nothing guarded that, and a collision surfaced as an
+    opaque HTTP 500 with the reason discarded on both sides.
+
+    Confirmed live 2026-08-27: a single ``POST /radius/client`` returned
+    500 at 14:45:29.920, 105ms after the preceding WireGuard write, and the
+    same request succeeded unchanged when replayed later.
+    """
+
+    def test_a_lock_exists_and_is_a_real_mutex(self) -> None:
+        assert isinstance(radius_agent._WRITE_LOCK, type(threading.Lock()))
+
+    def test_concurrent_add_and_remove_never_interleave(
+        self, conf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two threads mutating at once must produce a file that parses --
+        i.e. the critical section really is exclusive.
+
+        ``in_section`` is asserted INSIDE the stubbed restart, which is the
+        last step of ``_validate_and_restart`` and therefore the far end of
+        the critical section. If the lock did not span mutate-validate-
+        restart, two threads would be in here together and the counter
+        would exceed 1.
+        """
+        overlap = []
+        depth = {"n": 0}
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+            if cmd[0] == "freeradius":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="Configuration appears to be OK\n", stderr=""
+                )
+            depth["n"] += 1
+            overlap.append(depth["n"])
+            time.sleep(0.05)
+            depth["n"] -= 1
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(radius_agent, "CLIENTS_CONF", str(conf))
+        monkeypatch.setattr(radius_agent.subprocess, "run", fake_run)
+
+        errors: list[BaseException] = []
+
+        def add() -> None:
+            try:
+                radius_agent.add_client("10.20.0.9", "cg-thread-a", "secret-aaaaaaa")
+            except BaseException as exc:  # noqa: BLE001 -- surfaced below
+                errors.append(exc)
+
+        def remove() -> None:
+            try:
+                radius_agent.remove_client("cg-thread-a")
+            except BaseException as exc:  # noqa: BLE001 -- surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=add), threading.Thread(target=remove)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not errors, errors
+        assert overlap, "the stubbed restart never ran -- the test proved nothing"
+        assert max(overlap) == 1, (
+            "two threads were inside the critical section at once "
+            f"(depth {max(overlap)}) "
+            "-- _WRITE_LOCK does not span mutate-validate-restart"
+        )
+        # And the file it left behind is still parseable.
+        radius_agent._split_client_blocks(conf.read_text())
+
+    def test_validation_happens_outside_the_lock(
+        self, conf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A malformed request must not queue behind a live restart -- it
+        touches nothing shared and should fail immediately."""
+        monkeypatch.setattr(radius_agent, "CLIENTS_CONF", str(conf))
+        radius_agent._WRITE_LOCK.acquire()
+        try:
+            with pytest.raises(ValueError, match="invalid tunnel_ip"):
+                radius_agent.add_client("not-an-ip", "cg-x", "secret-aaaaaaa")
+            with pytest.raises(ValueError, match="invalid nas_identifier"):
+                radius_agent.remove_client("has space")
+        finally:
+            radius_agent._WRITE_LOCK.release()
+
+
+class TestFailuresAreRecorded:
+    """``log_message`` used to be ``pass``. Combined with the backend
+    discarding the 500's body, a failure left NO record anywhere -- not in
+    the response the operator saw, not in the hub's journal. That is the
+    single reason the 2026-08-27 fault took a day to place."""
+
+    def test_access_logging_is_no_longer_a_no_op(self) -> None:
+        import inspect
+
+        src = inspect.getsource(radius_agent.Handler.log_message)
+        assert "_LOG" in src, "log_message is still swallowing every access line"
+
+    def test_handlers_log_the_exception_they_return(self) -> None:
+        import inspect
+
+        for handler in (radius_agent.Handler.do_POST, radius_agent.Handler.do_DELETE):
+            src = inspect.getsource(handler)
+            assert "_LOG.warning" in src and "exc_info=True" in src, (
+                f"{handler.__name__} returns a 500 without recording why -- "
+                "the response body is the caller's only clue and the journal has none"
+            )

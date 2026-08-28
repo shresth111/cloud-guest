@@ -76,6 +76,7 @@ from .exceptions import (
     RadiusNasNotFoundError,
 )
 from .models import Guest, GuestDevice, GuestLoginHistory, GuestSession, RadiusNasClient
+from .radius_bridge import RadiusBridgePushError, push_nas_client
 from .schemas import (
     GuestAnalyticsSummaryResponse,
     GuestBlockRequest,
@@ -329,6 +330,8 @@ def _nas_response(nas_client: RadiusNasClient) -> RadiusNasResponse:
         name=nas_client.name,
         description=nas_client.description,
         ip_address=nas_client.ip_address,
+        hub_client_synced_ip=nas_client.hub_client_synced_ip,
+        hub_client_synced_at=nas_client.hub_client_synced_at,
         vendor=nas_client.vendor,
         created_at=nas_client.created_at,
         updated_at=nas_client.updated_at,
@@ -1226,6 +1229,26 @@ async def register_radius_nas(
     )
 
 
+def _bridge_error_detail(resp: httpx.Response) -> str:
+    """The hub agent's own explanation of a >=400, in a form safe to put in
+    an API error detail.
+
+    ``ops/hub-agents/radius_agent.py`` answers every failure as
+    ``{"error": "<str(exception)>"}``. That string is the only description
+    of what went wrong that exists anywhere -- the agent's
+    ``log_message`` is a deliberate no-op, so nothing is written to the
+    hub's journal either. Truncated because ``_validate_and_restart``
+    embeds up to 2000 characters of ``freeradius -CX`` output in it.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return (resp.text or "<empty response body>")[:600]
+    if isinstance(body, dict) and "error" in body:
+        return str(body["error"])[:600]
+    return str(body)[:600]
+
+
 @nas_router.post(
     "/register-external/{router_id}",
     response_model=ApiResponse[RadiusNasCreatedResponse],
@@ -1274,36 +1297,61 @@ async def register_external_radius_nas(
             requesting_organization_id=requesting_organization_id,
         )
 
+    # NOTE ON ERROR REPORTING (2026-08-27): this block used to collapse
+    # every possible failure -- connect timeout, DNS, 401, 500 -- into the
+    # single detail string "Could not reach the RADIUS server bridge",
+    # which is actively WRONG for the case that actually happens.
+    #
+    # Confirmed live on 2026-08-27 for router 01c9171e (the "lobby router"
+    # fresh provision): the bridge WAS reached, in 36ms, and answered
+    #     POST http://<hub>:9092/radius/client -> HTTP 500
+    # with a precise JSON diagnostic in its body. `raise_for_status()`
+    # turned that into an `HTTPStatusError`, this handler discarded the
+    # body, and the operator was told the hub was unreachable. The Master
+    # console then dropped the RADIUS chunk from the generated setup script
+    # with no way for anyone to find out why. Losing that body cost a
+    # multi-hour investigation; it is the single most useful piece of
+    # information this endpoint ever has.
+    #
+    # The push, its retry policy and that reporting now live in
+    # `app.domains.guest.radius_bridge`, because the reconciliation pass
+    # needs to make the identical call when a peer's tunnel address moves
+    # -- see that module's own docstring. This endpoint keeps only the
+    # translation to HTTP.
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            _settings = get_settings()
-            resp = await client.post(
-                _settings.hub_radius_agent_url,
-                headers={
-                    "X-Agent-Secret": _settings.hub_radius_agent_secret,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "tunnel_ip": peer.tunnel_ip_address,
-                    "nas_identifier": result.nas_client.nas_identifier,
-                    "secret": result.shared_secret,
-                },
-            )
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502, detail="Could not reach the RADIUS server bridge"
-        ) from exc
+        await push_nas_client(
+            tunnel_ip=peer.tunnel_ip_address,
+            nas_identifier=result.nas_client.nas_identifier,
+            secret=result.shared_secret,
+        )
+    except RadiusBridgePushError as exc:
+        raise HTTPException(status_code=502, detail=exc.detail) from exc
+
+    # RECORD WHAT THE HUB CONFIRMED, not what we intended.
+    #
+    # Written only after a 2xx, and only here and in the reconciliation
+    # pass, so `hub_client_synced_ip` means one thing: this address is in
+    # clients.conf. Before this, the address the whole RADIUS path turns on
+    # existed nowhere in the database -- `register_external_radius_nas`
+    # derived it from `peer.tunnel_ip_address` at this instant and threw it
+    # away, so when the peer later moved to 10.20.0.8 while the device
+    # stayed on 10.20.0.6, no query anywhere could show the disagreement.
+    nas_client = await service.record_hub_client_sync(
+        nas_id=result.nas_client.id,
+        tunnel_ip_address=peer.tunnel_ip_address,
+        requesting_organization_id=requesting_organization_id,
+    )
 
     return build_response(
         success=True,
         message="RADIUS NAS client registered",
         data=RadiusNasCreatedResponse(
-            **_nas_response(result.nas_client).model_dump(),
+            **_nas_response(nas_client).model_dump(),
             shared_secret=result.shared_secret,
         ).model_dump(),
         request_id=_request_id(request),
     )
+
 
 
 @nas_router.get(

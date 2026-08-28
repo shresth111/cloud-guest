@@ -134,12 +134,99 @@ class FleetPeerStatus(StrEnum):
     peer count (72, later 7 once partially reconciled) diverged sharply
     from this table's (1) -- exactly the drift each of these four values
     names.
+
+    The last three were added 2026-08-27 after the "huda city center"
+    fault, where all six of that router's superseded peers reported as
+    ``UNTRACKED_CONNECTED`` -- a value that says "this platform has no
+    idea what this is". It had an idea: it allocated every one of them,
+    minutes apart, for one known router. ``UNTRACKED_CONNECTED`` now means
+    what it says (genuinely unattributable), and the three cases the
+    platform *can* explain get their own names:
+
+    * ``ADOPTABLE_MISMATCH`` -- the hub shows this key handshaking, the
+      issuance ledger attributes it to a router, and that router's peer
+      row currently points at a *different* key. The device is right and
+      the table is wrong; this is the case ``adopt`` exists to close.
+    * ``KNOWN_ORPHAN`` -- the ledger attributes this key to a router, it
+      has been superseded, and the hub could not be told to drop it (no
+      ``DELETE`` verb). Explicable leftover, not drift.
+    * ``TRACKED_KEY_MISMATCH`` -- the router's peer row and the hub agree
+      the key exists, but on a different tunnel address than this table
+      records. Surfaced separately because the RADIUS ``client{}`` stanza
+      is keyed on that address, so this specific disagreement is the one
+      that silently drops every guest's Access-Request.
     """
 
     TRACKED_CONNECTED = "tracked_connected"
     TRACKED_STALE = "tracked_stale"
     UNTRACKED_CONNECTED = "untracked_connected"
     TRACKED_MISSING_FROM_HUB = "tracked_missing_from_hub"
+    ADOPTABLE_MISMATCH = "adoptable_mismatch"
+    KNOWN_ORPHAN = "known_orphan"
+    TRACKED_KEY_MISMATCH = "tracked_key_mismatch"
+
+
+class PeerIdentitySource(StrEnum):
+    """Where a ``wireguard_peer_issuances`` row's key/address pair came
+    from -- i.e. how much the platform actually *knows* versus asserts.
+
+    The distinction is the whole point of the ledger. ``PLATFORM_GENERATED``
+    and ``HUB_ALLOCATED`` are assertions: the platform decided an identity
+    and handed it out, with no confirmation any device applied it.
+    ``DEVICE_REPORTED`` and ``ADOPTED`` are observations: the device (or the
+    hub, on the device's behalf) demonstrated which key it actually holds.
+    An observation always outranks an assertion, which is why adoption
+    rewrites the peer row rather than the other way round.
+    """
+
+    PLATFORM_GENERATED = "platform_generated"
+    HUB_ALLOCATED = "hub_allocated"
+    DEVICE_REPORTED = "device_reported"
+    ADOPTED = "adopted"
+
+
+class HubPeerLifecycle(StrEnum):
+    """What the platform believes the hub currently holds for one issued
+    identity. Maintained by ``WireGuardService``; read by the allocator (a
+    ``LIVE`` or ``ORPHANED`` address must never be handed to another
+    router) and by fleet status.
+
+    ``ORPHANED`` is deliberately its own value rather than a flavour of
+    ``LIVE``: it records that the platform *tried* to have the hub forget
+    this peer and could not, which is a permanent property of the peer
+    until hub shell access exists, not a transient failure to retry.
+    """
+
+    LIVE = "live"
+    ORPHANED = "orphaned"
+    REMOVED = "removed"
+    NEVER_REGISTERED = "never_registered"
+
+
+class HubRemovalOutcome(StrEnum):
+    """What actually happened when the platform asked the hub to drop a
+    peer -- three outcomes that a bare "did it raise?" cannot tell apart
+    and that want three different responses.
+
+    * ``REMOVED`` -- the hub confirms the peer is gone.
+    * ``NOT_PRESENT`` -- the hub never had it. Success: it is the state we
+      were trying to reach, and a retry after a partial failure must be
+      able to report it. (``radius_agent.py``'s ``remove_client`` already
+      draws exactly this distinction for its own ``removed: 0``.)
+    * ``UNSUPPORTED`` -- the deployed agent has no removal verb at all
+      (``501``). Permanent until a new agent is installed on the hub; no
+      amount of retrying changes it, and the peer is now an orphan the
+      platform must account for rather than keep re-attempting.
+
+    A transport failure is deliberately NOT a member: "we could not reach
+    the hub" is not an outcome, it is the absence of one, and it stays an
+    exception (``dependencies.HubBridgeUnavailableError``) so it can never
+    be mistaken for a result.
+    """
+
+    REMOVED = "removed"
+    NOT_PRESENT = "not_present"
+    UNSUPPORTED = "unsupported"
 
 
 __all__ = [
@@ -151,4 +238,7 @@ __all__ = [
     "PEER_STATUS_TRANSITIONS",
     "HealthStatus",
     "FleetPeerStatus",
+    "PeerIdentitySource",
+    "HubPeerLifecycle",
+    "HubRemovalOutcome",
 ]
