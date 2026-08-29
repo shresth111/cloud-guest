@@ -302,9 +302,13 @@ class FakeRouterRepository:
 
     async def mark_provisioning_token_used(
         self, token: RouterProvisioningToken, *, used_at: object
-    ) -> RouterProvisioningToken:
+    ) -> bool:
+        """Mirrors the real repository's compare-and-set semantics: a
+        no-op (returning ``False``) if the token was already used."""
+        if token.used_at is not None:
+            return False
         token.used_at = used_at
-        return token
+        return True
 
     async def list_expired_unused_provisioning_tokens(
         self, *, now: object
@@ -1062,6 +1066,50 @@ class TestRouterProvisioning:
 
         with pytest.raises(ProvisioningTokenRouterStateError):
             await service.check_in(plaintext_token=plaintext)
+
+    async def test_check_in_treats_lost_compare_and_set_race_as_already_used(
+        self,
+    ) -> None:
+        """Regression test for a TOCTOU race: two concurrent ``check_in``
+        calls for the same token can both pass the earlier in-memory
+        ``token.is_used()`` guard before either one's write lands. This
+        simulates the *loser* of that race -- ``mark_provisioning_token_used``
+        reports "0 rows affected" (``False``) even though the token this
+        call already fetched still looks unused -- and asserts ``check_in``
+        surfaces the same ``ProvisioningTokenAlreadyUsedError`` a normal
+        already-used token would, and never transitions the router."""
+
+        class LostRaceRepository(FakeRouterRepository):
+            async def mark_provisioning_token_used(
+                self, token: RouterProvisioningToken, *, used_at: object
+            ) -> bool:
+                # Simulate someone else's concurrent, already-committed
+                # compare-and-set claiming this token first -- the atomic
+                # UPDATE ... WHERE used_at IS NULL affected zero rows.
+                return False
+
+        repo = LostRaceRepository()
+        service, repo, location_lookup, org_lookup, _audit = make_service(repo=repo)
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        router_device = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(),
+        )
+        _token, plaintext = await service.generate_provisioning_token(
+            actor_user_id=uuid.uuid4(),
+            router_id=router_device.id,
+            requesting_organization_id=None,
+        )
+
+        with pytest.raises(ProvisioningTokenAlreadyUsedError):
+            await service.check_in(plaintext_token=plaintext)
+
+        refreshed = await repo.get_by_id(router_device.id)
+        assert refreshed is not None
+        assert refreshed.status == RouterStatus.PENDING_PROVISIONING.value
 
     async def test_generate_token_rejected_outside_pending_provisioning(self) -> None:
         service, repo, _location_lookup, org_lookup, _audit = make_service()

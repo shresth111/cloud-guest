@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.repositories.generic import GenericRepository
@@ -95,7 +95,7 @@ class RouterRepositoryProtocol(Protocol):
 
     async def mark_provisioning_token_used(
         self, token: RouterProvisioningToken, *, used_at: object
-    ) -> RouterProvisioningToken: ...
+    ) -> bool: ...
 
     async def list_expired_unused_provisioning_tokens(
         self, *, now: datetime
@@ -199,8 +199,38 @@ class RouterRepository:
 
     async def mark_provisioning_token_used(
         self, token: RouterProvisioningToken, *, used_at: object
-    ) -> RouterProvisioningToken:
-        return await self.provisioning_tokens.update(token, {"used_at": used_at})
+    ) -> bool:
+        """Atomic compare-and-set on ``used_at`` -- a single ``UPDATE ...
+        WHERE id = :id AND used_at IS NULL`` rather than
+        ``GenericRepository.update``'s unconditional read-modify-write.
+        Two concurrent ``RouterService.check_in`` calls for the same
+        token can both pass the earlier in-memory ``token.is_used()``
+        check before either one's write lands; without a
+        compare-and-set at the database layer both would then happily
+        flip ``used_at`` and both would be treated as a successful,
+        first-time consumption of the same one-time token. Returns
+        whether *this* call actually consumed the token -- ``False``
+        means someone else's concurrent check-in already claimed it
+        first, which the caller must treat the same as an
+        already-used token (mirrors ``VoucherRepository
+        .bulk_revoke_vouchers_for_batch``'s identical
+        ``UPDATE ... WHERE`` + rowcount pattern)."""
+        statement = (
+            update(RouterProvisioningToken)
+            .where(
+                RouterProvisioningToken.id == token.id,
+                RouterProvisioningToken.used_at.is_(None),
+            )
+            .values(used_at=used_at)
+        )
+        result = await self.session.execute(statement)
+        await self.session.flush()
+        consumed = int(result.rowcount or 0) > 0
+        if consumed:
+            # Keep the in-memory instance the caller already holds in sync
+            # with what was just committed, without a second round trip.
+            token.used_at = used_at
+        return consumed
 
     async def list_expired_unused_provisioning_tokens(
         self, *, now: datetime
