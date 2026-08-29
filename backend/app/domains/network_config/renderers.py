@@ -612,6 +612,7 @@ assumption.
 from __future__ import annotations
 
 import ipaddress
+from urllib.parse import urlsplit
 
 from app.domains.content_filtering.constants import (
     CONTENT_FILTER_ADDRESS_LIST_NAME,
@@ -1259,6 +1260,115 @@ def render_guest_data_path_verification() -> list[str]:
     ]
 
 
+# ============================================================================
+# Captive-portal walled garden -- what a guest may reach BEFORE they log in.
+# ============================================================================
+
+#: Header for the section emitted by :func:`render_hotspot_walled_garden`.
+WALLED_GARDEN_SECTION_HEADER = (
+    "# --- Captive Portal Walled Garden (CloudGuest-managed) ---"
+)
+
+#: ``comment=`` every walled-garden row this module owns carries. Same
+#: ``cloudguest-<thing>-live`` shape as ``DISCOVERED_NAT_COMMENT`` and for
+#: the same reason: the re-apply below must be able to find *its own* rows
+#: without ever matching -- or removing -- one an operator added by hand.
+MANAGED_WALLED_GARDEN_COMMENT = "cloudguest-walledgarden-live"
+
+
+def _portal_walled_garden_hosts(api_url: str) -> list[str]:
+    """The two hosts a not-yet-authenticated guest must be able to reach.
+
+    ``api_url`` is any absolute URL on the platform's own API -- only its
+    host is read, never its path -- which is what lets the bootstrap
+    renderers pass the ``check_in_url`` they already hold instead of
+    growing a second parameter carrying the same host twice.
+
+    The API host is DERIVED from that URL rather than hardcoded so a
+    staging deployment walls in its own API, not production's. The portal
+    host is :data:`HOTSPOT_DNS_NAME`, the same constant
+    ``_render_vlan_hotspot`` already puts in ``dns-name``/``/ip dns
+    static`` -- one source of truth, so the name the guest is redirected to
+    and the name they are permitted to reach can never drift apart.
+    """
+    api_host = urlsplit(api_url).hostname
+    hosts = [HOTSPOT_DNS_NAME]
+    if api_host and api_host != HOTSPOT_DNS_NAME:
+        hosts.append(api_host)
+    return hosts
+
+
+def render_hotspot_walled_garden(*, api_url: str) -> list[str]:
+    """Let an unauthenticated guest reach the platform's own portal and
+    API -- and nothing else.
+
+    ## Why this exists as its own, profile-independent section
+
+    RouterOS's ``/ip hotspot walled-garden`` is what a captive portal uses
+    to punch a hole for its own login page: until a guest authenticates,
+    the hotspot intercepts *everything*, so the portal they are redirected
+    to is itself unreachable unless it is explicitly allowed through.
+
+    This platform already renders walled-garden rows -- in
+    :func:`render_hotspot_profile`, from ``HotspotProfile
+    .walled_garden_hosts``. That is an operator-configured list on an
+    optional row, and it is the same structural mistake
+    :func:`render_guest_data_path` was written to undo: something *every*
+    router needs unconditionally was reachable only through a table that
+    can legitimately be empty.
+
+    Confirmed against production 2026-08-29: ``select name,
+    walled_garden_hosts from hotspot_profiles where is_deleted=false``
+    returned **zero rows**. Not "rows with an empty list" -- no profiles at
+    all. So no router in the fleet has ever been sent a single
+    walled-garden entry, and the portal has only ever been reachable
+    because it is served from the router's own address, which the hotspot
+    necessarily permits. The moment the portal moves to a real hostname --
+    which is the entire point of ``dns-name``/``HOTSPOT_DNS_NAME`` -- that
+    accident stops covering for the missing configuration.
+
+    ## Rendered idempotently, and it never deletes
+
+    Each host is guarded by a ``find where dst-host=... && comment=...``
+    length check before its ``add``, the same self-guarding shape
+    :func:`render_guest_data_path` uses, so re-running a bootstrap does not
+    accumulate duplicate rows. Rows are only ever added, never removed:
+    an operator's own walled-garden entries carry a different ``comment``
+    (or none) and are untouched, and this function deliberately does not
+    prune even its own stale rows -- withdrawing a host a live guest may be
+    mid-request against is a worse failure than one extra allow rule.
+
+    ## What this does NOT fix
+
+    It does not stop the browser's "the information you're about to submit
+    is not secure" warning. That warning comes from the router serving its
+    own hotspot login page, with its own ``<form>``, over plain HTTP --
+    ``dns-name`` changed the host in that URL, not its scheme. Removing the
+    warning additionally requires the hotspot's ``html-directory``
+    (``cloudguest-hotspot``, already set by ``_render_vlan_hotspot``) to
+    hold a login page that carries no form of its own and merely redirects
+    to the platform's real HTTPS portal. That needs a file on the device,
+    so it needs either a ``/tool fetch`` of a page the API serves or a
+    ``/file`` write -- neither of which is rendered here, and neither of
+    which has been confirmed against a real device, which this module's own
+    "confirmed live" standard requires before it ships. This section is the
+    half that is safe to ship without a device: the HTTPS portal is
+    unreachable pre-auth *without* it, so it is a prerequisite for that
+    work rather than an alternative to it.
+    """
+    # One self-contained line per host, with the find inlined rather than
+    # bound to a `:local` first: this rides on the bootstrap script, whose
+    # own line-count cap (see tests) exists to keep it a thin paste, and a
+    # temporary variable per host would double the footprint for no gain.
+    return [
+        f":if ([:len [/ip hotspot walled-garden find where "
+        f'dst-host="{host}" && comment="{MANAGED_WALLED_GARDEN_COMMENT}"]] = 0) '
+        f'do={{ /ip hotspot walled-garden add dst-host="{host}" action=allow '
+        f'comment="{MANAGED_WALLED_GARDEN_COMMENT}" }}'
+        for host in _portal_walled_garden_hosts(api_url)
+    ]
+
+
 def render_radius_client(
     nas_client: RadiusNasClient, tunnel_ip: str, radius_server_host: str
 ) -> list[str]:
@@ -1865,6 +1975,12 @@ def _render_onsite_bootstrap_lines(
         #    working uplink and an active default route for
         #    render_guest_data_path to discover.
         *render_guest_data_path(),
+        # -- walled garden: emitted here for exactly the reason the data
+        #    path above is. Both are things every router needs and both
+        #    were previously reachable only through an optional table --
+        #    ISP links for the NAT rule, hotspot_profiles for these allow
+        #    rules -- which production confirmed is empty fleet-wide.
+        *render_hotspot_walled_garden(api_url=check_in_url),
         # -- verify what was actually created, then (and only then) declare
         #    success. The address check asserts attachment to the real
         #    interface, not mere existence -- the exact failure the orphaned
@@ -2200,6 +2316,11 @@ def _render_remote_bootstrap_lines(
         #    rule. The on-site path -- a fresh box, technician present --
         #    is where failing loudly is the right call.
         *render_guest_data_path(),
+        # -- walled garden, same add-only, never-remove shape. Safe on a
+        #    live re-provision for the same reason the data path above is:
+        #    it only ever adds its own comment-tagged allow rules and takes
+        #    nothing away from a router that is already serving guests.
+        *render_hotspot_walled_garden(api_url=check_in_url),
         # -- stage: bake validated values into the two detached scripts ----
         f":local cut {_ros_string_expr(_join_embedded_commands(cutover_commands))}",
         f":local rvt {_ros_string_expr(_join_embedded_commands(revert_commands))}",
@@ -2409,10 +2530,13 @@ def _idempotent_lines(lines: list[str]) -> list[str]:
 
 __all__ = [
     "HOTSPOT_DNS_NAME",
+    "MANAGED_WALLED_GARDEN_COMMENT",
+    "WALLED_GARDEN_SECTION_HEADER",
     "render_dhcp_pool",
     "render_vlan",
     "render_port_forwarding_rule",
     "render_hotspot_profile",
+    "render_hotspot_walled_garden",
     "render_qos_traffic_rule",
     "render_dns_record",
     "render_firewall_rule",
