@@ -46,6 +46,33 @@ from .device_adapters import (
 logger = logging.getLogger(__name__)
 
 
+def _escape_routeros_string(value: str) -> str:
+    """Escapes a value for safe interpolation inside a double-quoted
+    RouterOS console string literal.
+
+    RouterOS's scripting language treats ``\\`` as its escape character
+    inside ``"..."`` literals, so ``\\`` must be escaped first (otherwise a
+    literal backslash in the value would combine with whatever character
+    follows it to form an unintended escape sequence), then the enclosing
+    ``"`` delimiter itself. ``$`` also triggers RouterOS variable expansion
+    inside a double-quoted string (e.g. ``$foo``), so it is escaped too --
+    without this, a value like ``$RandomVariable`` would be substituted by
+    the router's own scripting engine rather than treated as a literal
+    password.
+
+    This alone does not make arbitrary input safe to interpolate as a bare,
+    unquoted RouterOS command fragment (e.g. breaking out via ``;`` after
+    the closing quote) -- callers must still only ever place the escaped
+    result *inside* a quoted literal, never concatenate it in as raw
+    script. Defense in depth: this is the second of two independent layers
+    guarding this value, the first being the strict charset allowlist on
+    ``api_secret`` enforced by ``RouterCreateRequest``/``RouterUpdateRequest``
+    (``app.domains.router.schemas``) -- this escaping exists so a
+    compromise or future loosening of that schema-level allowlist still
+    cannot break out of the RouterOS script this module builds."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+
+
 class DeviceCredentialRotationError(Exception):
     """Raised when a live password push to the device did not succeed --
     ``RouterService.update_router`` translates this into a real
@@ -88,13 +115,18 @@ class GatewayDeviceCredentialRotator:
         old_password: str,
         new_password: str,
     ) -> None:
-        # RouterOS scripting quoting: the username/password values here are
-        # platform-generated (API_ACCESS_USERNAME is a fixed constant;
-        # generateApiSecret() produces an alphanumeric secret -- see
-        # master.routers.tsx), never end-user free text, so a literal
-        # double-quoted RouterOS string is safe without a general escaping
-        # routine.
-        script = f'/user set [find name="{username}"] password="{new_password}"\n'
+        # RouterOS scripting quoting: username/password are escaped before
+        # interpolation into the double-quoted string literals below.
+        # username is normally the fixed API_ACCESS_USERNAME constant and
+        # new_password is normally a platform-generated alphanumeric secret
+        # (see master.routers.tsx's generateApiSecret()), but api_secret is
+        # also settable directly via PUT /routers/{id} as operator-supplied
+        # free text (RouterUpdateRequest.api_secret) -- this escaping is
+        # defense in depth so that path can never break out of the script
+        # regardless of what the schema-level allowlist currently permits.
+        safe_username = _escape_routeros_string(username)
+        safe_password = _escape_routeros_string(new_password)
+        script = f'/user set [find name="{safe_username}"] password="{safe_password}"\n'
         try:
             result = await execute_live_command(
                 host=host,

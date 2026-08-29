@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.location.exceptions import (
@@ -54,6 +55,12 @@ from app.domains.router.exceptions import (
 )
 from app.domains.router.models import Router, RouterProvisioningToken
 from app.domains.router.repository import stale_heartbeat_statement
+from app.domains.router.schemas import (
+    HeartbeatRequest,
+    RouterCreateRequest,
+    RouterManagementAccessRequest,
+    RouterUpdateRequest,
+)
 from app.domains.router.service import RouterService
 
 # ============================================================================
@@ -2200,3 +2207,251 @@ class TestLivenessFieldsSurviveOnTheCustomerShape:
             "created_at",
             "updated_at",
         } <= set(RouterResponse.model_fields)
+# api_secret/api_username: RouterOS script injection hardening
+#
+# GatewayDeviceCredentialRotator.rotate_password interpolates these values
+# into a RouterOS console script (`/user set [find name="{username}"]
+# password="{new_password}"`) executed over SSH. Two independent layers
+# guard against a malicious value breaking out of that script:
+#   1. A strict charset allowlist at the schema layer
+#      (RouterManagementAccessRequest, the master-console route that
+#      sets these) -- tested below.
+#   2. Proper `"`/`\`/`$` escaping in device_credential_rotator itself,
+#      regardless of what the schema layer permits -- tested further below.
+# ============================================================================
+
+
+class TestApiCredentialCharsetValidation:
+    """The allowlist lives on ``RouterManagementAccessRequest``, the
+    master-console route that actually sets these credentials.
+
+    It was written against ``RouterCreateRequest``/``RouterUpdateRequest``,
+    which carried ``api_secret`` at the time. #91 has since removed
+    credentials and SNMP config from both of those customer-reachable
+    schemas -- see ``TestCustomerReachableRouterSchemasCarryNoCredentials``
+    above, which asserts exactly that. Re-pointing these here keeps the
+    hardening on the one schema where the field still exists; asserting it
+    on the customer schemas would only re-prove that the field is absent.
+    """
+
+    def test_rejects_double_quote_in_api_secret(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterManagementAccessRequest(
+                api_secret='p"; :put [/system identity print]; #',
+            )
+
+    def test_rejects_semicolon_in_api_secret(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterManagementAccessRequest(api_secret="password;reboot")
+
+    def test_rejects_bad_charset_in_api_username(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterManagementAccessRequest(api_username='admin"]')
+
+    def test_rejects_backslash_and_dollar(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterManagementAccessRequest(api_secret="pa\\ssword")
+        with pytest.raises(ValidationError):
+            RouterManagementAccessRequest(api_secret="$RandomVar")
+
+    def test_accepts_generated_url_safe_secret(self) -> None:
+        # secrets.token_urlsafe()'s alphabet (A-Za-z0-9-_) is exactly the
+        # shape RouterService actually generates -- must keep working.
+        request = RouterManagementAccessRequest(
+            api_secret="AbC123-_xyZ", api_username="cloudguest-api"
+        )
+        assert request.api_secret == "AbC123-_xyZ"
+
+    def test_accepts_none(self) -> None:
+        # Unset stays unset -- the validator must not choke on the common
+        # "not touching this field" case.
+        request = RouterManagementAccessRequest(api_secret=None)
+        assert request.api_secret is None
+
+
+class TestRouterOsScriptEscaping:
+    """``GatewayDeviceCredentialRotator.rotate_password`` builds a RouterOS
+    console script by interpolating ``username``/``new_password`` into
+    double-quoted string literals. These tests prove a value containing
+    ``"`` and ``;`` cannot break out of the intended single command, i.e.
+    that the escaping layer holds even if it were ever reached with a
+    value the schema-level charset allowlist should have already
+    rejected (defense in depth)."""
+
+    @staticmethod
+    def _parse_quoted_routeros_string(script: str, *, after: str) -> tuple[str, str]:
+        """Finds ``after`` (e.g. ``password="``) in ``script``, then walks
+        forward RouterOS-escaping-aware (``\\\\`` and ``\\"`` are literal
+        escapes) to find the *true* closing ``"``. Returns
+        ``(recovered_value, remainder_after_closing_quote)`` -- a naive
+        "find the next literal double-quote" parse would be fooled by an
+        improperly-escaped value exactly the way this test guards
+        against."""
+        start = script.index(after) + len(after)
+        i = start
+        recovered: list[str] = []
+        while i < len(script):
+            ch = script[i]
+            if ch == "\\" and i + 1 < len(script):
+                recovered.append(script[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                return "".join(recovered), script[i + 1 :]
+            recovered.append(ch)
+            i += 1
+        raise AssertionError("unterminated RouterOS string literal in script")
+
+    async def test_double_quote_and_semicolon_cannot_break_out_of_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.domains.router import device_credential_rotator as rotator_module
+        from app.domains.router.device_adapters import RawCommandResult
+
+        malicious_password = 'x"; /user remove [find]; :put "pwned'
+        captured: dict[str, object] = {}
+
+        async def fake_execute_live_command(
+            *, host: str, username: str, password: str, command: str
+        ):
+            captured["host"] = host
+            captured["username"] = username
+            captured["password"] = password
+            captured["command"] = command
+            return RawCommandResult(
+                command=command, stdout="", stderr="", exit_status=0
+            )
+
+        monkeypatch.setattr(
+            rotator_module, "execute_live_command", fake_execute_live_command
+        )
+        rotator = rotator_module.GatewayDeviceCredentialRotator()
+        await rotator.rotate_password(
+            host="10.0.0.1",
+            username="cloudguest-api",
+            old_password="old-secret",
+            new_password=malicious_password,
+        )
+
+        script = captured["command"]
+        assert isinstance(script, str)
+        # Exactly one RouterOS statement -- a real semicolon-separated
+        # second command would show up as more than one top-level `/`
+        # command in the script.
+        assert script.count("/user set") == 1
+
+        recovered_password, remainder = self._parse_quoted_routeros_string(
+            script, after='password="'
+        )
+        assert recovered_password == malicious_password
+        # Nothing but the trailing newline may follow the closing quote --
+        # if the malicious `"` had closed the literal early, `remainder`
+        # would instead start with `; /user remove [find]; :put "pwned"`.
+        assert remainder.strip() == ""
+
+    async def test_double_quote_in_username_cannot_break_out_of_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.domains.router import device_credential_rotator as rotator_module
+        from app.domains.router.device_adapters import RawCommandResult
+
+        malicious_username = 'admin"] ; /user remove [find'
+        captured: dict[str, object] = {}
+
+        async def fake_execute_live_command(
+            *, host: str, username: str, password: str, command: str
+        ):
+            captured["command"] = command
+            return RawCommandResult(
+                command=command, stdout="", stderr="", exit_status=0
+            )
+
+        monkeypatch.setattr(
+            rotator_module, "execute_live_command", fake_execute_live_command
+        )
+        rotator = rotator_module.GatewayDeviceCredentialRotator()
+        await rotator.rotate_password(
+            host="10.0.0.1",
+            username=malicious_username,
+            old_password="old-secret",
+            new_password="NewSecret123",
+        )
+
+        script = captured["command"]
+        assert isinstance(script, str)
+        assert script.count("/user set") == 1
+        recovered_username, _ = self._parse_quoted_routeros_string(
+            script, after='find name="'
+        )
+        assert recovered_username == malicious_username
+
+    def test_escape_helper_handles_backslash_quote_and_dollar(self) -> None:
+        from app.domains.router.device_credential_rotator import (
+            _escape_routeros_string,
+        )
+
+        assert _escape_routeros_string('a"b') == 'a\\"b'
+        assert _escape_routeros_string("a\\b") == "a\\\\b"
+        assert _escape_routeros_string("$var") == "\\$var"
+        assert _escape_routeros_string('mix\\ed"$val;ue') == 'mix\\\\ed\\"\\$val;ue'
+
+
+# ============================================================================
+# management_ip_address/public_ip_address: format validation
+#
+# These values are later used as a literal `host` in an outbound request
+# (router.py's WebFig proxy: `f"http://{host}/{path}"`), so an unvalidated
+# value is a request-forgery-shaped risk, not just a data-quality one.
+# ============================================================================
+
+
+class TestHostAddressValidation:
+    def test_create_request_rejects_garbage_management_ip_address(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterCreateRequest(
+                **_create_kwargs(), management_ip_address="not an ip; rm -rf /"
+            )
+
+    def test_create_request_rejects_url_shaped_public_ip_address(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterCreateRequest(
+                **_create_kwargs(),
+                public_ip_address="10.0.0.1:8080@evil.example.com",
+            )
+
+    def test_create_request_accepts_valid_ipv4(self) -> None:
+        request = RouterCreateRequest(
+            **_create_kwargs(), management_ip_address="10.0.0.1"
+        )
+        assert request.management_ip_address == "10.0.0.1"
+
+    def test_create_request_accepts_valid_ipv6(self) -> None:
+        request = RouterCreateRequest(
+            **_create_kwargs(), public_ip_address="2001:db8::1"
+        )
+        assert request.public_ip_address == "2001:db8::1"
+
+    def test_create_request_accepts_valid_hostname(self) -> None:
+        request = RouterCreateRequest(
+            **_create_kwargs(), management_ip_address="router-01.local"
+        )
+        assert request.management_ip_address == "router-01.local"
+
+    def test_update_request_rejects_garbage_management_ip_address(self) -> None:
+        with pytest.raises(ValidationError):
+            RouterUpdateRequest(management_ip_address="../../etc/passwd")
+
+    def test_update_request_accepts_none(self) -> None:
+        request = RouterUpdateRequest(
+            management_ip_address=None, public_ip_address=None
+        )
+        assert request.management_ip_address is None
+        assert request.public_ip_address is None
+
+    def test_heartbeat_request_rejects_garbage_management_ip_address(self) -> None:
+        with pytest.raises(ValidationError):
+            HeartbeatRequest(management_ip_address="not-valid!!")
+
+    def test_heartbeat_request_accepts_valid_ipv4(self) -> None:
+        request = HeartbeatRequest(management_ip_address="192.168.1.1")
+        assert request.management_ip_address == "192.168.1.1"

@@ -36,6 +36,7 @@ echo back, encrypted or not.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from datetime import datetime
 from typing import Any
@@ -71,6 +72,63 @@ def _validate_mac(value: str) -> str:
             "'AA:BB:CC:DD:EE:FF'"
         )
     return normalized
+
+
+# ``api_username``/``api_secret`` are interpolated into a RouterOS console
+# script executed over SSH -- see
+# ``device_credential_rotator.GatewayDeviceCredentialRotator
+# .rotate_password``'s ``/user set [find name="{username}"]
+# password="{new_password}"``. RouterOS string literals use ``"`` as a
+# delimiter and ``\``/``$`` for escaping/variable-expansion; a strict
+# allowlist here is the first of two independent layers guarding this value
+# (the second is ``_escape_routeros_string`` in that same module -- defense
+# in depth, so a future loosening of this allowlist alone can't reopen the
+# injection). Both fields are always either platform-generated
+# (``generateApiSecret()``/the fixed ``API_ACCESS_USERNAME`` constant -- see
+# ``master.routers.tsx``) or an operator-chosen replacement typed into the
+# Master Console, never end-user free text that legitimately needs
+# characters outside this set.
+_API_CREDENTIAL_PATTERN = re.compile(r"^[A-Za-z0-9_.\-+=@!~]+$")
+
+
+def _validate_api_credential_charset(value: str) -> str:
+    if not _API_CREDENTIAL_PATTERN.match(value):
+        raise ValueError(
+            "must contain only letters, digits, and the characters "
+            "_ . - + = @ ! ~ (no quotes, backslashes, semicolons, "
+            "whitespace, or other punctuation)"
+        )
+    return value
+
+
+# ``management_ip_address``/``public_ip_address`` end up used as a literal
+# ``host`` in an outbound request (the WebFig proxy -- see
+# ``router.py``'s ``proxy_webfig_request``: ``upstream_url = f"http://
+# {host}/{path}"``), so an unvalidated value here is a request-forgery/
+# open-redirect-shaped risk (e.g. embedding a port, path, or credentials
+# via a crafted "host" string), not just a data-quality one. A real IP
+# address is the overwhelming common case (routers self-report over
+# WireGuard/DHCP), but a hostname is accepted too since nothing else in
+# this domain assumes one shape or the other.
+_HOSTNAME_LABEL_PATTERN = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+
+
+def _validate_host_address(value: str) -> str:
+    candidate = value.strip()
+    try:
+        ipaddress.ip_address(candidate)
+        return candidate
+    except ValueError:
+        pass
+    if (
+        candidate
+        and len(candidate) <= 253
+        and all(_HOSTNAME_LABEL_PATTERN.match(label) for label in candidate.split("."))
+    ):
+        return candidate
+    raise ValueError(
+        "must be a valid IPv4/IPv6 address or a syntactically valid hostname"
+    )
 
 
 # ============================================================================
@@ -277,6 +335,11 @@ class RouterCreateRequest(BaseModel):
     def validate_mac_address(cls, value: str) -> str:
         return _validate_mac(value)
 
+    @field_validator("management_ip_address", "public_ip_address")
+    @classmethod
+    def validate_host_address(cls, value: str | None) -> str | None:
+        return _validate_host_address(value) if value is not None else value
+
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
@@ -320,6 +383,11 @@ class RouterUpdateRequest(BaseModel):
     def validate_mac_address(cls, value: str | None) -> str | None:
         return _validate_mac(value) if value is not None else value
 
+    @field_validator("management_ip_address", "public_ip_address")
+    @classmethod
+    def validate_host_address(cls, value: str | None) -> str | None:
+        return _validate_host_address(value) if value is not None else value
+
 
 class RouterManagementAccessRequest(BaseModel):
     """The router's platform-management credentials and SNMP transport
@@ -332,12 +400,16 @@ class RouterManagementAccessRequest(BaseModel):
     ``api_secret`` rotates exactly that and leaves the SNMP block untouched.
     """
 
-    api_username: str | None = Field(default=None, max_length=100)
+    api_username: str | None = Field(default=None, min_length=1, max_length=100)
     api_secret: str | None = Field(
         default=None,
+        min_length=1,
+        max_length=256,
         description=(
             "RouterOS API password or API key, stored Fernet-encrypted -- "
-            "never returned by any endpoint once submitted."
+            "never returned by any endpoint once submitted. Letters, "
+            "digits, and _ . - + = @ ! ~ only -- see "
+            "app.domains.router.device_credential_rotator for why."
         ),
     )
     snmp_enabled: bool | None = Field(
@@ -379,6 +451,11 @@ class RouterManagementAccessRequest(BaseModel):
             "Settings.snmp_default_port (161) when unset."
         ),
     )
+
+    @field_validator("api_username", "api_secret")
+    @classmethod
+    def validate_api_credential_charset(cls, value: str | None) -> str | None:
+        return _validate_api_credential_charset(value) if value is not None else value
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -426,6 +503,11 @@ class ProvisioningCheckInRequest(BaseModel):
 class HeartbeatRequest(BaseModel):
     routeros_version: str | None = Field(default=None, max_length=50)
     management_ip_address: str | None = Field(default=None, max_length=45)
+
+    @field_validator("management_ip_address")
+    @classmethod
+    def validate_host_address(cls, value: str | None) -> str | None:
+        return _validate_host_address(value) if value is not None else value
 
 
 class DeviceConnectionResponse(BaseModel):

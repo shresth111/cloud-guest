@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.isp.constants import HealthStatus as IspHealthStatus
@@ -67,7 +68,10 @@ from app.domains.router_agent.exceptions import (
 )
 from app.domains.router_agent.models import RouterAgentCredential
 from app.domains.router_agent.router import agent_netwatch_event
-from app.domains.router_agent.schemas import AgentNetwatchEventRequest
+from app.domains.router_agent.schemas import (
+    AgentHeartbeatRequest,
+    AgentNetwatchEventRequest,
+)
 from app.domains.router_agent.service import RouterAgentService, hash_credential
 from app.domains.router_agent.validators import (
     netwatch_status_to_ping_result,
@@ -1600,3 +1604,63 @@ class TestAgentNetwatchEventEndpoint:
             )
         # No health check was recorded for a link this router doesn't own.
         assert isp_repository.health_checks == []
+
+
+# ============================================================================
+# isp_link_id typed as uuid.UUID -- a malformed value must fail schema
+# validation (a clean 422 via FastAPI/pydantic) rather than reach
+# ``router.py``'s ``uuid.UUID(payload.isp_link_id)`` and raise an unhandled
+# ``ValueError`` (an opaque 500).
+# ============================================================================
+
+
+class TestAgentNetwatchEventRequestIspLinkIdValidation:
+    def test_malformed_isp_link_id_is_rejected_at_the_schema_layer(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentNetwatchEventRequest(
+                isp_link_id="not-a-real-uuid", status="up", host="203.0.113.1"
+            )
+
+    def test_valid_uuid_string_is_coerced_to_uuid(self) -> None:
+        link_id = uuid.uuid4()
+        request = AgentNetwatchEventRequest(
+            isp_link_id=str(link_id), status="up", host="203.0.113.1"
+        )
+        assert request.isp_link_id == link_id
+        assert isinstance(request.isp_link_id, uuid.UUID)
+
+
+# ============================================================================
+# management_ip_address/public_ip_address format validation -- these values
+# end up used as a literal `host` in an outbound request elsewhere in the
+# Router domain (the WebFig proxy), so must be a real IP address or a
+# syntactically valid hostname, mirroring mac_address's existing pattern
+# validator.
+# ============================================================================
+
+
+class TestAgentHeartbeatRequestHostAddressValidation:
+    def test_rejects_garbage_management_ip_address(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentHeartbeatRequest(management_ip_address="not an ip; rm -rf /")
+
+    def test_rejects_garbage_public_ip_address(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentHeartbeatRequest(public_ip_address="10.0.0.1:8080/../evil")
+
+    def test_accepts_valid_ipv4(self) -> None:
+        request = AgentHeartbeatRequest(management_ip_address="10.0.0.1")
+        assert request.management_ip_address == "10.0.0.1"
+
+    def test_accepts_valid_ipv6(self) -> None:
+        request = AgentHeartbeatRequest(public_ip_address="2001:db8::1")
+        assert request.public_ip_address == "2001:db8::1"
+
+    def test_accepts_valid_hostname(self) -> None:
+        request = AgentHeartbeatRequest(management_ip_address="router-01.local")
+        assert request.management_ip_address == "router-01.local"
+
+    def test_none_stays_none(self) -> None:
+        request = AgentHeartbeatRequest()
+        assert request.management_ip_address is None
+        assert request.public_ip_address is None
