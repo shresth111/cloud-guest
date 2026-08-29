@@ -55,6 +55,7 @@ from app.domains.network_config.exceptions import (
 )
 from app.domains.network_config.renderers import (
     HOTSPOT_DNS_NAME,
+    MANAGED_WALLED_GARDEN_COMMENT,
     render_agent_heartbeat_scheduler,
     render_bootstrap_script,
     render_content_filter_enforcement,
@@ -62,7 +63,10 @@ from app.domains.network_config.renderers import (
     render_dhcp_pool,
     render_dns_record,
     render_firewall_rule,
+    render_guest_data_path,
+    render_guest_data_path_verification,
     render_hotspot_profile,
+    render_hotspot_walled_garden,
     render_isp_netwatch_config,
     render_isp_netwatch_entry,
     render_network_config,
@@ -690,7 +694,18 @@ class TestRenderBootstrapScript:
         # is what leaves a router serving guests while showing OFFLINE
         # forever. The cap exists to stop this becoming a config dump, not
         # to stop it being correct.
-        assert len(lines) <= 36
+        #
+        # Raised 36 -> 38 on 2026-08-29 for the captive-portal walled
+        # garden (2 lines, one per platform host). Same character as the
+        # clock block above: not padding, but the thing without which the
+        # feature it serves cannot work at all. Production had *zero*
+        # `hotspot_profiles` rows fleet-wide, so the only path that ever
+        # rendered a walled-garden entry never ran, and a guest redirected
+        # to the portal's real hostname would be intercepted before
+        # reaching it. Held to one line per host deliberately -- the
+        # renderer inlines its `find` instead of binding a `:local` per
+        # host, which would have cost 4 lines for the same behaviour.
+        assert len(lines) <= 38
 
         assert lines[0] == '/system identity set name="LOC-2026-000039"'
         # The provisioning token is embedded (the one deliberate, one-time,
@@ -851,7 +866,15 @@ class TestRenderBootstrapScript:
         #
         # Allow-listed by exact value, not by pattern, so this still fails
         # on any OTHER literal -- a hub address included.
-        allowed_literals = {"216.239.35.0", "162.159.200.1"}
+        # WIDENED 2026-08-28, on the same "categorically outside the rule"
+        # test: 0.0.0.0 appears only as `dst-address="0.0.0.0/0"`, the
+        # default-route selector `render_guest_data_path` uses to ask the
+        # device which interface is actually carrying the internet. It is
+        # not an address of anything -- it is the literal opposite of
+        # baking in an address, since it is how the script discovers the
+        # uplink instead of being told one. Still allow-listed by exact
+        # value, so a real hub address would still fail this.
+        allowed_literals = {"216.239.35.0", "162.159.200.1", "0.0.0.0"}
         found = set(
             re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script)
         )
@@ -1178,7 +1201,15 @@ class TestRenderRemoteBootstrapScript:
         script = "\n".join(remote)
         # Same narrow allow-list as TestRenderBootstrapScript's copy of
         # this invariant -- see the long note there.
-        allowed_literals = {"216.239.35.0", "162.159.200.1"}
+        # WIDENED 2026-08-28, on the same "categorically outside the rule"
+        # test: 0.0.0.0 appears only as `dst-address="0.0.0.0/0"`, the
+        # default-route selector `render_guest_data_path` uses to ask the
+        # device which interface is actually carrying the internet. It is
+        # not an address of anything -- it is the literal opposite of
+        # baking in an address, since it is how the script discovers the
+        # uplink instead of being told one. Still allow-listed by exact
+        # value, so a real hub address would still fail this.
+        allowed_literals = {"216.239.35.0", "162.159.200.1", "0.0.0.0"}
         found = set(
             re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script)
         )
@@ -2204,3 +2235,237 @@ class TestBootstrapSetsTheClock:
         for lines in (self._onsite(), self._remote()):
             script = "\n".join(lines)
             assert "$cgTries < 15" in script and ":delay 2s" in script
+
+
+# ============================================================================
+# Guest data path -- the NAT rule whose absence let a fully-provisioned
+# venue authenticate every guest and give none of them internet.
+# ============================================================================
+
+
+class TestRenderGuestDataPath:
+    def _script(self) -> str:
+        return "\n".join(render_guest_data_path())
+
+    def test_the_out_interface_is_discovered_never_named(self) -> None:
+        """This ships to every enrolled router, so a masquerade pointed at
+        a name the platform merely believes is a worse outcome than no
+        masquerade at all. The target is resolved from the device's own
+        active default route."""
+        script = self._script()
+        assert 'dst-address="0.0.0.0/0" active=yes' in script
+        assert "action=masquerade" in script
+        # The out-interface is a variable resolved on-device, never a
+        # literal interface name interpolated by the platform.
+        assert "out-interface=$cgDataPathIf" in script
+        for guessed in ("ether1", "sfp1", "pppoe-out1", "bridge"):
+            assert f"out-interface={guessed}" not in script
+
+    def test_nothing_untagged_is_ever_read_or_written(self) -> None:
+        """A venue's own masquerade, port forwards and hairpin rules are
+        the operator's. Every NAT statement here is filtered on our marker,
+        and nothing is removed at all."""
+        script = self._script()
+        for statement in script.split("; "):
+            if "/ip firewall nat" not in statement:
+                continue
+            assert (
+                "cloudguest-nat-live" in statement
+                or "$cgDataPathNat" in statement
+            ), statement
+        assert "/ip firewall nat remove" not in script
+
+    def test_it_cannot_match_tunnel_bound_traffic(self) -> None:
+        """RADIUS sources from the router's tunnel address and must keep
+        doing so. Scoping by out-interface rather than by source address is
+        what makes that true by construction: traffic to the hub egresses
+        wg-cloudguard, which is never the discovered default-route
+        interface. A src-address-scoped rule would have needed an explicit
+        tunnel exclusion to be equally safe."""
+        script = self._script()
+        assert "src-address=" not in script
+        assert "wg-cloudguard" not in script
+
+    def test_an_unresolved_uplink_changes_nothing_and_says_so(self) -> None:
+        """Every write is gated on the discovery having succeeded, so the
+        degraded outcome is 'nothing was guessed', not a plausible-looking
+        wrong interface."""
+        script = self._script()
+        assert 'no uplink interface resolved' in script
+        for statement in script.split("; "):
+            if "/ip firewall nat add" in statement or "/interface list member add" in (
+                statement
+            ):
+                assert '$cgDataPathIf != ""' in statement, statement
+
+    def test_re_running_converges_rather_than_duplicating(self) -> None:
+        script = self._script()
+        assert "[:len $cgDataPathNat] = 0" in script  # absent -> add
+        assert "[:len $cgDataPathNat] > 0" in script  # present -> re-point
+
+    def test_verification_fails_loudly_rather_than_reporting_success(
+        self,
+    ) -> None:
+        """The whole lesson of 2026-08-27: a router that finishes enrollment
+        without a NAT rule is a venue where every guest authenticates and
+        none gets online, silently, with the platform reporting success."""
+        line = "\n".join(render_guest_data_path_verification())
+        assert ":error" in line
+        assert "no guest NAT rule was established" in line
+
+
+class TestRenderHotspotWalledGarden:
+    API_URL = "https://app.wyfyguest.com/agent/check-in"
+
+    def _script(self, api_url: str | None = None) -> str:
+        return "\n".join(
+            render_hotspot_walled_garden(api_url=api_url or self.API_URL)
+        )
+
+    def test_allows_the_portal_and_the_api_and_nothing_else(self) -> None:
+        """A hotspot intercepts everything until the guest authenticates,
+        so the portal they are redirected to has to be punched through
+        explicitly -- and only it, plus the API that portal calls."""
+        script = self._script()
+        assert 'dst-host="portal.wyfyguest.com"' in script
+        assert 'dst-host="app.wyfyguest.com"' in script
+        assert script.count("walled-garden add") == 2
+        assert "action=allow" in script
+
+    def test_the_portal_host_is_the_same_constant_the_redirect_uses(self) -> None:
+        """`_render_vlan_hotspot` puts HOTSPOT_DNS_NAME in `dns-name` and
+        `/ip dns static`. If the allowed host were spelled separately the
+        two could drift, and a guest would be redirected to a name they are
+        not permitted to reach -- which fails as a hang, not an error."""
+        assert f'dst-host="{HOTSPOT_DNS_NAME}"' in self._script()
+
+    def test_the_api_host_is_derived_not_hardcoded(self) -> None:
+        """So a staging deployment walls in its own API rather than
+        production's."""
+        script = self._script("https://api.staging.example.net/agent/check-in")
+        assert 'dst-host="api.staging.example.net"' in script
+        assert "app.wyfyguest.com" not in script
+
+    def test_only_the_host_of_the_url_is_used_never_the_path(self) -> None:
+        """The bootstrap renderers pass the `check_in_url` they already
+        hold rather than carrying the same host twice."""
+        script = self._script()
+        assert "/agent/check-in" not in script
+
+    def test_it_is_idempotent_and_never_removes(self) -> None:
+        """Bootstraps re-run, including against a live router already
+        serving guests. Adding a duplicate allow rule is harmless; removing
+        one out from under an in-flight request is not."""
+        script = self._script()
+        assert script.count("= 0) do=") == 2
+        assert "walled-garden remove" not in script
+
+    def test_it_only_ever_matches_its_own_rows(self) -> None:
+        """An operator's hand-added walled-garden entries carry a different
+        comment (or none) and must never be found by this section."""
+        script = self._script()
+        assert script.count(f'comment="{MANAGED_WALLED_GARDEN_COMMENT}"') == 4
+
+    def test_a_host_that_is_also_the_portal_is_not_duplicated(self) -> None:
+        """RouterOS would accept two identical rows; the guard that keeps
+        this section to one line per host should not be defeated by a
+        deployment that serves portal and API from one name."""
+        script = self._script(f"https://{HOTSPOT_DNS_NAME}/agent/check-in")
+        assert script.count("walled-garden add") == 1
+
+
+class TestBootstrapRendersTheWalledGarden:
+    """The walled garden ships on the bootstrap, not on a config push,
+    for the same reason the guest data path does: it is gated on an
+    optional table (`hotspot_profiles`) that production has none of, so
+    the only path that reliably runs is the one every enrolled router
+    executes."""
+
+    def _script(self) -> str:
+        return "\n".join(
+            render_bootstrap_script(
+                location_code="LOC-2026-000053",
+                provisioning_token="tok",
+                api_base_url="https://api.example.com",
+            )
+        )
+
+    def test_onsite_bootstrap_carries_it(self) -> None:
+        script = self._script()
+        assert MANAGED_WALLED_GARDEN_COMMENT in script
+        assert f'dst-host="{HOTSPOT_DNS_NAME}"' in script
+
+    def test_the_api_host_comes_from_the_callers_own_base_url(self) -> None:
+        """Not from a literal baked into the renderer -- otherwise a
+        non-production deployment would allow production's API through and
+        wall in nothing useful of its own."""
+        script = self._script()
+        assert 'dst-host="api.example.com"' in script
+        assert "app.wyfyguest.com" not in script
+
+
+class TestBootstrapAssertsTheGuestDataPath:
+    def test_onsite_asserts_and_gates_success_on_it(self) -> None:
+        lines = render_bootstrap_script(
+            location_code="LOC-2026-000053",
+            provisioning_token="tok",
+            api_base_url="https://api.example.com",
+        )
+        script = "\n".join(lines)
+        assert "cloudguest-nat-live" in script
+        # The success line no longer means only "the tunnel is up".
+        assert "no guest NAT rule was established" in script
+        success = [line for line in lines if "bootstrap successful" in line]
+        assert success and "guest data path" in success[0]
+
+    def test_the_assertion_precedes_the_verification(self) -> None:
+        """Asserting and verifying are different claims and the order
+        matters -- verifying first would always fail on a fresh box."""
+        lines = render_bootstrap_script(
+            location_code="L",
+            provisioning_token="t",
+            api_base_url="https://api.example.com",
+        )
+        assert_at = next(
+            i for i, line in enumerate(lines) if "/ip firewall nat add" in line
+        )
+        verify_at = next(
+            i
+            for i, line in enumerate(lines)
+            if "no guest NAT rule was established" in line
+        )
+        assert assert_at < verify_at
+
+    def test_remote_asserts_without_a_hard_failure(self) -> None:
+        """Remote re-provisions a live, already-serving router. Aborting
+        that over a missing NAT rule would be a worse outcome than the
+        missing rule; the on-site path is where failing loudly is right."""
+        lines = render_bootstrap_script(
+            location_code="L",
+            provisioning_token="t",
+            api_base_url="https://api.example.com",
+            mode=BootstrapMode.REMOTE,
+        )
+        script = "\n".join(lines)
+        assert "cloudguest-nat-live" in script
+        assert "no guest NAT rule was established" not in script
+
+
+class TestGuestDataPathOnThePushPath:
+    def test_a_real_config_carries_the_nat_assertion(self) -> None:
+        rendered = render_network_config(
+            dhcp_pools=[_make_pool()],
+            vlans=[],
+            port_forwarding_rules=[],
+        )
+        assert "cloudguest-nat-live" in rendered
+
+    def test_an_empty_config_stays_empty(self) -> None:
+        """Emitting the data path unconditionally here would mean this
+        function never returns "", silently retiring push_config's
+        EmptyNetworkConfigError guard. Nothing is lost by the restraint:
+        the bootstrap script asserts it on every enrolled router."""
+        assert (
+            render_network_config(dhcp_pools=[], vlans=[], port_forwarding_rules=[])
+            == ""
+        )

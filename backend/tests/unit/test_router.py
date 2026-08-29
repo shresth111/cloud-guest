@@ -846,7 +846,12 @@ class TestRouterProvisioning:
         # Raised 30 -> 36 on 2026-08-27 alongside the identical cap in
         # tests/unit/test_network_config.py, for the clock/NTP block the
         # bootstrap renderer now emits. See that file for the reasoning.
-        assert len(lines) <= 36
+        # Raised 36 -> 38 on 2026-08-29, again in lockstep with that file,
+        # for the captive-portal walled garden (2 lines, one per platform
+        # host). These two caps are deliberately kept identical -- they
+        # guard the same script, and letting them drift would mean one of
+        # them silently stops guarding anything.
+        assert len(lines) <= 38
         assert '/system identity set name="HQ-001"' in script
         assert "provisioning/check-in" in script
         # Step 1 ends at a verified tunnel + success line; the full config
