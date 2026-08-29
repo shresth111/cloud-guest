@@ -68,7 +68,7 @@ newly-connected, not-yet-authenticated guest to the login page) uses that
 name instead of the hotspot's raw IP in the URL it builds -- confirmed
 against MikroTik's own published ``/ip hotspot profile`` reference. This is
 what turns ``http://10.5.50.1/login`` in a guest's address bar into
-``http://portal.wyfyguest.com/login``, the exact UX complaint this
+``http://wifi.wyfyguest.com/login``, the exact UX complaint this
 addition fixes.
 
 **A real subdomain of the platform's own registered domain, not a
@@ -76,12 +76,12 @@ pseudo-TLD -- a deliberate, later choice (this constant originally used
 ``wyfy.portal``).** ``wyfyguest.com`` is already this platform's own real,
 registered production domain (see ``app/main.py``'s CORS allowlist, which
 already trusts ``wyfyguest.com``/``app.wyfyguest.com`` origins), so this
-platform fully controls what, if anything, ``portal.wyfyguest.com``
+platform fully controls what, if anything, ``wifi.wyfyguest.com``
 resolves to on the public internet -- there is no third party who could
 ever legitimately hold or contest this exact name the way a truly
 unrelated public domain could. It still never needs a public DNS record
 for this feature to work (see below), and the org should be aware that
-*if* ``portal.wyfyguest.com`` is ever wanted for something else publicly
+*if* ``wifi.wyfyguest.com`` is ever wanted for something else publicly
 in the future, this per-router local override would fully shadow it for
 any guest sitting on that router's own LAN -- worth a one-line note
 wherever this platform's own DNS zone/domain inventory is tracked, not a
@@ -101,8 +101,8 @@ function's ``/ip dhcp-server network add`` line has always set, and
 wide in the master-console bootstrap script) makes the router answer that
 query -- no public DNS record is *needed* anywhere in this scheme, it is
 resolved entirely locally, by each router, for its own guests, regardless
-of whatever ``portal.wyfyguest.com`` may or may not publicly resolve to.
-(A public A record for ``portal.wyfyguest.com`` was separately added in
+of whatever ``wifi.wyfyguest.com`` may or may not publicly resolve to.
+(A public A record for ``wifi.wyfyguest.com`` was separately added in
 the platform's own GoDaddy DNS zone as a belt-and-suspenders fallback for
 the rare guest device that bypasses the router's own DNS server entirely
 -- see this section's own "not independently confirmed" paragraph below
@@ -135,7 +135,7 @@ by every one of them would leave the router's ``/ip dns static`` table
 with either a name collision (RouterOS rejects a second ``add`` of the
 same ``name=``) or, worse, multiple different addresses silently
 round-robined under one name, sending some fraction of guests on VLAN A's
-hotspot to VLAN B's gateway. ``{tag}.portal.wyfyguest.com`` (``tag`` already being
+hotspot to VLAN B's gateway. ``{tag}.wifi.wyfyguest.com`` (``tag`` already being
 this function's own real, ``vlan_id``-derived, guaranteed-unique-per-router
 identifier) sidesteps that entirely, the same "derive a real, already-
 unique value rather than fabricate a shared one" discipline
@@ -688,7 +688,21 @@ WIREGUARD_INTERFACE_NAME = "wg-cloudguard"
 # is a belt-and-suspenders fallback rather than the thing this feature
 # actually depends on, and why each VLAN's own hotspot gets a ``{tag}.``
 # prefixed variant of this rather than this exact literal.
-HOTSPOT_DNS_NAME = "portal.wyfyguest.com"
+#
+# ``wifi``, not ``portal``, since 2026-08-29: this constant said
+# ``portal.wyfyguest.com`` while the routers in the field were already
+# redirecting guests to ``wifi.wyfyguest.com``, set on the devices by hand
+# rather than by this platform. The platform was therefore about to allow
+# one name through the walled garden while guests were being sent to
+# another -- the exact drift ``_portal_walled_garden_hosts`` documents its
+# single-source-of-truth rule to prevent, present in production before that
+# rule existed. Aligned onto the name the devices actually use, which is
+# also the cheaper direction: the alternative is re-pointing every deployed
+# router. ``wifi.wyfyguest.com`` was added to the platform's Let's Encrypt
+# certificate the same day (it previously carried only app/auth/master/
+# portal), so the name now terminates TLS correctly instead of failing
+# validation and dropping guests onto plain HTTP.
+HOTSPOT_DNS_NAME = "wifi.wyfyguest.com"
 
 
 def _sanitize_identifier(name: str) -> str:
@@ -1290,10 +1304,23 @@ def _portal_walled_garden_hosts(api_url: str) -> list[str]:
     ``_render_vlan_hotspot`` already puts in ``dns-name``/``/ip dns
     static`` -- one source of truth, so the name the guest is redirected to
     and the name they are permitted to reach can never drift apart.
+
+    **The wildcard is not belt-and-braces, it is the entry that actually
+    matches.** ``_render_vlan_hotspot`` does not redirect to the bare
+    constant: it builds a per-VLAN ``{tag}.`` variant (``dns_name =
+    f"{tag}.{HOTSPOT_DNS_NAME}"``) precisely so two hotspots on one router
+    cannot collide. RouterOS's ``dst-host`` takes plain hostnames, IPs, or
+    ``*``-prefixed wildcard domains (see ``hotspot.validators
+    .validate_walled_garden_hosts``) -- a bare ``wifi.wyfyguest.com`` does
+    not cover ``vlan100.wifi.wyfyguest.com``. Allowing only the bare name
+    would therefore wall off the exact hostname every guest is sent to.
+    Both forms are emitted because the wildcard conventionally does not
+    match the bare name either, and a single-hotspot router bound straight
+    to the constant is a real configuration.
     """
     api_host = urlsplit(api_url).hostname
-    hosts = [HOTSPOT_DNS_NAME]
-    if api_host and api_host != HOTSPOT_DNS_NAME:
+    hosts = [HOTSPOT_DNS_NAME, f"*.{HOTSPOT_DNS_NAME}"]
+    if api_host and api_host not in hosts:
         hosts.append(api_host)
     return hosts
 

@@ -851,7 +851,15 @@ class TestRouterProvisioning:
         # host). These two caps are deliberately kept identical -- they
         # guard the same script, and letting them drift would mean one of
         # them silently stops guarding anything.
-        assert len(lines) <= 38
+        #
+        # Raised 38 -> 39 on 2026-08-29: the walled garden emits a third
+        # line. `_render_vlan_hotspot` redirects to a per-VLAN
+        # `{tag}.HOTSPOT_DNS_NAME`, and RouterOS `dst-host` does not treat a
+        # bare name as covering its subdomains, so the wildcard form has to
+        # be allowed too or the one hostname guests are actually sent to is
+        # the one hostname walled off. Keeps the one line of slack this cap
+        # has carried since the 30 -> 36 raise.
+        assert len(lines) <= 39
         assert '/system identity set name="HQ-001"' in script
         assert "provisioning/check-in" in script
         # Step 1 ends at a verified tunnel + success line; the full config

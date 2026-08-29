@@ -705,7 +705,15 @@ class TestRenderBootstrapScript:
         # reaching it. Held to one line per host deliberately -- the
         # renderer inlines its `find` instead of binding a `:local` per
         # host, which would have cost 4 lines for the same behaviour.
-        assert len(lines) <= 38
+        #
+        # Raised 38 -> 39 on 2026-08-29: the walled garden emits a third
+        # line. `_render_vlan_hotspot` redirects to a per-VLAN
+        # `{tag}.HOTSPOT_DNS_NAME`, and RouterOS `dst-host` does not treat a
+        # bare name as covering its subdomains, so the wildcard form has to
+        # be allowed too or the one hostname guests are actually sent to is
+        # the one hostname walled off. Keeps the one line of slack this cap
+        # has carried since the 30 -> 36 raise.
+        assert len(lines) <= 39
 
         assert lines[0] == '/system identity set name="LOC-2026-000039"'
         # The provisioning token is embedded (the one deliberate, one-time,
@@ -2327,10 +2335,23 @@ class TestRenderHotspotWalledGarden:
         so the portal they are redirected to has to be punched through
         explicitly -- and only it, plus the API that portal calls."""
         script = self._script()
-        assert 'dst-host="portal.wyfyguest.com"' in script
+        assert 'dst-host="wifi.wyfyguest.com"' in script
         assert 'dst-host="app.wyfyguest.com"' in script
-        assert script.count("walled-garden add") == 2
+        assert script.count("walled-garden add") == 3
         assert "action=allow" in script
+
+    def test_the_per_vlan_hostname_is_covered_by_a_wildcard(self) -> None:
+        """`_render_vlan_hotspot` redirects to `{tag}.HOTSPOT_DNS_NAME`, not
+        to the bare constant, so two hotspots on one router cannot collide.
+        RouterOS `dst-host` takes plain names or `*`-prefixed wildcards, and
+        a bare name does not cover a subdomain -- so allowing only the bare
+        name would wall off the exact host every guest is sent to."""
+        script = self._script()
+        assert f'dst-host="*.{HOTSPOT_DNS_NAME}"' in script
+        # The name _render_vlan_hotspot actually builds.
+        vlan_host = f"vlan100.{HOTSPOT_DNS_NAME}"
+        assert vlan_host.endswith(HOTSPOT_DNS_NAME)
+        assert f'dst-host="{HOTSPOT_DNS_NAME}"' in script
 
     def test_the_portal_host_is_the_same_constant_the_redirect_uses(self) -> None:
         """`_render_vlan_hotspot` puts HOTSPOT_DNS_NAME in `dns-name` and
@@ -2357,21 +2378,24 @@ class TestRenderHotspotWalledGarden:
         serving guests. Adding a duplicate allow rule is harmless; removing
         one out from under an in-flight request is not."""
         script = self._script()
-        assert script.count("= 0) do=") == 2
+        assert script.count("= 0) do=") == 3
         assert "walled-garden remove" not in script
 
     def test_it_only_ever_matches_its_own_rows(self) -> None:
         """An operator's hand-added walled-garden entries carry a different
         comment (or none) and must never be found by this section."""
         script = self._script()
-        assert script.count(f'comment="{MANAGED_WALLED_GARDEN_COMMENT}"') == 4
+        assert script.count(f'comment="{MANAGED_WALLED_GARDEN_COMMENT}"') == 6
 
     def test_a_host_that_is_also_the_portal_is_not_duplicated(self) -> None:
         """RouterOS would accept two identical rows; the guard that keeps
         this section to one line per host should not be defeated by a
         deployment that serves portal and API from one name."""
         script = self._script(f"https://{HOTSPOT_DNS_NAME}/agent/check-in")
-        assert script.count("walled-garden add") == 1
+        # Two, not three: the bare name and its wildcard are both always
+        # emitted; what must not appear is a third, duplicate row for the
+        # API host when it IS the portal host.
+        assert script.count("walled-garden add") == 2
 
 
 class TestBootstrapRendersTheWalledGarden:
