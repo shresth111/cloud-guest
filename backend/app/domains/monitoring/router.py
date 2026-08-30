@@ -819,14 +819,21 @@ async def create_notification_channel(
 )
 async def list_notification_channels(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     is_active: bool | None = Query(default=None),
     page: int = Query(default=DEFAULT_LIST_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_LIST_PAGE_SIZE, ge=1, le=100),
     service: NotificationService = Depends(get_notification_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param
+    # -- matching list_alerts/list_alert_rules. A non-GLOBAL caller can only
+    # ever resolve to an org they are an active member of, so ``organization_id``
+    # is either that own org or ``None`` for a platform/GLOBAL caller who
+    # legitimately reads across organizations.
     items, meta = await service.list_channels(
         organization_id=organization_id,
+        include_all_organizations=organization_id is None,
         is_active=is_active,
         page=page,
         page_size=page_size,
@@ -995,15 +1002,22 @@ async def create_incident(
 )
 async def list_incidents(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     incident_status: IncidentStatus | None = Query(default=None, alias="status"),
     severity: str | None = Query(default=None),
     page: int = Query(default=DEFAULT_LIST_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_LIST_PAGE_SIZE, ge=1, le=100),
     service: IncidentService = Depends(get_incident_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param
+    # -- matching list_alerts/list_alert_rules. A non-GLOBAL caller can only
+    # ever resolve to an org they are an active member of, so ``organization_id``
+    # is either that own org or ``None`` for a platform/GLOBAL caller who
+    # legitimately reads across organizations.
     items, meta = await service.list_incidents(
         organization_id=organization_id,
+        include_all_organizations=organization_id is None,
         status=incident_status.value if incident_status is not None else None,
         severity=severity,
         page=page,
@@ -1135,11 +1149,18 @@ async def list_incident_alerts(
 )
 async def list_sla_targets(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: SlaService = Depends(get_sla_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param
+    # -- matching list_alerts/list_alert_rules. A non-GLOBAL caller can only
+    # ever resolve to an org they are an active member of, so ``organization_id``
+    # is either that own org or ``None`` for a platform/GLOBAL caller who
+    # legitimately reads across organizations.
     pairs = await service.list_targets_with_latest_report(
-        organization_id=organization_id
+        organization_id=organization_id,
+        include_all_organizations=organization_id is None,
     )
     payload = SlaTargetListResponse(
         items=[
