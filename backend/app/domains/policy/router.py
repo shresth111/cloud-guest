@@ -111,7 +111,25 @@ def _assignment_response(assignment: PolicyAssignment) -> PolicyAssignmentRespon
 async def resolve_effective_policy(
     request: Request,
     policy_type: PolicyType = Query(...),
-    organization_id: uuid.UUID | None = Query(default=None),
+    # Tenant scoping: the organization we resolve for is the caller's
+    # validated auth scope (``CurrentOrganization``), never a client-supplied
+    # query param. ``policy.read`` is grantable at LOCATION scope (see
+    # rbac.seed's MODULE_NARROWEST_SCOPE ``POLICY: ScopeType.LOCATION``) and
+    # ``RequirePermission`` here derives its scope from ``X-Organization-Id``,
+    # so an org-scoped admin who sent that header (passing the org-scoped
+    # permission check) but set ``?organization_id=<other org>`` previously
+    # resolved a *different* tenant's effective policy -- the
+    # ``list_candidate_assignments`` scope OR matches any assignment whose
+    # ``scope_id`` equals the supplied org. Resolving it from the same header
+    # the permission check uses closes that: a non-GLOBAL caller can only ever
+    # resolve to an org they are an active member of, and a caller reaching
+    # this handler with ``organization_id is None`` sent no org header, passed
+    # the GLOBAL-scope permission gate, and may legitimately resolve across
+    # organizations (platform/Master-console). The ``location_id`` selector
+    # below is likewise validated against this org inside the service (a
+    # LOCATION-scoped assignment is matched by ``scope_id`` alone, so a foreign
+    # ``location_id`` would otherwise leak that location's tenant's policy).
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     location_id: uuid.UUID | None = Query(default=None),
     user_id: uuid.UUID | None = Query(
         default=None,
