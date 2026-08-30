@@ -1930,3 +1930,39 @@ def test_alerts_listings_resolve_org_from_auth_scope_not_query_param(
     # ... it is resolved via the CurrentOrganization dependency instead.
     dependency_calls = {dep.call for dep in dependant.dependencies}
     assert CurrentOrganization in dependency_calls
+
+@pytest.mark.parametrize(
+    ("path", "method"),
+    [
+        ("/api/v1/events", "GET"),
+        ("/api/v1/monitoring/dashboard", "GET"),
+        ("/api/v1/monitoring/devices", "GET"),
+        ("/api/v1/ztp/dashboard", "GET"),
+        ("/api/v1/ztp/analytics", "GET"),
+    ],
+)
+def test_platform_dashboards_resolve_org_from_auth_scope_not_query_param(
+    monitoring_routes_by_path_method, path, method
+):
+    """The platform monitoring/ZTP dashboards must take ``organization_id``
+    from ``CurrentOrganization`` (the caller's validated auth scope), not from
+    a client-supplied query param.
+
+    ``monitoring.read``/``analytics.read`` are grantable at ORGANIZATION scope
+    (see ``rbac.seed`` MODULE_NARROWEST_SCOPE), so an org-scoped admin who sent
+    ``X-Organization-Id`` (passing the org-scoped permission check) but omitted
+    ``?organization_id=`` previously had the org filter silently dropped and
+    aggregated every organization's data cross-tenant. A caller with no org
+    header resolves to ``None`` and, having passed the GLOBAL-scope permission
+    gate, may still legitimately read across organizations.
+    """
+    from app.domains.rbac.dependencies import CurrentOrganization
+
+    route = monitoring_routes_by_path_method[(path, method)]
+    dependant = route.dependant
+
+    query_names = {param.name for param in dependant.query_params}
+    assert "organization_id" not in query_names
+
+    dependency_calls = {dep.call for dep in dependant.dependencies}
+    assert CurrentOrganization in dependency_calls

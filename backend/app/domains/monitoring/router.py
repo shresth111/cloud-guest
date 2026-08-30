@@ -408,7 +408,7 @@ async def run_health_checks(
 )
 async def get_event_timeline(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     category: list[EventCategory] | None = Query(default=None),
     severity: list[EventSeverity] | None = Query(default=None),
     start_date: datetime | None = Query(default=None),
@@ -418,6 +418,16 @@ async def get_event_timeline(
     ),
     service: MonitoringService = Depends(get_monitoring_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param.
+    # ``monitoring.read`` is grantable at ORGANIZATION scope (see rbac.seed's
+    # MODULE_NARROWEST_SCOPE ``MONITORING: ScopeType.ROUTER``), so an org-scoped
+    # admin who sent ``X-Organization-Id`` (passing the org-scoped permission
+    # check) but omitted ``?organization_id=`` had the org filter silently
+    # dropped and read every organization's event timeline. A caller reaching
+    # this handler with ``organization_id is None`` sent no org header and thus
+    # passed the GLOBAL-scope permission gate, so may legitimately read across
+    # organizations.
     entries = await service.get_event_timeline(
         organization_id=organization_id,
         categories=category,
@@ -1515,7 +1525,7 @@ def _ztp_analytics_response(result: ZtpAnalyticsResult) -> ZtpAnalyticsResponse:
 )
 async def get_platform_dashboard(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     start_date: datetime | None = Query(default=None),
     end_date: datetime | None = Query(default=None),
     service: PlatformDashboardService = Depends(get_platform_dashboard_service),
@@ -1533,6 +1543,11 @@ async def get_platform_dashboard(
     """
     end = end_date or datetime.now(UTC)
     start = start_date or (end - timedelta(hours=24))
+    # Tenant scoping resolved from the caller's auth scope
+    # (``CurrentOrganization``), never a client-supplied query param -- see
+    # ``get_event_timeline`` above for the full rationale. Omitting the org
+    # filter here aggregated every organization's health/alert/device/visitor
+    # statistics into one cross-tenant dashboard payload.
     result = await service.get_dashboard_statistics(
         organization_id=organization_id,
         start=start,
@@ -1570,7 +1585,7 @@ async def get_platform_dashboard(
 )
 async def get_device_statistics(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     page: int = Query(default=DEFAULT_ZTP_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_ZTP_PAGE_SIZE, ge=1, le=100),
     service: ZtpMonitoringService = Depends(get_ztp_monitoring_service),
@@ -1581,6 +1596,10 @@ async def get_device_statistics(
     monitoring dashboard's device tab) -- deliberately not a second
     implementation, per this module's "compose, don't duplicate" discipline.
     """
+    # Tenant scoping resolved from the caller's auth scope
+    # (``CurrentOrganization``), never a client-supplied query param -- see
+    # ``get_event_timeline`` above. Omitting the org filter listed every
+    # organization's routers/lifecycle stages cross-tenant.
     result = await service.get_dashboard(
         organization_id=organization_id, page=page, page_size=page_size
     )
@@ -1600,7 +1619,7 @@ async def get_device_statistics(
 )
 async def get_ztp_dashboard(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     page: int = Query(default=DEFAULT_ZTP_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_ZTP_PAGE_SIZE, ge=1, le=100),
     service: ZtpMonitoringService = Depends(get_ztp_monitoring_service),
@@ -1609,6 +1628,10 @@ async def get_ztp_dashboard(
     router currently sit" view (read-only aggregation over
     ``app.domains.router_provisioning``'s own existing data -- see
     ``service.ZtpMonitoringService``'s own docstring)."""
+    # Tenant scoping resolved from the caller's auth scope
+    # (``CurrentOrganization``), never a client-supplied query param -- see
+    # ``get_event_timeline`` above. Omitting the org filter listed every
+    # organization's routers/lifecycle stages cross-tenant.
     result = await service.get_dashboard(
         organization_id=organization_id, page=page, page_size=page_size
     )
@@ -1628,7 +1651,7 @@ async def get_ztp_dashboard(
 )
 async def get_ztp_analytics(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     start_date: datetime | None = Query(default=None),
     end_date: datetime | None = Query(default=None),
     retry_page: int = Query(default=DEFAULT_ZTP_PAGE, ge=1),
@@ -1644,6 +1667,11 @@ async def get_ztp_analytics(
     identical default window)."""
     end = end_date or datetime.now(UTC)
     start = start_date or (end - timedelta(days=30))
+    # Tenant scoping resolved from the caller's auth scope
+    # (``CurrentOrganization``), never a client-supplied query param -- see
+    # ``get_event_timeline`` above (``analytics.read`` is likewise grantable at
+    # ORGANIZATION scope). Omitting the org filter aggregated every
+    # organization's provisioning success/failure/retry analytics cross-tenant.
     result = await service.get_analytics(
         organization_id=organization_id,
         start=start,
