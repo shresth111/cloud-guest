@@ -142,6 +142,11 @@ class CampaignAssetCreateRequest(BaseModel):
     click_url: str | None = None
     alt_text: str | None = None
     locale: str | None = None
+    # Banner & Discounts promo copy -- see models.CampaignAsset.
+    headline: str | None = None
+    subtext: str | None = None
+    coupon_code: str | None = None
+    coupon_expires_at: datetime | None = None
 
 
 class CampaignAssetUpdateRequest(BaseModel):
@@ -149,6 +154,10 @@ class CampaignAssetUpdateRequest(BaseModel):
     click_url: str | None = None
     alt_text: str | None = None
     locale: str | None = None
+    headline: str | None = None
+    subtext: str | None = None
+    coupon_code: str | None = None
+    coupon_expires_at: datetime | None = None
 
 
 class CampaignAssetResponse(BaseModel):
@@ -158,6 +167,10 @@ class CampaignAssetResponse(BaseModel):
     click_url: str | None
     alt_text: str | None
     locale: str | None
+    headline: str | None
+    subtext: str | None
+    coupon_code: str | None
+    coupon_expires_at: datetime | None
 
 
 class QuestionResultBreakdownResponse(BaseModel):
@@ -193,6 +206,12 @@ class NextCampaignAssetPayload(BaseModel):
     image_url: str | None
     click_url: str | None
     alt_text: str | None
+    # Banner & Discounts promo copy the captive portal renders as a coupon
+    # card -- see models.CampaignAsset. Null for a plain image/redirect banner.
+    headline: str | None = None
+    subtext: str | None = None
+    coupon_code: str | None = None
+    coupon_expires_at: datetime | None = None
 
 
 class NextCampaignResponse(BaseModel):

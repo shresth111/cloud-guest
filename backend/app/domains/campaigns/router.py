@@ -121,6 +121,10 @@ def _asset_response(asset: CampaignAsset) -> CampaignAssetResponse:
         click_url=asset.click_url,
         alt_text=asset.alt_text,
         locale=asset.locale,
+        headline=asset.headline,
+        subtext=asset.subtext,
+        coupon_code=asset.coupon_code,
+        coupon_expires_at=asset.coupon_expires_at,
     )
 
 
@@ -168,6 +172,10 @@ def _next_campaign_response(result: NextCampaignResult) -> NextCampaignResponse:
                 image_url=result.asset.image_url,
                 click_url=result.asset.click_url,
                 alt_text=result.asset.alt_text,
+                headline=result.asset.headline,
+                subtext=result.asset.subtext,
+                coupon_code=result.asset.coupon_code,
+                coupon_expires_at=result.asset.coupon_expires_at,
             )
             if result.asset is not None
             else None
@@ -605,6 +613,10 @@ async def add_campaign_asset(
         click_url=payload.click_url,
         alt_text=payload.alt_text,
         locale=payload.locale,
+        headline=payload.headline,
+        subtext=payload.subtext,
+        coupon_code=payload.coupon_code,
+        coupon_expires_at=payload.coupon_expires_at,
     )
     return build_response(
         success=True,

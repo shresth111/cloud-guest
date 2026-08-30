@@ -699,6 +699,18 @@ class TestValidateAssetUrls:
     def test_accepts_image_url_only(self) -> None:
         validate_asset_urls("https://example.com/a.png", None)
 
+    def test_accepts_coupon_code_only(self) -> None:
+        # A text-and-coupon "Banner & Discounts" banner is renderable with
+        # no image or link at all -- see validators.validate_asset_urls.
+        validate_asset_urls(None, None, coupon_code="SAVE20")
+
+    def test_accepts_headline_only(self) -> None:
+        validate_asset_urls(None, None, headline="Flat 20% off this weekend")
+
+    def test_still_rejects_when_all_sources_empty(self) -> None:
+        with pytest.raises(InvalidAssetUrlsError):
+            validate_asset_urls(None, None, headline=None, coupon_code=None)
+
 
 class TestValidateDisplayRuleFields:
     def test_once_per_n_days_requires_positive_interval(self) -> None:

@@ -649,6 +649,10 @@ class CampaignsService:
         click_url: str | None,
         alt_text: str | None,
         locale: str | None,
+        headline: str | None = None,
+        subtext: str | None = None,
+        coupon_code: str | None = None,
+        coupon_expires_at: datetime | None = None,
     ) -> CampaignAsset:
         campaign = await self.get_campaign(
             campaign_id, requesting_organization_id=requesting_organization_id
@@ -661,13 +665,19 @@ class CampaignsService:
                 f"{CampaignType.BANNER.value}/{CampaignType.REDIRECT.value}",
                 campaign.campaign_type,
             )
-        validate_asset_urls(image_url, click_url)
+        validate_asset_urls(
+            image_url, click_url, headline=headline, coupon_code=coupon_code
+        )
         return await self.repository.create_asset(
             campaign_id=campaign.id,
             image_url=image_url,
             click_url=click_url,
             alt_text=alt_text,
             locale=locale,
+            headline=headline,
+            subtext=subtext,
+            coupon_code=coupon_code,
+            coupon_expires_at=coupon_expires_at,
             created_by=actor_user_id,
         )
 
@@ -697,7 +707,14 @@ class CampaignsService:
         )
         image_url = fields.get("image_url", asset.image_url)
         click_url = fields.get("click_url", asset.click_url)
-        validate_asset_urls(image_url, click_url)  # type: ignore[arg-type]
+        headline = fields.get("headline", asset.headline)
+        coupon_code = fields.get("coupon_code", asset.coupon_code)
+        validate_asset_urls(
+            image_url,  # type: ignore[arg-type]
+            click_url,  # type: ignore[arg-type]
+            headline=headline,  # type: ignore[arg-type]
+            coupon_code=coupon_code,  # type: ignore[arg-type]
+        )
         data = {key: value for key, value in fields.items() if value is not None}
         return await self.repository.update_asset(asset, data)
 
