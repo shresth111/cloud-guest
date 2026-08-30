@@ -18,7 +18,10 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 from .constants import (
+    CONTENT_BODY_MAX_LENGTH,
+    CONTENT_HEADING_MAX_LENGTH,
     DEFAULT_LANGUAGE,
+    DEFAULT_PORTAL_CONTENT_MODE,
     DEFAULT_PRIMARY_COLOR,
     DEFAULT_SECONDARY_COLOR,
     DEFAULT_SUPPORTED_LANGUAGES,
@@ -110,6 +113,30 @@ class CaptivePortalConfigCreateRequest(BaseModel):
         ),
     )
     redirect_url: str | None = Field(default=None, max_length=500)
+    content_mode: str = Field(
+        default=DEFAULT_PORTAL_CONTENT_MODE.value,
+        max_length=20,
+        description=(
+            "What the portal presents as its primary content -- one of "
+            "'login' (default, sign-in card only), 'image', 'text', "
+            "'redirect' (sends the guest to redirect_url), or 'survey'. "
+            "Validated server-side against constants.PortalContentMode; see "
+            "that enum for each mode's source column."
+        ),
+    )
+    content_heading: str | None = Field(
+        default=None, max_length=CONTENT_HEADING_MAX_LENGTH
+    )
+    content_body: str | None = Field(default=None, max_length=CONTENT_BODY_MAX_LENGTH)
+    content_image_url: str | None = Field(default=None, max_length=500)
+    content_survey: dict | None = Field(
+        default=None,
+        description=(
+            "content_mode == 'survey': the survey definition "
+            "({'questions': [...], 'submitLabel': '...'}). Stored verbatim; "
+            "the frontend (PortalSurvey) owns the schema."
+        ),
+    )
     otp_sms_enabled: bool = Field(default=True)
     otp_email_enabled: bool = Field(default=False)
     otp_whatsapp_enabled: bool = Field(
@@ -239,6 +266,13 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
         ),
     )
     redirect_url: str | None = Field(default=None, max_length=500)
+    content_mode: str | None = Field(default=None, max_length=20)
+    content_heading: str | None = Field(
+        default=None, max_length=CONTENT_HEADING_MAX_LENGTH
+    )
+    content_body: str | None = Field(default=None, max_length=CONTENT_BODY_MAX_LENGTH)
+    content_image_url: str | None = Field(default=None, max_length=500)
+    content_survey: dict | None = Field(default=None)
     otp_sms_enabled: bool | None = Field(default=None)
     otp_email_enabled: bool | None = Field(default=None)
     otp_whatsapp_enabled: bool | None = Field(default=None)
@@ -318,6 +352,11 @@ class CaptivePortalConfigResponse(BaseModel):
     splash_headline: str | None
     splash_welcome_message: str | None
     redirect_url: str | None
+    content_mode: str
+    content_heading: str | None
+    content_body: str | None
+    content_image_url: str | None
+    content_survey: dict | None
     otp_sms_enabled: bool
     otp_email_enabled: bool
     otp_whatsapp_enabled: bool

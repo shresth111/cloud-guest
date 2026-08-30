@@ -74,7 +74,11 @@ from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 
-from .constants import PRIVACY_POLICY_LABEL, TERMS_AND_CONDITIONS_LABEL
+from .constants import (
+    DEFAULT_PORTAL_CONTENT_MODE,
+    PRIVACY_POLICY_LABEL,
+    TERMS_AND_CONDITIONS_LABEL,
+)
 from .events import (
     CaptivePortalConfigActivated,
     CaptivePortalConfigCreated,
@@ -98,6 +102,7 @@ from .validators import (
     validate_background_overlay_strength,
     validate_business_hours_schedule,
     validate_business_hours_timezone,
+    validate_content_mode,
     validate_default_scope,
     validate_guest_font_choice,
     validate_hex_color,
@@ -427,6 +432,11 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "splash_headline",
     "splash_welcome_message",
     "redirect_url",
+    "content_mode",
+    "content_heading",
+    "content_body",
+    "content_image_url",
+    "content_survey",
     "otp_sms_enabled",
     "otp_email_enabled",
     "otp_whatsapp_enabled",
@@ -481,6 +491,11 @@ class _CachedCaptivePortalConfig:
     splash_headline: str | None
     splash_welcome_message: str | None
     redirect_url: str | None
+    content_mode: str
+    content_heading: str | None
+    content_body: str | None
+    content_image_url: str | None
+    content_survey: dict[str, Any] | None
     otp_sms_enabled: bool
     otp_email_enabled: bool
     otp_whatsapp_enabled: bool
@@ -666,6 +681,17 @@ class CaptivePortalService:
         # own tests, never pass it. True is also the only default that
         # cannot leak revenue -- see the column's own docstring.
         powered_by_enabled: bool = True,
+        # Content mode + its per-mode source columns. All default to the
+        # existing sign-in-only behaviour / empty content for the same reason
+        # pin_login_enabled/powered_by_enabled default above: the smart-
+        # location provisioning flow and this domain's tests never pass them,
+        # and "login" is the only value that leaves a brand-new config
+        # rendering exactly as every config does today.
+        content_mode: str = DEFAULT_PORTAL_CONTENT_MODE.value,
+        content_heading: str | None = None,
+        content_body: str | None = None,
+        content_image_url: str | None = None,
+        content_survey: dict | None = None,
     ) -> CaptivePortalConfig:
         validate_hex_color(primary_color, field_name="primary_color")
         validate_hex_color(secondary_color, field_name="secondary_color")
@@ -684,6 +710,7 @@ class CaptivePortalService:
         # conditional there.
         validate_splash_text_length("splash_headline", splash_headline)
         validate_splash_text_length("splash_welcome_message", splash_welcome_message)
+        validate_content_mode(content_mode)
 
         organization = await self.organization_lookup.get_organization(organization_id)
         if (
@@ -727,6 +754,11 @@ class CaptivePortalService:
             splash_headline=splash_headline,
             splash_welcome_message=splash_welcome_message,
             redirect_url=redirect_url,
+            content_mode=content_mode,
+            content_heading=content_heading,
+            content_body=content_body,
+            content_image_url=content_image_url,
+            content_survey=content_survey,
             otp_sms_enabled=otp_sms_enabled,
             otp_email_enabled=otp_email_enabled,
             otp_whatsapp_enabled=otp_whatsapp_enabled,
@@ -841,6 +873,8 @@ class CaptivePortalService:
             )
         if "guest_font_choice" in update_data:
             validate_guest_font_choice(str(update_data["guest_font_choice"]))
+        if "content_mode" in update_data:
+            validate_content_mode(str(update_data["content_mode"]))
         if "background_overlay_strength" in update_data:
             validate_background_overlay_strength(
                 update_data["background_overlay_strength"]

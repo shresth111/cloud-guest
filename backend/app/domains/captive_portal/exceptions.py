@@ -20,6 +20,7 @@ from .constants import (
     MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
     GuestFontChoice,
+    PortalContentMode,
 )
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "CaptivePortalConfigImmutableFieldError",
     "InvalidBusinessHoursScheduleError",
     "InvalidGuestFontChoiceError",
+    "InvalidPortalContentModeError",
     "InvalidBackgroundOverlayStrengthError",
     "InvalidBackgroundFocalPointError",
     "SplashTextTooLongError",
@@ -171,6 +173,22 @@ class InvalidGuestFontChoiceError(CaptivePortalError):
         allowed = ", ".join(sorted(c.value for c in GuestFontChoice))
         super().__init__(
             f"guest_font_choice must be one of [{allowed}], got '{value}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidPortalContentModeError(CaptivePortalError):
+    """``content_mode`` was set to something outside
+    ``constants.PortalContentMode`` -- see
+    ``validators.validate_content_mode``. Like ``guest_font_choice`` this is
+    a closed enum stored as a plain string, never free text: an unknown mode
+    would have no renderer on the frontend and would silently fall back to
+    the sign-in card, so it is rejected at the write boundary instead."""
+
+    def __init__(self, value: str) -> None:
+        allowed = ", ".join(m.value for m in PortalContentMode)
+        super().__init__(
+            f"content_mode must be one of [{allowed}], got '{value}'",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
