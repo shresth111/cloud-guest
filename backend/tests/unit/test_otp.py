@@ -955,3 +955,47 @@ class TestTwilioWhatsAppProvider:
         )
         with pytest.raises(httpx.HTTPStatusError):
             await provider.send("+15551234567", code="042817", message="ignored")
+
+
+# ============================================================================
+# Tenant scoping of the admin OTP-requests listing
+# ----------------------------------------------------------------------------
+# GET /otp/requests must derive the effective organization from the caller's
+# validated auth scope (``CurrentOrganization`` -- the same ``X-Organization-Id``
+# header the ``otp.read`` permission check derives its scope from), never from
+# a client-supplied query param. Otherwise an org-scoped admin who sent the
+# header (passing the org-scoped permission check) but omitted the
+# ``?organization_id=`` query param had the org filter silently dropped and
+# read every organization's OTP requests -- guest identifiers (PII) across
+# tenants.
+# ============================================================================
+
+
+def _otp_routes_by_path_method():
+    from app.main import create_app
+
+    app = create_app()
+    routes: dict[tuple[str, str], object] = {}
+    for route in app.routes:
+        methods = getattr(route, "methods", None)
+        path = getattr(route, "path", None)
+        if not methods or not path or not path.startswith("/api/v1/"):
+            continue
+        for method in methods:
+            routes[(path, method)] = route
+    return routes
+
+
+def test_otp_requests_listing_resolves_org_from_auth_scope_not_query_param():
+    from app.domains.rbac.dependencies import CurrentOrganization
+
+    route = _otp_routes_by_path_method()[("/api/v1/otp/requests", "GET")]
+    dependant = route.dependant
+
+    # organization_id is no longer a request query parameter ...
+    query_names = {param.name for param in dependant.query_params}
+    assert "organization_id" not in query_names
+
+    # ... it is resolved via the CurrentOrganization dependency instead.
+    dependency_calls = {dep.call for dep in dependant.dependencies}
+    assert CurrentOrganization in dependency_calls
