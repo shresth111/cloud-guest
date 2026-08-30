@@ -129,6 +129,7 @@ from app.domains.guest.dependencies import get_guest_analytics_service
 from app.domains.guest.service import GuestAnalyticsService
 from app.domains.rbac.authorization import AccessValidator
 from app.domains.rbac.dependencies import (
+    CurrentOrganization,
     CurrentUser,
     RequirePermission,
     get_access_validator,
@@ -535,14 +536,22 @@ async def create_alert_rule(
 )
 async def list_alert_rules(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     is_active: bool | None = Query(default=None),
     page: int = Query(default=DEFAULT_LIST_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_LIST_PAGE_SIZE, ge=1, le=100),
     service: AlertService = Depends(get_alert_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param
+    # -- matching audit/controller_logs/analytics/dashboard. A non-GLOBAL
+    # caller can only ever resolve to an org they are an active member of (the
+    # membership check inside ``CurrentOrganization``), so ``organization_id``
+    # here is either that own org or ``None`` for a platform/GLOBAL caller who
+    # legitimately reads across organizations.
     items, meta = await service.list_alert_rules(
         organization_id=organization_id,
+        include_all_organizations=organization_id is None,
         is_active=is_active,
         page=page,
         page_size=page_size,
@@ -640,7 +649,7 @@ async def delete_alert_rule(
 )
 async def list_alerts(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     router_id: uuid.UUID | None = Query(default=None),
     alert_status: AlertStatus | None = Query(default=None, alias="status"),
     severity: str | None = Query(default=None),
@@ -648,8 +657,15 @@ async def list_alerts(
     page_size: int = Query(default=DEFAULT_LIST_PAGE_SIZE, ge=1, le=100),
     service: AlertService = Depends(get_alert_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param
+    # -- matching audit/controller_logs/analytics/dashboard. A non-GLOBAL
+    # caller can only ever resolve to an org they are an active member of, so
+    # ``organization_id`` is either that own org or ``None`` for a
+    # platform/GLOBAL caller who legitimately reads across organizations.
     items, meta = await service.list_alerts(
         organization_id=organization_id,
+        include_all_organizations=organization_id is None,
         status=alert_status.value if alert_status is not None else None,
         severity=severity,
         router_id=router_id,

@@ -35,6 +35,7 @@ __all__ = [
     "SlaTargetNotFoundError",
     "InvalidSlaTargetConfigError",
     "InsufficientSlaDataError",
+    "UnscopedOrganizationListError",
 ]
 
 
@@ -45,6 +46,30 @@ class MonitoringError(CloudGuestError):
         self, message: str, *, status_code: int, data: dict[str, object] | None = None
     ) -> None:
         super().__init__(message, status_code=status_code, data=data)
+
+
+class UnscopedOrganizationListError(MonitoringError):
+    """Defense-in-depth guard raised by the alerts/alert-rules repository
+    listings when no ``organization_id`` filter is supplied and the caller
+    did not *explicitly* opt into a cross-organization read
+    (``include_all_organizations=True``).
+
+    Without this, ``app.database.utils.filters.apply_filters`` drops a
+    ``None`` filter entirely -- emitting no ``WHERE organization_id = ...``
+    clause -- so a missing org filter would silently mean "every
+    organization". The router resolves the effective org from the caller's
+    auth scope and only sets the explicit cross-org flag for a
+    platform/GLOBAL caller; this guard ensures that any *other* code path
+    that reaches these listings without an org can never accidentally leak
+    another tenant's rows. Treated as a 403 -- a scoped read with no
+    resolvable organization context is forbidden, not a bad request."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "organization_id is required for this listing unless a "
+            "cross-organization read is explicitly requested",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
 
 
 class InvalidEventDateRangeError(MonitoringError):
