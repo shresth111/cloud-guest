@@ -981,6 +981,19 @@ class AuditAction(StrEnum):
     CHANNEL_PARTNER_REVOKED = "channel_partner_revoked"
     CHANNEL_PARTNER_WELCOME_RESENT = "channel_partner_welcome_resent"
 
+    # System Settings domain event -- the platform-wide (GLOBAL-scope)
+    # configuration store (``app.domains.system_settings``), written through
+    # this same table via the identical narrow ``AuditLogWriter`` protocol
+    # shape the Channel Partner/Organization/Voucher domains already use.
+    # A platform default (e.g. ``new_customer_default_plan_id``) is exactly
+    # the kind of change an operator needs a "who changed this, when, from
+    # what to what" trail for -- the same bar ``PLAN_UPDATED``/
+    # ``TAX_RATE_UPDATED`` are held to -- so every ``PUT /system-settings``
+    # that actually changes a value records one entry carrying the changed
+    # keys (old + new) in ``event_metadata``. ``organization_id`` is always
+    # ``None``: this is platform state that belongs to no tenant.
+    SYSTEM_SETTINGS_UPDATED = "system_settings_updated"
+
 
 # Actions that must never surface on an organization-scoped audit query --
 # concretely, the customer dashboard's own Admin Logs -> "Account Activity"
