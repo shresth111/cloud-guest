@@ -65,6 +65,7 @@ from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
+from app.domains.system_settings.router import router as system_settings_router
 from app.domains.user.router import router as user_router
 from app.domains.vlan.router import router as vlan_router
 from app.domains.voucher.router import router as voucher_router
@@ -132,6 +133,7 @@ api_v1_router.include_router(agent_permissions_router)
 api_v1_router.include_router(live_sessions_router)
 api_v1_router.include_router(customer_provisioning_router)
 api_v1_router.include_router(system_router)
+api_v1_router.include_router(system_settings_router)
 api_v1_router.include_router(branding_router)
 api_v1_router.include_router(support_tickets_router)
 api_v1_router.include_router(demo_request_router)
