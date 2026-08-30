@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import uuid
 
+from app.domains.guest.constants import GuestSessionStatus
 from app.domains.guest.service import GuestService
 from app.domains.rbac.service import RBACService
 
@@ -37,33 +38,49 @@ class LiveSessionService:
         page_size: int = 25,
     ) -> LiveSessionListResponse:
         sessions = []
+        # ``status`` arrives as the raw query-string value (defaulting to
+        # "active"); ``GuestService.list_sessions`` filters on the
+        # ``GuestSessionStatus`` enum, so coerce it and treat an unknown/blank
+        # value as "no status filter" rather than raising.
+        session_status: GuestSessionStatus | None = None
+        if status:
+            try:
+                session_status = GuestSessionStatus(status)
+            except ValueError:
+                session_status = None
         try:
             result = await self.guest_service.list_sessions(
-                organization_id=organization_id,
+                requesting_organization_id=organization_id,
                 location_id=location_id,
+                status=session_status,
                 page=page,
                 page_size=page_size,
             )
             # Adapt guest sessions to live session format
             for s in result[0] if isinstance(result, tuple) else result:
-                sessions.append(LiveSession(
-                    id=str(getattr(s, "id", "")),
-                    username=getattr(s, "guest_username", str(getattr(s, "id", ""))),
-                    mac=getattr(s, "mac_address", ""),
-                    ip=getattr(s, "ip_address", ""),
-                    ssid=getattr(s, "ssid", ""),
-                    nas=getattr(s, "nas_identifier", ""),
-                    router=getattr(s, "router_name", ""),
-                    device=getattr(s, "user_agent", ""),
-                    signal=getattr(s, "signal_strength", 0) or 0,
-                    session_time_seconds=getattr(s, "session_duration_seconds", 0) or 0,
-                    download_bytes=getattr(s, "bytes_downloaded", 0) or 0,
-                    upload_bytes=getattr(s, "bytes_uploaded", 0) or 0,
-                    status=getattr(s, "status", "active"),
-                    location_id=str(getattr(s, "location_id", "")),
-                    organization_id=str(getattr(s, "organization_id", "")),
-                    started_at=getattr(s, "connected_at", None),
-                ))
+                sessions.append(
+                    LiveSession(
+                        id=str(getattr(s, "id", "")),
+                        username=getattr(
+                            s, "guest_username", str(getattr(s, "id", ""))
+                        ),
+                        mac=getattr(s, "mac_address", ""),
+                        ip=getattr(s, "ip_address", ""),
+                        ssid=getattr(s, "ssid", ""),
+                        nas=getattr(s, "nas_identifier", ""),
+                        router=getattr(s, "router_name", ""),
+                        device=getattr(s, "user_agent", ""),
+                        signal=getattr(s, "signal_strength", 0) or 0,
+                        session_time_seconds=getattr(s, "session_duration_seconds", 0)
+                        or 0,
+                        download_bytes=getattr(s, "bytes_downloaded", 0) or 0,
+                        upload_bytes=getattr(s, "bytes_uploaded", 0) or 0,
+                        status=getattr(s, "status", "active"),
+                        location_id=str(getattr(s, "location_id", "")),
+                        organization_id=str(getattr(s, "organization_id", "")),
+                        started_at=getattr(s, "started_at", None),
+                    )
+                )
         except Exception as exc:
             logger.warning("Could not fetch live sessions: %s", exc)
 
