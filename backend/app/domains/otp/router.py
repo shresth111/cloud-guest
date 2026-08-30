@@ -39,7 +39,7 @@ from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.database.constants import SortOrder
-from app.domains.rbac.dependencies import RequirePermission
+from app.domains.rbac.dependencies import CurrentOrganization, RequirePermission
 
 from .constants import OtpPurpose
 from .dependencies import get_otp_service
@@ -172,10 +172,22 @@ async def list_otp_requests(
     page_size: int = Query(default=25, ge=1, le=100),
     identifier: str | None = Query(default=None, max_length=255),
     purpose: OtpPurpose | None = Query(default=None),
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     location_id: uuid.UUID | None = Query(default=None),
     service: OtpService = Depends(get_otp_service),
 ):
+    # Tenant scoping: the effective organization is resolved from the caller's
+    # auth scope (``CurrentOrganization``), never a client-supplied query param.
+    # Previously ``organization_id`` came from the query string while the RBAC
+    # permission check derived scope from the ``X-Organization-Id`` header -- so
+    # an org-scoped admin who sent the header (passing the org-scoped
+    # ``otp.read`` check) but omitted ``?organization_id=`` had the org filter
+    # silently dropped and read every organization's OTP requests (guest
+    # identifiers -- PII -- across tenants). Resolving it from the same header
+    # the permission check uses closes that gap; a non-GLOBAL caller can only
+    # ever resolve to an org they are an active member of, and a caller reaching
+    # this handler with ``organization_id is None`` passed the GLOBAL-scope
+    # permission gate and may legitimately read across organizations.
     filters: dict[str, object] = {
         "identifier": identifier,
         "purpose": purpose.value if purpose else None,
