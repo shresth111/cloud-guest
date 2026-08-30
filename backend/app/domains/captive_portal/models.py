@@ -137,6 +137,7 @@ from .constants import (
     DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
     DEFAULT_GUEST_FONT_CHOICE,
     DEFAULT_LANGUAGE,
+    DEFAULT_PORTAL_CONTENT_MODE,
     DEFAULT_PRIMARY_COLOR,
     DEFAULT_SECONDARY_COLOR,
     DEFAULT_THEME,
@@ -286,8 +287,40 @@ class CaptivePortalConfig(BaseModel):
     splash_welcome_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Where a guest is sent after a successful login (e.g. back to the
     # business's own website) -- consumed by the future `guest` module,
-    # never followed by this one.
+    # never followed by this one. Also the destination for
+    # ``content_mode == "redirect"`` (see below) -- one column, both
+    # purposes, rather than a parallel field that could drift out of sync.
     redirect_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # -- content mode --------------------------------------------------------
+    # What the portal presents as its primary content before/instead of the
+    # sign-in form -- see constants.PortalContentMode. A plain String (not a
+    # PG enum), default "login" (the existing, unchanged sign-in-only render),
+    # so migration 0098 backfilling every existing row to "login" is a pure
+    # no-op on what any guest currently sees. Each non-login mode reads its
+    # content from exactly one of the columns below (redirect reuses
+    # redirect_url above); the frontend's PortalContentBlock renders it.
+    content_mode: Mapped[str] = mapped_column(
+        String(20), default=DEFAULT_PORTAL_CONTENT_MODE.value, nullable=False
+    )
+    # content_mode == "image"/"text"/"survey": an optional heading shown
+    # above the content block. content_mode == "text": the body copy under
+    # it. content_mode == "image": the foreground content image URL (the
+    # promo/menu/event graphic itself -- distinct from background_image_url,
+    # which is the backdrop the sign-in card floats over). All nullable: a
+    # mode may be selected before its content is filled in (a draft), and the
+    # frontend degrades gracefully to the sign-in card when the chosen mode's
+    # source column is empty.
+    content_heading: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    content_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # content_mode == "survey": the survey definition -- a small
+    # JSON object ({"questions": [...], "submitLabel": "..."}), the same
+    # "explicit column, JSONB when the shape is a self-contained document"
+    # choice supported_languages/social_login_providers already make here.
+    # The frontend (types/portal-runtime.ts PortalSurvey) owns the schema;
+    # this column stores it verbatim.
+    content_survey: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # -- authentication method flags -----------------------------------------
     otp_sms_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

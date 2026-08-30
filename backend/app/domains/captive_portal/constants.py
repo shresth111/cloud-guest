@@ -56,6 +56,42 @@ class GuestFontChoice(StrEnum):
     BOLD_DISPLAY = "bold-display"
 
 
+class PortalContentMode(StrEnum):
+    """What the guest-facing captive portal presents as its primary content
+    before (or instead of) the sign-in form. Stored as a plain ``String``
+    column for the same additive-migration reason ``PortalTheme`` is (see
+    this module's header) -- adding a mode never needs an ``ALTER TYPE``.
+
+    ``LOGIN`` is the default and is the *existing*, unchanged behaviour: the
+    portal renders only the sign-in card, exactly as every venue does today.
+    Making it the default (and the value migration 0098 backfills every
+    existing row to) is what keeps this whole feature a pure addition -- no
+    venue's rendered portal changes until an admin deliberately picks a
+    different mode. The other four are the demo-showcased content modes, each
+    rendered by ``PortalContentBlock`` on the frontend and sourced from a
+    dedicated column:
+
+    * ``IMAGE`` -- a full-bleed content image (``content_image_url``), e.g. a
+      promo, menu board, or event card, shown above the connect action.
+    * ``TEXT`` -- a venue-authored text block (``content_heading`` +
+      ``content_body``), e.g. house rules or a welcome note.
+    * ``REDIRECT`` -- the portal sends the guest straight to ``redirect_url``
+      (the pre-existing post-login destination column, reused here rather
+      than a parallel field). Rendered as the existing ``/portal/redirect``
+      countdown screen.
+    * ``SURVEY`` -- a short guest survey (``content_survey`` JSON) shown
+      before connect, e.g. a satisfaction rating or a single choice question.
+
+    This module stores the *selection* and its content; it renders nothing --
+    the frontend owns every mode's presentation."""
+
+    LOGIN = "login"
+    IMAGE = "image"
+    TEXT = "text"
+    REDIRECT = "redirect"
+    SURVEY = "survey"
+
+
 # 6-digit hex color, leading '#' required (e.g. "#1A73E8") -- deliberately
 # does not accept the 3-digit shorthand (e.g. "#FFF") or an alpha channel:
 # a single, unambiguous, copy-paste-from-a-design-tool format keeps
@@ -86,6 +122,19 @@ DEFAULT_SUPPORTED_LANGUAGES: tuple[str, ...] = ("en",)
 # Editorial Serif, Bold Display, or back to System via its own branding
 # settings.
 DEFAULT_GUEST_FONT_CHOICE = GuestFontChoice.MODERN_SANS
+
+# The mode every existing venue is on and every new config starts at -- see
+# PortalContentMode.LOGIN's docstring for why the default must be "render the
+# sign-in card and nothing else" (this feature is purely additive).
+DEFAULT_PORTAL_CONTENT_MODE = PortalContentMode.LOGIN
+
+# Authoring-time ceilings for the two venue-authored content-mode strings.
+# Unlike the splash limits above these are not derived from an above-the-fold
+# render budget -- content-mode copy renders in its own scrollable block, not
+# stacked above the primary CTA -- so they are plain generous column limits
+# that only exist to keep a single row from being unbounded free text.
+CONTENT_HEADING_MAX_LENGTH = 120
+CONTENT_BODY_MAX_LENGTH = 2000
 
 # Integer 0-100, the guest-facing scrim's peak opacity as a percentage --
 # v6 design spec §4.2. 55 is not arbitrary: it is defined to reproduce the
@@ -232,8 +281,12 @@ PRIVACY_POLICY_LABEL = "privacy policy"
 __all__ = [
     "PortalTheme",
     "GuestFontChoice",
+    "PortalContentMode",
     "HEX_COLOR_PATTERN",
     "DEFAULT_THEME",
+    "DEFAULT_PORTAL_CONTENT_MODE",
+    "CONTENT_HEADING_MAX_LENGTH",
+    "CONTENT_BODY_MAX_LENGTH",
     "DEFAULT_PRIMARY_COLOR",
     "DEFAULT_SECONDARY_COLOR",
     "DEFAULT_LANGUAGE",
