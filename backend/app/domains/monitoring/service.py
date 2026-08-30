@@ -1310,12 +1310,14 @@ class AlertService:
         self,
         *,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         is_active: bool | None = None,
         page: int = DEFAULT_LIST_PAGE,
         page_size: int = DEFAULT_LIST_PAGE_SIZE,
     ) -> tuple[list[AlertRule], PaginationMeta]:
         return await self.repository.list_alert_rules(
             organization_id=organization_id,
+            include_all_organizations=include_all_organizations,
             is_active=is_active,
             page=page,
             page_size=page_size,
@@ -1335,6 +1337,7 @@ class AlertService:
         self,
         *,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         status: str | None = None,
         severity: str | None = None,
         router_id: uuid.UUID | None = None,
@@ -1343,6 +1346,7 @@ class AlertService:
     ) -> tuple[list[Alert], PaginationMeta]:
         return await self.repository.list_alerts(
             organization_id=organization_id,
+            include_all_organizations=include_all_organizations,
             status=status,
             severity=severity,
             router_id=router_id,
