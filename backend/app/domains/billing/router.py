@@ -1202,16 +1202,23 @@ async def create_coupon(
 )
 async def list_coupons(
     request: Request,
-    organization_id: uuid.UUID | None = Query(default=None),
+    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     is_active: bool | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     service: CouponService = Depends(get_coupon_service),
 ):
+    # Tenant scoping: resolve the effective organization from the caller's auth
+    # scope (``CurrentOrganization``), never a client-supplied query param. An
+    # org-scoped caller sees only their own org's coupons plus GLOBAL ones
+    # (``organization_id IS NULL``); a platform/GLOBAL caller (org resolves to
+    # ``None`` -- reachable only by passing the GLOBAL-scope permission gate)
+    # reads across every organization.
     items, meta = await service.list_coupons(
         page=page,
         page_size=page_size,
         organization_id=organization_id,
+        include_all_organizations=organization_id is None,
         is_active=is_active,
     )
     responses = []
