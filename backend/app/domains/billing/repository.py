@@ -37,7 +37,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -463,6 +463,7 @@ class CouponRepositoryProtocol(Protocol):
         page: int,
         page_size: int,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         is_active: bool | None = None,
     ) -> tuple[list[Coupon], PaginationMeta]: ...
 
@@ -527,20 +528,36 @@ class CouponRepository:
         page: int,
         page_size: int,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         is_active: bool | None = None,
     ) -> tuple[list[Coupon], PaginationMeta]:
-        filters: dict[str, object] = {}
-        if organization_id is not None:
-            filters["organization_id"] = organization_id
+        # Tenant scoping. A ``Coupon`` is either GLOBAL (``organization_id IS
+        # NULL``, usable by any org) or organization-specific. Previously an
+        # absent ``organization_id`` meant "no filter" -> every organization's
+        # private coupons, so an org-scoped caller who omitted the param read
+        # other tenants' exclusive discount codes. An org-scoped caller must
+        # instead see exactly their own org's coupons *plus* the GLOBAL ones;
+        # only a platform/GLOBAL caller (``include_all_organizations``) reads
+        # every organization's coupons.
+        conditions = [Coupon.is_deleted.is_(False)]
         if is_active is not None:
-            filters["is_active"] = is_active
-        return await self.coupons.paginate(
-            page=page,
-            page_size=page_size,
-            filters=filters,
-            sort_by="created_at",
-            sort_order=SortOrder.DESC,
+            conditions.append(Coupon.is_active.is_(is_active))
+        if not include_all_organizations:
+            conditions.append(
+                or_(
+                    Coupon.organization_id == organization_id,
+                    Coupon.organization_id.is_(None),
+                )
+            )
+        params = PageParams(page=page, page_size=page_size)
+        count_statement = select(func.count()).select_from(Coupon).where(*conditions)
+        total_items = int((await self.session.execute(count_statement)).scalar_one())
+        statement = (
+            select(Coupon).where(*conditions).order_by(Coupon.created_at.desc())
         )
+        result = await self.session.execute(paginate(statement, params))
+        rows = list(result.scalars().all())
+        return rows, PaginationMeta.from_total(params, total_items)
 
     async def set_applicable_plans(
         self, coupon_id: uuid.UUID, plan_ids: Sequence[uuid.UUID]

@@ -333,13 +333,21 @@ class FakeCouponRepository:
         page: int,
         page_size: int,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         is_active: bool | None = None,
     ) -> tuple[list[Coupon], PaginationMeta]:
-        items = list(self.coupons.values())
-        if organization_id is not None:
-            items = [c for c in items if c.organization_id == organization_id]
+        items = [c for c in self.coupons.values() if not c.is_deleted]
         if is_active is not None:
             items = [c for c in items if c.is_active == is_active]
+        if not include_all_organizations:
+            # Org-scoped caller: own org's coupons plus GLOBAL ones
+            # (``organization_id IS NULL``); never another org's.
+            items = [
+                c
+                for c in items
+                if c.organization_id == organization_id
+                or c.organization_id is None
+            ]
         params = PageParams(page=page, page_size=page_size)
         return items, PaginationMeta.from_total(params, len(items))
 
@@ -1416,3 +1424,83 @@ class TestReminders:
         assert report.expired_subscription_ids == []
         assert isinstance(report.renewal_reminders_sent, int)
         assert isinstance(report.expiry_reminders_sent, int)
+
+
+# ============================================================================
+# Tenant scoping of the coupon catalog listing (GET /coupons)
+# ----------------------------------------------------------------------------
+# A ``Coupon`` is either GLOBAL (``organization_id IS NULL``, usable by any
+# org) or organization-specific. ``billing.read`` is an ORGANIZATION-scoped
+# permission held by org-scoped customer roles, so ``GET /coupons`` is
+# reachable by a customer. Previously ``organization_id`` came from a query
+# param and, when omitted, dropped the filter entirely -- an org-scoped caller
+# who omitted it read every other tenant's private coupon codes. The effective
+# org must instead be resolved from the caller's auth scope, and an org-scoped
+# caller must see only their own org's coupons plus the GLOBAL ones.
+# ============================================================================
+
+
+async def _seed_coupon(fx: CouponFixture, *, code: str, organization_id):
+    return await fx.repository.create_coupon(
+        code=code,
+        discount_type="percentage",
+        discount_value=Decimal("10"),
+        currency=None,
+        organization_id=organization_id,
+        max_uses=None,
+        current_uses=0,
+        valid_from=_now(),
+        valid_until=None,
+        is_active=True,
+    )
+
+
+async def test_list_coupons_scoped_caller_sees_own_org_and_global_only():
+    fx = make_coupon_service()
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    await _seed_coupon(fx, code="AONLY", organization_id=org_a)
+    await _seed_coupon(fx, code="BONLY", organization_id=org_b)
+    await _seed_coupon(fx, code="GLOBAL", organization_id=None)
+
+    items, meta = await fx.service.list_coupons(
+        organization_id=org_a, include_all_organizations=False
+    )
+    codes = {c.code for c in items}
+    # Own org's coupon + the GLOBAL coupon, but never org_b's private coupon.
+    assert codes == {"AONLY", "GLOBAL"}
+    assert meta.total_items == 2
+
+
+async def test_list_coupons_platform_caller_sees_every_org():
+    fx = make_coupon_service()
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    await _seed_coupon(fx, code="AONLY", organization_id=org_a)
+    await _seed_coupon(fx, code="BONLY", organization_id=org_b)
+    await _seed_coupon(fx, code="GLOBAL", organization_id=None)
+
+    items, _meta = await fx.service.list_coupons(
+        organization_id=None, include_all_organizations=True
+    )
+    assert {c.code for c in items} == {"AONLY", "BONLY", "GLOBAL"}
+
+
+def test_coupon_listing_resolves_org_from_auth_scope_not_query_param():
+    from app.domains.rbac.dependencies import CurrentOrganization
+    from app.main import create_app
+
+    app = create_app()
+    route = next(
+        r
+        for r in app.routes
+        if getattr(r, "path", None) == "/api/v1/coupons"
+        and "GET" in (getattr(r, "methods", None) or set())
+    )
+    dependant = route.dependant
+
+    # organization_id is no longer a request query parameter ...
+    query_names = {param.name for param in dependant.query_params}
+    assert "organization_id" not in query_names
+
+    # ... it is resolved via the CurrentOrganization dependency instead.
+    dependency_calls = {dep.call for dep in dependant.dependencies}
+    assert CurrentOrganization in dependency_calls
