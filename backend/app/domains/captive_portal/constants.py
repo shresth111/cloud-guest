@@ -272,6 +272,28 @@ MAX_BACKGROUND_FOCAL = 100
 SPLASH_HEADLINE_MAX_LENGTH = 26
 SPLASH_WELCOME_MESSAGE_MAX_LENGTH = 78
 
+# Byte ceiling on ``captive_portal_configs.post_login_html`` -- the HTML a
+# venue authors for the page a guest sees *after* a successful sign-in.
+#
+# Measured in UTF-8 **bytes**, not characters, unlike SPLASH_*_MAX_LENGTH
+# above. Those two are rendered-line budgets, so code points are the right
+# unit; this one is a resource limit on a blob that gets parsed on write,
+# cached in Redis and shipped in every guest resolve response, so the unit
+# that matters is what it costs to move and store.
+#
+# 64 KiB is roughly 20x the largest thing a hand-authored page plausibly
+# needs (a full page of prose with inline CSS runs 2-4 KB) while staying
+# small enough that a hostile 64 KB payload is not a useful way to make the
+# sanitizer or the resolve cache expensive. Enforced against the *submitted*
+# value, before sanitizing, so the size in the 400 is the size the venue
+# sees in their own editor -- see html_sanitizer.sanitize_post_login_html.
+#
+# It is deliberately not a DB-level constraint: the column is Text, and the
+# sanitizer can return slightly *more* bytes than it was given (it appends
+# rel/target to anchors), so a hard column limit at exactly this number
+# would reject a payload that passed validation.
+POST_LOGIN_HTML_MAX_BYTES = 64 * 1024
+
 # Field-label constants for the "at most one of text/url" validation --
 # see validators.validate_single_content_source's docstring for why this is
 # "at most one", not "exactly one".
@@ -301,6 +323,7 @@ __all__ = [
     "MAX_BACKGROUND_FOCAL",
     "SPLASH_HEADLINE_MAX_LENGTH",
     "SPLASH_WELCOME_MESSAGE_MAX_LENGTH",
+    "POST_LOGIN_HTML_MAX_BYTES",
     "TERMS_AND_CONDITIONS_LABEL",
     "PRIVACY_POLICY_LABEL",
 ]
