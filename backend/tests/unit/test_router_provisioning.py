@@ -2635,3 +2635,55 @@ class TestRecordFailedHealthCheck:
             await service.record_failed_health_check(
                 router_id=uuid.uuid4(), requesting_organization_id=None
             )
+
+
+class TestEnrollmentApprovalCannotSetPlatformCredentials:
+    """The second door onto the same secret, found while fixing the first.
+
+    ``POST /router-enrollment/{id}/approve`` is gated on
+    ``router_provisioning.approve``, which -- like ``routers.update`` --
+    ``organization-owner``/``organization-admin``/``msp-*`` hold at
+    ORGANIZATION scope. Its request schema used to carry
+    ``api_username``/``api_secret``, so closing only
+    ``RouterCreateRequest``/``RouterUpdateRequest`` would have left an
+    identical way in. Approval registers the device; the credential is set
+    afterwards via ``PUT /platform/routers/{id}/management-access``
+    (GLOBAL-only).
+    """
+
+    def test_approve_schema_carries_no_credential_field(self) -> None:
+        from app.domains.router_provisioning.schemas import (
+            RouterEnrollmentApproveRequest,
+        )
+
+        assert not {"api_username", "api_secret"} & set(
+            RouterEnrollmentApproveRequest.model_fields
+        )
+
+    def test_a_hostile_approve_payload_drops_the_credential(self) -> None:
+        from app.domains.router_provisioning.schemas import (
+            RouterEnrollmentApproveRequest,
+        )
+
+        parsed = RouterEnrollmentApproveRequest.model_validate(
+            {
+                "location_id": str(uuid.uuid4()),
+                "name": "Front Desk AP",
+                "api_username": "attacker",
+                "api_secret": "pwned",
+            }
+        )
+        assert not {"api_username", "api_secret"} & set(parsed.model_dump())
+
+    def test_the_permission_really_is_held_at_organization_scope(self) -> None:
+        """The premise, asserted rather than assumed -- same shape as
+        ``test_router.py``'s own version."""
+        from app.domains.rbac.enums import PermissionAction, PermissionModule, ScopeType
+        from app.domains.rbac.seed import SYSTEM_ROLES
+
+        role = next(r for r in SYSTEM_ROLES if r.slug == "organization-owner")
+        assert role.scope_type == ScopeType.ORGANIZATION
+        assert (
+            PermissionAction.APPROVE
+            in role.grants()[PermissionModule.ROUTER_PROVISIONING]
+        )

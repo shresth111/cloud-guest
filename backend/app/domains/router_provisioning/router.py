@@ -847,8 +847,6 @@ async def approve_enrollment(
         name=payload.name,
         management_ip_address=payload.management_ip_address,
         public_ip_address=payload.public_ip_address,
-        api_username=payload.api_username,
-        api_secret=payload.api_secret,
     )
     result = RouterEnrollmentApproveResponse(
         enrollment=_enrollment_response(enrollment), router_id=str(router_device.id)
