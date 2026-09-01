@@ -41,14 +41,32 @@ graph, which resolves ``Depends(get_db_session)`` exactly once per request
 and hands that *same* ``AsyncSession`` instance to every dependant that
 (transitively) needs one -- so every composed repository in this call tree
 shares one connection/transaction. ``provision_location`` itself never
-catches and swallows an exception from any composed step (no
-``try``/``except`` anywhere in this method) -- so a failure at, say, step
-(g) propagates all the way up through the FastAPI route handler to
-``get_db_session``'s own ``except Exception: await session.rollback(); raise``,
-which genuinely rolls back every flushed-but-uncommitted change from steps
-(a)-(f) too. See ``tests/unit/test_location_provisioning.py``'s
+catches and swallows an exception from any composed step -- so a failure
+at, say, step (g) propagates all the way up through the FastAPI route
+handler to ``get_db_session``'s own
+``except Exception: await session.rollback(); raise``, which genuinely
+rolls back every flushed-but-uncommitted change from steps (a)-(f) too.
+See ``tests/unit/test_location_provisioning.py``'s
 ``TestTransactionalRollback`` for a real, forced-failure proof of this using
 a shared fake session double.
+
+There is exactly ONE ``try``/``except`` in ``provision_location``, around
+the WireGuard hub allocation, and it **re-raises** (as
+``RouterTunnelProvisioningFailedError``) rather than swallowing -- so the
+rollback above still happens, unchanged. It exists only to add the one
+fact the underlying hub errors cannot carry and the operator will act on:
+that nothing was saved. See that class's docstring.
+
+## The one step this transaction cannot undo
+
+``POST /wg/peer`` on the hub agent is an HTTP call to another machine, and
+that agent has no removal verb -- a ``DELETE`` answers ``501``. A peer it
+mints is therefore permanent whatever this transaction subsequently does.
+That is why the tunnel allocation, numbered step (e) by the spec, is
+executed **last** among the write steps (as ``e'``, after step (j)):
+running it first meant every later failure rolled back the database while
+stranding a peer and a tunnel address on the hub forever. See the comments
+at both positions in ``provision_location``.
 
 ## Billing feature-flag/plan-limit override design decision
 
@@ -210,7 +228,9 @@ from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.models import Role
 from app.domains.router.models import Router
 from app.domains.router_provisioning.models import ConfigTemplate
-from app.domains.wireguard.service import TunnelDeliveryInfo
+from app.domains.wireguard.dependencies import HubBridgeUnavailableError
+from app.domains.wireguard.exceptions import WireGuardError
+from app.domains.wireguard.service import HubTunnelAllocation
 
 from .enums import PropertyType
 from .exceptions import DefaultConfigTemplateNotFoundError, NewOrganizationRequiredError
@@ -258,6 +278,53 @@ class OwnerRoleNotSeededError(CloudGuestError):
             "The 'organization-owner' system role is not seeded -- run "
             "app.domains.rbac.seed.seed_rbac first",
             status_code=500,
+        )
+
+
+class RouterTunnelProvisioningFailedError(CloudGuestError):
+    """The hub bridge could not give the new router a WireGuard identity, so
+    the whole customer was rolled back.
+
+    ## Why this exists rather than letting the underlying error through
+
+    The underlying errors are written for someone holding a router_id --
+    ``HubBridgeUnavailableError`` ("Could not reach the WireGuard hub
+    bridge"), ``HubPeerAllocatorNotConfiguredError``,
+    ``TunnelIPAllocationConflictError``. An operator who has just filled in
+    a five-page new-customer wizard needs one more fact none of those
+    carry, and it is the fact they will act on: **whether the customer they
+    just tried to create exists.** Without it the honest options are both
+    wrong -- retry and risk a duplicate organization, or go hunting for a
+    half-built account that is not there.
+
+    It is not there. ``provision_location`` runs inside the single
+    request-scoped ``AsyncSession`` (see module docstring), so raising here
+    rolls back the organization, the owner user, the location and the
+    router along with everything else. This error says so in the message.
+
+    ``status_code`` is inherited from the cause rather than flattened to
+    500, so a caller can still tell "the hub is down, retry" (502) from
+    "this deployment has no hub configured" (503) from an allocation
+    conflict (409) -- the same distinction
+    ``HubBridgeUnavailableError``'s own docstring had to fight for.
+
+    ## The one thing rollback does NOT undo
+
+    If the hub bridge already minted a peer and a *later* step failed, that
+    peer stays on the hub forever: ``ops/hub-agents/wg_agent.py`` as
+    deployed has no ``do_DELETE`` (a DELETE answers ``501``). That is why
+    the allocation is deliberately the LAST write step in
+    ``provision_location`` -- see the comment at its call site."""
+
+    def __init__(self, *, router_name: str, cause: CloudGuestError) -> None:
+        super().__init__(
+            f"Could not allocate a WireGuard tunnel for router "
+            f"'{router_name}' through the hub bridge, so this customer was "
+            f"NOT provisioned: {cause.message}. Nothing was saved -- the "
+            "organization, owner account, location and router from this "
+            "attempt have all been rolled back. Once the hub bridge is "
+            "reachable again, submit the form again.",
+            status_code=cause.status_code,
         )
 
 
@@ -401,13 +468,28 @@ class ConfigTemplateAssignmentProtocol(Protocol):
 
 
 class WireGuardProvisioningProtocol(Protocol):
-    async def create_tunnel(
+    """DELIBERATELY NOT ``create_tunnel``.
+
+    ``WireGuardService.create_tunnel`` generates the keypair on the
+    platform, and ``ops/hub-agents/wg_agent.py`` has no verb that accepts a
+    public key it did not generate itself -- so the tunnel it describes can
+    never establish, and the service refuses outright with
+    ``HubCannotLearnPlatformKeyError``. Provisioning called it anyway until
+    2026-09-01, which is why creating a customer failed every time, at
+    step (e), after the organization/owner/router rows had already been
+    written. ``allocate_tunnel_via_hub`` is the path that produces a key
+    both sides hold; see its own docstring for the reuse/adopt/allocate
+    decision it makes."""
+
+    async def allocate_tunnel_via_hub(
         self,
         *,
         actor_user_id: uuid.UUID | None,
         router_id: uuid.UUID,
         requesting_organization_id: uuid.UUID | None,
-    ) -> TunnelDeliveryInfo: ...
+        rotate: bool = False,
+        force: bool = False,
+    ) -> HubTunnelAllocation: ...
 
 
 class PlanProvisioningProtocol(Protocol):
@@ -966,12 +1048,36 @@ class LocationProvisioningService:
             settings=dict(data.router.settings),
         )
 
-        # -- e. Generate WireGuard Peer -----------------------------------------
-        tunnel = await self.wireguard_service.create_tunnel(
-            actor_user_id=actor_user_id,
-            router_id=router.id,
-            requesting_organization_id=None,
-        )
+        # -- e. Generate WireGuard Peer -- DEFERRED, see step (e') below --------
+        #
+        # The spec numbers the tunnel as step (e), between Register Router
+        # and Apply default router configuration, and it used to run here.
+        # It has been moved to the end of the write sequence, and the move
+        # is the point rather than a tidy-up:
+        #
+        # The hub allocation is the ONE step in this whole flow that the
+        # request's transaction cannot undo. Every other step is a
+        # `session.flush()` on the single request-scoped AsyncSession, so a
+        # failure anywhere rolls all of them back (see module docstring).
+        # `POST /wg/peer` on `ops/hub-agents/wg_agent.py` is an HTTP call to
+        # another machine that mints a keypair and consumes the next free
+        # address out of the hub's /24 -- and that agent has no `do_DELETE`
+        # (a DELETE answers `501 Unsupported method`), so nothing, here or
+        # anywhere, can give the address back.
+        #
+        # With the allocation at (e), every later failure -- an incompatible
+        # config template at (f), a plan/subscription problem at (g), a
+        # captive-portal validation error at (j) -- rolled back the database
+        # and left a peer stranded on the hub forever. `next_free_ip()`
+        # scans live kernel state, so each one permanently narrows the fleet
+        # ceiling. Running it last shrinks that window to the three steps
+        # after it, none of which touch another machine.
+        #
+        # Nothing between here and there depends on the tunnel:
+        # `assign_profile` renders its template from
+        # `RouterProvisioningService.resolve_variables`, which reads the
+        # Router row and ConfigVariable scopes only -- no WireGuard field is
+        # in scope for a template today.
 
         # -- f. Apply default router configuration ------------------------------
         template_id = data.router_config_template_id
@@ -1077,6 +1183,44 @@ class LocationProvisioningService:
             social_login_enabled=login_methods.social_login_enabled,
             social_login_providers=[],
         )
+
+        # -- e'. Generate WireGuard Peer (spec step (e), run last -- see the
+        # comment at its original position for why) ---------------------------
+        #
+        # THROUGH THE HUB BRIDGE, NEVER `create_tunnel`. `create_tunnel`
+        # generates the keypair here, on the platform, and the hub agent has
+        # no verb to be told a public key it did not generate itself -- so
+        # it refuses with `HubCannotLearnPlatformKeyError` rather than
+        # writing a row describing a tunnel that could never establish.
+        # That refusal is correct and is not suppressed here; provisioning
+        # simply asks for the allocation the right way instead.
+        #
+        # A brand-new router has no peer and no issuance history, so
+        # `allocate_tunnel_via_hub`'s reuse and adopt branches cannot match
+        # and this always reaches the bridge -- one `POST /wg/peer` per
+        # successfully provisioned customer, which is the minimum possible.
+        try:
+            tunnel = await self.wireguard_service.allocate_tunnel_via_hub(
+                actor_user_id=actor_user_id,
+                router_id=router.id,
+                requesting_organization_id=None,
+            )
+        except (HubBridgeUnavailableError, WireGuardError) as exc:
+            # BOTH types are named on purpose. `HubBridgeUnavailableError`
+            # subclasses `CloudGuestError`, NOT `WireGuardError` -- it is
+            # also the most likely failure here (the hub is another machine
+            # on the far end of an HTTP call), so an `except WireGuardError`
+            # alone would miss exactly the case this handler exists for.
+            # See that class's own docstring, trap 1.
+            #
+            # Re-raised, never swallowed: the re-raise is what makes the
+            # rollback happen, and a half-provisioned customer reported as a
+            # success is strictly worse than a clean failure. All this adds
+            # is the fact the operator needs and none of the underlying
+            # errors carry -- that nothing was saved.
+            raise RouterTunnelProvisioningFailedError(
+                router_name=router.name, cause=exc
+            ) from exc
 
         # -- k. Audit logging (one additional Location-domain entry for the
         # overall event -- every composed step above already wrote its own,
@@ -1355,4 +1499,5 @@ __all__ = [
     "FeatureOverride",
     "OwnerRoleNotSeededError",
     "OwnerNotProvisionedError",
+    "RouterTunnelProvisioningFailedError",
 ]
