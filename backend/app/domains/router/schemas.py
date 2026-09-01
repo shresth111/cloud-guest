@@ -5,10 +5,33 @@ Follows the same pydantic v2 conventions as ``app.domains.location.schemas``
 ``MessageResponse`` is re-exported from the auth domain rather than
 duplicated, matching every other domain's own convention.
 
-Credential fields (``api_username``/``api_secret``) are write-only: they
-appear on the create/update request schemas but deliberately never on
-``RouterResponse`` -- the encrypted ciphertext is not something any API
-response should ever echo back, encrypted or not.
+Credential and SNMP-transport fields (``api_username``/``api_secret``/
+``snmp_*``) live on **one** pair of schemas -- ``RouterManagementAccessRequest``
+and ``RouterPlatformResponse`` -- and those are served only by the
+``/platform/routers/...`` routes, which are gated at ``ScopeType.GLOBAL``.
+
+## Why they are not on the organization-scoped schemas
+
+``routers.read``/``routers.create``/``routers.update`` are held at
+**organization** scope by ``organization-owner`` -- the role
+``LocationProvisioningService`` assigns to every venue owner it provisions
+(``app.domains.rbac.seed``'s ``organization-owner`` has ``default_level=FULL``
+and no ``ROUTERS`` override; ``organization-admin``/``msp-*``/``read-only``/
+``auditor`` hold subsets of the same). The customer dashboard genuinely reads
+``GET /locations/{id}/routers`` for venue liveness, so those three schemas are
+customer-reachable by construction.
+
+That made the router's shared secret and the platform's own RouterOS
+management credential settable, and its SNMP transport configuration
+(on/off, version, UDP port, whether a community is configured) readable, by a
+venue owner. Splitting the field off the shape -- rather than remembering not
+to populate/accept it -- is the same fix shape ``DELETE /routers/{id}`` already
+uses for the same class of bug (see its own ``ScopeType.GLOBAL`` comment in
+``router.py``), and the same one the WireGuard domain uses wholesale.
+
+``api_secret``/``snmp_community`` remain write-only even on the platform
+schema: the encrypted ciphertext is not something any API response should ever
+echo back, encrypted or not.
 """
 
 from __future__ import annotations
@@ -27,8 +50,10 @@ __all__ = [
     "MessageResponse",
     "RouterResponse",
     "RouterListResponse",
+    "RouterPlatformResponse",
     "RouterCreateRequest",
     "RouterUpdateRequest",
+    "RouterManagementAccessRequest",
     "ProvisioningTokenResponse",
     "ProvisioningCheckInRequest",
     "ProvisioningCheckInResponse",
@@ -69,16 +94,62 @@ class RouterResponse(BaseModel):
     last_seen_at: datetime | None = None
     last_health_check_at: datetime | None = None
     health_status: str | None = None
-    has_api_credentials: bool
-    snmp_enabled: bool
-    has_snmp_community: bool
-    snmp_version: str | None = None
-    snmp_port: int | None = None
+    has_api_credentials: bool = Field(
+        ...,
+        description=(
+            "Whether the platform holds RouterOS API credentials for this "
+            "device. Deliberately kept on this customer-reachable shape "
+            "(unlike the snmp_* block, which moved to "
+            "RouterPlatformResponse): it is a bare existence flag carrying "
+            "no transport detail an attacker could act on, and the "
+            "customer-facing network pages share this exact serialization "
+            "via routerService.listForLocation()."
+        ),
+    )
     settings: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+#: Field names that must never appear on a customer-reachable router
+#: response. Asserted directly in ``tests/unit/test_router.py`` --
+#: re-adding any of them to ``RouterResponse`` fails the suite rather than
+#: silently re-opening the disclosure.
+CUSTOMER_FORBIDDEN_ROUTER_FIELDS: frozenset[str] = frozenset(
+    {
+        "api_username",
+        "api_secret",
+        "api_credentials_encrypted",
+        "snmp_enabled",
+        "snmp_community",
+        "snmp_community_encrypted",
+        "has_snmp_community",
+        "snmp_version",
+        "snmp_port",
+    }
+)
+
+
+class RouterPlatformResponse(RouterResponse):
+    """``RouterResponse`` plus the SNMP transport configuration.
+
+    Served only by ``GET /platform/routers/{router_id}`` and
+    ``PUT /platform/routers/{router_id}/management-access``, both gated at
+    ``ScopeType.GLOBAL`` -- i.e. only a Master-console (platform-scoped)
+    role assignment reaches it, never an organization-scoped one, whatever
+    ``X-Organization-Id`` the caller sends.
+
+    ``has_snmp_community`` is still a boolean, never the community string
+    itself: the plaintext leaves this codebase only through
+    ``RouterService.get_decrypted_snmp_community`` on the polling path.
+    """
+
+    snmp_enabled: bool
+    has_snmp_community: bool
+    snmp_version: str | None = None
+    snmp_port: int | None = None
 
 
 class RouterListResponse(BaseModel):
@@ -199,53 +270,6 @@ class RouterCreateRequest(BaseModel):
     )
     management_ip_address: str | None = Field(default=None, max_length=45)
     public_ip_address: str | None = Field(default=None, max_length=45)
-    api_username: str | None = Field(default=None, max_length=100)
-    api_secret: str | None = Field(
-        default=None,
-        description=(
-            "RouterOS API password or API key, stored Fernet-encrypted -- "
-            "never returned by any endpoint once submitted."
-        ),
-    )
-    snmp_enabled: bool = Field(
-        default=False,
-        description=(
-            "Whether this router should be polled via SNMP for richer "
-            "device metrics (CPU/memory/uptime/per-interface traffic "
-            "counters) in addition to the existing RouterOS-API-based "
-            "health check -- see "
-            "app.domains.provisioning_engine.service"
-            ".run_router_snmp_metrics_poll_sweep. Requires SNMP to "
-            "actually be enabled, with a matching community string, on "
-            "the physical device itself."
-        ),
-    )
-    snmp_community: str | None = Field(
-        default=None,
-        description=(
-            "SNMP community string (SNMPv1/v2c), stored Fernet-encrypted "
-            "-- never returned by any endpoint once submitted. Falls back "
-            "to the platform-wide Settings.snmp_default_community when "
-            "unset and snmp_enabled is true."
-        ),
-    )
-    snmp_version: str | None = Field(
-        default=None,
-        max_length=10,
-        description=(
-            "\"1\" or \"2c\" -- falls back to Settings.snmp_default_version "
-            "when unset. SNMPv3 is not supported."
-        ),
-    )
-    snmp_port: int | None = Field(
-        default=None,
-        ge=1,
-        le=65535,
-        description=(
-            "SNMP agent UDP port -- falls back to "
-            "Settings.snmp_default_port (161) when unset."
-        ),
-    )
     settings: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("mac_address")
@@ -289,18 +313,81 @@ class RouterUpdateRequest(BaseModel):
     routeros_version: str | None = Field(default=None, max_length=50)
     management_ip_address: str | None = Field(default=None, max_length=45)
     public_ip_address: str | None = Field(default=None, max_length=45)
-    api_username: str | None = Field(default=None, max_length=100)
-    api_secret: str | None = Field(default=None)
-    snmp_enabled: bool | None = Field(default=None)
-    snmp_community: str | None = Field(default=None)
-    snmp_version: str | None = Field(default=None, max_length=10)
-    snmp_port: int | None = Field(default=None, ge=1, le=65535)
     settings: dict[str, Any] | None = None
 
     @field_validator("mac_address")
     @classmethod
     def validate_mac_address(cls, value: str | None) -> str | None:
         return _validate_mac(value) if value is not None else value
+
+
+class RouterManagementAccessRequest(BaseModel):
+    """The router's platform-management credentials and SNMP transport
+    configuration -- every field the *organization*-scoped create/update
+    schemas above deliberately no longer carry.
+
+    Served by ``PUT /platform/routers/{router_id}/management-access``
+    (``routers.update`` at ``ScopeType.GLOBAL``). Every field is optional and
+    ``exclude_unset`` is honoured by the route, so a caller that sends only
+    ``api_secret`` rotates exactly that and leaves the SNMP block untouched.
+    """
+
+    api_username: str | None = Field(default=None, max_length=100)
+    api_secret: str | None = Field(
+        default=None,
+        description=(
+            "RouterOS API password or API key, stored Fernet-encrypted -- "
+            "never returned by any endpoint once submitted."
+        ),
+    )
+    snmp_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Whether this router should be polled via SNMP for richer "
+            "device metrics (CPU/memory/uptime/per-interface traffic "
+            "counters) in addition to the existing RouterOS-API-based "
+            "health check -- see "
+            "app.domains.provisioning_engine.service"
+            ".run_router_snmp_metrics_poll_sweep. Requires SNMP to "
+            "actually be enabled, with a matching community string, on "
+            "the physical device itself."
+        ),
+    )
+    snmp_community: str | None = Field(
+        default=None,
+        description=(
+            "SNMP community string (SNMPv1/v2c), stored Fernet-encrypted "
+            "-- never returned by any endpoint once submitted. Falls back "
+            "to the platform-wide Settings.snmp_default_community when "
+            "unset and snmp_enabled is true."
+        ),
+    )
+    snmp_version: str | None = Field(
+        default=None,
+        max_length=10,
+        description=(
+            "\"1\" or \"2c\" -- falls back to Settings.snmp_default_version "
+            "when unset. SNMPv3 is not supported."
+        ),
+    )
+    snmp_port: int | None = Field(
+        default=None,
+        ge=1,
+        le=65535,
+        description=(
+            "SNMP agent UDP port -- falls back to "
+            "Settings.snmp_default_port (161) when unset."
+        ),
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "api_username": "cloudguest-api",
+                "api_secret": "s3cr3t",
+            }
+        }
+    )
 
 
 class ProvisioningCheckInRequest(BaseModel):
