@@ -26,6 +26,7 @@ from .constants import (
     DEFAULT_SECONDARY_COLOR,
     DEFAULT_SUPPORTED_LANGUAGES,
     DEFAULT_THEME,
+    POST_LOGIN_HTML_MAX_BYTES,
     SPLASH_HEADLINE_MAX_LENGTH,
     SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
 )
@@ -110,6 +111,28 @@ class CaptivePortalConfigCreateRequest(BaseModel):
             "Over-limit values are rejected with a 400 carrying "
             "`max_length` and `actual_length`, never truncated. Counted "
             "over the stripped value in Unicode code points."
+        ),
+    )
+    post_login_html: str | None = Field(
+        default=None,
+        description=(
+            "Venue-authored HTML for the page a guest sees after a "
+            "successful sign-in. Null or empty keeps today's behaviour "
+            "exactly: a countdown to `redirect_url` if one is set, the "
+            "built-in success screen otherwise. Non-empty and "
+            "`redirect_url` are not alternatives -- both apply, the HTML "
+            "renders and the continue-to-URL affordance stays. "
+            "**Sanitized on write against an allowlist** (see "
+            "`html_sanitizer`): scripts, frames, forms, every `on*` "
+            "handler and every non-http(s) URL are removed, formatting, "
+            "layout, `<style>` blocks and inline `style` survive. The "
+            "value in every response -- including the echo from this very "
+            "request -- is the **stored, sanitized** one, not what was "
+            "submitted, so the dashboard's editor and the database can "
+            "never disagree about what was kept. Capped at "
+            f"{POST_LOGIN_HTML_MAX_BYTES} UTF-8 bytes of *submitted* "
+            "input; over that is a 400 carrying `max_bytes` and "
+            "`actual_bytes`."
         ),
     )
     redirect_url: str | None = Field(default=None, max_length=500)
@@ -265,6 +288,17 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
             "over the stripped value in Unicode code points."
         ),
     )
+    post_login_html: str | None = Field(
+        default=None,
+        description=(
+            "Venue-authored post-sign-in HTML -- see the create schema's "
+            "own description for the full contract. Omit the key to leave "
+            "the stored page untouched; send null or an empty string to "
+            "clear it and fall back to today's redirect/success "
+            "behaviour. Sanitized on write; the response echoes the "
+            "sanitized value that was actually stored."
+        ),
+    )
     redirect_url: str | None = Field(default=None, max_length=500)
     content_mode: str | None = Field(default=None, max_length=20)
     content_heading: str | None = Field(
@@ -351,6 +385,7 @@ class CaptivePortalConfigResponse(BaseModel):
     privacy_policy_url: str | None
     splash_headline: str | None
     splash_welcome_message: str | None
+    post_login_html: str | None
     redirect_url: str | None
     content_mode: str
     content_heading: str | None

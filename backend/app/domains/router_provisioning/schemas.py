@@ -318,14 +318,30 @@ class RouterEnrollmentApproveRequest(BaseModel):
     """The device only ever supplies serial/MAC/model at submission time --
     an admin must supply the remaining ``Router``-creation fields BE-008
     requires (at minimum, which location the new device belongs to) at
-    approval time."""
+    approval time.
+
+    ``api_username``/``api_secret`` used to be on this schema too. They are
+    not any more, for exactly the reason
+    ``app.domains.router.schemas``' module docstring gives: this route is
+    gated on ``router_provisioning.approve``, which ``organization-owner``
+    (the role every provisioned venue owner holds) has at *organization*
+    scope -- so this was a second, parallel way for a customer-scoped caller
+    to set the platform's own RouterOS management credential, alongside the
+    ``RouterCreateRequest``/``RouterUpdateRequest`` one. Approval now
+    registers the device only; the credential is set afterwards through
+    ``PUT /platform/routers/{router_id}/management-access``
+    (``routers.update`` at ``ScopeType.GLOBAL``), using the ``router_id``
+    this endpoint returns.
+
+    Approval itself is deliberately left at its existing scope: who may
+    approve a device onto a tenant is a separate question from who may hold
+    that device's platform credential, and only the second one was wrong.
+    """
 
     location_id: str
     name: str = Field(..., min_length=1, max_length=200)
     management_ip_address: str | None = Field(default=None, max_length=45)
     public_ip_address: str | None = Field(default=None, max_length=45)
-    api_username: str | None = Field(default=None, max_length=100)
-    api_secret: str | None = Field(default=None)
 
 
 class RouterEnrollmentApproveResponse(BaseModel):
