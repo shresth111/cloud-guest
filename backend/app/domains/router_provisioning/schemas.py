@@ -62,6 +62,7 @@ __all__ = [
     "RouterSecretRotationResponse",
     # Health / events
     "RouterHealthSnapshotRequest",
+    "RouterInterfaceTrafficCounter",
     "RouterHealthSnapshotResponse",
     "RouterHealthHistoryResponse",
     "RouterEventResponse",
@@ -398,7 +399,54 @@ class RouterHealthSnapshotRequest(BaseModel):
     management_ip_address: str | None = Field(default=None, max_length=45)
 
 
+class RouterInterfaceTrafficCounter(BaseModel):
+    """One interface's IF-MIB reading inside a single health snapshot.
+
+    Mirrors, field for field, the dict
+    ``run_router_snmp_metrics_poll_sweep`` persists into
+    ``RouterHealthSnapshot.interface_traffic_counters``
+    (``app.domains.provisioning_engine.service``).
+
+    ``in_octets``/``out_octets`` are **cumulative counters, not rates** --
+    the same point
+    ``wyfy_device_gateway.snmp_poller.SnmpInterfaceCounters`` makes in its
+    own docstring ("never a rate ... turning two successive snapshots into
+    a Mbps rate is the caller's own job"). Serving them as-is keeps that
+    contract: this API reports what the device's counter said at
+    ``recorded_at``, and a consumer that wants throughput differences two
+    successive snapshots itself. Every field except ``if_index``/``if_name`` is
+    nullable because an SNMP agent that genuinely does not answer a given
+    OID yields ``None``, never a fabricated ``0``.
+    """
+
+    if_index: int
+    if_name: str
+    up: bool | None = None
+    in_octets: int | None = None
+    out_octets: int | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class RouterHealthSnapshotResponse(BaseModel):
+    """``metrics_source`` and ``interface_traffic_counters`` are the two
+    columns migration ``0079_add_snmp_device_metrics_monitoring`` added to
+    ``router_health_snapshots``; they were persisted from the day that
+    migration landed but never serialised, so an SNMP-sourced reading was
+    indistinguishable over the API from a RouterOS-API-sourced one.
+
+    Both stay ``None``-able rather than defaulted, because ``None`` is a
+    real, distinct answer in each case and must not be flattened:
+
+    * ``metrics_source is None`` -- a row written before 0079. Its true
+      transport is genuinely unrecorded; reporting it as ``"routeros_api"``
+      would be a fabricated provenance claim.
+    * ``interface_traffic_counters is None`` -- either a RouterOS-API-sourced
+      row (that path has no per-interface breakdown) or an SNMP poll that
+      returned no interfaces at all. The sweep persists ``None``, never
+      ``[]``, for both.
+    """
+
     id: str
     router_id: str
     recorded_at: datetime
@@ -407,6 +455,20 @@ class RouterHealthSnapshotResponse(BaseModel):
     memory_usage_percent: float | None
     uptime_seconds: int | None
     connected_clients_count: int | None
+    metrics_source: str | None = Field(
+        default=None,
+        description=(
+            'Which transport took this reading -- "snmp", "routeros_api", '
+            "or null for a reading recorded before the column existed."
+        ),
+    )
+    interface_traffic_counters: list[RouterInterfaceTrafficCounter] | None = Field(
+        default=None,
+        description=(
+            "Per-interface cumulative IF-MIB octet counters at recorded_at, "
+            "or null when this reading carries no per-interface breakdown."
+        ),
+    )
 
     model_config = ConfigDict(from_attributes=True)
 

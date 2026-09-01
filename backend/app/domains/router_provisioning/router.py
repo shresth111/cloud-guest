@@ -259,6 +259,14 @@ def _health_snapshot_response(
         memory_usage_percent=snapshot.memory_usage_percent,
         uptime_seconds=snapshot.uptime_seconds,
         connected_clients_count=snapshot.connected_clients_count,
+        metrics_source=snapshot.metrics_source,
+        # Passed through as-is: pydantic validates each dict into a
+        # RouterInterfaceTrafficCounter. The sweep is the only writer and
+        # SnmpPoller.get_interface_counters already guarantees every entry
+        # has a non-empty if_name and an int-parsable if_index (it skips
+        # the ones that don't), so there is no partially-shaped row to
+        # defend against here -- and None stays None, never [].
+        interface_traffic_counters=snapshot.interface_traffic_counters,
     )
 
 
