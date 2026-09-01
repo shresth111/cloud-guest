@@ -291,6 +291,42 @@ class CaptivePortalConfig(BaseModel):
     # ``content_mode == "redirect"`` (see below) -- one column, both
     # purposes, rather than a parallel field that could drift out of sync.
     redirect_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # The venue's own HTML for the page a guest sees *after* a successful
+    # sign-in -- the post-login surface, which until now could only ever be
+    # "bounce them at redirect_url" or "show the built-in success screen".
+    #
+    # Deliberately NOT a sixth ``content_mode`` value. ``content_mode``
+    # below is the *pre*-login content step: what the portal presents
+    # before/instead of the sign-in form. This is a different screen at a
+    # different point in the journey, and folding it into that enum would
+    # make "show a promo image before login" and "show my own page after
+    # login" mutually exclusive, which they are not. It does follow that
+    # enum's own stated convention exactly -- one column per surface, and
+    # degrade gracefully when the column is empty.
+    #
+    # Nullable, and null/empty is load-bearing: it means "unchanged", i.e.
+    # today's behaviour byte-for-byte (countdown to ``redirect_url`` if one
+    # is set, the built-in success screen otherwise). No row that exists
+    # when this column is added changes what any guest currently sees.
+    #
+    # ``post_login_html`` and ``redirect_url`` are not alternatives and do
+    # not override one another: with both set, the venue's HTML renders
+    # *and* the existing continue-to-URL affordance stays. Reconciling the
+    # two on screen is the frontend's job; this layer's only obligation is
+    # that both fields are always returned together, which
+    # ``router._config_response`` satisfies for every endpoint at once.
+    #
+    # **Stored pre-sanitized, never sanitized on read.** What is in this
+    # column has already been through
+    # ``html_sanitizer.sanitize_post_login_html`` -- see that module for
+    # why the write path is the right place and what the allowlist is. The
+    # short version: this HTML is shown to a guest on the same origin that
+    # handles their OTP code, its author is semi-trusted, and the
+    # sandboxed-iframe renderer on the frontend is the primary control but
+    # must not be the only one. A reader of this column may assume the
+    # bytes are already safe; a *writer* must never assume that and must go
+    # through the service layer.
+    post_login_html: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # -- content mode --------------------------------------------------------
     # What the portal presents as its primary content before/instead of the

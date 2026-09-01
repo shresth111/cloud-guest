@@ -33,6 +33,7 @@ from app.domains.captive_portal.constants import (
     DEFAULT_BACKGROUND_FOCAL_Y,
     DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
     DEFAULT_GUEST_FONT_CHOICE,
+    POST_LOGIN_HTML_MAX_BYTES,
     SPLASH_HEADLINE_MAX_LENGTH,
     SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
     TERMS_AND_CONDITIONS_LABEL,
@@ -49,8 +50,13 @@ from app.domains.captive_portal.exceptions import (
     InvalidHexColorError,
     InvalidPortalContentSourceError,
     MissingPortalResolutionParamsError,
+    PostLoginHtmlTooLargeError,
     PoweredByAttributionNotEntitledError,
     SplashTextTooLongError,
+)
+from app.domains.captive_portal.html_sanitizer import (
+    sanitize_post_login_html,
+    sanitize_stylesheet,
 )
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import (
@@ -470,6 +476,7 @@ async def _create_config(
     # defaults being the actually-enabled-by-default methods.
     username_password_enabled: bool = True,
     pin_login_enabled: bool = False,
+    post_login_html: str | None = None,
     requesting_organization_id: uuid.UUID | None = None,
     organization_id: uuid.UUID | None = None,
 ) -> CaptivePortalConfig:
@@ -511,6 +518,7 @@ async def _create_config(
         pin_login_enabled=pin_login_enabled,
         social_login_enabled=social_login_enabled,
         social_login_providers=social_login_providers or [],
+        post_login_html=post_login_html,
     )
 
 
@@ -2079,19 +2087,19 @@ class TestResolveSingleFlight:
 
 
 class TestResolveCacheKeyVersion:
-    def test_cache_key_is_v4(self) -> None:
+    def test_cache_key_is_v6(self) -> None:
         """Spec §0.3: the version must be bumped in the same change that
         changes the cached field set. Skipping it makes every payload
         written by the previous build raise KeyError out of the
         unauthenticated guest resolve endpoint -- a 500 for every guest
         joining WiFi until the TTL expires.
 
-        v4 is design spec §5 S7: the ``brandings`` row joined the payload
-        under a new top-level ``"branding"`` key."""
+        v6 is ``post_login_html``, the venue's own post-sign-in page,
+        joining ``_CACHED_CONFIG_SCALAR_FIELDS``."""
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
 
         key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
-        assert key == "captive_portal:resolve:v5:org:loc"
+        assert key == "captive_portal:resolve:v6:org:loc"
 
     def test_org_index_key_is_versioned_in_lockstep_with_the_payload_key(self) -> None:
         """The index names payload keys. Left at an older version it
@@ -2104,7 +2112,7 @@ class TestResolveCacheKeyVersion:
 
         payload_version = _CACHE_KEY_TEMPLATE.split(":")[2]
         index_version = _ORG_INDEX_KEY_TEMPLATE.split(":")[2]
-        assert payload_version == index_version == "v5"
+        assert payload_version == index_version == "v6"
 
     def test_a_payload_from_the_previous_key_version_would_raise(self) -> None:
         """The mechanism §0.3 is actually about, asserted rather than
@@ -2134,6 +2142,7 @@ class TestResolveCacheKeyVersion:
         assert "background_focal_x" in _CACHED_CONFIG_SCALAR_FIELDS
         assert "background_focal_y" in _CACHED_CONFIG_SCALAR_FIELDS
         assert "powered_by_enabled" in _CACHED_CONFIG_SCALAR_FIELDS
+        assert "post_login_html" in _CACHED_CONFIG_SCALAR_FIELDS
 
 
 # ============================================================================
@@ -3119,3 +3128,391 @@ class TestPoweredByAttributionReset:
             for e in fx.audit_writer.entries
             if e["action"] == "captive_portal_powered_by_restored"
         ] == ["captive_portal_powered_by_restored"]
+
+
+# ============================================================================
+# post_login_html: the venue's own post-sign-in page
+# ============================================================================
+
+
+class TestPostLoginHtmlSanitizerStripsExecutableMarkup:
+    """The allowlist half of ``html_sanitizer``.
+
+    Every case here is a way of getting script to run on a page a *guest*
+    is shown, on the origin that also handles their OTP code. The frontend
+    renders this HTML in an iframe sandboxed without ``allow-scripts`` or
+    ``allow-same-origin``, so none of these would execute there today --
+    which is exactly why they are asserted at this layer instead. The
+    sandbox is one renderer's decision; the stored bytes outlive it.
+    """
+
+    def test_script_element_is_removed_with_its_source(self) -> None:
+        out = sanitize_post_login_html("<script>alert(1)</script><p>hi</p>")
+        assert out == "<p>hi</p>"
+        # Removed *with* its content, not unwrapped -- unwrapping would
+        # paste the program into the page as visible text.
+        assert "alert" not in out
+
+    def test_framing_and_plugin_elements_are_removed(self) -> None:
+        out = sanitize_post_login_html(
+            '<iframe src="https://evil.example"></iframe>'
+            '<object data="x"></object><embed src="y">'
+        )
+        assert out is None
+
+    def test_document_head_elements_are_removed(self) -> None:
+        """``base`` rewrites every relative URL on the page, ``meta``
+        http-equiv can redirect it, and ``link`` pulls in a stylesheet
+        whose contents this sanitizer never sees."""
+        out = sanitize_post_login_html(
+            '<base href="https://evil.example/">'
+            '<meta http-equiv="refresh" content="0;url=https://evil.example">'
+            '<link rel="stylesheet" href="https://evil.example/x.css">'
+        )
+        assert out is None
+
+    def test_form_and_its_inputs_are_removed(self) -> None:
+        """A form on the post-login page is a phishing surface: it looks
+        like part of the venue's WiFi flow and can POST anywhere."""
+        out = sanitize_post_login_html(
+            '<form action="https://evil.example"><input name="otp"></form>'
+            "<p>after</p>"
+        )
+        assert out == "<p>after</p>"
+
+    def test_every_event_handler_attribute_is_dropped(self) -> None:
+        out = sanitize_post_login_html(
+            '<p onclick="alert(1)" onmouseover="x" onerror="y">hi</p>'
+        )
+        assert out == "<p>hi</p>"
+
+    def test_javascript_url_in_href_is_dropped_but_the_anchor_survives(
+        self,
+    ) -> None:
+        out = sanitize_post_login_html('<a href="javascript:alert(1)">click</a>')
+        assert "javascript" not in out
+        assert ">click</a>" in out
+
+    def test_data_url_in_img_src_is_dropped(self) -> None:
+        """``data:image/svg+xml`` is a whole document that can carry
+        script, and the MIME label is author-controlled -- so no ``data:``
+        survives, not even the harmless PNG case."""
+        out = sanitize_post_login_html(
+            '<img src="data:image/svg+xml;base64,PHN2Zz4="><p>x</p>'
+        )
+        assert "data:" not in out
+
+    def test_svg_and_math_are_removed_with_their_content(self) -> None:
+        """Foreign-content elements re-enter HTML parsing under different
+        rules; ``<svg onload=...>`` is the classic sanitizer bypass."""
+        assert sanitize_post_login_html("<svg onload=alert(1)></svg>") is None
+
+    def test_comments_are_stripped(self) -> None:
+        out = sanitize_post_login_html(
+            "<p>ok</p><!--[if IE]><script>x</script><![endif]-->"
+        )
+        assert out == "<p>ok</p>"
+
+    def test_relative_urls_are_denied(self) -> None:
+        """A relative URL resolves against whatever origin renders the
+        page -- for this field, the one handling guest OTP codes."""
+        out = sanitize_post_login_html('<a href="/admin">x</a>')
+        assert "/admin" not in out
+
+
+class TestPostLoginHtmlSanitizerKeepsWhatAVenueActuallyWrites:
+    """The other half: a sanitizer that eats the venue's page is not
+    secure, it is broken. These are the constructs the feature exists to
+    support."""
+
+    def test_formatting_and_layout_survive(self) -> None:
+        out = sanitize_post_login_html(
+            "<div><h1>Welcome</h1><p><strong>Enjoy</strong> your stay</p>"
+            "<ul><li>Menu</li></ul></div>"
+        )
+        assert "<h1>Welcome</h1>" in out
+        assert "<strong>Enjoy</strong>" in out
+        assert "<li>Menu</li>" in out
+
+    def test_http_image_and_link_survive_with_link_hardening(self) -> None:
+        out = sanitize_post_login_html(
+            '<img src="https://cdn.example/promo.png" alt="Promo">'
+            '<a href="https://venue.example/menu">Menu</a>'
+        )
+        assert '<img src="https://cdn.example/promo.png" alt="Promo">' in out
+        assert 'href="https://venue.example/menu"' in out
+        assert 'rel="noopener noreferrer"' in out
+        assert 'target="_blank"' in out
+
+    def test_author_supplied_target_is_replaced_not_trusted(self) -> None:
+        """``target="_top"`` would break out of a framing renderer. The
+        attribute is not allowlisted at all; ``_blank`` is then set
+        unconditionally, so the hostile value is unexpressible rather than
+        merely discouraged."""
+        out = sanitize_post_login_html(
+            '<a href="https://ok.example/" target="_top" rel="me">x</a>'
+        )
+        assert 'target="_blank"' in out
+        assert "_top" not in out
+        assert 'rel="noopener noreferrer"' in out
+
+    def test_mailto_and_tel_survive(self) -> None:
+        out = sanitize_post_login_html(
+            '<a href="mailto:hi@venue.example">Email</a>'
+            '<a href="tel:+911234567890">Call</a>'
+        )
+        assert "mailto:hi@venue.example" in out
+        assert "tel:+911234567890" in out
+
+    def test_inline_style_and_style_block_survive(self) -> None:
+        out = sanitize_post_login_html(
+            "<style>.card{border-radius:8px;padding:16px}</style>"
+            '<div class="card" style="color:#1a73e8;font-size:18px">Hi</div>'
+        )
+        assert "border-radius:8px" in out
+        assert "color:#1a73e8" in out
+        assert 'class="card"' in out
+
+    def test_http_backgrounds_and_font_faces_survive_in_css(self) -> None:
+        out = sanitize_post_login_html(
+            "<style>@font-face{font-family:F;src:url(https://cdn.example/f.woff2)}"
+            ".hero{background:url('https://cdn.example/bg.png') no-repeat}</style>"
+        )
+        assert "https://cdn.example/f.woff2" in out
+        assert "https://cdn.example/bg.png" in out
+
+    def test_media_queries_survive(self) -> None:
+        out = sanitize_post_login_html(
+            "<style>@media (max-width:600px){.hero{font-size:14px}}</style>"
+        )
+        assert "@media (max-width:600px)" in out
+        assert "font-size:14px" in out
+
+
+class TestPostLoginHtmlCssSanitizer:
+    """``nh3``/``ammonia`` filters tags, attributes and URL schemes and
+    stops there -- it never looks inside a ``style`` value or a
+    ``<style>`` element. Allowing styling therefore means owning the CSS,
+    which is what these cover."""
+
+    def test_javascript_url_in_a_style_attribute_is_dropped(self) -> None:
+        out = sanitize_post_login_html(
+            '<p style="color:red;background:url(javascript:alert(1));width:50%">x</p>'
+        )
+        assert "javascript" not in out
+        # Surgical: the offending declaration goes, the venue's other two
+        # survive.
+        assert "color:red" in out
+        assert "width:50%" in out
+
+    def test_ie_script_from_css_vectors_are_dropped(self) -> None:
+        out = sanitize_post_login_html(
+            '<p style="behavior:url(#x);-moz-binding:url(http://e/x.xml);color:blue">'
+            "x</p>"
+        )
+        assert "behavior" not in out
+        assert "-moz-binding" not in out
+        assert "color:blue" in out
+
+    def test_backslash_escaped_expression_is_caught(self) -> None:
+        r"""``expr\ession(`` is what the renderer resolves to
+        ``expression(``; a probe that matched only the literal spelling
+        would miss it."""
+        out = sanitize_post_login_html(
+            '<p style="color:expr\\ession(alert(1));font-size:14px">x</p>'
+        )
+        assert "ession" not in out
+        assert "font-size:14px" in out
+
+    def test_comment_split_expression_is_caught(self) -> None:
+        """``expr/**/ession(`` is the same trick using a CSS comment as
+        the splitter -- which is why comments are stripped *before* the
+        banned-substring probe runs, on the attribute path too."""
+        out = sanitize_post_login_html(
+            '<p style="color:expr/**/ession(alert(1));font-size:14px">x</p>'
+        )
+        assert "ession" not in out
+        assert "font-size:14px" in out
+
+    def test_at_import_is_dropped_without_taking_the_sheet_with_it(self) -> None:
+        """``@import`` is a remote load whose contents this sanitizer
+        never sees and whose owner can swap them after the fact. The rest
+        of the stylesheet must survive it -- dropping the whole sheet over
+        one line would be the kind of over-firing that gets a sanitizer
+        turned off."""
+        out = sanitize_post_login_html(
+            '<style>@import url("https://evil.example/x.css");'
+            ".card{color:red}</style>"
+        )
+        assert "@import" not in out
+        assert "color:red" in out
+
+    def test_javascript_url_inside_a_nested_block_is_dropped(self) -> None:
+        out = sanitize_stylesheet(
+            "@media screen{.a{color:blue;background:url(javascript:1)}}"
+        )
+        assert "javascript" not in out
+        assert "color:blue" in out
+
+    def test_stylesheet_braces_are_balanced_even_when_the_input_is_not(
+        self,
+    ) -> None:
+        """An unclosed rule that leaked through would swallow whatever a
+        future renderer concatenated after it."""
+        out = sanitize_stylesheet(".a{color:red")
+        assert out.count("{") == out.count("}")
+
+
+class TestPostLoginHtmlSizeCap:
+    def test_over_the_cap_raises_with_both_numbers(self) -> None:
+        """A bare "string too long" would leave the venue guessing how
+        much to cut, which is the entire argument for validating at
+        authoring time rather than truncating at render."""
+        oversized = "<p>" + ("a" * (POST_LOGIN_HTML_MAX_BYTES + 1)) + "</p>"
+        with pytest.raises(PostLoginHtmlTooLargeError) as exc_info:
+            sanitize_post_login_html(oversized)
+        error = exc_info.value
+        assert error.status_code == 400
+        assert error.data["max_bytes"] == POST_LOGIN_HTML_MAX_BYTES
+        assert error.data["actual_bytes"] == len(oversized.encode("utf-8"))
+        assert str(POST_LOGIN_HTML_MAX_BYTES) in str(error)
+        assert str(len(oversized.encode("utf-8"))) in str(error)
+
+    def test_the_cap_is_bytes_not_characters(self) -> None:
+        """Counted in UTF-8 bytes, unlike the splash ceilings, because
+        this is a resource limit on something parsed, cached and shipped
+        -- not a rendered-line budget. A page of Devanagari is three
+        bytes per code point and must be charged for all three."""
+        # Just under the cap in code points, comfortably over it in bytes.
+        payload = "क" * (POST_LOGIN_HTML_MAX_BYTES // 2)
+        assert len(payload) < POST_LOGIN_HTML_MAX_BYTES
+        with pytest.raises(PostLoginHtmlTooLargeError):
+            sanitize_post_login_html(payload)
+
+    def test_exactly_at_the_cap_is_accepted(self) -> None:
+        payload = "a" * POST_LOGIN_HTML_MAX_BYTES
+        assert sanitize_post_login_html(payload) == payload
+
+    def test_the_cap_is_measured_before_sanitizing(self) -> None:
+        """The number in the error has to be the number the venue sees in
+        their own editor. Measuring the *output* would report a size for
+        bytes they never wrote."""
+        oversized = "<script>" + ("a" * POST_LOGIN_HTML_MAX_BYTES) + "</script>"
+        with pytest.raises(PostLoginHtmlTooLargeError) as exc_info:
+            sanitize_post_login_html(oversized)
+        # Sanitizing first would have reduced this to nothing at all.
+        assert exc_info.value.data["actual_bytes"] > POST_LOGIN_HTML_MAX_BYTES
+
+
+class TestPostLoginHtmlEmptiness:
+    def test_none_stays_none(self) -> None:
+        assert sanitize_post_login_html(None) is None
+
+    def test_blank_becomes_none_not_empty_string(self) -> None:
+        """Null and "" both mean "no page, use today's redirect/success
+        behaviour". Storing two values for one meaning invites a renderer
+        to eventually treat them differently."""
+        assert sanitize_post_login_html("   \n ") is None
+
+    def test_html_that_sanitizes_away_entirely_becomes_none(self) -> None:
+        assert sanitize_post_login_html("<script>alert(1)</script>") is None
+
+
+class TestPostLoginHtmlServiceWiring:
+    async def test_create_stores_the_sanitized_bytes_not_the_input(self) -> None:
+        fx = make_service()
+        config = await _create_config(
+            fx,
+            post_login_html='<p onclick="alert(1)">Thanks!</p><script>x</script>',
+        )
+        assert config.post_login_html == "<p>Thanks!</p>"
+
+    async def test_create_defaults_to_none_so_nothing_existing_changes(self) -> None:
+        """The whole compatibility claim in one assertion: a config
+        created without the field renders exactly as every config does
+        today."""
+        fx = make_service()
+        config = await _create_config(fx)
+        assert config.post_login_html is None
+
+    async def test_update_stores_the_sanitized_bytes(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"post_login_html": "<p>Hi</p><iframe src='https://e/'></iframe>"},
+        )
+        assert updated.post_login_html == "<p>Hi</p>"
+
+    async def test_update_without_the_key_leaves_the_page_untouched(self) -> None:
+        """The dashboard PUTs its whole form; a save that never mentions
+        the field must not clear a page the venue already published."""
+        fx = make_service()
+        config = await _create_config(fx, post_login_html="<p>Keep me</p>")
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"name": "Renamed"},
+        )
+        assert updated.post_login_html == "<p>Keep me</p>"
+
+    async def test_update_to_none_clears_the_page(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, post_login_html="<p>Bye</p>")
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"post_login_html": None},
+        )
+        assert updated.post_login_html is None
+
+    async def test_oversized_update_is_rejected_before_any_write(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, post_login_html="<p>Original</p>")
+        with pytest.raises(PostLoginHtmlTooLargeError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"post_login_html": "a" * (POST_LOGIN_HTML_MAX_BYTES + 1)},
+            )
+        assert config.post_login_html == "<p>Original</p>"
+
+    async def test_post_login_html_and_redirect_url_coexist(self) -> None:
+        """They are not alternatives. With both set the venue's page
+        renders *and* the continue-to-URL affordance stays -- this layer's
+        only obligation is that neither field suppresses the other."""
+        fx = make_service()
+        config = await _create_config(fx, post_login_html="<p>Thanks</p>")
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"redirect_url": "https://venue.example/"},
+        )
+        assert updated.post_login_html == "<p>Thanks</p>"
+        assert updated.redirect_url == "https://venue.example/"
+
+    async def test_resolve_returns_the_page_and_survives_the_cache_round_trip(
+        self,
+    ) -> None:
+        """``resolve`` is what the portal actually reads, and it answers
+        from a Redis payload rebuilt into a stand-in object -- a field
+        missing from ``_CACHED_CONFIG_SCALAR_FIELDS`` would be silently
+        absent on the second guest, not the first."""
+        fx = make_service(with_cache=True)
+        await _create_config(
+            fx, is_default=True, post_login_html="<p>Welcome online</p>"
+        )
+        first = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert first.config.post_login_html == "<p>Welcome online</p>"
+        second = await fx.service.resolve_portal_config(
+            organization_id=fx.organization.id, location_id=None
+        )
+        assert second.config.post_login_html == "<p>Welcome online</p>"

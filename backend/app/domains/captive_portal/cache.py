@@ -67,15 +67,22 @@ from app.core.config import get_settings
 # on main, powered_by on this branch), so the merged payload -- carrying
 # both -- takes a fresh version; without it the first resolve after
 # deploy reads a payload missing one of the two keys and 500s every
-# guest until the TTL expires.
-_CACHE_KEY_TEMPLATE = "captive_portal:resolve:v5:{organization_id}:{location_id}"
+# guest until the TTL expires. v6 is ``post_login_html``, the venue's own
+# post-sign-in page, added to that same tuple. It is the same bump for
+# the same reason, and it also has a second, quieter failure mode the
+# earlier ones did not: this field is the *only* thing a venue edits on
+# the post-login screen, so a stale payload here does not merely serve an
+# old colour -- it serves the previous version of a page the venue
+# believes they just published, for up to a full TTL, with nothing on
+# screen to suggest the save did not take.
+_CACHE_KEY_TEMPLATE = "captive_portal:resolve:v6:{organization_id}:{location_id}"
 
 # Redis SET of every resolve key currently written for one organization,
 # so an organization-scoped edit can fan out to *all* of them (see
 # ``invalidate_organization``). Deliberately versioned in lockstep with
 # ``_CACHE_KEY_TEMPLATE`` -- an index holding keys from a previous
 # payload version would fan a delete out to keys nothing reads anymore.
-_ORG_INDEX_KEY_TEMPLATE = "captive_portal:resolve:v5:org-index:{organization_id}"
+_ORG_INDEX_KEY_TEMPLATE = "captive_portal:resolve:v6:org-index:{organization_id}"
 
 # The index set must outlive the payloads it points at, or a payload
 # written at second 59 of the index's own TTL would be orphaned (indexed

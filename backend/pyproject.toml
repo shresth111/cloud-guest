@@ -17,6 +17,11 @@ dependencies = [
     "cryptography==44.0.0",
     "email-validator==2.2.0",
     "fastapi==0.115.6",
+    # Rust/ammonia HTML sanitizer, used on the write path for
+    # captive_portal_configs.post_login_html (venue-authored, guest-facing
+    # HTML). See app/domains/captive_portal/html_sanitizer.py for why an
+    # allowlist sanitizer built on html5ever, and why not bleach.
+    "nh3==0.3.7",
     "opentelemetry-exporter-otlp-proto-http==1.44.0",
     "opentelemetry-instrumentation-fastapi==0.65b0",
     "opentelemetry-sdk==1.44.0",
