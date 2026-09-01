@@ -22,7 +22,8 @@ Super Admin onboarding a brand-new (or existing) customer:
 2. Create Location (with `property_type`/auto-generated `location_code`)
 3. Create Location Owner (`UserService.create_user`, one call)
 4. Register Router (`RouterService.create_router`)
-5. Generate WireGuard Peer (`WireGuardService.create_tunnel`)
+5. Generate WireGuard Peer (`WireGuardService.allocate_tunnel_via_hub`)
+   -- **executed last, after step 10; see §2a**
 6. Apply default router configuration (`RouterProvisioningService
    .assign_profile`, see §7 for the template-resolution gap)
 7. Apply Subscription Plan (`SubscriptionService.create_subscription`,
@@ -37,8 +38,49 @@ Super Admin onboarding a brand-new (or existing) customer:
 13. Activate Customer/Tenant (only if the reused organization was not
     already `ACTIVE` -- License/Subscription are already activated by step 7)
 
-No `try`/`except` appears anywhere in `provision_location` -- see §2 for
-why that is exactly what makes the transactional guarantee real.
+Exactly one `try`/`except` appears in `provision_location`, around step
+5, and it **re-raises** -- see §2 for why that leaves the transactional
+guarantee intact, and §2a for what step 5 is doing at the end of the list.
+
+### Step 5 is the hub bridge, never `create_tunnel`
+
+`WireGuardService.create_tunnel` generates the keypair *on the platform*,
+and `ops/hub-agents/wg_agent.py` exposes only `POST /wg/peer` (which mints
+its own keypair) and `GET /wg/peers` -- there is no verb that accepts a
+public key the agent did not generate. So `create_tunnel` refuses with
+`HubCannotLearnPlatformKeyError` rather than writing a row describing a
+tunnel that could never establish.
+
+This flow called it anyway until 2026-09-01, which meant provisioning a
+customer failed every single time, at step 5. Operators reported it as an
+error "after entering the plan" -- the plan is submitted with the rest of
+the wizard form and is used at step 7, so the request died two steps
+earlier. It now calls `allocate_tunnel_via_hub`, the same orchestration
+`POST /routers/{router_id}/wireguard-peer/allocate-external` uses.
+
+On failure the operator gets `RouterTunnelProvisioningFailedError`, which
+carries the cause's status code (502 hub unreachable / 503 no hub
+configured / 409 allocation conflict) and states plainly that nothing was
+saved.
+
+## 2a. Why step 5 runs last
+
+The hub allocation is the only step in this flow that the request's
+transaction cannot undo. Every other step is a `session.flush()` on the
+one request-scoped `AsyncSession`; `POST /wg/peer` is an HTTP call to
+another machine that mints a keypair and consumes the next free address
+out of the hub's /24 -- and the deployed agent has no `do_DELETE` (a
+`DELETE` answers `501 Unsupported method`), so nothing can give it back.
+
+With the allocation at position 5, every later failure -- an incompatible
+config template at 6, a plan problem at 7, a captive-portal validation
+error at 10 -- rolled back the database and left a peer stranded on the
+hub forever. `next_free_ip()` scans live kernel state, so each orphan
+permanently narrows the fleet ceiling. Running it after step 10 shrinks
+that window to the three steps that follow it, none of which touch
+another machine. Nothing between 6 and 10 reads the tunnel:
+`assign_profile` renders from `resolve_variables`, which sees the Router
+row and `ConfigVariable` scopes only.
 
 ## 2. The real single-transaction guarantee
 
