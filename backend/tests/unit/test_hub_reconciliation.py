@@ -555,6 +555,47 @@ class TestSweepTask:
         assert result["hub_unreachable"] is True
         assert "not configured" in result["error"]
 
+    def test_an_unreachable_BRIDGE_is_also_reported_not_raised(
+        self, monkeypatch
+    ) -> None:
+        """The sibling of the test above, and the one that was missing.
+
+        ``HubBridgeUnavailableError`` lives in ``wireguard/dependencies.py``
+        and subclasses ``CloudGuestError``, NOT ``WireGuardError`` -- so the
+        ``except WireGuardError`` this task has always had never caught it,
+        even though the comment sitting on that ``except`` named this exact
+        class. And it is the LIKELIER of the two by far: "no lister was
+        injected" is a misconfiguration, while "the bridge did not answer" is
+        the ordinary state of a plain-HTTP agent on a private address, raised
+        by ``make_hub_peer_lister`` on every unreachable poll and deliberately
+        propagated by ``get_fleet_status`` rather than guessed around.
+
+        Until 2026-09-01 that escaped as an unhandled Celery exception --
+        traceback, retry storm, and the one-line cause buried under both,
+        which is the precise burial this handler exists to prevent.
+        """
+        from app.domains.hub_reconciliation import tasks as tasks_module
+        from app.domains.wireguard.dependencies import HubBridgeUnavailableError
+        from app.domains.wireguard.exceptions import WireGuardError
+
+        # The trap itself, asserted rather than described: if someone later
+        # makes this a WireGuardError subclass, this test should stop being
+        # about anything and say so loudly rather than passing vacuously.
+        assert not issubclass(HubBridgeUnavailableError, WireGuardError)
+
+        def _boom(_coro):
+            _coro.close()
+            raise HubBridgeUnavailableError(
+                "Could not reach the WireGuard hub bridge to list live peers"
+            )
+
+        monkeypatch.setattr(tasks_module, "run_celery_task", _boom)
+
+        result = tasks_module.run_hub_reconciliation_sweep()
+
+        assert result["hub_unreachable"] is True
+        assert "hub bridge" in result["error"]
+
     def test_the_summary_is_json_serialisable_and_diagnostic(
         self, monkeypatch
     ) -> None:
