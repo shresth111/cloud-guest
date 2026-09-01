@@ -52,6 +52,7 @@ from app.domains.location.provisioning_service import (
     OwnerRoleNotSeededError,
     ProvisionLocationInput,
     RouterInput,
+    RouterTunnelProvisioningFailedError,
     _generate_temporary_password,
     _generate_username,
 )
@@ -279,6 +280,20 @@ class FakeTunnelDeliveryInfo:
 
 
 @dataclass
+class FakeHubTunnelAllocation:
+    """Stands in for ``WireGuardService.allocate_tunnel_via_hub``'s
+    ``HubTunnelAllocation``. Only ``peer`` is read by
+    ``provision_location``; the rest is carried so a test can assert the
+    provisioning result reports what the HUB said, not what the platform
+    guessed."""
+
+    peer: FakePeer
+    peer_private_key: str | None = "hub-generated-private-key"
+    reused: bool = False
+    adopted: bool = False
+
+
+@dataclass
 class FakePlan:
     id: uuid.UUID
     name: str
@@ -332,10 +347,15 @@ class ProvisioningFakes:
     notifications_enqueued: list[dict[str, object]] = field(default_factory=list)
 
     fail_at: str | None = None
+    # What ``fail_at`` raises. Defaults to a plain ``RuntimeError`` (the
+    # original behaviour, which proves the rollback is not conditional on
+    # the exception type); a test that needs a specific domain error --
+    # e.g. the hub bridge being down -- supplies it here.
+    fail_with: Exception | None = None
 
     def _maybe_fail(self, step: str) -> None:
         if self.fail_at == step:
-            raise RuntimeError(f"forced failure at step '{step}'")
+            raise self.fail_with or RuntimeError(f"forced failure at step '{step}'")
 
     # -- OrganizationProvisioningProtocol ---------------------------------
 
@@ -471,13 +491,39 @@ class ProvisioningFakes:
 
     # -- WireGuardProvisioningProtocol ---------------------------------------
 
+    async def allocate_tunnel_via_hub(
+        self,
+        *,
+        actor_user_id,
+        router_id,
+        requesting_organization_id,
+        rotate=False,
+        force=False,
+    ):
+        self._maybe_fail("wireguard.allocate_tunnel_via_hub")
+        self.session.flush("wireguard.allocate_tunnel_via_hub")
+        self.calls.append("wireguard.allocate_tunnel_via_hub")
+        return FakeHubTunnelAllocation(peer=FakePeer(tunnel_ip_address="10.100.0.5"))
+
     async def create_tunnel(
         self, *, actor_user_id, router_id, requesting_organization_id
     ):
-        self._maybe_fail("wireguard.create_tunnel")
-        self.session.flush("wireguard.create_tunnel")
+        """DELIBERATELY A TRIPWIRE, NOT AN IMPLEMENTATION.
+
+        The real ``WireGuardService.create_tunnel`` generates the keypair on
+        the platform and the hub agent has no verb to be told a public key
+        it did not generate, so it refuses with
+        ``HubCannotLearnPlatformKeyError`` -- which is exactly what made
+        "add a customer" fail for every operator who tried it. A fake that
+        quietly succeeded here is what let that regression be invisible to
+        this suite for as long as it was. If provisioning ever reaches this
+        method again, the suite says so."""
         self.calls.append("wireguard.create_tunnel")
-        return FakeTunnelDeliveryInfo(peer=FakePeer(tunnel_ip_address="10.100.0.5"))
+        raise AssertionError(
+            "provision_location called create_tunnel -- the platform-"
+            "generates-the-keypair path the hub can never learn. It must "
+            "allocate through the hub bridge (allocate_tunnel_via_hub)."
+        )
 
     # -- PlanProvisioningProtocol ---------------------------------------------
 
@@ -630,10 +676,10 @@ class _NotificationServiceAdapter:
 
 
 def make_service(
-    *, fail_at: str | None = None
+    *, fail_at: str | None = None, fail_with: Exception | None = None
 ) -> tuple[LocationProvisioningService, ProvisioningFakes, FakeSharedSession]:
     session = FakeSharedSession()
-    fakes = ProvisioningFakes(session=session, fail_at=fail_at)
+    fakes = ProvisioningFakes(session=session, fail_at=fail_at, fail_with=fail_with)
     fakes.roles_by_slug["organization-owner"] = FakeRole(
         id=uuid.uuid4(), slug="organization-owner"
     )
@@ -925,11 +971,16 @@ class TestHappyPath:
             "user.create",
             "identity.update_user",
             "router.create",
-            "wireguard.create_tunnel",
             "router_provisioning.list_templates",
             "router_provisioning.assign_profile",
             "subscription.create",
             "captive_portal.create_config",
+            # Spec step (e), executed LAST among the write steps -- the hub
+            # allocation is the only one this transaction cannot undo (the
+            # deployed agent has no removal verb), so every step that can
+            # still fail runs before it. See provision_location's own
+            # comments at both positions.
+            "wireguard.allocate_tunnel_via_hub",
             "audit:location_provisioned",
             "email.send",
         ]
@@ -1170,20 +1221,158 @@ class TestOrganizationConditional:
 
 
 # ============================================================================
+# The hub bridge is the ONLY path to a tunnel (regression, 2026-09-01)
+# ============================================================================
+
+
+class TestHubBridgeAllocation:
+    """The bug these exist for.
+
+    ``provision_location`` step (e) called
+    ``WireGuardService.create_tunnel``, which generates the keypair on the
+    platform. ``ops/hub-agents/wg_agent.py`` exposes only ``POST /wg/peer``
+    (it mints its own keypair) and ``GET /wg/peers`` -- there is no verb to
+    be told a public key it did not generate -- so ``create_tunnel``
+    refuses with ``HubCannotLearnPlatformKeyError`` rather than writing a
+    row describing a tunnel that could never establish.
+
+    The result was that provisioning a new customer failed 100% of the
+    time, and failed at step (e), which an operator experiences as an error
+    "after entering the plan": the plan is submitted with the rest of the
+    wizard form and step (g) is where it would have been used, so the
+    backend never got that far.
+
+    The suite could not see it because the WireGuard fake implemented
+    ``create_tunnel`` and quietly succeeded. It now raises instead (see
+    ``ProvisioningFakes.create_tunnel``), so any future drift back to the
+    platform-keypair path fails these tests rather than production.
+    """
+
+    async def test_provisioning_allocates_through_the_hub_bridge(self) -> None:
+        service, fakes, base_plan_id = make_service()
+
+        result = await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert "wireguard.allocate_tunnel_via_hub" in fakes.calls
+        assert result.tunnel_ip_address == "10.100.0.5"
+
+    async def test_provisioning_never_calls_create_tunnel(self) -> None:
+        """The guard itself. ``ProvisioningFakes.create_tunnel`` raises, so
+        this asserts on the call log as well -- if someone reintroduces the
+        call inside a ``try``/``except`` that swallows, the log still
+        catches it."""
+        service, fakes, base_plan_id = make_service()
+
+        await service.provision_location(
+            actor_user_id=uuid.uuid4(),
+            data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+        )
+
+        assert "wireguard.create_tunnel" not in fakes.calls
+
+    async def test_the_protocol_itself_does_not_expose_create_tunnel(self) -> None:
+        """Structural, not behavioural: a fake could always grow a method
+        back. ``WireGuardProvisioningProtocol`` is the contract this
+        orchestration is allowed to depend on, and ``create_tunnel`` must
+        not be in it."""
+        from app.domains.location.provisioning_service import (
+            WireGuardProvisioningProtocol,
+        )
+
+        members = set(WireGuardProvisioningProtocol.__protocol_attrs__)  # type: ignore[attr-defined]
+        assert "allocate_tunnel_via_hub" in members
+        assert "create_tunnel" not in members
+
+    async def test_hub_bridge_down_rolls_everything_back_and_says_so(self) -> None:
+        """A hub-bridge failure must not leave a half-provisioned customer.
+
+        ``HubBridgeUnavailableError`` subclasses ``CloudGuestError``, NOT
+        ``WireGuardError`` -- an ``except WireGuardError`` would miss the
+        single most likely failure on this path (the hub is another machine
+        at the end of an HTTP call). This proves the handler catches it,
+        re-raises so the transaction still rolls back, preserves the 502 so
+        a client can tell "retry, upstream is down" from "this platform is
+        broken", and tells the operator nothing was saved."""
+        from app.domains.wireguard.dependencies import HubBridgeUnavailableError
+
+        service, fakes, base_plan_id = make_service(
+            fail_at="wireguard.allocate_tunnel_via_hub",
+            fail_with=HubBridgeUnavailableError(
+                "Could not reach the WireGuard hub bridge"
+            ),
+        )
+
+        with pytest.raises(RouterTunnelProvisioningFailedError) as excinfo:
+            await run_within_transaction(
+                fakes.session,
+                service.provision_location(
+                    actor_user_id=uuid.uuid4(),
+                    data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+                ),
+            )
+
+        assert excinfo.value.status_code == 502
+        assert "NOT provisioned" in excinfo.value.message
+        assert "rolled back" in excinfo.value.message
+        assert "Could not reach the WireGuard hub bridge" in excinfo.value.message
+
+        # The whole customer really was discarded.
+        assert fakes.session.rolled_back is True
+        assert fakes.session.committed is False
+        # ...and no success was reported: the welcome email, which is what
+        # tells a customer their account exists, never went out.
+        assert "email.send" not in fakes.calls
+
+    async def test_a_wireguard_domain_failure_is_caught_too(self) -> None:
+        """The other half of the two-type ``except``.
+        ``HubPeerAllocatorNotConfiguredError`` (503) is a ``WireGuardError``
+        and does NOT subclass ``HubBridgeUnavailableError`` -- naming only
+        one of the two types would leak a raw domain error to the wizard."""
+        from app.domains.wireguard.exceptions import (
+            HubPeerAllocatorNotConfiguredError,
+        )
+
+        service, fakes, base_plan_id = make_service(
+            fail_at="wireguard.allocate_tunnel_via_hub",
+            fail_with=HubPeerAllocatorNotConfiguredError(),
+        )
+
+        with pytest.raises(RouterTunnelProvisioningFailedError) as excinfo:
+            await run_within_transaction(
+                fakes.session,
+                service.provision_location(
+                    actor_user_id=uuid.uuid4(),
+                    data=_input(new_organization=_new_org(), plan_id=base_plan_id),
+                ),
+            )
+
+        assert excinfo.value.status_code == 503
+        assert fakes.session.rolled_back is True
+
+
+# ============================================================================
 # Real single-transaction rollback proof
 # ============================================================================
 
 
 class TestTransactionalRollback:
     async def test_forced_failure_rolls_back_and_stops_subsequent_steps(self) -> None:
-        """Forces a failure inside step (e) (WireGuard tunnel creation) --
-        after Organization/Location/User/Router have already flushed -- and
-        proves: (1) no step after (e) ever ran, (2) the shared fake session's
+        """Forces a failure inside step (d) (router registration) -- after
+        Organization/Location/User have already flushed -- and proves:
+        (1) no step after it ever ran, (2) the shared fake session's
         rollback fired, (3) commit never fired, mirroring
         ``app.database.session.get_db_session``'s real commit-once /
         rollback-on-exception shape exactly (see
-        ``run_within_transaction`` above)."""
-        service, fakes, base_plan_id = make_service(fail_at="wireguard.create_tunnel")
+        ``run_within_transaction`` above).
+
+        This used to force the failure at the WireGuard step. It cannot any
+        more and still prove what it is named for: that step now runs LAST
+        (see ``TestHubBridgeAllocation``), so failing there leaves nothing
+        after it to assert was skipped."""
+        service, fakes, base_plan_id = make_service(fail_at="router.create")
 
         with pytest.raises(RuntimeError, match="forced failure"):
             await run_within_transaction(
@@ -1197,13 +1386,13 @@ class TestTransactionalRollback:
         # Steps before the failure point ran (and flushed)...
         assert "organization.create" in fakes.calls
         assert "user.create" in fakes.calls
-        assert "router.create" in fakes.calls
         assert "location.create" in fakes.session.flushed
 
         # ...but nothing from or after the failing step ever executed.
         assert "router_provisioning.assign_profile" not in fakes.calls
         assert "subscription.create" not in fakes.calls
         assert "captive_portal.create_config" not in fakes.calls
+        assert "wireguard.allocate_tunnel_via_hub" not in fakes.calls
         assert "email.send" not in fakes.calls
         assert not any(
             call == f"audit:{AuditAction.LOCATION_PROVISIONED.value}"
@@ -1218,9 +1407,14 @@ class TestTransactionalRollback:
     async def test_forced_failure_late_in_the_flow_still_rolls_back_everything(
         self,
     ) -> None:
-        """Same proof, but failing at the very last composed step
+        """Same proof, but failing at the last composed DATABASE step
         (captive portal config) -- confirms rollback discards even a nearly-
-        complete flow, not just an early failure."""
+        complete flow, not just an early failure.
+
+        It also proves the thing the step reordering exists for: a failure
+        this late must not have already burned a hub peer. The hub agent
+        has no removal verb, so a peer minted before this point would
+        survive the rollback and hold its tunnel address forever."""
         service, fakes, base_plan_id = make_service(
             fail_at="captive_portal.create_config"
         )
@@ -1236,6 +1430,9 @@ class TestTransactionalRollback:
 
         assert "subscription.create" in fakes.calls
         assert "email.send" not in fakes.calls
+        # No unreclaimable hub allocation was made for a customer that does
+        # not exist.
+        assert "wireguard.allocate_tunnel_via_hub" not in fakes.calls
         # The overall-event audit entry (written last, step k) never fired --
         # LocationService's own earlier CRUD audits (steps b/i) legitimately
         # did, before the forced failure.

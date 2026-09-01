@@ -74,6 +74,72 @@ class HubBridgeUnavailableError(CloudGuestError):
         super().__init__(message, status_code=status.HTTP_502_BAD_GATEWAY)
 
 
+def bridge_error_detail(resp: httpx.Response) -> str:
+    """The hub agent's own explanation of a >=400.
+
+    Lived in ``router.py`` until the allocation call moved down into the
+    service layer; it is here now because both the HTTP endpoint and the
+    injected allocator below need it, and because the identically-named
+    helper in ``app.domains.guest.router`` documents the reason it has to
+    exist at all -- both hub agents answer with the ``{"error":
+    "<str(exception)>"}`` shape and their ``log_message`` is a deliberate
+    no-op, so this body is the only description of the failure that exists
+    anywhere.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return (resp.text or "<empty response body>")[:600]
+    if isinstance(body, dict) and "error" in body:
+        return str(body["error"])[:600]
+    return str(body)[:600]
+
+
+def make_hub_peer_allocator(settings: Settings):
+    """Builds the callable ``WireGuardService.allocate_tunnel_via_hub`` uses
+    to have the hub mint a peer -- ``POST /wg/peer`` on
+    ``ops/hub-agents/wg_agent.py``, the same URL/secret the deregistrar and
+    the lister already use. One bridge, three verbs.
+
+    THIS IS THE ONLY PATH THAT PRODUCES A KEY BOTH SIDES KNOW. The agent
+    generates the keypair itself and returns both halves; there is no verb
+    that accepts a public key the caller already has, which is exactly what
+    ``exceptions.HubCannotLearnPlatformKeyError`` guards against on the
+    ``create_tunnel``/``rotate_tunnel`` side.
+
+    Injected on the service rather than called inline from a route for the
+    same reason as ``make_hub_peer_deregistrar``: the orchestration around
+    it (reuse, adopt, refuse-over-a-live-device) is business logic that more
+    than one caller needs -- the Master console's WireGuard tab *and*
+    ``LocationProvisioningService.provision_location`` -- and the in-memory
+    test suite has to be able to drive all of it without HTTP.
+
+    Raises ``HubBridgeUnavailableError`` (a 502, and NOT a
+    ``WireGuardError`` -- see that class's own docstring, trap 1) on both
+    an unreachable bridge and a bridge that answered with a >=400.
+    """
+
+    async def _allocate() -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    settings.hub_wg_agent_url,
+                    headers={"X-Agent-Secret": settings.hub_wg_agent_secret},
+                )
+        except httpx.HTTPError as exc:
+            raise HubBridgeUnavailableError(
+                f"Could not reach the WireGuard hub bridge: {exc!s}"
+            ) from exc
+        if resp.status_code >= 400:
+            raise HubBridgeUnavailableError(
+                "The WireGuard hub bridge refused this allocation "
+                f"(HTTP {resp.status_code}): {bridge_error_detail(resp)}"
+            )
+        return resp.json()
+
+    return _allocate
+
+
 def make_hub_peer_deregistrar(settings: Settings):
     """Builds the callable `WireGuardService` uses to remove a peer from the
     hub, from the same settings the ALLOCATION path already uses.
@@ -209,6 +275,7 @@ def get_wireguard_service(
         handshake_stale_after_minutes=settings.wireguard_handshake_stale_after_minutes,
         hub_peer_deregistrar=make_hub_peer_deregistrar(settings),
         hub_peer_lister=make_hub_peer_lister(settings),
+        hub_peer_allocator=make_hub_peer_allocator(settings),
         hub_capabilities=hub_capabilities_from_settings(settings),
         # No `peer_address_listener` here on purpose: wiring it would mean
         # importing `app.domains.guest`, which already imports this module.
@@ -220,6 +287,8 @@ __all__ = [
     "get_wireguard_repository",
     "get_wireguard_service",
     "hub_capabilities_from_settings",
+    "bridge_error_detail",
+    "make_hub_peer_allocator",
     "make_hub_peer_deregistrar",
     "make_hub_peer_lister",
     "HubBridgeUnavailableError",
