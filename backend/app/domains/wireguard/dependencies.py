@@ -42,10 +42,36 @@ class HubBridgeUnavailableError(CloudGuestError):
     that never reached the hub has not revoked anything -- the address is
     freed in the database while the hub still hands it out, which is the
     state that left 68 orphaned peers on the tunnel box.
+
+    TWO TRAPS LIVE HERE, both of them about the fact that this subclasses
+    ``CloudGuestError`` and NOT ``exceptions.WireGuardError``.
+
+    1. ``except WireGuardError`` does not catch it. Nothing about the name
+       says so, and the one place that tried --
+       ``hub_reconciliation.tasks`` -- named this class in its own comment
+       while catching a type that excludes it, so the most likely failure in
+       that task escaped the handler written for it. Fixed 2026-09-01; if a
+       new caller wants "any hub failure", it must name both.
+
+    2. ``status_code`` had to move into ``__init__``. It was written as a
+       CLASS attribute (``status_code = 502``), which
+       ``CloudGuestError.__init__`` then overwrote on every instance with
+       its own default of 500 -- so this was raised as a 502 in intent and
+       served as a 500 "Internal server error" in fact, for its whole life.
+       A hub bridge that is down is not an internal server error; it is an
+       upstream dependency that is down, and a client cannot tell the
+       difference between "retry, the hub is unreachable" and "this
+       platform is broken" from a 500. ``error_code`` below is left as a
+       class attribute because ``CloudGuestError`` never sets one, so
+       nothing shadows it -- though nothing reads it either today, the
+       shared handler in ``app.common.exceptions`` serialises ``message``
+       and ``data`` only.
     """
 
-    status_code = 502
     error_code = "hub_bridge_unavailable"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_502_BAD_GATEWAY)
 
 
 def make_hub_peer_deregistrar(settings: Settings):

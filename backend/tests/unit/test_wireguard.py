@@ -3091,3 +3091,39 @@ class TestLiveIdentityGuard:
             )
             is None
         )
+
+
+class TestHubBridgeUnavailableIsA502:
+    """A hub bridge that is down is an UPSTREAM failure, not this
+    platform's own.
+
+    ``HubBridgeUnavailableError`` declared ``status_code = 502`` as a class
+    attribute -- which ``CloudGuestError.__init__`` then overwrote on every
+    instance with its own default of 500. So for its entire life it was
+    raised as a 502 in intent and served as a 500 "Internal server error" in
+    fact. That distinction is the whole difference between "retry, the hub
+    is unreachable" and "this platform is broken", and the console has no
+    other way to tell them apart: the shared handler in
+    ``app.common.exceptions`` serialises ``message`` and ``data`` only, so
+    the status IS the classification.
+    """
+
+    def test_the_instance_carries_502_not_the_base_class_default(self) -> None:
+        from app.domains.wireguard.dependencies import HubBridgeUnavailableError
+
+        exc = HubBridgeUnavailableError("Could not reach the WireGuard hub bridge")
+
+        assert exc.status_code == 502
+        assert exc.message == "Could not reach the WireGuard hub bridge"
+
+    def test_it_is_not_a_wireguard_error_and_that_is_load_bearing(self) -> None:
+        """Pinned deliberately. ``except WireGuardError`` does NOT catch this
+        -- ``hub_reconciliation.tasks`` claimed in a comment that it did and
+        was wrong for as long as that comment existed. Anyone changing this
+        hierarchy has to come through here and read that."""
+        from app.common.exceptions import CloudGuestError
+        from app.domains.wireguard.dependencies import HubBridgeUnavailableError
+        from app.domains.wireguard.exceptions import WireGuardError
+
+        assert issubclass(HubBridgeUnavailableError, CloudGuestError)
+        assert not issubclass(HubBridgeUnavailableError, WireGuardError)
