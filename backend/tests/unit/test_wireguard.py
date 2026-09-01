@@ -580,6 +580,7 @@ def make_services(
     wireguard_repo: FakeWireGuardRepository | None = None,
     hub_peer_deregistrar=None,
     hub_peer_lister=None,
+    hub_peer_allocator=None,
     hub_capabilities: HubCapabilities | None = None,
     peer_address_listener=None,
 ) -> Fixture:
@@ -606,6 +607,7 @@ def make_services(
         handshake_stale_after_minutes=handshake_stale_after_minutes,
         hub_peer_deregistrar=hub_peer_deregistrar,
         hub_peer_lister=hub_peer_lister,
+        hub_peer_allocator=hub_peer_allocator,
         # Defaults to a fully-featured hub (HubCapabilities()'s own
         # defaults) so every pre-existing test keeps exercising the
         # unrestricted paths; the tests that care about today's degraded
@@ -3091,3 +3093,360 @@ class TestLiveIdentityGuard:
             )
             is None
         )
+
+
+class TestHubBridgeUnavailableIsA502:
+    """A hub bridge that is down is an UPSTREAM failure, not this
+    platform's own.
+
+    ``HubBridgeUnavailableError`` declared ``status_code = 502`` as a class
+    attribute -- which ``CloudGuestError.__init__`` then overwrote on every
+    instance with its own default of 500. So for its entire life it was
+    raised as a 502 in intent and served as a 500 "Internal server error" in
+    fact. That distinction is the whole difference between "retry, the hub
+    is unreachable" and "this platform is broken", and the console has no
+    other way to tell them apart: the shared handler in
+    ``app.common.exceptions`` serialises ``message`` and ``data`` only, so
+    the status IS the classification.
+    """
+
+    def test_the_instance_carries_502_not_the_base_class_default(self) -> None:
+        from app.domains.wireguard.dependencies import HubBridgeUnavailableError
+
+        exc = HubBridgeUnavailableError("Could not reach the WireGuard hub bridge")
+
+        assert exc.status_code == 502
+        assert exc.message == "Could not reach the WireGuard hub bridge"
+
+    def test_it_is_not_a_wireguard_error_and_that_is_load_bearing(self) -> None:
+        """Pinned deliberately. ``except WireGuardError`` does NOT catch this
+        -- ``hub_reconciliation.tasks`` claimed in a comment that it did and
+        was wrong for as long as that comment existed. Anyone changing this
+        hierarchy has to come through here and read that."""
+        from app.common.exceptions import CloudGuestError
+        from app.domains.wireguard.dependencies import HubBridgeUnavailableError
+        from app.domains.wireguard.exceptions import WireGuardError
+
+        assert issubclass(HubBridgeUnavailableError, CloudGuestError)
+        assert not issubclass(HubBridgeUnavailableError, WireGuardError)
+
+
+# ============================================================================
+# The hub bridge is the only path to a usable tunnel
+# ============================================================================
+
+
+def _agent_allocation(
+    *,
+    public_key: str = "HUB-MINTED-KEY",
+    tunnel_ip: str = "10.100.0.7",
+    cidr: str = "10.100.0.0/16",
+) -> dict:
+    """The exact JSON ``ops/hub-agents/wg_agent.py``'s ``POST /wg/peer``
+    returns -- it runs ``wg genkey`` itself and hands back BOTH halves,
+    which is the whole reason this path produces a key the hub actually
+    holds and ``create_tunnel``'s does not."""
+    return {
+        "router_public_key": public_key,
+        "router_private_key": "HUB-MINTED-PRIVATE-KEY",
+        "router_tunnel_ip": tunnel_ip,
+        "server_public_key": "HUB-SERVER-KEY",
+        "server_endpoint_host": "hub.cloudguest.example",
+        "server_endpoint_port": 51820,
+        "tunnel_subnet": cidr,
+    }
+
+
+class TestAllocateTunnelViaHub:
+    """``allocate_tunnel_via_hub`` is the orchestration that used to live
+    inline in ``router.allocate_external_wireguard_peer``.
+
+    It moved onto the service on 2026-09-01 because it was never
+    endpoint-specific: ``LocationProvisioningService.provision_location``
+    needs the identical sequence, and while it lived in a route handler the
+    only thing provisioning could reach was ``create_tunnel`` -- whose
+    platform-generated public key the hub has no verb to learn, so every
+    attempt to add a customer died on ``HubCannotLearnPlatformKeyError``.
+    """
+
+    async def test_allocates_through_the_bridge_and_records_the_hub_key(
+        self,
+    ) -> None:
+        calls: list[int] = []
+
+        async def _allocator() -> dict:
+            calls.append(1)
+            return _agent_allocation()
+
+        f = make_services(hub_peer_allocator=_allocator)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+
+        allocation = await f.wireguard_service.allocate_tunnel_via_hub(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+
+        assert calls == [1]
+        assert allocation.reused is False
+        assert allocation.adopted is False
+        # The recorded identity is the HUB's, not one generated here.
+        assert allocation.peer.public_key == "HUB-MINTED-KEY"
+        assert allocation.peer.tunnel_ip_address == "10.100.0.7"
+        assert allocation.peer_private_key == "HUB-MINTED-PRIVATE-KEY"
+        assert allocation.hub_public_key == "HUB-SERVER-KEY"
+        assert allocation.hub_tunnel_ip_address == "10.100.0.1"
+
+    async def test_never_generates_a_keypair_the_hub_cannot_learn(self) -> None:
+        """The contrast that is the whole bug. On the same fixture, with a
+        hub that has no key-registration verb (production's real
+        capability set), ``create_tunnel`` refuses -- and
+        ``allocate_tunnel_via_hub`` succeeds."""
+
+        async def _allocator() -> dict:
+            return _agent_allocation()
+
+        f = make_services(
+            hub_peer_allocator=_allocator,
+            hub_capabilities=HubCapabilities(can_register_public_key=False),
+        )
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+
+        with pytest.raises(HubCannotLearnPlatformKeyError):
+            await f.wireguard_service.create_tunnel(
+                actor_user_id=None,
+                router_id=router.id,
+                requesting_organization_id=None,
+            )
+
+        allocation = await f.wireguard_service.allocate_tunnel_via_hub(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+        assert allocation.peer.public_key == "HUB-MINTED-KEY"
+
+    async def test_reuses_an_existing_peer_instead_of_leaking_another(self) -> None:
+        """Every allocation is permanent -- the deployed agent has no
+        ``do_DELETE`` -- so a second call for a router that already has a
+        usable peer must not reach the bridge at all."""
+        calls: list[int] = []
+
+        async def _allocator() -> dict:
+            calls.append(1)
+            return _agent_allocation()
+
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_allocator=_allocator, hub_peer_lister=_lister)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+
+        first = await f.wireguard_service.allocate_tunnel_via_hub(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+        hub.append(
+            _hub_peer("HUB-MINTED-KEY", handshake_epoch=0, tunnel_ip="10.100.0.7")
+        )
+
+        second = await f.wireguard_service.allocate_tunnel_via_hub(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+        )
+
+        assert calls == [1]
+        assert second.reused is True
+        # The platform never held this key's private half -- it was
+        # generated on the hub -- so it is not invented on the reuse path.
+        assert second.peer_private_key is None
+        assert second.peer.public_key == first.peer.public_key
+
+    async def test_a_live_device_is_never_allocated_over_even_with_rotate(
+        self,
+    ) -> None:
+        """``rotate=true`` is what the Master console sent on every
+        Generate, four times in 24h, while the device sat handshaking. The
+        guard cannot live behind a flag the caller controls."""
+        calls: list[int] = []
+
+        async def _allocator() -> dict:
+            calls.append(1)
+            return _agent_allocation()
+
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_allocator=_allocator, hub_peer_lister=_lister)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.100.0.6",
+            public_key="KEY-SIX",
+        )
+        hub.append(
+            _hub_peer(
+                "KEY-SIX",
+                handshake_epoch=int(datetime.now(UTC).timestamp()),
+                tunnel_ip="10.100.0.6",
+            )
+        )
+
+        allocation = await f.wireguard_service.allocate_tunnel_via_hub(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            rotate=True,
+        )
+
+        assert calls == []
+        assert allocation.reused is True
+        assert allocation.peer.tunnel_ip_address == "10.100.0.6"
+
+    async def test_a_diverged_router_is_adopted_not_reallocated(self) -> None:
+        """The production shape: issued .6 (which the device imported and
+        is using), then superseded it with .8 (which no device ever saw).
+        Clicking Generate must repair the divergence, not deepen it."""
+        calls: list[int] = []
+
+        async def _allocator() -> dict:
+            calls.append(1)
+            return _agent_allocation()
+
+        hub: list[dict] = []
+
+        async def _lister() -> list[dict]:
+            return list(hub)
+
+        f = make_services(hub_peer_allocator=_allocator, hub_peer_lister=_lister)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.100.0.6",
+            public_key="KEY-SIX",
+        )
+        await f.wireguard_service.register_agent_allocated_peer(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            tunnel_ip_address="10.100.0.8",
+            public_key="KEY-EIGHT",
+        )
+        hub.extend(
+            [
+                _hub_peer(
+                    "KEY-SIX",
+                    handshake_epoch=int(datetime.now(UTC).timestamp()),
+                    tunnel_ip="10.100.0.6",
+                ),
+                _hub_peer("KEY-EIGHT", handshake_epoch=0, tunnel_ip="10.100.0.8"),
+            ]
+        )
+
+        allocation = await f.wireguard_service.allocate_tunnel_via_hub(
+            actor_user_id=None,
+            router_id=router.id,
+            requesting_organization_id=None,
+            rotate=True,
+        )
+
+        assert calls == []
+        assert allocation.adopted is True
+        assert allocation.peer.public_key == "KEY-SIX"
+        assert allocation.peer.tunnel_ip_address == "10.100.0.6"
+
+    async def test_an_ineligible_router_is_refused_before_the_hub_is_touched(
+        self,
+    ) -> None:
+        """Validation runs BEFORE the irreversible call. A decommissioned
+        router that got as far as the bridge would leak a peer that no
+        router will ever use and no verb can remove."""
+        calls: list[int] = []
+
+        async def _allocator() -> dict:
+            calls.append(1)
+            return _agent_allocation()
+
+        f = make_services(hub_peer_allocator=_allocator)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org, status=RouterStatus.DECOMMISSIONED)
+
+        with pytest.raises(WireGuardRouterNotEligibleError):
+            await f.wireguard_service.allocate_tunnel_via_hub(
+                actor_user_id=None,
+                router_id=router.id,
+                requesting_organization_id=None,
+            )
+
+        assert calls == []
+
+    async def test_no_allocator_configured_fails_loudly(self) -> None:
+        """It must NOT degrade to ``create_tunnel``: the only local
+        fallback available is the platform-generated keypair that cannot
+        work."""
+        from app.domains.wireguard.exceptions import (
+            HubPeerAllocatorNotConfiguredError,
+        )
+
+        f = make_services()
+        await make_hub(f)
+        org = f.org_lookup.add()
+        router = await make_router(f, org)
+
+        with pytest.raises(HubPeerAllocatorNotConfiguredError) as excinfo:
+            await f.wireguard_service.allocate_tunnel_via_hub(
+                actor_user_id=None,
+                router_id=router.id,
+                requesting_organization_id=None,
+            )
+        assert excinfo.value.status_code == 503
+
+    async def test_tenant_scope_is_enforced_on_the_router_lookup(self) -> None:
+        """RBAC/tenant scoping is unchanged by the move: the router lookup
+        still carries ``requesting_organization_id``, so a caller scoped to
+        another organization cannot allocate against this router."""
+        from app.domains.router.exceptions import (
+            CrossOrganizationRouterAccessError,
+        )
+
+        calls: list[int] = []
+
+        async def _allocator() -> dict:
+            calls.append(1)
+            return _agent_allocation()
+
+        f = make_services(hub_peer_allocator=_allocator)
+        await make_hub(f)
+        org = f.org_lookup.add()
+        other_org = f.org_lookup.add()
+        router = await make_router(f, org)
+
+        with pytest.raises(CrossOrganizationRouterAccessError):
+            await f.wireguard_service.allocate_tunnel_via_hub(
+                actor_user_id=None,
+                router_id=router.id,
+                requesting_organization_id=other_org.id,
+            )
+
+        assert calls == []
