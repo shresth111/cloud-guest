@@ -913,6 +913,22 @@ class UserService:
             return
         raise CrossOrganizationUserAccessError()
 
+    async def assert_user_accessible(
+        self, user_id: uuid.UUID, requesting_organization_id: uuid.UUID | None
+    ) -> None:
+        """Public tenant check for callers that need the guard without the
+        aggregate ``get_user_detail`` assembles.
+
+        The RBAC domain's ``/users/{id}/roles`` and ``/users/{id}/permissions``
+        reads had no tenant check at all: ``RequirePermission("users.read")``
+        scopes off the ``X-Organization-Id`` header while both handlers read
+        by path id, so any organization user could enumerate the role
+        assignments and effective permissions of any user on the platform,
+        including platform administrators.
+        """
+        user = await self._get_user_or_raise(user_id)
+        await self._enforce_user_tenant_access(user, requesting_organization_id)
+
     async def _enforce_user_tenant_access(
         self, user: User, requesting_organization_id: uuid.UUID | None
     ) -> None:
