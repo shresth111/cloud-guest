@@ -188,6 +188,7 @@ class MonitoringRepositoryProtocol(Protocol):
         status: str | None,
         severity: str | None,
         router_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
     ) -> tuple[list[Alert], PaginationMeta]: ...
@@ -698,6 +699,7 @@ class MonitoringRepository:
         status: str | None = None,
         severity: str | None = None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[Alert], PaginationMeta]:
@@ -714,6 +716,12 @@ class MonitoringRepository:
                 "status": status,
                 "severity": severity,
                 "router_id": router_id,
+                # Alert.location_id has always been populated by the
+                # router-health path; it simply was not filterable, so a
+                # caller wanting one venue's alerts had to over-fetch the
+                # organization and narrow client-side -- silently capped at
+                # one page.
+                "location_id": location_id,
             },
             sort_by="triggered_at",
             sort_order=SortOrder.DESC,
