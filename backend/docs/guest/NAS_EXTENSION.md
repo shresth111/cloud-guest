@@ -92,6 +92,32 @@ gone from the customer dashboard and the route is `ScopeType.GLOBAL`, the
 same posture `GET /platform/routers/{id}` and the WireGuard domain already
 carry.
 
+*So did `activate` and `disable` (2026-09-02).* That first move fixed one
+of the three `radius.execute` routes and left two behind, which meant the
+argument above was written down in one place while two routes carrying the
+same permission key and the same blast radius stayed on the venue owner's
+own dashboard. `disable` is the sharp one: it is a pure database write --
+`disable_nas` sets `status`/`is_active` and returns, with no hub call and
+no device call -- and `authenticate_nas` accepts only an `ACTIVE` NAS, so
+every guest login at that venue starts failing on the next Access-Request
+with nothing in any log naming the cause. It is worth being straight that
+this is *not* the rotate argument: a disable is reversible, and by the same
+role, since `activate` sat next to it. The reason it moved is that no
+product surface ever asked for a venue-owner kill switch -- the buttons
+existed because this status graph had been mirrored into the customer
+dashboard, and an internal lifecycle model is not a feature. A venue
+owner's own intent to stop serving guests is modeled in captive-portal
+business hours / closed state, which is where it belongs. `activate`
+followed both because the pair is meaningless split and because
+`SUSPENDED -> ACTIVE` is a legal edge, which made it a customer's way out
+of a platform-imposed hold the moment a suspend path exists.
+
+The rule the platform section now carries is stated for the *key*, not for
+the three routes that exist today: no `radius.execute` route in this domain
+is organization-scoped, asserted in
+`TestNasSecretRotationIsPlatformOnly::test_no_radius_execute_route_is_org_scoped`
+so that a fourth one added to `nas_router` later fails by construction.
+
 ## 3. Status lifecycle: real graph, `ACTIVE`-by-default registration
 
 `constants.NasStatus` (`PENDING`/`ACTIVE`/`DISABLED`/`SUSPENDED`/`DELETED`)
