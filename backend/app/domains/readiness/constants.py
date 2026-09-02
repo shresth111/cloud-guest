@@ -70,6 +70,7 @@ class ChecklistItemKey(StrEnum):
     HEARTBEAT = "heartbeat"
     SAAS_PROVISIONING = "saas_provisioning"
     WAN_CONNECTIVITY = "wan_connectivity"
+    GUEST_DATA_PATH = "guest_data_path"
     WIREGUARD = "wireguard"
     API_REACHABILITY = "api_reachability"
     GUEST_SIGN_IN = "guest_sign_in"
@@ -120,6 +121,34 @@ CHECKLIST_ITEMS: tuple[ChecklistItemDefinition, ...] = (
         key=ChecklistItemKey.WAN_CONNECTIVITY,
         label="WAN connectivity",
         description="At least one enabled WAN link is passing its health check.",
+        detection_mode=DetectionMode.AUTO,
+        category=ChecklistCategory.CONNECTIVITY,
+    ),
+    # THE ITEM THAT WOULD HAVE CAUGHT 2026-08-27.
+    #
+    # Every other item here asks whether something the platform configured
+    # is currently working. This one asks whether the platform ever
+    # configured it at all -- a different and, as it turns out, more
+    # dangerous question. Venue "huda city center" passed heartbeat, SaaS
+    # provisioning, WireGuard and API reachability, and every guest who
+    # authenticated had no internet, because no NAT rule had ever been
+    # asserted for that router and nothing anywhere said so.
+    #
+    # Deliberately NOT folded into WAN_CONNECTIVITY above. That item
+    # returns NOT_CHECKED when a router has no enabled ISP link -- which is
+    # correct for a question about *link health* (there is no link to
+    # assess) and is exactly why it could not surface this: NOT_CHECKED is
+    # not in FAILING_STATUSES, so a router with no data path at all counted
+    # as nothing-wrong. Two different claims deserve two rows.
+    ChecklistItemDefinition(
+        key=ChecklistItemKey.GUEST_DATA_PATH,
+        label="Guest data path",
+        description=(
+            "The platform has asserted a route to the internet for this "
+            "router's guests -- an enabled WAN link, or an applied config "
+            "version. Without one, guests authenticate successfully and "
+            "then have nowhere to send a packet."
+        ),
         detection_mode=DetectionMode.AUTO,
         category=ChecklistCategory.CONNECTIVITY,
     ),

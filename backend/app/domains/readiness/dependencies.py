@@ -20,6 +20,10 @@ from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 from app.domains.router_agent.dependencies import get_router_agent_service
 from app.domains.router_agent.service import RouterAgentService
+from app.domains.router_provisioning.dependencies import (
+    get_router_provisioning_service,
+)
+from app.domains.router_provisioning.service import RouterProvisioningService
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
@@ -39,6 +43,9 @@ def get_readiness_service(
     isp_service: IspService = Depends(get_isp_service),
     wireguard_service: WireGuardService = Depends(get_wireguard_service),
     router_agent_service: RouterAgentService = Depends(get_router_agent_service),
+    router_provisioning_service: RouterProvisioningService = Depends(
+        get_router_provisioning_service
+    ),
 ) -> ReadinessService:
     return ReadinessService(
         repository,
@@ -46,6 +53,11 @@ def get_readiness_service(
         isp_service,
         wireguard_service,
         router_agent_service,
+        # Supplies the second kind of evidence GUEST_DATA_PATH accepts: a
+        # config version that actually reached the device. Without it that
+        # check can only see ISP links, and would fail a router that was
+        # genuinely configured by a push.
+        router_provisioning_service,
     )
 
 

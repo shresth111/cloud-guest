@@ -24,6 +24,13 @@ class Settings(BaseSettings):
             "https://www.wyfyguest.com",
             "https://app.wyfyguest.com",
             "https://portal.wyfyguest.com",
+            # The name the captive portal is actually reached by -- see
+            # `network_config.renderers.HOTSPOT_DNS_NAME`. Today the portal
+            # calls the API same-origin (nginx proxies /api/ from the same
+            # server block), so CORS is not on that path at all; this entry
+            # is here so it stays working if that ever stops being true,
+            # not because anything currently depends on it.
+            "https://wifi.wyfyguest.com",
         ]
     )
 

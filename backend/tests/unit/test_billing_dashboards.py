@@ -22,10 +22,12 @@ Postgres/Redis anywhere in this suite.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -1005,3 +1007,80 @@ class TestSuperAdminDashboardScopeWiring:
             key = (path, frozenset(methods))
             assert key not in seen, f"duplicate route registered: {key}"
             seen.add(key)
+
+
+class _ReachedService(Exception):
+    """Sentinel raised by the fake dashboard service once the tenant guard
+    has been cleared, so these tests never have to build a full dashboard
+    result just to exercise the guard."""
+
+
+class TestBillingDashboardByOrganizationTenantScoping:
+    """``GET /billing/dashboard/{organization_id}`` reads the organization
+    named in the *path*, but ``RequirePermission("billing.read")`` resolves
+    its scope through ``_current_scope_context``, which prefers the
+    ``X-Organization-Id`` *header* over the path parameter. Without an
+    explicit check on the target, any tenant holding ``billing.read`` on its
+    own organization could read another tenant's plan, subscription, usage
+    and recent invoices by sending its own header alongside a foreign UUID
+    in the URL.
+    """
+
+    async def _call(self, *, path_org, requesting_org, parent_of_target=None):
+        """Invoke the endpoint with fakes. Returns the organization id the
+        dashboard service was actually asked for, or raises whatever the
+        guard raised."""
+        from app.domains.billing.router import get_billing_dashboard
+
+        asked_for: list[uuid.UUID] = []
+
+        class _FakeDashboardService:
+            async def get_dashboard(self, organization_id):
+                asked_for.append(organization_id)
+                raise _ReachedService
+
+        class _FakeOrganizationService:
+            async def get_organization(self, organization_id):
+                return SimpleNamespace(
+                    id=organization_id,
+                    parent_organization_id=parent_of_target,
+                )
+
+        request = SimpleNamespace(
+            state=SimpleNamespace(request_id="req-test"), headers={}
+        )
+        with contextlib.suppress(_ReachedService):
+            await get_billing_dashboard(
+                request,
+                path_org,
+                requesting_organization_id=requesting_org,
+                organization_service=_FakeOrganizationService(),
+                service=_FakeDashboardService(),
+            )
+        return asked_for
+
+    async def test_foreign_organization_is_refused(self) -> None:
+        from app.domains.organization.exceptions import CrossOrganizationAccessError
+
+        victim = uuid.uuid4()
+        attacker = uuid.uuid4()
+        with pytest.raises(CrossOrganizationAccessError):
+            await self._call(path_org=victim, requesting_org=attacker)
+
+    async def test_own_organization_is_allowed(self) -> None:
+        own = uuid.uuid4()
+        assert await self._call(path_org=own, requesting_org=own) == [own]
+
+    async def test_msp_parent_may_read_a_child(self) -> None:
+        parent = uuid.uuid4()
+        child = uuid.uuid4()
+        asked_for = await self._call(
+            path_org=child, requesting_org=parent, parent_of_target=parent
+        )
+        assert asked_for == [child]
+
+    async def test_platform_level_caller_may_target_any_organization(self) -> None:
+        """A global-scope operator has no organization context at all; the
+        guard must not turn that into a denial."""
+        target = uuid.uuid4()
+        assert await self._call(path_org=target, requesting_org=None) == [target]
