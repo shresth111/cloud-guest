@@ -12,12 +12,24 @@ audit, version columns) for the same reason every other domain does.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
+
+from .constants import VlanDevicePushStatus
 
 
 class Vlan(BaseModel):
@@ -74,6 +86,27 @@ class Vlan(BaseModel):
     )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # -- device push ---------------------------------------------------------
+    #
+    # Whether this row has ever reached a real router, and what happened.
+    # Deliberately independent of ``is_enabled`` (intent) and of
+    # ``network_config``'s ``ConfigVersion`` status (a different, script-based
+    # pipeline). A VLAN can be enabled and rendered into an "APPLIED" config
+    # version and still never have been on a device -- which was the state of
+    # every VLAN row before this domain had a push at all.
+    device_push_status: Mapped[str] = mapped_column(
+        String(20),
+        default=VlanDevicePushStatus.PENDING.value,
+        server_default=VlanDevicePushStatus.PENDING.value,
+        nullable=False,
+    )
+    # The raw ``str(exc)`` from the last failed push. Shown to the operator
+    # verbatim -- a device error is more useful unedited than summarized.
+    device_push_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    device_pushed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_vlans_router_id", "router_id"),

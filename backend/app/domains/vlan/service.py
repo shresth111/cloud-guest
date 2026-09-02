@@ -32,15 +32,22 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.models import Router
 
-from .events import VlanCreated, VlanDeleted, VlanUpdated
+from .constants import VlanDevicePushStatus
+from .device_adapters import VlanCredentials, get_vlan_adapter
+from .events import VlanCreated, VlanDeleted, VlanPushed, VlanUpdated
 from .exceptions import (
     CrossOrganizationVlanAccessError,
+    VlanHotspotPushUnsupportedError,
     VlanIdAlreadyExistsError,
+    VlanMissingCredentialsError,
+    VlanMissingInterfaceError,
+    VlanNotEnabledError,
     VlanNotFoundError,
 )
 from .models import Vlan
@@ -254,6 +261,140 @@ class VlanService:
             description=f"VLAN '{deleted.name}' deleted",
         )
         return deleted
+
+    async def push_vlan_to_device(
+        self,
+        vlan_pk: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> Vlan:
+        """Realizes one VLAN on its own router, over the RouterOS API.
+
+        Until this existed, ``create_vlan`` wrote a row, returned 201, and
+        the device was never contacted -- so "VLAN created" meant "a
+        database row exists" and nothing more. Verified against the live
+        fleet: one VLAN row, zero ``/interface vlan`` entries on the router.
+
+        **Separate from create/update, deliberately.** Renaming a VLAN must
+        not be able to fail with a connection error, and an operator must be
+        able to retry a push without re-submitting the form.
+
+        **Every precondition is checked before a socket is opened**, so a
+        misconfigured row fails as a 4xx naming the problem rather than as a
+        device timeout.
+
+        **A failure is committed, then re-raised.** This is the one place
+        this method deliberately does *not* copy ``qos.push_rule_to_device``:
+        that method writes the failure and re-raises, but
+        ``GenericRepository.update`` only ``flush()``es and
+        ``get_db_session`` rolls back on any exception -- so its failure
+        record is discarded and the row still reads ``pending`` after a real
+        device failure, with ``device_push_error`` NULL. Its docstring
+        claims the opposite, and the unit test that "proves" it uses an
+        in-memory fake with no transaction. Committing explicitly before
+        raising is what makes the record survive to be read.
+
+        The exception then propagates as a real non-2xx. It must not become
+        a ``200 {"success": false}``: the frontend interceptor unwraps
+        ``data`` and never reads ``success``, so such a response is
+        indistinguishable from success to every caller in the app.
+        """
+        vlan = await self.get_vlan(
+            vlan_pk, requesting_organization_id=requesting_organization_id
+        )
+
+        if not vlan.is_enabled:
+            raise VlanNotEnabledError(vlan.id)
+        if not vlan.interface:
+            # render_vlan handles this by emitting a comment and skipping --
+            # fine for a script, but on a direct push the same silence would
+            # report success for a device that received nothing.
+            raise VlanMissingInterfaceError(vlan.id)
+        if vlan.enable_hotspot:
+            # The toggle is six further RouterOS commands the adapter does
+            # not implement. Pushing the interface and address while
+            # dropping the portal would be a success message for a VLAN
+            # whose guests never see one.
+            raise VlanHotspotPushUnsupportedError(vlan.id)
+
+        router = await self.router_lookup.get_router(
+            vlan.router_id, requesting_organization_id=requesting_organization_id
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_vlan_adapter(router.vendor)
+
+        try:
+            await adapter.configure_vlan(
+                credentials,
+                vlan_id=vlan.vlan_id,
+                name=vlan.name,
+                interface=vlan.interface,
+                ip_cidr=self._device_address(vlan),
+                port_mode=vlan.port_mode,
+            )
+        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
+            await self.repository.update_vlan(
+                vlan,
+                {
+                    "device_push_status": VlanDevicePushStatus.FAILED.value,
+                    "device_push_error": str(exc),
+                },
+            )
+            await self.repository.commit()
+            raise
+
+        updated = await self.repository.update_vlan(
+            vlan,
+            {
+                "device_push_status": VlanDevicePushStatus.ACTIVE.value,
+                "device_push_error": None,
+                "device_pushed_at": datetime.now(UTC),
+                "updated_by": actor_user_id,
+            },
+        )
+        event = VlanPushed(
+            id=updated.id, router_id=updated.router_id, port_mode=updated.port_mode
+        )
+        logger.info("vlan_pushed", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.VLAN_PUSHED,
+            entity_id=updated.id,
+            organization_id=updated.organization_id,
+            description=(
+                f"VLAN {updated.vlan_id} ('{updated.name}') pushed to router "
+                f"{updated.router_id} in {updated.port_mode} mode"
+            ),
+        )
+        return updated
+
+    @staticmethod
+    def _device_address(vlan: Vlan) -> str | None:
+        """The address line the device should carry, matching
+        ``renderers._vlan_address_line`` exactly.
+
+        When a gateway is set the router's own address is the *gateway*
+        inside the subnet, not the network address -- sending ``cidr`` here
+        would put the router at ``.0``. The two paths must agree: a VLAN
+        pushed directly and the same VLAN rendered into a config script have
+        to produce the same device state.
+        """
+        if not vlan.cidr:
+            return None
+        if vlan.gateway_ip_address:
+            return f"{vlan.gateway_ip_address}/{vlan.cidr.split('/')[-1]}"
+        return vlan.cidr
+
+    def _resolve_device_credentials(self, router: Router) -> VlanCredentials:
+        """Raise rather than guess -- mirrors ``qos``/``queue_management``."""
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.router_lookup.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            raise VlanMissingCredentialsError(router.id)
+        return VlanCredentials(
+            host=host, username=router.api_username, password=secret
+        )
 
     async def _audit(
         self,

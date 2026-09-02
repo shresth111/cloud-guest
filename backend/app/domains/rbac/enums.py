@@ -768,6 +768,11 @@ class AuditAction(StrEnum):
     VLAN_CREATED = "vlan_created"
     VLAN_UPDATED = "vlan_updated"
     VLAN_DELETED = "vlan_deleted"
+    # VLAN_PUSHED is the real device-push event: the row was realized on an
+    # actual router over the RouterOS API. Distinct from VLAN_CREATED, which
+    # only ever meant "a database row exists" -- for most of this domain's
+    # life that was all a "created" VLAN was.
+    VLAN_PUSHED = "vlan_pushed"
 
     # DHCP Pool Management domain events -- written through this same
     # table by ``app.domains.dhcp.service.DhcpService`` via the same

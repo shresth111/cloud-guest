@@ -1055,24 +1055,75 @@ class MikroTikAdapter:
         await asyncio.to_thread(self._configure_vlan_sync, creds, vlan)
 
     def _configure_vlan_sync(self, creds: DeviceCredentials, vlan: VlanConfig) -> None:
-        vlan_interface = f"vlan{vlan.vlan_id}"
         api = self._connect_api(creds)
         try:
-            try:
+            if vlan.port_mode == "access":
+                self._configure_vlan_access(api, creds, vlan)
+            else:
+                self._configure_vlan_trunk(api, creds, vlan)
+        finally:
+            api.close()
+
+    def _configure_vlan_trunk(
+        self, api, creds: DeviceCredentials, vlan: VlanConfig
+    ) -> None:
+        """Tagged sub-interface on a parent trunk -- ``render_vlan``'s
+        default branch."""
+        vlan_interface = f"vlan{vlan.vlan_id}"
+        try:
+            if not self._interface_vlan_exists(api, vlan_interface):
                 api.path("interface", "vlan").add(
                     name=vlan_interface,
                     **{"vlan-id": str(vlan.vlan_id)},
                     interface=vlan.interface,
                     comment=vlan.name,
                 )
-                if vlan.ip_cidr:
-                    api.path("ip", "address").add(
-                        address=vlan.ip_cidr, interface=vlan_interface
-                    )
-            except LibRouterosError as exc:
-                raise MikroTikDeviceError(creds.host, f"configure_vlan: {exc}") from exc
-        finally:
-            api.close()
+            self._ensure_ip_address(api, vlan.ip_cidr, vlan_interface)
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(creds.host, f"configure_vlan: {exc}") from exc
+
+    def _configure_vlan_access(
+        self, api, creds: DeviceCredentials, vlan: VlanConfig
+    ) -> None:
+        """Dedicated untagged port -- ``render_vlan``'s "access" branch.
+
+        The physical port is pulled out of the shared bridge and given the
+        subnet directly. No ``/interface vlan`` entry is created: in this
+        mode the VLAN is realized as a separate port, deliberately, so that
+        enabling it can never disturb the shared production bridge's
+        already-live traffic (see ``Vlan.port_mode``'s own docstring).
+        """
+        physical = vlan.interface
+        try:
+            for port in list(api.path("interface", "bridge", "port")):
+                if port.get("interface") == physical:
+                    api.path("interface", "bridge", "port").remove(port[".id"])
+            self._ensure_ip_address(api, vlan.ip_cidr, physical)
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(creds.host, f"configure_vlan: {exc}") from exc
+
+    def _interface_vlan_exists(self, api, name: str) -> bool:
+        return any(row.get("name") == name for row in api.path("interface", "vlan"))
+
+    def _ensure_ip_address(self, api, ip_cidr: str | None, interface: str) -> None:
+        """Adds the address only when that exact address is not already on
+        that interface.
+
+        Re-pushing is an ordinary operation -- an operator edits a name and
+        saves again -- and RouterOS answers a duplicate ``add`` with
+        "already have such item". Without this check the second push of an
+        unchanged row surfaces as a device error, which teaches people to
+        ignore push failures.
+
+        Matches on address *and* interface: the same subnet existing
+        somewhere else on the router is not this VLAN's address.
+        """
+        if not ip_cidr:
+            return
+        for row in api.path("ip", "address"):
+            if row.get("address") == ip_cidr and row.get("interface") == interface:
+                return
+        api.path("ip", "address").add(address=ip_cidr, interface=interface)
 
     async def configure_dhcp_pool(
         self, creds: DeviceCredentials, *, pool: DhcpPoolConfig

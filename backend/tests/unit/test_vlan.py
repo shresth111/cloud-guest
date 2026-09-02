@@ -452,7 +452,11 @@ class TestListVlansForRouter:
 
 class TestEveryRouteRequiresPermission:
     def test_every_vlan_route_has_a_permission_dependency(self) -> None:
-        assert len(vlan_router.routes) == 5
+        # 6, not 5: POST /vlans/{vlan_pk}/push was added when this domain
+        # gained a real device push. The count is asserted on purpose so a
+        # new route cannot slip in unguarded -- bump it deliberately, having
+        # checked the new route actually carries a permission dependency.
+        assert len(vlan_router.routes) == 6
         for route in vlan_router.routes:
             assert (
                 route.dependencies != []
