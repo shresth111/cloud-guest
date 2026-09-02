@@ -1554,60 +1554,6 @@ async def delete_radius_nas(
     )
 
 
-@nas_router.post(
-    "/{nas_id}/activate",
-    response_model=ApiResponse[RadiusNasResponse],
-    status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("radius.execute"))],
-)
-async def activate_radius_nas(
-    request: Request,
-    nas_id: uuid.UUID,
-    user: AuthUser = Depends(CurrentUser),
-    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    service: RadiusService = Depends(get_radius_service),
-):
-    nas_client = await service.activate_nas(
-        nas_id=nas_id,
-        requesting_organization_id=requesting_organization_id,
-        actor_user_id=uuid.UUID(user.id),
-    )
-    return build_response(
-        success=True,
-        message="RADIUS NAS client activated",
-        data=_nas_response(nas_client).model_dump(),
-        request_id=_request_id(request),
-    )
-
-
-@nas_router.post(
-    "/{nas_id}/disable",
-    response_model=ApiResponse[RadiusNasResponse],
-    status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("radius.execute"))],
-)
-async def disable_radius_nas(
-    request: Request,
-    nas_id: uuid.UUID,
-    payload: RadiusNasDisableRequest,
-    user: AuthUser = Depends(CurrentUser),
-    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    service: RadiusService = Depends(get_radius_service),
-):
-    nas_client = await service.disable_nas(
-        nas_id=nas_id,
-        requesting_organization_id=requesting_organization_id,
-        actor_user_id=uuid.UUID(user.id),
-        reason=payload.reason,
-    )
-    return build_response(
-        success=True,
-        message="RADIUS NAS client disabled",
-        data=_nas_response(nas_client).model_dump(),
-        request_id=_request_id(request),
-    )
-
-
 # ============================================================================
 # Platform-only NAS endpoints (Master console)
 # ============================================================================
@@ -1625,6 +1571,19 @@ async def disable_radius_nas(
 # thing that separates the two audiences, since an organization-scoped grant
 # can never satisfy a GLOBAL check however the caller sets
 # ``X-Organization-Id`` (``ScopeResolver.satisfies``).
+#
+# THE RULE THIS SECTION NOW CARRIES (2026-09-02, widened): *no*
+# ``radius.execute`` route anywhere in this domain is organization-scoped.
+# ``radius.execute`` is the NAS *lifecycle* key -- activate/disable/rotate --
+# and every one of those three reaches into the live RADIUS auth path for a
+# venue rather than into its tenant data. #93 moved only the rotate route and
+# left ``activate``/``disable`` behind on ``nas_router``, which meant the
+# reason for the split was written down in one place while two routes with
+# the same key and the same blast radius stayed reachable by every venue
+# owner. ``TestNasSecretRotationIsPlatformOnly`` now asserts the rule for the
+# key rather than for the three routes that exist today, so a fourth
+# ``radius.execute`` route added to ``nas_router`` later fails by
+# construction instead of quietly reopening this.
 
 
 @nas_platform_router.post(
@@ -1723,6 +1682,127 @@ async def regenerate_radius_nas_secret(
             **_nas_response(synced).model_dump(),
             shared_secret=result.shared_secret,
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_platform_router.post(
+    "/{nas_id}/activate",
+    response_model=ApiResponse[RadiusNasResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("radius.execute", scope=ScopeType.GLOBAL))
+    ],
+)
+async def activate_radius_nas(
+    request: Request,
+    nas_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    service: RadiusService = Depends(get_radius_service),
+):
+    """Returns a NAS to ``ACTIVE``, which is the only status
+    ``RadiusService.authenticate_nas`` accepts.
+
+    MOVED HERE FROM ``POST /radius/nas/{nas_id}/activate`` (2026-09-02),
+    with ``disable`` alongside it. See the section header for the rule.
+
+    This is the *lifting* half of the pair, so it does not take a venue
+    down -- but it is not therefore harmless. ``NAS_STATUS_TRANSITIONS``
+    makes ``SUSPENDED -> ACTIVE`` a legal edge, and ``SUSPENDED`` is
+    documented (``constants.NasStatus``) as the stronger, platform-imposed
+    restriction -- "a security incident or billing hold". Left on
+    ``nas_router`` this was a venue owner clearing the platform's own hold
+    on their own venue from their own dashboard. No endpoint sets
+    ``SUSPENDED`` in this build, so that was latent rather than live; it
+    stops being latent the moment a suspend path is added, and the fix for
+    it is here, not in whoever adds one.
+
+    ``requesting_organization_id`` is deliberately ``None``: the route is
+    GLOBAL-only, so the caller is a platform operator acting on some
+    tenant's device -- the same shape ``regenerate_radius_nas_secret`` and
+    ``get_router_platform_view``/``decommission_router`` use.
+    """
+    nas_client = await service.activate_nas(
+        nas_id=nas_id,
+        requesting_organization_id=None,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message=(
+            "RADIUS NAS client activated -- guest authentication through "
+            "this NAS is accepted again"
+        ),
+        data=_nas_response(nas_client).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_platform_router.post(
+    "/{nas_id}/disable",
+    response_model=ApiResponse[RadiusNasResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("radius.execute", scope=ScopeType.GLOBAL))
+    ],
+)
+async def disable_radius_nas(
+    request: Request,
+    nas_id: uuid.UUID,
+    payload: RadiusNasDisableRequest,
+    user: AuthUser = Depends(CurrentUser),
+    service: RadiusService = Depends(get_radius_service),
+):
+    """Takes a NAS out of ``ACTIVE``, which stops every guest login at that
+    venue from the moment it returns.
+
+    MOVED HERE FROM ``POST /radius/nas/{nas_id}/disable`` (2026-09-02).
+
+    This is the sharp one of the pair. There is no hub call and no device
+    call: ``disable_nas`` writes ``status``/``is_active`` and returns, and
+    ``authenticate_nas`` rejects any NAS that is not ``ACTIVE``
+    (``service.py``), so the venue's guest WiFi stops on the next
+    Access-Request. Nothing the guest, the router or the hub can see names
+    the cause -- the same silent-failure shape as the rotation bug #93
+    fixed, arrived at through the success path rather than a bug.
+
+    It differs from a rotation in one way worth stating plainly, because it
+    weakens the case rather than strengthens it: a disable *is* reversible,
+    and by the very role that could perform it -- ``activate`` above was
+    sitting next to it on the same dashboard. So the argument for moving it
+    is not "the venue owner cannot undo it". It is that no product surface
+    ever asked for a venue-owner-operated kill switch: the buttons existed
+    because ``NasStatus``'s internal lifecycle graph had been mirrored into
+    the customer dashboard, and an internal lifecycle model is not a
+    feature. Guest-facing "pause the WiFi" belongs to captive-portal
+    scheduling (business hours / portal closed), which is where a venue
+    owner's own intent to stop serving guests is actually modeled.
+
+    ``reason`` is retained and still audited: it is now an operator's note
+    about someone else's venue, which is if anything more worth having.
+    """
+    nas_client = await service.disable_nas(
+        nas_id=nas_id,
+        requesting_organization_id=None,
+        actor_user_id=uuid.UUID(user.id),
+        reason=payload.reason,
+    )
+    # The message states the consequence, not the operation. "RADIUS NAS
+    # client disabled" is true and tells an operator nothing about what
+    # just happened to the venue on the other end of it. Same reasoning as
+    # ``RadiusNasSecretRotatedResponse``'s ``device_action`` field, but a
+    # message rather than a field: a rotation obliges the caller to *do*
+    # something afterwards (drive to the router) and so needs a flag a
+    # client cannot miss, whereas a disable obliges nothing -- inventing a
+    # ``device_action_required: False`` field here would add API surface
+    # that describes no action.
+    return build_response(
+        success=True,
+        message=(
+            "RADIUS NAS client disabled -- every guest login at this venue "
+            "now fails until it is activated again"
+        ),
+        data=_nas_response(nas_client).model_dump(),
         request_id=_request_id(request),
     )
 

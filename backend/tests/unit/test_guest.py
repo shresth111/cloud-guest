@@ -6872,6 +6872,42 @@ def test_run_session_timeout_sweep_task_bridges_into_async(monkeypatch) -> None:
 
 
 class TestNasSecretRotationIsPlatformOnly:
+    """The NAS *lifecycle* routes are Master-console-only.
+
+    Named for the rotation because #93 got there first with one route.
+    Widened 2026-09-02 to the whole ``radius.execute`` key after
+    ``activate``/``disable`` were found still sitting on ``nas_router``,
+    reachable by every venue owner, with the same blast radius the rotate
+    route was moved for. The load-bearing assertion is now
+    ``test_no_radius_execute_route_is_org_scoped``, which is written against
+    the permission key rather than against today's three paths -- a fourth
+    ``radius.execute`` route added anywhere fails it by construction.
+    """
+
+    @staticmethod
+    def _routes_requiring(permission_key: str) -> list[object]:
+        """Every mounted route gated on ``permission_key``, found by reading
+        what ``RequirePermission`` actually closed over rather than by
+        guessing at paths -- a route can only hide from this by not using
+        the permission at all."""
+        from app.main import app
+
+        found = []
+        for route in app.routes:
+            dependant = getattr(route, "dependant", None)
+            if dependant is None:
+                continue
+            for dep in dependant.dependencies:
+                if dep.call is None:
+                    continue
+                if (
+                    TestNasSecretRotationIsPlatformOnly._declared_permission(dep.call)
+                    == permission_key
+                ):
+                    found.append(route)
+                    break
+        return found
+
     @staticmethod
     def _rotate_routes() -> list[object]:
         from app.main import app
@@ -6884,6 +6920,23 @@ class TestNasSecretRotationIsPlatformOnly:
         ]
 
     @staticmethod
+    def _declared_permission(dependant_call) -> object:
+        """The ``permission_key`` ``RequirePermission`` was constructed with.
+
+        Same closure read as ``_declared_scope``, taking the ``str``.
+        ``RequireRole`` also closes over a ``str`` (a role slug), which is
+        harmless here: no role is slugged ``radius.execute``.
+        """
+        for cell in getattr(dependant_call, "__closure__", None) or ():
+            try:
+                contents = cell.cell_contents
+            except ValueError:  # pragma: no cover -- empty cell
+                continue
+            if isinstance(contents, str):
+                return contents
+        return None
+
+    @staticmethod
     def _declared_scope(dependant_call) -> object:
         """The ``scope=`` ``RequirePermission`` was constructed with.
 
@@ -6893,7 +6946,7 @@ class TestNasSecretRotationIsPlatformOnly:
         """
         from app.domains.rbac.enums import ScopeType
 
-        for cell in dependant_call.__closure__ or ():
+        for cell in getattr(dependant_call, "__closure__", None) or ():
             try:
                 contents = cell.cell_contents
             except ValueError:  # pragma: no cover -- empty cell
@@ -6901,6 +6954,85 @@ class TestNasSecretRotationIsPlatformOnly:
             if isinstance(contents, ScopeType):
                 return contents
         return None
+
+    def test_no_radius_execute_route_is_org_scoped(self) -> None:
+        """THE RULE, stated for the permission key rather than for the three
+        routes that hold it today.
+
+        ``radius.execute`` gates NAS lifecycle -- activate, disable, rotate
+        -- and every one of those reaches into the live RADIUS auth path for
+        a venue. It is held at *organization* scope by ``organization-owner``
+        (asserted separately below), so any route carrying it without an
+        explicit ``scope=ScopeType.GLOBAL`` is customer-reachable the moment
+        it is mounted.
+
+        Writing it this way is the point: #93 fixed the one route it was
+        looking at and two others with the identical defect stayed live for a
+        day. A fourth one added later fails here rather than in an incident.
+        """
+        from app.domains.rbac.enums import ScopeType
+
+        offenders = []
+        for route in self._routes_requiring("radius.execute"):
+            scopes = [
+                self._declared_scope(dep.call)
+                for dep in route.dependant.dependencies
+                if dep.call is not None
+                and self._declared_permission(dep.call) == "radius.execute"
+            ]
+            if ScopeType.GLOBAL not in scopes:
+                offenders.append((route.path, scopes))
+
+        assert offenders == [], (
+            "These radius.execute routes are reachable by any venue owner, "
+            "because organization-owner holds radius.execute at organization "
+            "scope. Mount them on nas_platform_router with "
+            "scope=ScopeType.GLOBAL: " + repr(offenders)
+        )
+
+    def test_the_radius_execute_routes_are_exactly_the_platform_three(
+        self,
+    ) -> None:
+        """A companion to the rule above, and the half that catches the
+        *other* direction: a route that keeps GLOBAL scope but is mounted
+        back under the customer ``/radius/nas`` namespace passes the scope
+        assertion while telling every reader the wrong thing about who the
+        endpoint is for."""
+        paths = sorted(r.path for r in self._routes_requiring("radius.execute"))
+        assert paths == [
+            "/api/v1/platform/radius/nas/{nas_id}/activate",
+            "/api/v1/platform/radius/nas/{nas_id}/disable",
+            "/api/v1/platform/radius/nas/{nas_id}/regenerate-secret",
+        ]
+
+    def test_disable_is_a_database_write_with_no_hub_or_device_call(
+        self,
+    ) -> None:
+        """Why ``disable`` is immediate rather than eventually-consistent,
+        asserted as a signature so the claim in the route docstring cannot
+        rot.
+
+        ``regenerate_secret`` had to grow a mandatory ``push_secret``
+        because a rotation that does not reach the hub is a lie
+        (``test_regenerate_secret_cannot_be_called_without_a_push``).
+        ``disable_nas`` deliberately has no such argument: there is nothing
+        to push. It flips ``status``/``is_active`` and returns, and
+        ``authenticate_nas`` rejects anything that is not ``ACTIVE`` -- see
+        ``test_disabled_nas_cannot_authenticate`` -- so the venue stops
+        serving guests on the very next Access-Request, with no hub
+        round-trip to fail and no reconciliation sweep to undo it.
+        """
+        import inspect
+
+        params = set(inspect.signature(RadiusService.disable_nas).parameters)
+        assert "push_secret" not in params
+        assert params == {
+            "self",
+            "nas_id",
+            "requesting_organization_id",
+            "actor_user_id",
+            "reason",
+        }
 
     def test_the_only_rotate_route_is_the_platform_one(self) -> None:
         routes = self._rotate_routes()
@@ -6941,6 +7073,43 @@ class TestNasSecretRotationIsPlatformOnly:
         role = next(r for r in SYSTEM_ROLES if r.slug == "organization-owner")
         assert role.scope_type == ScopeType.ORGANIZATION
         assert PermissionAction.EXECUTE in role.grants()[PermissionModule.RADIUS]
+
+    def test_the_full_set_of_non_global_radius_execute_holders_is_known(
+        self,
+    ) -> None:
+        """The premise widened: ``organization-owner`` is not the only
+        non-platform role holding the key, so pinning only that one would
+        under-state how reachable these routes were.
+
+        Resolved by running the seed's own ``grants()`` rather than reading
+        its comments. If a future seed change adds or removes a holder this
+        fails, and whoever is reading gets to decide what it means for the
+        split -- which is the entire point of asserting a premise.
+        """
+        from app.domains.rbac.enums import PermissionAction, PermissionModule, ScopeType
+        from app.domains.rbac.seed import SYSTEM_ROLES
+
+        holders = {
+            role.slug: role.scope_type
+            for role in SYSTEM_ROLES
+            if PermissionAction.EXECUTE
+            in role.grants().get(PermissionModule.RADIUS, ())
+        }
+        assert holders == {
+            "super-admin": ScopeType.GLOBAL,
+            "platform-admin": ScopeType.GLOBAL,
+            "msp-owner": ScopeType.ORGANIZATION,
+            "msp-admin": ScopeType.ORGANIZATION,
+            "organization-owner": ScopeType.ORGANIZATION,
+            "organization-admin": ScopeType.ORGANIZATION,
+            "network-administrator": ScopeType.LOCATION,
+        }
+        # Five of the seven are below GLOBAL, and every one of those five is
+        # excluded by the move -- a LOCATION grant cannot satisfy a GLOBAL
+        # check either (SCOPE_HIERARCHY_ORDER), so network-administrator, the
+        # role closest to a legitimate operator of these endpoints, loses
+        # them too. That is the behaviour change, named.
+        assert sum(1 for s in holders.values() if s != ScopeType.GLOBAL) == 5
 
     def test_an_organization_scoped_grant_can_never_satisfy_a_global_check(
         self,
