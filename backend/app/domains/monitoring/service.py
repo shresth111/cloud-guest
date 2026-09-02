@@ -1158,6 +1158,38 @@ class AlertEvaluationResult:
     resolved: list[Alert]
 
 
+
+def _assert_owned_by(resource, requesting_organization_id: uuid.UUID | None) -> None:
+    """Tenant guard for a monitoring resource fetched by its own id.
+
+    ``RequirePermission`` resolves its scope from the ``X-Organization-Id``
+    header while these handlers read by path id, so without this the check and
+    the read name different organizations -- the defect class documented in
+    ``app/domains/organization/scoping.py``.
+
+    Two rules, and the second is the subtle one:
+
+    * ``requesting_organization_id is None`` -- a platform-level caller with no
+      organization context. Unrestricted, as everywhere else.
+    * Otherwise the resource must belong to *that* organization. A resource
+      whose ``organization_id`` is ``NULL`` is a **platform-wide** one (a
+      "Database Down" system rule, a platform-ops Slack channel) and is
+      refused: it is not the caller's, the corresponding list endpoints
+      already exclude it -- ``apply_filters`` turns
+      ``{"organization_id": org}`` into ``WHERE organization_id = org``, which
+      never matches ``NULL`` -- and in the notification-channel case reading
+      it would hand a tenant the platform's own ``config_encrypted``
+      credentials.
+
+    No MSP-parent carve-out: no customer surface has ever needed a parent to
+    reach a child's monitoring objects. Widen it deliberately if that changes.
+    """
+    if requesting_organization_id is None:
+        return
+    if resource.organization_id != requesting_organization_id:
+        raise CrossOrganizationAccessError()
+
+
 class AlertService:
     """Alert Engine business logic: ``AlertRule`` CRUD, ``Alert`` lifecycle
     (acknowledge/resolve), and ``evaluate_alert_rules`` -- the evaluation
@@ -1266,10 +1298,16 @@ class AlertService:
             )
         return rule
 
-    async def get_alert_rule(self, rule_id: uuid.UUID) -> AlertRule:
+    async def get_alert_rule(
+        self,
+        rule_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> AlertRule:
         rule = await self.repository.get_alert_rule(rule_id)
         if rule is None:
             raise AlertRuleNotFoundError(rule_id)
+        _assert_owned_by(rule, requesting_organization_id)
         return rule
 
     async def update_alert_rule(
@@ -1278,8 +1316,11 @@ class AlertService:
         *,
         data: dict[str, object],
         notification_channel_ids: list[uuid.UUID] | None = None,
+        requesting_organization_id: uuid.UUID | None = None,
     ) -> AlertRule:
-        rule = await self.get_alert_rule(rule_id)
+        rule = await self.get_alert_rule(
+            rule_id, requesting_organization_id=requesting_organization_id
+        )
         prospective_trigger_type = AlertTriggerType(
             data.get("trigger_type", rule.trigger_type)
         )
@@ -1303,8 +1344,15 @@ class AlertService:
             )
         return updated
 
-    async def delete_alert_rule(self, rule_id: uuid.UUID) -> None:
-        rule = await self.get_alert_rule(rule_id)
+    async def delete_alert_rule(
+        self,
+        rule_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> None:
+        rule = await self.get_alert_rule(
+            rule_id, requesting_organization_id=requesting_organization_id
+        )
         await self.repository.soft_delete_alert_rule(rule)
 
     async def list_alert_rules(
@@ -1354,11 +1402,7 @@ class AlertService:
         alert = await self.repository.get_alert(alert_id)
         if alert is None:
             raise AlertNotFoundError(alert_id)
-        if (
-            requesting_organization_id is not None
-            and alert.organization_id != requesting_organization_id
-        ):
-            raise CrossOrganizationAccessError()
+        _assert_owned_by(alert, requesting_organization_id)
         return alert
 
     async def list_alerts(
@@ -2176,10 +2220,19 @@ class NotificationService:
             is_active=is_active,
         )
 
-    async def get_channel(self, channel_id: uuid.UUID) -> NotificationChannel:
+    async def get_channel(
+        self,
+        channel_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> NotificationChannel:
         channel = await self.repository.get_notification_channel(channel_id)
         if channel is None:
             raise NotificationChannelNotFoundError(channel_id)
+        # A channel carries `config_encrypted` -- the webhook URL or API
+        # credential it delivers through. Reading someone else's, or the
+        # platform's own, hands over a secret.
+        _assert_owned_by(channel, requesting_organization_id)
         return channel
 
     async def update_channel(
@@ -2188,8 +2241,11 @@ class NotificationService:
         *,
         data: dict[str, object],
         config: dict[str, object] | None = None,
+        requesting_organization_id: uuid.UUID | None = None,
     ) -> NotificationChannel:
-        channel = await self.get_channel(channel_id)
+        channel = await self.get_channel(
+            channel_id, requesting_organization_id=requesting_organization_id
+        )
         if config is not None:
             channel_type = NotificationChannelType(
                 data.get("channel_type", channel.channel_type)
@@ -2198,8 +2254,15 @@ class NotificationService:
             data = {**data, "config_encrypted": encrypt_secret(json.dumps(config))}
         return await self.repository.update_notification_channel(channel, data)
 
-    async def delete_channel(self, channel_id: uuid.UUID) -> None:
-        channel = await self.get_channel(channel_id)
+    async def delete_channel(
+        self,
+        channel_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> None:
+        channel = await self.get_channel(
+            channel_id, requesting_organization_id=requesting_organization_id
+        )
         await self.repository.soft_delete_notification_channel(channel)
 
     async def list_channels(
@@ -2283,10 +2346,16 @@ class IncidentService:
         logger.info("incident_opened", extra=_event_extra(event))
         return incident
 
-    async def get_incident(self, incident_id: uuid.UUID) -> Incident:
+    async def get_incident(
+        self,
+        incident_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> Incident:
         incident = await self.repository.get_incident(incident_id)
         if incident is None:
             raise IncidentNotFoundError(incident_id)
+        _assert_owned_by(incident, requesting_organization_id)
         return incident
 
     async def list_incidents(
@@ -2359,8 +2428,16 @@ class IncidentService:
             await self.repository.attach_alert_to_incident(incident.id, alert_id)
         return incident
 
-    async def list_alerts_for_incident(self, incident_id: uuid.UUID) -> list[Alert]:
-        await self.get_incident(incident_id)
+    async def list_alerts_for_incident(
+        self,
+        incident_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[Alert]:
+        # The guard lives on the incident: reaching its alerts is reaching it.
+        await self.get_incident(
+            incident_id, requesting_organization_id=requesting_organization_id
+        )
         return await self.repository.list_alerts_for_incident(incident_id)
 
 
@@ -2397,10 +2474,16 @@ class SlaService:
             measurement_window_days=measurement_window_days,
         )
 
-    async def get_target(self, target_id: uuid.UUID) -> SlaTarget:
+    async def get_target(
+        self,
+        target_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> SlaTarget:
         target = await self.repository.get_sla_target(target_id)
         if target is None:
             raise SlaTargetNotFoundError(target_id)
+        _assert_owned_by(target, requesting_organization_id)
         return target
 
     async def list_targets_with_latest_report(
@@ -2425,8 +2508,12 @@ class SlaService:
         *,
         page: int = DEFAULT_LIST_PAGE,
         page_size: int = DEFAULT_LIST_PAGE_SIZE,
+        requesting_organization_id: uuid.UUID | None = None,
     ) -> tuple[list[SlaReport], PaginationMeta]:
-        await self.get_target(target_id)
+        # The guard lives on the target: reaching its reports is reaching it.
+        await self.get_target(
+            target_id, requesting_organization_id=requesting_organization_id
+        )
         return await self.repository.list_sla_reports(
             sla_target_id=target_id, page=page, page_size=page_size
         )
