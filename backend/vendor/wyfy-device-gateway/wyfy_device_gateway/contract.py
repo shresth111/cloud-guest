@@ -324,6 +324,20 @@ class DeviceGatewayAdapter(Protocol):
     # -- network config push ---------------------------------------------
     async def configure_vlan(self, creds: DeviceCredentials, *, vlan: VlanConfig) -> None: ...
     async def configure_dhcp_pool(self, creds: DeviceCredentials, *, pool: DhcpPoolConfig) -> None: ...
+
+    # -- network config teardown ------------------------------------------
+    # Deleting a row never removed anything from the device: the platform
+    # could create a VLAN or a pool on a router and then had no way to take
+    # it back off, so a "deleted" object went on serving traffic forever.
+    # Both are idempotent -- removing what is already absent is a no-op, not
+    # an error, so a retry after a partial failure completes cleanly.
+    async def delete_vlan(
+        self, creds: DeviceCredentials, *, vlan: VlanConfig
+    ) -> None: ...
+
+    async def delete_dhcp_pool(
+        self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
+    ) -> None: ...
     async def configure_port_forward(
         self, creds: DeviceCredentials, *, rule: PortForwardConfig
     ) -> None: ...

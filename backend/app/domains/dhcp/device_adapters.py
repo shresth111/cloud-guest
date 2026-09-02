@@ -116,6 +116,23 @@ class BaseDhcpAdapter(Protocol):
         """
         ...
 
+    async def delete_dhcp_pool(
+        self,
+        credentials: DhcpCredentials,
+        *,
+        interface: str,
+        range_start: str,
+        range_end: str,
+    ) -> None:
+        """Removes the address pool, the DHCP server bound to ``interface``,
+        and the network row for this subnet.
+
+        Deleting a pool row never touched the device -- the row went away
+        and the DHCP server kept handing out addresses. Idempotent, and the
+        server is removed before the pool it references.
+        """
+        ...
+
 
 class MikroTikDhcpAdapter:
     """Real MikroTik implementation, delegating to the shared gateway."""
@@ -166,6 +183,34 @@ class MikroTikDhcpAdapter:
             raise DhcpDeviceOperationError(
                 "configure_dhcp_pool", exc.detail
             ) from exc
+
+    async def delete_dhcp_pool(
+        self,
+        credentials: DhcpCredentials,
+        *,
+        interface: str,
+        range_start: str,
+        range_end: str,
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        # gateway and dns_servers are irrelevant to teardown -- the three
+        # objects are found by the interface-derived names and the subnet.
+        config = DhcpPoolConfig(
+            interface=interface,
+            range_start=range_start,
+            range_end=range_end,
+            gateway="",
+            dns_servers=[],
+            lease_time_seconds=0,
+        )
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).delete_dhcp_pool(
+                creds, pool=config
+            )
+        except MikroTikConnectionError as exc:
+            raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DhcpDeviceOperationError("delete_dhcp_pool", exc.detail) from exc
 
 
 _DHCP_ADAPTERS: dict[str, BaseDhcpAdapter] = {"mikrotik": MikroTikDhcpAdapter()}

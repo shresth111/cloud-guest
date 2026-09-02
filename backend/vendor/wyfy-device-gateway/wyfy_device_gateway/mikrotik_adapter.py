@@ -1139,6 +1139,119 @@ class MikroTikAdapter:
                 return
         api.path("ip", "address").add(address=ip_cidr, interface=interface)
 
+    async def delete_vlan(
+        self, creds: DeviceCredentials, *, vlan: VlanConfig
+    ) -> None:
+        """Removes what :meth:`configure_vlan` created, for the same
+        ``port_mode``.
+
+        Deleting a VLAN row never touched the device, and the gateway had
+        no teardown method to call even if it had wanted to -- so a VLAN
+        the platform created went on carrying traffic after the operator
+        deleted it, with nothing in the UI to say so.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error. A delete retried after a partial failure completes cleanly,
+        and deleting a row that was never pushed does nothing.
+        """
+        await asyncio.to_thread(self._delete_vlan_sync, creds, vlan)
+
+    def _delete_vlan_sync(self, creds: DeviceCredentials, vlan: VlanConfig) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if vlan.port_mode == "access":
+                    self._delete_vlan_access(api, vlan)
+                else:
+                    self._delete_vlan_trunk(api, vlan)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"delete_vlan: {exc}") from exc
+        finally:
+            api.close()
+
+    def _delete_vlan_trunk(self, api, vlan: VlanConfig) -> None:
+        vlan_interface = f"vlan{vlan.vlan_id}"
+        # Address first, then the interface carrying it. RouterOS would
+        # cascade, but removing the address explicitly keeps the teardown
+        # symmetric with the two writes configure_vlan made and leaves
+        # nothing behind if the interface row is already gone.
+        self._remove_ip_address(api, vlan.ip_cidr, vlan_interface)
+        for row in list(api.path("interface", "vlan")):
+            if row.get("name") == vlan_interface:
+                api.path("interface", "vlan").remove(row[".id"])
+
+    def _delete_vlan_access(self, api, vlan: VlanConfig) -> None:
+        """Access mode gave a physical port the subnet directly, after
+        pulling it out of the shared bridge.
+
+        The address is removed. The port is **not** put back into a bridge:
+        which bridge it belonged to was never recorded, and re-adding it to
+        a guessed one would silently rejoin a port to the wrong L2 segment.
+        The port is left out of every bridge, holding no address -- inert
+        and safe, and visible to an operator as an unbridged port.
+        """
+        self._remove_ip_address(api, vlan.ip_cidr, vlan.interface)
+
+    def _remove_ip_address(self, api, ip_cidr: str | None, interface: str) -> None:
+        """Removes that exact address from that exact interface.
+
+        Matches on address *and* interface, the same pair
+        ``_ensure_ip_address`` adds on: the same subnet existing elsewhere
+        on the router is not this VLAN's address and must not be removed.
+        """
+        if not ip_cidr:
+            return
+        for row in list(api.path("ip", "address")):
+            if row.get("address") == ip_cidr and row.get("interface") == interface:
+                api.path("ip", "address").remove(row[".id"])
+
+    async def delete_dhcp_pool(
+        self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
+    ) -> None:
+        """Removes the three objects :meth:`configure_dhcp_pool` created.
+
+        Order matters and is not cosmetic: the DHCP server holds a
+        reference to the address pool, so the server goes first or RouterOS
+        refuses to remove a pool still in use.
+
+        Idempotent, for the same reasons as :meth:`delete_vlan`.
+        """
+        await asyncio.to_thread(self._delete_dhcp_pool_sync, creds, pool)
+
+    def _delete_dhcp_pool_sync(
+        self, creds: DeviceCredentials, pool: DhcpPoolConfig
+    ) -> None:
+        identifier = re.sub(r"[^A-Za-z0-9_-]", "-", pool.interface)
+        pool_name = f"{identifier}-pool"
+        server_name = f"{identifier}-dhcp"
+        network = str(
+            _smallest_enclosing_network(pool.range_start, pool.range_end)
+        )
+        api = self._connect_api(creds)
+        try:
+            try:
+                self._remove_where(
+                    api, ("ip", "dhcp-server", "network"), "address", network
+                )
+                # Server before pool: the server references the pool, and
+                # RouterOS refuses to remove a pool that is still in use.
+                self._remove_where(api, ("ip", "dhcp-server"), "name", server_name)
+                self._remove_where(api, ("ip", "pool"), "name", pool_name)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_dhcp_pool: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _remove_where(
+        self, api, path_segments: tuple[str, ...], field: str, value: str
+    ) -> None:
+        menu = api.path(*path_segments)
+        for row in list(menu):
+            if row.get(field) == value:
+                menu.remove(row[".id"])
+
     async def configure_dhcp_pool(
         self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
     ) -> None:

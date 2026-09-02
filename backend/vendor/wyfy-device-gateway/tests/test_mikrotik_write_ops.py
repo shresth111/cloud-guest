@@ -347,3 +347,175 @@ async def test_a_pool_on_a_different_interface_is_a_separate_pool(
 
     pool_adds = [f for s, f in api.add_calls if s == ("ip", "pool")]
     assert [f["name"] for f in pool_adds] == ["vlan300-pool", "vlan400-pool"]
+
+
+# ============================================================================
+# Teardown -- deleting a row never removed anything from the device, and the
+# gateway had no method to call even if it had wanted to. A "deleted" VLAN
+# or pool went on serving traffic forever.
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_delete_vlan_removes_the_address_then_the_interface(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    vlan = VlanConfig(
+        vlan_id=300, name="Guest", interface="bridge", ip_cidr="10.30.30.1/24"
+    )
+    await adapter.configure_vlan(mikrotik_creds, vlan=vlan)
+
+    await adapter.delete_vlan(mikrotik_creds, vlan=vlan)
+
+    assert list(api.path("interface", "vlan")) == []
+    assert list(api.path("ip", "address")) == []
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_vlan_twice_is_a_no_op(patch_connect, mikrotik_creds):
+    """A delete retried after a partial failure has to complete cleanly,
+    and deleting a row that was never pushed must do nothing."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    vlan = VlanConfig(
+        vlan_id=300, name="Guest", interface="bridge", ip_cidr="10.30.30.1/24"
+    )
+    await adapter.configure_vlan(mikrotik_creds, vlan=vlan)
+    await adapter.delete_vlan(mikrotik_creds, vlan=vlan)
+
+    await adapter.delete_vlan(mikrotik_creds, vlan=vlan)  # must not raise
+
+    assert list(api.path("interface", "vlan")) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_vlan_leaves_the_same_subnet_on_another_interface_alone(
+    patch_connect, mikrotik_creds
+):
+    """Matches on address *and* interface, the same pair the write adds
+    on. The same subnet living elsewhere is not this VLAN's address."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "address"): [
+                {".id": "*9", "address": "10.30.30.1/24", "interface": "ether4"}
+            ]
+        }
+    )
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    vlan = VlanConfig(
+        vlan_id=300, name="Guest", interface="bridge", ip_cidr="10.30.30.1/24"
+    )
+    await adapter.configure_vlan(mikrotik_creds, vlan=vlan)
+
+    await adapter.delete_vlan(mikrotik_creds, vlan=vlan)
+
+    remaining = list(api.path("ip", "address"))
+    assert len(remaining) == 1
+    assert remaining[0]["interface"] == "ether4"
+
+
+@pytest.mark.asyncio
+async def test_delete_access_vlan_frees_the_address_without_rebridging(
+    patch_connect, mikrotik_creds
+):
+    """The port is deliberately not put back into a bridge: which bridge it
+    belonged to was never recorded, and re-adding it to a guessed one would
+    silently rejoin a port to the wrong L2 segment."""
+    api = FakeRouterOSApi(
+        menus={
+            ("interface", "bridge", "port"): [
+                {".id": "*1", "interface": "ether5", "bridge": "bridge"}
+            ]
+        }
+    )
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    vlan = VlanConfig(
+        vlan_id=400,
+        name="Access",
+        interface="ether5",
+        ip_cidr="10.40.40.1/24",
+        port_mode="access",
+    )
+    await adapter.configure_vlan(mikrotik_creds, vlan=vlan)
+    assert list(api.path("interface", "bridge", "port")) == []
+
+    await adapter.delete_vlan(mikrotik_creds, vlan=vlan)
+
+    assert list(api.path("ip", "address")) == []
+    assert list(api.path("interface", "bridge", "port")) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_dhcp_pool_removes_all_three_objects(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=_pool())
+
+    await adapter.delete_dhcp_pool(mikrotik_creds, pool=_pool())
+
+    assert list(api.path("ip", "pool")) == []
+    assert list(api.path("ip", "dhcp-server")) == []
+    assert list(api.path("ip", "dhcp-server", "network")) == []
+
+
+@pytest.mark.asyncio
+async def test_dhcp_server_is_removed_before_the_pool_it_references(
+    patch_connect, mikrotik_creds
+):
+    """Not cosmetic: RouterOS refuses to remove an address pool that a
+    DHCP server still points at."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=_pool())
+
+    await adapter.delete_dhcp_pool(mikrotik_creds, pool=_pool())
+
+    order = [segments for segments, _ids in api.remove_calls]
+    assert order.index(("ip", "dhcp-server")) < order.index(("ip", "pool"))
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_dhcp_pool_twice_is_a_no_op(patch_connect, mikrotik_creds):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=_pool())
+    await adapter.delete_dhcp_pool(mikrotik_creds, pool=_pool())
+
+    await adapter.delete_dhcp_pool(mikrotik_creds, pool=_pool())  # must not raise
+
+    assert list(api.path("ip", "pool")) == []
+
+
+@pytest.mark.asyncio
+async def test_deleting_one_pool_leaves_another_interfaces_pool_alone(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    other = DhcpPoolConfig(
+        interface="vlan400",
+        range_start="10.40.40.100",
+        range_end="10.40.40.200",
+        gateway="10.40.40.1",
+        dns_servers=["1.1.1.1"],
+        lease_time_seconds=3600,
+    )
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=_pool())
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=other)
+
+    await adapter.delete_dhcp_pool(mikrotik_creds, pool=_pool())
+
+    remaining = [row["name"] for row in api.path("ip", "pool")]
+    assert remaining == ["vlan400-pool"]

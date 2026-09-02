@@ -154,6 +154,12 @@ class VlanService:
             enable_hotspot=enable_hotspot,
             description=description,
             is_enabled=is_enabled,
+            # Written explicitly rather than left to the column default,
+            # which only applies at INSERT: a freshly constructed row would
+            # otherwise carry None until it round-trips through the
+            # database, and "has this reached a device" must never read as
+            # unknown.
+            device_push_status=VlanDevicePushStatus.PENDING.value,
             created_by=actor_user_id,
         )
         event = VlanCreated(id=vlan.id, router_id=router.id, tag=vlan_id)
@@ -263,8 +269,29 @@ class VlanService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> Vlan:
+        """Removes the VLAN from its router, then soft-deletes the row.
+
+        Deleting used to soft-delete the row and nothing else, so a VLAN
+        this platform had created went on carrying traffic on the device
+        after the operator deleted it -- with nothing anywhere to say so.
+
+        **The device comes first, and a device failure aborts the delete.**
+        Removing the row while the interface is still live is exactly the
+        drift this closes: the operator would believe it was gone, and
+        nothing would ever reconcile it. Failing loudly leaves both sides
+        consistent and the delete retryable.
+
+        The trade-off is real and worth stating: a VLAN on a permanently
+        unreachable router cannot be deleted through this path. That is the
+        safer side to err on -- an undeletable row is visible, an orphaned
+        live interface is not -- but it means decommissioning a dead router
+        needs a deliberate escape hatch, which this method does not provide.
+        """
         vlan = await self.get_vlan(
             vlan_pk, requesting_organization_id=requesting_organization_id
+        )
+        await self._remove_from_device(
+            vlan, requesting_organization_id=requesting_organization_id
         )
         deleted = await self.repository.soft_delete_vlan(vlan)
         event = VlanDeleted(id=deleted.id, router_id=deleted.router_id)
@@ -384,6 +411,38 @@ class VlanService:
             ),
         )
         return updated
+
+    async def _remove_from_device(
+        self, vlan: Vlan, *, requesting_organization_id: uuid.UUID | None
+    ) -> None:
+        """Tears the VLAN off its router, when there is anything there.
+
+        Skipped entirely unless ``device_push_status`` is ``ACTIVE``: a row
+        that was never pushed, or whose last push failed, has nothing on the
+        device, and opening a connection to delete nothing would make every
+        such delete fail whenever a router happened to be unreachable.
+        """
+        if vlan.device_push_status != VlanDevicePushStatus.ACTIVE.value:
+            return
+        if not vlan.interface:
+            # Cannot be ACTIVE without one in practice -- push refuses
+            # without an interface -- but the column is nullable, and
+            # guessing an interface name to delete on would be worse than
+            # doing nothing.
+            return
+        router = await self.router_lookup.get_router(
+            vlan.router_id, requesting_organization_id=requesting_organization_id
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_vlan_adapter(router.vendor)
+        await adapter.delete_vlan(
+            credentials,
+            vlan_id=vlan.vlan_id,
+            name=vlan.name,
+            interface=vlan.interface,
+            ip_cidr=self._device_address(vlan),
+            port_mode=vlan.port_mode,
+        )
 
     @staticmethod
     def _device_address(vlan: Vlan) -> str | None:

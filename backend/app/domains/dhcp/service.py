@@ -282,8 +282,29 @@ class DhcpService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> DhcpPool:
+        """Removes the pool from its router, then soft-deletes the row.
+
+        Deleting used to soft-delete the row and nothing else, so a DHCP
+        server this platform had created went on handing out addresses on
+        the device after the operator deleted the pool -- and a later pool
+        on the same interface would collide with an object nothing knew
+        about.
+
+        **The device comes first, and a device failure aborts the delete.**
+        Removing the row while the server is still live is exactly the
+        drift this closes. Failing loudly leaves both sides consistent and
+        the delete retryable.
+
+        The trade-off is real: a pool on a permanently unreachable router
+        cannot be deleted through this path. That is the safer side to err
+        on -- an undeletable row is visible, an orphaned live DHCP server
+        is not.
+        """
         pool = await self.get_pool(
             pool_id, requesting_organization_id=requesting_organization_id
+        )
+        await self._remove_from_device(
+            pool, requesting_organization_id=requesting_organization_id
         )
         deleted = await self.repository.soft_delete_pool(pool)
         event = DhcpPoolDeleted(id=deleted.id, router_id=deleted.router_id)
@@ -426,6 +447,36 @@ class DhcpService:
             ),
         )
         return updated
+
+    async def _remove_from_device(
+        self, pool: DhcpPool, *, requesting_organization_id: uuid.UUID | None
+    ) -> None:
+        """Tears the pool off its router, when there is anything there.
+
+        Skipped entirely unless ``device_push_status`` is ``ACTIVE``: a row
+        that was never pushed, or whose last push failed, has nothing on the
+        device, and opening a connection to delete nothing would make every
+        such delete fail whenever a router happened to be unreachable.
+        """
+        if pool.device_push_status != DhcpDevicePushStatus.ACTIVE.value:
+            return
+        if not pool.interface:
+            # Cannot be ACTIVE without one -- push refuses without an
+            # interface -- but the column is nullable, and the adapter
+            # derives every object name from it, so there is nothing safe
+            # to delete on.
+            return
+        router = await self.router_lookup.get_router(
+            pool.router_id, requesting_organization_id=requesting_organization_id
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+        await adapter.delete_dhcp_pool(
+            credentials,
+            interface=pool.interface,
+            range_start=pool.address_range_start,
+            range_end=pool.address_range_end,
+        )
 
     @staticmethod
     def _dns_servers(pool: DhcpPool) -> list[str]:

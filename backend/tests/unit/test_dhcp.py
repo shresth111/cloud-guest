@@ -27,6 +27,7 @@ from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.dhcp.constants import DhcpDevicePushStatus
 from app.domains.dhcp.exceptions import (
     CrossOrganizationDhcpPoolAccessError,
+    DhcpDeviceConnectionError,
     DhcpDeviceOperationError,
     DhcpMissingCredentialsError,
     DhcpPoolMissingGatewayError,
@@ -488,6 +489,27 @@ class FakeDhcpAdapter:
     vendor: str = "mikrotik"
     calls: list[dict[str, object]] = field(default_factory=list)
     raises: Exception | None = None
+    deletes: list[dict[str, object]] = field(default_factory=list)
+    delete_raises: Exception | None = None
+
+    async def delete_dhcp_pool(
+        self,
+        credentials,
+        *,
+        interface: str,
+        range_start: str,
+        range_end: str,
+    ) -> None:
+        self.deletes.append(
+            {
+                "host": credentials.host,
+                "interface": interface,
+                "range_start": range_start,
+                "range_end": range_end,
+            }
+        )
+        if self.delete_raises is not None:
+            raise self.delete_raises
 
     async def configure_dhcp_pool(
         self,
@@ -733,3 +755,84 @@ class TestUnsupportedVendorIsATypedError:
                 actor_user_id=None,
                 requesting_organization_id=router.organization_id,
             )
+
+
+class TestDhcpPoolDeleteReachesTheDevice:
+    """Deleting a pool used to soft-delete the row and nothing else, so a
+    DHCP server this platform created went on handing out addresses after
+    the operator deleted it."""
+
+    async def _pushed_pool(
+        self, h: Harness, router: Router, adapter: FakeDhcpAdapter
+    ) -> DhcpPool:
+        pool = await _create_pool(h, router)
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        adapter.calls.clear()
+        return pool
+
+    async def test_deleting_a_pushed_pool_removes_it_from_the_router(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+
+        deleted = await h.service.delete_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.deletes == [
+            {
+                "host": "10.0.0.1",
+                "interface": "ether2",
+                "range_start": "192.168.10.10",
+                "range_end": "192.168.10.100",
+            }
+        ]
+        assert deleted.is_deleted is True
+
+    async def test_a_pool_that_never_reached_a_device_skips_the_connection(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Opening a connection to delete nothing would make every such
+        delete fail whenever a router happened to be unreachable."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        assert pool.device_push_status == DhcpDevicePushStatus.PENDING.value
+
+        deleted = await h.service.delete_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.deletes == []
+        assert deleted.is_deleted is True
+
+    async def test_a_device_failure_aborts_the_delete_and_keeps_the_row(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Removing the row while the server is still live is exactly the
+        drift this closes -- the operator would believe it was gone and
+        nothing would ever reconcile it."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+        adapter.delete_raises = DhcpDeviceConnectionError("10.0.0.1", "timed out")
+
+        with pytest.raises(DhcpDeviceConnectionError):
+            await h.service.delete_pool(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert pool.is_deleted is False
+        assert await h.repository.get_pool_by_id(pool.id) is not None

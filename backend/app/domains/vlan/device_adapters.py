@@ -113,6 +113,26 @@ class BaseVlanAdapter(Protocol):
         """
         ...
 
+    async def delete_vlan(
+        self,
+        credentials: VlanCredentials,
+        *,
+        vlan_id: int,
+        name: str,
+        interface: str,
+        ip_cidr: str | None,
+        port_mode: str,
+    ) -> None:
+        """Removes what ``configure_vlan`` created, for the same
+        ``port_mode``.
+
+        Deleting a VLAN row never touched the device -- the row went away
+        and the interface kept carrying traffic. Idempotent: removing what
+        is already absent is a no-op, so a retry after a partial failure
+        completes cleanly.
+        """
+        ...
+
 
 class MikroTikVlanAdapter:
     """Real MikroTik implementation, delegating to the shared gateway."""
@@ -157,6 +177,31 @@ class MikroTikVlanAdapter:
             raise VlanDeviceConnectionError(credentials.host, exc.detail) from exc
         except MikroTikDeviceError as exc:
             raise VlanDeviceOperationError("configure_vlan", exc.detail) from exc
+
+    async def delete_vlan(
+        self,
+        credentials: VlanCredentials,
+        *,
+        vlan_id: int,
+        name: str,
+        interface: str,
+        ip_cidr: str | None,
+        port_mode: str,
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        config = VlanConfig(
+            vlan_id=vlan_id,
+            name=name,
+            interface=interface,
+            ip_cidr=ip_cidr,
+            port_mode=port_mode,
+        )
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).delete_vlan(creds, vlan=config)
+        except MikroTikConnectionError as exc:
+            raise VlanDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise VlanDeviceOperationError("delete_vlan", exc.detail) from exc
 
 
 _VLAN_ADAPTERS: dict[str, BaseVlanAdapter] = {"mikrotik": MikroTikVlanAdapter()}
