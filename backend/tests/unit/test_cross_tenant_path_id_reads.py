@@ -412,6 +412,11 @@ def _global_scopes_on(route) -> list:
 # org-side roles also hold.
 _PLATFORM_ONLY_ROUTES = [
     ("/api/v1/controller-logs/authentication/admin", "GET"),
+    # The CSV sibling of the line above. It was missed when that endpoint was
+    # gated, leaving the exact data the gate protects available in bulk as a
+    # file to any Organization Owner -- every platform admin's and every other
+    # tenant's login emails, IPs and failure reasons.
+    ("/api/v1/controller-logs/authentication/admin/export", "GET"),
     ("/api/v1/monitoring/health", "GET"),
     ("/api/v1/monitoring/health/{component}", "GET"),
     ("/api/v1/monitoring/health/run", "POST"),
