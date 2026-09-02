@@ -316,11 +316,35 @@ def _timeline_entry_response(entry: TimelineEntry) -> TimelineEntryResponse:
 # ============================================================================
 
 
+# The three Health Engine endpoints below are gated at ``ScopeType.GLOBAL``,
+# deliberately.
+#
+# ``HealthCheck`` and ``ServiceHealth`` have no ``organization_id`` column at
+# all -- one row per *platform component* (database, redis, celery,
+# freeradius), shared by every tenant. There is nothing to scope them by, so
+# unlike the by-id resources fixed alongside these cannot be filtered down;
+# they can only be withheld.
+#
+# Without the explicit scope they gated on a bare ``monitoring.read`` /
+# ``monitoring.manage``, which several org-side roles hold
+# (``location-manager``, ``helpdesk``, ``network-engineer`` at READ;
+# ``network-administrator`` at FULL -- see ``rbac/seed.py``). That exposed the
+# platform's own infrastructure state to a venue's staff, and in the case of
+# ``/health/run`` let them trigger live probes against every platform
+# dependency on demand.
+#
+# A venue's own health signals are not here: they are on
+# ``/monitoring/dashboard``, which resolves ``CurrentOrganization`` and scopes
+# its statistics to the caller's organization.
+
+
 @router.get(
     "/monitoring/health",
     response_model=ApiResponse[DashboardSummaryResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("monitoring.read"))],
+    dependencies=[
+        Depends(RequirePermission("monitoring.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def get_health_dashboard(
     request: Request,
@@ -343,7 +367,9 @@ async def get_health_dashboard(
     "/monitoring/health/{component}",
     response_model=ApiResponse[HealthHistoryResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("monitoring.read"))],
+    dependencies=[
+        Depends(RequirePermission("monitoring.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def get_health_history(
     request: Request,
@@ -376,7 +402,9 @@ async def get_health_history(
     "/monitoring/health/run",
     response_model=ApiResponse[HealthCheckRunResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("monitoring.manage"))],
+    dependencies=[
+        Depends(RequirePermission("monitoring.manage", scope=ScopeType.GLOBAL))
+    ],
 )
 async def run_health_checks(
     request: Request,

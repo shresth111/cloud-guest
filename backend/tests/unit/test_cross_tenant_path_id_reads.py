@@ -390,6 +390,48 @@ def test_path_id_route_resolves_the_callers_organization(path, method) -> None:
     )
 
 
+def _global_scopes_on(route) -> list:
+    """The ScopeType values baked into a route's RequirePermission closures."""
+    from app.domains.rbac.enums import ScopeType
+
+    scopes = []
+    for dep in _dependency_calls(route.dependant):
+        closure = getattr(dep, "__closure__", None)
+        if closure:
+            scopes.extend(
+                cell.cell_contents
+                for cell in closure
+                if isinstance(cell.cell_contents, ScopeType)
+            )
+    return scopes
+
+
+# Platform-only surfaces: the underlying models have no organization_id at
+# all, so these cannot be filtered per tenant -- only withheld. Each must
+# therefore require GLOBAL scope rather than a bare permission key that
+# org-side roles also hold.
+_PLATFORM_ONLY_ROUTES = [
+    ("/api/v1/controller-logs/authentication/admin", "GET"),
+    ("/api/v1/monitoring/health", "GET"),
+    ("/api/v1/monitoring/health/{component}", "GET"),
+    ("/api/v1/monitoring/health/run", "POST"),
+]
+
+
+@pytest.mark.parametrize(("path", "method"), _PLATFORM_ONLY_ROUTES)
+def test_platform_only_route_requires_global_scope(path, method) -> None:
+    from app.domains.rbac.enums import ScopeType
+    from app.main import create_app
+
+    app = create_app()
+    route = _route(app, path, method)
+    assert ScopeType.GLOBAL in _global_scopes_on(route), (
+        f"{method} {path} returns platform-wide state with no organization_id "
+        "to filter on, so it must require GLOBAL scope -- a bare permission "
+        "key is also held by org-side roles."
+    )
+
+
 def test_admin_login_attempts_are_gated_at_global_scope() -> None:
     """``LoginAttempt`` has no ``organization_id``, so this listing cannot be
     tenant-filtered and must not be reachable with an organization-scoped
