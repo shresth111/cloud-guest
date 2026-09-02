@@ -57,6 +57,7 @@ from .schemas import (
     OrganizationResponse,
     OrganizationUpdateRequest,
 )
+from .scoping import enforce_target_organization
 from .service import OrganizationService
 
 router = APIRouter(tags=["Organizations"])
@@ -225,8 +226,18 @@ async def create_organization(
 async def get_organization(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     organization_service: OrganizationService = Depends(get_organization_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path parameter, so without an explicit check the two name different
+    # organizations. The sibling /branding route below already threads
+    # requesting_organization_id; these three never did.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     organization = await organization_service.get_organization(organization_id)
     return build_response(
         success=True,
@@ -410,8 +421,18 @@ async def activate_organization(
 async def list_organization_children(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     organization_service: OrganizationService = Depends(get_organization_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path parameter, so without an explicit check the two name different
+    # organizations. The sibling /branding route below already threads
+    # requesting_organization_id; these three never did.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     children = await organization_service.list_children(organization_id)
     return build_response(
         success=True,
@@ -435,8 +456,18 @@ async def list_organization_children(
 async def list_organization_members(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     organization_service: OrganizationService = Depends(get_organization_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path parameter, so without an explicit check the two name different
+    # organizations. The sibling /branding route below already threads
+    # requesting_organization_id; these three never did.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     members = await organization_service.list_members(organization_id)
     return build_response(
         success=True,

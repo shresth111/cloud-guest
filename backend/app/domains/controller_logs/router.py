@@ -38,6 +38,7 @@ from app.domains.monitoring.constants import HealthComponent
 from app.domains.monitoring.models import HealthCheck
 from app.domains.provisioning_engine.models import ProvisionLog
 from app.domains.rbac.dependencies import CurrentOrganization, RequirePermission
+from app.domains.rbac.enums import ScopeType
 from app.domains.router_provisioning.models import ConfigVersion, RouterEvent
 
 from .constants import MAX_EXPORT_ROWS
@@ -377,11 +378,30 @@ async def export_router_logs(
 # ============================================================================
 
 
+# GLOBAL scope, deliberately. ``LoginAttempt`` has no ``organization_id``
+# column at all -- a login attempt is recorded by email and IP, not scoped to
+# a tenant -- so this listing is genuinely platform-wide and cannot be
+# filtered down by any organization context.
+#
+# Without the explicit scope it gated on a bare ``audit_logs.read``, which an
+# Organization Owner holds at ORGANIZATION scope (``rbac/seed.py``,
+# ``default_level=FULL``). The check therefore passed for any venue owner and
+# returned every dashboard login attempt on the platform: emails, IP
+# addresses, user agents and failure reasons for every other customer and for
+# staff accounts.
+#
+# The tenant-scoped equivalent already exists and is correctly built:
+# ``GET /admin-logs/dashboard-logins`` (RequireOrganization + RequireRole
+# "organization-owner"), which narrows by the caller's own member user ids
+# through the ``user_ids`` seam on ``AuthRepository.list_login_attempts``.
+# Customer surfaces belong there.
 @router.get(
     "/authentication/admin",
     response_model=ApiResponse[LoginAttemptLogListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("audit_logs.read"))],
+    dependencies=[
+        Depends(RequirePermission("audit_logs.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def list_admin_authentication_logs(
     request: Request,

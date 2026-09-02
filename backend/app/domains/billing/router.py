@@ -156,7 +156,7 @@ from app.domains.auth.dependencies import get_current_user
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
 from app.domains.organization.dependencies import get_organization_service
-from app.domains.organization.exceptions import CrossOrganizationAccessError
+from app.domains.organization.scoping import enforce_target_organization
 from app.domains.organization.service import OrganizationService
 from app.domains.otp.service import (
     EmailAttachment,
@@ -917,8 +917,18 @@ async def downgrade_license(
 async def get_usage(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    organization_service: OrganizationService = Depends(get_organization_service),
     service: UsageService = Depends(get_usage_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path parameter -- without an explicit check the two name different
+    # organizations. See organization/scoping.py.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     result = await service.validate_usage_against_license(organization_id)
     return build_response(
         success=True,
@@ -937,8 +947,18 @@ async def get_usage(
 async def refresh_usage(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    organization_service: OrganizationService = Depends(get_organization_service),
     service: UsageService = Depends(get_usage_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path parameter -- without an explicit check the two name different
+    # organizations. See organization/scoping.py.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     await service.record_current_usage(organization_id)
     result = await service.validate_usage_against_license(organization_id)
     return build_response(
@@ -1015,8 +1035,18 @@ async def get_my_subscription(
 async def get_subscription(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    organization_service: OrganizationService = Depends(get_organization_service),
     service: SubscriptionService = Depends(get_subscription_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path parameter -- without an explicit check the two name different
+    # organizations. See organization/scoping.py.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     subscription = await service.get_subscription_for_organization(organization_id)
     return build_response(
         success=True,
@@ -2488,8 +2518,18 @@ async def get_my_billing_profile(
 async def get_billing_profile(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    organization_service: OrganizationService = Depends(get_organization_service),
     service: BillingProfileService = Depends(get_billing_profile_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path parameter -- without an explicit check the two name different
+    # organizations. See organization/scoping.py.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     profile = await service.get_billing_profile(organization_id)
     return build_response(
         success=True,
@@ -2704,25 +2744,11 @@ async def get_billing_dashboard(
         get_customer_billing_dashboard_service
     ),
 ):
-    # ``RequirePermission`` above resolves its scope from
-    # ``_current_scope_context``, which prefers ``X-Organization-Id`` over the
-    # path parameter (see rbac/dependencies.py). So the permission check runs
-    # against the *caller's own* organization while the service below reads
-    # the one named in the path: any tenant holding ``billing.read`` on its
-    # own org could read another tenant's plan, subscription, usage and
-    # recent invoices simply by putting a foreign UUID in the URL. Enforce
-    # tenant scoping on the target explicitly, mirroring
-    # ``OrganizationService._enforce_tenant_access`` -- a platform-level
-    # caller (no organization context) may still target any organization, and
-    # an MSP parent may still target its children.
-    if (
-        requesting_organization_id is not None
-        and organization_id != requesting_organization_id
-    ):
-        target = await organization_service.get_organization(organization_id)
-        if target.parent_organization_id != requesting_organization_id:
-            raise CrossOrganizationAccessError()
-
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     result = await service.get_dashboard(organization_id)
     return build_response(
         success=True,
