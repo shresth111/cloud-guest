@@ -1,11 +1,37 @@
 """Customer provisioning service.
 
-Orchestrates the multi-step onboarding of a new customer — creating the
-organization, first location, first router, and generating configuration
-scripts and NAS/WireGuard credentials.
+Orchestrates onboarding a new customer: creates the organization, grants
+the acting user ``organization-admin`` on it, and optionally creates the
+first location. Composes existing organization, location and RBAC
+services -- no new database tables.
 
-Composes existing organization, location, router, provisioning, and
-wireguard services — no new database tables.
+This service used to also expose ``generate_script``, ``generate_nas``
+and ``generate_wireguard``. All three were stubs: they fabricated
+plausible-looking output (a bash installer for an agent that does not
+exist, a random NAS id/IP/shared secret, a real X25519 keypair pointed
+at a hostname that does not resolve), wrote nothing to the database,
+pushed nothing to the hub, and returned a confident success message.
+A fabricated RADIUS shared secret is worse than a 404: it hands an
+operator a fourth value that matches neither the DB, the hub, nor the
+device. They were removed rather than reimplemented -- the real paths
+already exist and are the only ones that reach the hub:
+
+* NAS registration -> ``POST /radius/nas/register-external/{router_id}``
+  (``app.domains.guest.router.register_external_radius_nas``), which
+  POSTs ``{tunnel_ip, nas_identifier, secret}`` to the FreeRADIUS hub
+  agent via ``guest.radius_bridge.push_nas_client`` and raises 502 if
+  the push fails -- the DB is only reconciled once the hub confirms.
+* WireGuard peers -> ``POST /routers/{router_id}/wireguard-peer/
+  allocate-external``, the one path that both reaches the live hub and
+  writes a row (``wireguard.router`` POSTs to the hub agent, then calls
+  ``WireGuardService.register_agent_allocated_peer``). It is gated at
+  ``RequirePermission("wireguard.create", scope=ScopeType.GLOBAL)``,
+  which is how this platform keeps tunnel internals off customer-
+  reachable routes. The real endpoint is the hub's own
+  ``hub.wyfyguest.com:51820``, not a constant in this domain.
+* Device configuration -> ``network_config.renderers``, which emits
+  RouterOS script text, applied through the ``router_provisioning``
+  domain's adapters. Nothing here installs a bash agent.
 """
 
 from __future__ import annotations
@@ -19,17 +45,8 @@ from app.domains.organization.service import OrganizationService
 from app.domains.rbac.enums import ScopeType
 from app.domains.rbac.exceptions import RoleNotFoundError
 from app.domains.rbac.service import RBACService
-from app.domains.router.service import RouterService
-from app.domains.router_provisioning.service import RouterProvisioningService
-from app.domains.wireguard.service import WireGuardService
 
-from .schemas import (
-    GenerateNasResponse,
-    GenerateScriptResponse,
-    OnboardRequest,
-    OnboardResponse,
-    WireguardConfigResponse,
-)
+from .schemas import OnboardRequest, OnboardResponse
 
 logger = logging.getLogger(__name__)
 
@@ -39,16 +56,10 @@ class CustomerProvisioningService:
         self,
         organization_service: OrganizationService,
         location_service: LocationService,
-        router_service: RouterService,
-        provisioning_service: RouterProvisioningService,
-        wireguard_service: WireGuardService,
         rbac_service: RBACService,
     ) -> None:
         self.organization_service = organization_service
         self.location_service = location_service
-        self.router_service = router_service
-        self.provisioning_service = provisioning_service
-        self.wireguard_service = wireguard_service
         self.rbac_service = rbac_service
 
     async def onboard(
@@ -98,66 +109,4 @@ class CustomerProvisioningService:
             location_id=str(location_id) if location_id else None,
             admin_user_id=str(actor_user_id),
             message=f"Organization '{org.name}' onboarded",
-        )
-
-    async def generate_script(
-        self, customer_id: uuid.UUID
-    ) -> GenerateScriptResponse:
-        script = (
-            "#!/bin/bash\n"
-            "# CloudGuest Router Provisioning Script\n"
-            f"# Customer ID: {customer_id}\n\n"
-            "echo 'Downloading CloudGuest agent...'\n"
-            "curl -sSL https://cloudguest.io/agent/install.sh | bash\n\n"
-            "echo 'Registering router with CloudGuest...'\n"
-            f"cloudguest-agent register --customer-id={customer_id}\n\n"
-            "echo 'Router provisioning complete.'\n"
-        )
-        return GenerateScriptResponse(
-            script=script,
-            script_type="bash",
-            message="Configuration script generated",
-        )
-
-    async def generate_nas(
-        self, customer_id: uuid.UUID
-    ) -> GenerateNasResponse:
-        import secrets
-
-        nas_ip = f"10.0.{uuid.uuid4().int % 255}.{uuid.uuid4().int % 255}"
-        nas_secret = secrets.token_hex(16)
-        return GenerateNasResponse(
-            nas_id=str(uuid.uuid4()),
-            nas_ip=nas_ip,
-            nas_secret=nas_secret,
-            message="NAS device registered",
-        )
-
-    async def generate_wireguard(
-        self, customer_id: uuid.UUID
-    ) -> WireguardConfigResponse:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-
-        private_key_obj = X25519PrivateKey.generate()
-        private_key = private_key_obj.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        public_key = private_key_obj.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
-
-        import base64
-        priv_b64 = base64.b64encode(private_key).decode()
-        pub_b64 = base64.b64encode(public_key).decode()
-
-        return WireguardConfigResponse(
-            peer_id=str(uuid.uuid4()),
-            private_key=priv_b64,
-            public_key=pub_b64,
-            endpoint="wg.cloudguest.io:51820",
-            message="WireGuard configuration generated",
         )
