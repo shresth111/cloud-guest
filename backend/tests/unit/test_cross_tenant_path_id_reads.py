@@ -29,7 +29,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.domains.monitoring.service import AlertService
+from app.domains.monitoring.service import (
+    AlertService,
+    IncidentService,
+    NotificationService,
+    SlaService,
+)
 from app.domains.organization.exceptions import CrossOrganizationAccessError
 from app.domains.organization.scoping import enforce_target_organization
 from app.domains.rbac.dependencies import CurrentOrganization
@@ -163,6 +168,168 @@ class TestAlertTenantScoping:
 
 
 # ---------------------------------------------------------------------------
+# The rest of the monitoring domain's by-id resources
+#
+# AlertRule, NotificationChannel, Incident and SlaTarget all carry a
+# *nullable* organization_id, where NULL means a platform-wide object (a
+# "Database Down" system rule, a platform-ops Slack channel). The guard
+# refuses those for an org-scoped caller, which matches what the list
+# endpoints already do: apply_filters turns {"organization_id": org} into
+# WHERE organization_id = org, and that never matches NULL.
+# ---------------------------------------------------------------------------
+
+
+class _FakeByIdRepo:
+    """One row, returned for any id, plus a flag proving whether the mutation
+    underneath the guard was ever reached."""
+
+    def __init__(self, row) -> None:
+        self._row = row
+        self.mutated = False
+
+    async def get_alert_rule(self, rule_id):
+        return self._row
+
+    async def get_notification_channel(self, channel_id):
+        return self._row
+
+    async def get_incident(self, incident_id):
+        return self._row
+
+    async def get_sla_target(self, target_id):
+        return self._row
+
+    async def soft_delete_alert_rule(self, rule):
+        self.mutated = True
+        raise _ReachedRead
+
+    async def soft_delete_notification_channel(self, channel):
+        self.mutated = True
+        raise _ReachedRead
+
+    async def list_alerts_for_incident(self, incident_id):
+        self.mutated = True
+        raise _ReachedRead
+
+    async def list_sla_reports(self, **kwargs):
+        self.mutated = True
+        raise _ReachedRead
+
+
+def _owned_by(organization_id: uuid.UUID | None):
+    return SimpleNamespace(id=uuid.uuid4(), organization_id=organization_id)
+
+
+class TestAlertRuleTenantScoping:
+    async def test_foreign_rule_cannot_be_read(self) -> None:
+        service = AlertService(_FakeByIdRepo(_owned_by(uuid.uuid4())))
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.get_alert_rule(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_foreign_rule_cannot_be_deleted(self) -> None:
+        repo = _FakeByIdRepo(_owned_by(uuid.uuid4()))
+        service = AlertService(repo)
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.delete_alert_rule(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+        assert repo.mutated is False
+
+    async def test_platform_wide_rule_is_refused_for_an_org_caller(self) -> None:
+        """NULL organization_id is a platform system rule, not the caller's --
+        and the org-scoped list endpoint never returns it either."""
+        service = AlertService(_FakeByIdRepo(_owned_by(None)))
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.get_alert_rule(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_platform_caller_may_read_a_platform_wide_rule(self) -> None:
+        service = AlertService(_FakeByIdRepo(_owned_by(None)))
+        rule = await service.get_alert_rule(
+            uuid.uuid4(), requesting_organization_id=None
+        )
+        assert rule is not None
+
+
+class TestNotificationChannelTenantScoping:
+    async def test_foreign_channel_cannot_be_read(self) -> None:
+        """A channel carries config_encrypted -- the webhook URL or API
+        credential it delivers through."""
+        service = NotificationService(
+            _FakeByIdRepo(_owned_by(uuid.uuid4())), http_client=None
+        )
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.get_channel(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_platform_ops_channel_is_refused_for_an_org_caller(self) -> None:
+        service = NotificationService(_FakeByIdRepo(_owned_by(None)), http_client=None)
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.get_channel(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_foreign_channel_cannot_be_deleted(self) -> None:
+        repo = _FakeByIdRepo(_owned_by(uuid.uuid4()))
+        service = NotificationService(repo, http_client=None)
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.delete_channel(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+        assert repo.mutated is False
+
+    async def test_own_channel_is_readable(self) -> None:
+        own = uuid.uuid4()
+        service = NotificationService(_FakeByIdRepo(_owned_by(own)), http_client=None)
+        channel = await service.get_channel(
+            uuid.uuid4(), requesting_organization_id=own
+        )
+        assert channel.organization_id == own
+
+
+class TestIncidentTenantScoping:
+    async def test_foreign_incident_cannot_be_read(self) -> None:
+        service = IncidentService(_FakeByIdRepo(_owned_by(uuid.uuid4())))
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.get_incident(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_foreign_incidents_alerts_are_not_listable(self) -> None:
+        """The guard lives on the incident: reaching its alerts is reaching
+        it, so the listing must never get past the check."""
+        repo = _FakeByIdRepo(_owned_by(uuid.uuid4()))
+        service = IncidentService(repo)
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.list_alerts_for_incident(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+        assert repo.mutated is False
+
+
+class TestSlaTargetTenantScoping:
+    async def test_foreign_target_cannot_be_read(self) -> None:
+        service = SlaService(_FakeByIdRepo(_owned_by(uuid.uuid4())))
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.get_target(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+
+    async def test_foreign_targets_reports_are_not_listable(self) -> None:
+        repo = _FakeByIdRepo(_owned_by(uuid.uuid4()))
+        service = SlaService(repo)
+        with pytest.raises(CrossOrganizationAccessError):
+            await service.list_reports(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+        assert repo.mutated is False
+
+
+# ---------------------------------------------------------------------------
 # Structural: the routes still declare an organization dependency
 # ---------------------------------------------------------------------------
 
@@ -198,6 +365,15 @@ _PATH_ID_ROUTES = [
     ("/api/v1/alerts/{alert_id}/resolve", "POST"),
     ("/api/v1/users/{user_id}/roles", "GET"),
     ("/api/v1/users/{user_id}/permissions", "GET"),
+    ("/api/v1/alerts/rules/{rule_id}", "GET"),
+    ("/api/v1/alerts/rules/{rule_id}", "PUT"),
+    ("/api/v1/alerts/rules/{rule_id}", "DELETE"),
+    ("/api/v1/notifications/channels/{channel_id}", "GET"),
+    ("/api/v1/notifications/channels/{channel_id}", "PUT"),
+    ("/api/v1/notifications/channels/{channel_id}", "DELETE"),
+    ("/api/v1/incidents/{incident_id}", "GET"),
+    ("/api/v1/incidents/{incident_id}/alerts", "GET"),
+    ("/api/v1/sla/{target_id}/reports", "GET"),
 ]
 
 
