@@ -97,10 +97,29 @@ class ConnectedDevice:
 
 @dataclass(frozen=True, slots=True)
 class VlanConfig:
+    """One VLAN to realize on a device.
+
+    ``port_mode`` mirrors ``app.domains.vlan.models.Vlan.port_mode`` and
+    changes what is created, not merely how it looks:
+
+    * ``"trunk"`` -- ``interface`` is the parent trunk carrying tagged
+      traffic; a ``/interface vlan`` sub-interface named ``vlan<id>`` is
+      created on it and the address goes there.
+    * ``"access"`` -- ``interface`` is a dedicated *physical* port. It is
+      pulled out of the shared bridge and given this VLAN's subnet
+      directly, untagged. No ``/interface vlan`` entry is created at all.
+
+    Getting this wrong is not cosmetic: a row the operator saved as
+    "access" but realized as trunk leaves that physical port on the wrong
+    network. See ``network_config.renderers.render_vlan``, which this
+    mirrors.
+    """
+
     vlan_id: int
     name: str
     interface: str
     ip_cidr: str | None
+    port_mode: str = "trunk"
 
 
 @dataclass(frozen=True, slots=True)

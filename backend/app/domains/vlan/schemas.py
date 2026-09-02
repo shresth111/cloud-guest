@@ -65,6 +65,13 @@ class VlanResponse(BaseModel):
     enable_hotspot: bool
     description: str | None
     is_enabled: bool
+    # Whether this row has ever reached a real router, and what happened.
+    # Independent of is_enabled: a VLAN can be enabled for months and never
+    # have been on a device, which was true of every row before this domain
+    # had a push at all.
+    device_push_status: str
+    device_push_error: str | None
+    device_pushed_at: datetime | None
     created_at: datetime
 
 

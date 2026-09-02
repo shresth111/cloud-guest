@@ -317,11 +317,22 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # VLAN Management: same CRUD+MANAGE shape as PermissionModule
     # .ISP_ROUTING -- a pure rules/inventory domain, no EXECUTE action in
     # this pass (see app.domains.vlan.service's own module docstring).
+    # VLAN gained EXECUTE when the domain gained a real device push
+    # (POST /vlans/{id}/push -- see app.domains.vlan.device_adapters).
+    # EXECUTE, not UPDATE: editing a row and reaching into a live router are
+    # different privileges, and the row edit must not require the second.
+    #
+    # NOTE FOR DEPLOY: seeding is a manual entrypoint (see __main__ at the
+    # bottom of this module), not a startup hook. Shipping the push endpoint
+    # without re-running the seed gives every operator a 403 on it.
+    # expand_grant_level already folds EXECUTE into OPERATE and FULL, so no
+    # role table changes are needed.
     PermissionModule.VLAN: (
         _A.CREATE,
         _A.READ,
         _A.UPDATE,
         _A.DELETE,
+        _A.EXECUTE,
         _A.MANAGE,
     ),
     # PermissionModule.DHCP's own action tuple already exists above

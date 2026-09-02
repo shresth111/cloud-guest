@@ -74,6 +74,9 @@ def _vlan_response(vlan: Vlan) -> VlanResponse:
         enable_hotspot=vlan.enable_hotspot,
         description=vlan.description,
         is_enabled=vlan.is_enabled,
+        device_push_status=vlan.device_push_status,
+        device_push_error=vlan.device_push_error,
+        device_pushed_at=vlan.device_pushed_at,
         created_at=vlan.created_at,
     )
 
@@ -220,6 +223,52 @@ async def delete_vlan(
         success=True,
         message="VLAN deleted",
         data=MessageResponse(message="VLAN deleted").model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/{vlan_pk}/push",
+    response_model=ApiResponse[VlanResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("vlan.execute"))],
+)
+async def push_vlan(
+    request: Request,
+    vlan_pk: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: VlanService = Depends(get_vlan_service),
+):
+    """Realizes this VLAN on its own router over the RouterOS API.
+
+    Gated by ``vlan.execute``, not ``vlan.update``: editing a row and
+    reaching into a live router are different privileges. That action is
+    new -- ``app.domains.rbac.seed`` must be re-run on deploy or every
+    operator gets a 403 here.
+
+    **There is no try/except in this handler, deliberately.** Every failure
+    path raises a ``VlanError`` carrying its own status code (502 for a
+    device connection or operation failure, 409/400/403/404 for the rest),
+    and the app-wide ``CloudGuestError`` handler turns it into a real
+    non-2xx.
+
+    Returning ``200 {"success": false}`` instead would be invisible: the
+    frontend's response interceptor unwraps ``response.data.data`` and never
+    reads ``success``, so such a response reaches the UI as a success. The
+    honesty has to live in the status code -- which is exactly the lesson of
+    ``POST /network-config/routers/{id}/push``, which returns 202
+    ``success: true`` without reading ``job.status``.
+    """
+    vlan = await service.push_vlan_to_device(
+        vlan_pk,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="VLAN pushed to device",
+        data=_vlan_response(vlan).model_dump(),
         request_id=_request_id(request),
     )
 
