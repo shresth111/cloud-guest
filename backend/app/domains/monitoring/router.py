@@ -592,9 +592,12 @@ async def list_alert_rules(
 async def get_alert_rule(
     request: Request,
     rule_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
-    rule = await service.get_alert_rule(rule_id)
+    rule = await service.get_alert_rule(
+        rule_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Alert rule retrieved",
@@ -613,6 +616,7 @@ async def update_alert_rule(
     request: Request,
     rule_id: uuid.UUID,
     payload: AlertRuleUpdateRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
     data = payload.model_dump(exclude_unset=True, exclude={"notification_channel_ids"})
@@ -621,7 +625,10 @@ async def update_alert_rule(
     if "severity" in data and payload.severity is not None:
         data["severity"] = payload.severity.value
     rule = await service.update_alert_rule(
-        rule_id, data=data, notification_channel_ids=payload.notification_channel_ids
+        rule_id,
+        data=data,
+        notification_channel_ids=payload.notification_channel_ids,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
@@ -640,9 +647,12 @@ async def update_alert_rule(
 async def delete_alert_rule(
     request: Request,
     rule_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
-    await service.delete_alert_rule(rule_id)
+    await service.delete_alert_rule(
+        rule_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Alert rule deleted",
@@ -885,9 +895,12 @@ async def list_notification_channels(
 async def get_notification_channel(
     request: Request,
     channel_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: NotificationService = Depends(get_notification_service),
 ):
-    channel = await service.get_channel(channel_id)
+    channel = await service.get_channel(
+        channel_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Notification channel retrieved",
@@ -906,10 +919,16 @@ async def update_notification_channel(
     request: Request,
     channel_id: uuid.UUID,
     payload: NotificationChannelUpdateRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: NotificationService = Depends(get_notification_service),
 ):
     data = payload.model_dump(exclude_unset=True, exclude={"config"})
-    channel = await service.update_channel(channel_id, data=data, config=payload.config)
+    channel = await service.update_channel(
+        channel_id,
+        data=data,
+        config=payload.config,
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message="Notification channel updated",
@@ -927,9 +946,12 @@ async def update_notification_channel(
 async def delete_notification_channel(
     request: Request,
     channel_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: NotificationService = Depends(get_notification_service),
 ):
-    await service.delete_channel(channel_id)
+    await service.delete_channel(
+        channel_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Notification channel deleted",
@@ -1070,9 +1092,12 @@ async def list_incidents(
 async def get_incident(
     request: Request,
     incident_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: IncidentService = Depends(get_incident_service),
 ):
-    incident = await service.get_incident(incident_id)
+    incident = await service.get_incident(
+        incident_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Incident retrieved",
@@ -1139,9 +1164,12 @@ async def attach_alert_to_incident(
 async def list_incident_alerts(
     request: Request,
     incident_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: IncidentService = Depends(get_incident_service),
 ):
-    alerts = await service.list_alerts_for_incident(incident_id)
+    alerts = await service.list_alerts_for_incident(
+        incident_id, requesting_organization_id=requesting_organization_id
+    )
     payload = IncidentAlertsResponse(items=[_alert_response(a) for a in alerts])
     return build_response(
         success=True,
@@ -1238,9 +1266,15 @@ async def list_sla_reports(
     target_id: uuid.UUID,
     page: int = Query(default=DEFAULT_LIST_PAGE, ge=1),
     page_size: int = Query(default=DEFAULT_LIST_PAGE_SIZE, ge=1, le=100),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: SlaService = Depends(get_sla_service),
 ):
-    items, meta = await service.list_reports(target_id, page=page, page_size=page_size)
+    items, meta = await service.list_reports(
+        target_id,
+        page=page,
+        page_size=page_size,
+        requesting_organization_id=requesting_organization_id,
+    )
     payload = SlaReportListResponse(
         items=[_sla_report_response(item) for item in items],
         page=meta.page,
