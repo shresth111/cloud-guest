@@ -171,6 +171,15 @@ def get_powered_by_reset_service(
     )
 
 
+# Defined here, ahead of the Subscription section it belongs to, because
+# ``get_license_service`` below consumes it and a ``Depends()`` default is
+# evaluated at import time -- a later definition would be a NameError.
+def get_subscription_repository(
+    db: AsyncSession = Depends(get_db_session),
+) -> SubscriptionRepositoryProtocol:
+    return SubscriptionRepository(db)
+
+
 def get_license_service(
     repository: LicenseRepositoryProtocol = Depends(get_license_repository),
     plan_repository: PlanRepositoryProtocol = Depends(get_plan_repository),
@@ -181,6 +190,9 @@ def get_license_service(
     powered_by_reset: PoweredByAttributionResetService = Depends(
         get_powered_by_reset_service
     ),
+    subscription_repository: SubscriptionRepositoryProtocol = Depends(
+        get_subscription_repository
+    ),
 ) -> LicenseService:
     return LicenseService(
         repository,
@@ -190,6 +202,7 @@ def get_license_service(
         audit_writer=audit_repository,
         entitlement_cache=entitlement_cache,
         white_label_reset=powered_by_reset,
+        subscription_repository=subscription_repository,
     )
 
 
@@ -259,12 +272,6 @@ def RequireFeature(
         return organization_id
 
     return _dependency
-
-
-def get_subscription_repository(
-    db: AsyncSession = Depends(get_db_session),
-) -> SubscriptionRepositoryProtocol:
-    return SubscriptionRepository(db)
 
 
 def get_coupon_repository(

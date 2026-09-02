@@ -383,6 +383,10 @@ class SubscriptionRepositoryProtocol(Protocol):
 
     async def list_due_for_renewal(self, *, now: datetime) -> list[Subscription]: ...
 
+    async def list_lapsed_non_renewing(
+        self, *, now: datetime
+    ) -> list[Subscription]: ...
+
 
 class SubscriptionRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -420,6 +424,43 @@ class SubscriptionRepository:
 
     async def list_by_status(self, statuses: Sequence[str]) -> list[Subscription]:
         return await self.subscriptions.get_all(filters={"status": list(statuses)})
+
+    async def list_lapsed_non_renewing(
+        self, *, now: datetime
+    ) -> list[Subscription]:
+        """Subscriptions that have run past the end of the period they paid
+        for and are not going to renew -- the exact complement of
+        ``list_due_for_renewal``'s ``auto_renew`` predicate, otherwise the
+        identical filter.
+
+        Nothing used to look for these. ``list_due_for_renewal`` requires
+        ``auto_renew=True``, so a customer who turned auto-renewal off via
+        Renewal Settings dropped out of the sweep entirely: never renewed,
+        therefore never ``PAST_DUE``, therefore never seen by
+        ``expire_lapsed_subscriptions`` -- and ``cancel_at_period_end`` was
+        never set, so the scheduled-cancellation path did not apply either.
+        The subscription stayed ``ACTIVE`` past its period end forever, with
+        a valid license, indefinitely, for free.
+        """
+        statement = select(Subscription).where(
+            Subscription.is_deleted.is_(False),
+            Subscription.auto_renew.is_(False),
+            Subscription.billing_cycle.in_(
+                [cycle.value for cycle in CYCLIC_BILLING_CYCLES]
+            ),
+            # ACTIVE/TRIALING only -- deliberately NOT the full
+            # RENEWABLE_SUBSCRIPTION_STATUSES, which also contains PAST_DUE.
+            # A PAST_DUE subscription is already owned by
+            # expire_lapsed_subscriptions' grace-period machinery, and
+            # sweeping it up here would cut a customer off early, before the
+            # grace days they still had. One row, one phase.
+            Subscription.status.in_(
+                [SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIALING.value]
+            ),
+            Subscription.current_period_end <= now,
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def list_due_for_renewal(self, *, now: datetime) -> list[Subscription]:
         statement = select(Subscription).where(
