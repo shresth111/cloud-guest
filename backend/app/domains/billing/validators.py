@@ -249,6 +249,39 @@ def compute_renewal_charge_amount(plan: object) -> Decimal:
     return plan.base_price
 
 
+def compute_taxable_value(subtotal: Decimal, discount_amount: Decimal) -> Decimal:
+    """The value GST is actually charged on: gross ``subtotal`` less the
+    coupon ``discount_amount`` recorded on the same invoice.
+
+    Discount-before-tax is not a stylistic choice. CGST Act s.15(3)(a)
+    excludes a discount given at or before the time of supply, and recorded
+    in the invoice, from the value of supply -- so a recorded coupon
+    reduces the taxable value, and taxing the gross would over-collect GST
+    on money the customer never paid. ``models.Invoice.discount_amount``
+    exists precisely so the discount *is* recorded and this treatment is
+    available.
+
+    **Clamped at zero, never negative.** A discount exceeding the plan
+    price is a real, reachable input -- a fixed-amount coupon outliving the
+    plan repricing that made it larger than ``base_price`` -- and the
+    honest outcome is a free period (zero taxable value, zero tax), not a
+    negative taxable value that would compute *negative tax* and turn an
+    invoice into a silent credit note. ``compute_discount_amount`` already
+    caps a percentage discount at the base amount; this is the backstop for
+    the fixed-amount case and for any future caller that hands over an
+    externally-sourced discount.
+
+    Pure and side-effect-free, in this module rather than ``service.py``
+    for the same no-import-cycle reason ``compute_renewal_charge_amount``
+    lives here: both ``InvoiceService.generate_invoice_for_subscription``
+    and any future renewal-side caller need the identical rule, and a
+    second copy of "is tax charged before or after the discount" drifting
+    out of sync is a wrong-tax bug, not a cosmetic one.
+    """
+    taxable = subtotal - discount_amount
+    return taxable if taxable > 0 else Decimal("0")
+
+
 def is_payment_retry_eligible(status: str) -> bool:
     """The one, real rule for "may this ``Payment`` be retried" --
     ``status == PaymentStatus.FAILED`` -- factored out of

@@ -522,6 +522,7 @@ def get_invoice_service(
     note_repository: CreditDebitNoteRepositoryProtocol = Depends(
         get_credit_debit_note_repository
     ),
+    coupon_repository: CouponRepositoryProtocol = Depends(get_coupon_repository),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     settings: Settings = Depends(get_settings),
 ) -> InvoiceService:
@@ -535,6 +536,7 @@ def get_invoice_service(
         note_repository=note_repository,
         platform_gst_state=settings.platform_gst_state,
         platform_gst_country=settings.platform_gst_country,
+        coupon_repository=coupon_repository,
         invoice_due_days=settings.invoice_due_days,
         audit_writer=audit_repository,
     )

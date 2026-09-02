@@ -1868,6 +1868,7 @@ def _invoice_response(
         issue_date=invoice.issue_date,
         due_date=invoice.due_date,
         subtotal=invoice.subtotal,
+        discount_amount=invoice.discount_amount,
         cgst_amount=invoice.cgst_amount,
         sgst_amount=invoice.sgst_amount,
         igst_amount=invoice.igst_amount,

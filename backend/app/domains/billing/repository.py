@@ -479,6 +479,10 @@ class CouponRepositoryProtocol(Protocol):
 
     async def create_coupon_usage(self, **fields: object) -> CouponUsage: ...
 
+    async def get_usage_for_subscription(
+        self, subscription_id: uuid.UUID
+    ) -> CouponUsage | None: ...
+
 
 class CouponRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -588,6 +592,34 @@ class CouponRepository:
 
     async def create_coupon_usage(self, **fields: object) -> CouponUsage:
         return await self.usages.create(fields)
+
+    async def get_usage_for_subscription(
+        self, subscription_id: uuid.UUID
+    ) -> CouponUsage | None:
+        """The redemption ``CouponService.apply_coupon`` recorded for this
+        subscription, or ``None`` if none was.
+
+        ``InvoiceService.generate_invoice_for_subscription`` reads the
+        frozen ``discount_amount_applied`` off this row rather than
+        recomputing the discount from the ``Coupon``: the coupon's
+        ``discount_value`` is editable, and an invoice must grant what was
+        actually redeemed at signup, not what the coupon happens to be
+        worth on the day the invoice is cut.
+
+        Ordered oldest-first and limited to one. A subscription is expected
+        to have at most one usage row -- ``apply_coupon`` runs once, at
+        creation -- but the schema does not constrain it to one, and
+        picking the earliest makes the "which redemption is the signup
+        one" question deterministic rather than dependent on physical row
+        order if a second ever appears.
+        """
+        results = await self.usages.get_all(
+            filters={"subscription_id": subscription_id},
+            sort_by="used_at",
+            sort_order=SortOrder.ASC,
+            limit=1,
+        )
+        return results[0] if results else None
 
 
 # ============================================================================
@@ -1007,6 +1039,8 @@ class InvoiceRepositoryProtocol(Protocol):
 
     async def list_issued_past_due(self, *, now: datetime) -> list[Invoice]: ...
 
+    async def has_discounted_invoice(self, subscription_id: uuid.UUID) -> bool: ...
+
     async def create_invoice_item(self, **fields: object) -> InvoiceItem: ...
 
     async def list_items(self, invoice_id: uuid.UUID) -> list[InvoiceItem]: ...
@@ -1084,6 +1118,37 @@ class InvoiceRepository:
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    async def has_discounted_invoice(self, subscription_id: uuid.UUID) -> bool:
+        """Whether any live invoice for this subscription already granted a
+        coupon discount.
+
+        This is what makes "the coupon applies once, at signup" true in the
+        invoice layer. ``CouponService``'s own policy (and
+        ``compute_renewal_charge_amount``'s docstring) is that a redemption
+        is a one-time grant, but ``generate_invoice_for_subscription`` can
+        legitimately be called more than once for the same subscription --
+        it is wired to an operator-triggered endpoint, not to signup -- and
+        without this check the second call would grant the discount a
+        second time off the same single ``CouponUsage`` row.
+
+        ``VOID`` and ``CANCELLED`` invoices are deliberately excluded: a
+        discount on an invoice that was formally reversed, or withdrawn
+        before it ever reached the customer, was not in the end granted, so
+        the reissue must carry it rather than silently charging full price
+        for a coupon the organization already spent. Soft-deleted rows are
+        excluded for the same reason every other query here excludes them.
+        """
+        statement = select(Invoice.id).where(
+            Invoice.is_deleted.is_(False),
+            Invoice.subscription_id == subscription_id,
+            Invoice.status.not_in(
+                [InvoiceStatus.VOID.value, InvoiceStatus.CANCELLED.value]
+            ),
+            Invoice.discount_amount > 0,
+        )
+        result = await self.session.execute(statement.limit(1))
+        return result.first() is not None
 
     async def list_issued_past_due(self, *, now: datetime) -> list[Invoice]:
         statement = select(Invoice).where(
