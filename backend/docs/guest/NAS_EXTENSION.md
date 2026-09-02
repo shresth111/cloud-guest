@@ -63,10 +63,34 @@ API-key system needs, since the stored value is Fernet-encrypted
 (`encrypt_secret`, reused from `app.domains.router.crypto`, unchanged from
 before this extension) and never logged or persisted in plaintext.
 
-`POST /radius/nas/{id}/regenerate-secret` invalidates the old secret
-immediately and returns the new one the same way -- it does not require or
+`POST /platform/radius/nas/{id}/regenerate-secret` invalidates the old
+secret and returns the new one the same way -- it does not require or
 change the NAS's own `status`, since rotating a compromised secret on a
 currently-disabled NAS is a legitimate, independent action.
+
+Two things about it changed on 2026-09-02, and both were live defects.
+
+*It now pushes.* `RadiusService.regenerate_secret` takes a **mandatory**
+`push_secret` and calls it *before* the database write. Until then the
+rotate was database-only: the row took the new secret, the hub's
+`client{}` stanza kept the old one, the router kept the old one, and every
+guest login at that venue Access-Rejected from that instant with nothing in
+any log naming the cause. The reconciliation sweep did not repair it --
+`rebind_nas_for_router` fires on *address* drift and deliberately re-pushes
+the stored secret, so a secret-only divergence never triggered it. Making
+the argument required rather than optional is the point: the broken state
+is now unreachable from any caller, including a future one.
+
+*It moved to the platform namespace.* `radius.execute` is held at
+organization scope by `organization-owner`, so the old path was reachable
+by a venue owner -- and the customer dashboard really did wire a
+"Regenerate secret" button in their own NAS detail page to it, with no
+confirmation. A rotation cannot be completed from a dashboard: nothing in
+this codebase can write a RADIUS client onto RouterOS, so the new secret
+has to be pasted in over WinBox before the venue works again. The button is
+gone from the customer dashboard and the route is `ScopeType.GLOBAL`, the
+same posture `GET /platform/routers/{id}` and the WireGuard domain already
+carry.
 
 ## 3. Status lifecycle: real graph, `ACTIVE`-by-default registration
 

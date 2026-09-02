@@ -170,7 +170,7 @@ PUT    /api/v1/radius/nas/{id}                          radius.update
 DELETE /api/v1/radius/nas/{id}                           radius.delete
 POST   /api/v1/radius/nas/{id}/activate                  radius.execute
 POST   /api/v1/radius/nas/{id}/disable                   radius.execute
-POST   /api/v1/radius/nas/{id}/regenerate-secret         radius.execute
+POST   /api/v1/platform/radius/nas/{id}/regenerate-secret radius.execute (GLOBAL scope only)
 GET    /api/v1/locations/{location_id}/nas              radius.read
 GET    /api/v1/routers/{router_id}/nas                 radius.read
 ```
