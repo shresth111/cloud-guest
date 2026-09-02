@@ -8,14 +8,23 @@ This module never resolves a router itself. ``RouterLookupProtocol``
 is the identical narrow, duck-typed Protocol composition-over-duplication
 pattern every domain in this codebase establishes.
 
-## No live device push in this pass
+## Live device push
 
-Unlike ``app.domains.isp``, this domain has no ``device_adapters.py`` and
-no Celery task -- it is a pure rules/inventory domain, mirroring
-``app.domains.vlan``/``app.domains.isp_routing``'s own "config resource,
-realized onto a device later" precedent. Real RouterOS DHCP server/pool
-provisioning belongs to the not-yet-built Network Configuration
-Management domain's own provisioning-integration layer, not this one.
+``push_pool_to_device`` realizes a pool on its router over the RouterOS
+API, through ``device_adapters``. This paragraph previously said the
+opposite -- "no live device push in this pass ... no ``device_adapters.py``
+and no Celery task" -- and deferred real provisioning to a "not-yet-built
+Network Configuration Management domain". That deferral is what made
+creating a DHCP pool a database-only operation: the dashboard reported a
+pool, the router had none, and guests on the network received no address
+at all.
+
+The gateway writer already existed
+(``wyfy_device_gateway.mikrotik_adapter.configure_dhcp_pool``, three real
+RouterOS operations over librouteros on 8728) with no callers. Creation
+still writes only a row, deliberately: renaming a pool must not be able to
+fail with a connection error, and an operator must be able to retry a push
+without re-submitting the form.
 
 ## Validation and conflict detection
 
@@ -35,15 +44,26 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.models import Router
 
-from .constants import DEFAULT_LEASE_TIME_SECONDS
-from .events import DhcpPoolCreated, DhcpPoolDeleted, DhcpPoolUpdated
+from .constants import DEFAULT_LEASE_TIME_SECONDS, DhcpDevicePushStatus
+from .device_adapters import DhcpCredentials, get_dhcp_adapter
+from .events import (
+    DhcpPoolCreated,
+    DhcpPoolDeleted,
+    DhcpPoolPushed,
+    DhcpPoolUpdated,
+)
 from .exceptions import (
     CrossOrganizationDhcpPoolAccessError,
+    DhcpMissingCredentialsError,
+    DhcpPoolMissingGatewayError,
+    DhcpPoolMissingInterfaceError,
+    DhcpPoolNotEnabledError,
     DhcpPoolNotFoundError,
     DhcpPoolRangeConflictError,
 )
@@ -74,6 +94,12 @@ class RouterLookupProtocol(Protocol):
         requesting_organization_id: uuid.UUID | None = None,
         include_deleted: bool = False,
     ) -> Router: ...
+
+    # Declared because the device-push path really calls it. It was
+    # previously left out, so this Protocol under-described what the
+    # service requires: a collaborator could satisfy the annotation and
+    # still blow up at runtime, and no type checker could see it coming.
+    def get_decrypted_api_secret(self, router: Router) -> str | None: ...
 
 
 class AuditLogWriter(Protocol):
@@ -134,6 +160,12 @@ class DhcpService:
             dns_secondary=dns_secondary,
             lease_time_seconds=lease_time_seconds,
             is_enabled=is_enabled,
+            # Written explicitly rather than left to the column default,
+            # which only applies at INSERT: a freshly constructed row would
+            # otherwise carry None until it round-trips through the
+            # database, and "has this reached a device" must never read as
+            # unknown.
+            device_push_status=DhcpDevicePushStatus.PENDING.value,
             created_by=actor_user_id,
         )
         event = DhcpPoolCreated(id=pool.id, router_id=router.id)
@@ -286,6 +318,138 @@ class DhcpService:
                 start, end, other.address_range_start, other.address_range_end
             ):
                 raise DhcpPoolRangeConflictError(router_id, other.id)
+
+    async def push_pool_to_device(
+        self,
+        pool_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> DhcpPool:
+        """Realizes one DHCP pool on its own router, over the RouterOS API.
+
+        Until this existed, ``create_pool`` wrote a row, returned 201, and
+        the device was never contacted -- this module's own docstring said
+        so and called it deliberate. The visible consequence was not a
+        missing pool but a broken network: a guest joining a VLAN the
+        dashboard reported as created received no address at all, because
+        no ``/ip dhcp-server`` had ever been created to answer them.
+
+        **Separate from create/update, deliberately.** Renaming a pool must
+        not be able to fail with a connection error, and an operator must be
+        able to retry a push without re-submitting the form.
+
+        **Every precondition is checked before a socket is opened**, so a
+        misconfigured row fails as a 4xx naming the problem rather than as a
+        device timeout.
+
+        **A failure is committed, then re-raised.**
+        ``GenericRepository.update`` only ``flush()``es and
+        ``get_db_session`` rolls back on any exception, so a failure record
+        written just before a re-raise is otherwise discarded and the row
+        still reads ``pending`` with ``device_push_error`` NULL. Committing
+        explicitly is what makes the record survive to be read.
+
+        The exception then propagates as a real non-2xx. It must not become
+        a ``200 {"success": false}``: the frontend interceptor unwraps
+        ``data`` and never reads ``success``, so such a response is
+        indistinguishable from success to every caller in the app.
+        """
+        pool = await self.get_pool(
+            pool_id, requesting_organization_id=requesting_organization_id
+        )
+
+        if not pool.is_enabled:
+            raise DhcpPoolNotEnabledError(pool.id)
+        if not pool.interface:
+            # render_dhcp_pool handles this by emitting a comment and
+            # skipping -- fine for a script, but on a direct push the same
+            # silence would report success for a device that received
+            # nothing. The adapter also derives both RouterOS identifiers
+            # from this field.
+            raise DhcpPoolMissingInterfaceError(pool.id)
+        if not pool.gateway_ip_address:
+            # Handing out addresses with no gateway gives guests an IP and
+            # no route off the subnet. Defaulting to ``.1`` would be a
+            # fabricated network fact.
+            raise DhcpPoolMissingGatewayError(pool.id)
+
+        router = await self.router_lookup.get_router(
+            pool.router_id, requesting_organization_id=requesting_organization_id
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+
+        try:
+            await adapter.configure_dhcp_pool(
+                credentials,
+                interface=pool.interface,
+                range_start=pool.address_range_start,
+                range_end=pool.address_range_end,
+                gateway=pool.gateway_ip_address,
+                dns_servers=self._dns_servers(pool),
+                lease_time_seconds=pool.lease_time_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
+            await self.repository.update_pool(
+                pool,
+                {
+                    "device_push_status": DhcpDevicePushStatus.FAILED.value,
+                    "device_push_error": str(exc),
+                },
+            )
+            await self.repository.commit()
+            raise
+
+        updated = await self.repository.update_pool(
+            pool,
+            {
+                "device_push_status": DhcpDevicePushStatus.ACTIVE.value,
+                "device_push_error": None,
+                "device_pushed_at": datetime.now(UTC),
+                "updated_by": actor_user_id,
+            },
+        )
+        event = DhcpPoolPushed(
+            id=updated.id,
+            router_id=updated.router_id,
+            interface=updated.interface or "",
+        )
+        logger.info("dhcp_pool_pushed", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.DHCP_POOL_PUSHED,
+            entity_id=updated.id,
+            organization_id=updated.organization_id,
+            description=(
+                f"DHCP pool {updated.id} pushed to router {updated.router_id}"
+            ),
+        )
+        return updated
+
+    @staticmethod
+    def _dns_servers(pool: DhcpPool) -> list[str]:
+        """The DNS servers to advertise, in the operator's own order.
+
+        Only the ones actually set: an empty list means the adapter omits
+        ``dns-server=`` entirely rather than sending a blank value, which
+        RouterOS would take as "no DNS" in a way that looks configured.
+        """
+        return [
+            server
+            for server in (pool.dns_primary, pool.dns_secondary)
+            if server
+        ]
+
+    def _resolve_device_credentials(self, router: Router) -> DhcpCredentials:
+        """Raise rather than guess -- mirrors ``vlan``/``qos``."""
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.router_lookup.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            raise DhcpMissingCredentialsError(router.id)
+        return DhcpCredentials(
+            host=host, username=router.api_username, password=secret
+        )
 
     async def _audit(
         self,

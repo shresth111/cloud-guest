@@ -224,3 +224,126 @@ async def test_an_address_on_a_different_interface_does_not_count_as_present(
         ("ip", "address"),
         {"address": "10.42.0.1/24", "interface": "vlan42"},
     ) in api.add_calls
+
+
+# ============================================================================
+# DHCP pool idempotency -- all three writes were unconditional ``add`` calls,
+# so the second push of an unchanged pool died on RouterOS's "already have
+# such item". Re-pushing is an ordinary operation.
+# ============================================================================
+
+
+def _pool() -> DhcpPoolConfig:
+    return DhcpPoolConfig(
+        interface="vlan300",
+        range_start="10.30.30.100",
+        range_end="10.30.30.200",
+        gateway="10.30.30.1",
+        dns_servers=["1.1.1.1", "8.8.8.8"],
+        lease_time_seconds=3600,
+    )
+
+
+@pytest.mark.asyncio
+async def test_re_pushing_an_unchanged_dhcp_pool_is_a_no_op(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=_pool())
+    first_adds = list(api.add_calls)
+    assert len(first_adds) == 3  # pool, dhcp-server, dhcp-server network
+
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=_pool())
+
+    # Nothing added the second time, and nothing raised.
+    assert api.add_calls == first_adds
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_widening_the_range_updates_the_pool_rather_than_skipping(
+    patch_connect, mikrotik_creds
+):
+    """The range is the thing an operator actually edits. Skipping because
+    a pool of that name exists would report success and leave the old
+    range on the device."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=_pool())
+    widened = DhcpPoolConfig(
+        interface="vlan300",
+        range_start="10.30.30.100",
+        range_end="10.30.30.250",
+        gateway="10.30.30.1",
+        dns_servers=["1.1.1.1", "8.8.8.8"],
+        lease_time_seconds=3600,
+    )
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=widened)
+
+    pool_updates = [
+        fields for segments, fields in api.update_calls if segments == ("ip", "pool")
+    ]
+    assert len(pool_updates) == 1
+    assert pool_updates[0]["ranges"] == "10.30.30.100-10.30.30.250"
+
+
+@pytest.mark.asyncio
+async def test_changed_dns_updates_the_network_row_for_that_subnet(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=_pool())
+    changed = DhcpPoolConfig(
+        interface="vlan300",
+        range_start="10.30.30.100",
+        range_end="10.30.30.200",
+        gateway="10.30.30.1",
+        dns_servers=["9.9.9.9"],
+        lease_time_seconds=3600,
+    )
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=changed)
+
+    network_updates = [
+        fields
+        for segments, fields in api.update_calls
+        if segments == ("ip", "dhcp-server", "network")
+    ]
+    assert len(network_updates) == 1
+    assert network_updates[0]["dns-server"] == "9.9.9.9"
+    # The subnet itself is the row's identity and must not be re-added.
+    assert (
+        len([s for s, _ in api.add_calls if s == ("ip", "dhcp-server", "network")]) == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_pool_on_a_different_interface_is_a_separate_pool(
+    patch_connect, mikrotik_creds
+):
+    """Identifiers are derived from the interface name, so two interfaces
+    must not collide into one pool."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=_pool())
+    other = DhcpPoolConfig(
+        interface="vlan400",
+        range_start="10.40.40.100",
+        range_end="10.40.40.200",
+        gateway="10.40.40.1",
+        dns_servers=["1.1.1.1"],
+        lease_time_seconds=3600,
+    )
+    await adapter.configure_dhcp_pool(mikrotik_creds, pool=other)
+
+    pool_adds = [f for s, f in api.add_calls if s == ("ip", "pool")]
+    assert [f["name"] for f in pool_adds] == ["vlan300-pool", "vlan400-pool"]

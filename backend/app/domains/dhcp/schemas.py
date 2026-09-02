@@ -65,6 +65,12 @@ class DhcpPoolResponse(BaseModel):
     dns_secondary: str | None
     lease_time_seconds: int
     is_enabled: bool
+    # Whether this pool actually exists on the router right now, and why
+    # not if it doesn't. Separate from is_enabled, which is only intent --
+    # a pool can be enabled and never have reached a device.
+    device_push_status: str
+    device_push_error: str | None
+    device_pushed_at: datetime | None
     created_at: datetime
 
 

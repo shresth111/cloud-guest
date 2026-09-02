@@ -33,6 +33,8 @@ class DhcpRepositoryProtocol(Protocol):
 
     async def soft_delete_pool(self, pool: DhcpPool) -> DhcpPool: ...
 
+    async def commit(self) -> None: ...
+
     async def list_pools(
         self,
         *,
@@ -65,6 +67,19 @@ class DhcpRepository:
 
     async def update_pool(self, pool: DhcpPool, data: dict[str, object]) -> DhcpPool:
         return await self.pools.update(pool, data)
+
+    async def commit(self) -> None:
+        """Commits the current transaction.
+
+        Needed by ``DhcpService.push_pool_to_device`` and nothing else.
+        ``GenericRepository.update`` only ``flush()``es, and
+        ``get_db_session`` rolls the session back on any exception -- so a
+        failure record written just before a re-raise is discarded, and the
+        row still reads ``pending`` after a real device failure with
+        ``device_push_error`` NULL. Committing explicitly before raising is
+        what makes the record survive to be read.
+        """
+        await self.session.commit()
 
     async def soft_delete_pool(self, pool: DhcpPool) -> DhcpPool:
         return await self.pools.soft_delete(pool)

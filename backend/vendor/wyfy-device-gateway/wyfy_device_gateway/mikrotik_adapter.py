@@ -264,6 +264,20 @@ def _domain_subdomain_regex(domain: str) -> str:
     return f"^.*\\.{escaped}$"
 
 
+def _is_truthy(value: object) -> bool:
+    """RouterOS booleans, read back honestly.
+
+    The API answers a read with a real ``bool``, but accepts ``"no"``/
+    ``"yes"``/``"true"``/``"false"`` on write, and a fake or an older
+    firmware may hand back either shape. Comparing the raw value against a
+    string is how an idempotent write turns into an update issued on every
+    single push.
+    """
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "yes"}
+
+
 def _smallest_enclosing_network(
     start: str, end: str
 ) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
@@ -1148,35 +1162,122 @@ class MikroTikAdapter:
         self, creds: DeviceCredentials, pool: DhcpPoolConfig
     ) -> None:
         identifier = re.sub(r"[^A-Za-z0-9_-]", "-", pool.interface)
+        pool_name = f"{identifier}-pool"
+        server_name = f"{identifier}-dhcp"
         network = _smallest_enclosing_network(pool.range_start, pool.range_end)
         api = self._connect_api(creds)
         try:
             try:
-                api.path("ip", "pool").add(
-                    name=f"{identifier}-pool",
-                    ranges=f"{pool.range_start}-{pool.range_end}",
+                # Each of the three writes is guarded on its own existence
+                # check. All three were unconditional ``add`` calls, so the
+                # second push of an unchanged pool died on RouterOS's
+                # "already have such item" -- and re-pushing is an ordinary
+                # operation (an operator widens a range and saves again).
+                # Same fix, same reasoning as ``_ensure_ip_address`` above.
+                self._ensure_ip_pool(
+                    api, pool_name, f"{pool.range_start}-{pool.range_end}"
                 )
-                api.path("ip", "dhcp-server").add(
-                    name=f"{identifier}-dhcp",
+                self._ensure_dhcp_server(
+                    api,
+                    server_name,
                     interface=pool.interface,
-                    **{
-                        "address-pool": f"{identifier}-pool",
-                        "lease-time": f"{pool.lease_time_seconds}s",
-                    },
-                    disabled="no",
+                    address_pool=pool_name,
+                    lease_time=f"{pool.lease_time_seconds}s",
                 )
                 network_fields: dict[str, str] = {"address": str(network)}
                 if pool.gateway:
                     network_fields["gateway"] = pool.gateway
                 if pool.dns_servers:
                     network_fields["dns-server"] = ",".join(pool.dns_servers)
-                api.path("ip", "dhcp-server", "network").add(**network_fields)
+                self._ensure_dhcp_network(api, str(network), network_fields)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"configure_dhcp_pool: {exc}"
                 ) from exc
         finally:
             api.close()
+
+    def _ensure_ip_pool(self, api, name: str, ranges: str) -> None:
+        """Creates the address pool, or updates its ranges if a pool of that
+        name is already there.
+
+        Updating rather than skipping matters here in a way it does not for
+        an IP address: the range *is* the thing an operator edits, so a
+        re-push after widening a pool has to actually widen it on the
+        device. Skipping would report success and leave the old range.
+        """
+        for row in api.path("ip", "pool"):
+            if row.get("name") == name:
+                if row.get("ranges") != ranges:
+                    api.path("ip", "pool").update(**{".id": row[".id"], "ranges": ranges})
+                return
+        api.path("ip", "pool").add(name=name, ranges=ranges)
+
+    def _ensure_dhcp_server(
+        self,
+        api,
+        name: str,
+        *,
+        interface: str,
+        address_pool: str,
+        lease_time: str,
+    ) -> None:
+        """Creates the DHCP server, or brings an existing one of that name
+        into line with the requested interface/pool/lease-time."""
+        desired = {
+            "interface": interface,
+            "address-pool": address_pool,
+            "lease-time": lease_time,
+        }
+        for row in api.path("ip", "dhcp-server"):
+            if row.get("name") == name:
+                changed = {
+                    key: value
+                    for key, value in desired.items()
+                    if row.get(key) != value
+                }
+                # ``disabled`` is compared as a boolean, not a string.
+                # RouterOS accepts "no"/"false" on write and answers reads
+                # with a real bool, so a string comparison reports a
+                # difference on every single push and issues a pointless
+                # update forever.
+                if _is_truthy(row.get("disabled")):
+                    changed["disabled"] = "no"
+                if changed:
+                    api.path("ip", "dhcp-server").update(
+                        **{".id": row[".id"], **changed}
+                    )
+                return
+        api.path("ip", "dhcp-server").add(
+            name=name,
+            interface=interface,
+            **{"address-pool": address_pool, "lease-time": lease_time},
+            disabled="no",
+        )
+
+    def _ensure_dhcp_network(
+        self, api, address: str, fields: dict[str, str]
+    ) -> None:
+        """Creates the ``/ip dhcp-server network`` row for this subnet, or
+        updates the existing row for that exact address.
+
+        Keyed on ``address`` because that is what RouterOS itself treats as
+        the row's identity here -- adding a second row for the same subnet
+        is what produces "already have such item".
+        """
+        for row in api.path("ip", "dhcp-server", "network"):
+            if row.get("address") == address:
+                changed = {
+                    key: value
+                    for key, value in fields.items()
+                    if row.get(key) != value
+                }
+                if changed:
+                    api.path("ip", "dhcp-server", "network").update(
+                        **{".id": row[".id"], **changed}
+                    )
+                return
+        api.path("ip", "dhcp-server", "network").add(**fields)
 
     async def configure_port_forward(
         self, creds: DeviceCredentials, *, rule: PortForwardConfig

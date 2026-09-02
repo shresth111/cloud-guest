@@ -7,15 +7,25 @@ This module never resolves a router itself. ``RouterLookupProtocol``
 is the identical narrow, duck-typed Protocol composition-over-duplication
 pattern every domain in this codebase establishes.
 
-## No live device push in this pass
+## Live device push
 
-Unlike ``app.domains.isp``, this domain has no ``device_adapters.py`` and
-no Celery task -- it is a pure rules/inventory domain, mirroring
-``app.domains.isp_routing``/``app.domains.policy``'s own "priority/config +
-enable/disable, realized onto a device later" precedent. Real RouterOS
-VLAN interface + IP address provisioning belongs to the not-yet-built
-Network Configuration Management domain's own provisioning-integration
-layer, not this one. See ``docs/vlan/FLOW.md``.
+``push_vlan_to_device`` realizes a VLAN on its router over the RouterOS
+API, through ``device_adapters``. This paragraph used to say the opposite
+-- "no live device push in this pass ... this domain has no
+``device_adapters.py``" -- and stayed after the adapter was added, which
+is exactly the kind of stale claim that makes a docstring worse than
+none. Creation still writes only a row, deliberately: renaming a VLAN must
+not be able to fail with a connection error.
+
+**A pushed VLAN is not automatically a working VLAN.** ``/interface vlan``
+on a bridge only segments traffic when that bridge has
+``vlan-filtering=yes``; MikroTik's own documentation is explicit that with
+``vlan-filtering=no`` "the bridge ignores VLAN tags, works in a
+shared-VLAN-learning (SVL) mode, and cannot modify VLAN tags of packets".
+This domain creates the interface and its address and reports exactly
+that -- it does not turn on bridge VLAN filtering, which is a bridge-wide
+change that drops untagged frames on any port without a correct PVID and
+can lock an operator out of the router. See ``docs/vlan/FLOW.md``.
 
 ## Validation
 
@@ -77,6 +87,12 @@ class RouterLookupProtocol(Protocol):
         requesting_organization_id: uuid.UUID | None = None,
         include_deleted: bool = False,
     ) -> Router: ...
+
+    # Declared because the device-push path really calls it. It was
+    # previously left out, so this Protocol under-described what the
+    # service requires: a collaborator could satisfy the annotation and
+    # still blow up at runtime, and no type checker could see it coming.
+    def get_decrypted_api_secret(self, router: Router) -> str | None: ...
 
 
 class AuditLogWriter(Protocol):
