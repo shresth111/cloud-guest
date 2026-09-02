@@ -100,3 +100,121 @@ class InvalidGatewayIpAddressError(VlanError):
             f"Invalid gateway IP address: '{gateway_ip_address}'",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
+
+
+# ---------------------------------------------------------------------------
+# Device push
+#
+# Everything below is raised by ``VlanService.push_vlan_to_device``. They all
+# subclass ``CloudGuestError``, so the app-wide handler turns them into a
+# real non-2xx response.
+#
+# That matters more than it looks: the frontend's response interceptor
+# (``cloudguest-foundation/src/services/api.ts``) unwraps ``response.data.data``
+# and never reads ``envelope.success``. A handler that "reported failure
+# honestly" by returning ``200 {"success": false}`` would be indistinguishable
+# from success to every caller in the app -- the exact bug this domain is
+# being wired up to stop. Failure has to live in the status code.
+# ---------------------------------------------------------------------------
+
+
+class VlanNotEnabledError(VlanError):
+    """Asked to push a VLAN whose ``is_enabled`` is ``False``.
+
+    There is nothing correct to push: ``NetworkConfigService
+    ._gather_enabled_rows`` filters disabled rows out of the rendered
+    script, so device state created here would be state the script pipeline
+    never maintains.
+    """
+
+    def __init__(self, vlan_pk: uuid.UUID) -> None:
+        super().__init__(
+            f"VLAN '{vlan_pk}' is disabled and cannot be pushed to a device",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class VlanMissingInterfaceError(VlanError):
+    """Asked to push a VLAN with no parent/physical ``interface``.
+
+    ``Vlan.interface`` is nullable, and ``render_vlan`` handles that by
+    emitting a comment and skipping -- harmless in a script, but on a direct
+    push the same silence would report success while the device got nothing.
+    Rejected before a connection is opened.
+
+    This is not hypothetical: the one real VLAN row in production is
+    ``port_mode="access"`` with an empty ``interface``, which access mode
+    cannot realize -- there is no port to pull out of the bridge.
+    """
+
+    def __init__(self, vlan_pk: uuid.UUID) -> None:
+        super().__init__(
+            f"VLAN '{vlan_pk}' has no interface configured -- set the parent "
+            "trunk (or the dedicated access port) before pushing it",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class VlanHotspotPushUnsupportedError(VlanError):
+    """Asked to push a VLAN with ``enable_hotspot`` set.
+
+    The rendered script realizes that toggle as six further RouterOS
+    commands (pool, dhcp-server, dhcp-server network, hotspot profile, dns
+    static, hotspot server -- see ``renderers._render_vlan_hotspot``). The
+    device adapter implements none of them yet.
+
+    Rejected rather than partially applied: pushing the interface and
+    address while silently dropping the captive portal would report success
+    for a VLAN whose guests never see a portal, which is precisely the
+    failure shape this work exists to remove.
+    """
+
+    def __init__(self, vlan_pk: uuid.UUID) -> None:
+        super().__init__(
+            f"VLAN '{vlan_pk}' has a hotspot enabled, which this push does not "
+            "configure yet -- push the router's full configuration instead, or "
+            "disable the hotspot on this VLAN",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class VlanMissingCredentialsError(VlanError):
+    """The VLAN's router has no management IP / API username / decrypted
+    secret stored. Mirrors ``QosMissingCredentialsError``."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router '{router_id}' is missing device connection credentials "
+            "(management IP, API username, or API secret)",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class UnsupportedVlanVendorError(VlanError):
+    """No VLAN device adapter is registered for the router's vendor."""
+
+    def __init__(self, vendor: str) -> None:
+        super().__init__(
+            f"No VLAN device adapter is registered for vendor '{vendor}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class VlanDeviceConnectionError(VlanError):
+    """A real connection attempt (RouterOS API, port 8728) failed."""
+
+    def __init__(self, host: str, detail: str) -> None:
+        super().__init__(
+            f"Could not connect to device at '{host}': {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class VlanDeviceOperationError(VlanError):
+    """A device VLAN operation failed after a connection was established."""
+
+    def __init__(self, operation: str, detail: str) -> None:
+        super().__init__(
+            f"Device operation '{operation}' failed: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
