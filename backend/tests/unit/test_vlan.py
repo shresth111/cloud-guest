@@ -37,6 +37,7 @@ from app.domains.vlan.exceptions import (
     VlanDeviceOperationError,
     VlanIdAlreadyExistsError,
     VlanMissingInterfaceError,
+    VlanNatRequiresCidrError,
     VlanNotFoundError,
 )
 from app.domains.vlan.models import Vlan
@@ -254,6 +255,8 @@ async def _create_vlan(
     vlan_id: int = 100,
     interface: str | None = "bridge",
     port_mode: str = "trunk",
+    nat_enabled: bool = False,
+    cidr: str | None = "192.168.10.0/24",
 ) -> Vlan:
     return await h.service.create_vlan(
         actor_user_id=uuid.uuid4(),
@@ -262,9 +265,10 @@ async def _create_vlan(
         vlan_id=vlan_id,
         name="Guest VLAN",
         gateway_ip_address="192.168.10.1",
-        cidr="192.168.10.0/24",
+        cidr=cidr,
         interface=interface,
         port_mode=port_mode,
+        nat_enabled=nat_enabled,
     )
 
 
@@ -510,6 +514,9 @@ class FakeVlanAdapter:
     raises: Exception | None = None
     deletes: list[dict[str, object]] = field(default_factory=list)
     delete_raises: Exception | None = None
+    nat_calls: list[dict[str, object]] = field(default_factory=list)
+    nat_deletes: list[dict[str, object]] = field(default_factory=list)
+    nat_raises: Exception | None = None
 
     async def configure_vlan(
         self,
@@ -554,6 +561,18 @@ class FakeVlanAdapter:
         )
         if self.delete_raises is not None:
             raise self.delete_raises
+
+    async def configure_nat_masquerade(
+        self, credentials, *, vlan_id: int, src_cidr: str
+    ) -> None:
+        self.nat_calls.append(
+            {"host": credentials.host, "vlan_id": vlan_id, "src_cidr": src_cidr}
+        )
+        if self.nat_raises is not None:
+            raise self.nat_raises
+
+    async def delete_nat_masquerade(self, credentials, *, vlan_id: int) -> None:
+        self.nat_deletes.append({"host": credentials.host, "vlan_id": vlan_id})
 
 
 @pytest.fixture
@@ -652,6 +671,8 @@ class TestVlanDeleteReachesTheDevice:
             requesting_organization_id=router.organization_id,
         )
         adapter.calls.clear()
+        adapter.nat_calls.clear()
+        adapter.nat_deletes.clear()
         return vlan
 
     async def test_deleting_a_pushed_vlan_removes_it_from_the_router(
@@ -717,3 +738,249 @@ class TestVlanDeleteReachesTheDevice:
 
         assert vlan.is_deleted is False
         assert await h.repository.get_vlan_by_id(vlan.id) is not None
+
+
+class TestVlanNatIsPartOfThePush:
+    """NAT / Internet Access. Without the masquerade rule a pushed VLAN is
+    a complete *local* network and nothing more -- its guests get a lease,
+    a gateway, and no route off the router, with no error anywhere to say
+    so."""
+
+    async def test_nat_is_applied_with_the_vlans_own_subnet(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The source subnet is the VLAN's ``cidr`` -- the network, not the
+        ``_device_address`` gateway form the interface gets. Masquerading
+        ``192.168.10.1/24`` would name a host where a subnet belongs."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, nat_enabled=True)
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.nat_calls == [
+            {"host": "10.0.0.1", "vlan_id": 100, "src_cidr": "192.168.10.0/24"}
+        ]
+        assert adapter.nat_deletes == []
+
+    async def test_the_service_never_names_a_wan_interface(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Which port a site's uplink is in is not stored anywhere here.
+        The adapter is called with the VLAN and its subnet only, so the
+        vendor layer resolves the real WAN from the router itself."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, nat_enabled=True)
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert set(adapter.nat_calls[0]) == {"host", "vlan_id", "src_cidr"}
+
+    async def test_nat_disabled_removes_the_rule_rather_than_doing_nothing(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """This is what makes "turning NAT off removes the rule" true. A
+        no-op here would leave the last-pushed rule masquerading a network
+        the operator has since decided must not reach the internet -- and
+        the push would report success."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, nat_enabled=True)
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        adapter.nat_calls.clear()
+
+        await h.service.update_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            nat_enabled=False,
+        )
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.nat_calls == []
+        assert adapter.nat_deletes == [{"host": "10.0.0.1", "vlan_id": 100}]
+
+    async def test_a_vlan_that_never_wanted_nat_still_pushes_normally(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The removal is idempotent, so it is a harmless no-op on a VLAN
+        that never had a rule -- the VLAN itself still reaches the device."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.nat_calls == []
+        assert adapter.nat_deletes == [{"host": "10.0.0.1", "vlan_id": 100}]
+        assert len(adapter.calls) == 1
+        assert pushed.device_push_status == VlanDevicePushStatus.ACTIVE.value
+
+    async def test_nat_without_a_cidr_is_refused_before_connecting(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """NAT is a rule about a source subnet, and this row has none.
+        Skipping the NAT step instead would report a successful push for a
+        VLAN whose guests still have no internet."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, nat_enabled=True, cidr=None)
+
+        with pytest.raises(VlanNatRequiresCidrError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert adapter.calls == []
+        assert adapter.nat_calls == []
+
+    async def test_a_nat_failure_is_recorded_committed_and_re_raised(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The NAT step is inside the same failure-recording block as the
+        VLAN write: a push that put the interface up but could not give it
+        internet access is a failed push, not a successful one."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, nat_enabled=True)
+        adapter.nat_raises = VlanDeviceOperationError(
+            "configure_nat_masquerade", "could not determine the WAN interface"
+        )
+
+        with pytest.raises(VlanDeviceOperationError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert vlan.device_push_status == VlanDevicePushStatus.FAILED.value
+        assert "WAN interface" in (vlan.device_push_error or "")
+        assert h.repository.commits == 1
+
+    async def test_deleting_a_vlan_takes_its_nat_rule_off_the_router(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, nat_enabled=True)
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        adapter.nat_calls.clear()
+        adapter.nat_deletes.clear()
+
+        await h.service.delete_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.nat_deletes == [{"host": "10.0.0.1", "vlan_id": 100}]
+        assert len(adapter.deletes) == 1
+
+    async def test_teardown_removes_nat_even_when_the_flag_is_now_off(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """``nat_enabled`` is current intent; the rule on the device is
+        history. A VLAN pushed with NAT on and switched off without a
+        re-push still has its rule, and gating the teardown on the flag
+        would leave exactly that rule behind."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, nat_enabled=True)
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        vlan.nat_enabled = False
+        adapter.nat_deletes.clear()
+
+        await h.service.delete_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.nat_deletes == [{"host": "10.0.0.1", "vlan_id": 100}]
+
+    async def test_nat_comes_off_before_the_interface_it_references(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The exact reverse of the push order: the rule goes while the
+        interface it names is still there."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        order: list[str] = []
+        vlan = await _create_vlan(h, router, nat_enabled=True)
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        original_delete_nat = adapter.delete_nat_masquerade
+        original_delete_vlan = adapter.delete_vlan
+
+        async def _record_nat(*args: object, **kwargs: object) -> None:
+            order.append("nat")
+            await original_delete_nat(*args, **kwargs)
+
+        async def _record_vlan(*args: object, **kwargs: object) -> None:
+            order.append("vlan")
+            await original_delete_vlan(*args, **kwargs)
+
+        adapter.delete_nat_masquerade = _record_nat
+        adapter.delete_vlan = _record_vlan
+
+        await h.service.delete_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert order == ["nat", "vlan"]
+
+    async def test_a_vlan_that_never_reached_a_device_skips_nat_teardown_too(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Opening a connection to delete nothing would make every such
+        delete fail whenever a router happened to be unreachable."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, nat_enabled=True)
+
+        await h.service.delete_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.nat_deletes == []
+        assert adapter.deletes == []

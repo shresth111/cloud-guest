@@ -200,6 +200,57 @@ class UnsupportedVlanVendorError(VlanError):
         )
 
 
+class VlanNatRequiresCidrError(VlanError):
+    """Asked to push a VLAN with NAT enabled but no ``cidr``.
+
+    NAT is a rule about a *source subnet*: without one there is nothing to
+    masquerade. ``Vlan.cidr`` is nullable and a VLAN legitimately does not
+    need one (a tagged interface with no address is a real, valid thing to
+    create), so this is a combination the row can genuinely be in.
+
+    Rejected before a connection is opened, and rejected rather than
+    quietly skipping the NAT step: skipping would report a successful push
+    for a VLAN whose guests have no internet, which is the exact failure
+    shape this toggle exists to remove.
+
+    Deliberately not resolved by falling back to the router's WAN subnet
+    or to ``0.0.0.0/0``: a masquerade rule with a source address the
+    operator did not choose either NATs traffic that should not be NATed
+    or matches nothing.
+    """
+
+    def __init__(self, vlan_pk: uuid.UUID) -> None:
+        super().__init__(
+            f"VLAN '{vlan_pk}' has NAT enabled but no CIDR -- set the VLAN's "
+            "subnet before pushing it, or turn NAT off",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class VlanNatWanInterfaceUnresolvedError(VlanError):
+    """The router's own WAN-facing interface could not be determined, so
+    there is no honest interface to masquerade out of.
+
+    The interface is derived from the router's live default route (see
+    ``wyfy_device_gateway.mikrotik_adapter.resolve_wan_interface``) rather
+    than stored: nothing in this database knows which port a given site's
+    uplink is in, and a hardcoded ``"WAN"``/``"ether1"`` would be wrong at
+    the first site that names its ports differently.
+
+    A 502, alongside the other device errors, because it is a statement
+    about the device's current state -- no usable default route, or a
+    gateway on no known interface -- and not about the request. Usually it
+    means the router's own uplink is down, which is worth surfacing as
+    exactly that rather than as a NAT-specific failure.
+    """
+
+    def __init__(self, host: str, detail: str) -> None:
+        super().__init__(
+            f"Could not determine the WAN interface on device '{host}': {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
 class VlanDeviceConnectionError(VlanError):
     """A real connection attempt (RouterOS API, port 8728) failed."""
 

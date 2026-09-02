@@ -44,10 +44,11 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
-from wyfy_device_gateway.contract import DeviceVendor, VlanConfig
+from wyfy_device_gateway.contract import DeviceVendor, NatRuleConfig, VlanConfig
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikConnectionError,
     MikroTikDeviceError,
+    MikroTikWanInterfaceError,
 )
 from wyfy_device_gateway.registry import get_adapter
 
@@ -55,6 +56,7 @@ from .exceptions import (
     UnsupportedVlanVendorError,
     VlanDeviceConnectionError,
     VlanDeviceOperationError,
+    VlanNatWanInterfaceUnresolvedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,6 +135,39 @@ class BaseVlanAdapter(Protocol):
         """
         ...
 
+    async def configure_nat_masquerade(
+        self, credentials: VlanCredentials, *, vlan_id: int, src_cidr: str
+    ) -> None:
+        """Gives this VLAN's subnet real internet access.
+
+        ``configure_vlan`` builds a complete *local* network and stops
+        there: guests get a lease, a gateway, and no route off the router.
+        This is the source-NAT rule that closes that gap.
+
+        No WAN interface is passed in, deliberately. Which port a site's
+        uplink is in is not stored anywhere in this database and differs
+        per site, so the vendor adapter derives it from the router's own
+        live default route. Naming it here would mean this domain
+        inventing a value it cannot know.
+
+        Idempotent on the VLAN's identity rather than on ``src_cidr``:
+        re-subnetting a VLAN updates its existing rule instead of leaving
+        an orphan behind and adding a second one.
+        """
+        ...
+
+    async def delete_nat_masquerade(
+        self, credentials: VlanCredentials, *, vlan_id: int
+    ) -> None:
+        """Takes this VLAN's internet access back off the device.
+
+        Takes no ``src_cidr``: the rule is found by the VLAN's identity, so
+        a rule left over from an older subnet is still removed. Idempotent,
+        and needs no reachable WAN -- a VLAN must stay removable from a
+        router whose uplink is down.
+        """
+        ...
+
 
 class MikroTikVlanAdapter:
     """Real MikroTik implementation, delegating to the shared gateway."""
@@ -202,6 +237,52 @@ class MikroTikVlanAdapter:
             raise VlanDeviceConnectionError(credentials.host, exc.detail) from exc
         except MikroTikDeviceError as exc:
             raise VlanDeviceOperationError("delete_vlan", exc.detail) from exc
+
+    async def configure_nat_masquerade(
+        self, credentials: VlanCredentials, *, vlan_id: int, src_cidr: str
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        # out_interface is left None on purpose: that is what tells the
+        # gateway to resolve this router's real WAN from its own live
+        # default route. See NatRuleConfig's own docstring.
+        rule = NatRuleConfig(vlan_id=vlan_id, src_address=src_cidr)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).configure_nat_masquerade(
+                creds, rule=rule
+            )
+        # Both subclasses of MikroTikDeviceError, so both come first. The
+        # WAN one is separated because "this router is not telling us where
+        # the internet is" is a different, operator-fixable condition that
+        # reads as nonsense reported as a NAT write failure.
+        except MikroTikWanInterfaceError as exc:
+            raise VlanNatWanInterfaceUnresolvedError(
+                credentials.host, exc.detail
+            ) from exc
+        except MikroTikConnectionError as exc:
+            raise VlanDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise VlanDeviceOperationError(
+                "configure_nat_masquerade", exc.detail
+            ) from exc
+
+    async def delete_nat_masquerade(
+        self, credentials: VlanCredentials, *, vlan_id: int
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        # src_address is required by the shape but unread on the delete
+        # path, which matches on the VLAN's identity alone -- so the
+        # current subnet, whatever it is, cannot change what is removed.
+        rule = NatRuleConfig(vlan_id=vlan_id, src_address="")
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).delete_nat_masquerade(
+                creds, rule=rule
+            )
+        except MikroTikConnectionError as exc:
+            raise VlanDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise VlanDeviceOperationError(
+                "delete_nat_masquerade", exc.detail
+            ) from exc
 
 
 _VLAN_ADAPTERS: dict[str, BaseVlanAdapter] = {"mikrotik": MikroTikVlanAdapter()}

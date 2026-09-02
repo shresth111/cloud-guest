@@ -35,6 +35,7 @@ class VlanCreateRequest(BaseModel):
     interface: str | None = None
     port_mode: Literal["trunk", "access"] = "trunk"
     enable_hotspot: bool = False
+    nat_enabled: bool = False
     description: str | None = None
     is_enabled: bool = True
 
@@ -47,6 +48,7 @@ class VlanUpdateRequest(BaseModel):
     interface: str | None = None
     port_mode: Literal["trunk", "access"] | None = None
     enable_hotspot: bool | None = None
+    nat_enabled: bool | None = None
     description: str | None = None
     is_enabled: bool | None = None
 
@@ -63,6 +65,10 @@ class VlanResponse(BaseModel):
     interface: str | None
     port_mode: str
     enable_hotspot: bool
+    # Whether this VLAN's subnet is masqueraded onto the router's WAN --
+    # i.e. whether its guests actually reach the internet. Realized (or
+    # removed) by the device push, never by create/update alone.
+    nat_enabled: bool
     description: str | None
     is_enabled: bool
     # Whether this row has ever reached a real router, and what happened.

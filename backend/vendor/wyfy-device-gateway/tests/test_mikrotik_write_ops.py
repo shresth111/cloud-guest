@@ -9,8 +9,11 @@ from __future__ import annotations
 import pytest
 
 from tests.fake_write_transport import FakeRouterOSApi
-from wyfy_device_gateway.contract import DhcpPoolConfig, VlanConfig
-from wyfy_device_gateway.mikrotik_adapter import MikroTikAdapter
+from wyfy_device_gateway.contract import DhcpPoolConfig, NatRuleConfig, VlanConfig
+from wyfy_device_gateway.mikrotik_adapter import (
+    MikroTikAdapter,
+    MikroTikWanInterfaceError,
+)
 
 
 @pytest.mark.asyncio
@@ -519,3 +522,472 @@ async def test_deleting_one_pool_leaves_another_interfaces_pool_alone(
 
     remaining = [row["name"] for row in api.path("ip", "pool")]
     assert remaining == ["vlan400-pool"]
+
+
+# ============================================================================
+# NAT / internet access -- ``/ip firewall nat`` chain=srcnat action=masquerade.
+#
+# A VLAN with an address and a DHCP pool is a working *local* network and
+# nothing more: its guests get a lease, a gateway, and no route off the
+# router. These tests pin the three things that make the rule safe to push
+# repeatedly -- the values are derived rather than hardcoded, the rule is
+# found again by its comment, and disabling NAT (or deleting the VLAN)
+# genuinely takes it back off.
+# ============================================================================
+
+
+def _wan_menus(
+    overrides: dict[tuple[str, ...], list[dict[str, object]]] | None = None,
+) -> dict[tuple[str, ...], list[dict[str, object]]]:
+    """A router shaped like the lab unit: ether1 is the WAN, holding a
+    dynamic DHCP address, and is not a bridge port. Nothing in it is named
+    "WAN" -- the resolution has to come from the routing table."""
+    menus: dict[tuple[str, ...], list[dict[str, object]]] = {
+        ("interface",): [
+            {".id": "*1", "name": "ether1"},
+            {".id": "*2", "name": "ether2"},
+            {".id": "*3", "name": "bridge"},
+            {".id": "*4", "name": "vlan100"},
+        ],
+        ("ip", "route"): [
+            {
+                ".id": "*1",
+                "dst-address": "0.0.0.0/0",
+                "gateway": "192.168.1.1",
+                "dynamic": "true",
+                "active": "true",
+            }
+        ],
+        ("ip", "address"): [
+            {".id": "*1", "address": "192.168.1.100/24", "interface": "ether1"},
+            {".id": "*2", "address": "10.100.0.1/24", "interface": "vlan100"},
+        ],
+        ("ip", "dhcp-client"): [
+            {
+                ".id": "*1",
+                "interface": "ether1",
+                "gateway": "192.168.1.1",
+                "status": "bound",
+            }
+        ],
+    }
+    menus.update(overrides or {})
+    return menus
+
+
+def _nat_rule(vlan_id: int = 100, src: str = "10.100.0.0/24") -> NatRuleConfig:
+    return NatRuleConfig(vlan_id=vlan_id, src_address=src)
+
+
+@pytest.mark.asyncio
+async def test_nat_rule_is_built_from_the_vlan_and_the_routers_real_wan(
+    patch_connect, mikrotik_creds
+):
+    """Every value is derived: the subnet from the VLAN, the interface from
+    the router's own default route, the comment from the VLAN's id. The
+    literal "WAN" appears nowhere on this router and the rule still lands on
+    the right interface."""
+    api = FakeRouterOSApi(menus=_wan_menus())
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    assert api.add_calls == [
+        (
+            ("ip", "firewall", "nat"),
+            {
+                "chain": "srcnat",
+                "action": "masquerade",
+                "src-address": "10.100.0.0/24",
+                "out-interface": "ether1",
+                "comment": "WyfyGuest VLAN 100",
+                "disabled": "no",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_wan_follows_the_default_route_not_the_interface_ordering(
+    patch_connect, mikrotik_creds
+):
+    """ether1 being the uplink is a convention of one router, not a fact
+    about routers. Move the default route to ether5 and the rule has to
+    follow it."""
+    api = FakeRouterOSApi(
+        menus=_wan_menus(
+            {
+                ("interface",): [
+                    {".id": "*1", "name": "ether1"},
+                    {".id": "*2", "name": "ether5"},
+                    {".id": "*3", "name": "vlan100"},
+                ],
+                ("ip", "route"): [
+                    {
+                        ".id": "*1",
+                        "dst-address": "0.0.0.0/0",
+                        "gateway": "203.0.113.1",
+                        "dynamic": "false",
+                        "active": "true",
+                    }
+                ],
+                ("ip", "address"): [
+                    {".id": "*1", "address": "192.168.1.100/24", "interface": "ether1"},
+                    {".id": "*2", "address": "203.0.113.9/24", "interface": "ether5"},
+                ],
+                ("ip", "dhcp-client"): [],
+            }
+        )
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    assert api.add_calls[0][1]["out-interface"] == "ether5"
+
+
+@pytest.mark.asyncio
+async def test_a_route_naming_its_own_interface_is_believed_over_the_subnet_match(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS naming the egress interface outright is a stronger signal
+    than deriving it from which address holds the gateway."""
+    api = FakeRouterOSApi(
+        menus=_wan_menus(
+            {
+                ("ip", "route"): [
+                    {
+                        ".id": "*1",
+                        "dst-address": "0.0.0.0/0",
+                        "gateway": "192.168.1.1",
+                        "immediate-gw": "192.168.1.1%ether2",
+                        "dynamic": "true",
+                        "active": "true",
+                    }
+                ]
+            }
+        )
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    assert api.add_calls[0][1]["out-interface"] == "ether2"
+
+
+@pytest.mark.asyncio
+async def test_no_usable_default_route_raises_rather_than_guessing(
+    patch_connect, mikrotik_creds
+):
+    """A wrong out-interface does not fail loudly: it either masquerades
+    guest traffic onto an internal segment or matches nothing, and both
+    report success. Nothing may be written when the WAN is unknown."""
+    api = FakeRouterOSApi(
+        menus=_wan_menus(
+            {
+                ("ip", "route"): [
+                    {
+                        ".id": "*1",
+                        "dst-address": "0.0.0.0/0",
+                        "gateway": "192.168.1.1",
+                        "dynamic": "false",
+                        "active": "false",
+                    }
+                ]
+            }
+        )
+    )
+    patch_connect(api)
+
+    with pytest.raises(MikroTikWanInterfaceError):
+        await MikroTikAdapter().configure_nat_masquerade(
+            mikrotik_creds, rule=_nat_rule()
+        )
+
+    assert api.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_on_no_known_interface_raises(patch_connect, mikrotik_creds):
+    """The route is active, but nothing on this router holds an address in
+    the gateway's subnet -- so which interface it leaves by is genuinely
+    unknown."""
+    api = FakeRouterOSApi(
+        menus=_wan_menus(
+            {
+                ("ip", "address"): [
+                    {".id": "*1", "address": "10.100.0.1/24", "interface": "vlan100"}
+                ],
+                ("ip", "dhcp-client"): [],
+            }
+        )
+    )
+    patch_connect(api)
+
+    with pytest.raises(MikroTikWanInterfaceError):
+        await MikroTikAdapter().configure_nat_masquerade(
+            mikrotik_creds, rule=_nat_rule()
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_out_interface_must_still_exist(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(menus=_wan_menus())
+    patch_connect(api)
+
+    with pytest.raises(MikroTikWanInterfaceError):
+        await MikroTikAdapter().configure_nat_masquerade(
+            mikrotik_creds,
+            rule=NatRuleConfig(
+                vlan_id=100, src_address="10.100.0.0/24", out_interface="sfp-sfpplus1"
+            ),
+        )
+
+    assert api.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_re_pushing_unchanged_nat_is_a_no_op(patch_connect, mikrotik_creds):
+    """RouterOS answers a duplicate add with "already have such item", and
+    a second identical push is an ordinary thing to do."""
+    api = FakeRouterOSApi(menus=_wan_menus())
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+    first_adds = list(api.add_calls)
+
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    assert api.add_calls == first_adds
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_rule_read_back_with_a_real_bool_is_not_updated_forever(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS accepts ``disabled="no"`` on write and answers reads with a
+    real ``bool``. Comparing the raw value against the string is how an
+    idempotent write turns into an update issued on every single push."""
+    api = FakeRouterOSApi(
+        menus=_wan_menus(
+            {
+                ("ip", "firewall", "nat"): [
+                    {
+                        ".id": "*1",
+                        "chain": "srcnat",
+                        "action": "masquerade",
+                        "src-address": "10.100.0.0/24",
+                        "out-interface": "ether1",
+                        "comment": "WyfyGuest VLAN 100",
+                        "disabled": False,
+                    }
+                ]
+            }
+        )
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    assert api.add_calls == []
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_rule_is_re_enabled_by_a_re_push(
+    patch_connect, mikrotik_creds
+):
+    """A disabled rule provides no internet access, and a push is the
+    operator asking for it."""
+    api = FakeRouterOSApi(
+        menus=_wan_menus(
+            {
+                ("ip", "firewall", "nat"): [
+                    {
+                        ".id": "*1",
+                        "chain": "srcnat",
+                        "action": "masquerade",
+                        "src-address": "10.100.0.0/24",
+                        "out-interface": "ether1",
+                        "comment": "WyfyGuest VLAN 100",
+                        "disabled": True,
+                    }
+                ]
+            }
+        )
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    assert api.add_calls == []
+    assert api.update_calls == [
+        (("ip", "firewall", "nat"), {".id": "*1", "disabled": "no"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_changing_the_subnet_updates_the_rule_instead_of_adding_a_second(
+    patch_connect, mikrotik_creds
+):
+    """The whole reason the comment is the rule's identity. Keyed on
+    ``src-address``, this push would find no match, add a second rule, and
+    leave the first one masquerading a subnet nothing uses any more."""
+    api = FakeRouterOSApi(menus=_wan_menus())
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+    await adapter.configure_nat_masquerade(
+        mikrotik_creds, rule=_nat_rule(src="10.200.0.0/24")
+    )
+
+    assert len(api.add_calls) == 1
+    assert api.update_calls == [
+        (("ip", "firewall", "nat"), {".id": "*1", "src-address": "10.200.0.0/24"})
+    ]
+    rules = list(api.path("ip", "firewall", "nat"))
+    assert len(rules) == 1
+    assert rules[0]["src-address"] == "10.200.0.0/24"
+
+
+@pytest.mark.asyncio
+async def test_a_recabled_wan_updates_the_out_interface_in_place(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(menus=_wan_menus())
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    # The uplink moved to ether2; the router's own routing table says so.
+    api._menus[("ip", "address")][0]["interface"] = "ether2"
+    api._menus[("ip", "dhcp-client")][0]["interface"] = "ether2"
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    assert len(api.add_calls) == 1
+    assert api.update_calls == [
+        (("ip", "firewall", "nat"), {".id": "*1", "out-interface": "ether2"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_the_rule(patch_connect, mikrotik_creds):
+    api = FakeRouterOSApi(menus=_wan_menus())
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    await adapter.delete_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    assert list(api.path("ip", "firewall", "nat")) == []
+
+
+@pytest.mark.asyncio
+async def test_deleting_nat_twice_is_a_no_op(patch_connect, mikrotik_creds):
+    api = FakeRouterOSApi(menus=_wan_menus())
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+    await adapter.delete_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    await adapter.delete_nat_masquerade(mikrotik_creds, rule=_nat_rule())  # no raise
+
+    assert list(api.path("ip", "firewall", "nat")) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_finds_the_rule_after_the_subnet_changed(
+    patch_connect, mikrotik_creds
+):
+    """Teardown matches on the VLAN's identity, never on its current
+    subnet: a rule left from an older subnet is still this VLAN's rule, and
+    matching on the current one is exactly how it would be orphaned."""
+    api = FakeRouterOSApi(menus=_wan_menus())
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    await adapter.delete_nat_masquerade(
+        mikrotik_creds, rule=_nat_rule(src="10.222.0.0/24")
+    )
+
+    assert list(api.path("ip", "firewall", "nat")) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_does_not_need_a_reachable_wan(patch_connect, mikrotik_creds):
+    """A VLAN has to stay removable from a router whose uplink is down --
+    often exactly the state a router is in when its config is being torn
+    down."""
+    api = FakeRouterOSApi(menus=_wan_menus())
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+    api._menus[("ip", "route")] = []
+
+    await adapter.delete_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    assert list(api.path("ip", "firewall", "nat")) == []
+
+
+@pytest.mark.asyncio
+async def test_another_vlans_nat_rule_is_left_alone(patch_connect, mikrotik_creds):
+    """Two VLANs are two rules, and touching one must not disturb the
+    other -- on the write path or the teardown path."""
+    api = FakeRouterOSApi(menus=_wan_menus())
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+    await adapter.configure_nat_masquerade(
+        mikrotik_creds, rule=_nat_rule(vlan_id=200, src="10.200.0.0/24")
+    )
+    assert len(api.add_calls) == 2
+
+    # Re-pushing one is still a no-op with the other's rule sitting there.
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+    assert len(api.add_calls) == 2
+    assert api.update_calls == []
+
+    await adapter.delete_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    remaining = list(api.path("ip", "firewall", "nat"))
+    assert [row["comment"] for row in remaining] == ["WyfyGuest VLAN 200"]
+    assert remaining[0]["src-address"] == "10.200.0.0/24"
+
+
+@pytest.mark.asyncio
+async def test_nat_leaves_an_unrelated_port_forward_alone(
+    patch_connect, mikrotik_creds
+):
+    """``/ip firewall nat`` is a shared menu: the dstnat rules port
+    forwarding writes there are not ours to update or remove."""
+    api = FakeRouterOSApi(
+        menus=_wan_menus(
+            {
+                ("ip", "firewall", "nat"): [
+                    {
+                        ".id": "*1",
+                        "chain": "dstnat",
+                        "action": "dst-nat",
+                        "protocol": "tcp",
+                        "dst-port": "8080",
+                        "to-addresses": "10.100.0.50",
+                    }
+                ]
+            }
+        )
+    )
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+    await adapter.delete_nat_masquerade(mikrotik_creds, rule=_nat_rule())
+
+    remaining = list(api.path("ip", "firewall", "nat"))
+    assert len(remaining) == 1
+    assert remaining[0]["chain"] == "dstnat"

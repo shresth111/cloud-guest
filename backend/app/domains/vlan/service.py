@@ -17,6 +17,45 @@ is exactly the kind of stale claim that makes a docstring worse than
 none. Creation still writes only a row, deliberately: renaming a VLAN must
 not be able to fail with a connection error.
 
+## NAT / Internet Access
+
+``nat_enabled`` decides whether the push also realizes a source-NAT
+masquerade rule for the VLAN's own ``cidr`` on the router's real WAN
+interface. Without it a pushed VLAN is a complete *local* network and
+nothing more -- guests get a lease, a gateway, and no route off the
+router, with no error anywhere to say so.
+
+Both directions are part of the same push: NAT on applies the rule, NAT
+off removes it. That is what makes the toggle honest -- were the disabled
+case a no-op, turning NAT off would leave the last-pushed rule
+masquerading a network the operator has since decided must not reach the
+internet, and the push would report success.
+
+The WAN interface is never stored or assumed. It is derived from the
+router's own live default route by the vendor adapter
+(``mikrotik_adapter.resolve_wan_interface``), because nothing here knows
+which port a given site's uplink is in, and a hardcoded ``"WAN"``/
+``"ether1"`` would be wrong at the first site that names its ports
+differently. When the router's state does not identify one, the push
+fails with ``VlanNatWanInterfaceUnresolvedError`` rather than guessing.
+This is the same rule ``network_config.wan.renderers
+._uplink_discovery_statements`` applies device-side -- active default
+route, verified to be a real interface, degrade rather than guess --
+arrived at independently and worth keeping aligned.
+
+**This rule coexists with the router-wide one, and does not replace
+it.** ``network_config.renderers.render_guest_data_path`` ships a
+masquerade scoped by ``out-interface`` alone, marked
+``comment="cloudguest-nat-live"``, to every enrolled router. The two
+never touch: each finds its own rule by its own comment, so neither
+counts, re-points, or removes the other's. But the consequence is worth
+stating plainly -- **on a router carrying that rule, turning
+``nat_enabled`` off does not actually cut that VLAN off from the
+internet**, because the router-wide rule still NATs everything leaving
+the uplink. This push removes the VLAN's own rule and nothing else;
+removing the shared one would take a whole venue offline, which is not a
+per-VLAN toggle's decision to make.
+
 **A pushed VLAN is not automatically a working VLAN.** ``/interface vlan``
 on a bridge only segments traffic when that bridge has
 ``vlan-filtering=yes``; MikroTik's own documentation is explicit that with
@@ -57,6 +96,7 @@ from .exceptions import (
     VlanIdAlreadyExistsError,
     VlanMissingCredentialsError,
     VlanMissingInterfaceError,
+    VlanNatRequiresCidrError,
     VlanNotEnabledError,
     VlanNotFoundError,
 )
@@ -126,6 +166,7 @@ class VlanService:
         interface: str | None = None,
         port_mode: str = "trunk",
         enable_hotspot: bool = False,
+        nat_enabled: bool = False,
         description: str | None = None,
         is_enabled: bool = True,
     ) -> Vlan:
@@ -152,6 +193,7 @@ class VlanService:
             interface=interface,
             port_mode=port_mode,
             enable_hotspot=enable_hotspot,
+            nat_enabled=nat_enabled,
             description=description,
             is_enabled=is_enabled,
             # Written explicitly rather than left to the column default,
@@ -360,6 +402,11 @@ class VlanService:
             # dropping the portal would be a success message for a VLAN
             # whose guests never see one.
             raise VlanHotspotPushUnsupportedError(vlan.id)
+        if vlan.nat_enabled and not vlan.cidr:
+            # NAT is a rule about a source subnet, and this row has none.
+            # Skipping the NAT step instead would report a successful push
+            # for a VLAN whose guests still have no internet.
+            raise VlanNatRequiresCidrError(vlan.id)
 
         router = await self.router_lookup.get_router(
             vlan.router_id, requesting_organization_id=requesting_organization_id
@@ -376,6 +423,25 @@ class VlanService:
                 ip_cidr=self._device_address(vlan),
                 port_mode=vlan.port_mode,
             )
+            # NAT after the interface exists, so the push reads on the
+            # device in the order the config depends: a masquerade rule for
+            # a subnet no interface carries is a rule that matches nothing.
+            #
+            # The *disabled* case issues a delete rather than doing nothing,
+            # and that is what makes "turning NAT off removes the rule"
+            # true. Doing nothing would leave the last-pushed rule
+            # masquerading a network the operator has since decided must
+            # not reach the internet -- and this push would report success.
+            # The delete is idempotent, so on a VLAN that never had NAT it
+            # is a harmless no-op.
+            if vlan.nat_enabled:
+                await adapter.configure_nat_masquerade(
+                    credentials, vlan_id=vlan.vlan_id, src_cidr=vlan.cidr
+                )
+            else:
+                await adapter.delete_nat_masquerade(
+                    credentials, vlan_id=vlan.vlan_id
+                )
         except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
             await self.repository.update_vlan(
                 vlan,
@@ -435,6 +501,16 @@ class VlanService:
         )
         credentials = self._resolve_device_credentials(router)
         adapter = get_vlan_adapter(router.vendor)
+        # The exact reverse of the push order: NAT comes off first, while
+        # the interface it references is still there, then the interface.
+        #
+        # Unconditional, not gated on ``nat_enabled``. The flag is current
+        # intent; the rule on the device is history. A VLAN pushed with NAT
+        # on and later switched off without a re-push still has its rule,
+        # and reading the flag would leave exactly that rule behind on a
+        # subnet that no longer exists. Removing what is already absent is
+        # a no-op.
+        await adapter.delete_nat_masquerade(credentials, vlan_id=vlan.vlan_id)
         await adapter.delete_vlan(
             credentials,
             vlan_id=vlan.vlan_id,
