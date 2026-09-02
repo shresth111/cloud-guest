@@ -91,6 +91,7 @@ from app.core.logging import get_logger
 from app.database.utils.pagination import PaginationMeta
 from app.domains.monitored_hardware.constants import HardwareStatus
 from app.domains.monitored_hardware.service import MonitoredHardwareService
+from app.domains.organization.exceptions import CrossOrganizationAccessError
 from app.domains.otp.service import (
     EmailProviderProtocol,
     LoggingEmailProvider,
@@ -1327,10 +1328,37 @@ class AlertService:
     # Alert lifecycle
     # ------------------------------------------------------------------
 
-    async def get_alert(self, alert_id: uuid.UUID) -> Alert:
+    async def get_alert(
+        self,
+        alert_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> Alert:
+        """``requesting_organization_id`` is the tenant guard, and every
+        caller that can reach a route should pass it.
+
+        ``RequirePermission`` resolves its scope from the
+        ``X-Organization-Id`` header while this reads by path id, so without
+        the comparison the check and the read name different organizations:
+        a venue owner holding ``alerts.read`` on their own organization could
+        read -- and via acknowledge/resolve below, *mutate* -- any tenant's
+        alert by putting a foreign UUID in the URL.
+
+        ``None`` means a platform-level caller with no organization context
+        and is deliberately unrestricted, matching every other guard in this
+        codebase. There is no MSP-parent carve-out here: unlike the
+        organization-path guard, an alert names its own organization
+        directly, and no customer surface has ever needed a parent to reach a
+        child's alerts. Widen it deliberately if that changes.
+        """
         alert = await self.repository.get_alert(alert_id)
         if alert is None:
             raise AlertNotFoundError(alert_id)
+        if (
+            requesting_organization_id is not None
+            and alert.organization_id != requesting_organization_id
+        ):
+            raise CrossOrganizationAccessError()
         return alert
 
     async def list_alerts(
@@ -1382,9 +1410,15 @@ class AlertService:
         return {r.id: r.name for r in routers}
 
     async def acknowledge_alert(
-        self, alert_id: uuid.UUID, *, user_id: uuid.UUID
+        self,
+        alert_id: uuid.UUID,
+        *,
+        user_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None = None,
     ) -> Alert:
-        alert = await self.get_alert(alert_id)
+        alert = await self.get_alert(
+            alert_id, requesting_organization_id=requesting_organization_id
+        )
         validate_alert_status_transition(
             AlertStatus(alert.status), AlertStatus.ACKNOWLEDGED
         )
@@ -1400,8 +1434,15 @@ class AlertService:
         logger.info("alert_acknowledged", extra=_event_extra(event))
         return updated
 
-    async def resolve_alert(self, alert_id: uuid.UUID) -> Alert:
-        alert = await self.get_alert(alert_id)
+    async def resolve_alert(
+        self,
+        alert_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> Alert:
+        alert = await self.get_alert(
+            alert_id, requesting_organization_id=requesting_organization_id
+        )
         validate_alert_status_transition(
             AlertStatus(alert.status), AlertStatus.RESOLVED
         )

@@ -711,9 +711,12 @@ async def list_alerts(
 async def get_alert(
     request: Request,
     alert_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
-    alert = await service.get_alert(alert_id)
+    alert = await service.get_alert(
+        alert_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Alert retrieved",
@@ -732,9 +735,14 @@ async def acknowledge_alert(
     request: Request,
     alert_id: uuid.UUID,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
-    alert = await service.acknowledge_alert(alert_id, user_id=uuid.UUID(user.id))
+    alert = await service.acknowledge_alert(
+        alert_id,
+        user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message="Alert acknowledged",
@@ -752,9 +760,12 @@ async def acknowledge_alert(
 async def resolve_alert(
     request: Request,
     alert_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: AlertService = Depends(get_alert_service),
 ):
-    alert = await service.resolve_alert(alert_id)
+    alert = await service.resolve_alert(
+        alert_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="Alert resolved",
