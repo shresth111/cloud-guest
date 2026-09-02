@@ -425,10 +425,23 @@ async def list_admin_authentication_logs(
     )
 
 
+# GLOBAL scope, for the same reason as the listing endpoint above -- and this
+# one is the more dangerous of the pair.
+#
+# It was missed when that fix landed: the listing 40 lines up was gated and its
+# CSV sibling was not, so the exact data the gate exists to protect stayed
+# available in bulk, as a file. ``LoginAttempt`` has no ``organization_id``, so
+# this returns every platform admin's and every other tenant's login emails, IP
+# addresses and failure reasons -- and ``audit_logs.export`` is held by
+# Organization Owners at ORGANIZATION scope, so any customer could call it.
+#
+# The tenant-scoped equivalent is ``GET /admin-logs/dashboard-logins``.
 @router.get(
     "/authentication/admin/export",
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("audit_logs.export"))],
+    dependencies=[
+        Depends(RequirePermission("audit_logs.export", scope=ScopeType.GLOBAL))
+    ],
 )
 async def export_admin_authentication_logs(
     service: ControllerLogsService = Depends(get_controller_logs_service),
