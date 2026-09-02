@@ -12,8 +12,10 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.domains.auth.models import AuthUser
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
+    CurrentUser,
     RequirePermission,
 )
 
@@ -60,6 +62,22 @@ async def list_live_sessions(
     )
 
 
+# The four session actions below now thread the caller's identity and
+# organization into the guest domain.
+#
+# Previously they passed only ``session_id``, positionally, into keyword-only
+# signatures -- so every call raised ``TypeError``, the service swallowed it,
+# and this handler wrapped the result in a hardcoded ``success=True``
+# envelope. An operator disconnecting an abusive guest got a clean success
+# message and the guest stayed online.
+#
+# There is no try/except here now, deliberately. ``GuestService`` raises
+# typed ``CloudGuestError``s carrying their own status codes, and the
+# app-wide handler turns them into real non-2xx responses. A
+# ``200 {"success": false}`` would be invisible: the frontend interceptor
+# unwraps ``data`` and never reads ``success``.
+
+
 @router.post(
     "/sessions/{session_id}/disconnect",
     response_model=ApiResponse[SessionActionResponse],
@@ -69,9 +87,15 @@ async def list_live_sessions(
 async def disconnect_session(
     request: Request,
     session_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: LiveSessionService = Depends(get_live_session_service),
 ):
-    payload = await service.disconnect_session(session_id)
+    payload = await service.disconnect_session(
+        session_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message=payload.message,
@@ -89,9 +113,15 @@ async def disconnect_session(
 async def pause_session(
     request: Request,
     session_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: LiveSessionService = Depends(get_live_session_service),
 ):
-    payload = await service.pause_session(session_id)
+    payload = await service.pause_session(
+        session_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message=payload.message,
@@ -109,9 +139,15 @@ async def pause_session(
 async def resume_session(
     request: Request,
     session_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: LiveSessionService = Depends(get_live_session_service),
 ):
-    payload = await service.resume_session(session_id)
+    payload = await service.resume_session(
+        session_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message=payload.message,
@@ -130,9 +166,16 @@ async def extend_session(
     request: Request,
     session_id: uuid.UUID,
     minutes: int = Query(default=30, ge=1, le=1440),
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: LiveSessionService = Depends(get_live_session_service),
 ):
-    payload = await service.extend_session(session_id, minutes=minutes)
+    payload = await service.extend_session(
+        session_id,
+        minutes=minutes,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message=payload.message,

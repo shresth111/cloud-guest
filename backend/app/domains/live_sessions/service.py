@@ -91,68 +91,106 @@ class LiveSessionService:
             page_size=page_size,
         )
 
-    async def disconnect_session(self, session_id: uuid.UUID) -> SessionActionResponse:
-        try:
-            await self.guest_service.disconnect_session(session_id)
-            return SessionActionResponse(
-                session_id=str(session_id),
-                action="disconnect",
-                message="Session disconnected",
-            )
-        except Exception as exc:
-            return SessionActionResponse(
-                session_id=str(session_id),
-                action="disconnect",
-                success=False,
-                message=str(exc),
-            )
+    # -- session actions -----------------------------------------------------
+    #
+    # All four of these were broken in the same three ways, and the
+    # combination made them report success while doing nothing:
+    #
+    # 1. They called ``GuestService``'s methods **positionally**, but every
+    #    one of those signatures is keyword-only (``async def
+    #    disconnect_session(self, *, session_id, ...)``). Every call raised
+    #    ``TypeError`` before reaching any logic.
+    # 2. A bare ``except Exception`` swallowed that ``TypeError`` into a
+    #    ``SessionActionResponse(success=False, message=str(exc))`` -- so the
+    #    Python error text became the user-facing message.
+    # 3. The router then wrapped that in a hardcoded ``success=True``
+    #    envelope and returned 200, and the frontend interceptor never reads
+    #    ``envelope.success`` -- so the UI showed a clean success.
+    #
+    # This is the control an operator reaches for during abuse, a compromised
+    # device, or a lawful request. It was dead at every layer, and every
+    # layer said it worked.
+    #
+    # The fix is to call correctly, thread the caller's identity and
+    # organization through for scoping and audit, and let failures raise.
+    # ``GuestService`` already raises typed ``CloudGuestError``s carrying
+    # their own status codes; the app-wide handler turns them into real
+    # non-2xx responses. Nothing here catches them any more.
 
-    async def pause_session(self, session_id: uuid.UUID) -> SessionActionResponse:
-        try:
-            await self.guest_service.pause_session(session_id)
-            return SessionActionResponse(
-                session_id=str(session_id),
-                action="pause",
-                message="Session paused",
-            )
-        except Exception as exc:
-            return SessionActionResponse(
-                session_id=str(session_id),
-                action="pause",
-                success=False,
-                message=str(exc),
-            )
+    async def disconnect_session(
+        self,
+        session_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+        requesting_organization_id: uuid.UUID | None = None,
+        reason: str | None = None,
+    ) -> SessionActionResponse:
+        await self.guest_service.disconnect_session(
+            session_id=session_id,
+            actor_user_id=actor_user_id,
+            requesting_organization_id=requesting_organization_id,
+            reason=reason,
+        )
+        return SessionActionResponse(
+            session_id=str(session_id),
+            action="disconnect",
+            message="Session disconnected",
+        )
 
-    async def resume_session(self, session_id: uuid.UUID) -> SessionActionResponse:
-        try:
-            await self.guest_service.resume_session(session_id)
-            return SessionActionResponse(
-                session_id=str(session_id),
-                action="resume",
-                message="Session resumed",
-            )
-        except Exception as exc:
-            return SessionActionResponse(
-                session_id=str(session_id),
-                action="resume",
-                success=False,
-                message=str(exc),
-            )
+    async def pause_session(
+        self,
+        session_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+        requesting_organization_id: uuid.UUID | None = None,
+        reason: str | None = None,
+    ) -> SessionActionResponse:
+        await self.guest_service.pause_session(
+            session_id=session_id,
+            actor_user_id=actor_user_id,
+            requesting_organization_id=requesting_organization_id,
+            reason=reason,
+        )
+        return SessionActionResponse(
+            session_id=str(session_id),
+            action="pause",
+            message="Session paused",
+        )
+
+    async def resume_session(
+        self,
+        session_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> SessionActionResponse:
+        await self.guest_service.resume_session(
+            session_id=session_id,
+            actor_user_id=actor_user_id,
+            requesting_organization_id=requesting_organization_id,
+        )
+        return SessionActionResponse(
+            session_id=str(session_id),
+            action="resume",
+            message="Session resumed",
+        )
 
     async def extend_session(
-        self, session_id: uuid.UUID, minutes: int = 30
+        self,
+        session_id: uuid.UUID,
+        minutes: int = 30,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+        requesting_organization_id: uuid.UUID | None = None,
     ) -> SessionActionResponse:
-        try:
-            await self.guest_service.extend_session(session_id, extra_minutes=minutes)
-            return SessionActionResponse(
-                session_id=str(session_id),
-                action="extend",
-                message=f"Session extended by {minutes} minutes",
-            )
-        except Exception as exc:
-            return SessionActionResponse(
-                session_id=str(session_id),
-                action="extend",
-                success=False,
-                message=str(exc),
-            )
+        await self.guest_service.extend_session(
+            session_id=session_id,
+            additional_minutes=minutes,
+            actor_user_id=actor_user_id,
+            requesting_organization_id=requesting_organization_id,
+        )
+        return SessionActionResponse(
+            session_id=str(session_id),
+            action="extend",
+            message=f"Session extended by {minutes} minutes",
+        )
