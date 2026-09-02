@@ -521,13 +521,48 @@ class RadiusNasResponse(BaseModel):
 
 
 class RadiusNasCreatedResponse(RadiusNasResponse):
-    """Returned only from ``POST /radius/nas`` and
-    ``POST /radius/nas/{id}/regenerate-secret`` -- the one and only moment
-    the plaintext shared secret is ever exposed (see ``service.py``'s
+    """Returned only from ``POST /radius/nas``,
+    ``POST /radius/nas/register-external/{router_id}`` and
+    ``POST /platform/radius/nas/{id}/regenerate-secret`` -- the one and only
+    moment the plaintext shared secret is ever exposed (see ``service.py``'s
     ``RadiusNasRegistrationResult``/``RadiusNasSecretRegenerationResult``
     docstrings)."""
 
     shared_secret: str
+
+
+# The device half of a rotation, stated rather than implied.
+#
+# A rotate touches two of the three places that must agree -- the database
+# row and the hub's ``client{}`` stanza -- and cannot touch the third. The
+# platform has no write path to a RouterOS RADIUS client at all; the chunk
+# is pasted in by hand over WinBox. So a 200 from the rotate endpoint means
+# "the venue's guest WiFi is down *right now*, and stays down until someone
+# pastes this secret onto the router", which is very nearly the opposite of
+# what a bare success reads as.
+#
+# Carried as data rather than left to the message string because both
+# consoles need to render it as a blocking instruction, not a toast, and a
+# field is the only version of that a client cannot fail to notice.
+NAS_SECRET_ROTATION_DEVICE_ACTION = (
+    "Guest WiFi at this venue is DOWN until this secret is written onto the "
+    "router. The platform cannot do that -- open the router in WinBox and "
+    "re-paste the RADIUS client configuration with the secret above. Until "
+    "then every guest login will be rejected."
+)
+
+
+class RadiusNasSecretRotatedResponse(RadiusNasCreatedResponse):
+    """``POST /platform/radius/nas/{id}/regenerate-secret``'s response.
+
+    ``hub_client_synced_ip``/``hub_client_synced_at`` (inherited) are the
+    proof the hub half actually happened -- they are written only after the
+    bridge returned 2xx, so a rotate that reaches this schema at all has a
+    hub holding the same secret the ``shared_secret`` field shows.
+    """
+
+    device_action_required: bool = True
+    device_action: str = NAS_SECRET_ROTATION_DEVICE_ACTION
 
 
 class RadiusNasListResponse(BaseModel):
