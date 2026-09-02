@@ -1688,6 +1688,7 @@ def test_endpoint_requires_expected_permission_key(
 @dataclass
 class _FakeAlertRow:
     organization_id: uuid.UUID
+    location_id: uuid.UUID | None = None
 
 
 @dataclass
@@ -1709,7 +1710,14 @@ class _RecordingPaginator:
     async def paginate(self, *, page, page_size, filters, sort_by, sort_order):
         self.last_filters = filters
         org = filters.get("organization_id")
-        selected = [r for r in self._rows if org is None or r.organization_id == org]
+        loc = filters.get("location_id")
+        selected = [
+            r
+            for r in self._rows
+            if (org is None or r.organization_id == org)
+            # Mirrors apply_filters: a None filter contributes no WHERE clause.
+            and (loc is None or r.location_id == loc)
+        ]
         return selected, _FakePaginateMeta(total_items=len(selected))
 
 
@@ -1966,3 +1974,46 @@ def test_platform_dashboards_resolve_org_from_auth_scope_not_query_param(
 
     dependency_calls = {dep.call for dep in dependant.dependencies}
     assert CurrentOrganization in dependency_calls
+
+
+async def test_list_alerts_filters_by_location_server_side():
+    """A venue's alerts must be selectable by location in the query, not by
+    over-fetching the organization and narrowing client-side.
+
+    The customer dashboard's Monitoring tab did the latter: it asked for the
+    org's first 100 alerts and filtered on `a.locationId === locationId`, so a
+    location whose alerts fell past that page reported "Open alerts 0", and
+    browsing N locations issued N byte-identical org-wide requests.
+    """
+    org = uuid.uuid4()
+    venue_a, venue_b = uuid.uuid4(), uuid.uuid4()
+    rows = [
+        _FakeAlertRow(org, venue_a),
+        _FakeAlertRow(org, venue_b),
+        _FakeAlertRow(org, venue_b),
+        _FakeAlertRow(org, None),
+    ]
+    repo = _repo_with_alert_rows(rows)
+    service = AlertService(repo)
+
+    items, meta = await service.list_alerts(organization_id=org, location_id=venue_b)
+
+    assert len(items) == 2
+    assert all(row.location_id == venue_b for row in items)
+    # total_items must reflect the filtered set, so the tile shows the venue's
+    # real count rather than the organization's.
+    assert meta.total_items == 2
+    assert repo.alerts.last_filters["location_id"] == venue_b  # type: ignore[union-attr]
+
+
+async def test_list_alerts_without_location_still_returns_the_whole_org():
+    """The new filter is additive -- omitting it must not narrow anything."""
+    org = uuid.uuid4()
+    rows = [_FakeAlertRow(org, uuid.uuid4()), _FakeAlertRow(org, None)]
+    repo = _repo_with_alert_rows(rows)
+    service = AlertService(repo)
+
+    items, _meta = await service.list_alerts(organization_id=org)
+
+    assert len(items) == 2
+    assert repo.alerts.last_filters["location_id"] is None  # type: ignore[union-attr]

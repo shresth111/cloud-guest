@@ -1341,6 +1341,7 @@ class AlertService:
         status: str | None = None,
         severity: str | None = None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         page: int = DEFAULT_LIST_PAGE,
         page_size: int = DEFAULT_LIST_PAGE_SIZE,
     ) -> tuple[list[Alert], PaginationMeta]:
@@ -1350,6 +1351,7 @@ class AlertService:
             status=status,
             severity=severity,
             router_id=router_id,
+            location_id=location_id,
             page=page,
             page_size=page_size,
         )
