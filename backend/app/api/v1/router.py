@@ -32,6 +32,7 @@ from app.domains.guest.router import admin_router as guest_admin_router
 from app.domains.guest.router import analytics_router as guest_analytics_router
 from app.domains.guest.router import guest_router
 from app.domains.guest.router import nas_cross_reference_router as guest_nas_xref_router
+from app.domains.guest.router import nas_platform_router as guest_nas_platform_router
 from app.domains.guest.router import nas_router as guest_nas_router
 from app.domains.guest.router import radius_router as guest_radius_router
 from app.domains.guest_access.router import router as guest_access_router
@@ -92,6 +93,7 @@ api_v1_router.include_router(guest_admin_router)
 api_v1_router.include_router(guest_radius_router)
 api_v1_router.include_router(guest_nas_router)
 api_v1_router.include_router(guest_nas_xref_router)
+api_v1_router.include_router(guest_nas_platform_router)
 api_v1_router.include_router(guest_analytics_router)
 api_v1_router.include_router(guest_access_router)
 api_v1_router.include_router(guest_teams_guest_router)
