@@ -74,7 +74,11 @@ from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 
-from .constants import PRIVACY_POLICY_LABEL, TERMS_AND_CONDITIONS_LABEL
+from .constants import (
+    DEFAULT_PORTAL_CONTENT_MODE,
+    PRIVACY_POLICY_LABEL,
+    TERMS_AND_CONDITIONS_LABEL,
+)
 from .events import (
     CaptivePortalConfigActivated,
     CaptivePortalConfigCreated,
@@ -90,6 +94,7 @@ from .exceptions import (
     MissingPortalResolutionParamsError,
     PoweredByAttributionNotEntitledError,
 )
+from .html_sanitizer import sanitize_post_login_html
 from .models import CaptivePortalConfig
 from .repository import CaptivePortalRepositoryProtocol
 from .validators import (
@@ -98,6 +103,7 @@ from .validators import (
     validate_background_overlay_strength,
     validate_business_hours_schedule,
     validate_business_hours_timezone,
+    validate_content_mode,
     validate_default_scope,
     validate_guest_font_choice,
     validate_hex_color,
@@ -427,6 +433,12 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "splash_headline",
     "splash_welcome_message",
     "redirect_url",
+    "post_login_html",
+    "content_mode",
+    "content_heading",
+    "content_body",
+    "content_image_url",
+    "content_survey",
     "otp_sms_enabled",
     "otp_email_enabled",
     "otp_whatsapp_enabled",
@@ -481,6 +493,12 @@ class _CachedCaptivePortalConfig:
     splash_headline: str | None
     splash_welcome_message: str | None
     redirect_url: str | None
+    post_login_html: str | None
+    content_mode: str
+    content_heading: str | None
+    content_body: str | None
+    content_image_url: str | None
+    content_survey: dict[str, Any] | None
     otp_sms_enabled: bool
     otp_email_enabled: bool
     otp_whatsapp_enabled: bool
@@ -666,6 +684,23 @@ class CaptivePortalService:
         # own tests, never pass it. True is also the only default that
         # cannot leak revenue -- see the column's own docstring.
         powered_by_enabled: bool = True,
+        # Content mode + its per-mode source columns. All default to the
+        # existing sign-in-only behaviour / empty content for the same reason
+        # pin_login_enabled/powered_by_enabled default above: the smart-
+        # location provisioning flow and this domain's tests never pass them,
+        # and "login" is the only value that leaves a brand-new config
+        # rendering exactly as every config does today.
+        content_mode: str = DEFAULT_PORTAL_CONTENT_MODE.value,
+        content_heading: str | None = None,
+        content_body: str | None = None,
+        content_image_url: str | None = None,
+        content_survey: dict | None = None,
+        # The venue's own post-sign-in page. Defaults None for the same
+        # reason the content_* parameters above do -- the smart-location
+        # provisioning flow and this domain's tests never pass it -- and
+        # None is also the value that means "unchanged": a config created
+        # without one behaves exactly as every config does today.
+        post_login_html: str | None = None,
     ) -> CaptivePortalConfig:
         validate_hex_color(primary_color, field_name="primary_color")
         validate_hex_color(secondary_color, field_name="secondary_color")
@@ -684,6 +719,16 @@ class CaptivePortalService:
         # conditional there.
         validate_splash_text_length("splash_headline", splash_headline)
         validate_splash_text_length("splash_welcome_message", splash_welcome_message)
+        validate_content_mode(content_mode)
+        # Sanitize here, not at the schema layer and not on read. The value
+        # bound to `post_login_html` from this point on is the *stored*
+        # value, which is what makes the response the caller gets back the
+        # sanitized bytes rather than what they submitted -- a dashboard
+        # editor that re-renders from the response therefore shows the
+        # venue exactly what was kept. Raises PostLoginHtmlTooLargeError
+        # (400) before any DB work if the submitted payload is over the
+        # byte ceiling.
+        post_login_html = sanitize_post_login_html(post_login_html)
 
         organization = await self.organization_lookup.get_organization(organization_id)
         if (
@@ -727,6 +772,12 @@ class CaptivePortalService:
             splash_headline=splash_headline,
             splash_welcome_message=splash_welcome_message,
             redirect_url=redirect_url,
+            post_login_html=post_login_html,
+            content_mode=content_mode,
+            content_heading=content_heading,
+            content_body=content_body,
+            content_image_url=content_image_url,
+            content_survey=content_survey,
             otp_sms_enabled=otp_sms_enabled,
             otp_email_enabled=otp_email_enabled,
             otp_whatsapp_enabled=otp_whatsapp_enabled,
@@ -841,6 +892,8 @@ class CaptivePortalService:
             )
         if "guest_font_choice" in update_data:
             validate_guest_font_choice(str(update_data["guest_font_choice"]))
+        if "content_mode" in update_data:
+            validate_content_mode(str(update_data["content_mode"]))
         if "background_overlay_strength" in update_data:
             validate_background_overlay_strength(
                 update_data["background_overlay_strength"]
@@ -876,6 +929,20 @@ class CaptivePortalService:
             if not _splash_text_changed(incoming, getattr(config, splash_field)):
                 continue
             validate_splash_text_length(splash_field, incoming)
+
+        # Sanitized only when the key is actually present, so a PUT that
+        # never mentions the field cannot rewrite a stored page -- and
+        # `update_data` itself is mutated rather than a local, because what
+        # goes to the repository has to be the sanitized bytes and the
+        # response is built from the row that comes back. Unlike the splash
+        # ceilings above there is no grandfathering clause: no row can
+        # predate this column, so there is no legacy value to protect, and
+        # unsanitized HTML is not something to grandfather in any case.
+        if "post_login_html" in update_data:
+            submitted = update_data["post_login_html"]
+            update_data["post_login_html"] = sanitize_post_login_html(
+                submitted if submitted is None else str(submitted)
+            )
 
         if "powered_by_enabled" in update_data:
             await self._enforce_powered_by_entitlement(

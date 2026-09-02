@@ -56,6 +56,42 @@ class GuestFontChoice(StrEnum):
     BOLD_DISPLAY = "bold-display"
 
 
+class PortalContentMode(StrEnum):
+    """What the guest-facing captive portal presents as its primary content
+    before (or instead of) the sign-in form. Stored as a plain ``String``
+    column for the same additive-migration reason ``PortalTheme`` is (see
+    this module's header) -- adding a mode never needs an ``ALTER TYPE``.
+
+    ``LOGIN`` is the default and is the *existing*, unchanged behaviour: the
+    portal renders only the sign-in card, exactly as every venue does today.
+    Making it the default (and the value migration 0098 backfills every
+    existing row to) is what keeps this whole feature a pure addition -- no
+    venue's rendered portal changes until an admin deliberately picks a
+    different mode. The other four are the demo-showcased content modes, each
+    rendered by ``PortalContentBlock`` on the frontend and sourced from a
+    dedicated column:
+
+    * ``IMAGE`` -- a full-bleed content image (``content_image_url``), e.g. a
+      promo, menu board, or event card, shown above the connect action.
+    * ``TEXT`` -- a venue-authored text block (``content_heading`` +
+      ``content_body``), e.g. house rules or a welcome note.
+    * ``REDIRECT`` -- the portal sends the guest straight to ``redirect_url``
+      (the pre-existing post-login destination column, reused here rather
+      than a parallel field). Rendered as the existing ``/portal/redirect``
+      countdown screen.
+    * ``SURVEY`` -- a short guest survey (``content_survey`` JSON) shown
+      before connect, e.g. a satisfaction rating or a single choice question.
+
+    This module stores the *selection* and its content; it renders nothing --
+    the frontend owns every mode's presentation."""
+
+    LOGIN = "login"
+    IMAGE = "image"
+    TEXT = "text"
+    REDIRECT = "redirect"
+    SURVEY = "survey"
+
+
 # 6-digit hex color, leading '#' required (e.g. "#1A73E8") -- deliberately
 # does not accept the 3-digit shorthand (e.g. "#FFF") or an alpha channel:
 # a single, unambiguous, copy-paste-from-a-design-tool format keeps
@@ -86,6 +122,19 @@ DEFAULT_SUPPORTED_LANGUAGES: tuple[str, ...] = ("en",)
 # Editorial Serif, Bold Display, or back to System via its own branding
 # settings.
 DEFAULT_GUEST_FONT_CHOICE = GuestFontChoice.MODERN_SANS
+
+# The mode every existing venue is on and every new config starts at -- see
+# PortalContentMode.LOGIN's docstring for why the default must be "render the
+# sign-in card and nothing else" (this feature is purely additive).
+DEFAULT_PORTAL_CONTENT_MODE = PortalContentMode.LOGIN
+
+# Authoring-time ceilings for the two venue-authored content-mode strings.
+# Unlike the splash limits above these are not derived from an above-the-fold
+# render budget -- content-mode copy renders in its own scrollable block, not
+# stacked above the primary CTA -- so they are plain generous column limits
+# that only exist to keep a single row from being unbounded free text.
+CONTENT_HEADING_MAX_LENGTH = 120
+CONTENT_BODY_MAX_LENGTH = 2000
 
 # Integer 0-100, the guest-facing scrim's peak opacity as a percentage --
 # v6 design spec §4.2. 55 is not arbitrary: it is defined to reproduce the
@@ -223,6 +272,28 @@ MAX_BACKGROUND_FOCAL = 100
 SPLASH_HEADLINE_MAX_LENGTH = 26
 SPLASH_WELCOME_MESSAGE_MAX_LENGTH = 78
 
+# Byte ceiling on ``captive_portal_configs.post_login_html`` -- the HTML a
+# venue authors for the page a guest sees *after* a successful sign-in.
+#
+# Measured in UTF-8 **bytes**, not characters, unlike SPLASH_*_MAX_LENGTH
+# above. Those two are rendered-line budgets, so code points are the right
+# unit; this one is a resource limit on a blob that gets parsed on write,
+# cached in Redis and shipped in every guest resolve response, so the unit
+# that matters is what it costs to move and store.
+#
+# 64 KiB is roughly 20x the largest thing a hand-authored page plausibly
+# needs (a full page of prose with inline CSS runs 2-4 KB) while staying
+# small enough that a hostile 64 KB payload is not a useful way to make the
+# sanitizer or the resolve cache expensive. Enforced against the *submitted*
+# value, before sanitizing, so the size in the 400 is the size the venue
+# sees in their own editor -- see html_sanitizer.sanitize_post_login_html.
+#
+# It is deliberately not a DB-level constraint: the column is Text, and the
+# sanitizer can return slightly *more* bytes than it was given (it appends
+# rel/target to anchors), so a hard column limit at exactly this number
+# would reject a payload that passed validation.
+POST_LOGIN_HTML_MAX_BYTES = 64 * 1024
+
 # Field-label constants for the "at most one of text/url" validation --
 # see validators.validate_single_content_source's docstring for why this is
 # "at most one", not "exactly one".
@@ -232,8 +303,12 @@ PRIVACY_POLICY_LABEL = "privacy policy"
 __all__ = [
     "PortalTheme",
     "GuestFontChoice",
+    "PortalContentMode",
     "HEX_COLOR_PATTERN",
     "DEFAULT_THEME",
+    "DEFAULT_PORTAL_CONTENT_MODE",
+    "CONTENT_HEADING_MAX_LENGTH",
+    "CONTENT_BODY_MAX_LENGTH",
     "DEFAULT_PRIMARY_COLOR",
     "DEFAULT_SECONDARY_COLOR",
     "DEFAULT_LANGUAGE",
@@ -248,6 +323,7 @@ __all__ = [
     "MAX_BACKGROUND_FOCAL",
     "SPLASH_HEADLINE_MAX_LENGTH",
     "SPLASH_WELCOME_MESSAGE_MAX_LENGTH",
+    "POST_LOGIN_HTML_MAX_BYTES",
     "TERMS_AND_CONDITIONS_LABEL",
     "PRIVACY_POLICY_LABEL",
 ]

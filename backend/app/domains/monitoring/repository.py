@@ -53,6 +53,7 @@ from app.domains.router_provisioning.models import (
 from app.domains.wireguard.models import WireGuardPeer
 
 from .constants import AlertStatus
+from .exceptions import UnscopedOrganizationListError
 from .models import (
     Alert,
     AlertRule,
@@ -152,6 +153,7 @@ class MonitoringRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID | None,
+        include_all_organizations: bool = False,
         is_active: bool | None,
         page: int,
         page_size: int,
@@ -182,6 +184,7 @@ class MonitoringRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID | None,
+        include_all_organizations: bool = False,
         status: str | None,
         severity: str | None,
         router_id: uuid.UUID | None,
@@ -244,6 +247,7 @@ class MonitoringRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID | None,
+        include_all_organizations: bool = False,
         channel_type: str | None,
         is_active: bool | None,
         page: int,
@@ -280,6 +284,7 @@ class MonitoringRepositoryProtocol(Protocol):
         self,
         *,
         organization_id: uuid.UUID | None,
+        include_all_organizations: bool = False,
         status: str | None,
         severity: str | None,
         page: int,
@@ -302,7 +307,10 @@ class MonitoringRepositoryProtocol(Protocol):
     async def get_sla_target(self, target_id: uuid.UUID) -> SlaTarget | None: ...
 
     async def list_sla_targets(
-        self, *, organization_id: uuid.UUID | None
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        include_all_organizations: bool = False,
     ) -> list[SlaTarget]: ...
 
     async def create_sla_report(self, **fields: object) -> SlaReport: ...
@@ -619,10 +627,16 @@ class MonitoringRepository:
         self,
         *,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         is_active: bool | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[AlertRule], PaginationMeta]:
+        # Defense-in-depth tenant guard: a ``None`` org filter is dropped by
+        # ``apply_filters`` (no WHERE clause -> every organization), so refuse
+        # it unless the caller explicitly opted into a cross-org read.
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
         return await self.alert_rules.paginate(
             page=page,
             page_size=page_size,
@@ -680,12 +694,18 @@ class MonitoringRepository:
         self,
         *,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         status: str | None = None,
         severity: str | None = None,
         router_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[Alert], PaginationMeta]:
+        # Defense-in-depth tenant guard: a ``None`` org filter is dropped by
+        # ``apply_filters`` (no WHERE clause -> every organization), so refuse
+        # it unless the caller explicitly opted into a cross-org read.
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
         return await self.alerts.paginate(
             page=page,
             page_size=page_size,
@@ -834,11 +854,17 @@ class MonitoringRepository:
         self,
         *,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         channel_type: str | None = None,
         is_active: bool | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[NotificationChannel], PaginationMeta]:
+        # Defense-in-depth tenant guard: a ``None`` org filter is dropped by
+        # ``apply_filters`` (no WHERE clause -> every organization), so refuse
+        # it unless the caller explicitly opted into a cross-org read.
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
         return await self.notification_channels.paginate(
             page=page,
             page_size=page_size,
@@ -902,11 +928,17 @@ class MonitoringRepository:
         self,
         *,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         status: str | None = None,
         severity: str | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[Incident], PaginationMeta]:
+        # Defense-in-depth tenant guard: a ``None`` org filter is dropped by
+        # ``apply_filters`` (no WHERE clause -> every organization), so refuse
+        # it unless the caller explicitly opted into a cross-org read.
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
         return await self.incidents.paginate(
             page=page,
             page_size=page_size,
@@ -956,8 +988,16 @@ class MonitoringRepository:
         return await self.sla_targets.get_by_id(target_id)
 
     async def list_sla_targets(
-        self, *, organization_id: uuid.UUID | None = None
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
     ) -> list[SlaTarget]:
+        # Defense-in-depth tenant guard: a ``None`` org filter is dropped by
+        # ``apply_filters`` (no WHERE clause -> every organization), so refuse
+        # it unless the caller explicitly opted into a cross-org read.
+        if organization_id is None and not include_all_organizations:
+            raise UnscopedOrganizationListError()
         return await self.sla_targets.get_all(
             filters={"organization_id": organization_id},
             sort_by="created_at",

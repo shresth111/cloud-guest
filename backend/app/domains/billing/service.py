@@ -1442,12 +1442,14 @@ class CouponService:
         page: int = 1,
         page_size: int = 25,
         organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
         is_active: bool | None = None,
     ):
         return await self.repository.list_coupons(
             page=page,
             page_size=page_size,
             organization_id=organization_id,
+            include_all_organizations=include_all_organizations,
             is_active=is_active,
         )
 

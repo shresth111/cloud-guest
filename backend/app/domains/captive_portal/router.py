@@ -129,6 +129,19 @@ def _config_response(config: CaptivePortalConfig) -> CaptivePortalConfigResponse
         splash_headline=config.splash_headline,
         splash_welcome_message=config.splash_welcome_message,
         redirect_url=config.redirect_url,
+        # Always emitted alongside redirect_url, in this one function, for
+        # every endpoint at once -- admin CRUD and the guest-facing
+        # /captive-portal/resolve both build their payload here. The two
+        # fields are not alternatives (see the column's own comment in
+        # models.py): the frontend needs both to decide what the
+        # post-sign-in screen looks like, so neither may ever ship without
+        # the other.
+        post_login_html=config.post_login_html,
+        content_mode=config.content_mode,
+        content_heading=config.content_heading,
+        content_body=config.content_body,
+        content_image_url=config.content_image_url,
+        content_survey=config.content_survey,
         otp_sms_enabled=config.otp_sms_enabled,
         otp_email_enabled=config.otp_email_enabled,
         otp_whatsapp_enabled=config.otp_whatsapp_enabled,
@@ -196,6 +209,12 @@ async def create_captive_portal_config(
         splash_welcome_message=payload.splash_welcome_message,
         powered_by_enabled=payload.powered_by_enabled,
         redirect_url=payload.redirect_url,
+        post_login_html=payload.post_login_html,
+        content_mode=payload.content_mode,
+        content_heading=payload.content_heading,
+        content_body=payload.content_body,
+        content_image_url=payload.content_image_url,
+        content_survey=payload.content_survey,
         otp_sms_enabled=payload.otp_sms_enabled,
         otp_email_enabled=payload.otp_email_enabled,
         otp_whatsapp_enabled=payload.otp_whatsapp_enabled,

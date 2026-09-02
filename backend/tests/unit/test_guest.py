@@ -87,6 +87,7 @@ from app.domains.guest.models import (
     GuestSession,
     RadiusNasClient,
 )
+from app.domains.guest.radius_bridge import RadiusBridgePushError
 from app.domains.guest.repository import (
     ActiveGuestOrgPair,
     AuthMethodOutcomeCounts,
@@ -119,7 +120,7 @@ from app.domains.location.models import Location
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.exceptions import OtpCodeMismatchError
 from app.domains.queue_management.constants import QueueTargetType
-from app.domains.router.crypto import encrypt_secret
+from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router.enums import RouterStatus
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
@@ -5898,6 +5899,26 @@ class TestSharedSecretGeneration:
 
 
 class TestNasLifecycle:
+    @staticmethod
+    def _pusher() -> tuple[object, list[str]]:
+        """A stand-in for the real hub push, and the list of secrets it was
+        handed.
+
+        ``regenerate_secret`` takes this as a *required* argument, which is
+        the fix: before 2026-09-02 it wrote the new secret to the database
+        and told nobody, so a rotate left the row, the hub's ``client{}``
+        stanza and the router holding three different secrets and every
+        guest login at that venue Access-Rejecting silently. Deleting the
+        argument here is how you re-break it -- and a `TypeError` is what
+        you get, at every call site, rather than a green suite.
+        """
+        seen: list[str] = []
+
+        async def _push(secret: str) -> None:
+            seen.append(secret)
+
+        return _push, seen
+
     async def _register(self, fx: Fixture, **overrides: object):
         overrides.setdefault("nas_identifier", "nas-x")
         return await fx.radius_service.register_nas(
@@ -6058,12 +6079,16 @@ class TestNasLifecycle:
     async def test_regenerate_secret_invalidates_old_one(self) -> None:
         fx = make_fixture()
         result = await self._register(fx, shared_secret="original-secret")
+        push, pushed = self._pusher()
         regen = await fx.radius_service.regenerate_secret(
             nas_id=result.nas_client.id,
             requesting_organization_id=fx.organization_id,
             actor_user_id=uuid.uuid4(),
+            push_secret=push,
         )
         assert regen.shared_secret != "original-secret"
+        # The hub was handed exactly the secret the database now holds.
+        assert pushed == [regen.shared_secret]
         with pytest.raises(RadiusNasAuthenticationError):
             await fx.radius_service.authenticate_nas(
                 nas_identifier=result.nas_client.nas_identifier,
@@ -6087,8 +6112,117 @@ class TestNasLifecycle:
             nas_id=result.nas_client.id,
             requesting_organization_id=fx.organization_id,
             actor_user_id=uuid.uuid4(),
+            push_secret=self._pusher()[0],
         )
         assert regen.nas_client.status == NasStatus.DISABLED.value
+
+    # ========================================================================
+    # A rotate must never leave the database ahead of the hub
+    # ========================================================================
+    #
+    # The regression these exist for (2026-09-02):
+    # ``POST /radius/nas/{id}/regenerate-secret`` rotated the shared secret
+    # in the database and never pushed it to the FreeRADIUS hub. Three
+    # places then disagreed -- the row held the new secret, the hub's
+    # ``client{}`` stanza held the old one, the router held the old one --
+    # and FreeRADIUS answers an Access-Request authenticated with a secret
+    # that is not the one in ``clients.conf`` with a bare Access-Reject. So
+    # every guest login at the venue failed from that instant with nothing
+    # in any log naming the cause, and the 5-minute reconciliation sweep
+    # did not repair it: ``rebind_nas_for_router`` fires on *address* drift
+    # and deliberately re-pushes the stored secret, which a secret-only
+    # divergence never triggers.
+    #
+    # The endpoint was additionally wired to a button in the venue owner's
+    # own dashboard, where it reported success. See
+    # ``TestNasSecretRotationIsPlatformOnly`` for that half.
+
+    async def test_the_hub_is_told_before_the_row_is_written(self) -> None:
+        """The ordering *is* the fix. Asserted by having the push read the
+        stored secret at the moment it is called: if the row were written
+        first, the push would observe the new value."""
+        fx = make_fixture()
+        result = await self._register(fx, shared_secret="original-secret")
+        observed: list[str] = []
+
+        async def _push(secret: str) -> None:
+            stored = await fx.radius_service.get_nas_client(
+                result.nas_client.id,
+                requesting_organization_id=fx.organization_id,
+            )
+            observed.append(decrypt_secret(stored.shared_secret_encrypted))
+
+        await fx.radius_service.regenerate_secret(
+            nas_id=result.nas_client.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+            push_secret=_push,
+        )
+        assert observed == ["original-secret"]
+
+    async def test_a_refused_push_leaves_the_old_secret_working(self) -> None:
+        """A rotate that cannot reach the hub must fail loudly having
+        changed nothing -- the venue is still up on the old secret, which
+        the row, the hub and the device all still share.
+
+        This is the behaviour change operators may notice: rotation now
+        *fails* where it previously returned success having broken the
+        venue.
+        """
+        fx = make_fixture()
+        result = await self._register(fx, shared_secret="original-secret")
+
+        async def _boom(secret: str) -> None:
+            raise RadiusBridgePushError(
+                "config validation failed, reverted",
+                transport=False,
+                status_code=500,
+            )
+
+        with pytest.raises(RadiusBridgePushError):
+            await fx.radius_service.regenerate_secret(
+                nas_id=result.nas_client.id,
+                requesting_organization_id=fx.organization_id,
+                actor_user_id=uuid.uuid4(),
+                push_secret=_boom,
+            )
+
+        authenticated = await fx.radius_service.authenticate_nas(
+            nas_identifier=result.nas_client.nas_identifier,
+            shared_secret="original-secret",
+        )
+        assert authenticated.id == result.nas_client.id
+
+    async def test_a_refused_push_writes_no_audit_row_either(self) -> None:
+        """Nothing happened, so nothing may claim it did. An audit entry for
+        a rotation that did not occur is the same lie in a slower medium.
+        """
+        fx = make_fixture()
+        result = await self._register(fx)
+        before = len(fx.audit_writer.entries)
+
+        async def _boom(secret: str) -> None:
+            raise RadiusBridgePushError("nope", transport=True, status_code=None)
+
+        with pytest.raises(RadiusBridgePushError):
+            await fx.radius_service.regenerate_secret(
+                nas_id=result.nas_client.id,
+                requesting_organization_id=fx.organization_id,
+                actor_user_id=uuid.uuid4(),
+                push_secret=_boom,
+            )
+        assert len(fx.audit_writer.entries) == before
+
+    def test_regenerate_secret_cannot_be_called_without_a_push(self) -> None:
+        """The guarantee stated as a signature, so a future caller cannot
+        reintroduce the defect by simply not thinking about the hub."""
+        import inspect
+
+        param = inspect.signature(
+            RadiusService.regenerate_secret
+        ).parameters["push_secret"]
+        assert param.default is inspect.Parameter.empty
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
 
     async def test_delete_sets_terminal_status_and_soft_delete(self) -> None:
         fx = make_fixture()
@@ -6166,6 +6300,7 @@ class TestNasLifecycle:
             nas_id=result.nas_client.id,
             requesting_organization_id=fx.organization_id,
             actor_user_id=uuid.uuid4(),
+            push_secret=self._pusher()[0],
         )
         await fx.radius_service.update_nas_client(
             nas_id=result.nas_client.id,
@@ -6713,3 +6848,295 @@ def test_run_session_timeout_sweep_task_bridges_into_async(monkeypatch) -> None:
 
     result = tasks_module.run_session_timeout_sweep()
     assert result == {"expired_count": 3}
+
+
+# ============================================================================
+# Rotating a NAS shared secret is a platform operation, not a customer one
+# ============================================================================
+#
+# The other half of the 2026-09-02 defect. The rotate endpoint was gated on
+# bare ``radius.execute``, which ``organization-owner`` holds at
+# *organization* scope -- the role ``LocationProvisioningService`` assigns
+# to every venue owner it provisions -- and the customer dashboard wired a
+# "Regenerate secret" button in the venue owner's own NAS detail page
+# straight to it, with no confirmation at all.
+#
+# A rotation is irreversible for the device: nothing in this codebase can
+# write a RADIUS client onto RouterOS, so the new secret has to be pasted
+# in over WinBox before the venue works again. That makes it a site action
+# wearing an API call's clothes, and not one a venue owner can complete --
+# they got a success toast and a dead network. It now lives on
+# ``POST /platform/radius/nas/{id}/regenerate-secret`` at
+# ``ScopeType.GLOBAL``, the same posture ``GET /platform/routers/{id}`` and
+# the whole WireGuard domain already carry.
+
+
+class TestNasSecretRotationIsPlatformOnly:
+    """The NAS *lifecycle* routes are Master-console-only.
+
+    Named for the rotation because #93 got there first with one route.
+    Widened 2026-09-02 to the whole ``radius.execute`` key after
+    ``activate``/``disable`` were found still sitting on ``nas_router``,
+    reachable by every venue owner, with the same blast radius the rotate
+    route was moved for. The load-bearing assertion is now
+    ``test_no_radius_execute_route_is_org_scoped``, which is written against
+    the permission key rather than against today's three paths -- a fourth
+    ``radius.execute`` route added anywhere fails it by construction.
+    """
+
+    @staticmethod
+    def _routes_requiring(permission_key: str) -> list[object]:
+        """Every mounted route gated on ``permission_key``, found by reading
+        what ``RequirePermission`` actually closed over rather than by
+        guessing at paths -- a route can only hide from this by not using
+        the permission at all."""
+        from app.main import app
+
+        found = []
+        for route in app.routes:
+            dependant = getattr(route, "dependant", None)
+            if dependant is None:
+                continue
+            for dep in dependant.dependencies:
+                if dep.call is None:
+                    continue
+                if (
+                    TestNasSecretRotationIsPlatformOnly._declared_permission(dep.call)
+                    == permission_key
+                ):
+                    found.append(route)
+                    break
+        return found
+
+    @staticmethod
+    def _rotate_routes() -> list[object]:
+        from app.main import app
+
+        return [
+            route
+            for route in app.routes
+            if str(getattr(route, "path", "")).endswith("/regenerate-secret")
+            and "nas" in str(getattr(route, "path", ""))
+        ]
+
+    @staticmethod
+    def _declared_permission(dependant_call) -> object:
+        """The ``permission_key`` ``RequirePermission`` was constructed with.
+
+        Same closure read as ``_declared_scope``, taking the ``str``.
+        ``RequireRole`` also closes over a ``str`` (a role slug), which is
+        harmless here: no role is slugged ``radius.execute``.
+        """
+        for cell in getattr(dependant_call, "__closure__", None) or ():
+            try:
+                contents = cell.cell_contents
+            except ValueError:  # pragma: no cover -- empty cell
+                continue
+            if isinstance(contents, str):
+                return contents
+        return None
+
+    @staticmethod
+    def _declared_scope(dependant_call) -> object:
+        """The ``scope=`` ``RequirePermission`` was constructed with.
+
+        It closes over the value rather than storing it on an attribute, so
+        this reads the closure. Unambiguous because the only other captured
+        free variable is the permission key, a ``str``.
+        """
+        from app.domains.rbac.enums import ScopeType
+
+        for cell in getattr(dependant_call, "__closure__", None) or ():
+            try:
+                contents = cell.cell_contents
+            except ValueError:  # pragma: no cover -- empty cell
+                continue
+            if isinstance(contents, ScopeType):
+                return contents
+        return None
+
+    def test_no_radius_execute_route_is_org_scoped(self) -> None:
+        """THE RULE, stated for the permission key rather than for the three
+        routes that hold it today.
+
+        ``radius.execute`` gates NAS lifecycle -- activate, disable, rotate
+        -- and every one of those reaches into the live RADIUS auth path for
+        a venue. It is held at *organization* scope by ``organization-owner``
+        (asserted separately below), so any route carrying it without an
+        explicit ``scope=ScopeType.GLOBAL`` is customer-reachable the moment
+        it is mounted.
+
+        Writing it this way is the point: #93 fixed the one route it was
+        looking at and two others with the identical defect stayed live for a
+        day. A fourth one added later fails here rather than in an incident.
+        """
+        from app.domains.rbac.enums import ScopeType
+
+        offenders = []
+        for route in self._routes_requiring("radius.execute"):
+            scopes = [
+                self._declared_scope(dep.call)
+                for dep in route.dependant.dependencies
+                if dep.call is not None
+                and self._declared_permission(dep.call) == "radius.execute"
+            ]
+            if ScopeType.GLOBAL not in scopes:
+                offenders.append((route.path, scopes))
+
+        assert offenders == [], (
+            "These radius.execute routes are reachable by any venue owner, "
+            "because organization-owner holds radius.execute at organization "
+            "scope. Mount them on nas_platform_router with "
+            "scope=ScopeType.GLOBAL: " + repr(offenders)
+        )
+
+    def test_the_radius_execute_routes_are_exactly_the_platform_three(
+        self,
+    ) -> None:
+        """A companion to the rule above, and the half that catches the
+        *other* direction: a route that keeps GLOBAL scope but is mounted
+        back under the customer ``/radius/nas`` namespace passes the scope
+        assertion while telling every reader the wrong thing about who the
+        endpoint is for."""
+        paths = sorted(r.path for r in self._routes_requiring("radius.execute"))
+        assert paths == [
+            "/api/v1/platform/radius/nas/{nas_id}/activate",
+            "/api/v1/platform/radius/nas/{nas_id}/disable",
+            "/api/v1/platform/radius/nas/{nas_id}/regenerate-secret",
+        ]
+
+    def test_disable_is_a_database_write_with_no_hub_or_device_call(
+        self,
+    ) -> None:
+        """Why ``disable`` is immediate rather than eventually-consistent,
+        asserted as a signature so the claim in the route docstring cannot
+        rot.
+
+        ``regenerate_secret`` had to grow a mandatory ``push_secret``
+        because a rotation that does not reach the hub is a lie
+        (``test_regenerate_secret_cannot_be_called_without_a_push``).
+        ``disable_nas`` deliberately has no such argument: there is nothing
+        to push. It flips ``status``/``is_active`` and returns, and
+        ``authenticate_nas`` rejects anything that is not ``ACTIVE`` -- see
+        ``test_disabled_nas_cannot_authenticate`` -- so the venue stops
+        serving guests on the very next Access-Request, with no hub
+        round-trip to fail and no reconciliation sweep to undo it.
+        """
+        import inspect
+
+        params = set(inspect.signature(RadiusService.disable_nas).parameters)
+        assert "push_secret" not in params
+        assert params == {
+            "self",
+            "nas_id",
+            "requesting_organization_id",
+            "actor_user_id",
+            "reason",
+        }
+
+    def test_the_only_rotate_route_is_the_platform_one(self) -> None:
+        routes = self._rotate_routes()
+        assert [r.path for r in routes] == [
+            "/api/v1/platform/radius/nas/{nas_id}/regenerate-secret"
+        ], (
+            "A NAS secret rotation reachable at any other path is reachable "
+            "by a venue owner, because radius.execute is an organization-"
+            "scoped grant. Put it on nas_platform_router."
+        )
+
+    def test_the_rotate_route_is_gated_at_global_scope(self) -> None:
+        from app.domains.rbac.enums import ScopeType
+
+        (route,) = self._rotate_routes()
+        scopes = [
+            self._declared_scope(dep.call)
+            for dep in route.dependant.dependencies
+            if dep.call is not None and getattr(dep.call, "__closure__", None)
+        ]
+        assert ScopeType.GLOBAL in scopes, (
+            "Mounting the route under /platform is cosmetic on its own -- "
+            "without scope=ScopeType.GLOBAL an organization-scoped grant "
+            "still satisfies it."
+        )
+
+    def test_organization_owner_really_does_hold_radius_execute(self) -> None:
+        """The premise the move exists for, asserted rather than assumed.
+
+        If a future seed change genuinely takes ``radius.execute`` away from
+        every organization-scoped role, this fails and whoever is reading
+        can decide the split is no longer load-bearing -- rather than the
+        split quietly outliving its reason.
+        """
+        from app.domains.rbac.enums import PermissionAction, PermissionModule, ScopeType
+        from app.domains.rbac.seed import SYSTEM_ROLES
+
+        role = next(r for r in SYSTEM_ROLES if r.slug == "organization-owner")
+        assert role.scope_type == ScopeType.ORGANIZATION
+        assert PermissionAction.EXECUTE in role.grants()[PermissionModule.RADIUS]
+
+    def test_the_full_set_of_non_global_radius_execute_holders_is_known(
+        self,
+    ) -> None:
+        """The premise widened: ``organization-owner`` is not the only
+        non-platform role holding the key, so pinning only that one would
+        under-state how reachable these routes were.
+
+        Resolved by running the seed's own ``grants()`` rather than reading
+        its comments. If a future seed change adds or removes a holder this
+        fails, and whoever is reading gets to decide what it means for the
+        split -- which is the entire point of asserting a premise.
+        """
+        from app.domains.rbac.enums import PermissionAction, PermissionModule, ScopeType
+        from app.domains.rbac.seed import SYSTEM_ROLES
+
+        holders = {
+            role.slug: role.scope_type
+            for role in SYSTEM_ROLES
+            if PermissionAction.EXECUTE
+            in role.grants().get(PermissionModule.RADIUS, ())
+        }
+        assert holders == {
+            "super-admin": ScopeType.GLOBAL,
+            "platform-admin": ScopeType.GLOBAL,
+            "msp-owner": ScopeType.ORGANIZATION,
+            "msp-admin": ScopeType.ORGANIZATION,
+            "organization-owner": ScopeType.ORGANIZATION,
+            "organization-admin": ScopeType.ORGANIZATION,
+            "network-administrator": ScopeType.LOCATION,
+        }
+        # Five of the seven are below GLOBAL, and every one of those five is
+        # excluded by the move -- a LOCATION grant cannot satisfy a GLOBAL
+        # check either (SCOPE_HIERARCHY_ORDER), so network-administrator, the
+        # role closest to a legitimate operator of these endpoints, loses
+        # them too. That is the behaviour change, named.
+        assert sum(1 for s in holders.values() if s != ScopeType.GLOBAL) == 5
+
+    def test_an_organization_scoped_grant_can_never_satisfy_a_global_check(
+        self,
+    ) -> None:
+        """The one property the move rests on: an organization-scoped role
+        is excluded whatever ``X-Organization-Id`` it sends -- while still
+        satisfying the org-scoped NAS *reads* the customer dashboard
+        legitimately needs."""
+        from app.domains.rbac.authorization import ScopeResolver
+        from app.domains.rbac.context import GrantScope, ScopeContext
+        from app.domains.rbac.enums import ScopeType
+
+        org_id = uuid.uuid4()
+        grant = GrantScope(scope_type=ScopeType.ORGANIZATION, organization_id=org_id)
+        context = ScopeContext(organization_id=org_id)
+        assert ScopeResolver.satisfies(grant, ScopeType.GLOBAL, context) is False
+        assert ScopeResolver.satisfies(grant, ScopeType.LOCATION, context) is True
+
+    def test_the_response_states_the_device_half_out_loud(self) -> None:
+        """A 200 here means the venue's guest WiFi is DOWN until somebody
+        re-pastes the RADIUS chunk. Carried as a field rather than left to
+        the message string because that is the only version of it a client
+        cannot fail to notice."""
+        from app.domains.guest.schemas import RadiusNasSecretRotatedResponse
+
+        fields = RadiusNasSecretRotatedResponse.model_fields
+        assert fields["device_action_required"].default is True
+        action = fields["device_action"].default
+        assert "DOWN" in action
+        assert "router" in action.lower()

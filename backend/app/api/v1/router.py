@@ -32,6 +32,7 @@ from app.domains.guest.router import admin_router as guest_admin_router
 from app.domains.guest.router import analytics_router as guest_analytics_router
 from app.domains.guest.router import guest_router
 from app.domains.guest.router import nas_cross_reference_router as guest_nas_xref_router
+from app.domains.guest.router import nas_platform_router as guest_nas_platform_router
 from app.domains.guest.router import nas_router as guest_nas_router
 from app.domains.guest.router import radius_router as guest_radius_router
 from app.domains.guest_access.router import router as guest_access_router
@@ -65,6 +66,7 @@ from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
+from app.domains.system_settings.router import router as system_settings_router
 from app.domains.user.router import router as user_router
 from app.domains.vlan.router import router as vlan_router
 from app.domains.voucher.router import router as voucher_router
@@ -91,6 +93,7 @@ api_v1_router.include_router(guest_admin_router)
 api_v1_router.include_router(guest_radius_router)
 api_v1_router.include_router(guest_nas_router)
 api_v1_router.include_router(guest_nas_xref_router)
+api_v1_router.include_router(guest_nas_platform_router)
 api_v1_router.include_router(guest_analytics_router)
 api_v1_router.include_router(guest_access_router)
 api_v1_router.include_router(guest_teams_guest_router)
@@ -132,6 +135,7 @@ api_v1_router.include_router(agent_permissions_router)
 api_v1_router.include_router(live_sessions_router)
 api_v1_router.include_router(customer_provisioning_router)
 api_v1_router.include_router(system_router)
+api_v1_router.include_router(system_settings_router)
 api_v1_router.include_router(branding_router)
 api_v1_router.include_router(support_tickets_router)
 api_v1_router.include_router(demo_request_router)

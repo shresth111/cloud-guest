@@ -109,6 +109,7 @@ from .constants import (
 from .events import TunnelCreated, TunnelHandshakeRecorded, TunnelRevoked, TunnelRotated
 from .exceptions import (
     HubCannotLearnPlatformKeyError,
+    HubPeerAllocatorNotConfiguredError,
     HubPeerClaimedByAnotherRouterError,
     HubPeerListerNotConfiguredError,
     HubPeerNotOnHubError,
@@ -124,6 +125,7 @@ from .models import WireGuardPeer, WireGuardPeerIssuance, WireGuardServer
 from .repository import WireGuardRepositoryProtocol
 from .validators import (
     allocate_tunnel_ip,
+    hub_reserved_ip,
     validate_peer_transition,
     validate_router_eligible_for_wireguard,
 )
@@ -312,6 +314,32 @@ class HubPeerLister(Protocol):
     async def __call__(self) -> list[dict]: ...
 
 
+class HubPeerAllocator(Protocol):
+    """Asks the hub to mint a peer -- ``POST /wg/peer`` on
+    ``ops/hub-agents/wg_agent.py``, built by
+    ``dependencies.make_hub_peer_allocator``.
+
+    The third verb of the same bridge ``HubPeerDeregistrar`` and
+    ``HubPeerLister`` speak to, and the only one that produces a WireGuard
+    identity **both sides hold**: the agent runs ``wg genkey`` itself and
+    returns both halves, which is why nothing here generates a keypair and
+    why ``HubCannotLearnPlatformKeyError`` refuses the path that does.
+
+    Returns the agent's own JSON verbatim -- ``router_public_key``,
+    ``router_private_key``, ``router_tunnel_ip``, ``server_public_key``,
+    ``server_endpoint_host``, ``server_endpoint_port``, ``tunnel_subnet``.
+
+    NOT IDEMPOTENT, AND NOT REVERSIBLE. Every call allocates a new keypair
+    and consumes the next free address out of the hub's /24, and the
+    deployed agent has no ``do_DELETE`` -- so each call that is not
+    strictly necessary leaks a peer permanently. That is the entire reason
+    ``allocate_tunnel_via_hub`` exhausts reuse and adoption before ever
+    reaching this callable.
+    """
+
+    async def __call__(self) -> dict: ...
+
+
 class PeerAddressListener(Protocol):
     """Notified after a peer's tunnel ADDRESS changes -- adoption, or any
     other correction that moves a router from one address to another.
@@ -385,6 +413,37 @@ class FleetStatus:
     adopted_public_keys: list[str] = dataclasses.field(default_factory=list)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class HubTunnelAllocation:
+    """Return shape of ``WireGuardService.allocate_tunnel_via_hub`` -- one
+    router's WireGuard identity as the **hub** understands it, plus enough
+    of the hub's own parameters to write a device config without a second
+    round trip.
+
+    ``peer_private_key`` is ``None`` whenever ``reused`` is true. That is
+    not a degraded response: an agent-allocated peer's private key was
+    generated on the hub and stored here as
+    ``EXTERNALLY_MANAGED_KEY_SENTINEL``, so this platform has never held
+    it -- and reuse is only ever chosen when the device demonstrably still
+    has it. The setup-script generator omits the ``private-key=`` line in
+    that case rather than writing a sentinel over a working interface.
+
+    ``adopted`` means this call *corrected* the recorded identity onto the
+    one the hub reports the device handshaking on, rather than allocating.
+    """
+
+    peer: WireGuardPeer
+    peer_private_key: str | None
+    hub_public_key: str
+    hub_endpoint_host: str
+    hub_endpoint_port: int
+    tunnel_network_cidr: str
+    hub_tunnel_ip_address: str
+    reused: bool
+    adopted: bool
+    message: str
+
+
 class WireGuardService:
     """Core WireGuard business logic."""
 
@@ -397,6 +456,7 @@ class WireGuardService:
         handshake_stale_after_minutes: int = 5,
         hub_peer_deregistrar: HubPeerDeregistrar | None = None,
         hub_peer_lister: HubPeerLister | None = None,
+        hub_peer_allocator: HubPeerAllocator | None = None,
         hub_capabilities: HubCapabilities | None = None,
         peer_address_listener: PeerAddressListener | None = None,
     ) -> None:
@@ -420,6 +480,15 @@ class WireGuardService:
         # Same injection reasoning as `hub_peer_deregistrar` -- see
         # `get_fleet_status`, the only caller.
         self.hub_peer_lister = hub_peer_lister
+        # The third verb of the same bridge -- see `HubPeerAllocator`. It is
+        # injected here, rather than being called inline from the one HTTP
+        # endpoint that used to own it, because the decision of WHETHER to
+        # call it (reuse / adopt / refuse / allocate) is business logic that
+        # two callers now need: the Master console's WireGuard tab and
+        # `LocationProvisioningService.provision_location`. Leaving that
+        # decision in a route handler is what let provisioning reach for
+        # `create_tunnel` instead and produce tunnels that cannot establish.
+        self.hub_peer_allocator = hub_peer_allocator
         # Notified whenever a peer's tunnel ADDRESS changes, which is the
         # event the RADIUS `client{}` stanza has to follow and never did.
         # Injected (and left `None` here) rather than imported so this
@@ -1387,6 +1456,189 @@ class WireGuardService:
     # ========================================================================
     # Tunnel creation / re-creation
     # ========================================================================
+
+    async def allocate_tunnel_via_hub(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        router_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        rotate: bool = False,
+        force: bool = False,
+    ) -> HubTunnelAllocation:
+        """Give ``router_id`` a WireGuard identity **the hub actually
+        holds** -- the only way to get one, and the correct alternative
+        ``HubCannotLearnPlatformKeyError`` names.
+
+        This is the orchestration that used to live inline in
+        ``router.allocate_external_wireguard_peer``. It is here, on the
+        service, because it is business logic and it has two callers:
+
+        * the Master console's WireGuard tab, via
+          ``POST /routers/{router_id}/wireguard-peer/allocate-external``;
+        * ``LocationProvisioningService.provision_location``'s step (e),
+          which called ``create_tunnel`` until 2026-09-01 and therefore
+          could not provision a customer at all -- every attempt died on
+          ``HubCannotLearnPlatformKeyError`` after the organization, owner
+          and router rows had already been written, which the operator saw
+          as "an error right after entering the plan" because the plan is
+          submitted with the rest of the wizard form and step (g) is where
+          it would have been used.
+
+        The decision order below is deliberate and each branch exists
+        because of a measured incident -- see the endpoint's own historical
+        comments, preserved here:
+
+        1. **Never allocate over a live device** (unless ``force``). The
+           hub is asked whether this router is handshaking right now, on
+           the recorded key or any key the issuance ledger says was issued
+           to it. A device cannot be made to change key by anything this
+           server does, so allocating on top of a live one only moves the
+           platform further from the device. Measured 2026-08-28: four
+           ``?rotate=true`` allocations for router 21e13913 in 24h, the
+           last one handing out ``10.20.0.9`` while the device sat
+           handshaking on ``10.20.0.6``.
+        2. **Adopt rather than refuse.** If the live identity differs from
+           what this table records, the row is corrected onto it -- the
+           divergence is repaired instead of deepened.
+        3. **Reuse before allocating** (unless ``rotate``). The deployed
+           agent has no removal verb, so every allocation is permanent and
+           unreclaimable; ``next_free_ip()`` scans live kernel state, so
+           orphans consume a /24 forever.
+        4. Only then ask the hub for a new peer.
+
+        ``force`` is destructive and unreclaimable -- it supersedes a peer
+        the hub cannot be told to drop, leaving the device on an address
+        the RADIUS ``client{}`` stanza no longer names. It exists only for
+        "the device has demonstrably lost its config", where no handshake
+        will be found anyway.
+        """
+        # Validate the router (and tenant scope) up front, before any
+        # irreversible hub call. `include_deleted=True` mirrors
+        # `create_tunnel`'s own reasoning: a decommissioned router should
+        # surface `WireGuardRouterNotEligibleError`, not a misleading
+        # `RouterNotFoundError`.
+        router = await self.router_lookup.get_router(
+            router_id,
+            requesting_organization_id=requesting_organization_id,
+            include_deleted=True,
+        )
+        validate_router_eligible_for_wireguard(router)
+
+        # (1)/(2) A LIVE DEVICE IS NEVER ALLOCATED OVER.
+        if not force:
+            live = await self.resolve_live_identity_for_router(router_id=router_id)
+            if live is not None:
+                peer = await self.get_peer(
+                    router_id=router_id,
+                    requesting_organization_id=requesting_organization_id,
+                )
+                adopted = False
+                if peer.public_key != live["public_key"]:
+                    peer = await self.adopt_hub_peer(
+                        actor_user_id=actor_user_id,
+                        router_id=router_id,
+                        requesting_organization_id=requesting_organization_id,
+                        public_key=live["public_key"],
+                        note=(
+                            "adopted during allocate-external: the hub "
+                            "reported this router handshaking on a key this "
+                            "table did not hold, so a new allocation would "
+                            "have moved the platform further from the device"
+                        ),
+                    )
+                    adopted = True
+                return self._allocation_from_recorded_peer(
+                    peer,
+                    server=await self.get_server(peer.server_id),
+                    adopted=adopted,
+                    message=(
+                        (
+                            "This router is already connected on "
+                            f"{peer.tunnel_ip_address} -- adopted that "
+                            "identity instead of allocating a new peer, "
+                            "because the device holds a private key no "
+                            "server-side action can change."
+                        )
+                        if adopted
+                        else (
+                            "Existing WireGuard tunnel reused -- the hub "
+                            "reports this router connected on it, so no new "
+                            "peer was allocated"
+                        )
+                    ),
+                )
+
+        # (3) REUSE BEFORE ALLOCATING.
+        if not rotate:
+            existing = await self.get_peer_if_usable(
+                router_id=router_id,
+                requesting_organization_id=requesting_organization_id,
+            )
+            if existing is not None:
+                return self._allocation_from_recorded_peer(
+                    existing,
+                    server=await self.get_server(existing.server_id),
+                    adopted=False,
+                    message=(
+                        "Existing WireGuard tunnel reused -- no new peer was "
+                        "allocated on the hub"
+                    ),
+                )
+
+        # (4) Ask the hub to mint one. Irreversible from here: the agent has
+        # no removal verb, so anything that fails after this line leaks a
+        # peer and an address permanently.
+        if self.hub_peer_allocator is None:
+            raise HubPeerAllocatorNotConfiguredError()
+        wg = await self.hub_peer_allocator()
+
+        peer = await self.register_agent_allocated_peer(
+            actor_user_id=actor_user_id,
+            router_id=router_id,
+            requesting_organization_id=requesting_organization_id,
+            tunnel_ip_address=wg["router_tunnel_ip"],
+            public_key=wg["router_public_key"],
+        )
+        return HubTunnelAllocation(
+            peer=peer,
+            peer_private_key=wg["router_private_key"],
+            hub_public_key=wg["server_public_key"],
+            hub_endpoint_host=wg["server_endpoint_host"],
+            hub_endpoint_port=int(wg["server_endpoint_port"]),
+            tunnel_network_cidr=wg["tunnel_subnet"],
+            hub_tunnel_ip_address=hub_reserved_ip(wg["tunnel_subnet"]),
+            reused=False,
+            adopted=False,
+            message="WireGuard tunnel allocated",
+        )
+
+    def _allocation_from_recorded_peer(
+        self,
+        peer: WireGuardPeer,
+        *,
+        server: WireGuardServer,
+        adopted: bool,
+        message: str,
+    ) -> HubTunnelAllocation:
+        """A ``HubTunnelAllocation`` for a peer this call did NOT allocate.
+
+        ``peer_private_key`` is ``None`` rather than the stored value on
+        purpose -- see ``HubTunnelAllocation``'s own docstring. The hub
+        parameters come from the ``WireGuardServer`` row here, not from a
+        bridge response, because no bridge call was made."""
+        return HubTunnelAllocation(
+            peer=peer,
+            peer_private_key=None,
+            hub_public_key=server.public_key,
+            hub_endpoint_host=server.endpoint_host,
+            hub_endpoint_port=server.endpoint_port,
+            tunnel_network_cidr=server.tunnel_network_cidr,
+            hub_tunnel_ip_address=hub_reserved_ip(server.tunnel_network_cidr),
+            reused=True,
+            adopted=adopted,
+            message=message,
+        )
 
     async def create_tunnel(
         self,

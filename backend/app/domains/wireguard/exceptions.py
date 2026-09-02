@@ -28,6 +28,7 @@ __all__ = [
     "TunnelIPAllocationConflictError",
     "InvalidWireGuardCidrError",
     "HubPeerListerNotConfiguredError",
+    "HubPeerAllocatorNotConfiguredError",
     "HubCannotLearnPlatformKeyError",
     "HubPeerRemovalUnsupportedError",
     "HubPeerNotOnHubError",
@@ -78,6 +79,25 @@ class HubPeerListerNotConfiguredError(WireGuardError):
         super().__init__(
             "The WireGuard hub bridge is not configured -- cannot read live "
             "fleet status",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
+class HubPeerAllocatorNotConfiguredError(WireGuardError):
+    """``allocate_tunnel_via_hub`` has no ``hub_peer_allocator`` injected.
+
+    Same reasoning as ``HubPeerListerNotConfiguredError``, and for the same
+    reason it must never degrade to a local fallback: the only "local
+    fallback" available is ``create_tunnel``'s platform-generated keypair,
+    which is precisely the unusable tunnel ``HubCannotLearnPlatformKeyError``
+    exists to refuse. Failing loudly is the whole point -- a caller that
+    cannot reach the hub cannot produce a working tunnel by any other
+    means."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The WireGuard hub bridge is not configured -- cannot allocate a "
+            "tunnel the hub would actually hold",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 

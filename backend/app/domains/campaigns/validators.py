@@ -67,8 +67,25 @@ def validate_question_options(answer_type: AnswerType, options: list[str]) -> No
         raise InvalidQuestionOptionsError(f"{answer_type.value} must not have options")
 
 
-def validate_asset_urls(image_url: str | None, click_url: str | None) -> None:
-    if not image_url and not click_url:
+def validate_asset_urls(
+    image_url: str | None,
+    click_url: str | None,
+    *,
+    headline: str | None = None,
+    coupon_code: str | None = None,
+) -> None:
+    """A ``BANNER``/``REDIRECT`` asset must carry at least one renderable
+    thing, or the row is inert (see ``models.CampaignAsset``'s docstring).
+
+    Historically that meant an image or a click-through URL. A "Banner &
+    Discounts" banner may instead be pure text-and-coupon copy -- a
+    ``headline`` and/or a ``coupon_code`` with no image or link at all --
+    which is equally renderable (the frontend ``CampaignOverlay`` draws a
+    coupon card from it), so those two count toward the "at least one"
+    requirement as well. The keyword-only ``headline``/``coupon_code``
+    default to ``None`` so every pre-existing image/redirect call site
+    (and its tests) keeps its exact prior behaviour."""
+    if not any((image_url, click_url, headline, coupon_code)):
         raise InvalidAssetUrlsError()
 
 

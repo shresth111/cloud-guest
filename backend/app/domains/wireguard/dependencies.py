@@ -42,10 +42,102 @@ class HubBridgeUnavailableError(CloudGuestError):
     that never reached the hub has not revoked anything -- the address is
     freed in the database while the hub still hands it out, which is the
     state that left 68 orphaned peers on the tunnel box.
+
+    TWO TRAPS LIVE HERE, both of them about the fact that this subclasses
+    ``CloudGuestError`` and NOT ``exceptions.WireGuardError``.
+
+    1. ``except WireGuardError`` does not catch it. Nothing about the name
+       says so, and the one place that tried --
+       ``hub_reconciliation.tasks`` -- named this class in its own comment
+       while catching a type that excludes it, so the most likely failure in
+       that task escaped the handler written for it. Fixed 2026-09-01; if a
+       new caller wants "any hub failure", it must name both.
+
+    2. ``status_code`` had to move into ``__init__``. It was written as a
+       CLASS attribute (``status_code = 502``), which
+       ``CloudGuestError.__init__`` then overwrote on every instance with
+       its own default of 500 -- so this was raised as a 502 in intent and
+       served as a 500 "Internal server error" in fact, for its whole life.
+       A hub bridge that is down is not an internal server error; it is an
+       upstream dependency that is down, and a client cannot tell the
+       difference between "retry, the hub is unreachable" and "this
+       platform is broken" from a 500. ``error_code`` below is left as a
+       class attribute because ``CloudGuestError`` never sets one, so
+       nothing shadows it -- though nothing reads it either today, the
+       shared handler in ``app.common.exceptions`` serialises ``message``
+       and ``data`` only.
     """
 
-    status_code = 502
     error_code = "hub_bridge_unavailable"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_502_BAD_GATEWAY)
+
+
+def bridge_error_detail(resp: httpx.Response) -> str:
+    """The hub agent's own explanation of a >=400.
+
+    Lived in ``router.py`` until the allocation call moved down into the
+    service layer; it is here now because both the HTTP endpoint and the
+    injected allocator below need it, and because the identically-named
+    helper in ``app.domains.guest.router`` documents the reason it has to
+    exist at all -- both hub agents answer with the ``{"error":
+    "<str(exception)>"}`` shape and their ``log_message`` is a deliberate
+    no-op, so this body is the only description of the failure that exists
+    anywhere.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return (resp.text or "<empty response body>")[:600]
+    if isinstance(body, dict) and "error" in body:
+        return str(body["error"])[:600]
+    return str(body)[:600]
+
+
+def make_hub_peer_allocator(settings: Settings):
+    """Builds the callable ``WireGuardService.allocate_tunnel_via_hub`` uses
+    to have the hub mint a peer -- ``POST /wg/peer`` on
+    ``ops/hub-agents/wg_agent.py``, the same URL/secret the deregistrar and
+    the lister already use. One bridge, three verbs.
+
+    THIS IS THE ONLY PATH THAT PRODUCES A KEY BOTH SIDES KNOW. The agent
+    generates the keypair itself and returns both halves; there is no verb
+    that accepts a public key the caller already has, which is exactly what
+    ``exceptions.HubCannotLearnPlatformKeyError`` guards against on the
+    ``create_tunnel``/``rotate_tunnel`` side.
+
+    Injected on the service rather than called inline from a route for the
+    same reason as ``make_hub_peer_deregistrar``: the orchestration around
+    it (reuse, adopt, refuse-over-a-live-device) is business logic that more
+    than one caller needs -- the Master console's WireGuard tab *and*
+    ``LocationProvisioningService.provision_location`` -- and the in-memory
+    test suite has to be able to drive all of it without HTTP.
+
+    Raises ``HubBridgeUnavailableError`` (a 502, and NOT a
+    ``WireGuardError`` -- see that class's own docstring, trap 1) on both
+    an unreachable bridge and a bridge that answered with a >=400.
+    """
+
+    async def _allocate() -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    settings.hub_wg_agent_url,
+                    headers={"X-Agent-Secret": settings.hub_wg_agent_secret},
+                )
+        except httpx.HTTPError as exc:
+            raise HubBridgeUnavailableError(
+                f"Could not reach the WireGuard hub bridge: {exc!s}"
+            ) from exc
+        if resp.status_code >= 400:
+            raise HubBridgeUnavailableError(
+                "The WireGuard hub bridge refused this allocation "
+                f"(HTTP {resp.status_code}): {bridge_error_detail(resp)}"
+            )
+        return resp.json()
+
+    return _allocate
 
 
 def make_hub_peer_deregistrar(settings: Settings):
@@ -183,6 +275,7 @@ def get_wireguard_service(
         handshake_stale_after_minutes=settings.wireguard_handshake_stale_after_minutes,
         hub_peer_deregistrar=make_hub_peer_deregistrar(settings),
         hub_peer_lister=make_hub_peer_lister(settings),
+        hub_peer_allocator=make_hub_peer_allocator(settings),
         hub_capabilities=hub_capabilities_from_settings(settings),
         # No `peer_address_listener` here on purpose: wiring it would mean
         # importing `app.domains.guest`, which already imports this module.
@@ -194,6 +287,8 @@ __all__ = [
     "get_wireguard_repository",
     "get_wireguard_service",
     "hub_capabilities_from_settings",
+    "bridge_error_detail",
+    "make_hub_peer_allocator",
     "make_hub_peer_deregistrar",
     "make_hub_peer_lister",
     "HubBridgeUnavailableError",

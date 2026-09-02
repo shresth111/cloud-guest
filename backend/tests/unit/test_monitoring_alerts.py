@@ -67,6 +67,7 @@ from app.domains.monitoring.exceptions import (
     InvalidSlaTargetConfigError,
     NotificationChannelNotFoundError,
     SlaTargetNotFoundError,
+    UnscopedOrganizationListError,
 )
 from app.domains.monitoring.models import (
     Alert,
@@ -80,6 +81,7 @@ from app.domains.monitoring.models import (
     SlaReport,
     SlaTarget,
 )
+from app.domains.monitoring.repository import MonitoringRepository
 from app.domains.monitoring.service import (
     AlertService,
     IncidentService,
@@ -408,7 +410,10 @@ class FakeRepository:
         return self.sla_targets.get(target_id)
 
     async def list_sla_targets(
-        self, *, organization_id: uuid.UUID | None = None
+        self,
+        *,
+        organization_id: uuid.UUID | None = None,
+        include_all_organizations: bool = False,
     ) -> list[SlaTarget]:
         if organization_id is None:
             return list(self.sla_targets.values())
@@ -1668,3 +1673,296 @@ def test_endpoint_requires_expected_permission_key(
 ):
     route = monitoring_routes_by_path_method[(path, method)]
     assert _permission_key_for_route(route) == expected_key
+
+
+# ============================================================================
+# Tenant scoping of the alerts / alert-rules listings
+# ----------------------------------------------------------------------------
+# GET /alerts and GET /alerts/rules must derive the effective organization
+# from the caller's auth scope, never from a client-supplied query param, and
+# a missing org filter must never silently mean "every organization" for a
+# scoped caller. See ``fix(monitoring): scope alerts/rules to caller org``.
+# ============================================================================
+
+
+@dataclass
+class _FakeAlertRow:
+    organization_id: uuid.UUID
+
+
+@dataclass
+class _FakePaginateMeta:
+    total_items: int
+
+
+class _RecordingPaginator:
+    """Stands in for a ``GenericRepository`` on ``MonitoringRepository`` --
+    just enough of ``paginate`` to observe the org filter the repository builds
+    and mimic ``apply_filters``' "``None`` org -> no WHERE clause -> every
+    row" behaviour, so the test proves the repository's own guard, not
+    ``apply_filters`` itself."""
+
+    def __init__(self, rows: list[_FakeAlertRow]) -> None:
+        self._rows = rows
+        self.last_filters: dict[str, object] | None = None
+
+    async def paginate(self, *, page, page_size, filters, sort_by, sort_order):
+        self.last_filters = filters
+        org = filters.get("organization_id")
+        selected = [r for r in self._rows if org is None or r.organization_id == org]
+        return selected, _FakePaginateMeta(total_items=len(selected))
+
+
+def _repo_with_alert_rows(rows: list[_FakeAlertRow]) -> MonitoringRepository:
+    repo = MonitoringRepository(session=None)  # type: ignore[arg-type]
+    paginator = _RecordingPaginator(rows)
+    # Both listings route through their respective GenericRepository; swap in a
+    # recording double so no live session is touched.
+    repo.alerts = paginator  # type: ignore[assignment]
+    repo.alert_rules = paginator  # type: ignore[assignment]
+    return repo
+
+
+async def test_list_alerts_scoped_admin_sees_only_own_org():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    rows = [_FakeAlertRow(org_a), _FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    service = AlertService(_repo_with_alert_rows(rows))
+
+    # An organization-scoped caller resolves to their own org (org_a) and sees
+    # only org_a's alerts -- never org_b's.
+    items, _meta = await service.list_alerts(organization_id=org_a)
+    assert len(items) == 2
+    assert all(row.organization_id == org_a for row in items)
+
+
+async def test_list_alerts_missing_org_without_optin_is_refused():
+    rows = [_FakeAlertRow(uuid.uuid4())]
+    service = AlertService(_repo_with_alert_rows(rows))
+
+    # Defense-in-depth: a missing org filter without an explicit cross-org
+    # opt-in must never fall through to "every organization".
+    with pytest.raises(UnscopedOrganizationListError):
+        await service.list_alerts(organization_id=None)
+
+
+async def test_list_alerts_platform_caller_may_read_across_orgs():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    rows = [_FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    service = AlertService(_repo_with_alert_rows(rows))
+
+    # A platform/GLOBAL caller (org resolves to None) explicitly opts into the
+    # cross-organization read and sees every org's alerts.
+    items, _meta = await service.list_alerts(
+        organization_id=None, include_all_organizations=True
+    )
+    assert len(items) == 2
+
+
+async def test_list_alert_rules_scoped_admin_sees_only_own_org():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    rows = [_FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    service = AlertService(_repo_with_alert_rows(rows))
+
+    items, _meta = await service.list_alert_rules(organization_id=org_a)
+    assert len(items) == 1
+    assert items[0].organization_id == org_a
+
+
+async def test_list_alert_rules_missing_org_without_optin_is_refused():
+    service = AlertService(_repo_with_alert_rows([_FakeAlertRow(uuid.uuid4())]))
+
+    with pytest.raises(UnscopedOrganizationListError):
+        await service.list_alert_rules(organization_id=None)
+
+
+async def test_list_alert_rules_platform_caller_may_read_across_orgs():
+    rows = [_FakeAlertRow(uuid.uuid4()), _FakeAlertRow(uuid.uuid4())]
+    service = AlertService(_repo_with_alert_rows(rows))
+
+    items, _meta = await service.list_alert_rules(
+        organization_id=None, include_all_organizations=True
+    )
+    assert len(items) == 2
+
+
+# ----------------------------------------------------------------------------
+# Same tenant-scoping guard for the notification-channels / incidents / SLA
+# listings (the endpoints fixed alongside alerts/alert-rules): an org-scoped
+# caller omitting the param must see only their own org's rows, never every
+# organization's. See ``fix(monitoring): scope channels/incidents/sla``.
+# ----------------------------------------------------------------------------
+
+
+class _RecordingLister:
+    """``get_all`` counterpart to ``_RecordingPaginator`` -- stands in for a
+    ``GenericRepository`` whose listing returns a plain ``list`` (SLA targets),
+    mimicking ``apply_filters``' "``None`` org -> every row" so the test proves
+    the repository's own guard, not ``apply_filters``."""
+
+    def __init__(self, rows: list[_FakeAlertRow]) -> None:
+        self._rows = rows
+
+    async def get_all(self, *, filters, sort_by=None, sort_order=None, **kwargs):
+        org = filters.get("organization_id")
+        return [r for r in self._rows if org is None or r.organization_id == org]
+
+
+def _repo_with_rows_on(attr: str, rows: list[_FakeAlertRow]) -> MonitoringRepository:
+    repo = MonitoringRepository(session=None)  # type: ignore[arg-type]
+    setattr(repo, attr, _RecordingPaginator(rows))
+    return repo
+
+
+async def test_list_channels_scoped_admin_sees_only_own_org():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    rows = [_FakeAlertRow(org_a), _FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    service = NotificationService(
+        _repo_with_rows_on("notification_channels", rows), httpx.AsyncClient()
+    )
+
+    items, _meta = await service.list_channels(organization_id=org_a)
+    assert len(items) == 2
+    assert all(row.organization_id == org_a for row in items)
+
+
+async def test_list_channels_missing_org_without_optin_is_refused():
+    service = NotificationService(
+        _repo_with_rows_on("notification_channels", [_FakeAlertRow(uuid.uuid4())]),
+        httpx.AsyncClient(),
+    )
+    with pytest.raises(UnscopedOrganizationListError):
+        await service.list_channels(organization_id=None)
+
+
+async def test_list_channels_platform_caller_may_read_across_orgs():
+    rows = [_FakeAlertRow(uuid.uuid4()), _FakeAlertRow(uuid.uuid4())]
+    service = NotificationService(
+        _repo_with_rows_on("notification_channels", rows), httpx.AsyncClient()
+    )
+    items, _meta = await service.list_channels(
+        organization_id=None, include_all_organizations=True
+    )
+    assert len(items) == 2
+
+
+async def test_list_incidents_scoped_admin_sees_only_own_org():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    rows = [_FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    service = IncidentService(_repo_with_rows_on("incidents", rows))
+
+    items, _meta = await service.list_incidents(organization_id=org_a)
+    assert len(items) == 1
+    assert items[0].organization_id == org_a
+
+
+async def test_list_incidents_missing_org_without_optin_is_refused():
+    service = IncidentService(
+        _repo_with_rows_on("incidents", [_FakeAlertRow(uuid.uuid4())])
+    )
+    with pytest.raises(UnscopedOrganizationListError):
+        await service.list_incidents(organization_id=None)
+
+
+async def test_list_incidents_platform_caller_may_read_across_orgs():
+    rows = [_FakeAlertRow(uuid.uuid4()), _FakeAlertRow(uuid.uuid4())]
+    service = IncidentService(_repo_with_rows_on("incidents", rows))
+    items, _meta = await service.list_incidents(
+        organization_id=None, include_all_organizations=True
+    )
+    assert len(items) == 2
+
+
+async def test_list_sla_targets_scoped_admin_sees_only_own_org():
+    org_a, org_b = uuid.uuid4(), uuid.uuid4()
+    repo = MonitoringRepository(session=None)  # type: ignore[arg-type]
+    repo.sla_targets = _RecordingLister(  # type: ignore[assignment]
+        [_FakeAlertRow(org_a), _FakeAlertRow(org_a), _FakeAlertRow(org_b)]
+    )
+    targets = await repo.list_sla_targets(organization_id=org_a)
+    assert len(targets) == 2
+    assert all(t.organization_id == org_a for t in targets)
+
+
+async def test_list_sla_targets_missing_org_without_optin_is_refused():
+    repo = MonitoringRepository(session=None)  # type: ignore[arg-type]
+    repo.sla_targets = _RecordingLister([_FakeAlertRow(uuid.uuid4())])  # type: ignore[assignment]
+    with pytest.raises(UnscopedOrganizationListError):
+        await repo.list_sla_targets(organization_id=None)
+
+
+async def test_list_sla_targets_platform_caller_may_read_across_orgs():
+    repo = MonitoringRepository(session=None)  # type: ignore[arg-type]
+    repo.sla_targets = _RecordingLister(  # type: ignore[assignment]
+        [_FakeAlertRow(uuid.uuid4()), _FakeAlertRow(uuid.uuid4())]
+    )
+    targets = await repo.list_sla_targets(
+        organization_id=None, include_all_organizations=True
+    )
+    assert len(targets) == 2
+
+
+@pytest.mark.parametrize(
+    ("path", "method"),
+    [
+        ("/api/v1/alerts", "GET"),
+        ("/api/v1/alerts/rules", "GET"),
+        ("/api/v1/notifications/channels", "GET"),
+        ("/api/v1/incidents", "GET"),
+        ("/api/v1/sla", "GET"),
+    ],
+)
+def test_alerts_listings_resolve_org_from_auth_scope_not_query_param(
+    monitoring_routes_by_path_method, path, method
+):
+    """The two listings must take ``organization_id`` from
+    ``CurrentOrganization`` (the caller's validated auth scope), not from a
+    client-supplied query param -- otherwise an org-scoped admin omitting the
+    param would read every organization's rows."""
+    from app.domains.rbac.dependencies import CurrentOrganization
+
+    route = monitoring_routes_by_path_method[(path, method)]
+    dependant = route.dependant
+
+    # organization_id is no longer a request query parameter ...
+    query_names = {param.name for param in dependant.query_params}
+    assert "organization_id" not in query_names
+
+    # ... it is resolved via the CurrentOrganization dependency instead.
+    dependency_calls = {dep.call for dep in dependant.dependencies}
+    assert CurrentOrganization in dependency_calls
+
+@pytest.mark.parametrize(
+    ("path", "method"),
+    [
+        ("/api/v1/events", "GET"),
+        ("/api/v1/monitoring/dashboard", "GET"),
+        ("/api/v1/monitoring/devices", "GET"),
+        ("/api/v1/ztp/dashboard", "GET"),
+        ("/api/v1/ztp/analytics", "GET"),
+    ],
+)
+def test_platform_dashboards_resolve_org_from_auth_scope_not_query_param(
+    monitoring_routes_by_path_method, path, method
+):
+    """The platform monitoring/ZTP dashboards must take ``organization_id``
+    from ``CurrentOrganization`` (the caller's validated auth scope), not from
+    a client-supplied query param.
+
+    ``monitoring.read``/``analytics.read`` are grantable at ORGANIZATION scope
+    (see ``rbac.seed`` MODULE_NARROWEST_SCOPE), so an org-scoped admin who sent
+    ``X-Organization-Id`` (passing the org-scoped permission check) but omitted
+    ``?organization_id=`` previously had the org filter silently dropped and
+    aggregated every organization's data cross-tenant. A caller with no org
+    header resolves to ``None`` and, having passed the GLOBAL-scope permission
+    gate, may still legitimately read across organizations.
+    """
+    from app.domains.rbac.dependencies import CurrentOrganization
+
+    route = monitoring_routes_by_path_method[(path, method)]
+    dependant = route.dependant
+
+    query_names = {param.name for param in dependant.query_params}
+    assert "organization_id" not in query_names
+
+    dependency_calls = {dep.call for dep in dependant.dependencies}
+    assert CurrentOrganization in dependency_calls

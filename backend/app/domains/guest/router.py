@@ -51,6 +51,7 @@ from app.domains.rbac.dependencies import (
     RequireOrganization,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
@@ -112,6 +113,7 @@ from .schemas import (
     RadiusNasListResponse,
     RadiusNasRegisterRequest,
     RadiusNasResponse,
+    RadiusNasSecretRotatedResponse,
     RadiusNasUpdateRequest,
     SessionDisconnectRequest,
     SessionExtendRequest,
@@ -136,6 +138,14 @@ admin_router = APIRouter(tags=["Guest Admin"])
 radius_router = APIRouter(prefix="/radius", tags=["RADIUS"])
 nas_router = APIRouter(prefix="/radius/nas", tags=["RADIUS NAS Admin"])
 nas_cross_reference_router = APIRouter(tags=["RADIUS NAS Admin"])
+# Platform (Master console) NAS operations -- ScopeType.GLOBAL only.
+# Mounted under /platform/... rather than /radius/nas/... to match the
+# namespace `app.domains.router.router` already established for exactly
+# this separation; see the section header above
+# `regenerate_radius_nas_secret` for why the split exists.
+nas_platform_router = APIRouter(
+    prefix="/platform/radius/nas", tags=["RADIUS NAS Platform"]
+)
 analytics_router = APIRouter(prefix="/guest-analytics", tags=["Guest Analytics"])
 
 # The single-tenant FreeRADIUS bridge (ops/hub-agents/radius_agent.py,
@@ -1249,6 +1259,27 @@ def _bridge_error_detail(resp: httpx.Response) -> str:
     return str(body)[:600]
 
 
+def _external_nas_registration_response(
+    request: Request, nas_client: RadiusNasClient, shared_secret: str
+):
+    """``register_external_radius_nas``'s single success envelope.
+
+    Extracted only because that endpoint now has two returns -- the rotate
+    branch pushes through ``regenerate_secret``'s hook and finishes early,
+    the fresh-registration branch falls through -- and two hand-written
+    copies of the same envelope is how the two paths drift apart.
+    """
+    return build_response(
+        success=True,
+        message="RADIUS NAS client registered",
+        data=RadiusNasCreatedResponse(
+            **_nas_response(nas_client).model_dump(),
+            shared_secret=shared_secret,
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
 @nas_router.post(
     "/register-external/{router_id}",
     response_model=ApiResponse[RadiusNasCreatedResponse],
@@ -1283,19 +1314,57 @@ async def register_external_radius_nas(
         page=1,
         page_size=1,
     )
+    # NOTE ON ORDERING (2026-09-02): the rotate branch used to be a bare
+    # `regenerate_secret()` followed by the shared push below, i.e. it
+    # carried the same database-ahead-of-hub defect as the standalone
+    # rotate endpoint -- a 502 from the push left this router's row holding
+    # a secret the hub had never seen, and the venue rejecting every guest
+    # login. `regenerate_secret` now requires the push and performs it
+    # before its own write, so the branch pushes through the hook and the
+    # block below is the *fresh registration* path only.
+    #
+    # `register_nas` keeps the write-then-push order, and that is deliberate
+    # rather than overlooked: it has no `nas_identifier` to push under until
+    # the row exists (the identifier is server-assigned), and the state a
+    # failed push leaves -- a `pending` row with `hub_client_synced_ip` NULL
+    # and no device configured yet -- is a venue that was not working
+    # before either, is visibly unsynced, and converges on the next call,
+    # which takes the rotate branch above.
     if existing:
-        result = await service.regenerate_secret(
-            nas_id=existing[0].id,
-            requesting_organization_id=requesting_organization_id,
-            actor_user_id=uuid.UUID(user.id),
+        nas_identifier = existing[0].nas_identifier
+
+        async def _push_rotated(secret: str) -> None:
+            await push_nas_client(
+                tunnel_ip=peer.tunnel_ip_address,
+                nas_identifier=nas_identifier,
+                secret=secret,
+            )
+
+        try:
+            result = await service.regenerate_secret(
+                nas_id=existing[0].id,
+                requesting_organization_id=requesting_organization_id,
+                actor_user_id=uuid.UUID(user.id),
+                push_secret=_push_rotated,
+            )
+        except RadiusBridgePushError as exc:
+            raise HTTPException(status_code=502, detail=exc.detail) from exc
+        return _external_nas_registration_response(
+            request,
+            await service.record_hub_client_sync(
+                nas_id=result.nas_client.id,
+                tunnel_ip_address=peer.tunnel_ip_address,
+                requesting_organization_id=requesting_organization_id,
+            ),
+            result.shared_secret,
         )
-    else:
-        result = await service.register_nas(
-            actor_user_id=uuid.UUID(user.id),
-            router_id=router_id,
-            nas_identifier=f"cg-{str(router_id)[:8]}",
-            requesting_organization_id=requesting_organization_id,
-        )
+
+    result = await service.register_nas(
+        actor_user_id=uuid.UUID(user.id),
+        router_id=router_id,
+        nas_identifier=f"cg-{str(router_id)[:8]}",
+        requesting_organization_id=requesting_organization_id,
+    )
 
     # NOTE ON ERROR REPORTING (2026-08-27): this block used to collapse
     # every possible failure -- connect timeout, DNS, 401, 500 -- into the
@@ -1342,14 +1411,8 @@ async def register_external_radius_nas(
         requesting_organization_id=requesting_organization_id,
     )
 
-    return build_response(
-        success=True,
-        message="RADIUS NAS client registered",
-        data=RadiusNasCreatedResponse(
-            **_nas_response(nas_client).model_dump(),
-            shared_secret=result.shared_secret,
-        ).model_dump(),
-        request_id=_request_id(request),
+    return _external_nas_registration_response(
+        request, nas_client, result.shared_secret
     )
 
 
@@ -1491,85 +1554,255 @@ async def delete_radius_nas(
     )
 
 
-@nas_router.post(
+# ============================================================================
+# Platform-only NAS endpoints (Master console)
+# ============================================================================
+#
+# Everything on ``nas_platform_router`` is gated at ``ScopeType.GLOBAL``, the
+# same posture ``GET /platform/routers/{id}`` and
+# ``PUT /platform/routers/{id}/management-access`` already carry for the
+# identical bug class (2026-09-01), and the same one the WireGuard domain
+# uses wholesale.
+#
+# ``radius.execute`` is held at *organization* scope by
+# ``organization-owner`` -- the role ``LocationProvisioningService`` assigns
+# to every venue owner it provisions -- so ``nas_router`` above is
+# customer-reachable by construction. An explicit GLOBAL scope is the only
+# thing that separates the two audiences, since an organization-scoped grant
+# can never satisfy a GLOBAL check however the caller sets
+# ``X-Organization-Id`` (``ScopeResolver.satisfies``).
+#
+# THE RULE THIS SECTION NOW CARRIES (2026-09-02, widened): *no*
+# ``radius.execute`` route anywhere in this domain is organization-scoped.
+# ``radius.execute`` is the NAS *lifecycle* key -- activate/disable/rotate --
+# and every one of those three reaches into the live RADIUS auth path for a
+# venue rather than into its tenant data. #93 moved only the rotate route and
+# left ``activate``/``disable`` behind on ``nas_router``, which meant the
+# reason for the split was written down in one place while two routes with
+# the same key and the same blast radius stayed reachable by every venue
+# owner. ``TestNasSecretRotationIsPlatformOnly`` now asserts the rule for the
+# key rather than for the three routes that exist today, so a fourth
+# ``radius.execute`` route added to ``nas_router`` later fails by
+# construction instead of quietly reopening this.
+
+
+@nas_platform_router.post(
+    "/{nas_id}/regenerate-secret",
+    response_model=ApiResponse[RadiusNasSecretRotatedResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("radius.execute", scope=ScopeType.GLOBAL))
+    ],
+)
+async def regenerate_radius_nas_secret(
+    request: Request,
+    nas_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    service: RadiusService = Depends(get_radius_service),
+    wireguard_service: WireGuardService = Depends(get_wireguard_service),
+):
+    """Rotates this NAS's RADIUS shared secret, pushing it to the real
+    FreeRADIUS server as part of the same operation.
+
+    MOVED HERE FROM ``POST /radius/nas/{nas_id}/regenerate-secret``
+    (2026-09-02), and both halves of that move are the fix.
+
+    *The push.* The old endpoint rotated the secret in the database and
+    told nobody. The result was three places disagreeing -- row, hub,
+    device -- and a venue whose every guest login Access-Rejected with
+    nothing in any log naming the cause. ``RadiusService.regenerate_secret``
+    now takes a mandatory ``push_secret`` and calls it before it writes, so
+    the state the old endpoint produced is not reachable from any caller;
+    see that method's docstring for the ordering argument in full.
+
+    *The scope.* The old endpoint was gated on bare ``radius.execute``,
+    which ``organization-owner`` holds, and the customer dashboard wired a
+    "Regenerate secret" button in the venue owner's own NAS detail page
+    straight to it. A rotation is irreversible for the device -- there is no
+    write path from this platform to a RouterOS RADIUS client, so the new
+    secret has to be pasted in over WinBox before the venue works again --
+    which makes it a site action wearing an API call's clothes, and not one
+    a venue owner can complete. It belongs where every other infrastructure
+    internal already lives.
+
+    Requires a WireGuard peer, for the same reason
+    ``register_external_radius_nas`` does: the hub keys the ``client{}``
+    stanza on the router's tunnel address, so with no peer there is nowhere
+    to push and therefore -- now -- no rotation. That is a 404 from
+    ``get_peer``, not a silent database-only rotate.
+
+    ``requesting_organization_id`` is deliberately ``None`` throughout: this
+    route is already GLOBAL-only, so the caller is a platform operator
+    acting on any tenant's device, the same shape
+    ``get_router_platform_view``/``decommission_router`` use.
+    """
+    nas_client = await service.get_nas_client(nas_id, requesting_organization_id=None)
+    peer = await wireguard_service.get_peer(
+        router_id=nas_client.router_id, requesting_organization_id=None
+    )
+
+    async def _push(secret: str) -> None:
+        await push_nas_client(
+            tunnel_ip=peer.tunnel_ip_address,
+            nas_identifier=nas_client.nas_identifier,
+            secret=secret,
+        )
+
+    try:
+        result = await service.regenerate_secret(
+            nas_id=nas_id,
+            requesting_organization_id=None,
+            actor_user_id=uuid.UUID(user.id),
+            push_secret=_push,
+        )
+    except RadiusBridgePushError as exc:
+        # 502, and the row is untouched: the hub, the device and the
+        # database all still hold the previous secret, so the venue is
+        # still working. This is the case that used to return 200 having
+        # broken it.
+        raise HTTPException(status_code=502, detail=exc.detail) from exc
+
+    # Same "record what the hub confirmed, not what we intended" rule as
+    # `register_external_radius_nas` -- only reachable after a 2xx, and it
+    # also re-converges `hub_client_synced_ip` if the peer had moved since
+    # the last push (`add_client` is idempotent on shortname).
+    synced = await service.record_hub_client_sync(
+        nas_id=result.nas_client.id,
+        tunnel_ip_address=peer.tunnel_ip_address,
+        requesting_organization_id=None,
+    )
+
+    return build_response(
+        success=True,
+        message=(
+            "RADIUS NAS client shared secret rotated and pushed to the "
+            "FreeRADIUS server -- the router still holds the old secret"
+        ),
+        data=RadiusNasSecretRotatedResponse(
+            **_nas_response(synced).model_dump(),
+            shared_secret=result.shared_secret,
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_platform_router.post(
     "/{nas_id}/activate",
     response_model=ApiResponse[RadiusNasResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("radius.execute"))],
+    dependencies=[
+        Depends(RequirePermission("radius.execute", scope=ScopeType.GLOBAL))
+    ],
 )
 async def activate_radius_nas(
     request: Request,
     nas_id: uuid.UUID,
     user: AuthUser = Depends(CurrentUser),
-    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RadiusService = Depends(get_radius_service),
 ):
+    """Returns a NAS to ``ACTIVE``, which is the only status
+    ``RadiusService.authenticate_nas`` accepts.
+
+    MOVED HERE FROM ``POST /radius/nas/{nas_id}/activate`` (2026-09-02),
+    with ``disable`` alongside it. See the section header for the rule.
+
+    This is the *lifting* half of the pair, so it does not take a venue
+    down -- but it is not therefore harmless. ``NAS_STATUS_TRANSITIONS``
+    makes ``SUSPENDED -> ACTIVE`` a legal edge, and ``SUSPENDED`` is
+    documented (``constants.NasStatus``) as the stronger, platform-imposed
+    restriction -- "a security incident or billing hold". Left on
+    ``nas_router`` this was a venue owner clearing the platform's own hold
+    on their own venue from their own dashboard. No endpoint sets
+    ``SUSPENDED`` in this build, so that was latent rather than live; it
+    stops being latent the moment a suspend path is added, and the fix for
+    it is here, not in whoever adds one.
+
+    ``requesting_organization_id`` is deliberately ``None``: the route is
+    GLOBAL-only, so the caller is a platform operator acting on some
+    tenant's device -- the same shape ``regenerate_radius_nas_secret`` and
+    ``get_router_platform_view``/``decommission_router`` use.
+    """
     nas_client = await service.activate_nas(
         nas_id=nas_id,
-        requesting_organization_id=requesting_organization_id,
+        requesting_organization_id=None,
         actor_user_id=uuid.UUID(user.id),
     )
     return build_response(
         success=True,
-        message="RADIUS NAS client activated",
+        message=(
+            "RADIUS NAS client activated -- guest authentication through "
+            "this NAS is accepted again"
+        ),
         data=_nas_response(nas_client).model_dump(),
         request_id=_request_id(request),
     )
 
 
-@nas_router.post(
+@nas_platform_router.post(
     "/{nas_id}/disable",
     response_model=ApiResponse[RadiusNasResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("radius.execute"))],
+    dependencies=[
+        Depends(RequirePermission("radius.execute", scope=ScopeType.GLOBAL))
+    ],
 )
 async def disable_radius_nas(
     request: Request,
     nas_id: uuid.UUID,
     payload: RadiusNasDisableRequest,
     user: AuthUser = Depends(CurrentUser),
-    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RadiusService = Depends(get_radius_service),
 ):
+    """Takes a NAS out of ``ACTIVE``, which stops every guest login at that
+    venue from the moment it returns.
+
+    MOVED HERE FROM ``POST /radius/nas/{nas_id}/disable`` (2026-09-02).
+
+    This is the sharp one of the pair. There is no hub call and no device
+    call: ``disable_nas`` writes ``status``/``is_active`` and returns, and
+    ``authenticate_nas`` rejects any NAS that is not ``ACTIVE``
+    (``service.py``), so the venue's guest WiFi stops on the next
+    Access-Request. Nothing the guest, the router or the hub can see names
+    the cause -- the same silent-failure shape as the rotation bug #93
+    fixed, arrived at through the success path rather than a bug.
+
+    It differs from a rotation in one way worth stating plainly, because it
+    weakens the case rather than strengthens it: a disable *is* reversible,
+    and by the very role that could perform it -- ``activate`` above was
+    sitting next to it on the same dashboard. So the argument for moving it
+    is not "the venue owner cannot undo it". It is that no product surface
+    ever asked for a venue-owner-operated kill switch: the buttons existed
+    because ``NasStatus``'s internal lifecycle graph had been mirrored into
+    the customer dashboard, and an internal lifecycle model is not a
+    feature. Guest-facing "pause the WiFi" belongs to captive-portal
+    scheduling (business hours / portal closed), which is where a venue
+    owner's own intent to stop serving guests is actually modeled.
+
+    ``reason`` is retained and still audited: it is now an operator's note
+    about someone else's venue, which is if anything more worth having.
+    """
     nas_client = await service.disable_nas(
         nas_id=nas_id,
-        requesting_organization_id=requesting_organization_id,
+        requesting_organization_id=None,
         actor_user_id=uuid.UUID(user.id),
         reason=payload.reason,
     )
+    # The message states the consequence, not the operation. "RADIUS NAS
+    # client disabled" is true and tells an operator nothing about what
+    # just happened to the venue on the other end of it. Same reasoning as
+    # ``RadiusNasSecretRotatedResponse``'s ``device_action`` field, but a
+    # message rather than a field: a rotation obliges the caller to *do*
+    # something afterwards (drive to the router) and so needs a flag a
+    # client cannot miss, whereas a disable obliges nothing -- inventing a
+    # ``device_action_required: False`` field here would add API surface
+    # that describes no action.
     return build_response(
         success=True,
-        message="RADIUS NAS client disabled",
+        message=(
+            "RADIUS NAS client disabled -- every guest login at this venue "
+            "now fails until it is activated again"
+        ),
         data=_nas_response(nas_client).model_dump(),
-        request_id=_request_id(request),
-    )
-
-
-@nas_router.post(
-    "/{nas_id}/regenerate-secret",
-    response_model=ApiResponse[RadiusNasCreatedResponse],
-    status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("radius.execute"))],
-)
-async def regenerate_radius_nas_secret(
-    request: Request,
-    nas_id: uuid.UUID,
-    user: AuthUser = Depends(CurrentUser),
-    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    service: RadiusService = Depends(get_radius_service),
-):
-    result = await service.regenerate_secret(
-        nas_id=nas_id,
-        requesting_organization_id=requesting_organization_id,
-        actor_user_id=uuid.UUID(user.id),
-    )
-    return build_response(
-        success=True,
-        message="RADIUS NAS client shared secret regenerated",
-        data=RadiusNasCreatedResponse(
-            **_nas_response(result.nas_client).model_dump(),
-            shared_secret=result.shared_secret,
-        ).model_dump(),
         request_id=_request_id(request),
     )
 

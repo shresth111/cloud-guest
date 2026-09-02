@@ -20,6 +20,7 @@ from .constants import (
     MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
     GuestFontChoice,
+    PortalContentMode,
 )
 
 __all__ = [
@@ -34,9 +35,11 @@ __all__ = [
     "CaptivePortalConfigImmutableFieldError",
     "InvalidBusinessHoursScheduleError",
     "InvalidGuestFontChoiceError",
+    "InvalidPortalContentModeError",
     "InvalidBackgroundOverlayStrengthError",
     "InvalidBackgroundFocalPointError",
     "SplashTextTooLongError",
+    "PostLoginHtmlTooLargeError",
     "PoweredByAttributionNotEntitledError",
 ]
 
@@ -175,6 +178,22 @@ class InvalidGuestFontChoiceError(CaptivePortalError):
         )
 
 
+class InvalidPortalContentModeError(CaptivePortalError):
+    """``content_mode`` was set to something outside
+    ``constants.PortalContentMode`` -- see
+    ``validators.validate_content_mode``. Like ``guest_font_choice`` this is
+    a closed enum stored as a plain string, never free text: an unknown mode
+    would have no renderer on the frontend and would silently fall back to
+    the sign-in card, so it is rejected at the write boundary instead."""
+
+    def __init__(self, value: str) -> None:
+        allowed = ", ".join(m.value for m in PortalContentMode)
+        super().__init__(
+            f"content_mode must be one of [{allowed}], got '{value}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 class InvalidBackgroundOverlayStrengthError(CaptivePortalError):
     """``background_overlay_strength`` was outside the valid [0, 100]
     integer range -- see ``validators.validate_background_overlay_
@@ -240,6 +259,41 @@ class SplashTextTooLongError(CaptivePortalError):
                 "field": field_name,
                 "max_length": max_length,
                 "actual_length": actual_length,
+            },
+        )
+
+
+class PostLoginHtmlTooLargeError(CaptivePortalError):
+    """``post_login_html`` -- the page a venue authors for what a guest
+    sees after signing in -- exceeded ``constants.POST_LOGIN_HTML_MAX_BYTES``.
+
+    Carries ``max_bytes``/``actual_bytes`` in ``data`` for the same reason
+    ``SplashTextTooLongError`` above carries lengths: the dashboard's editor
+    has to be able to say "68 KB of a 64 KB limit" next to the field. A bare
+    Pydantic "string too long" would name neither number, and the venue
+    would be left guessing how much to cut.
+
+    Both figures are **UTF-8 bytes of the submitted value**, counted before
+    sanitizing -- see ``html_sanitizer.sanitize_post_login_html`` for why
+    the pre-sanitize input is the honest thing to measure.
+
+    400, not 413 or 422: this is the same domain-validation class as every
+    other error in this module, raised from the service layer rather than
+    from Pydantic or from a transport-level body limit.
+    """
+
+    def __init__(self, actual_bytes: int, max_bytes: int) -> None:
+        self.field_name = "post_login_html"
+        self.actual_bytes = actual_bytes
+        self.max_bytes = max_bytes
+        super().__init__(
+            f"post_login_html must be at most {max_bytes} bytes "
+            f"({max_bytes // 1024} KB), got {actual_bytes} bytes",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={
+                "field": "post_login_html",
+                "max_bytes": max_bytes,
+                "actual_bytes": actual_bytes,
             },
         )
 

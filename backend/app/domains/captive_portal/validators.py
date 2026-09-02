@@ -21,6 +21,7 @@ from .constants import (
     SPLASH_HEADLINE_MAX_LENGTH,
     SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
     GuestFontChoice,
+    PortalContentMode,
 )
 from .exceptions import (
     InvalidBackgroundFocalPointError,
@@ -29,6 +30,7 @@ from .exceptions import (
     InvalidDefaultConfigScopeError,
     InvalidGuestFontChoiceError,
     InvalidHexColorError,
+    InvalidPortalContentModeError,
     InvalidPortalContentSourceError,
     SplashTextTooLongError,
 )
@@ -87,6 +89,19 @@ def validate_guest_font_choice(value: str) -> None:
     spec's own explicit guardrail (§6.2 item 9)."""
     if value not in _GUEST_FONT_CHOICE_VALUES:
         raise InvalidGuestFontChoiceError(value)
+
+
+_PORTAL_CONTENT_MODE_VALUES = frozenset(mode.value for mode in PortalContentMode)
+
+
+def validate_content_mode(value: str) -> None:
+    """Raises ``InvalidPortalContentModeError`` unless ``value`` is one of
+    ``constants.PortalContentMode``'s values. Same closed-enum-stored-as-
+    string discipline as ``validate_guest_font_choice``: an unknown mode has
+    no frontend renderer, so it is refused here rather than silently falling
+    back to the sign-in card."""
+    if value not in _PORTAL_CONTENT_MODE_VALUES:
+        raise InvalidPortalContentModeError(value)
 
 
 def validate_background_overlay_strength(value: object) -> None:
@@ -309,6 +324,7 @@ __all__ = [
     "validate_business_hours_timezone",
     "validate_business_hours_schedule",
     "validate_guest_font_choice",
+    "validate_content_mode",
     "validate_background_overlay_strength",
     "validate_background_focal_point",
     "is_open_now",

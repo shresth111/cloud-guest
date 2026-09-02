@@ -4,49 +4,26 @@ from pydantic import BaseModel
 
 
 class OnboardRequest(BaseModel):
+    """Input for the one real operation this domain performs.
+
+    Deliberately narrow: it carries only the fields ``onboard`` actually
+    acts on. Fields that used to sit here (``router_name``,
+    ``router_model``, ``admin_password``, ``plan_slug``) were never read
+    by the service -- a caller could ask for a router, or set an admin
+    password, and receive a 201 with none of it having happened. Router
+    provisioning has its own real domain (``router_provisioning``);
+    plans/licensing have theirs (``billing``).
+    """
+
     organization_name: str
     organization_slug: str
     location_name: str | None = None
     location_address: str | None = None
-    router_name: str | None = None
-    router_model: str | None = None
     admin_email: str
-    admin_password: str | None = None
-    plan_slug: str = "starter"
 
 
 class OnboardResponse(BaseModel):
     organization_id: str
     location_id: str | None = None
-    router_id: str | None = None
     admin_user_id: str
     message: str = "Organization onboarded successfully"
-
-
-class GenerateScriptRequest(BaseModel):
-    router_model: str | None = None
-    config_variables: dict[str, str] | None = None
-
-
-class GenerateScriptResponse(BaseModel):
-    script: str
-    script_type: str = "bash"
-    message: str = "Configuration script generated"
-
-
-class GenerateNasResponse(BaseModel):
-    nas_id: str
-    nas_ip: str
-    nas_secret: str
-    nas_type: str = "MikroTik"
-    message: str = "NAS device registered"
-
-
-class WireguardConfigResponse(BaseModel):
-    peer_id: str
-    private_key: str
-    public_key: str
-    endpoint: str
-    allowed_ips: str = "0.0.0.0/0"
-    dns: str = "8.8.8.8"
-    message: str = "WireGuard configuration generated"

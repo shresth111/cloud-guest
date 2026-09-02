@@ -18,11 +18,15 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 from .constants import (
+    CONTENT_BODY_MAX_LENGTH,
+    CONTENT_HEADING_MAX_LENGTH,
     DEFAULT_LANGUAGE,
+    DEFAULT_PORTAL_CONTENT_MODE,
     DEFAULT_PRIMARY_COLOR,
     DEFAULT_SECONDARY_COLOR,
     DEFAULT_SUPPORTED_LANGUAGES,
     DEFAULT_THEME,
+    POST_LOGIN_HTML_MAX_BYTES,
     SPLASH_HEADLINE_MAX_LENGTH,
     SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
 )
@@ -109,7 +113,53 @@ class CaptivePortalConfigCreateRequest(BaseModel):
             "over the stripped value in Unicode code points."
         ),
     )
+    post_login_html: str | None = Field(
+        default=None,
+        description=(
+            "Venue-authored HTML for the page a guest sees after a "
+            "successful sign-in. Null or empty keeps today's behaviour "
+            "exactly: a countdown to `redirect_url` if one is set, the "
+            "built-in success screen otherwise. Non-empty and "
+            "`redirect_url` are not alternatives -- both apply, the HTML "
+            "renders and the continue-to-URL affordance stays. "
+            "**Sanitized on write against an allowlist** (see "
+            "`html_sanitizer`): scripts, frames, forms, every `on*` "
+            "handler and every non-http(s) URL are removed, formatting, "
+            "layout, `<style>` blocks and inline `style` survive. The "
+            "value in every response -- including the echo from this very "
+            "request -- is the **stored, sanitized** one, not what was "
+            "submitted, so the dashboard's editor and the database can "
+            "never disagree about what was kept. Capped at "
+            f"{POST_LOGIN_HTML_MAX_BYTES} UTF-8 bytes of *submitted* "
+            "input; over that is a 400 carrying `max_bytes` and "
+            "`actual_bytes`."
+        ),
+    )
     redirect_url: str | None = Field(default=None, max_length=500)
+    content_mode: str = Field(
+        default=DEFAULT_PORTAL_CONTENT_MODE.value,
+        max_length=20,
+        description=(
+            "What the portal presents as its primary content -- one of "
+            "'login' (default, sign-in card only), 'image', 'text', "
+            "'redirect' (sends the guest to redirect_url), or 'survey'. "
+            "Validated server-side against constants.PortalContentMode; see "
+            "that enum for each mode's source column."
+        ),
+    )
+    content_heading: str | None = Field(
+        default=None, max_length=CONTENT_HEADING_MAX_LENGTH
+    )
+    content_body: str | None = Field(default=None, max_length=CONTENT_BODY_MAX_LENGTH)
+    content_image_url: str | None = Field(default=None, max_length=500)
+    content_survey: dict | None = Field(
+        default=None,
+        description=(
+            "content_mode == 'survey': the survey definition "
+            "({'questions': [...], 'submitLabel': '...'}). Stored verbatim; "
+            "the frontend (PortalSurvey) owns the schema."
+        ),
+    )
     otp_sms_enabled: bool = Field(default=True)
     otp_email_enabled: bool = Field(default=False)
     otp_whatsapp_enabled: bool = Field(
@@ -238,7 +288,25 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
             "over the stripped value in Unicode code points."
         ),
     )
+    post_login_html: str | None = Field(
+        default=None,
+        description=(
+            "Venue-authored post-sign-in HTML -- see the create schema's "
+            "own description for the full contract. Omit the key to leave "
+            "the stored page untouched; send null or an empty string to "
+            "clear it and fall back to today's redirect/success "
+            "behaviour. Sanitized on write; the response echoes the "
+            "sanitized value that was actually stored."
+        ),
+    )
     redirect_url: str | None = Field(default=None, max_length=500)
+    content_mode: str | None = Field(default=None, max_length=20)
+    content_heading: str | None = Field(
+        default=None, max_length=CONTENT_HEADING_MAX_LENGTH
+    )
+    content_body: str | None = Field(default=None, max_length=CONTENT_BODY_MAX_LENGTH)
+    content_image_url: str | None = Field(default=None, max_length=500)
+    content_survey: dict | None = Field(default=None)
     otp_sms_enabled: bool | None = Field(default=None)
     otp_email_enabled: bool | None = Field(default=None)
     otp_whatsapp_enabled: bool | None = Field(default=None)
@@ -317,7 +385,13 @@ class CaptivePortalConfigResponse(BaseModel):
     privacy_policy_url: str | None
     splash_headline: str | None
     splash_welcome_message: str | None
+    post_login_html: str | None
     redirect_url: str | None
+    content_mode: str
+    content_heading: str | None
+    content_body: str | None
+    content_image_url: str | None
+    content_survey: dict | None
     otp_sms_enabled: bool
     otp_email_enabled: bool
     otp_whatsapp_enabled: bool

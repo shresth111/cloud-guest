@@ -1856,3 +1856,299 @@ class TestBootstrapSingleLineCopy:
         for var in ("enroll", "wgcfg", "tunaddr"):
             assert f":local {var}" in joined
             assert f"${var}" in joined
+
+
+# ============================================================================
+# Customer-reachable router endpoints must not carry platform credentials
+# ============================================================================
+#
+# The regression these exist for (2026-09-01): ``RouterResponse`` emitted
+# ``snmp_enabled``/``has_snmp_community``/``snmp_version``/``snmp_port``, and
+# ``RouterCreateRequest``/``RouterUpdateRequest`` accepted plaintext
+# ``snmp_community`` and ``api_secret``. All four routes carrying those
+# schemas are gated on ``routers.read``/``create``/``update`` at
+# *organization* scope -- which ``organization-owner`` holds in full (see
+# ``TestRouterPermissionsAreHeldByCustomerScopedRoles`` below), and which
+# ``LocationProvisioningService`` assigns to every venue owner it
+# provisions. The customer dashboard really does call
+# ``GET /locations/{id}/routers`` for venue liveness, so that payload
+# reached venue-owner browsers, and a venue owner could set the router's
+# SNMP community string and the platform's own RouterOS API secret.
+
+
+class TestRouterPermissionsAreHeldByCustomerScopedRoles:
+    """The premise the split below exists for, asserted rather than assumed.
+
+    If a future seed change genuinely takes ``routers.*`` away from every
+    organization-scoped role, these fail and whoever is reading can decide
+    the split is no longer load-bearing -- rather than the split quietly
+    outliving its reason.
+    """
+
+    @staticmethod
+    def _grants(slug: str):
+        from app.domains.rbac.enums import PermissionModule
+        from app.domains.rbac.seed import SYSTEM_ROLES
+
+        role = next(r for r in SYSTEM_ROLES if r.slug == slug)
+        return role, role.grants().get(PermissionModule.ROUTERS, ())
+
+    def test_organization_owner_holds_routers_read_and_update(self) -> None:
+        from app.domains.rbac.enums import PermissionAction, ScopeType
+
+        role, actions = self._grants("organization-owner")
+        assert role.scope_type == ScopeType.ORGANIZATION
+        assert PermissionAction.READ in actions
+        assert PermissionAction.UPDATE in actions
+        assert PermissionAction.CREATE in actions
+
+    def test_other_customer_scoped_roles_hold_them_too(self) -> None:
+        from app.domains.rbac.enums import PermissionAction, ScopeType
+
+        for slug in ("organization-admin", "msp-owner", "msp-admin"):
+            role, actions = self._grants(slug)
+            assert role.scope_type == ScopeType.ORGANIZATION, slug
+            assert PermissionAction.UPDATE in actions, slug
+
+    def test_an_organization_scoped_grant_can_never_satisfy_a_global_check(
+        self,
+    ) -> None:
+        """The one property the whole fix rests on: pointing the sensitive
+        fields at a ``ScopeType.GLOBAL`` route really does exclude an
+        organization-scoped role, whatever ``X-Organization-Id`` it sends."""
+        from app.domains.rbac.authorization import ScopeResolver
+        from app.domains.rbac.context import GrantScope, ScopeContext
+        from app.domains.rbac.enums import ScopeType
+
+        org_id = uuid.uuid4()
+        grant = GrantScope(scope_type=ScopeType.ORGANIZATION, organization_id=org_id)
+        assert (
+            ScopeResolver.satisfies(
+                grant, ScopeType.GLOBAL, ScopeContext(organization_id=org_id)
+            )
+            is False
+        )
+        # ...while still satisfying the organization-scoped liveness read
+        # the customer dashboard legitimately needs.
+        assert (
+            ScopeResolver.satisfies(
+                grant, ScopeType.LOCATION, ScopeContext(organization_id=org_id)
+            )
+            is True
+        )
+
+
+class TestCustomerReachableRouterSchemasCarryNoCredentials:
+    def test_router_response_has_no_credential_or_snmp_config_field(self) -> None:
+        from app.domains.router.schemas import (
+            CUSTOMER_FORBIDDEN_ROUTER_FIELDS,
+            RouterResponse,
+        )
+
+        leaked = set(RouterResponse.model_fields) & CUSTOMER_FORBIDDEN_ROUTER_FIELDS
+        assert leaked == set(), (
+            f"RouterResponse is returned by organization-scoped routes that a "
+            f"venue owner reaches; it must not carry {sorted(leaked)}. Put the "
+            f"field on RouterPlatformResponse instead."
+        )
+
+    def test_create_and_update_requests_cannot_set_a_secret(self) -> None:
+        from app.domains.router.schemas import (
+            CUSTOMER_FORBIDDEN_ROUTER_FIELDS,
+            RouterCreateRequest,
+            RouterUpdateRequest,
+        )
+
+        for schema in (RouterCreateRequest, RouterUpdateRequest):
+            leaked = set(schema.model_fields) & CUSTOMER_FORBIDDEN_ROUTER_FIELDS
+            assert leaked == set(), (
+                f"{schema.__name__} is accepted by an organization-scoped "
+                f"route; it must not accept {sorted(leaked)}."
+            )
+
+    def test_a_customer_write_carrying_a_secret_never_reaches_the_service(
+        self,
+    ) -> None:
+        """The end the service actually sees. ``update_router`` takes a plain
+        dict, so what matters is that the route's ``model_dump`` of a hostile
+        payload contains no credential key at all -- not merely that the
+        field is undeclared."""
+        from app.domains.router.schemas import (
+            CUSTOMER_FORBIDDEN_ROUTER_FIELDS,
+            RouterCreateRequest,
+            RouterUpdateRequest,
+        )
+
+        hostile = {
+            "api_username": "attacker",
+            "api_secret": "pwned",
+            "snmp_enabled": True,
+            "snmp_community": "public",
+            "snmp_version": "2c",
+            "snmp_port": 1610,
+        }
+        update = RouterUpdateRequest.model_validate({"name": "Front Desk", **hostile})
+        assert set(update.model_dump(exclude_unset=True)) == {"name"}
+
+        create = RouterCreateRequest.model_validate(
+            {
+                "name": "Front Desk",
+                "serial_number": "HB31090ABCD",
+                "mac_address": "AA:BB:CC:DD:EE:FF",
+                "model": "hAP ac2",
+                **hostile,
+            }
+        )
+        assert not set(create.model_dump()) & CUSTOMER_FORBIDDEN_ROUTER_FIELDS
+
+    def test_the_platform_response_still_carries_them(self) -> None:
+        """The Master console must not lose the fields -- only the audience
+        changes."""
+        from app.domains.router.schemas import RouterPlatformResponse
+
+        assert {
+            "snmp_enabled",
+            "has_snmp_community",
+            "snmp_version",
+            "snmp_port",
+        } <= set(RouterPlatformResponse.model_fields)
+
+    def test_the_platform_write_schema_still_carries_them(self) -> None:
+        from app.domains.router.schemas import RouterManagementAccessRequest
+
+        assert {
+            "api_username",
+            "api_secret",
+            "snmp_enabled",
+            "snmp_community",
+            "snmp_version",
+            "snmp_port",
+        } == set(RouterManagementAccessRequest.model_fields)
+
+    def test_the_platform_response_never_echoes_a_plaintext_secret(self) -> None:
+        from app.domains.router.schemas import RouterPlatformResponse
+
+        assert not {
+            "api_secret",
+            "snmp_community",
+            "api_credentials_encrypted",
+            "snmp_community_encrypted",
+        } & set(RouterPlatformResponse.model_fields)
+
+
+class TestPlatformRouterRoutesAreGlobalScopeOnly:
+    """Asserts the route dependencies directly, the same convention
+    ``test_wireguard.py``'s ``TestFleetStatusRouteRequiresPermission`` and
+    ``test_user.py``'s impersonate tests already establish."""
+
+    @staticmethod
+    def _route(path: str, method: str):
+        from app.domains.router.router import router as router_module
+
+        return next(
+            route
+            for route in router_module.routes
+            if route.path == path and method in route.methods  # type: ignore[attr-defined]
+        )
+
+    @staticmethod
+    def _dependency_nonlocals(route):
+        import inspect
+
+        return [
+            inspect.getclosurevars(dependency.dependency).nonlocals
+            for dependency in route.dependencies
+        ]
+
+    def test_platform_read_route_is_routers_read_at_global_scope(self) -> None:
+        from app.domains.rbac.enums import ScopeType
+
+        (nonlocals,) = self._dependency_nonlocals(
+            self._route("/platform/routers/{router_id}", "GET")
+        )
+        assert nonlocals["permission_key"] == "routers.read"
+        assert nonlocals["scope"] == ScopeType.GLOBAL
+
+    def test_management_access_route_is_routers_update_at_global_scope(self) -> None:
+        from app.domains.rbac.enums import ScopeType
+
+        (nonlocals,) = self._dependency_nonlocals(
+            self._route(
+                "/platform/routers/{router_id}/management-access",
+                "PUT",
+            )
+        )
+        assert nonlocals["permission_key"] == "routers.update"
+        assert nonlocals["scope"] == ScopeType.GLOBAL
+
+    def test_the_organization_scoped_routes_serialize_the_customer_safe_shape(
+        self,
+    ) -> None:
+        """The other half: the routes a venue owner reaches must be declared
+        with ``RouterResponse``/``RouterListResponse``, never the platform
+        one. A future edit that swaps the response_model back fails here."""
+        from app.domains.router.schemas import (
+            RouterListResponse,
+            RouterPlatformResponse,
+            RouterResponse,
+        )
+
+        for path, method, expected in (
+            ("/locations/{location_id}/routers", "GET", RouterListResponse),
+            ("/locations/{location_id}/routers", "POST", RouterResponse),
+            ("/routers/{router_id}", "GET", RouterResponse),
+            ("/routers/{router_id}", "PUT", RouterResponse),
+        ):
+            route = self._route(path, method)
+            (inner,) = route.response_model.__pydantic_generic_metadata__["args"]
+            assert inner is expected, (method, path)
+            assert inner is not RouterPlatformResponse
+
+    def test_the_organization_scoped_routes_are_not_global_scoped(self) -> None:
+        """Guards the other direction: these four must stay reachable by the
+        customer dashboard's liveness read and the venue's own network pages.
+        Tightening them to GLOBAL would break both."""
+        from app.domains.rbac.enums import ScopeType
+
+        for path, method in (
+            ("/locations/{location_id}/routers", "GET"),
+            ("/locations/{location_id}/routers", "POST"),
+            ("/routers/{router_id}", "GET"),
+            ("/routers/{router_id}", "PUT"),
+        ):
+            for nonlocals in self._dependency_nonlocals(self._route(path, method)):
+                assert nonlocals["scope"] != ScopeType.GLOBAL, (method, path)
+
+
+class TestLivenessFieldsSurviveOnTheCustomerShape:
+    """``src/lib/location-liveness.ts`` and ``customer.service.ts`` read
+    exactly ``id``/``name``/``status``/``last_seen_at`` off
+    ``GET /locations/{id}/routers``; ``src/services/router.service.ts``'s
+    ``toRouter()`` (which the venue's own DHCP/DNS/VLAN/QoS/hotspot/ISP
+    pages reach through ``listForLocation``) reads the rest. Removing any of
+    them would break the customer dashboard, so they are pinned here."""
+
+    def test_customer_consumed_fields_are_present(self) -> None:
+        from app.domains.router.schemas import RouterResponse
+
+        assert {
+            "id",
+            "location_id",
+            "organization_id",
+            "name",
+            "serial_number",
+            "mac_address",
+            "model",
+            "vendor",
+            "routeros_version",
+            "management_ip_address",
+            "public_ip_address",
+            "status",
+            "last_seen_at",
+            "last_health_check_at",
+            "health_status",
+            "has_api_credentials",
+            "settings",
+            "created_at",
+            "updated_at",
+        } <= set(RouterResponse.model_fields)

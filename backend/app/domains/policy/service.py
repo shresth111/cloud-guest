@@ -672,6 +672,23 @@ class PolicyService:
         ``GUEST``-targeted assignment, which outranks all of the above --
         see ``constants.PolicyAssignmentTargetType.GUEST``'s own
         docstring."""
+        # Tenant isolation: a ``location_id`` named as a resolution key must
+        # belong to the resolving ``organization_id`` (or one of its child
+        # organizations -- ``get_location``'s own scope check allows that).
+        # ``list_candidate_assignments`` matches a LOCATION-scoped assignment
+        # by its ``scope_id`` alone, so without this check a caller scoped to
+        # organization A who passed organization B's ``location_id`` would read
+        # B's location-scoped effective policy. ``get_location`` raises
+        # ``CrossOrganizationLocationAccessError`` on a mismatch (and
+        # ``LocationNotFoundError`` for an unknown id). Skipped when
+        # ``organization_id is None`` -- a platform/GLOBAL caller (who passed
+        # the GLOBAL-scope permission gate) may resolve for any location, and
+        # ``get_location`` itself no-ops on a ``None`` requesting org.
+        if location_id is not None and organization_id is not None:
+            await self.location_lookup.get_location(
+                location_id, requesting_organization_id=organization_id
+            )
+
         candidates = await self.repository.list_candidate_assignments(
             policy_type=policy_type.value,
             organization_id=organization_id,

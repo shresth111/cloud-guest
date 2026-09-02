@@ -145,7 +145,13 @@ class FakeLocationLookup:
             raise CrossOrganizationLocationAccessError()
         return location
 
-    def add(self, *, organization_id: uuid.UUID) -> Location:
+    def add(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
+    ) -> Location:
+        extra = {"id": location_id} if location_id is not None else {}
         location = Location(
             **_base_fields(
                 organization_id=organization_id,
@@ -165,6 +171,7 @@ class FakeLocationLookup:
                 contact_phone=None,
                 contact_email=None,
                 settings={},
+                **extra,
             )
         )
         self.locations[location.id] = location
@@ -316,9 +323,7 @@ class FakePolicyRepository:
                 and assignment.target_id == user_id
             )
             is_role_match = (
-                target_type == "role"
-                and role_ids
-                and assignment.target_id in role_ids
+                target_type == "role" and role_ids and assignment.target_id in role_ids
             )
             is_guest_match = (
                 target_type == "guest"
@@ -360,11 +365,9 @@ class FakePolicyRepository:
         return matches[0] if matches else None
 
 
-def _build_service() -> (
-    tuple[
-        PolicyService, FakePolicyRepository, FakeOrganizationLookup, FakeAuditLogWriter
-    ]
-):
+def _build_service() -> tuple[
+    PolicyService, FakePolicyRepository, FakeOrganizationLookup, FakeAuditLogWriter
+]:
     repo = FakePolicyRepository()
     org_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup()
@@ -1195,6 +1198,11 @@ class TestResolution:
         service, repo, org_lookup, _ = _build_service()
         org = org_lookup.add()
         location_id = uuid.uuid4()
+        # Register the location under this org so resolution's tenant-isolation
+        # check (a resolved ``location_id`` must belong to the resolving org)
+        # passes -- the assignment below is written straight to the repo, but
+        # the location itself must still be a real, org-owned location.
+        service.location_lookup.add(organization_id=org.id, location_id=location_id)
 
         org_policy = await _create_published_session_policy(
             service, organization_id=org.id
@@ -2056,10 +2064,68 @@ class TestTenantIsolation:
         assert len(policies) == 1
         assert policies[0].organization_id == org_a.id
 
+    async def test_resolve_rejects_location_from_another_organization(self) -> None:
+        """A caller scoped to org A resolving with org B's ``location_id`` must
+        be refused -- otherwise (``list_candidate_assignments`` matches a
+        LOCATION-scoped assignment by ``scope_id`` alone) org A could read org
+        B's location-scoped effective policy."""
+        service, _, org_lookup, _ = _build_service()
+        org_a = org_lookup.add()
+        org_b = org_lookup.add()
+        victim_location = service.location_lookup.add(organization_id=org_b.id)
+
+        with pytest.raises(CrossOrganizationLocationAccessError):
+            await service.resolve_effective_policy(
+                policy_type=PolicyType.SESSION,
+                organization_id=org_a.id,
+                location_id=victim_location.id,
+            )
+
+    async def test_resolve_allows_platform_caller_any_location(self) -> None:
+        """A platform/GLOBAL caller (``organization_id is None``, having passed
+        the GLOBAL-scope permission gate) may resolve for any location; the
+        location tenant-check is skipped."""
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        location = service.location_lookup.add(organization_id=org.id)
+
+        resolved = await service.resolve_effective_policy(
+            policy_type=PolicyType.SESSION,
+            organization_id=None,
+            location_id=location.id,
+        )
+        # No assignment exists -> platform default, but crucially no raise.
+        assert resolved.source == "platform_default"
+
 
 # ============================================================================
 # RBAC -- every route in this domain is admin-facing
 # ============================================================================
+
+
+class TestResolveRouteScoping:
+    def test_resolve_takes_organization_from_auth_scope_not_query_param(
+        self,
+    ) -> None:
+        """``GET /policies/resolve`` must resolve ``organization_id`` from
+        ``CurrentOrganization`` (the caller's validated auth scope), not a
+        client-supplied query param -- otherwise an org-scoped admin omitting
+        the header's org while passing ``?organization_id=<other org>`` would
+        read another tenant's effective policy."""
+        from app.domains.rbac.dependencies import CurrentOrganization
+
+        resolve_route = next(
+            route
+            for route in policy_router.routes
+            if getattr(route, "path", "") == "/policies/resolve"
+        )
+        dependant = resolve_route.dependant
+
+        query_names = {param.name for param in dependant.query_params}
+        assert "organization_id" not in query_names
+
+        dependency_calls = {dep.call for dep in dependant.dependencies}
+        assert CurrentOrganization in dependency_calls
 
 
 class TestEveryRouteRequiresPermission:
@@ -2072,6 +2138,6 @@ class TestEveryRouteRequiresPermission:
             # docstring -- there is no guest-facing route at all here), so
             # every one of them must carry the RequirePermission dependency
             # supplied via its own @router.<method>(..., dependencies=[...]).
-            assert (
-                route.dependencies != []
-            ), f"{route.path} ({route.methods}) has no permission dependency"
+            assert route.dependencies != [], (
+                f"{route.path} ({route.methods}) has no permission dependency"
+            )

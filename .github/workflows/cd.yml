@@ -215,7 +215,7 @@ jobs:
           # deploy. ubuntu is already in the docker group.
           jq -n --arg b64 "$SCRIPT_B64" --arg image "$IMAGE" '{
             commands: [
-              "set -euo pipefail",
+              "set -eu",
               ("echo \($b64) | base64 -d > /tmp/remote-deploy.sh"),
               "chmod 0755 /tmp/remote-deploy.sh",
               ("sudo -u ubuntu -H env AWS_REGION=ap-south-1 /tmp/remote-deploy.sh api \($image)"),

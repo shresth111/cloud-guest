@@ -63,10 +63,60 @@ API-key system needs, since the stored value is Fernet-encrypted
 (`encrypt_secret`, reused from `app.domains.router.crypto`, unchanged from
 before this extension) and never logged or persisted in plaintext.
 
-`POST /radius/nas/{id}/regenerate-secret` invalidates the old secret
-immediately and returns the new one the same way -- it does not require or
+`POST /platform/radius/nas/{id}/regenerate-secret` invalidates the old
+secret and returns the new one the same way -- it does not require or
 change the NAS's own `status`, since rotating a compromised secret on a
 currently-disabled NAS is a legitimate, independent action.
+
+Two things about it changed on 2026-09-02, and both were live defects.
+
+*It now pushes.* `RadiusService.regenerate_secret` takes a **mandatory**
+`push_secret` and calls it *before* the database write. Until then the
+rotate was database-only: the row took the new secret, the hub's
+`client{}` stanza kept the old one, the router kept the old one, and every
+guest login at that venue Access-Rejected from that instant with nothing in
+any log naming the cause. The reconciliation sweep did not repair it --
+`rebind_nas_for_router` fires on *address* drift and deliberately re-pushes
+the stored secret, so a secret-only divergence never triggered it. Making
+the argument required rather than optional is the point: the broken state
+is now unreachable from any caller, including a future one.
+
+*It moved to the platform namespace.* `radius.execute` is held at
+organization scope by `organization-owner`, so the old path was reachable
+by a venue owner -- and the customer dashboard really did wire a
+"Regenerate secret" button in their own NAS detail page to it, with no
+confirmation. A rotation cannot be completed from a dashboard: nothing in
+this codebase can write a RADIUS client onto RouterOS, so the new secret
+has to be pasted in over WinBox before the venue works again. The button is
+gone from the customer dashboard and the route is `ScopeType.GLOBAL`, the
+same posture `GET /platform/routers/{id}` and the WireGuard domain already
+carry.
+
+*So did `activate` and `disable` (2026-09-02).* That first move fixed one
+of the three `radius.execute` routes and left two behind, which meant the
+argument above was written down in one place while two routes carrying the
+same permission key and the same blast radius stayed on the venue owner's
+own dashboard. `disable` is the sharp one: it is a pure database write --
+`disable_nas` sets `status`/`is_active` and returns, with no hub call and
+no device call -- and `authenticate_nas` accepts only an `ACTIVE` NAS, so
+every guest login at that venue starts failing on the next Access-Request
+with nothing in any log naming the cause. It is worth being straight that
+this is *not* the rotate argument: a disable is reversible, and by the same
+role, since `activate` sat next to it. The reason it moved is that no
+product surface ever asked for a venue-owner kill switch -- the buttons
+existed because this status graph had been mirrored into the customer
+dashboard, and an internal lifecycle model is not a feature. A venue
+owner's own intent to stop serving guests is modeled in captive-portal
+business hours / closed state, which is where it belongs. `activate`
+followed both because the pair is meaningless split and because
+`SUSPENDED -> ACTIVE` is a legal edge, which made it a customer's way out
+of a platform-imposed hold the moment a suspend path exists.
+
+The rule the platform section now carries is stated for the *key*, not for
+the three routes that exist today: no `radius.execute` route in this domain
+is organization-scoped, asserted in
+`TestNasSecretRotationIsPlatformOnly::test_no_radius_execute_route_is_org_scoped`
+so that a fourth one added to `nas_router` later fails by construction.
 
 ## 3. Status lifecycle: real graph, `ACTIVE`-by-default registration
 

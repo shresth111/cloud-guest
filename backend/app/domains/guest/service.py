@@ -4119,6 +4119,28 @@ class RadiusNasSecretRegenerationResult:
     shared_secret: str
 
 
+class NasSecretPushProtocol(Protocol):
+    """"Put this secret into the real FreeRADIUS server's ``client{}``
+    stanza, or raise."
+
+    A *required* collaborator of ``RadiusService.regenerate_secret`` -- the
+    whole point of it existing is that there is no way to call that method
+    without one. See that method's own docstring for the fault this shape
+    is written against (2026-09-02: a rotate wrote the new secret to the
+    database, never told the hub, reported success, and every guest login
+    at the venue Access-Rejected from that moment on).
+
+    Narrow by construction, like ``router_lookup``/``location_lookup``/
+    ``queue_lookup`` above: the caller already knows the NAS identifier and
+    the tunnel address to bind the stanza to, and this domain deliberately
+    does not -- ``RadiusService`` has no WireGuard collaborator and should
+    not grow one. All it needs to know is that somebody else's push either
+    returned or raised.
+    """
+
+    async def __call__(self, secret: str) -> None: ...
+
+
 class QueueRateLimitLookupProtocol(Protocol):
     """The single method ``RadiusService.authorize``'s optional
     ``queue_lookup`` hook needs from the real
@@ -4470,20 +4492,66 @@ class RadiusService:
         nas_id: uuid.UUID,
         requesting_organization_id: uuid.UUID | None,
         actor_user_id: uuid.UUID | None,
+        push_secret: NasSecretPushProtocol,
         length_bytes: int = NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
     ) -> RadiusNasSecretRegenerationResult:
-        """Generates a brand-new shared secret and immediately overwrites
-        ``shared_secret_encrypted`` -- the old secret is never recoverable
-        again after this call (Fernet-encrypted, not hashed, but the
-        plaintext itself is never retained anywhere once this method
-        returns). Does not require any particular current ``status`` -- an
-        operator may want to rotate a compromised secret on a
-        currently-``DISABLED``/``SUSPENDED`` NAS too, and this action never
-        changes ``status`` itself."""
+        """Generates a brand-new shared secret, **hands it to the hub
+        first**, and only then overwrites ``shared_secret_encrypted`` -- the
+        old secret is never recoverable again after that write
+        (Fernet-encrypted, not hashed, but the plaintext itself is never
+        retained anywhere once this method returns). Does not require any
+        particular current ``status`` -- an operator may want to rotate a
+        compromised secret on a currently-``DISABLED``/``SUSPENDED`` NAS
+        too, and this action never changes ``status`` itself.
+
+        PUSH BEFORE WRITE, AND ``push_secret`` IS NOT OPTIONAL. Until
+        2026-09-02 this method took no such argument and did the database
+        write alone, which meant a rotate left three places disagreeing:
+        the row held the new secret, the hub's ``client{}`` stanza held the
+        old one, and the router held the old one. FreeRADIUS answers an
+        Access-Request whose authenticator was computed with a secret that
+        is not the one in ``clients.conf`` with a bare Access-Reject, so
+        every guest login at the venue failed from that instant, and
+        nothing anywhere named the cause. The 5-minute reconciliation
+        sweep did not repair it either: ``rebind_nas_for_router`` fires on
+        *address* drift and deliberately re-pushes the stored secret, so a
+        secret-only divergence is invisible to it.
+
+        The ordering is what makes that unreachable, and it is the same one
+        ``record_hub_client_sync``/``rebind_nas_for_router`` already
+        established for the address half. If ``push_secret`` raises, this
+        method raises the same exception and has written nothing: the row,
+        the hub and the device all still hold the old secret, which is a
+        *working* venue. Rotation now fails loudly where it used to
+        half-succeed silently, and that is the intended behaviour change.
+
+        The reverse ordering was considered and rejected. Writing first and
+        rolling back on a failed push cannot be made safe: the old
+        plaintext would have to be re-encrypted and re-written by a second
+        database call that can itself fail, and the window in between is
+        precisely the broken state. The residual risk here is the mirror
+        image -- push succeeds, the database write then fails, and the hub
+        is briefly *ahead* of the row -- and that one is recoverable
+        without a site visit, because re-running the push with the stored
+        (old) secret restores service, which is exactly what
+        ``register-external`` and the reconciliation sweep both already do.
+        Ahead-hub is a bad minute; ahead-database was a dead venue.
+
+        WHAT THIS STILL CANNOT DO is write the new secret onto the router.
+        Nothing in this codebase can -- the RADIUS chunk is pasted into
+        RouterOS by hand. So a rotate that returns successfully has still
+        taken the venue's guest WiFi down until somebody does that, and the
+        caller is responsible for saying so; see
+        ``schemas.RadiusNasSecretRotatedResponse``.
+        """
         nas_client = await self.get_nas_client(
             nas_id, requesting_organization_id=requesting_organization_id
         )
         plaintext_secret = generate_shared_secret(length_bytes)
+        # Raises straight through on failure -- deliberately not caught and
+        # not translated. Nothing below this line has run, so there is
+        # nothing to undo.
+        await push_secret(plaintext_secret)
         updated = await self.repository.update_nas_client(
             nas_client,
             {
