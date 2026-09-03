@@ -84,7 +84,6 @@ async def main() -> int:
         get_access_validator,
         get_current_user,
     )
-    from app.domains.router.models import Router
     from app.domains.vlan.router import router as vlan_router
 
     url = str(get_settings().database_url)
@@ -148,8 +147,10 @@ async def main() -> int:
         if push.status_code >= 300:
             print(push.text[:900])
         else:
-            print(f"device_push_status={body.get('devicePushStatus') or body.get('device_push_status')!r}")
-            print(f"device_push_error={body.get('devicePushError') or body.get('device_push_error')!r}")
+            status = body.get("devicePushStatus") or body.get("device_push_status")
+            error = body.get("devicePushError") or body.get("device_push_error")
+            print(f"device_push_status={status!r}")
+            print(f"device_push_error={error!r}")
 
         device_state(router_row, "AFTER PUSH")
 
