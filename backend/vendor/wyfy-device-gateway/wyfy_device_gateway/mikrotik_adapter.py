@@ -1904,13 +1904,40 @@ class MikroTikAdapter:
         """Access mode gave a physical port the subnet directly, after
         pulling it out of the shared bridge.
 
-        The address is removed. The port is **not** put back into a bridge:
-        which bridge it belonged to was never recorded, and re-adding it to
-        a guessed one would silently rejoin a port to the wrong L2 segment.
-        The port is left out of every bridge, holding no address -- inert
-        and safe, and visible to an operator as an unbridged port.
+        The address is removed, and the port is put back into
+        ``vlan.previous_bridge`` when the caller recorded one.
+
+        This used to deliberately leave the port unbridged, reasoning that
+        which bridge it came from "was never recorded" and that rejoining a
+        guessed one would be worse. Both halves of that were right; the
+        conclusion was not. A venue's access point sat on an unbridged port
+        with the guest network down, and the product had no way to undo what
+        it had done -- an engineer restored it by hand. The fix was to record
+        the bridge (see :class:`VlanConfig.previous_bridge`), not to keep
+        declining to.
+
+        Still no guessing: with ``previous_bridge`` unset the port is left
+        out of every bridge exactly as before, because "in no bridge" is
+        then the truthful previous state rather than an unknown one.
+
+        ``pvid`` is copied from a sibling port of that same bridge rather
+        than defaulted to 1 -- on a VLAN-filtering bridge the siblings'
+        value is the one that makes untagged ingress land where the rest of
+        that segment lands, and 1 would be a guess dressed as a default.
         """
         self._remove_ip_address(api, vlan.ip_cidr, vlan.interface)
+        if not vlan.previous_bridge:
+            return
+        ports = list(api.path("interface", "bridge", "port"))
+        if any(row.get("interface") == vlan.interface for row in ports):
+            return  # already bridged -- somebody restored it first
+        siblings = [
+            row for row in ports if row.get("bridge") == vlan.previous_bridge
+        ]
+        pvid = str(siblings[0].get("pvid")) if siblings else "1"
+        api.path("interface", "bridge", "port").add(
+            interface=vlan.interface, bridge=vlan.previous_bridge, pvid=pvid
+        )
 
     def _remove_ip_address(self, api, ip_cidr: str | None, interface: str) -> None:
         """Removes that exact address from that exact interface.

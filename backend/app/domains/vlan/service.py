@@ -615,7 +615,29 @@ class VlanService:
             # named interface exist on it, is this subnet already taken.
             # Inside the try because a preflight failure is a real push
             # failure and belongs in device_push_error like any other.
-            await self._preflight_device(vlan, credentials, adapter)
+            snapshot = await self._preflight_device(vlan, credentials, adapter)
+
+            # Before the push takes the port, record which bridge it is in.
+            # Access mode pulls a physical port out of its bridge, and until
+            # this was recorded the product could not put it back -- a
+            # venue's access point was left on an unbridged port with the
+            # guest network down, restored by hand. Written from the same
+            # snapshot the preflight already read, so it cannot disagree
+            # with what the preflight validated against.
+            #
+            # ``None`` is a real answer, not a missing one: a port that was
+            # in no bridge should be left in none on delete.
+            if vlan.port_mode == "access":
+                current = next(
+                    (i for i in snapshot.interfaces if i.name == vlan.interface),
+                    None,
+                )
+                previous_bridge = current.bridge if current else None
+                if vlan.previous_bridge != previous_bridge:
+                    await self.repository.update_vlan(
+                        vlan, {"previous_bridge": previous_bridge}
+                    )
+                    await self.repository.commit()
 
             await adapter.configure_vlan(
                 credentials,
@@ -770,12 +792,17 @@ class VlanService:
         vlan: Vlan,
         credentials: VlanCredentials,
         adapter: BaseVlanAdapter,
-    ) -> None:
+    ) -> VlanNetworkSnapshot:
         """The three preconditions that need the router, in one read.
 
         Reachability is not checked separately -- it *is* this read: a
         router that does not answer raises ``VlanDeviceConnectionError``
         from the adapter before any of the rest is evaluated.
+
+        Returns the snapshot rather than discarding it: the push needs one
+        more fact from the same read -- which bridge an access-mode port is
+        currently in -- and taking a second read to learn it would let the
+        two answers disagree.
         """
         snapshot = await adapter.read_network_snapshot(credentials)
         names = {interface.name for interface in snapshot.interfaces}
@@ -788,6 +815,7 @@ class VlanService:
                 raise VlanAccessPortNotFoundError(vlan.interface, credentials.host)
             raise VlanParentInterfaceNotFoundError(vlan.interface, credentials.host)
         self._check_subnet_conflict(vlan, snapshot, credentials.host)
+        return snapshot
 
     def _check_subnet_conflict(
         self, vlan: Vlan, snapshot: VlanNetworkSnapshot, host: str
@@ -960,6 +988,10 @@ class VlanService:
             interface=vlan.interface,
             ip_cidr=self._device_address(vlan),
             port_mode=vlan.port_mode,
+            # Recorded at push time for access mode -- this is what lets the
+            # port go back to the bridge the VLAN took it from. See
+            # ``Vlan.previous_bridge``.
+            previous_bridge=vlan.previous_bridge,
         )
 
     @staticmethod

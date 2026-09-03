@@ -159,6 +159,18 @@ class VlanConfig:
     interface: str
     ip_cidr: str | None
     port_mode: str = "trunk"
+    # The bridge this port belonged to before an access-mode VLAN took it,
+    # so deleting the VLAN can put it back. Set by the caller from the
+    # device snapshot taken before the push; ``None`` means the port was in
+    # no bridge, and the delete leaves it that way.
+    #
+    # This exists because the alternative was unrecoverable. ``delete_vlan``
+    # used to leave the port out of every bridge on the grounds that "which
+    # bridge it belonged to was never recorded" -- which is true, and the
+    # consequence was a venue whose access point sat on an unbridged port
+    # until somebody restored it by hand. Recording it is what makes the
+    # operation reversible by the product rather than by an engineer.
+    previous_bridge: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -665,6 +665,7 @@ class FakeVlanAdapter:
         interface: str,
         ip_cidr: str | None,
         port_mode: str,
+        previous_bridge: str | None = None,
     ) -> None:
         self.deletes.append(
             {
@@ -673,6 +674,9 @@ class FakeVlanAdapter:
                 "interface": interface,
                 "ip_cidr": ip_cidr,
                 "port_mode": port_mode,
+                # Recorded so a test can assert the port goes back to the
+                # bridge an access-mode push took it from.
+                "previous_bridge": previous_bridge,
             }
         )
         if self.delete_raises is not None:
@@ -816,6 +820,9 @@ class TestVlanDeleteReachesTheDevice:
                 "interface": "bridge",
                 "ip_cidr": "192.168.10.1/24",
                 "port_mode": "trunk",
+                # A trunk VLAN never took a port, so there is no bridge to
+                # give back -- see Vlan.previous_bridge.
+                "previous_bridge": None,
             }
         ]
         assert deleted.is_deleted is True
@@ -1152,6 +1159,67 @@ class TestVlanDevicePreflight:
                 requesting_organization_id=router.organization_id,
             )
         assert adapter.calls == []
+
+    async def test_an_access_push_records_the_bridge_it_takes_the_port_from(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The incident this closes: an access VLAN took ether2 out of the
+        bridge the guest portal is bound to, the access point went dark, and
+        the product had no way to put the port back because it had never
+        recorded where the port came from. An engineer restored it by hand.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether2", port_mode="access")
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.previous_bridge == "bridge"
+
+    async def test_deleting_that_vlan_hands_the_recorded_bridge_to_the_device(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether2", port_mode="access")
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        await h.service.delete_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.deletes[-1]["previous_bridge"] == "bridge"
+
+    async def test_a_trunk_push_records_no_previous_bridge(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A trunk VLAN never takes a port, so there is nothing to give
+        back -- and a value here would be a claim about a port this VLAN
+        does not own."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="bridge", port_mode="trunk")
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.previous_bridge is None
 
     async def test_a_subnet_the_router_already_carries_is_refused(
         self, adapter: FakeVlanAdapter

@@ -188,6 +188,7 @@ class BaseVlanAdapter(Protocol):
         interface: str,
         ip_cidr: str | None,
         port_mode: str,
+        previous_bridge: str | None = None,
     ) -> None:
         """Removes what ``configure_vlan`` created, for the same
         ``port_mode``.
@@ -445,6 +446,7 @@ class MikroTikVlanAdapter:
         interface: str,
         ip_cidr: str | None,
         port_mode: str,
+        previous_bridge: str | None = None,
     ) -> None:
         creds = self._gateway_credentials(credentials)
         config = VlanConfig(
@@ -453,6 +455,7 @@ class MikroTikVlanAdapter:
             interface=interface,
             ip_cidr=ip_cidr,
             port_mode=port_mode,
+            previous_bridge=previous_bridge,
         )
         try:
             await get_adapter(DeviceVendor.MIKROTIK).delete_vlan(creds, vlan=config)

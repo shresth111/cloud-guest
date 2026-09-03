@@ -2746,3 +2746,128 @@ async def test_an_already_enabled_coa_listener_is_not_rewritten(
     assert [
         s for s, _ in api.update_calls if s == ("radius", "incoming")
     ] == []
+
+
+# ----------------------------------------------------------------------
+# Access-mode VLAN: giving the port back.
+#
+# Access mode pulls a physical port out of its bridge. Until `VlanConfig`
+# carried `previous_bridge`, delete left it unbridged -- a venue's access
+# point sat on a dead port with the guest network down until an engineer
+# restored it by hand.
+# ----------------------------------------------------------------------
+
+
+def _bridged(*interfaces, bridge="bridge", pvid="1"):
+    return [
+        {".id": f"*{i + 1}", "interface": name, "bridge": bridge, "pvid": pvid}
+        for i, name in enumerate(interfaces)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deleting_an_access_vlan_returns_the_port_to_its_bridge(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(
+        menus={
+            ("interface", "bridge", "port"): _bridged("ether3", "ether4"),
+            ("ip", "address"): [
+                {".id": "*9", "address": "10.30.30.1/24", "interface": "ether2"}
+            ],
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_vlan(
+        mikrotik_creds,
+        vlan=VlanConfig(
+            vlan_id=100,
+            name="admin",
+            interface="ether2",
+            ip_cidr="10.30.30.1/24",
+            port_mode="access",
+            previous_bridge="bridge",
+        ),
+    )
+
+    members = {
+        str(r.get("interface")): str(r.get("bridge"))
+        for r in api.path("interface", "bridge", "port")
+    }
+    assert members["ether2"] == "bridge"
+    # And the address it was given is gone.
+    assert [r for r in api.path("ip", "address")] == []
+
+
+@pytest.mark.asyncio
+async def test_the_restored_port_copies_its_siblings_pvid(
+    patch_connect, mikrotik_creds
+):
+    """On a VLAN-filtering bridge the siblings' pvid is what makes untagged
+    ingress land where the rest of that segment lands. Defaulting to 1 would
+    be a guess dressed as a default."""
+    api = FakeRouterOSApi(
+        menus={
+            ("interface", "bridge", "port"): _bridged("ether3", pvid="20"),
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_vlan(
+        mikrotik_creds,
+        vlan=VlanConfig(
+            vlan_id=100, name="admin", interface="ether2", ip_cidr=None,
+            port_mode="access", previous_bridge="bridge",
+        ),
+    )
+
+    added = next(
+        fields for segments, fields in api.add_calls
+        if segments == ("interface", "bridge", "port")
+    )
+    assert added["pvid"] == "20"
+
+
+@pytest.mark.asyncio
+async def test_without_a_recorded_bridge_the_port_is_left_unbridged(
+    patch_connect, mikrotik_creds
+):
+    """`None` is the truthful previous state for a port that was in no
+    bridge -- rejoining a guessed one would put it on the wrong segment."""
+    api = FakeRouterOSApi(
+        menus={("interface", "bridge", "port"): _bridged("ether3")}
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_vlan(
+        mikrotik_creds,
+        vlan=VlanConfig(
+            vlan_id=100, name="admin", interface="ether2", ip_cidr=None,
+            port_mode="access", previous_bridge=None,
+        ),
+    )
+
+    assert [s for s, _ in api.add_calls if s == ("interface", "bridge", "port")] == []
+
+
+@pytest.mark.asyncio
+async def test_a_port_somebody_already_restored_is_not_added_twice(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(
+        menus={("interface", "bridge", "port"): _bridged("ether3", "ether2")}
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_vlan(
+        mikrotik_creds,
+        vlan=VlanConfig(
+            vlan_id=100, name="admin", interface="ether2", ip_cidr=None,
+            port_mode="access", previous_bridge="bridge",
+        ),
+    )
+
+    members = [str(r.get("interface")) for r in api.path("interface", "bridge", "port")]
+    assert members.count("ether2") == 1
+    assert [s for s, _ in api.add_calls if s == ("interface", "bridge", "port")] == []
