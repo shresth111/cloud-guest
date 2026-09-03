@@ -331,7 +331,7 @@ async def agent_netwatch_event(
     ``RouterAgentService.report_netwatch_event`` additionally records a
     real, queryable ``RouterEvent`` proving this call landed -- see that
     method's own docstring."""
-    link = await isp_service.get_link(uuid.UUID(payload.isp_link_id))
+    link = await isp_service.get_link(payload.isp_link_id)
     validate_netwatch_link_owned_by_router(
         link.router_id, identity.router.id, isp_link_id=link.id
     )

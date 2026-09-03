@@ -754,7 +754,17 @@ class RouterService:
         if router.status != RouterStatus.PENDING_PROVISIONING.value:
             raise ProvisioningTokenRouterStateError(router.id, router.status)
 
-        await self.repository.mark_provisioning_token_used(token, used_at=now)
+        consumed = await self.repository.mark_provisioning_token_used(
+            token, used_at=now
+        )
+        if not consumed:
+            # Lost the race: another concurrent check-in for this same
+            # token committed its atomic compare-and-set first. Treat it
+            # exactly like the upfront ``token.is_used()`` check above --
+            # the TOCTOU window between that read and this write is
+            # precisely what the compare-and-set in
+            # ``mark_provisioning_token_used`` closes.
+            raise ProvisioningTokenAlreadyUsedError()
         updated = await self.repository.update_router(
             router,
             {"status": RouterStatus.PROVISIONING.value, "last_seen_at": now},

@@ -297,9 +297,13 @@ class FakeRouterRepository:
             (t for t in self.tokens.values() if t.token_hash == token_hash), None
         )
 
-    async def mark_provisioning_token_used(self, token, *, used_at: object):
+    async def mark_provisioning_token_used(self, token, *, used_at: object) -> bool:
+        """Mirrors the real repository's compare-and-set semantics: a
+        no-op (returning ``False``) if the token was already used."""
+        if token.used_at is not None:
+            return False
         token.used_at = used_at
-        return token
+        return True
 
 
 # ============================================================================
