@@ -210,10 +210,42 @@ class DhcpPoolConfig:
 
 @dataclass(frozen=True, slots=True)
 class PortForwardConfig:
-    protocol: str          # "tcp" | "udp"
+    """One inbound port-forwarding (DSTNAT) rule to realize on a device.
+
+    Sibling of :class:`NatRuleConfig` -- both land in ``/ip firewall nat``,
+    but on opposite chains and in opposite directions
+    (``dstnat``/``dst-nat`` inbound here, ``srcnat``/``masquerade``
+    outbound there) -- and it carries its identity for the same reason.
+
+    ``rule_id`` is the caller's own stable handle for this rule (the
+    ``port_forwarding_rules`` row id), carried for identity and written to
+    no RouterOS field except the comment. Every *other* field here is one a
+    customer edits in the dashboard: the external port they publish, the
+    host behind it, its port, the protocol. Keying the rule on any of them
+    means the next push finds no match, adds a second rule, and leaves the
+    first one still forwarding the same public port to a host that may no
+    longer be there -- silent, cumulative, and invisible in this platform's
+    own UI. See ``mikrotik_adapter.configure_port_forward``.
+
+    ``protocol`` accepts ``"both"`` in addition to ``"tcp"``/``"udp"``,
+    because that is what the domain's own rules can say. RouterOS cannot
+    express it on a single rule (``dst-port`` is only valid alongside a
+    tcp/udp ``protocol``), so the vendor adapter realizes it as one device
+    rule per transport -- see that method's docstring.
+
+    ``dst_address``/``src_address`` are ``None`` for "any", matching the
+    nullable columns they come from. ``src_address`` in particular is a
+    restriction: dropping it on the way to the device would publish a port
+    the operator meant to expose to one network to the whole internet.
+    """
+
+    rule_id: str
+    protocol: str  # "tcp" | "udp" | "both"
     external_port: int
     internal_ip: str
     internal_port: int
+    dst_address: str | None = None
+    src_address: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -538,6 +570,24 @@ class DeviceGatewayAdapter(Protocol):
     async def configure_port_forward(
         self, creds: DeviceCredentials, *, rule: PortForwardConfig
     ) -> None: ...
+
+    async def delete_port_forward(
+        self, creds: DeviceCredentials, *, rule: PortForwardConfig
+    ) -> None:
+        """Takes one port-forwarding rule back off the device.
+
+        Only ``rule.rule_id`` is consulted, by the same comment identity
+        :meth:`configure_port_forward` writes under -- so a rule left from
+        an earlier external port or internal host is still this row's rule
+        and is removed too. Matching on the current field values is exactly
+        how one would be orphaned instead: still forwarding a public port,
+        with nothing in this platform left pointing at it.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error.
+        """
+        ...
+
     async def set_radius_client_config(
         self, creds: DeviceCredentials, *, config: RadiusClientConfig
     ) -> None: ...

@@ -134,6 +134,49 @@ def _nat_rule_comment(vlan_id: int) -> str:
     return f"{_NAT_RULE_COMMENT_PREFIX}{vlan_id}"
 
 
+# Port forwarding: the same marker trick, for the same reason. The handle
+# is the caller's own row id, because every RouterOS field on a DSTNAT rule
+# -- dst-port, to-addresses, to-ports, protocol -- is one a customer edits.
+# ``<prefix><rule_id> <protocol>``: one device rule per transport, because a
+# "both" rule cannot be expressed as one (see ``configure_port_forward``),
+# and the trailing token keeps the two apart without giving up the row's
+# single identity.
+_PORT_FORWARD_COMMENT_PREFIX = "WyfyGuest PF "
+# The transports a "both" rule really means on a device.
+_PORT_FORWARD_BOTH_PROTOCOLS = ("tcp", "udp")
+
+
+def _port_forward_comment(rule_id: str, protocol: str) -> str:
+    return f"{_PORT_FORWARD_COMMENT_PREFIX}{rule_id} {protocol}"
+
+
+def _port_forward_protocols(protocol: str) -> tuple[str, ...]:
+    """Which transports one stored rule occupies on the device.
+
+    ``both`` is a value this platform's own port-forwarding domain stores
+    and defaults to, not a RouterOS one: ``dst-port`` is only accepted
+    alongside a tcp or udp ``protocol``, so a single rule cannot say it.
+    ``render_port_forwarding_rule`` handles the same case by omitting
+    ``protocol=`` entirely, which a real router rejects.
+    """
+    if protocol.strip().lower() == "both":
+        return _PORT_FORWARD_BOTH_PROTOCOLS
+    return (protocol,)
+
+
+def _owns_port_forward_comment(comment: object, rule_id: str) -> bool:
+    """Whether a ``/ip firewall nat`` row belongs to this stored rule.
+
+    Prefix-matched on the id and then on a separator, never on the bare
+    prefix: matching ``"WyfyGuest PF <id>"`` alone would also claim a row
+    belonging to a rule whose id merely starts with these characters.
+    """
+    if not isinstance(comment, str):
+        return False
+    owner = f"{_PORT_FORWARD_COMMENT_PREFIX}{rule_id}"
+    return comment == owner or comment.startswith(f"{owner} ")
+
+
 class _HotspotNames:
     """The six RouterOS object names one VLAN's captive portal occupies.
 
@@ -1817,7 +1860,33 @@ class MikroTikAdapter:
         """Ported from
         ``network_config/renderers.py::render_port_forwarding_rule`` --
         same real ``/ip firewall nat add chain=dstnat ... action=dst-nat``
-        operation, issued directly over the structured API."""
+        operation, issued directly over the structured API.
+
+        **The comment is the rule's identity**, exactly as it is for
+        :meth:`configure_nat_masquerade`, and for the same reason. This was
+        an unconditional ``.add()``, so the second push of an unchanged
+        rule died on RouterOS's "already have such item" -- and re-pushing
+        is an ordinary operation, not a recovery step. Keying instead on
+        any RouterOS field would be worse than failing: ``dst-port``,
+        ``to-addresses``, ``to-ports`` and ``protocol`` are precisely what
+        a customer edits, so the push after an edit would match nothing,
+        add a second rule, and leave the old one forwarding a live public
+        port at a host that has moved. Keyed on the row's own id, the same
+        push finds what it wrote last time and *updates* it.
+
+        A ``"both"`` rule becomes two device rules, one per transport,
+        under ``<id> tcp`` and ``<id> udp``. RouterOS cannot express "both"
+        on a rule carrying a ``dst-port`` (see
+        :func:`_port_forward_protocols`), and this domain both stores and
+        defaults to that value, so refusing it would make the ordinary case
+        unpushable. Narrowing a rule from both to one transport reaps the
+        other's row rather than leaving it forwarding.
+
+        ``disabled`` is normalized back to ``no`` via :func:`_is_truthy`,
+        never by string comparison: a rule someone disabled by hand is
+        forwarding nothing, and a re-push is the operator asking for it
+        back.
+        """
         await asyncio.to_thread(self._configure_port_forward_sync, creds, rule)
 
     def _configure_port_forward_sync(
@@ -1826,18 +1895,126 @@ class MikroTikAdapter:
         api = self._connect_api(creds)
         try:
             try:
-                fields: dict[str, str] = {
-                    "chain": "dstnat",
-                    "protocol": rule.protocol,
-                    "action": "dst-nat",
-                    "to-addresses": rule.internal_ip,
-                    "to-ports": str(rule.internal_port),
-                }
-                fields["dst-port"] = str(rule.external_port)
-                api.path("ip", "firewall", "nat").add(**fields)
+                self._ensure_port_forward_rules(api, rule)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"configure_port_forward: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _port_forward_desired(
+        self, rule: PortForwardConfig, protocol: str
+    ) -> dict[str, str]:
+        """The complete state one device rule should be in.
+
+        ``chain`` and ``action`` belong to the desired state, not only to
+        the ``add``: a row found under this rule's comment but sitting on
+        the wrong chain is this rule in a broken state, and correcting it
+        is right where adding a second one alongside would not be.
+
+        The two optional matchers are carried as ``""`` when unset rather
+        than omitted, so that clearing a source restriction on the row
+        really clears it on the device. Omitting them from the comparison
+        would let a rule the operator narrowed to one source and then
+        widened stay narrow, and the reverse -- a rule left restricted to a
+        network that no longer exists -- forwards nothing while reporting
+        success.
+        """
+        return {
+            "chain": "dstnat",
+            "action": "dst-nat",
+            "protocol": protocol,
+            "dst-port": str(rule.external_port),
+            "to-addresses": rule.internal_ip,
+            "to-ports": str(rule.internal_port),
+            "dst-address": rule.dst_address or "",
+            "src-address": rule.src_address or "",
+        }
+
+    def _ensure_port_forward_rules(self, api, rule: PortForwardConfig) -> None:
+        """Brings this rule's whole set of device rows into line: update
+        what is already there under its comment, add what is missing, drop
+        what it no longer claims."""
+        wanted = {
+            _port_forward_comment(rule.rule_id, protocol): protocol
+            for protocol in _port_forward_protocols(rule.protocol)
+        }
+        menu = api.path("ip", "firewall", "nat")
+        # Materialized before any write: adds append to the same live menu,
+        # and iterating it while writing would revisit rows this call made.
+        rows = [
+            row
+            for row in menu
+            if _owns_port_forward_comment(row.get("comment"), rule.rule_id)
+        ]
+        found: set[str] = set()
+        for row in rows:
+            comment = str(row.get("comment"))
+            protocol = wanted.get(comment)
+            if protocol is None:
+                # This rule's own row for a transport it no longer matches
+                # -- left in place it would keep forwarding the port.
+                menu.remove(row[".id"])
+                continue
+            found.add(comment)
+            desired = self._port_forward_desired(rule, protocol)
+            changed = {
+                key: value
+                for key, value in desired.items()
+                if str(row.get(key) or "") != value
+            }
+            # Boolean, never string -- see ``_is_truthy``. RouterOS accepts
+            # "no" on write and answers reads with a real bool, so comparing
+            # the raw value against "no" reports a difference on every push
+            # and issues a pointless update forever.
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+        for comment, protocol in wanted.items():
+            if comment in found:
+                continue
+            # Empty optional matchers are dropped here, not sent blank: an
+            # ``add`` naming a field with no value is not the same request
+            # as one that never named it.
+            fields = {
+                key: value
+                for key, value in self._port_forward_desired(rule, protocol).items()
+                if value != ""
+            }
+            menu.add(**fields, comment=comment, disabled="no")
+
+    async def delete_port_forward(
+        self, creds: DeviceCredentials, *, rule: PortForwardConfig
+    ) -> None:
+        """Removes every device row this rule owns, by the same comment
+        identity :meth:`configure_port_forward` writes them under.
+
+        Only ``rule.rule_id`` is read. The current field values deliberately
+        are not: a row left from an earlier external port or internal host
+        is still this rule's row, and matching on what the row says *now* is
+        exactly how one would be orphaned -- still forwarding a public port,
+        with nothing in this platform left pointing at it.
+
+        Idempotent: removing what is already absent is a no-op, so deleting
+        a rule twice, or one whose push never landed, completes cleanly.
+        """
+        await asyncio.to_thread(self._delete_port_forward_sync, creds, rule)
+
+    def _delete_port_forward_sync(
+        self, creds: DeviceCredentials, rule: PortForwardConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                menu = api.path("ip", "firewall", "nat")
+                for row in list(menu):
+                    if _owns_port_forward_comment(row.get("comment"), rule.rule_id):
+                        menu.remove(row[".id"])
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_port_forward: {exc}"
                 ) from exc
         finally:
             api.close()
@@ -2678,6 +2855,7 @@ class MikroTikAdapter:
             "read_network_snapshot": True,
             "configure_dhcp_pool": True,
             "configure_port_forward": True,
+            "delete_port_forward": True,
             "configure_nat_masquerade": True,
             "delete_nat_masquerade": True,
             "set_radius_client_config": True,

@@ -799,6 +799,11 @@ class AuditAction(StrEnum):
     PORT_FORWARDING_RULE_CREATED = "port_forwarding_rule_created"
     PORT_FORWARDING_RULE_UPDATED = "port_forwarding_rule_updated"
     PORT_FORWARDING_RULE_DELETED = "port_forwarding_rule_deleted"
+    # The real device-push event: the row was realized on an actual router
+    # over the RouterOS API. Distinct from PORT_FORWARDING_RULE_CREATED,
+    # which only ever meant "a row was written" -- same distinction as
+    # VLAN_PUSHED and DHCP_POOL_PUSHED above.
+    PORT_FORWARDING_RULE_PUSHED = "port_forwarding_rule_pushed"
 
     # MAC Authorization domain events -- written through this same table
     # by

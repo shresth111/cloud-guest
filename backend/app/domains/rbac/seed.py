@@ -192,6 +192,14 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.READ,
         _A.UPDATE,
         _A.DELETE,
+        # EXECUTE now also gates POST /port-forwarding/rules/{id}/push --
+        # realizing a DSTNAT rule on a real router, which is a different
+        # privilege from editing the row. Same distinction as DHCP/VLAN
+        # below, but unlike theirs this action already existed on this
+        # module, so plugging the port-forwarding domain into a real device
+        # needs no re-seed on deploy. (Worth stating: vlan.execute shipped
+        # without the seed being run, and the Apply button 403'd against a
+        # working adapter until it was.)
         _A.EXECUTE,
         _A.MANAGE,
     ),
