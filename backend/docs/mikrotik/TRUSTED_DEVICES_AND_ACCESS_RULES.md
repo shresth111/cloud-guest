@@ -1150,6 +1150,46 @@ before that first `accept`, and re-checks the position on every push instead
 of only at creation. See its own docstring for why that is safe for this
 specific rule and would not be for a general access rule.
 
+#### `/radius incoming` on the lab router — read 2026-09-03
+
+Read-only, via `backend/ops/probes/read_radius.py` and `read_radius_db.py`:
+
+```
+/radius/incoming  ->  {'accept': False, 'port': 3799, 'vrf': 'main'}
+/radius           ->  service=hotspot address=10.20.0.1 src-address=10.20.0.14
+                      comment=cloudguest-radius disabled=False
+```
+
+**3799 is ours, not a default.** MikroTik documents `/radius incoming` as
+`accept` (default `no`) and `port` (default **1700**)
+[DOC — [RADIUS](https://help.mikrotik.com/docs/spaces/ROS/pages/328097/RADIUS)]. So the port on the device is
+the value this codebase writes, which means the setting was reached at some
+point; `accept` is not. `git log -S` confirms the line was introduced
+complete (`set accept=yes port=3799`) and never existed in a port-only form,
+so a stale older script does not explain it.
+
+**Why the platform cannot repair it.** `set_radius_client_config` — the
+gateway method that issues both the `/radius add` and the
+`/radius incoming set` over 8728 — has **zero callers in `app/`**. The only
+writer that can actually run is `renderers.render_radius_client`, inside the
+combined config script, which is delivered over SSH; a port sweep from the
+platform reached only `8728` on a fleet router. That script therefore lands
+only when it is pasted by hand at provisioning, which is consistent with a
+router that has the `/radius` client row and the port but has since drifted
+on `accept`.
+
+This is the same defect shape as `vlan`, `dhcp`, `port_forwarding`,
+`content_filtering` and `qos`: a working device writer with no caller. The
+hub half *does* have a real sync path
+(`GuestService.record_hub_client_sync`, with `hub_client_synced_ip`/`_at`);
+the router half has none.
+
+`read_hotspot_session_control` is therefore right to read this per router and
+right not to infer it. **Nothing should claim CoA works on a router until
+T8 says the hEX lite accepts a Disconnect-Request over the tunnel** — and T8
+needs a shell on the RADIUS host, which this platform does not currently
+have.
+
 **T3–T11 remain unrun.** T3, T4, T7 and T8 all need a real client behind
 `ether2` generating traffic; they cannot be answered from the platform.
 
