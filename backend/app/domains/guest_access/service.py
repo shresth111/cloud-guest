@@ -20,6 +20,36 @@ guest -> guest_access, never the reverse, keeping the module graph acyclic
 exactly as the Architecture Design Document's dependency graph (§4/§21)
 specifies.
 
+## Blocking is not a database insert
+
+``create_guest_rule`` used to write a row, audit it, and stop -- while the
+customer dashboard's Blocked Guests form promised, verbatim, *"Takes
+effect immediately, ending any session these users currently have."* It
+did not. The blocked guest stayed online.
+
+Signing in *again* was already handled: ``GuestService
+._enforce_access_control`` consults ``check_access`` before every OTP,
+voucher, password and MAC-whitelist login. What was missing is the session
+the guest is already in -- which is the only part the copy promises.
+
+A ``BLOCKLIST`` rule now runs through ``enforcement.BlocklistEnforcer``,
+which removes the guest from the router's own ``/ip hotspot active`` table
+over the port-8728 API and then moves their ``GuestSession`` rows to a
+terminal status. Both halves are required: leaving the row ``ACTIVE`` is a
+standing re-admission ticket for the next RADIUS re-authorization, and
+ending only the row is a record that says "over" while the device keeps
+forwarding -- the same class of lie as the original bug.
+
+The outcome is recorded on the rule
+(``enforcement_status``/``enforcement_error``/``enforced_at``/
+``sessions_ended``, mirroring ``Vlan.device_push_*``) and, when the device
+cannot be made to agree, raised as a typed non-2xx rather than returned as
+a success envelope. The block itself is committed *first*, so a guest
+whose live session could not be cut is still barred from signing in again
+and an operator can retry the device half alone -- ``enforce_guest_rule``,
+the same "retry the push without re-submitting the form" separation
+``VlanService.push_vlan_to_device`` makes.
+
 ## Default-allow, not deny-by-default
 
 This module does **not** turn the platform into a whitelist-only ("deny
@@ -44,7 +74,12 @@ from typing import Protocol
 from app.database.utils.pagination import PaginationMeta
 from app.domains.rbac.enums import AuditAction
 
-from .constants import ACCESS_RULE_TYPE_PRECEDENCE, AccessRuleType
+from .constants import (
+    ACCESS_RULE_TYPE_PRECEDENCE,
+    AccessRuleType,
+    BlockEnforcementStatus,
+)
+from .enforcement import BlockEnforcementReport
 from .events import (
     AccessRuleCreated,
     AccessRuleDeactivated,
@@ -166,18 +201,50 @@ class DeviceRuleListResult:
     meta: PaginationMeta
 
 
+class BlockEnforcerProtocol(Protocol):
+    """What this service needs to make a ``BLOCKLIST`` rule true on the
+    device -- satisfied by ``enforcement.BlocklistEnforcer``.
+
+    Declared as a Protocol rather than imported concretely so this module
+    keeps no dependency on the device-I/O layer, exactly as
+    ``AccessDecisionProtocol`` does for the reverse direction in
+    ``app.domains.guest.service``.
+    """
+
+    async def enforce(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        identifier: str,
+        reason: str | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> BlockEnforcementReport: ...
+
+
 class GuestAccessService:
     """CRUD over both rule tables, plus ``check_access`` (the read path
     ``GuestService``'s optional hook, and this module's own
-    ``POST .../check`` endpoint, both call)."""
+    ``POST .../check`` endpoint, both call) and the device-side
+    enforcement that makes a ``BLOCKLIST`` rule true (see the module
+    docstring)."""
 
     def __init__(
         self,
         repository: GuestAccessRepositoryProtocol,
         *,
+        block_enforcer: BlockEnforcerProtocol | None,
         audit_writer: AuditLogWriter | None = None,
     ) -> None:
         self.repository = repository
+        # Keyword-only and **without a default**, deliberately. A default
+        # of ``None`` is how the original defect would come back: a
+        # mis-wired construction would silently create blocks that end no
+        # sessions, and look exactly like a correct one. Passing ``None``
+        # is still allowed -- a Celery sweep that only expires rules has
+        # no router stack to build -- but it has to be written down at the
+        # call site, and a BLOCKLIST rule created that way records
+        # ``BlockEnforcementStatus.UNENFORCED`` rather than pretending.
+        self.block_enforcer = block_enforcer
         self.audit_writer = audit_writer
         self.resolver = AccessDecisionResolver()
 
@@ -210,6 +277,7 @@ class GuestAccessService:
             email=email,
             expires_at=expires_at,
             is_active=True,
+            enforcement_status=self._initial_enforcement_status(rule_type).value,
             created_by=actor_user_id,
             updated_by=actor_user_id,
         )
@@ -228,7 +296,139 @@ class GuestAccessService:
             organization_id=organization_id,
             location_id=location_id,
         )
-        return rule
+        if rule_type is not AccessRuleType.BLOCKLIST or self.block_enforcer is None:
+            return rule
+        # The block is committed BEFORE the device is touched, and that
+        # ordering is not incidental. ``GenericRepository.create`` only
+        # ``flush()``es and ``get_db_session`` rolls back on any exception,
+        # so without this commit a device failure would discard the rule
+        # itself -- and the customer, who asked for this person to be
+        # blocked, would end up with neither the block nor the
+        # disconnection. Barring a future sign-in is the half this platform
+        # can always deliver; it should not be forfeited because a router
+        # was unreachable.
+        await self.repository.commit()
+        return await self._enforce_block(rule, actor_user_id=actor_user_id)
+
+    def _initial_enforcement_status(
+        self, rule_type: AccessRuleType
+    ) -> BlockEnforcementStatus:
+        """The value written at insert time, before any device work.
+
+        Three distinct values, and the distinctions are the point (see
+        ``constants.BlockEnforcementStatus``): "this rule type has nothing
+        to enforce", "nobody was wired up to enforce it", and "enforcement
+        is under way" are three different facts, and collapsing any two of
+        them is how a block that ends no sessions goes unnoticed. In
+        particular this never writes ``ENFORCED`` optimistically -- a row
+        may only claim that after a router has confirmed it.
+        """
+        if rule_type is not AccessRuleType.BLOCKLIST:
+            return BlockEnforcementStatus.NOT_APPLICABLE
+        if self.block_enforcer is None:
+            return BlockEnforcementStatus.UNENFORCED
+        return BlockEnforcementStatus.PENDING
+
+    async def enforce_guest_rule(
+        self,
+        *,
+        rule_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> GuestAccessRule:
+        """Re-runs device-side enforcement for an existing ``BLOCKLIST``
+        rule.
+
+        **Separate from create, deliberately** -- the same separation
+        ``VlanService.push_vlan_to_device`` makes and for the same reason:
+        an operator whose block failed on an unreachable router must be
+        able to retry the device half without re-submitting the form and
+        without creating a second, duplicate rule.
+
+        Idempotent all the way down: a guest who is already offline
+        matches nothing on the router, removes nothing, and records
+        ``ENFORCED`` with ``sessions_ended=0``.
+        """
+        rule = await self.get_guest_rule(
+            rule_id, requesting_organization_id=requesting_organization_id
+        )
+        rule_type = AccessRuleType(rule.rule_type)
+        if rule_type is not AccessRuleType.BLOCKLIST or self.block_enforcer is None:
+            # A whitelist/VIP/temporary rule grants access -- there is no
+            # session to end, and no enforcer means there is nobody to end
+            # it. Both are recorded as what they are rather than silently
+            # returning a row that still reads ``pending`` forever.
+            return await self.repository.update_guest_rule(
+                rule,
+                {
+                    "enforcement_status": self._initial_enforcement_status(
+                        rule_type
+                    ).value
+                },
+            )
+        return await self._enforce_block(rule, actor_user_id=actor_user_id)
+
+    async def _enforce_block(
+        self, rule: GuestAccessRule, *, actor_user_id: uuid.UUID | None
+    ) -> GuestAccessRule:
+        """Ends the blocked guest's live sessions, and records what
+        happened either way.
+
+        **A failure is recorded, committed, and then re-raised.**
+        ``GenericRepository.update`` only ``flush()``es, and
+        ``get_db_session`` rolls the session back on any exception -- so a
+        failure record written just before a re-raise is discarded, and the
+        row would still read as though the block had reached the device.
+        Committing explicitly, before raising, is what makes the record
+        survive to be read. (``VlanService.push_vlan_to_device`` documents
+        the same fix; ``qos.push_rule_to_device`` was the last domain still
+        missing it.)
+
+        The exception then propagates as a real non-2xx. It must not become
+        a ``200 {"success": false}``: the frontend's response interceptor
+        unwraps ``data`` and never reads ``success``, so such a response is
+        indistinguishable from success to every caller in the app -- which
+        is exactly the failure mode this whole path exists to remove.
+        """
+        assert self.block_enforcer is not None  # noqa: S101 -- guarded by callers
+        try:
+            report = await self.block_enforcer.enforce(
+                organization_id=rule.organization_id,
+                identifier=rule.identifier,
+                reason=rule.reason,
+                actor_user_id=actor_user_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
+            await self.repository.update_guest_rule(
+                rule,
+                {
+                    "enforcement_status": BlockEnforcementStatus.FAILED.value,
+                    "enforcement_error": str(exc),
+                    "enforced_at": datetime.now(UTC),
+                    "sessions_ended": 0,
+                },
+            )
+            await self.repository.commit()
+            logger.warning(
+                "guest_access_block_enforcement_failed",
+                extra={
+                    "event_rule_id": str(rule.id),
+                    "event_identifier": rule.identifier,
+                    "event_error": str(exc),
+                },
+            )
+            raise
+        updated = await self.repository.update_guest_rule(
+            rule,
+            {
+                "enforcement_status": BlockEnforcementStatus.ENFORCED.value,
+                "enforcement_error": None,
+                "enforced_at": datetime.now(UTC),
+                "sessions_ended": report.sessions_ended,
+            },
+        )
+        await self.repository.commit()
+        return updated
 
     async def get_guest_rule(
         self,
@@ -515,6 +715,7 @@ class GuestAccessService:
 
 __all__ = [
     "AccessDecision",
+    "BlockEnforcerProtocol",
     "AccessDecisionResolver",
     "AccessRuleListResult",
     "DeviceRuleListResult",

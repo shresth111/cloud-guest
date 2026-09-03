@@ -221,7 +221,16 @@ class Fixture:
 def make_fixture() -> Fixture:
     repository = FakeGuestAccessRepository()
     audit_writer = FakeAuditLogWriter()
-    service = GuestAccessService(repository, audit_writer=audit_writer)
+    # No block enforcer: this module covers rule CRUD, tenant scoping and
+    # precedence resolution, none of which touch a device. The
+    # device-side half -- blocking a guest actually ending the session
+    # they are in -- has its own suite in
+    # ``test_guest_access_block_enforcement.py``, including a test that a
+    # ``None`` enforcer records ``UNENFORCED`` rather than pretending the
+    # block reached a router.
+    service = GuestAccessService(
+        repository, block_enforcer=None, audit_writer=audit_writer
+    )
     return Fixture(
         repository=repository,
         audit_writer=audit_writer,

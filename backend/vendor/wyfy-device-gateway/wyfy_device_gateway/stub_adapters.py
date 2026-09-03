@@ -19,6 +19,8 @@ from .contract import (
     DeviceHealthResult,
     DeviceVendor,
     DhcpPoolConfig,
+    HotspotDisconnectResult,
+    HotspotSessionControl,
     InterfaceInfo,
     PingResult,
     PortForwardConfig,
@@ -94,6 +96,20 @@ class _StubAdapter:
     async def disconnect_device(
         self, creds: DeviceCredentials, *, mac_address: str, interface: str | None
     ) -> None:
+        raise self._not_implemented()
+
+    async def read_hotspot_session_control(
+        self, creds: DeviceCredentials
+    ) -> HotspotSessionControl:
+        raise self._not_implemented()
+
+    async def end_hotspot_sessions(
+        self,
+        creds: DeviceCredentials,
+        *,
+        mac_address: str | None,
+        username: str | None,
+    ) -> HotspotDisconnectResult:
         raise self._not_implemented()
 
     async def ping(

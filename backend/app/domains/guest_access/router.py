@@ -157,6 +157,46 @@ async def get_guest_rule(
 
 
 @router.post(
+    "/rules/{rule_id}/enforce",
+    response_model=ApiResponse[GuestAccessRuleResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_access.update"))],
+)
+async def enforce_guest_rule(
+    request: Request,
+    rule_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestAccessService = Depends(get_guest_access_service),
+):
+    """Re-runs device-side enforcement for a blocklist rule.
+
+    Exists because ``POST /rules`` can legitimately succeed at blocking a
+    guest from signing in again and fail at ending the session they are
+    already in -- an unreachable router, a tunnel down. Retrying through
+    this endpoint does the device half alone, so an operator never has to
+    re-submit the form and never ends up with a second, duplicate rule.
+    Mirrors ``POST /vlans/{id}/push``'s identical separation.
+
+    Every failure mode is a real non-2xx carrying a named error (see
+    ``exceptions.py``'s "Block enforcement" section), never a 200 with a
+    ``success: false`` body -- the frontend interceptor unwraps ``data``
+    and never reads ``success``, so the latter would read as success.
+    """
+    rule = await service.enforce_guest_rule(
+        rule_id=rule_id,
+        requesting_organization_id=requesting_organization_id,
+        actor_user_id=uuid.UUID(user.id),
+    )
+    return build_response(
+        success=True,
+        message="Guest access rule enforced",
+        data=_guest_rule_response(rule).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
     "/rules/{rule_id}/deactivate",
     response_model=ApiResponse[GuestAccessRuleResponse],
     status_code=status.HTTP_200_OK,

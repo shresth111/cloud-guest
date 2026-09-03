@@ -79,6 +79,9 @@ from .contract import (
     DeviceHealthResult,
     DeviceVendor,
     DhcpPoolConfig,
+    HotspotActiveSession,
+    HotspotDisconnectResult,
+    HotspotSessionControl,
     InterfaceInfo,
     IpAddressInfo,
     NatRuleConfig,
@@ -1047,6 +1050,220 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(creds.host, f"disconnect_device: {exc}") from exc
         finally:
             api.close()
+
+    # ------------------------------------------------------------------
+    # hotspot session control (guest_access blocklist enforcement)
+    # ------------------------------------------------------------------
+
+    async def read_hotspot_session_control(
+        self, creds: DeviceCredentials
+    ) -> HotspotSessionControl:
+        """Reads, from the device, whether it runs a hotspot at all and
+        whether it currently accepts an RFC 5176 Disconnect-Request.
+
+        **Why this is a read and never an assumption.** Both places this
+        codebase writes ``/radius incoming`` -- this adapter's own
+        :meth:`set_radius_client_config` and
+        ``network_config/renderers.py``'s ``render_radius_client`` -- set
+        ``accept=yes`` and ``port=3799`` in the *same* statement. The lab
+        router nonetheless holds ``accept=false port=3799``: the port is
+        the value this platform wrote (RouterOS's own default is 1700), so
+        the write did land, and ``accept`` was reset afterwards by
+        something nobody has identified. A platform that infers "we
+        configured CoA, therefore CoA works" from its own history is
+        wrong about that router today.
+
+        ``accept`` is resolved through :func:`_is_truthy`, never a string
+        compare: the API answers a read with a real ``bool`` and accepts
+        ``"no"``/``"false"`` on write, so ``row.get("accept") == "yes"``
+        would read a live ``True`` as disabled.
+
+        Read-only -- this method never writes to ``/radius incoming``. See
+        :meth:`end_hotspot_sessions` for why repairing it is deliberately
+        not part of the enforcement path.
+        """
+        return await asyncio.to_thread(self._read_hotspot_session_control_sync, creds)
+
+    def _hotspot_session_control(self, api, host: str) -> HotspotSessionControl:  # noqa: ANN001
+        try:
+            hotspot_servers = len(list(api.path("ip", "hotspot")))
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(
+                host, f"read_hotspot_session_control: {exc}"
+            ) from exc
+        coa_accept = False
+        coa_port: int | None = None
+        try:
+            for row in api.path("radius", "incoming"):
+                coa_accept = _is_truthy(row.get("accept"))
+                coa_port = _safe_int(row.get("port"))
+                break
+        except LibRouterosError as exc:
+            # A router with no ``/radius incoming`` menu at all cannot
+            # accept a Disconnect either. Reported as "no", logged, never
+            # raised -- the caller's real mechanism does not depend on it.
+            logger.info(
+                "mikrotik_radius_incoming_unreadable",
+                extra={"host": host, "detail": str(exc)},
+            )
+        return HotspotSessionControl(
+            hotspot_servers=hotspot_servers,
+            coa_accept=coa_accept,
+            coa_port=coa_port,
+        )
+
+    def _read_hotspot_session_control_sync(
+        self, creds: DeviceCredentials
+    ) -> HotspotSessionControl:
+        api = self._connect_api(creds)
+        try:
+            return self._hotspot_session_control(api, creds.host)
+        finally:
+            api.close()
+
+    async def end_hotspot_sessions(
+        self,
+        creds: DeviceCredentials,
+        *,
+        mac_address: str | None,
+        username: str | None,
+    ) -> HotspotDisconnectResult:
+        """Ends every live ``/ip hotspot active`` session belonging to one
+        guest -- the operation that actually cuts them off.
+
+        **Why device-local removal and not a RADIUS Disconnect-Request.**
+        Both end a hotspot session; RouterOS's own response to a
+        Disconnect-Request is to remove the host from this same table. The
+        difference is what each one needs to work:
+
+        * A Disconnect needs ``/radius incoming accept=yes`` (false on the
+          lab router), needs the right shared secret and the right session
+          identifiers or it is dropped with no NAK, and needs an *inbound*
+          UDP path from this platform to the NAS. That path does not exist
+          today -- see ``RadiusNasClient.ip_address``'s own comment in
+          ``app/domains/guest/models.py``: the API container has no route
+          into the hub's tunnel subnet, so ``issue_live_disconnect`` has
+          been reporting "no response" fleet-wide rather than "never
+          sent".
+        * This needs port 8728, which is the transport every other write
+          in this gateway already uses and the only one confirmed to reach
+          fleet routers.
+
+        So a Disconnect is the weaker mechanism *on this fleet*, and it
+        fails silently where this one raises. CoA availability is still
+        read and reported (:meth:`read_hotspot_session_control`), because
+        an operator deserves to know that the RFC-sanctioned path is shut
+        -- but the block does not depend on it.
+
+        **``/radius incoming`` is deliberately not repaired here.** This
+        method has every ingredient to issue
+        ``api.path("radius", "incoming").update(accept="yes")`` and fix the
+        contradiction it reads. It does not, for two reasons. Repairing it
+        would not help the operation at hand -- the session is already
+        being ended by the mechanism above -- so it would be an unrelated
+        write to a live router's RADIUS configuration performed as a side
+        effect of a customer clicking "Block". And a change to exactly
+        this subsystem took the guest network down earlier today. A write
+        that fixes nothing for the caller and can break everything for the
+        venue does not belong on a customer-triggered path. The honest
+        move is to surface ``coa_accept=False`` so an operator repairs it
+        deliberately, through :meth:`set_radius_client_config`, which is
+        the method that owns that setting.
+
+        **Matching.** A row matches when its normalized ``mac-address``
+        equals ``mac_address``, or its ``user`` equals ``username``
+        exactly. Either identifier alone is enough, because either alone
+        identifies the guest: the MAC is what the device knows them by,
+        the ``user`` is what RADIUS authenticated. Both ``None`` matches
+        **nothing** -- a block whose subject could not be identified must
+        end zero sessions rather than every session on the router.
+
+        **Removal is per-row by ``.id``**, never a bare ``remove [find]``:
+        a predicate that evaluates to nothing must produce zero removals,
+        and enumerating in Python is the only way to guarantee that.
+
+        Idempotent: a guest with no live session matches nothing and
+        raises nothing, so a retry after a partial failure -- or a second
+        block of an already-blocked guest -- completes cleanly.
+        """
+        return await asyncio.to_thread(
+            self._end_hotspot_sessions_sync, creds, mac_address, username
+        )
+
+    @staticmethod
+    def _match_active_rows(
+        rows: list[dict[str, object]],
+        mac_address: str | None,
+        username: str | None,
+    ) -> tuple[HotspotActiveSession, ...]:
+        if mac_address is None and username is None:
+            return ()
+        matched: list[HotspotActiveSession] = []
+        for row in rows:
+            row_mac = normalize_mac_address(row.get("mac-address"))
+            row_user = _safe_str(row.get("user"))
+            if (mac_address is not None and row_mac == mac_address) or (
+                username is not None and row_user == username
+            ):
+                row_id = _safe_str(row.get(".id"))
+                if row_id is None:
+                    # A row with no ``.id`` cannot be removed per-row, and
+                    # this method does not fall back to a broad remove.
+                    continue
+                matched.append(
+                    HotspotActiveSession(
+                        routeros_id=row_id,
+                        user=row_user,
+                        mac_address=row_mac,
+                        address=_safe_str(row.get("address")),
+                    )
+                )
+        return tuple(matched)
+
+    def _end_hotspot_sessions_sync(
+        self,
+        creds: DeviceCredentials,
+        mac_address: str | None,
+        username: str | None,
+    ) -> HotspotDisconnectResult:
+        normalized_mac = (
+            normalize_mac_address(mac_address) if mac_address is not None else None
+        )
+        api = self._connect_api(creds)
+        try:
+            control = self._hotspot_session_control(api, creds.host)
+            try:
+                menu = api.path("ip", "hotspot", "active")
+                matched = self._match_active_rows(
+                    list(menu), normalized_mac, username
+                )
+                for row in matched:
+                    menu.remove(row.routeros_id)
+                # A SECOND read, not a re-use of the first. Without it this
+                # method could only report "the removes did not raise",
+                # which is precisely the claim this platform has been
+                # burned by twice.
+                still_active = self._match_active_rows(
+                    list(api.path("ip", "hotspot", "active")),
+                    normalized_mac,
+                    username,
+                )
+            except LibRouterosError as exc:
+                # Unlike ``disconnect_device``'s optional wireless menu, an
+                # unreadable ``/ip hotspot active`` is fatal here: without
+                # it this method cannot tell whether the guest is still
+                # online, and reporting success would be a guess.
+                raise MikroTikDeviceError(
+                    creds.host, f"end_hotspot_sessions: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return HotspotDisconnectResult(
+            control=control,
+            matched=matched,
+            removed_ids=tuple(row.routeros_id for row in matched),
+            still_active=still_active,
+        )
 
     # ------------------------------------------------------------------
     # diagnostics (shared by network_diagnostics + isp call sites)

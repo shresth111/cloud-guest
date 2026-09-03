@@ -168,7 +168,19 @@ async def _sync_single_router_devices_async(
             repository = ConnectedDeviceRepository(session)
             router_service = _build_router_service(session)
             guest_access_service = GuestAccessService(
-                GuestAccessRepository(session), audit_writer=RBACRepository(session)
+                GuestAccessRepository(session),
+                # No block enforcer, written down rather than defaulted.
+                # This sweep only ever reaches ``create_device_rule``/
+                # ``list_device_rules``/``deactivate_device_rule`` (see
+                # ``GuestAccessProtocol`` in ``connected_devices.service``),
+                # and device (MAC-keyed) rules have no session-termination
+                # path yet -- so there is nothing here for an enforcer to
+                # do. If this sweep ever starts creating identifier-keyed
+                # blocklist rules, this ``None`` is what will make that
+                # visible: those rows record ``UNENFORCED`` rather than
+                # silently ending no sessions.
+                block_enforcer=None,
+                audit_writer=RBACRepository(session),
             )
             guest_repository = GuestRepository(session)
             try:
