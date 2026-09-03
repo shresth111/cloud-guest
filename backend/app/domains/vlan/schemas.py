@@ -67,6 +67,16 @@ class VlanResponse(BaseModel):
     interface: str | None
     port_mode: str
     enable_hotspot: bool
+    # Whether ANYTHING on this VLAN hands out addresses -- its own captive
+    # portal, or a DHCP pool an operator created for its interface.
+    #
+    # Exposed because "pushed successfully" and "usable" are different
+    # facts and the dashboard could not tell them apart. A VLAN with the
+    # portal off gets an interface and an address and nothing else: a
+    # client joins, never receives a lease, and the row reads "Applied".
+    # That state cost a real customer an evening. None means it was not
+    # computed for this response, not that there is no DHCP.
+    has_dhcp: bool | None = None
     # Whether this VLAN's subnet is masqueraded onto the router's WAN --
     # i.e. whether its guests actually reach the internet. Realized (or
     # removed) by the device push, never by create/update alone.

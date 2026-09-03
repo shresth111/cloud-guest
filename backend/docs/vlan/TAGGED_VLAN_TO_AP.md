@@ -66,7 +66,27 @@ receive tagged frames" are different statements, and MikroTik's Bridging and
 Switching page states only the first
 [DOC — [Bridging and Switching](https://help.mikrotik.com/docs/spaces/ROS/pages/328068/Bridging+and+Switching); checked, and it does not address the second].
 
-This is the single question that decides the whole architecture:
+**SETTLED 2026-09-03, and the answer removes the rest of this document's
+risk.** A customer tagged VLAN 12 at the access point. With the bridge still
+at `vlan-filtering=no`, `vlan12` -- a `/interface vlan` layered on that
+bridge -- read `rx-packet 1351`, and a client on it took a DHCP lease
+(`10.40.40.253`, then `10.40.40.252` for `DESKTOP-5A61JIF`) and reached the
+internet.
+
+So a VLAN interface on a bridge **does** receive frames carrying its VID with
+filtering off. **No bridge change is needed at all**: no `vlan-filtering=yes`,
+no Atheros-8227 switch-chip reset, no port bounce, no risk to the live guest
+network. The ordered sequence below is not required for this use case and
+should not be run for it.
+
+What is given up is isolation, and that is a real cost, not a footnote: with
+no ingress filtering the bridge floods tagged frames to every port and any
+port can inject any VID. The sequence below remains the answer when isolation
+between zones is actually required -- it is no longer the answer to "deliver
+a VLAN to the AP".
+
+The original question, kept because the reasoning is what made the test
+obvious:
 
 * **If a VLAN interface on the bridge does receive tagged frames** with
   filtering off, then the platform needs no bridge changes at all. Trunk mode

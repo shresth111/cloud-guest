@@ -787,6 +787,40 @@ class VlanService:
                     vlan.id, bind_interface, pool.name
                 )
 
+    async def dhcp_interfaces_for_router(self, router_id: uuid.UUID) -> set[str]:
+        """Which of this router's interfaces have something handing out
+        addresses on them.
+
+        Used to answer, per VLAN, "is this network actually usable" -- a
+        question separate from "did the push succeed". A VLAN with the
+        captive portal off gets an interface and an address and nothing
+        else, so a client joins and never receives a lease while the row
+        reads ``active``. The dashboard could not tell the two apart, and a
+        customer lost an evening to it.
+
+        Only *enabled* pools count. A disabled pool hands out nothing, and
+        reporting it as DHCP would recreate the same false reassurance one
+        level down.
+        """
+        pools = await self.dhcp_pool_lookup.list_pools_for_router(router_id)
+        return {
+            pool.interface
+            for pool in pools
+            if pool.is_enabled and pool.interface
+        }
+
+    def vlan_has_dhcp(self, vlan: Vlan, dhcp_interfaces: set[str]) -> bool:
+        """True when this VLAN hands out addresses by either route.
+
+        The portal creates its own pool and DHCP server, so
+        ``enable_hotspot`` is sufficient on its own; otherwise it takes an
+        operator-created pool bound to the same interface the VLAN is
+        realized as.
+        """
+        if vlan.enable_hotspot:
+            return True
+        return self._bind_interface(vlan) in dhcp_interfaces
+
     async def _preflight_device(
         self,
         vlan: Vlan,

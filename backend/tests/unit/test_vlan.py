@@ -1164,6 +1164,45 @@ class TestVlanDevicePreflight:
             )
         assert adapter.calls == []
 
+    async def test_a_portal_vlan_reports_that_it_hands_out_addresses(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        vlan.enable_hotspot = True
+
+        assert h.service.vlan_has_dhcp(vlan, set()) is True
+
+    async def test_a_portal_less_vlan_reports_no_dhcp_until_a_pool_exists(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The state that cost a customer an evening: pushed, "Applied",
+        and no client can get an address."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, vlan_id=12, port_mode="trunk")
+        vlan.enable_hotspot = False
+
+        assert h.service.vlan_has_dhcp(vlan, set()) is False
+        assert h.service.vlan_has_dhcp(vlan, {"vlan12"}) is True
+
+    async def test_an_access_vlan_is_matched_on_its_port_not_a_vlan_name(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """An access VLAN is realized as the physical port, so a pool bound
+        to `ether2` is its DHCP -- there is no `vlan<tag>` interface to
+        match against."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(
+            h, router, vlan_id=12, interface="ether2", port_mode="access"
+        )
+        vlan.enable_hotspot = False
+
+        assert h.service.vlan_has_dhcp(vlan, {"vlan12"}) is False
+        assert h.service.vlan_has_dhcp(vlan, {"ether2"}) is True
+
     async def test_a_dead_address_does_not_reserve_a_subnet(
         self, adapter: FakeVlanAdapter
     ) -> None:

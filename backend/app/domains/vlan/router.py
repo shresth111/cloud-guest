@@ -61,8 +61,15 @@ def _pagination_fields(meta: PaginationMeta) -> dict[str, int | bool]:
     }
 
 
-def _vlan_response(vlan: Vlan) -> VlanResponse:
+def _vlan_response(
+    vlan: Vlan, *, has_dhcp: bool | None = None
+) -> VlanResponse:
+    """``has_dhcp`` is passed only where it was computed. Left ``None``
+    elsewhere rather than defaulted to ``False``: "we did not look" and
+    "nothing hands out addresses here" are different answers, and guessing
+    the second would put a warning on rows that do not deserve one."""
     return VlanResponse(
+        has_dhcp=has_dhcp,
         id=str(vlan.id),
         router_id=str(vlan.router_id),
         organization_id=str(vlan.organization_id),
@@ -143,8 +150,24 @@ async def list_vlans(
         page=page,
         page_size=page_size,
     )
+    # One DHCP lookup per distinct router, not one per VLAN: the list is
+    # usually all one router's VLANs, and asking per row would turn a page
+    # render into N queries for an answer that is the same every time.
+    dhcp_by_router: dict[uuid.UUID, set[str]] = {}
+    for vlan in vlans:
+        if vlan.router_id not in dhcp_by_router:
+            dhcp_by_router[vlan.router_id] = await service.dhcp_interfaces_for_router(
+                vlan.router_id
+            )
     payload = VlanListResponse(
-        items=[_vlan_response(vlan) for vlan in vlans], **_pagination_fields(meta)
+        items=[
+            _vlan_response(
+                vlan,
+                has_dhcp=service.vlan_has_dhcp(vlan, dhcp_by_router[vlan.router_id]),
+            )
+            for vlan in vlans
+        ],
+        **_pagination_fields(meta),
     )
     return build_response(
         success=True,
