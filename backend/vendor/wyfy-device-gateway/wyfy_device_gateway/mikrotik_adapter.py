@@ -66,7 +66,7 @@ import ipaddress
 import logging
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import asyncssh
 import librouteros
@@ -95,6 +95,8 @@ from .contract import (
     QueueDeviceStatus,
     RadiusClientConfig,
     RawCommandResult,
+    RogueDhcpAlertConfig,
+    RogueDhcpAlertStatus,
     SpeedTestResult,
     TracerouteHop,
     TracerouteResult,
@@ -130,6 +132,19 @@ _CONTENT_FILTER_SINKHOLE_ADDRESS = "127.0.0.1"
 # is adopted rather than duplicated.
 _RADIUS_CLIENT_COMMENT = "WyfyGuest RADIUS NAS client"
 _CONTENT_FILTER_ADDRESS_LIST_NAME = "wyfyguest-content-filter-blocked"
+# Rogue DHCP detection: the marker stamped on every ``/ip dhcp-server
+# alert`` row this platform manages.
+#
+# Deliberately the SAME literal the hand-run probe
+# (``cloud-guest-repo/backend/ops/probes/setup_dhcp_alert.py``) already
+# wrote onto the lab router. RouterOS holds one alert per interface, so a
+# different marker here would not add a second row -- it would make the
+# writer fail to recognize its own predecessor's work and leave the
+# operator's carefully-checked rows unmanaged. The marker is not the lookup
+# key (the interface is -- see ``configure_rogue_dhcp_alerts``); it is what
+# tells an operator reading ``/ip dhcp-server alert`` on the device, and
+# the reader's ``managed`` flag, where a row came from.
+_ROGUE_DHCP_ALERT_COMMENT = "cloudguest-rogue-dhcp-watch"
 _CONTENT_FILTER_ENFORCEMENT_COMMENT = (
     "Wyfy Guest content filtering: block listed addresses"
 )
@@ -662,6 +677,46 @@ def _is_truthy(value: object) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "yes"}
+
+
+def _split_valid_servers(value: object) -> tuple[str, ...]:
+    """A RouterOS ``valid-server`` list, split and canonicalized.
+
+    Entries that are real MAC addresses come back in
+    :func:`normalize_mac_address`'s canonical uppercase form. Anything
+    else is kept **verbatim rather than dropped**: a reader that silently
+    discards what it cannot parse reports a shorter trusted list than the
+    device actually has, which on this field means telling an operator a
+    server is untrusted while the router happily accepts it.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, list | tuple):
+        parts = [str(item) for item in value]
+    else:
+        parts = str(value).split(",")
+    servers: list[str] = []
+    for part in parts:
+        text = part.strip()
+        if not text:
+            continue
+        servers.append(normalize_mac_address(text) or text)
+    return tuple(servers)
+
+
+def _same_valid_servers(current: object, wanted: tuple[str, ...]) -> bool:
+    """Whether the device already trusts exactly these DHCP servers.
+
+    Compared as a *set of canonicalized entries*, never as the raw string.
+    RouterOS answers with its own uppercase form and in its own order, so
+    a caller that supplied a lowercase MAC -- or the same two servers the
+    other way round -- would differ on every single read and this writer
+    would re-issue the identical ``set`` forever. That is the string-
+    compare trap :func:`_is_truthy` exists for on ``disabled`` and
+    :func:`_routeros_seconds` on durations, in a third field with a third
+    shape.
+    """
+    return set(_split_valid_servers(current)) == set(wanted)
 
 
 _RATE_SUFFIX_MULTIPLIERS = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
@@ -2499,6 +2554,246 @@ class MikroTikAdapter:
         for row in list(menu):
             if row.get("address") == address and row.get("comment") == owner:
                 menu.remove(row[".id"])
+
+    # ------------------------------------------------------------------
+    # rogue DHCP detection (/ip dhcp-server alert)
+    # ------------------------------------------------------------------
+
+    async def configure_rogue_dhcp_alerts(
+        self, creds: DeviceCredentials, *, alerts: Sequence[RogueDhcpAlertConfig]
+    ) -> None:
+        """Converge ``/ip dhcp-server alert`` -- the device's own watch for
+        a DHCP server on a guest segment that is not ours.
+
+        ## A detector, and only ever a detector
+
+        The alert **logs**; it drops nothing and blocks nothing. See
+        :class:`RogueDhcpAlertConfig` for the full statement of that
+        limit, and for the lab observation this exists because of. Nothing
+        this method writes can interrupt a working guest network, which is
+        the property that makes it safe to push to a fleet unattended.
+
+        ## The interface is the row's identity
+
+        Unlike the QoS/NAT/port-forward writers, this one is *not* keyed on
+        a comment marker. RouterOS holds one alert per interface, and the
+        interface is not a field a customer edits -- it is the segment
+        being watched, which is the row's whole meaning. Keying on our own
+        marker instead would mean an alert a human (or the hand-run probe
+        that preceded this method) already placed on that interface is not
+        recognized, and RouterOS would reject or duplicate around it. So an
+        unmarked row on a watched interface is **adopted and stamped**,
+        never duplicated -- ``_ensure_dhcp_network``'s reasoning, with the
+        marker serving provenance rather than lookup.
+
+        ## disabled=no is written explicitly, every time
+
+        RouterOS creates an alert row **disabled by default**. Adding one
+        without saying otherwise leaves a guard that is present in the
+        configuration and watching nothing -- worse than no guard at all,
+        because it reads as one. This was not theory: the first by-hand
+        attempt on the lab router left exactly three such rows. So the
+        ``add`` carries ``disabled="no"``, and an existing row found
+        switched off is switched back on.
+
+        ``disabled`` is compared through :func:`_is_truthy`, ``valid-server``
+        through :func:`_same_valid_servers` and ``alert-timeout`` through
+        :func:`_same_routeros_duration` -- three fields, three different
+        ways the naive string compare would re-issue the same ``set`` on
+        every push forever. See ``_ensure_dhcp_server`` for the first of
+        those and why it matters.
+
+        ## What is skipped, and what is refused
+
+        An interface running no *enabled* ``/ip dhcp-server`` of ours is
+        skipped: with no server of our own on that segment there is no
+        baseline for calling a reply rogue, and an alert there would
+        report our own legitimate neighbours.
+
+        A config whose ``valid_servers`` is empty, or contains something
+        that is not a MAC address, is refused **before the connection is
+        opened** -- never filled in with a plausible guess. A wrong
+        trusted-server list is not a partial guard; it is an alert on
+        every legitimate lease, which is how a real one gets ignored.
+
+        Idempotent: a second push of an unchanged set writes nothing.
+        """
+        desired = self._rogue_dhcp_alert_desired_rows(creds, alerts)
+        await asyncio.to_thread(
+            self._configure_rogue_dhcp_alerts_sync, creds, desired
+        )
+
+    @staticmethod
+    def _rogue_dhcp_alert_desired_rows(
+        creds: DeviceCredentials, alerts: Sequence[RogueDhcpAlertConfig]
+    ) -> dict[str, dict[str, str]]:
+        """Validate the whole request and render it into desired rows,
+        before anything is connected to or written.
+
+        Validated as a set rather than one at a time so a bad entry cannot
+        leave half a fleet's worth of interfaces watched and the rest not
+        -- the same "check before the first write" posture
+        ``set_default_route_distances`` and ``configure_dhcp_pool`` take.
+        """
+        desired: dict[str, dict[str, str]] = {}
+        for alert in alerts:
+            interface = _safe_str(alert.interface)
+            if interface is None:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "configure_rogue_dhcp_alerts: an alert with no interface",
+                )
+            if interface in desired:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "configure_rogue_dhcp_alerts: two alerts requested for "
+                    f"interface {interface!r}; RouterOS holds one per "
+                    "interface, so one would silently overwrite the other",
+                )
+            if not alert.valid_servers:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    f"configure_rogue_dhcp_alerts: interface {interface!r} has "
+                    "no valid_servers; an alert that trusts nobody reports "
+                    "every legitimate lease, and this adapter will not invent "
+                    "a trusted server",
+                )
+            servers: list[str] = []
+            for value in alert.valid_servers:
+                mac = normalize_mac_address(value)
+                if mac is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        f"configure_rogue_dhcp_alerts: interface {interface!r} "
+                        f"has valid_server {value!r}, which is not a MAC "
+                        "address",
+                    )
+                servers.append(mac)
+            row = {
+                "interface": interface,
+                "valid-server": ",".join(servers),
+                "comment": _ROGUE_DHCP_ALERT_COMMENT,
+            }
+            timeout = _safe_str(alert.alert_timeout)
+            if timeout is not None:
+                # Omitted means "leave whatever the device has", never a
+                # fabricated default -- ``_ensure_dhcp_server``'s reasoning
+                # about ``lease_time``, unchanged.
+                row["alert-timeout"] = timeout
+            desired[interface] = row
+        return desired
+
+    def _configure_rogue_dhcp_alerts_sync(
+        self, creds: DeviceCredentials, desired: dict[str, dict[str, str]]
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                serving = self._dhcp_serving_interfaces(api)
+                menu = api.path("ip", "dhcp-server", "alert")
+                rows = list(menu)
+                for interface, fields in desired.items():
+                    if interface not in serving:
+                        logger.info(
+                            "mikrotik_rogue_dhcp_alert_skipped_no_dhcp_server",
+                            extra={"host": creds.host, "interface": interface},
+                        )
+                        continue
+                    row = next(
+                        (
+                            candidate
+                            for candidate in rows
+                            if _safe_str(candidate.get("interface")) == interface
+                        ),
+                        None,
+                    )
+                    if row is None:
+                        menu.add(**fields, disabled="no")
+                        continue
+                    changed = {
+                        key: value
+                        for key, value in fields.items()
+                        if not self._same_rogue_dhcp_alert_field(
+                            key, row.get(key), value
+                        )
+                    }
+                    if _is_truthy(row.get("disabled")):
+                        # Present and switched off: the state that looks
+                        # guarded in the configuration and watches nothing.
+                        changed["disabled"] = "no"
+                    if changed:
+                        menu.update(**{".id": row[".id"], **changed})
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_rogue_dhcp_alerts: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    @staticmethod
+    def _same_rogue_dhcp_alert_field(key: str, current: object, wanted: str) -> bool:
+        """Whether the device's value for one alert field already means
+        what we want it to -- per field, because two of the three do not
+        survive a string comparison. See :func:`_same_valid_servers`."""
+        if key == "valid-server":
+            return _same_valid_servers(current, _split_valid_servers(wanted))
+        if key == "alert-timeout":
+            return _same_routeros_duration(current, wanted)
+        return _safe_str(current) == wanted
+
+    @staticmethod
+    def _dhcp_serving_interfaces(api) -> set[str]:  # noqa: ANN001
+        """The interfaces this router actually runs a DHCP server on.
+
+        Disabled servers are excluded, through :func:`_is_truthy` rather
+        than a string compare: a switched-off server hands out nothing, so
+        an alert on that interface would have no offers of our own to
+        compare an unknown one against.
+        """
+        serving: set[str] = set()
+        for row in api.path("ip", "dhcp-server"):
+            if _is_truthy(row.get("disabled")):
+                continue
+            interface = _safe_str(row.get("interface"))
+            if interface is not None:
+                serving.add(interface)
+        return serving
+
+    async def read_rogue_dhcp_alerts(
+        self, creds: DeviceCredentials
+    ) -> list[RogueDhcpAlertStatus]:
+        """Whether this device is guarded against a rogue DHCP server,
+        interface by interface. Reads only.
+
+        Every interface serving DHCP appears in the answer, whether or not
+        it has an alert row, because "hands out addresses, nothing watching
+        it" is the finding worth having and it has no row of its own to be
+        reported by. Every alert row appears too, including one on an
+        interface that serves no DHCP -- reported rather than hidden, since
+        it means the configuration and the device disagree.
+
+        Presence and liveness are two separate fields
+        (:class:`RogueDhcpAlertStatus`): RouterOS creates these rows
+        disabled, so a check that looks only for presence certifies a
+        router that is watching nothing.
+        """
+        return await asyncio.to_thread(self._read_rogue_dhcp_alerts_sync, creds)
+
+    def _read_rogue_dhcp_alerts_sync(
+        self, creds: DeviceCredentials
+    ) -> list[RogueDhcpAlertStatus]:
+        api = self._connect_api(creds)
+        try:
+            try:
+                serving = self._dhcp_serving_interfaces(api)
+                rows = list(api.path("ip", "dhcp-server", "alert"))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_rogue_dhcp_alerts: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return _build_rogue_dhcp_alert_statuses(rows, serving)
 
     async def configure_port_forward(
         self, creds: DeviceCredentials, *, rule: PortForwardConfig
@@ -4714,6 +5009,58 @@ def _is_main_table_row(row: dict[str, object]) -> bool:
     make every load-balanced router look permanently ambiguous."""
     table = _safe_str(row.get("routing-table"))
     return table is None or table == "main"
+
+
+def _build_rogue_dhcp_alert_statuses(
+    alert_rows: list[dict[str, object]],
+    dhcp_serving_interfaces: set[str],
+) -> list[RogueDhcpAlertStatus]:
+    """One :class:`RogueDhcpAlertStatus` per interface, from the union of
+    the alert rows and the interfaces actually serving DHCP.
+
+    The union, not the alert rows alone: an interface handing out
+    addresses with no alert on it is precisely the thing a caller asks
+    this question to find, and it has no row to be listed by. Pure, and
+    module-level, so the shape of the answer is testable without a
+    transport at all -- ``_build_default_routes``'s precedent.
+
+    Sorted by interface name so a caller diffing two reads, or a test
+    asserting on one, is not comparing against RouterOS's row order.
+    """
+    statuses: dict[str, RogueDhcpAlertStatus] = {}
+    for row in alert_rows:
+        interface = _safe_str(row.get("interface"))
+        if interface is None:
+            # A row that names no interface watches nothing identifiable;
+            # reporting it under a made-up name would be worse than
+            # leaving it out.
+            continue
+        statuses[interface] = RogueDhcpAlertStatus(
+            interface=interface,
+            serves_dhcp=interface in dhcp_serving_interfaces,
+            alert_present=True,
+            # RouterOS answers with a real bool and accepts "no" on write;
+            # see ``_is_truthy``.
+            enabled=not _is_truthy(row.get("disabled")),
+            valid_servers=_split_valid_servers(row.get("valid-server")),
+            alert_timeout=_safe_str(row.get("alert-timeout")),
+            managed=_safe_str(row.get("comment")) == _ROGUE_DHCP_ALERT_COMMENT,
+            unknown_server=_safe_str(row.get("unknown-server")),
+        )
+    for interface in dhcp_serving_interfaces:
+        if interface in statuses:
+            continue
+        statuses[interface] = RogueDhcpAlertStatus(
+            interface=interface,
+            serves_dhcp=True,
+            alert_present=False,
+            enabled=False,
+            valid_servers=(),
+            alert_timeout=None,
+            managed=False,
+            unknown_server=None,
+        )
+    return [statuses[name] for name in sorted(statuses)]
 
 
 def _build_default_routes(

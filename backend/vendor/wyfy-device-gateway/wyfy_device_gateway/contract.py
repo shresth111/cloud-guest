@@ -12,7 +12,7 @@ so no compatibility shim is needed.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
@@ -232,6 +232,120 @@ class DhcpPoolConfig:
     gateway: str
     dns_servers: list[str]
     lease_time_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class RogueDhcpAlertConfig:
+    """One interface's watch for a DHCP server that is not ours --
+    RouterOS's ``/ip dhcp-server alert``.
+
+    ## What it does, and what it does NOT
+
+    It **logs**. That is the whole of it. It drops nothing, blocks
+    nothing, disconnects nobody, and cannot take a working guest network
+    down. A rogue DHCP server it detects keeps answering exactly as it
+    did before; the only thing that changes is that the router now says
+    so, in its own log, instead of the whole event being invisible. A
+    raised alert is evidence for a person, not a containment action, and
+    any caller that treats one as "handled" is wrong.
+
+    That ceiling is deliberate, not a gap to be closed later. The
+    alternative shapes -- dropping DHCP replies from unknown servers,
+    kicking the offending MAC -- are guards that can themselves black out
+    a venue if the trusted list is wrong by one character, and this
+    platform pushes to a fleet it cannot watch. A detector that is always
+    safe to have on beats a blocker nobody dares enable.
+
+    ## Why it is worth having anyway
+
+    A consumer router in factory configuration appeared briefly on the lab
+    guest bridge announcing ``192.168.1.1`` -- the WAN gateway's own
+    address -- with an Atheros MAC, and was gone before it could be
+    traced. The address it claimed was the small half of the danger: a box
+    in that state usually serves DHCP as well, and a rogue DHCP server
+    wins whenever it answers first. Guests take an address and a default
+    gateway that go nowhere, the router they are actually associated with
+    reports nothing wrong, and support gets "the wifi is broken" with no
+    evidence attached to it at all.
+
+    ## ``valid_servers`` is the caller's value, never the adapter's
+
+    The MAC addresses of the DHCP servers that are *supposed* to answer on
+    this interface -- in practice the router's own MAC on it, read off the
+    device by whatever resolves this config. It is required, and the
+    adapter refuses to invent one: a wrong entry makes every legitimate
+    reply look rogue and buries a real alert under a log full of false
+    ones, and an empty list means the same thing in a form that looks like
+    configuration rather than a mistake.
+
+    ``alert_timeout`` is how long RouterOS waits before reporting the same
+    unknown server again. ``None`` means "leave whatever the device has",
+    never "set it to a default we made up" -- the same posture
+    ``mikrotik_adapter._ensure_dhcp_server`` takes on ``lease_time``.
+    """
+
+    interface: str
+    valid_servers: tuple[str, ...]
+    alert_timeout: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RogueDhcpAlertStatus:
+    """Whether one interface is actually being watched for a rogue DHCP
+    server, as the device reports it right now.
+
+    The reader produces one of these for every interface running an
+    enabled DHCP server *and* for every alert row present, so an
+    unguarded interface is a row in the answer rather than a silence a
+    caller has to notice. An interface that hands out addresses with
+    nothing watching it is the state worth reporting, and it has no alert
+    row of its own to be listed by.
+
+    ``enabled`` is the field this type exists for. **RouterOS creates an
+    alert row disabled by default**: a first, careful attempt at
+    configuring this by hand on the lab router left three alerts present
+    and switched off -- guarding nothing, while reading in the
+    configuration exactly like a router that was guarded. A check that
+    tests only for presence certifies that router as safe. So presence
+    (``alert_present``) and liveness (``enabled``) are reported as two
+    separate facts, and :attr:`guarded` is the answer to the question
+    anyone actually has.
+
+    ``serves_dhcp`` is read from ``/ip dhcp-server`` in the same pass,
+    because an alert is only meaningful where this router is itself a DHCP
+    server -- an interface with no server of ours has no baseline to
+    compare an offer against.
+
+    ``managed`` says the row carries this platform's own comment marker. A
+    row without it was written by a person or an older tool; it is
+    reported, and adopted rather than duplicated on the next push, but the
+    distinction is worth seeing.
+
+    ``valid_servers`` is what the device says it trusts (canonical
+    uppercase where the entry is a real MAC, verbatim where it is not);
+    ``unknown_server`` is whatever RouterOS last saw answering that it did
+    not trust -- the only field here that is evidence rather than
+    configuration.
+    """
+
+    interface: str
+    serves_dhcp: bool
+    alert_present: bool
+    enabled: bool
+    valid_servers: tuple[str, ...]
+    alert_timeout: str | None
+    managed: bool
+    unknown_server: str | None
+
+    @property
+    def guarded(self) -> bool:
+        """Is this interface's DHCP being watched *right now*.
+
+        False for a missing row and, just as importantly, for one that is
+        present and disabled -- the state that looks configured and
+        watches nothing.
+        """
+        return self.alert_present and self.enabled
 
 
 @dataclass(frozen=True, slots=True)
@@ -728,6 +842,44 @@ class DeviceGatewayAdapter(Protocol):
         """
         ...
     async def configure_dhcp_pool(self, creds: DeviceCredentials, *, pool: DhcpPoolConfig) -> None: ...
+
+    # -- rogue DHCP detection ----------------------------------------------
+    # A detector, deliberately never an enforcer: see
+    # :class:`RogueDhcpAlertConfig` for what a DHCP alert does and, more
+    # importantly, what it does not.
+
+    async def configure_rogue_dhcp_alerts(
+        self, creds: DeviceCredentials, *, alerts: Sequence[RogueDhcpAlertConfig]
+    ) -> None:
+        """Make the device watch the named interfaces for a DHCP server
+        other than the ones the caller vouches for, and *log* when one
+        answers. It blocks nothing; a rogue server keeps working exactly
+        as before, it just stops being invisible.
+
+        An interface that runs no enabled DHCP server of ours is skipped
+        rather than alerted on: there is no baseline there to call a
+        reply rogue against.
+
+        Idempotent, and idempotent on the state that matters rather than
+        on presence -- a second push of an unchanged set writes nothing,
+        and a row somebody left disabled is switched back on, because
+        RouterOS creates these disabled by default and a present-but-off
+        alert reads as guarded while watching nothing.
+        """
+        ...
+
+    async def read_rogue_dhcp_alerts(
+        self, creds: DeviceCredentials
+    ) -> list[RogueDhcpAlertStatus]:
+        """Whether this device is actually guarded against a rogue DHCP
+        server, interface by interface -- read-only.
+
+        Covers every interface serving DHCP as well as every alert row
+        present, so "this interface hands out addresses and nothing is
+        watching it" is something the caller is told rather than something
+        it has to infer from an absence.
+        """
+        ...
 
     async def configure_nat_masquerade(
         self, creds: DeviceCredentials, *, rule: NatRuleConfig
@@ -1235,6 +1387,8 @@ __all__ = [
     "VlanConfig",
     "VlanHotspotConfig",
     "DhcpPoolConfig",
+    "RogueDhcpAlertConfig",
+    "RogueDhcpAlertStatus",
     "NatRuleConfig",
     "PortForwardConfig",
     "RadiusClientConfig",

@@ -16,6 +16,7 @@ from wyfy_device_gateway.contract import (
     PortForwardConfig,
     QosPacketMarkConfig,
     RadiusClientConfig,
+    RogueDhcpAlertConfig,
     VlanConfig,
     VlanHotspotConfig,
 )
@@ -2952,3 +2953,383 @@ async def test_use_radius_is_compared_as_a_bool_not_a_string(
     assert [
         f for s, f in api.update_calls if s == ("ip", "hotspot", "profile")
     ] == []
+
+
+# ----------------------------------------------------------------------
+# Rogue DHCP detection -- `/ip dhcp-server alert`.
+#
+# A consumer router in factory configuration appeared on the lab guest
+# bridge claiming the WAN gateway's address; a box in that state usually
+# serves DHCP too, and a rogue DHCP server wins whenever it answers first.
+# The alert only logs -- it blocks nothing -- so what these tests are
+# really guarding is that it is actually *on*: RouterOS creates the row
+# disabled by default, and a present-but-disabled alert reads in the
+# configuration exactly like a guarded router while watching nothing.
+# ----------------------------------------------------------------------
+
+ROUTER_MAC = "48:A9:8A:11:22:33"
+
+
+def _alert(interface: str = "bridge", **overrides) -> RogueDhcpAlertConfig:
+    fields = {
+        "interface": interface,
+        "valid_servers": (ROUTER_MAC,),
+        "alert_timeout": "1h",
+    }
+    fields.update(overrides)
+    return RogueDhcpAlertConfig(**fields)
+
+
+def _dhcp_menus(*interfaces: str, disabled: tuple[str, ...] = ()) -> dict:
+    return {
+        ("ip", "dhcp-server"): [
+            {
+                ".id": f"*{index + 1}",
+                "name": f"{name}-dhcp",
+                "interface": name,
+                "disabled": name in disabled,
+            }
+            for index, name in enumerate(interfaces)
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_rogue_dhcp_alert_is_created_explicitly_enabled(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS creates an alert row DISABLED unless told otherwise. The
+    first by-hand attempt on the lab router left three alerts present and
+    switched off -- guarding nothing while looking guarded."""
+    api = FakeRouterOSApi(menus=_dhcp_menus("bridge"))
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_rogue_dhcp_alerts(
+        mikrotik_creds, alerts=[_alert("bridge")]
+    )
+
+    assert api.add_calls == [
+        (
+            ("ip", "dhcp-server", "alert"),
+            {
+                "interface": "bridge",
+                "valid-server": ROUTER_MAC,
+                "comment": "cloudguest-rogue-dhcp-watch",
+                "alert-timeout": "1h",
+                "disabled": "no",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repushing_an_unchanged_rogue_dhcp_alert_writes_nothing(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(menus=_dhcp_menus("bridge", "vlan12", "vlan95"))
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    alerts = [_alert("bridge"), _alert("vlan12"), _alert("vlan95")]
+
+    await adapter.configure_rogue_dhcp_alerts(mikrotik_creds, alerts=alerts)
+    api.add_calls.clear()
+    await adapter.configure_rogue_dhcp_alerts(mikrotik_creds, alerts=alerts)
+
+    assert api.add_calls == []
+    assert api.update_calls == []
+    assert api.remove_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_alert_somebody_left_disabled_is_switched_back_on(
+    patch_connect, mikrotik_creds
+):
+    """The worst of the three states: present, so a config review passes,
+    and off, so nothing is watched. Enabling it must not depend on any
+    other field having changed."""
+    api = FakeRouterOSApi(
+        menus={
+            **_dhcp_menus("bridge"),
+            ("ip", "dhcp-server", "alert"): [
+                {
+                    ".id": "*7",
+                    "interface": "bridge",
+                    "valid-server": ROUTER_MAC,
+                    "alert-timeout": "1h",
+                    "comment": "cloudguest-rogue-dhcp-watch",
+                    # A real bool, the way the API answers a read.
+                    "disabled": True,
+                }
+            ],
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_rogue_dhcp_alerts(
+        mikrotik_creds, alerts=[_alert("bridge")]
+    )
+
+    assert api.add_calls == []
+    assert api.update_calls == [
+        (("ip", "dhcp-server", "alert"), {".id": "*7", "disabled": "no"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_alert_is_created_for_an_interface_with_no_dhcp_server(
+    patch_connect, mikrotik_creds
+):
+    """An interface this router serves no DHCP on has no offer of our own
+    to compare an unknown one against, so an alert there would report
+    legitimate neighbours."""
+    api = FakeRouterOSApi(menus=_dhcp_menus("bridge"))
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_rogue_dhcp_alerts(
+        mikrotik_creds, alerts=[_alert("bridge"), _alert("ether5")]
+    )
+
+    assert [fields["interface"] for _, fields in api.add_calls] == ["bridge"]
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_dhcp_server_does_not_count_as_serving(
+    patch_connect, mikrotik_creds
+):
+    """`disabled` through `_is_truthy`, not a string compare -- a switched
+    off server hands out nothing."""
+    api = FakeRouterOSApi(menus=_dhcp_menus("bridge", disabled=("bridge",)))
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_rogue_dhcp_alerts(
+        mikrotik_creds, alerts=[_alert("bridge")]
+    )
+
+    assert api.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_valid_server_case_and_order_do_not_re_issue_the_same_set(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS answers with its own uppercase form and its own order. A
+    string compare on this field is the `disabled`/`lease-time` trap in a
+    third shape: the identical `set` re-issued on every push, forever."""
+    api = FakeRouterOSApi(
+        menus={
+            **_dhcp_menus("bridge"),
+            ("ip", "dhcp-server", "alert"): [
+                {
+                    ".id": "*7",
+                    "interface": "bridge",
+                    "valid-server": f"{ROUTER_MAC},48:A9:8A:44:55:66",
+                    "alert-timeout": "1h",
+                    "comment": "cloudguest-rogue-dhcp-watch",
+                    "disabled": False,
+                }
+            ],
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_rogue_dhcp_alerts(
+        mikrotik_creds,
+        alerts=[
+            _alert("bridge", valid_servers=("48:a9:8a:44:55:66", ROUTER_MAC.lower()))
+        ],
+    )
+
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_alert_timeout_is_compared_as_a_duration_not_a_string(
+    patch_connect, mikrotik_creds
+):
+    """`60m` and `1h` are the same hour; RouterOS stores one and reads back
+    the other."""
+    api = FakeRouterOSApi(
+        menus={
+            **_dhcp_menus("bridge"),
+            ("ip", "dhcp-server", "alert"): [
+                {
+                    ".id": "*7",
+                    "interface": "bridge",
+                    "valid-server": ROUTER_MAC,
+                    "alert-timeout": "1h",
+                    "comment": "cloudguest-rogue-dhcp-watch",
+                    "disabled": False,
+                }
+            ],
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_rogue_dhcp_alerts(
+        mikrotik_creds, alerts=[_alert("bridge", alert_timeout="60m")]
+    )
+
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_existing_unmarked_alert_is_adopted_not_duplicated(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS holds one alert per interface, so the interface -- not our
+    comment -- is the row's identity. A row the hand-run probe or a person
+    placed is stamped and corrected in place; a second row beside it would
+    be a duplicate at best and a rejected write at worst."""
+    api = FakeRouterOSApi(
+        menus={
+            **_dhcp_menus("bridge"),
+            ("ip", "dhcp-server", "alert"): [
+                {
+                    ".id": "*7",
+                    "interface": "bridge",
+                    "valid-server": "00:00:00:00:00:01",
+                    "disabled": True,
+                }
+            ],
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_rogue_dhcp_alerts(
+        mikrotik_creds, alerts=[_alert("bridge")]
+    )
+
+    assert api.add_calls == []
+    assert api.update_calls[0][1] == {
+        ".id": "*7",
+        "valid-server": ROUTER_MAC,
+        "comment": "cloudguest-rogue-dhcp-watch",
+        "alert-timeout": "1h",
+        "disabled": "no",
+    }
+
+
+@pytest.mark.asyncio
+async def test_alert_with_no_valid_servers_is_refused_before_any_write(
+    patch_connect, mikrotik_creds
+):
+    """An alert that trusts nobody reports every legitimate lease, which is
+    how a real alert gets ignored. Refused for the whole request, so a bad
+    entry cannot leave half the interfaces watched."""
+    api = FakeRouterOSApi(menus=_dhcp_menus("bridge", "vlan12"))
+    patch_connect(api)
+
+    with pytest.raises(MikroTikDeviceError, match="no valid_servers"):
+        await MikroTikAdapter().configure_rogue_dhcp_alerts(
+            mikrotik_creds,
+            alerts=[_alert("bridge"), _alert("vlan12", valid_servers=())],
+        )
+
+    assert api.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_valid_server_that_is_not_a_mac_is_refused(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(menus=_dhcp_menus("bridge"))
+    patch_connect(api)
+
+    with pytest.raises(MikroTikDeviceError, match="not a MAC address"):
+        await MikroTikAdapter().configure_rogue_dhcp_alerts(
+            mikrotik_creds, alerts=[_alert("bridge", valid_servers=("192.168.1.1",))]
+        )
+
+    assert api.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_two_alerts_for_one_interface_are_refused(patch_connect, mikrotik_creds):
+    api = FakeRouterOSApi(menus=_dhcp_menus("bridge"))
+    patch_connect(api)
+
+    with pytest.raises(MikroTikDeviceError, match="one per interface"):
+        await MikroTikAdapter().configure_rogue_dhcp_alerts(
+            mikrotik_creds,
+            alerts=[_alert("bridge"), _alert("bridge", valid_servers=(ROUTER_MAC,))],
+        )
+
+    assert api.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_reports_a_dhcp_interface_with_no_alert_as_unguarded(
+    patch_connect, mikrotik_creds
+):
+    """The finding worth having, and the one with no row of its own to be
+    listed by: this segment hands out addresses and nothing watches it."""
+    api = FakeRouterOSApi(menus=_dhcp_menus("bridge", "vlan12"))
+    patch_connect(api)
+
+    statuses = await MikroTikAdapter().read_rogue_dhcp_alerts(mikrotik_creds)
+
+    assert [s.interface for s in statuses] == ["bridge", "vlan12"]
+    assert all(s.serves_dhcp and not s.alert_present for s in statuses)
+    assert not any(s.guarded for s in statuses)
+
+
+@pytest.mark.asyncio
+async def test_read_reports_a_present_but_disabled_alert_as_not_guarded(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(
+        menus={
+            **_dhcp_menus("bridge"),
+            ("ip", "dhcp-server", "alert"): [
+                {
+                    ".id": "*7",
+                    "interface": "bridge",
+                    "valid-server": ROUTER_MAC.lower(),
+                    "alert-timeout": "1h",
+                    "comment": "cloudguest-rogue-dhcp-watch",
+                    "disabled": True,
+                    "unknown-server": "AA:BB:CC:DD:EE:FF",
+                }
+            ],
+        }
+    )
+    patch_connect(api)
+
+    (status,) = await MikroTikAdapter().read_rogue_dhcp_alerts(mikrotik_creds)
+
+    assert status.alert_present is True
+    assert status.enabled is False
+    assert status.guarded is False
+    assert status.managed is True
+    assert status.valid_servers == (ROUTER_MAC,)
+    # What the router already saw answering that it does not trust -- the
+    # one field here that is evidence rather than configuration.
+    assert status.unknown_server == "AA:BB:CC:DD:EE:FF"
+
+
+@pytest.mark.asyncio
+async def test_read_reports_an_enabled_alert_as_guarded_and_writes_nothing(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(
+        menus={
+            **_dhcp_menus("bridge"),
+            ("ip", "dhcp-server", "alert"): [
+                {
+                    ".id": "*7",
+                    "interface": "bridge",
+                    "valid-server": ROUTER_MAC,
+                    "comment": "somebody else's row",
+                    "disabled": False,
+                }
+            ],
+        }
+    )
+    patch_connect(api)
+
+    (status,) = await MikroTikAdapter().read_rogue_dhcp_alerts(mikrotik_creds)
+
+    assert status.guarded is True
+    # Provenance is reported, not corrected: this is the read path.
+    assert status.managed is False
+    assert api.ops == []
