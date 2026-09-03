@@ -836,3 +836,69 @@ class TestDhcpPoolDeleteReachesTheDevice:
 
         assert pool.is_deleted is False
         assert await h.repository.get_pool_by_id(pool.id) is not None
+
+
+class TestDnsServerFallback:
+    """A pool with no DNS configured must still point guests at this
+    router, never past it.
+
+    MikroTik documents that a DHCP server with no ``dns-server`` hands out
+    the router's own *upstream* resolvers. Both DNS fields are optional and
+    blank by default on the customer's screen, so the ordinary pool was the
+    broken one -- and nobody had to touch a DNS setting to cause it.
+    """
+
+    async def test_a_pool_with_no_dns_advertises_the_gateway(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            dns_primary=None,
+            dns_secondary=None,
+        )
+
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        # Not [] -- an empty list makes the adapter omit dns-server=, which
+        # is what sent guests to 8.8.8.8 and silently disabled every
+        # feature built on this router's resolver.
+        assert adapter.calls[0]["dns_servers"] == ["192.168.10.1"]
+
+    async def test_configured_dns_still_wins_over_the_fallback(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)  # dns_primary=8.8.8.8
+
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.calls[0]["dns_servers"] == ["8.8.8.8"]
+
+    async def test_no_dns_and_no_gateway_advertises_nothing_rather_than_guessing(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """There is nothing truthful to advertise, and inventing an address
+        would be worse than the gap. The push itself is refused earlier for
+        a missing gateway, so this covers the helper directly."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        pool.dns_primary = None
+        pool.dns_secondary = None
+        pool.gateway_ip_address = None
+
+        assert h.service._dns_servers(pool) == []

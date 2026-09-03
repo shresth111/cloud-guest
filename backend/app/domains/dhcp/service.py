@@ -480,17 +480,42 @@ class DhcpService:
 
     @staticmethod
     def _dns_servers(pool: DhcpPool) -> list[str]:
-        """The DNS servers to advertise, in the operator's own order.
+        """The DNS servers to advertise, in the operator's own order,
+        falling back to the gateway -- this router -- when the operator set
+        none.
 
-        Only the ones actually set: an empty list means the adapter omits
+        The fallback is the point, and this docstring used to argue the
+        opposite: that an empty list "means the adapter omits
         ``dns-server=`` entirely rather than sending a blank value, which
-        RouterOS would take as "no DNS" in a way that looks configured.
+        RouterOS would take as no DNS in a way that looks configured".
+        Omitting it does not mean no DNS. MikroTik documents that a DHCP
+        server with no ``dns-server`` hands out **the router's own
+        upstream resolvers** -- so every guest on such a pool resolves
+        past this router entirely.
+
+        That silently disables everything built on the router's resolver.
+        Website Blocking realizes a blocked domain as an ``/ip dns static``
+        entry; a guest asking 8.8.8.8 directly never sees it. Both DNS
+        fields are optional and blank by default on the customer's screen,
+        so the ordinary pool is the broken one, and nobody has to touch a
+        DNS setting to cause it.
+
+        Pointing guests at the gateway is what ``_render_vlan_hotspot``
+        has always done for the hotspot path. This makes the plain-pool
+        path agree with it.
+
+        Returns empty only when there is no gateway either -- there is
+        then nothing truthful to advertise, and the caller must not invent
+        one.
         """
-        return [
+        configured = [
             server
             for server in (pool.dns_primary, pool.dns_secondary)
             if server
         ]
+        if configured:
+            return configured
+        return [pool.gateway_ip_address] if pool.gateway_ip_address else []
 
     def _resolve_device_credentials(self, router: Router) -> DhcpCredentials:
         """Raise rather than guess -- mirrors ``vlan``/``qos``."""
