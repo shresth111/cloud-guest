@@ -20,6 +20,11 @@ __all__ = [
     "CrossOrganizationContentFilterRuleAccessError",
     "InvalidContentFilterValueError",
     "ContentFilterRuleAlreadyExistsError",
+    "ContentFilterRuleNotEnabledError",
+    "ContentFilterMissingCredentialsError",
+    "UnsupportedContentFilterVendorError",
+    "ContentFilterDeviceConnectionError",
+    "ContentFilterDeviceOperationError",
 ]
 
 
@@ -74,4 +79,84 @@ class ContentFilterRuleAlreadyExistsError(ContentFilteringError):
             f"Router '{router_id}' already has a {value_type} content "
             f"filter rule for '{value}'",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Device push
+#
+# Everything below is raised by ``ContentFilterService.push_rule_to_device``
+# and its delete path. They all subclass ``CloudGuestError``, so the app-wide
+# handler turns them into a real non-2xx response.
+#
+# That matters more than it looks: the frontend's response interceptor
+# (``cloudguest-foundation/src/services/api.ts``) unwraps ``response.data.data``
+# and never reads ``envelope.success``. A handler that "reported failure
+# honestly" by returning ``200 {"success": false}`` would be indistinguishable
+# from success to every caller in the app -- which is the exact shape of the
+# bug this domain is being wired up to stop, since "Website Blocking" already
+# reported success for a site it had never actually blocked.
+# ---------------------------------------------------------------------------
+
+
+class ContentFilterRuleNotEnabledError(ContentFilteringError):
+    """Asked to push a rule whose ``is_enabled`` is ``False``.
+
+    There is nothing correct to push: an ``is_enabled=False`` rule is the
+    customer saying this site should *not* be blocked, and realizing it
+    would block the site the toggle exists to unblock. Turning a rule off
+    is a delete on the device, which is the delete path's job, not a
+    push's.
+    """
+
+    def __init__(self, rule_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Content filter rule '{rule_id}' is disabled and cannot be "
+            "pushed to a device",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class ContentFilterMissingCredentialsError(ContentFilteringError):
+    """The rule's router has no management IP / API username / decrypted
+    secret stored. Mirrors ``VlanMissingCredentialsError``."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router '{router_id}' is missing device connection credentials "
+            "(management IP, API username, or API secret)",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class UnsupportedContentFilterVendorError(ContentFilteringError):
+    """No content-filtering device adapter is registered for the router's
+    vendor."""
+
+    def __init__(self, vendor: str) -> None:
+        super().__init__(
+            "No content filtering device adapter is registered for vendor "
+            f"'{vendor}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ContentFilterDeviceConnectionError(ContentFilteringError):
+    """A real connection attempt (RouterOS API, port 8728) failed."""
+
+    def __init__(self, host: str, detail: str) -> None:
+        super().__init__(
+            f"Could not connect to device at '{host}': {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class ContentFilterDeviceOperationError(ContentFilteringError):
+    """A device content-filtering operation failed after a connection was
+    established."""
+
+    def __init__(self, operation: str, detail: str) -> None:
+        super().__init__(
+            f"Device operation '{operation}' failed: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
         )
