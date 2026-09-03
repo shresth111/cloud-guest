@@ -24,16 +24,24 @@ from datetime import UTC, datetime
 import pytest
 
 from app.database.utils.pagination import PageParams, PaginationMeta
+from app.domains.dhcp.constants import DhcpDevicePushStatus
 from app.domains.dhcp.exceptions import (
     CrossOrganizationDhcpPoolAccessError,
+    DhcpDeviceOperationError,
+    DhcpMissingCredentialsError,
+    DhcpPoolMissingGatewayError,
+    DhcpPoolMissingInterfaceError,
+    DhcpPoolNotEnabledError,
     DhcpPoolNotFoundError,
     DhcpPoolRangeConflictError,
     InvalidAddressRangeError,
     InvalidIpAddressError,
+    UnsupportedDhcpVendorError,
 )
 from app.domains.dhcp.models import DhcpPool
 from app.domains.dhcp.router import router as dhcp_router
 from app.domains.dhcp.service import DhcpService
+from app.domains.rbac.enums import AuditAction
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 
@@ -121,6 +129,14 @@ class FakeDhcpRepository:
         pool.deleted_at = _now()
         return pool
 
+    #: Counts the explicit commit ``push_pool_to_device`` issues before
+    #: re-raising a device failure. Without it the failure record is
+    #: discarded by the session rollback and the row still reads "pending".
+    commits: int = 0
+
+    async def commit(self) -> None:
+        self.commits += 1
+
     async def list_pools(
         self,
         *,
@@ -183,6 +199,14 @@ class FakeRouterLookup:
         ):
             raise RouterNotFoundError(router_id)
         return router
+
+    # Really part of the protocol -- the device-push path calls it. The
+    # sentinel lets a test blank it out to exercise the missing-credentials
+    # guard without hand-building a half-populated Router.
+    secret: str | None = "s3cret"
+
+    def get_decrypted_api_secret(self, router: Router) -> str | None:
+        return self.secret
 
 
 # ============================================================================
@@ -444,8 +468,268 @@ class TestListPoolsForRouter:
 
 class TestEveryRouteRequiresPermission:
     def test_every_dhcp_route_has_a_permission_dependency(self) -> None:
-        assert len(dhcp_router.routes) == 5
+        assert len(dhcp_router.routes) == 6
         for route in dhcp_router.routes:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+# ============================================================================
+# Device push -- the piece this domain never had. Creating a pool wrote a
+# row and contacted nothing, so a guest joining the network got no address.
+# ============================================================================
+
+
+@dataclass
+class FakeDhcpAdapter:
+    """Records what the service actually asked the device to do."""
+
+    vendor: str = "mikrotik"
+    calls: list[dict[str, object]] = field(default_factory=list)
+    raises: Exception | None = None
+
+    async def configure_dhcp_pool(
+        self,
+        credentials,
+        *,
+        interface: str,
+        range_start: str,
+        range_end: str,
+        gateway: str,
+        dns_servers: list[str],
+        lease_time_seconds: int,
+    ) -> None:
+        self.calls.append(
+            {
+                "host": credentials.host,
+                "username": credentials.username,
+                "password": credentials.password,
+                "interface": interface,
+                "range_start": range_start,
+                "range_end": range_end,
+                "gateway": gateway,
+                "dns_servers": dns_servers,
+                "lease_time_seconds": lease_time_seconds,
+            }
+        )
+        if self.raises is not None:
+            raise self.raises
+
+
+@pytest.fixture
+def adapter(monkeypatch: pytest.MonkeyPatch) -> FakeDhcpAdapter:
+    """Replaces the registry lookup the service performs.
+
+    Patched on ``service``'s own reference, not on ``device_adapters`` --
+    the service imported the name at module load, so patching the source
+    module would leave the bound name untouched and the test would silently
+    exercise the real adapter.
+    """
+    fake = FakeDhcpAdapter()
+    monkeypatch.setattr(
+        "app.domains.dhcp.service.get_dhcp_adapter", lambda vendor: fake
+    )
+    return fake
+
+
+class TestDhcpPoolDevicePush:
+    async def test_push_reaches_the_device_and_records_it(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        assert pool.device_push_status == DhcpDevicePushStatus.PENDING.value
+
+        pushed = await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(adapter.calls) == 1
+        call = adapter.calls[0]
+        assert call["host"] == "10.0.0.1"
+        assert call["username"] == "admin"
+        assert call["password"] == "s3cret"
+        assert call["interface"] == "ether2"
+        assert call["range_start"] == "192.168.10.10"
+        assert call["range_end"] == "192.168.10.100"
+        assert call["gateway"] == "192.168.10.1"
+
+        assert pushed.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+        assert pushed.device_push_error is None
+        assert pushed.device_pushed_at is not None
+
+    async def test_only_the_dns_servers_actually_set_are_advertised(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """An empty entry would reach RouterOS as a blank ``dns-server=``,
+        which looks configured and resolves nothing."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)  # dns_primary only
+
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.calls[0]["dns_servers"] == ["8.8.8.8"]
+
+    async def test_push_writes_a_real_audit_entry(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        before = len(h.audit_writer.entries)
+
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(h.audit_writer.entries) == before + 1
+        assert (
+            h.audit_writer.entries[-1]["action"]
+            == AuditAction.DHCP_POOL_PUSHED.value
+        )
+
+    async def test_a_device_failure_is_recorded_committed_and_re_raised(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The commit is the point. ``GenericRepository.update`` only
+        flushes and ``get_db_session`` rolls back on any exception, so
+        without an explicit commit the failure record is discarded and the
+        row still reads "pending" with a NULL error after a real failure."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        adapter.raises = DhcpDeviceOperationError(
+            "configure_dhcp_pool", "already have such item"
+        )
+
+        with pytest.raises(DhcpDeviceOperationError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert pool.device_push_status == DhcpDevicePushStatus.FAILED.value
+        assert "already have such item" in (pool.device_push_error or "")
+        assert h.repository.commits == 1
+
+    async def test_a_disabled_pool_is_refused_before_any_connection(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            is_enabled=False,
+        )
+
+        with pytest.raises(DhcpPoolNotEnabledError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_a_pool_with_no_interface_is_refused(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """``interface`` is nullable, and the adapter derives both RouterOS
+        identifiers and the server's own binding from it."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router, interface=None)
+
+        with pytest.raises(DhcpPoolMissingInterfaceError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_a_pool_with_no_gateway_is_refused(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Guests would get an address and no route off the subnet.
+        Defaulting to ``.1`` would be a fabricated network fact."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            gateway_ip_address=None,
+        )
+
+        with pytest.raises(DhcpPoolMissingGatewayError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_a_router_with_no_usable_credentials_is_refused(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        h.router_lookup.secret = None
+
+        with pytest.raises(DhcpMissingCredentialsError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_another_organizations_pool_cannot_be_pushed(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+
+        with pytest.raises(CrossOrganizationDhcpPoolAccessError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=uuid.uuid4(),
+            )
+        assert adapter.calls == []
+
+
+class TestUnsupportedVendorIsATypedError:
+    async def test_an_unknown_vendor_gets_a_400_not_a_gateway_error(self) -> None:
+        """``Router.vendor`` is a free ``String(50)``, so a row carrying
+        "MikroTik" or "mikrotik_routeros" must fail here, typed, rather than
+        opaquely inside the gateway's own enum lookup."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        router.vendor = "ubiquiti"
+        pool = await _create_pool(h, router)
+
+        with pytest.raises(UnsupportedDhcpVendorError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )

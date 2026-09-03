@@ -195,7 +195,17 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXECUTE,
         _A.MANAGE,
     ),
-    PermissionModule.DHCP: (_A.CREATE, _A.READ, _A.UPDATE, _A.DELETE, _A.MANAGE),
+    PermissionModule.DHCP: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        # EXECUTE gates POST /dhcp-pools/{id}/push -- realizing a pool on a
+        # real router, which is a different privilege from editing the row.
+        # Same distinction, and the same tuple shape, as VLAN below.
+        _A.EXECUTE,
+        _A.MANAGE,
+    ),
     PermissionModule.DNS: (_A.CREATE, _A.READ, _A.UPDATE, _A.DELETE, _A.MANAGE),
     PermissionModule.HOTSPOT: (
         _A.CREATE,
@@ -338,8 +348,8 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # PermissionModule.DHCP's own action tuple already exists above
     # (seeded ahead of any real domain, like PermissionModule.BANDWIDTH
     # was for queue_management) -- this build reuses it as-is for
-    # app.domains.dhcp rather than minting a second key, and its shape
-    # already matches (CREATE/READ/UPDATE/DELETE/MANAGE, no EXECUTE).
+    # app.domains.dhcp rather than minting a second key. It now also
+    # carries EXECUTE, for the device push that domain gained.
     # MAC Authorization: CRUD plus IMPORT/EXPORT for its own bulk
     # operations -- mirrors PermissionModule.VOUCHER's own inclusion of
     # both actions for the identical "bulk-load/download a whitelist"

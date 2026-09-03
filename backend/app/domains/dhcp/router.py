@@ -75,6 +75,9 @@ def _pool_response(pool: DhcpPool) -> DhcpPoolResponse:
         dns_secondary=pool.dns_secondary,
         lease_time_seconds=pool.lease_time_seconds,
         is_enabled=pool.is_enabled,
+        device_push_status=pool.device_push_status,
+        device_push_error=pool.device_push_error,
+        device_pushed_at=pool.device_pushed_at,
         created_at=pool.created_at,
     )
 
@@ -219,6 +222,52 @@ async def delete_dhcp_pool(
         success=True,
         message="DHCP pool deleted",
         data=MessageResponse(message="DHCP pool deleted").model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/{pool_id}/push",
+    response_model=ApiResponse[DhcpPoolResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("dhcp.execute"))],
+)
+async def push_dhcp_pool(
+    request: Request,
+    pool_id: uuid.UUID,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: DhcpService = Depends(get_dhcp_service),
+):
+    """Realizes this DHCP pool on its own router over the RouterOS API.
+
+    Gated by ``dhcp.execute``, not ``dhcp.update``: editing a row and
+    reaching into a live router are different privileges. That action is
+    new -- ``app.domains.rbac.seed`` must be re-run on deploy or every
+    operator gets a 403 here. (That is not hypothetical: the identical
+    ``vlan.execute`` action shipped without the seed being run, and the
+    Apply button 403'd against a working adapter until it was.)
+
+    **There is no try/except in this handler, deliberately.** Every failure
+    path raises a ``DhcpError`` carrying its own status code (502 for a
+    device connection or operation failure, 409/400/403/404 for the rest),
+    and the app-wide ``CloudGuestError`` handler turns it into a real
+    non-2xx.
+
+    Returning ``200 {"success": false}`` instead would be invisible: the
+    frontend's response interceptor unwraps ``response.data.data`` and never
+    reads ``success``, so such a response reaches the UI as a success. The
+    honesty has to live in the status code.
+    """
+    pool = await service.push_pool_to_device(
+        pool_id,
+        actor_user_id=uuid.UUID(actor.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="DHCP pool pushed to device",
+        data=_pool_response(pool).model_dump(),
         request_id=_request_id(request),
     )
 

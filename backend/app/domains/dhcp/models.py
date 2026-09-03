@@ -23,14 +23,23 @@ service-layer check only (``service.py``'s own ``_check_range_conflict``)
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-from .constants import DEFAULT_LEASE_TIME_SECONDS
+from .constants import DEFAULT_LEASE_TIME_SECONDS, DhcpDevicePushStatus
 
 
 class DhcpPool(BaseModel):
@@ -67,6 +76,22 @@ class DhcpPool(BaseModel):
         Integer, default=DEFAULT_LEASE_TIME_SECONDS, nullable=False
     )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    #: Whether a real ``/ip pool`` + ``/ip dhcp-server`` +
+    #: ``/ip dhcp-server network`` triple for this row exists on the router
+    #: right now -- see ``constants.DhcpDevicePushStatus``. Deliberately
+    #: independent of ``is_enabled``, which is intent: a pool can be enabled
+    #: and never have reached a device. Before this existed, creating a pool
+    #: wrote a row and contacted nothing, so a guest joining the network got
+    #: no address at all.
+    device_push_status: Mapped[str] = mapped_column(
+        String(20), default=DhcpDevicePushStatus.PENDING.value, nullable=False
+    )
+    #: The raw ``str(exc)`` from the last failed push, shown to the operator
+    #: verbatim -- a RouterOS error is more useful unedited than summarized.
+    device_push_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    device_pushed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_dhcp_pools_router_id", "router_id"),

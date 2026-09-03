@@ -783,6 +783,11 @@ class AuditAction(StrEnum):
     DHCP_POOL_CREATED = "dhcp_pool_created"
     DHCP_POOL_UPDATED = "dhcp_pool_updated"
     DHCP_POOL_DELETED = "dhcp_pool_deleted"
+    # The real device-push event: the pool was realized on a router, not
+    # merely written to a row. Distinct from DHCP_POOL_CREATED, which says
+    # nothing about any device -- and used to be the only DHCP audit entry
+    # that ever existed, which is how "created" came to mean "a row exists".
+    DHCP_POOL_PUSHED = "dhcp_pool_pushed"
 
     # Port Forwarding Management domain events -- written through this
     # same table by
