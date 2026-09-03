@@ -76,10 +76,17 @@ from .constants import (
     HealthStatus,
     HealthStatusSource,
     IspConnectionMode,
+    IspFailoverPushStatus,
     IspLinkRole,
     WanRoutingMode,
 )
-from .device_adapters import IspCredentials, PingResult, get_isp_health_adapter
+from .device_adapters import (
+    BaseIspHealthAdapter,
+    DefaultRouteInfo,
+    IspCredentials,
+    PingResult,
+    get_isp_health_adapter,
+)
 from .events import (
     IspFailbackTriggered,
     IspFailoverTriggered,
@@ -91,12 +98,17 @@ from .events import (
 )
 from .exceptions import (
     CrossOrganizationIspLinkAccessError,
+    IspAmbiguousDefaultRouteError,
     IspDeviceConnectionError,
     IspDeviceOperationError,
+    IspDeviceRouteMismatchError,
+    IspError,
+    IspFailoverTargetUnreachableError,
     IspHealthCheckTargetUnavailableError,
     IspLinkDisabledError,
     IspLinkInterfaceRequiredError,
     IspLinkNotFoundError,
+    IspLinkRoutingInterfaceUnknownError,
     IspMissingCredentialsError,
     IspNoBackupLinkAvailableError,
     IspPrimaryLinkAlreadyExistsError,
@@ -1353,12 +1365,31 @@ class IspService:
                     actor_user_id=None,
                     reason="consecutive_health_check_failures",
                 )
-            except IspNoBackupLinkAvailableError:
-                # A real, honest outcome: the primary is down and there is
-                # nothing safe to fail over to. Logged, never raised back
-                # at the caller of a routine health check.
+            except IspError as exc:
+                # Two honest outcomes, both logged and never raised back at
+                # the caller of a routine health check:
+                #
+                #   * IspNoBackupLinkAvailableError -- the primary is down
+                #     and there is nothing safe to fail over to;
+                #   * any device-side refusal or failure now that this
+                #     actually contacts the router (unreachable target,
+                #     ambiguous routes, an immovable dynamic route, the
+                #     router itself unreachable -- which during the very
+                #     outage that triggered this is the likely case).
+                #
+                # The second group is deliberately not silent: it is
+                # already recorded on the promoted link's own
+                # `failover_push_status`/`failover_push_error` and
+                # committed there before the exception reached here, so the
+                # dashboard shows the real reason rather than a tile that
+                # claims a failover happened. Letting it propagate instead
+                # would turn a routine health check into a 5xx.
                 logger.warning(
-                    "isp_failover_unavailable", extra={"router_id": str(link.router_id)}
+                    "isp_failover_unavailable",
+                    extra={
+                        "router_id": str(link.router_id),
+                        "error": str(exc),
+                    },
                 )
                 return link
         if (
@@ -1367,12 +1398,52 @@ class IspService:
             and link.auto_failback
             and link.health_status == HealthStatus.HEALTHY.value
         ):
-            return await self.trigger_failback(link.router_id, actor_user_id=None)
+            try:
+                return await self.trigger_failback(link.router_id, actor_user_id=None)
+            except IspError as exc:
+                # Same posture as the failover branch above, and for the
+                # same reason: an automatic failback that the router
+                # refuses (the primary's route not active yet, an
+                # unreachable device) is recorded on the primary's own
+                # push columns and must not turn a routine health check
+                # into a 5xx. The link stays on the backup, which is the
+                # safe side to fail on.
+                logger.warning(
+                    "isp_failback_unavailable",
+                    extra={"router_id": str(link.router_id), "error": str(exc)},
+                )
+                return link
         return link
 
     # ========================================================================
     # Failover / failback
     # ========================================================================
+    #
+    # WHAT A FAILOVER IS, IN ONE PLACE.
+    #
+    # Two facts, deliberately separate, both written here:
+    #
+    #   1. ``IspLink.is_active_uplink`` -- which link this platform intends
+    #      to be carrying traffic. A database boolean.
+    #   2. ``IspLink.failover_push_status``/``failover_pushed_at`` -- what
+    #      the router was actually told, and whether it accepted.
+    #
+    # Until ``_push_preferred_uplink`` existed only (1) was ever written.
+    # ``trigger_failover`` flipped two booleans, wrote an audit row and
+    # returned 200 while ``device_adapters.py`` had no write method of any
+    # kind -- so a customer whose primary was down clicked the button, saw
+    # ``toast.success("Failover triggered")``, stayed offline, and watched
+    # the "Active uplink" tile start naming the backup. The one screen
+    # anyone looks at during an outage became actively wrong, which is
+    # worse than having no button at all.
+    #
+    # The device operation itself, and why route ``distance`` rather than
+    # ``check-gateway``, route disabling or policy routing, is documented on
+    # ``wyfy_device_gateway.mikrotik_adapter.MikroTikAdapter
+    # .set_default_route_distances``. The NAT half -- without which moving
+    # the route leaves every guest un-NATed and still offline -- is on
+    # ``ensure_wan_egress``. Both are worth reading before changing anything
+    # below.
 
     async def trigger_failover(
         self,
@@ -1382,35 +1453,92 @@ class IspService:
         reason: str,
         requesting_organization_id: uuid.UUID | None = None,
     ) -> IspLink:
-        """Fails traffic over from the router's current active uplink to
-        its best available ``BACKUP`` -- "best" meaning the
-        lowest-``priority``, enabled backup whose own ``health_status`` is
-        not currently ``UNHEALTHY`` (a link this domain already knows is
-        down is never a safe failover target). Raises
-        ``IspNoBackupLinkAvailableError`` if none qualifies -- the
-        primary's own outage is real, but there is nothing safe to switch
-        to."""
-        current_active = await self.repository.get_active_uplink_for_router(router_id)
-        backups = await self.repository.list_backup_links_for_router(router_id)
-        candidate = next(
-            (
-                backup
-                for backup in backups
-                if backup.is_enabled
-                and backup.health_status != HealthStatus.UNHEALTHY.value
-                and not (current_active and backup.id == current_active.id)
-            ),
-            None,
-        )
-        if candidate is None:
-            raise IspNoBackupLinkAvailableError(router_id)
+        """Moves traffic off the router's current active uplink and onto
+        its best available ``BACKUP`` -- on the device first, in the
+        database only once the device has accepted.
 
+        "Best" means the lowest-``priority``, enabled backup whose own
+        ``health_status`` is not currently ``UNHEALTHY``: a link this
+        platform already knows is down is never a safe target. Raises
+        ``IspNoBackupLinkAvailableError`` when none qualifies -- which is
+        also, correctly, what a single-WAN router gets, before any socket
+        is opened.
+
+        **Re-triggering an already-active failover is a clean no-op.**
+        When the active uplink is already a backup, this does not promote
+        a *second* one: it re-runs the (idempotent) device push, which
+        writes nothing to a router already in the requested state, and
+        returns the same link without a database write, an event or an
+        audit row. That push is not pointless -- it is what repairs a
+        router whose configuration has drifted since (a masquerade rule
+        removed by hand, a distance changed on the console) -- and when it
+        does repair something, the fact is logged and stamped on the row's
+        own ``failover_pushed_at``.
+
+        **The organization scope is enforced here now.** This method took
+        a ``requesting_organization_id`` and never read it, so an operator
+        holding ``isp.execute`` in organization A could fail over a router
+        belonging to organization B by putting its id in the path -- the
+        permission check reads the header, the handler read the path. The
+        router lookup below is scoped, and raises
+        ``RouterNotFoundError`` on a mismatch exactly like every other
+        cross-organization read in this codebase.
+        """
+        current_active = await self.repository.get_active_uplink_for_router(router_id)
+        already_failed_over = (
+            current_active is not None
+            and current_active.role != IspLinkRole.PRIMARY.value
+            and current_active.is_enabled
+        )
+        if already_failed_over and current_active is not None:
+            target = current_active
+        else:
+            backups = await self.repository.list_backup_links_for_router(router_id)
+            candidate = next(
+                (
+                    backup
+                    for backup in backups
+                    if backup.is_enabled
+                    and backup.health_status != HealthStatus.UNHEALTHY.value
+                    and not (current_active and backup.id == current_active.id)
+                ),
+                None,
+            )
+            if candidate is None:
+                raise IspNoBackupLinkAvailableError(router_id)
+            target = candidate
+
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        moved = await self._push_preferred_uplink(target, router=router)
+
+        if already_failed_over:
+            logger.info(
+                "isp_failover_already_active",
+                extra={
+                    "router_id": str(router_id),
+                    "isp_link_id": str(target.id),
+                    # True only when the router had drifted out of the
+                    # state a previous failover put it in and this push
+                    # put it back.
+                    "device_state_repaired": moved,
+                },
+            )
+            return target
+
+        # The database follows the device, never leads it. Deactivate
+        # before promoting: `uq_isp_links_router_id_active_uplink` is a
+        # partial UNIQUE index on (router_id) WHERE is_active_uplink, and
+        # Postgres checks it per statement, so promoting first would
+        # briefly leave two active rows and the index would reject the
+        # write outright.
         if current_active is not None:
             await self.repository.update_link(
                 current_active, {"is_active_uplink": False}
             )
         promoted = await self.repository.update_link(
-            candidate, {"is_active_uplink": True}
+            target, {"is_active_uplink": True}
         )
         event = IspFailoverTriggered(
             router_id=router_id,
@@ -1438,24 +1566,53 @@ class IspService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None = None,
     ) -> IspLink:
-        """Reverses a failover, handing traffic back to the router's own
-        ``PRIMARY`` link. Requires the primary to currently be
-        ``HEALTHY`` -- failing back onto a still-degraded/unhealthy link
-        would recreate the exact outage the failover just fixed."""
+        """Hands traffic back to the router's own ``PRIMARY`` link -- a
+        real device operation, the exact reverse of the one
+        ``trigger_failover`` performed, not the booleans flipped back.
+
+        Requires the primary to currently be ``HEALTHY``: failing back
+        onto a still-degraded link would recreate the outage the failover
+        just ended. On top of that this runs the identical read-before-
+        write the failover path does, so a primary the *database* believes
+        is healthy but whose default route the *router* has stopped
+        considering active is refused rather than moved onto.
+
+        Idempotent in the same way: a primary that is already the active
+        uplink gets the (write-free) device push and is returned without a
+        database write, an event or an audit row.
+        """
         primary = await self.repository.get_primary_link_for_router(router_id)
         if primary is None or primary.health_status != HealthStatus.HEALTHY.value:
             raise IspNoBackupLinkAvailableError(router_id)
-        if primary.is_active_uplink:
+
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        already_active = primary.is_active_uplink
+        moved = await self._push_preferred_uplink(primary, router=router)
+        if already_active:
+            logger.info(
+                "isp_failback_already_active",
+                extra={
+                    "router_id": str(router_id),
+                    "isp_link_id": str(primary.id),
+                    "device_state_repaired": moved,
+                },
+            )
             return primary
 
         current_active = await self.repository.get_active_uplink_for_router(router_id)
-        promoted = await self.repository.update_link(
-            primary, {"is_active_uplink": True}
-        )
+        # Deactivate first, promote second -- see trigger_failover's own
+        # comment on the partial unique index. This method used to do it in
+        # the other order, which the in-memory test double tolerated and
+        # Postgres would not.
         if current_active is not None:
             await self.repository.update_link(
                 current_active, {"is_active_uplink": False}
             )
+        promoted = await self.repository.update_link(
+            primary, {"is_active_uplink": True}
+        )
         event = IspFailbackTriggered(
             router_id=router_id,
             from_link_id=current_active.id if current_active else promoted.id,
@@ -1473,6 +1630,293 @@ class IspService:
             ),
         )
         return promoted
+
+    # ------------------------------------------------------------------
+    # The device half
+    # ------------------------------------------------------------------
+
+    async def _push_preferred_uplink(self, link: IspLink, *, router: Router) -> bool:
+        """Make ``link`` the uplink this router actually prefers, and
+        return whether the router's routing was changed.
+
+        Shared by failover and failback, because on the device they are
+        the same operation aimed at different links -- and writing them
+        twice is how the two would drift into disagreeing about what
+        "preferred" means.
+
+        **Everything that can be decided without the router is decided
+        before a socket is opened** (which interface this link even
+        terminates on, whether the router has usable credentials), so a
+        misconfigured row fails as a 4xx naming the problem rather than as
+        a device timeout.
+
+        **PROVISIONING is written and committed before the first socket**,
+        so a customer refreshing during a slow push sees the work in
+        progress rather than the previous attempt's outcome, and a process
+        killed mid-push leaves a row saying nobody confirmed this instead
+        of a stale ``ACTIVE``.
+
+        **A failure is recorded, committed, and then re-raised.**
+        ``GenericRepository.update`` only ``flush()``es and
+        ``get_db_session`` rolls the session back on any exception, so
+        without the explicit commit the failure record is discarded and
+        the row still reads ``pending`` with ``failover_push_error``
+        NULL -- see ``IspRepository.commit``. The exception then
+        propagates as a real non-2xx; it must never become a ``200
+        {"success": false}``, which the frontend interceptor cannot
+        distinguish from success because it unwraps ``data`` and never
+        reads ``success``.
+
+        **Order on the device: NAT before the route.** The masquerade rule
+        and WAN-list membership for the target interface are ensured
+        first, so that the instant the default route moves there is
+        already something NATing what leaves that way. The reverse order
+        leaves a window in which traffic egresses from an un-NATed private
+        source address -- a real outage, briefly, caused by the operation
+        meant to end one.
+        """
+        interface = self._uplink_interface(link)
+        credentials = self._resolve_device_credentials(router)
+        adapter = self._get_device_adapter(router.vendor)
+
+        await self.repository.update_link(
+            link,
+            {
+                "failover_push_status": IspFailoverPushStatus.PROVISIONING.value,
+                "failover_push_error": None,
+            },
+        )
+        await self.repository.commit()
+
+        try:
+            # One read answers every question the decision needs: which
+            # uplinks the router believes it has, which it prefers, which
+            # are live, and which can be modified at all.
+            routes = await adapter.read_default_routes(credentials)
+            plan = self._plan_distance_swap(link.router_id, routes, interface)
+            if plan:
+                # Only when something is actually about to move. With an
+                # empty plan there is no traffic to put anywhere, so there
+                # is nothing to protect from a dead target -- and refusing
+                # a no-op would stop a re-trigger from repairing a router
+                # whose NAT had been removed by hand.
+                await self._verify_failover_target(
+                    link, interface, routes, credentials, adapter
+                )
+            await adapter.ensure_wan_egress(credentials, interface=interface)
+            if plan:
+                await adapter.set_default_route_distances(
+                    credentials, distances=plan
+                )
+        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
+            await self.repository.update_link(
+                link,
+                {
+                    "failover_push_status": IspFailoverPushStatus.FAILED.value,
+                    "failover_push_error": str(exc),
+                },
+            )
+            await self.repository.commit()
+            raise
+
+        await self.repository.update_link(
+            link,
+            {
+                "failover_push_status": IspFailoverPushStatus.ACTIVE.value,
+                "failover_push_error": None,
+                "failover_pushed_at": datetime.now(UTC),
+            },
+        )
+        return bool(plan)
+
+    @staticmethod
+    def _uplink_interface(link: IspLink) -> str:
+        """The interface this link's traffic actually routes and NATs out
+        of -- ``routing_interface`` when the WAN split has been applied
+        (for PPPoE that is the virtual dial-out client, not the physical
+        port), falling back to the legacy ``interface`` column the split
+        keeps in sync.
+
+        Raises rather than guesses. A router with two WAN ports offers an
+        obvious-looking inference ("it must be the other one"), and acting
+        on it would move a venue's traffic onto a port chosen by this
+        codebase rather than by whoever cabled the site."""
+        interface = link.routing_interface or link.interface
+        if not interface:
+            raise IspLinkRoutingInterfaceUnknownError(link.id)
+        return interface
+
+    def _resolve_device_credentials(self, router: Router) -> IspCredentials:
+        """Raise rather than guess -- mirrors ``vlan``/``qos``/
+        ``queue_management``."""
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.router_lookup.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            raise IspMissingCredentialsError(router.id)
+        return IspCredentials(
+            host=host, username=router.api_username, password=secret
+        )
+
+    @staticmethod
+    def _plan_distance_swap(
+        router_id: uuid.UUID,
+        routes: list[DefaultRouteInfo],
+        target_interface: str,
+    ) -> dict[str, int]:
+        """The distance assignment that makes ``target_interface`` the
+        router's preferred uplink -- ``{}`` when it already is.
+
+        A **swap**, not an invented number: the target takes the lowest
+        distance currently in use, and whichever route held it takes the
+        target's. Nothing is decremented (RouterOS distances start at 1,
+        so "one better than the best" runs out), nothing is renumbered
+        into a scheme this platform made up, and the operation is its own
+        exact inverse -- which is what makes failback a real reversal
+        rather than a second, differently-shaped write.
+
+        Pure: no I/O, so the whole decision can be tested against raw
+        route rows. Every refusal below is a state where a distance change
+        would make things worse than leaving them alone:
+
+        * no route on the target's interface -- the platform and the
+          router disagree about where this uplink terminates;
+        * two routes on it -- "this link's route" has no single answer;
+        * a tie at the lowest distance -- that is RouterOS load sharing,
+          and joining or disturbing it is not a failover;
+        * a route with no readable distance, or an incumbent that resolves
+          to no interface on this device -- nothing here can address it,
+          and writing the half that *can* be addressed is exactly the
+          partial swap that produces a tie.
+        """
+        matches = [route for route in routes if route.interface == target_interface]
+        if not matches:
+            raise IspDeviceRouteMismatchError(
+                router_id,
+                f"no main-table default route leaves by interface "
+                f"'{target_interface}', which is where this platform believes "
+                f"the uplink terminates",
+            )
+        if len(matches) > 1:
+            raise IspAmbiguousDefaultRouteError(
+                router_id,
+                f"{len(matches)} default routes leave by interface "
+                f"'{target_interface}'",
+            )
+        target = matches[0]
+        if target.distance is None:
+            raise IspAmbiguousDefaultRouteError(
+                router_id,
+                f"the default route on '{target_interface}' reports no "
+                f"distance, so it cannot be ordered against the others",
+            )
+
+        others = [
+            route
+            for route in routes
+            if route.route_id != target.route_id and route.distance is not None
+        ]
+        if not others:
+            # A single default route is already the preferred one. This is
+            # the honest single-WAN answer, and it is a no-op rather than
+            # an error: nothing is wrong, there is simply nowhere else for
+            # traffic to go.
+            return {}
+
+        best = min([target.distance, *(route.distance for route in others)])
+        holders = [
+            route
+            for route in [target, *others]
+            if route.distance == best
+        ]
+        if len(holders) > 1:
+            raise IspAmbiguousDefaultRouteError(
+                router_id,
+                f"{len(holders)} default routes share the lowest distance "
+                f"({best}), which is load sharing rather than a preference "
+                f"order",
+            )
+        incumbent = holders[0]
+        if incumbent.route_id == target.route_id:
+            return {}
+        if incumbent.interface is None:
+            raise IspAmbiguousDefaultRouteError(
+                router_id,
+                "the currently-preferred default route resolves to no "
+                "interface on this device, so its distance cannot be "
+                "addressed",
+            )
+        return {target_interface: best, incumbent.interface: target.distance}
+
+    async def _verify_failover_target(
+        self,
+        link: IspLink,
+        interface: str,
+        routes: list[DefaultRouteInfo],
+        credentials: IspCredentials,
+        adapter: BaseIspHealthAdapter,
+    ) -> None:
+        """Confirm, from the router itself, that the link about to receive
+        the venue's traffic can actually carry it.
+
+        A failover onto a link that is also down is worse than none: it
+        adds an outage to an outage, and it makes the dashboard lie twice
+        -- once about the failover having worked and once about which
+        uplink is live.
+
+        Two signals, both read from the device, neither of which is "the
+        route exists":
+
+        * RouterOS's own ``active`` flag on the target's default route.
+          It goes false the instant that route's ``check-gateway=ping``
+          probe fails, so it distinguishes a configured uplink from a
+          working one. ``disabled`` is checked separately because an
+          administratively-disabled route is a human decision, not a
+          fault, and deserves its own message.
+        * a real ``/tool/ping`` from the router to that route's own next
+          hop. This is the part ``active`` alone cannot give: a route can
+          be freshly added and not yet probed.
+
+        **What this does not prove**, stated plainly because the whole
+        point of this method is not to repeat the mistake it exists to
+        prevent: that the ISP beyond that next hop is passing traffic, and
+        that a guest on the LAN can reach the internet through it. A
+        first-hop ICMP reply is the strongest evidence obtainable from the
+        router without sourcing a probe from the guest subnet out of this
+        specific uplink, which RouterOS cannot be asked to do while a
+        different route is still preferred. ``active=true``, "the route
+        exists" and "the address is still there" all pass on a router
+        forwarding zero packets.
+        """
+        route = next(route for route in routes if route.interface == interface)
+        if route.disabled:
+            raise IspFailoverTargetUnreachableError(
+                link.id,
+                "its default route is administratively disabled on the router",
+            )
+        if not route.active:
+            raise IspFailoverTargetUnreachableError(
+                link.id,
+                "RouterOS does not currently consider its default route "
+                "active -- the route's own check-gateway probe is failing",
+            )
+        if not route.gateway:
+            raise IspFailoverTargetUnreachableError(
+                link.id,
+                "its default route names no next-hop gateway, so nothing "
+                "about it can be tested before traffic is moved",
+            )
+        result = await adapter.ping(
+            credentials,
+            target_ip=route.gateway,
+            count=ISP_PING_COUNT,
+            timeout_seconds=ISP_PING_TIMEOUT_SECONDS,
+        )
+        if result.received <= 0:
+            raise IspFailoverTargetUnreachableError(
+                link.id,
+                f"the router cannot reach its next hop {route.gateway} "
+                f"({result.sent} sent, {result.received} received)",
+            )
 
     # ========================================================================
     # Availability (computed read-model, never persisted)

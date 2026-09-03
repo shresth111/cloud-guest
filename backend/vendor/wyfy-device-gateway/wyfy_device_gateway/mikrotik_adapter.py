@@ -66,6 +66,7 @@ import ipaddress
 import logging
 import re
 import uuid
+from collections.abc import Mapping
 
 import asyncssh
 import librouteros
@@ -74,6 +75,7 @@ from librouteros.exceptions import LibRouterosError
 from .contract import (
     ConnectedDevice,
     ContentFilterRuleConfig,
+    DefaultRoute,
     DeviceCredentials,
     DeviceDiscoveryResult,
     DeviceHealthResult,
@@ -156,6 +158,46 @@ _QOS_MANGLE_COMMENT_PREFIX = "WyfyGuest qos "
 # fields the old match used are still on the device row and are not in the
 # new desired set, and RouterOS's update has no way to unset them.
 _QOS_MANGLE_MATCH_FIELDS = ("protocol", "dst-port", "dscp")
+# WAN failover: the markers on the two objects ``ensure_wan_egress`` may add
+# so that traffic leaving a newly-preferred uplink is masqueraded and treated
+# as WAN-facing.
+#
+# INTERFACE-DERIVED, AND ONE PER INTERFACE ON PURPOSE. The alternative --
+# a single "the failover masquerade" rule whose ``out-interface`` is
+# rewritten on every failover -- is a *mutation of a live router-wide NAT
+# rule*, which is the class of change that took a guest network down on
+# 2026-08-18. Keyed per interface, every push this makes is an ADD of an
+# object that did not exist, and an add cannot break what already works: a
+# masquerade rule matches only traffic that actually leaves its own
+# ``out-interface``, so the rule for a backup uplink is inert for as long as
+# nothing is routed that way.
+_UPLINK_NAT_COMMENT_PREFIX = "cloudguest-nat-uplink-"
+_UPLINK_WAN_LIST_COMMENT_PREFIX = "cloudguest-wanlist-uplink-"
+# Fields that narrow a masquerade rule to less than "everything leaving this
+# interface". A rule carrying any of them may be someone else's deliberately
+# scoped NAT (one VLAN's own ``WyfyGuest VLAN <id>`` rule is exactly this
+# shape, with ``src-address`` set) and is therefore NOT evidence that guest
+# traffic in general is masqueraded out of that interface.
+_NAT_NARROWING_FIELDS = (
+    "src-address",
+    "src-address-list",
+    "dst-address",
+    "dst-address-list",
+    "in-interface",
+    "in-interface-list",
+    "protocol",
+    "src-port",
+    "dst-port",
+    "port",
+)
+
+
+def _uplink_nat_comment(interface: str) -> str:
+    return f"{_UPLINK_NAT_COMMENT_PREFIX}{interface}"
+
+
+def _uplink_wan_list_comment(interface: str) -> str:
+    return f"{_UPLINK_WAN_LIST_COMMENT_PREFIX}{interface}"
 
 
 def _nat_rule_comment(vlan_id: int) -> str:
@@ -419,6 +461,43 @@ class MikroTikWanInterfaceError(MikroTikDeviceError):
     out of the wrong interface does not fail loudly -- it silently NATs
     guest traffic onto an internal segment, or matches nothing at all and
     leaves a VLAN with no internet while the push reports success."""
+
+
+class MikroTikRouteNotFoundError(MikroTikDeviceError):
+    """A caller named an interface that has no ``0.0.0.0/0`` route in the
+    device's own ``main`` table.
+
+    Distinct from :class:`MikroTikWanInterfaceError`, which is "the device
+    will not say where the internet is at all". This one is narrower and
+    more alarming: the platform believes an uplink terminates on this
+    interface and the router has no default route there, so the two
+    disagree about the site's topology. Failing over onto it would produce
+    a dashboard that names an uplink no traffic can use."""
+
+
+class MikroTikAmbiguousRouteError(MikroTikDeviceError):
+    """More than one default route resolves to the same interface, or more
+    than one shares the lowest distance on the device.
+
+    Both are states where "which route is the preferred one" has no single
+    answer, and both are states a distance change would make worse rather
+    than better -- two routes tied at the lowest distance is RouterOS load
+    sharing, and lowering a third to join them adds a third share.
+    Refused rather than resolved by picking the first row, because row
+    order in a RouterOS reply is not a decision anyone made."""
+
+
+class MikroTikImmutableRouteError(MikroTikDeviceError):
+    """The route that would have to be modified is ``dynamic`` -- RouterOS
+    created it itself (a dhcp-client's own auto-route) and refuses
+    ``/ip route set`` on it.
+
+    Checked before the write rather than discovered from the device's
+    refusal, so the error names the interface and says what an operator can
+    do about it (this platform's own Setup Script generator provisions a
+    *static* default route per WAN precisely so this case does not arise --
+    a router showing this one was not provisioned by it, or has had its
+    routes replaced since)."""
 
 
 def normalize_mac_address(value: object) -> str | None:
@@ -2786,6 +2865,349 @@ class MikroTikAdapter:
         finally:
             api.close()
 
+    # ------------------------------------------------------------------
+    # WAN failover
+    # ------------------------------------------------------------------
+
+    async def read_default_routes(self, creds: DeviceCredentials) -> list[DefaultRoute]:
+        """Every ``0.0.0.0/0`` route in the device's own ``main`` table,
+        each resolved to the interface it actually leaves by.
+
+        The read a failover is decided from, and the reason this is a
+        separate call rather than something folded into the write: a
+        caller has to be able to refuse -- because the target is not
+        active, because the platform and the router disagree about the
+        topology, because the route is one RouterOS will not let anyone
+        modify -- *before* it has moved anything. Nothing here is
+        filtered: inactive, disabled and dynamic rows are all returned,
+        flagged, because each is a different refusal.
+        """
+        return await asyncio.to_thread(self._read_default_routes_sync, creds)
+
+    def _read_default_routes_sync(self, creds: DeviceCredentials) -> list[DefaultRoute]:
+        api = self._connect_api(creds)
+        try:
+            return self._read_default_routes(api, creds)
+        finally:
+            api.close()
+
+    def _read_default_routes(self, api, creds: DeviceCredentials) -> list[DefaultRoute]:
+        """Same read, against an already-open connection -- so the write
+        below re-reads and validates over the connection it then writes on
+        rather than trusting what a previous connection saw."""
+        try:
+            route_rows = list(api.path("ip", "route"))
+            address_rows = list(api.path("ip", "address"))
+            interface_rows = list(api.path("interface"))
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(
+                creds.host, f"read_default_routes: {exc}"
+            ) from exc
+        try:
+            dhcp_client_rows = list(api.path("ip", "dhcp-client"))
+        except LibRouterosError:
+            # Tier 4 of interface resolution only. An unreadable optional
+            # menu must not sink a read the earlier tiers can satisfy.
+            dhcp_client_rows = []
+        interface_names = {
+            str(row["name"]) for row in interface_rows if row.get("name")
+        }
+        return _build_default_routes(
+            route_rows, address_rows, dhcp_client_rows, interface_names
+        )
+
+    async def set_default_route_distances(
+        self, creds: DeviceCredentials, *, distances: Mapping[str, int]
+    ) -> None:
+        """Set the administrative distance of the ``main``-table default
+        route leaving by each named interface. **This is what failover
+        means on a RouterOS device in this platform.**
+
+        WHY DISTANCE, AND NOT THE ALTERNATIVES:
+
+        * *Disabling the primary's route* moves traffic too, and moves it
+          just as fast. It is rejected because it takes the primary out of
+          RouterOS's own decision entirely: while it is disabled the
+          router cannot fall back to it no matter what happens to the
+          backup, so a backup that dies during a failover leaves the site
+          dark even though a working uplink is sitting right there. With
+          distances, both routes keep their ``check-gateway=ping`` and
+          RouterOS keeps doing what it is good at -- the platform only
+          says which it should prefer. It also fails a blunter test: if
+          this backend never gets to run the reversal (process killed,
+          credentials rotated, site unreachable), a wrong distance is a
+          preference nobody notices, and an administratively disabled
+          route is an uplink nothing will ever bring back.
+        * *``check-gateway``* is not an alternative at all -- it is the
+          automatic mechanism, already provisioned on every route this
+          platform writes (``render_wan_routing_section``). There is no
+          way to tell RouterOS "pretend this gateway is down", so it
+          cannot express an operator's deliberate failover.
+        * *``/routing rule`` or policy routing* would work, and would
+          collide head-on with the routing-marks and ``to_wan<N>`` tables
+          ``render_wan_mangle_section`` already writes for load balancing.
+          Two mechanisms deciding the same thing is how a site ends up
+          with traffic that follows neither.
+
+        WHAT ACTUALLY HAPPENS TO TRAFFIC. RouterOS recomputes the FIB when
+        a distance changes, so new connections take the new uplink
+        immediately. Established connections do NOT survive: they were
+        masqueraded to the old uplink's source address, and the far end
+        will not accept them from a different one. A failover is a brief,
+        real interruption for anyone mid-download; it is not, and cannot
+        be made, seamless on this hardware.
+
+        ON PRIMARY RECOVERY: **sticky**. Distances are exactly what this
+        method set them to, so a primary coming back does not take traffic
+        back on its own -- it is reclaimed only by an explicit failback
+        (which the caller may automate via ``IspLink.auto_failback``, but
+        that is the platform deciding, not the router flapping). The one
+        thing the router still does by itself is the safety net that
+        disabling would have removed: if the *backup* then fails,
+        ``check-gateway`` deactivates its route and the primary's route --
+        still present, still probed, merely at a worse distance -- takes
+        over.
+
+        VALIDATED IN FULL BEFORE THE FIRST WRITE. A half-applied swap can
+        leave two default routes tied at the lowest distance, which is
+        RouterOS load sharing across an uplink that is down -- strictly
+        worse than the state it started from. Every route is resolved and
+        checked before any of them is written, so no *validation* failure
+        can produce that state.
+
+        WHAT VALIDATION DOES NOT CLOSE. RouterOS has no multi-row atomic
+        update, so a device error raised partway through the write loop
+        still leaves the earlier routes changed and the later ones not --
+        the tie above, reachable and not preventable here. Two things
+        follow, and both are deliberate. The failure is raised, never
+        swallowed, so the caller records ``failed`` rather than a green
+        badge. And the error names the routes that were already written,
+        because an operator looking at a failed failover needs to know
+        whether the device is in the state it started in or halfway to the
+        new one -- reading it back off the router is the only alternative,
+        and that is exactly what an outage leaves no time for.
+
+        IDEMPOTENT ON REAL VALUES. A route already carrying the requested
+        distance is skipped, so re-triggering an already-applied failover
+        issues no write at all. The comparison is on parsed integers, not
+        on RouterOS's reply strings.
+        """
+        await asyncio.to_thread(
+            self._set_default_route_distances_sync, creds, dict(distances)
+        )
+
+    def _set_default_route_distances_sync(
+        self, creds: DeviceCredentials, distances: dict[str, int]
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            routes = self._read_default_routes(api, creds)
+            by_interface: dict[str, list[DefaultRoute]] = {}
+            for route in routes:
+                if route.interface is None:
+                    continue
+                by_interface.setdefault(route.interface, []).append(route)
+
+            pending: list[tuple[DefaultRoute, int]] = []
+            for interface, desired in distances.items():
+                matches = by_interface.get(interface, [])
+                if not matches:
+                    raise MikroTikRouteNotFoundError(
+                        creds.host,
+                        f"no main-table default route leaves by interface "
+                        f"'{interface}' on this device",
+                    )
+                if len(matches) > 1:
+                    raise MikroTikAmbiguousRouteError(
+                        creds.host,
+                        f"{len(matches)} main-table default routes leave by "
+                        f"interface '{interface}'; which one is this uplink's "
+                        f"has no single answer",
+                    )
+                route = matches[0]
+                if route.distance == desired:
+                    continue
+                if route.dynamic:
+                    raise MikroTikImmutableRouteError(
+                        creds.host,
+                        f"the default route on '{interface}' is dynamic "
+                        f"(RouterOS created it, and refuses /ip route set on "
+                        f"it), so its distance cannot be changed",
+                    )
+                pending.append((route, desired))
+
+            if not pending:
+                return
+            menu = api.path("ip", "route")
+            applied: list[str] = []
+            for route, desired in pending:
+                try:
+                    menu.update(**{".id": route.route_id, "distance": str(desired)})
+                except LibRouterosError as exc:
+                    # Name what already landed -- see this method's own
+                    # "WHAT VALIDATION DOES NOT CLOSE" note. Without this
+                    # the operator cannot tell a no-op failure from a
+                    # half-applied swap without reading the router back.
+                    done = (
+                        "; already applied: " + ", ".join(applied)
+                        if applied
+                        else "; no route was changed"
+                    )
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        f"set_default_route_distances: {exc}{done}",
+                    ) from exc
+                applied.append(f"{route.interface}->distance {desired}")
+        finally:
+            api.close()
+
+    async def ensure_wan_egress(
+        self, creds: DeviceCredentials, *, interface: str
+    ) -> None:
+        """Make sure traffic leaving by ``interface`` is masqueraded and
+        that the interface is in the ``WAN`` interface list.
+
+        **THE NAT PROBLEM THIS EXISTS FOR.** A router provisioned by this
+        platform carries ``/ip firewall nat`` ``chain=srcnat
+        action=masquerade out-interface=ether1
+        comment="cloudguest-nat-wan1"`` -- hard-bound to the primary port.
+        Move the default route to a backup and that rule stops matching:
+        guest traffic leaves the router from an un-NATed RFC1918 source
+        address and dies at the first upstream hop. Every guest loses
+        internet *because of* the failover, and the route move looks
+        perfectly correct on the device.
+
+        **ADDITIVE, NEVER A REWRITE, AND THAT IS THE WHOLE POINT.** The
+        obvious fix is to widen the existing rule to
+        ``out-interface-list=WAN``. It is rejected for two reasons. First,
+        it is a mutation of a live router-wide NAT rule -- the exact class
+        of change that took a guest network down on 2026-08-18 -- carried
+        out at the moment a site is already in an outage, which is the
+        worst possible time to be wrong. Second, it is genuinely wider
+        than intended: this platform's *own* provisioning script adds
+        discovered uplinks to the ``WAN`` list at runtime
+        (``DISCOVERED_WAN_LIST_COMMENT``), so a list-scoped masquerade
+        starts NATing out of whatever lands in that list later, including
+        interfaces nobody decided should carry guest traffic.
+
+        What this does instead is what the provisioning script already
+        does per WAN slot: ensure the target interface has *its own*
+        masquerade rule. A masquerade rule matches only traffic that
+        actually leaves its own ``out-interface``, so adding the backup's
+        rule changes nothing whatsoever about traffic on the primary --
+        it is inert until the route moves, and stays inert after a
+        failback. No existing rule is read for permission, edited, or
+        removed.
+
+        **The existence check is on effect, not on identity.** Any
+        enabled, un-narrowed ``srcnat``/``masquerade`` rule on this
+        interface already answers the question "is traffic leaving here
+        NATed?" -- whoever wrote it. So a router provisioned with
+        ``cloudguest-nat-wan2`` gets nothing added, rather than a second,
+        redundant rule accumulating on every failover. A rule carrying a
+        ``src-address``, an ``in-interface`` or a port narrows to less
+        than all guest traffic (one VLAN's own rule looks exactly like
+        this) and is deliberately not counted.
+
+        **WAN list membership too**, for the same "otherwise the route
+        moves and traffic still does not flow" reason: the firewall this
+        platform provisions matches ``in-interface-list=WAN``, and an
+        uplink outside that list is one the input/forward rules treat as
+        an internal segment.
+
+        Idempotent in both halves, and the whole thing is a no-op on a
+        router already configured for this uplink.
+        """
+        await asyncio.to_thread(self._ensure_wan_egress_sync, creds, interface)
+
+    def _ensure_wan_egress_sync(
+        self, creds: DeviceCredentials, interface: str
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                names = {
+                    str(row["name"])
+                    for row in api.path("interface")
+                    if row.get("name")
+                }
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"ensure_wan_egress: {exc}"
+                ) from exc
+            if interface not in names:
+                # Named first, rather than left to RouterOS to reject with
+                # a message about an input not matching a value attributed
+                # to whichever write happened to go first.
+                raise MikroTikWanInterfaceError(
+                    creds.host,
+                    f"no interface named '{interface}' exists on this device",
+                )
+            try:
+                self._ensure_wan_list_member(api, interface)
+                self._ensure_uplink_masquerade(api, interface)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"ensure_wan_egress: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _ensure_wan_list_member(self, api, interface: str) -> None:
+        """``/interface list member`` for ``list=WAN``, added only if this
+        interface is not already a member under any comment."""
+        menu = api.path("interface", "list", "member")
+        for row in menu:
+            if row.get("interface") == interface and row.get("list") == "WAN":
+                if _is_truthy(row.get("disabled")):
+                    # Membership that exists but is switched off is not
+                    # membership. Boolean, never a string comparison --
+                    # see ``_is_truthy``.
+                    menu.update(**{".id": row[".id"], "disabled": "no"})
+                return
+        menu.add(
+            list="WAN",
+            interface=interface,
+            comment=_uplink_wan_list_comment(interface),
+            disabled="no",
+        )
+
+    def _ensure_uplink_masquerade(self, api, interface: str) -> None:
+        """A blanket ``srcnat``/``masquerade`` on this interface, added
+        only if nothing already provides one -- see
+        :meth:`ensure_wan_egress` for why the check is on effect rather
+        than on this method's own comment."""
+        menu = api.path("ip", "firewall", "nat")
+        own_comment = _uplink_nat_comment(interface)
+        for row in menu:
+            if (
+                row.get("chain") != "srcnat"
+                or row.get("action") != "masquerade"
+                or row.get("out-interface") != interface
+            ):
+                continue
+            if any(row.get(field) for field in _NAT_NARROWING_FIELDS):
+                continue
+            if _is_truthy(row.get("disabled")):
+                if row.get("comment") == own_comment:
+                    # Ours, switched off. Re-enabling something this
+                    # method wrote is repairing its own state.
+                    menu.update(**{".id": row[".id"], "disabled": "no"})
+                    return
+                # Someone else's rule, deliberately disabled. Not
+                # re-enabled -- that is a decision about their rule --
+                # and not counted as covering, so a rule of our own is
+                # added alongside it.
+                continue
+            return
+        menu.add(
+            chain="srcnat",
+            action="masquerade",
+            **{"out-interface": interface},
+            comment=own_comment,
+            disabled="no",
+        )
+
     async def set_radius_client_config(
         self, creds: DeviceCredentials, *, config: RadiusClientConfig
     ) -> None:
@@ -4028,6 +4450,30 @@ def _select_wan_interface(
     row = _select_default_route_row(route_rows)
     if row is None:
         return None
+    return _route_interface(row, address_rows, dhcp_client_rows, interface_names)
+
+
+def _route_interface(
+    row: dict[str, object],
+    address_rows: list[dict[str, object]],
+    dhcp_client_rows: list[dict[str, object]],
+    interface_names: set[str],
+) -> str | None:
+    """The egress interface of ONE route row -- the four ordered tiers
+    documented on :meth:`MikroTikAdapter.resolve_wan_interface`, with no
+    opinion about which route is the important one.
+
+    Split out of :func:`_select_wan_interface` when WAN failover needed the
+    same naming rule applied to *every* default route rather than only to
+    the winning one. Deliberately not a second copy: a failover that named
+    interfaces by one rule while ``resolve_wan_interface`` (and therefore
+    every NAT push) named them by another would put the masquerade on one
+    interface and the route on a different one, and each would look correct
+    on its own.
+
+    Every candidate is checked against ``interface_names`` before it wins,
+    so a stale name in a route row can never become an ``out-interface``
+    referring to an interface this device does not have."""
     gateway = _gateway_address(row.get("gateway"))
     candidates = (
         _safe_str(row.get("interface")),
@@ -4040,6 +4486,62 @@ def _select_wan_interface(
         if candidate and candidate in interface_names:
             return candidate
     return None
+
+
+def _is_main_table_row(row: dict[str, object]) -> bool:
+    """Whether a ``/ip route`` row lives in the ``main`` routing table.
+
+    RouterOS omits the property on an unmarked route rather than spelling
+    out ``"main"``, so absent means main. The filter matters because this
+    module's own caller (``network_config/wan/renderers.py``) provisions a
+    ``routing-table="to_wan<N>"`` default route *per WAN* plus a
+    ``distance=2`` crossover backup in load-balance mode. Those are active
+    in their own tables simultaneously; counting them as candidates would
+    make every load-balanced router look permanently ambiguous."""
+    table = _safe_str(row.get("routing-table"))
+    return table is None or table == "main"
+
+
+def _build_default_routes(
+    route_rows: list[dict[str, object]],
+    address_rows: list[dict[str, object]],
+    dhcp_client_rows: list[dict[str, object]],
+    interface_names: set[str],
+) -> list[DefaultRoute]:
+    """Every ``0.0.0.0/0`` row in the ``main`` table, as
+    :class:`~.contract.DefaultRoute` values.
+
+    No I/O, so the whole failover decision can be reasoned about (and
+    tested) against raw RouterOS reply rows. Nothing is filtered out for
+    being inactive or disabled: "the backup route exists but RouterOS has
+    stopped considering it active" is precisely the fact a caller has to
+    see before it moves traffic onto it, and dropping such rows here would
+    turn a refusal into a route-not-found."""
+    routes: list[DefaultRoute] = []
+    for row in route_rows:
+        if row.get("dst-address") != "0.0.0.0/0" or not _is_main_table_row(row):
+            continue
+        route_id = _safe_str(row.get(".id"))
+        if route_id is None:
+            # No handle to address it by, so no write could ever target it.
+            # Reporting it as a candidate would let a caller select a route
+            # it cannot then move.
+            continue
+        routes.append(
+            DefaultRoute(
+                route_id=route_id,
+                gateway=_gateway_address(row.get("gateway")),
+                interface=_route_interface(
+                    row, address_rows, dhcp_client_rows, interface_names
+                ),
+                distance=_safe_int(row.get("distance")),
+                active=_is_truthy(row.get("active")),
+                disabled=_is_truthy(row.get("disabled")),
+                dynamic=_is_truthy(row.get("dynamic")),
+                comment=_safe_str(row.get("comment")),
+            )
+        )
+    return routes
 
 
 def _parse_ping_rows(

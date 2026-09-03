@@ -147,6 +147,41 @@ class HealthStatusSource(StrEnum):
     MANUAL = "manual"
 
 
+class IspFailoverPushStatus(StrEnum):
+    """Lifecycle of the *device* half of a failover/failback on the link
+    traffic was moved onto.
+
+    ``is_active_uplink`` is what this platform intends; this is what the
+    router was actually told and whether it accepted. Before these
+    existed, "Trigger failover" flipped ``is_active_uplink``, wrote an
+    audit row, and returned success without contacting the device at all
+    -- so during an outage the "Active uplink" tile named the backup while
+    every packet still went nowhere. The two facts must be separately
+    visible, because they genuinely differ.
+
+    Mirrors ``vlan.constants.VlanDevicePushStatus`` value-for-value so a
+    reader of either table sees the same vocabulary.
+
+    * ``PENDING`` -- no failover has ever been pushed for this link. Every
+      pre-existing row, truthfully.
+    * ``PROVISIONING`` -- a push is in flight. Written and committed
+      before the first socket, so a customer refreshing during a slow push
+      sees work in progress, and a process killed mid-push leaves a row
+      that says nobody confirmed this rather than a stale ``ACTIVE``.
+    * ``ACTIVE`` -- the router accepted every write: this link's route is
+      the preferred one and its egress is NATed. Only ever written after
+      the device has confirmed, never optimistically.
+    * ``FAILED`` -- the last attempt raised; ``failover_push_error`` holds
+      why, verbatim, and it is what the customer is shown instead of a
+      success toast.
+    """
+
+    PENDING = "pending"
+    PROVISIONING = "provisioning"
+    ACTIVE = "active"
+    FAILED = "failed"
+
+
 # ============================================================================
 # Health-check classification thresholds -- see
 # ``validators.classify_health_status``. Deliberately plain module
@@ -278,6 +313,7 @@ __all__ = [
     "IspLinkRole",
     "HealthStatus",
     "HealthStatusSource",
+    "IspFailoverPushStatus",
     "DEFAULT_LATENCY_DEGRADED_THRESHOLD_MS",
     "DEFAULT_LATENCY_UNHEALTHY_THRESHOLD_MS",
     "DEFAULT_PACKET_LOSS_DEGRADED_THRESHOLD_PERCENT",
