@@ -4,25 +4,33 @@ the full "before/after" write-up).
 
 ## What this closes
 
-``app.domains.network_config.renderers.render_qos_traffic_rule`` already
-renders the real ``/ip firewall mangle ... action=mark-packet`` half of
-RouterOS QoS, pushed to the device through
-``app.domains.network_config.service.NetworkConfigService.push_config``'s
-own real, already-working ``ConfigVersion``/``ProvisioningJob`` pipeline
-(``POST /network-config/routers/{router_id}/push``) -- that path was
-already real and reachable, not a gap. What had no real device effect at
-all was the paired ``/queue tree`` entry that actually makes a packet
-mark *do* anything (RouterOS realizes QoS as two independent steps: mark,
-then a queue that references the mark -- a mark with no referencing queue
-is inert). This module is that second step, a real, direct device push
-mirroring ``app.domains.queue_management.device_adapters``'s own
-established shape exactly:
+RouterOS realizes QoS as two independent objects: an ``/ip firewall
+mangle`` rule that *sets* a packet mark, and a ``/queue tree`` entry that
+*references* it. Either one alone is inert.
+
+This module now pushes **both**, because pushing one was worse than
+pushing neither. ``app.domains.network_config.renderers
+.render_qos_traffic_rule`` does render the mangle half, but only into a
+config script applied by ``POST /network-config/routers/{router_id}/push``
+-- an endpoint no customer surface calls and no scheduled job runs (see
+``docs/qa/NETWORK_FEATURES_AUDIT.md`` §4). So a customer who clicked Apply
+got a real queue tree matching zero packets, a row reading ``active``, and
+a dashboard badge reading "Applied to your router". The queue's own device
+id existing is exactly what made that state hard to doubt.
+
+``apply_packet_mark``/``remove_packet_mark`` close the first half;
+``create_priority_queue``/``set_priority``/``remove_priority_queue`` are
+the second. Both are real, direct device pushes mirroring
+``app.domains.queue_management.device_adapters``'s own established shape
+exactly:
 
 * Its own narrow ``QosCredentials`` dataclass (mirrors ``QueueCredentials``).
 * Its own ``BaseQosPriorityQueueAdapter`` Protocol (a **subset** of
   ``queue_management``'s ``BaseQueueAdapter`` -- only the three real
   ``wyfy_device_gateway`` operations this domain actually needs:
-  ``create_queue_tree``, ``set_priority``, ``remove_queue``. This domain
+  ``create_queue_tree``, ``set_priority``, ``remove_queue``, plus the two
+  ``configure_qos_packet_mark``/``delete_qos_packet_mark`` writers this
+  domain's own gap required. This domain
   never creates a ``/queue simple`` entry, never calls ``apply_pcq``/
   ``assign_queue_to_target`` -- those remain ``queue_management``'s own
   concern, see this module's own "why a new, smaller adapter, not reuse of
@@ -60,7 +68,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
-from wyfy_device_gateway.contract import DeviceVendor
+from wyfy_device_gateway.contract import DeviceVendor, QosPacketMarkConfig
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikConnectionError,
     MikroTikDeviceError,
@@ -120,9 +128,10 @@ class BaseQosPriorityQueueAdapter(Protocol):
     ) -> str:
         """Creates a real ``/queue tree`` entry, parented at
         ``constants.QOS_QUEUE_TREE_PARENT`` and referencing
-        ``packet_mark`` (a mangle mark this domain does not itself create
-        -- see ``app.domains.network_config.renderers
-        .render_qos_traffic_rule``), with ``max-limit`` fixed at
+        ``packet_mark`` -- the mark :meth:`apply_packet_mark` puts on the
+        device in the same push, derived from one source of truth
+        (``identifiers.qos_packet_mark_identifier``) so the two objects can
+        never reference different strings -- with ``max-limit`` fixed at
         ``constants.QOS_QUEUE_UNLIMITED_MAX_LIMIT_KBPS`` (this domain
         tracks priority/classification only, never a bandwidth ceiling --
         see ``models.py``'s own "Scope" section). Returns the device-side
@@ -142,6 +151,34 @@ class BaseQosPriorityQueueAdapter(Protocol):
         self, credentials: QosCredentials, *, device_queue_id: str
     ) -> None:
         """Removes a ``/queue tree`` entry entirely."""
+        ...
+
+    async def apply_packet_mark(
+        self,
+        credentials: QosCredentials,
+        *,
+        rule_id: str,
+        packet_mark: str,
+        label: str,
+        priority: int,
+        protocol: str | None,
+        port_range_start: int | None,
+        port_range_end: int | None,
+        dscp_value: int | None,
+    ) -> None:
+        """Creates or updates the real ``/ip firewall mangle`` rule that
+        *sets* ``packet_mark`` -- the half of RouterOS QoS the queue tree
+        references. Idempotent on ``rule_id``; see the gateway's own
+        ``configure_qos_packet_mark`` docstring for the identity-by-comment
+        design and for what it deliberately does not claim about the rule's
+        position in the ``prerouting`` chain."""
+        ...
+
+    async def remove_packet_mark(
+        self, credentials: QosCredentials, *, rule_id: str
+    ) -> None:
+        """Removes that mangle rule, by the same ``rule_id`` identity the
+        write path stamps it with. Idempotent."""
         ...
 
 
@@ -217,6 +254,52 @@ class MikroTikQosQueueAdapter:
             raise QosDeviceConnectionError(credentials.host, exc.detail) from exc
         except MikroTikDeviceError as exc:
             raise QosDeviceOperationError("remove_priority_queue", exc.detail) from exc
+
+    async def apply_packet_mark(
+        self,
+        credentials: QosCredentials,
+        *,
+        rule_id: str,
+        packet_mark: str,
+        label: str,
+        priority: int,
+        protocol: str | None,
+        port_range_start: int | None,
+        port_range_end: int | None,
+        dscp_value: int | None,
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).configure_qos_packet_mark(
+                creds,
+                rule=QosPacketMarkConfig(
+                    rule_id=rule_id,
+                    packet_mark=packet_mark,
+                    label=label,
+                    priority=priority,
+                    protocol=protocol,
+                    port_range_start=port_range_start,
+                    port_range_end=port_range_end,
+                    dscp_value=dscp_value,
+                ),
+            )
+        except MikroTikConnectionError as exc:
+            raise QosDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QosDeviceOperationError("apply_packet_mark", exc.detail) from exc
+
+    async def remove_packet_mark(
+        self, credentials: QosCredentials, *, rule_id: str
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).delete_qos_packet_mark(
+                creds, rule_id=rule_id
+            )
+        except MikroTikConnectionError as exc:
+            raise QosDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise QosDeviceOperationError("remove_packet_mark", exc.detail) from exc
 
 
 _QOS_QUEUE_ADAPTERS: dict[str, BaseQosPriorityQueueAdapter] = {

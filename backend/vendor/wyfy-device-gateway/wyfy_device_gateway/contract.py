@@ -249,6 +249,63 @@ class PortForwardConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class QosPacketMarkConfig:
+    """One QoS traffic-classification rule's ``/ip firewall mangle``
+    packet mark -- the half of RouterOS QoS that actually selects packets.
+
+    RouterOS realizes QoS as two independent objects: a mangle rule that
+    *sets* a packet mark, and a ``/queue tree`` entry that *references* it.
+    A queue referencing a mark nothing sets is inert, and that was exactly
+    the shipped state: ``create_queue_tree`` had a caller, this had no
+    equivalent at all, so the live push wrote the queue half and nothing
+    else.
+
+    The mangle line was not missing from the codebase -- ``network_config``
+    renders it (``renderers.render_qos_traffic_rule``) into the combined
+    config script, and ``POST /network-config/routers/{id}/push`` is
+    customer-reachable. It does not rescue QoS, because that script is
+    delivered over SSH, and a port sweep run from the platform against a
+    fleet router reached **only** ``8728``: ``22`` times out, along with
+    every other port tried including one nothing listens on, so the
+    filtering sits upstream of the router rather than on it. Both halves
+    therefore failed at once -- the half this class fixes was never called,
+    and the half that existed could not be delivered. The dashboard said
+    "Applied to your router" over the top of that.
+
+    ``rule_id`` is carried for identity, not for any RouterOS field, for
+    the same reason it is on :class:`ContentFilterRuleConfig` and
+    :class:`PortForwardConfig`: ``protocol``/``port_range_*``/``dscp_value``
+    are precisely what a customer edits, and ``label`` is the name they
+    typed. Keyed on any of them, the push after an edit would find no
+    match, add a second mangle rule, and leave the first one still marking
+    traffic for a classification nobody asked for.
+
+    ``packet_mark`` is the caller's own identifier and must be the exact
+    string the paired ``/queue tree`` entry references -- the two are
+    derived from one source of truth on the caller's side
+    (``app.domains.qos.identifiers.qos_packet_mark_identifier``), because
+    two independently-derived strings that drift apart fail silently: both
+    objects exist, neither does anything.
+
+    The match is either a protocol/port-range pair or a DSCP value, never
+    both and never neither -- the caller's own validator enforces that
+    (``app.domains.qos.validators.validate_traffic_match``), and a rule
+    that switched from one to the other is torn down and rewritten rather
+    than updated in place, because the fields the old match used have to
+    stop matching.
+    """
+
+    rule_id: str  # this rule's own stable id, and its device-side identity
+    packet_mark: str  # the mark this rule sets, and the queue tree reads
+    label: str  # human-readable label, carried in the device's own comment
+    priority: int  # carried in the comment only -- the queue tree sets it
+    protocol: str | None = None  # "tcp"/"udp", with a port range
+    port_range_start: int | None = None
+    port_range_end: int | None = None
+    dscp_value: int | None = None  # the alternative match, 0-63
+
+
+@dataclass(frozen=True, slots=True)
 class NatRuleConfig:
     """One VLAN's source-NAT (masquerade) rule -- what turns a routed but
     isolated VLAN subnet into one whose guests actually reach the
@@ -620,6 +677,32 @@ class DeviceGatewayAdapter(Protocol):
         a second set beside them."""
         ...
 
+    async def configure_qos_packet_mark(
+        self, creds: DeviceCredentials, *, rule: QosPacketMarkConfig
+    ) -> None:
+        """Realizes the ``/ip firewall mangle`` packet mark half of one QoS
+        rule -- the half that decides which packets the paired
+        ``/queue tree`` entry ever sees. Without it the queue is inert and
+        the platform is claiming a prioritisation that is not happening.
+
+        Idempotent on ``rule.rule_id``: re-realizing an unchanged rule
+        writes nothing and raises nothing, and editing the match updates
+        the rule already carrying this rule's marker rather than adding a
+        second one beside it."""
+        ...
+
+    async def delete_qos_packet_mark(
+        self, creds: DeviceCredentials, *, rule_id: str
+    ) -> None:
+        """Takes one QoS rule's mangle mark back off the device, by the
+        same ``rule_id`` identity the write path stamps it with -- so a
+        rule whose match was edited since the last push is still found and
+        removed rather than left marking traffic for a rule the customer
+        deleted.
+
+        Idempotent: removing what is already absent is a no-op."""
+        ...
+
     async def delete_content_filter_rule(
         self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig
     ) -> None:
@@ -901,6 +984,7 @@ __all__ = [
     "PortForwardConfig",
     "RadiusClientConfig",
     "ContentFilterRuleConfig",
+    "QosPacketMarkConfig",
     "ProvisionResult",
     "SpeedTestResult",
     "PingResult",

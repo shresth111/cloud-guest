@@ -60,4 +60,28 @@ __all__ = [
     "MAX_PORT",
     "PortForwardingProtocol",
     "PortForwardingDevicePushStatus",
+    "DEVICE_CARRIED_FIELDS",
 ]
+
+
+# Every column ``PortForwardingService.push_rule_to_device`` actually puts
+# on the router -- the six arguments it hands ``configure_port_forward``,
+# which become the DSTNAT rule's ``protocol``/``dst-port``/``to-addresses``/
+# ``to-ports``/``dst-address``/``src-address``. Changing any of them makes
+# an ``ACTIVE`` row describe a forward the device is not performing -- and
+# for ``source_address`` in particular, a row claiming a restriction the
+# router no longer has. See ``app.common.device_push``.
+#
+# ``name``/``description`` never leave the database (``rule_id``, not the
+# name, is the rule's device-side identity -- see ``PortForwardConfig``),
+# and ``is_enabled`` is intent, not configuration.
+DEVICE_CARRIED_FIELDS = frozenset(
+    {
+        "protocol",
+        "destination_address",
+        "destination_port",
+        "internal_address",
+        "internal_port",
+        "source_address",
+    }
+)

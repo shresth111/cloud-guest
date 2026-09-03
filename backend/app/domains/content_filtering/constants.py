@@ -127,4 +127,24 @@ __all__ = [
     "ContentFilterValueType",
     "ContentFilterCategory",
     "ContentFilterDevicePushStatus",
+    "DEVICE_CARRIED_FIELDS",
 ]
+
+
+# The two columns ``ContentFilterService.push_rule_to_device`` actually
+# puts on the router: ``value`` is the blocked domain or address itself,
+# and ``value_type`` decides which mechanism realizes it (a DNS sinkhole
+# or an address-list entry plus the shared DROP rule) -- a re-typed rule
+# tears down the mechanism it stopped using. Changing either makes an
+# ``ACTIVE`` row claim a site is blocked that is not. See
+# ``app.common.device_push``.
+#
+# ``name`` is deliberately absent even though it *does* reach the device:
+# it is carried as ``label``, the mutable tail of the RouterOS comment
+# whose identity marker is the rule id (see
+# ``mikrotik_adapter.configure_content_filter_rule``'s own "the comment is
+# the rule's identity" section). A stale label on a comment blocks exactly
+# what the customer asked for; demoting a live block to "not yet applied"
+# over a rename would be the more misleading of the two. ``category``/
+# ``comment`` never leave the database, and ``is_enabled`` is intent.
+DEVICE_CARRIED_FIELDS = frozenset({"value", "value_type"})

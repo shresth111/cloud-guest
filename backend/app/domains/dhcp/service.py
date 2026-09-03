@@ -47,10 +47,15 @@ import uuid
 from datetime import UTC, datetime
 from typing import Protocol
 
+from app.common.device_push import demote_device_push_on_edit
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.models import Router
 
-from .constants import DEFAULT_LEASE_TIME_SECONDS, DhcpDevicePushStatus
+from .constants import (
+    DEFAULT_LEASE_TIME_SECONDS,
+    DEVICE_CARRIED_FIELDS,
+    DhcpDevicePushStatus,
+)
 from .device_adapters import DhcpCredentials, get_dhcp_adapter
 from .events import (
     DhcpPoolCreated,
@@ -261,8 +266,20 @@ class DhcpService:
         if "dns_secondary" in fields:
             validate_ip_address("dns_secondary", fields["dns_secondary"])
 
+        # An edit to a field the router actually carries invalidates what
+        # the router is holding, so the row stops claiming ``active`` in the
+        # same UPDATE that changes the values -- see
+        # ``app.common.device_push`` for the rule and ``constants
+        # .DEVICE_CARRIED_FIELDS`` for which of this domain's columns count.
+        demotion = demote_device_push_on_edit(
+            pool,
+            fields,
+            device_carried_fields=DEVICE_CARRIED_FIELDS,
+            active_status=DhcpDevicePushStatus.ACTIVE.value,
+            pending_status=DhcpDevicePushStatus.PENDING.value,
+        )
         updated = await self.repository.update_pool(
-            pool, {**fields, "updated_by": actor_user_id}
+            pool, {**fields, **demotion, "updated_by": actor_user_id}
         )
         event = DhcpPoolUpdated(id=updated.id)
         logger.info("dhcp_pool_updated", extra=_event_extra(event))
@@ -453,12 +470,21 @@ class DhcpService:
     ) -> None:
         """Tears the pool off its router, when there is anything there.
 
-        Skipped entirely unless ``device_push_status`` is ``ACTIVE``: a row
-        that was never pushed, or whose last push failed, has nothing on the
-        device, and opening a connection to delete nothing would make every
-        such delete fail whenever a router happened to be unreachable.
+        Skipped entirely unless this row has actually been pushed at some
+        point (``device_pushed_at`` is set): a row that was never pushed,
+        or whose first push failed, has nothing on the device, and opening
+        a connection to delete nothing would make every such delete fail
+        whenever a router happened to be unreachable.
+
+        Keyed on ``device_pushed_at``, not on ``device_push_status ==
+        ACTIVE``, and the difference is load-bearing: an edit to a
+        device-carried field demotes a live row to ``pending`` (see
+        ``app.common.device_push``) precisely *because* the device is still
+        holding the previous values. Reading ``pending`` as "nothing to
+        remove" would orphan exactly the objects the demotion exists to
+        flag.
         """
-        if pool.device_push_status != DhcpDevicePushStatus.ACTIVE.value:
+        if pool.device_pushed_at is None:
             return
         if not pool.interface:
             # Cannot be ACTIVE without one -- push refuses without an

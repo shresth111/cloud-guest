@@ -50,10 +50,15 @@ import uuid
 from datetime import UTC, datetime
 from typing import Protocol
 
+from app.common.device_push import demote_device_push_on_edit
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.models import Router
 
-from .constants import PortForwardingDevicePushStatus, PortForwardingProtocol
+from .constants import (
+    DEVICE_CARRIED_FIELDS,
+    PortForwardingDevicePushStatus,
+    PortForwardingProtocol,
+)
 from .device_adapters import PortForwardingCredentials, get_port_forwarding_adapter
 from .events import (
     PortForwardingRuleCreated,
@@ -274,8 +279,20 @@ class PortForwardingService:
                 exclude_rule_id=rule.id,
             )
 
+        # An edit to a field the router actually carries invalidates what
+        # the router is holding, so the row stops claiming ``active`` in the
+        # same UPDATE that changes the values -- see
+        # ``app.common.device_push`` for the rule and ``constants
+        # .DEVICE_CARRIED_FIELDS`` for which of this domain's columns count.
+        demotion = demote_device_push_on_edit(
+            rule,
+            fields,
+            device_carried_fields=DEVICE_CARRIED_FIELDS,
+            active_status=PortForwardingDevicePushStatus.ACTIVE.value,
+            pending_status=PortForwardingDevicePushStatus.PENDING.value,
+        )
         updated = await self.repository.update_rule(
-            rule, {**fields, "updated_by": actor_user_id}
+            rule, {**fields, **demotion, "updated_by": actor_user_id}
         )
         event = PortForwardingRuleUpdated(id=updated.id)
         logger.info("port_forwarding_rule_updated", extra=_event_extra(event))
@@ -444,12 +461,21 @@ class PortForwardingService:
     ) -> None:
         """Tears the rule off its router, when there is anything there.
 
-        Skipped entirely unless ``device_push_status`` is ``ACTIVE``: a row
-        that was never pushed, or whose last push failed, has nothing on the
-        device, and opening a connection to delete nothing would make every
-        such delete fail whenever a router happened to be unreachable.
+        Skipped entirely unless this row has actually been pushed at some
+        point (``device_pushed_at`` is set): a row that was never pushed,
+        or whose first push failed, has nothing on the device, and opening
+        a connection to delete nothing would make every such delete fail
+        whenever a router happened to be unreachable.
+
+        Keyed on ``device_pushed_at``, not on ``device_push_status ==
+        ACTIVE``, and the difference is load-bearing: an edit to a
+        device-carried field demotes a live row to ``pending`` (see
+        ``app.common.device_push``) precisely *because* the device is still
+        holding the previous values. Reading ``pending`` as "nothing to
+        remove" would orphan exactly the objects the demotion exists to
+        flag.
         """
-        if rule.device_push_status != PortForwardingDevicePushStatus.ACTIVE.value:
+        if rule.device_pushed_at is None:
             return
         router = await self.router_lookup.get_router(
             rule.router_id, requesting_organization_id=requesting_organization_id
