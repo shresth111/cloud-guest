@@ -152,6 +152,7 @@ from .constants import VlanDevicePushStatus
 from .device_adapters import (
     BaseVlanAdapter,
     VlanCredentials,
+    VlanDeviceInterface,
     VlanNetworkSnapshot,
     get_vlan_adapter,
 )
@@ -159,6 +160,8 @@ from .events import VlanCreated, VlanDeleted, VlanPushed, VlanUpdated
 from .exceptions import (
     CrossOrganizationVlanAccessError,
     VlanAccessPortNotFoundError,
+    VlanDeviceConnectionError,
+    VlanDeviceOperationError,
     VlanHotspotDhcpPoolConflictError,
     VlanHotspotRequiresSubnetError,
     VlanIdAlreadyExistsError,
@@ -378,6 +381,66 @@ class VlanService:
             router_id, requesting_organization_id=requesting_organization_id
         )
         return await self.repository.list_vlans_for_router(router_id)
+
+    async def list_device_interfaces(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> tuple[list[VlanDeviceInterface], str]:
+        """The router's real interfaces, for the VLAN form's own picker.
+
+        Returns the list *and the sentence explaining it*, because an empty
+        list has three different meanings -- this router has no credentials
+        stored, it did not answer, or it genuinely has nothing to offer --
+        and a picker that renders an empty dropdown for all three teaches
+        an operator that the feature is broken.
+
+        **A router this platform cannot reach is not an error here.** The
+        form is being filled in; refusing to render it because a device is
+        momentarily unreachable helps nobody, and a 500 would be a lie
+        about whose fault it is. The push path is where unreachability has
+        to be fatal, and it is.
+
+        **The empty cases still return a 2xx with ``success: true``.** The
+        honesty lives in the message, deliberately: the frontend's
+        interceptor unwraps ``response.data.data`` and never reads
+        ``success``, so a ``200 {"success": false}`` reaches the UI
+        indistinguishable from success -- with the added cost that the
+        message explaining *why* the list is empty would be the part
+        thrown away.
+
+        Unlike ``app.domains.router``'s ``/device-interfaces``, nothing is
+        filtered out. That endpoint exists to back a DHCP picker and drops
+        every interface already bound to an ``/ip dhcp-server``, which on
+        a real router drops ``bridge`` -- verified on the lab box, whose
+        ``bridge`` was simply absent from its output. ``bridge`` is the
+        interface most VLAN trunks hang off, so reusing it here would hide
+        the one option most customers need.
+        """
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        try:
+            credentials = self._resolve_device_credentials(router)
+        except VlanMissingCredentialsError:
+            return [], (
+                "This router has no device connection credentials stored, so "
+                "its interfaces cannot be read"
+            )
+        adapter = get_vlan_adapter(router.vendor)
+        try:
+            snapshot = await adapter.read_network_snapshot(credentials)
+        except (VlanDeviceConnectionError, VlanDeviceOperationError) as exc:
+            # Logged rather than swallowed: the operator gets a sentence,
+            # and whoever is debugging the fleet gets the device's own
+            # words.
+            logger.info(
+                "vlan_device_interfaces_unavailable",
+                extra={"router_id": str(router.id), "detail": exc.message},
+            )
+            return [], exc.message
+        return snapshot.interfaces, "Device interfaces retrieved"
 
     async def update_vlan(
         self,
