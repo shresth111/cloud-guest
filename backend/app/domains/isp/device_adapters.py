@@ -122,6 +122,26 @@ command. Public signatures/return shapes are unchanged; the gateway's
 translated back into this domain's own
 ``IspDeviceConnectionError``/``IspDeviceOperationError`` pair.
 
+## Writes, finally -- this module was read-only, and that was the bug
+
+For most of this domain's life every method here was a read
+(``ping``/``get_active_default_gateway``/``get_pppoe_interface_status``/
+``get_interface_traffic_counters``/``run_speed_test``), and
+``IspService.trigger_failover`` therefore moved no traffic at all: it
+flipped two ``is_active_uplink`` booleans, wrote an audit row and
+returned 200. A customer whose primary link was down clicked the button,
+saw ``toast.success("Failover triggered")``, stayed offline, and watched
+the "Active uplink" tile start naming the backup.
+
+``read_default_routes``/``set_default_route_distances``/
+``ensure_wan_egress`` are the three operations that make that button
+real. See ``wyfy_device_gateway.mikrotik_adapter
+.set_default_route_distances`` for the full write-up of what failover
+means on a RouterOS device here (route ``distance``, and why not
+``check-gateway``, route disabling, or policy routing) and
+``ensure_wan_egress`` for the NAT half, without which moving the route
+alone leaves every guest un-NATed and still offline.
+
 ## Traffic load: raw counters here, rate computed in ``service.py``
 
 ``get_interface_traffic_counters`` reads ``/interface``'s own
@@ -145,20 +165,28 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
 from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
 from wyfy_device_gateway.contract import DeviceVendor
 from wyfy_device_gateway.mikrotik_adapter import (
+    MikroTikAmbiguousRouteError,
     MikroTikConnectionError,
     MikroTikDeviceError,
+    MikroTikImmutableRouteError,
+    MikroTikRouteNotFoundError,
+    MikroTikWanInterfaceError,
 )
 from wyfy_device_gateway.registry import get_adapter
 
 from .exceptions import (
+    IspAmbiguousDefaultRouteError,
     IspDeviceConnectionError,
     IspDeviceOperationError,
+    IspDeviceRouteMismatchError,
+    IspRouteImmutableError,
     UnsupportedIspVendorError,
 )
 
@@ -217,6 +245,30 @@ class SpeedTestResult:
     download_mbps: float
     downloaded_bytes: int
     duration_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class DefaultRouteInfo:
+    """One ``0.0.0.0/0`` route in the router's own ``main`` table, as
+    RouterOS reports it right now -- this domain's own mirror of
+    ``wyfy_device_gateway.contract.DefaultRoute``, kept so ``service.py``
+    never imports the gateway package directly (the same seam
+    ``PingResult``/``SpeedTestResult`` above already hold).
+
+    ``interface`` is ``None`` when no tier of the gateway's own WAN
+    resolution can honestly name a real interface for the route: it
+    exists, but nothing can say where it goes. ``distance`` is ``None``
+    only for a malformed reply -- degrading to "cannot decide" rather than
+    to a fabricated 1."""
+
+    route_id: str
+    gateway: str | None
+    interface: str | None
+    distance: int | None
+    active: bool
+    disabled: bool
+    dynamic: bool
+    comment: str | None
 
 
 class BaseIspHealthAdapter(Protocol):
@@ -284,6 +336,47 @@ class BaseIspHealthAdapter(Protocol):
         throughput -- never a simulated/estimated number. See
         ``service.IspService.run_speed_test`` for the caller-side timeout
         sizing this genuinely slow, multi-second real action needs."""
+        ...
+
+    async def read_default_routes(
+        self, credentials: IspCredentials
+    ) -> list[DefaultRouteInfo]:
+        """Every ``0.0.0.0/0`` route in the router's own ``main`` routing
+        table, each resolved to the interface it actually leaves by.
+
+        The read a failover decision is made from, and deliberately a
+        separate call from the write below: a caller must be able to
+        refuse -- target not active, platform and router disagreeing about
+        the topology, a route RouterOS will not let anyone modify --
+        *before* it has moved a venue's live traffic. Nothing is filtered
+        out: inactive, disabled and dynamic rows all come back, flagged,
+        because each is a different refusal."""
+        ...
+
+    async def set_default_route_distances(
+        self, credentials: IspCredentials, *, distances: Mapping[str, int]
+    ) -> None:
+        """Set the administrative distance of the default route leaving by
+        each named interface -- the write that actually moves traffic.
+
+        Validated in full before the first write (a half-applied swap can
+        leave two routes tied at the lowest distance, which is RouterOS
+        load sharing across an uplink that is down) and idempotent on
+        parsed integers, so re-triggering an already-applied failover
+        issues no write at all."""
+        ...
+
+    async def ensure_wan_egress(
+        self, credentials: IspCredentials, *, interface: str
+    ) -> None:
+        """Make sure traffic leaving by ``interface`` is masqueraded and
+        that the interface counts as WAN-facing.
+
+        Additive only: it adds this interface's own objects and never
+        edits, widens or removes a rule that is already working. Moving
+        the route without this leaves guests egressing from an un-NATed
+        private address, which is the same outage the failover was meant
+        to end."""
         ...
 
 
@@ -392,6 +485,78 @@ class MikroTikIspHealthAdapter:
             duration_seconds=result.duration_seconds,
         )
 
+    async def read_default_routes(
+        self, credentials: IspCredentials
+    ) -> list[DefaultRouteInfo]:
+        creds = self._gateway_credentials(credentials)
+        try:
+            routes = await get_adapter(DeviceVendor.MIKROTIK).read_default_routes(creds)
+        except MikroTikConnectionError as exc:
+            raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise IspDeviceOperationError("read_default_routes", exc.detail) from exc
+        return [
+            DefaultRouteInfo(
+                route_id=route.route_id,
+                gateway=route.gateway,
+                interface=route.interface,
+                distance=route.distance,
+                active=route.active,
+                disabled=route.disabled,
+                dynamic=route.dynamic,
+                comment=route.comment,
+            )
+            for route in routes
+        ]
+
+    async def set_default_route_distances(
+        self, credentials: IspCredentials, *, distances: Mapping[str, int]
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).set_default_route_distances(
+                creds, distances=distances
+            )
+        except MikroTikConnectionError as exc:
+            raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
+        # Ordered before the MikroTikDeviceError catch below, which is
+        # their base class: each of these three is a distinct, operator-
+        # actionable refusal that reads as nonsense reported as a generic
+        # "the device rejected an operation".
+        except MikroTikRouteNotFoundError as exc:
+            raise IspDeviceRouteMismatchError(
+                credentials.host, exc.detail
+            ) from exc
+        except MikroTikAmbiguousRouteError as exc:
+            raise IspAmbiguousDefaultRouteError(
+                credentials.host, exc.detail
+            ) from exc
+        except MikroTikImmutableRouteError as exc:
+            raise IspRouteImmutableError(
+                credentials.host, exc.detail
+            ) from exc
+        except MikroTikDeviceError as exc:
+            raise IspDeviceOperationError(
+                "set_default_route_distances", exc.detail
+            ) from exc
+
+    async def ensure_wan_egress(
+        self, credentials: IspCredentials, *, interface: str
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).ensure_wan_egress(
+                creds, interface=interface
+            )
+        except MikroTikConnectionError as exc:
+            raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikWanInterfaceError as exc:
+            raise IspDeviceRouteMismatchError(
+                credentials.host, exc.detail
+            ) from exc
+        except MikroTikDeviceError as exc:
+            raise IspDeviceOperationError("ensure_wan_egress", exc.detail) from exc
+
 
 def _parse_ping_rows(
     rows: list[dict[str, object]], *, requested_count: int
@@ -478,6 +643,7 @@ __all__ = [
     "IspCredentials",
     "PingResult",
     "SpeedTestResult",
+    "DefaultRouteInfo",
     "BaseIspHealthAdapter",
     "MikroTikIspHealthAdapter",
     "get_isp_health_adapter",

@@ -19,6 +19,7 @@ anywhere in this sandbox -- see that module's own docstring).
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -32,21 +33,32 @@ from app.domains.isp.constants import (
     SPEED_TEST_TIMEOUT_SECONDS,
     HealthStatus,
     IspConnectionMode,
+    IspFailoverPushStatus,
     IspLinkRole,
     IspLinkType,
     WanRoutingMode,
 )
-from app.domains.isp.device_adapters import IspCredentials, PingResult, SpeedTestResult
+from app.domains.isp.device_adapters import (
+    DefaultRouteInfo,
+    IspCredentials,
+    PingResult,
+    SpeedTestResult,
+)
 from app.domains.isp.exceptions import (
     CrossOrganizationIspLinkAccessError,
+    IspAmbiguousDefaultRouteError,
     IspDeviceConnectionError,
+    IspDeviceRouteMismatchError,
+    IspFailoverTargetUnreachableError,
     IspHealthCheckTargetUnavailableError,
     IspLinkDisabledError,
     IspLinkInterfaceRequiredError,
     IspLinkNotFoundError,
+    IspLinkRoutingInterfaceUnknownError,
     IspMissingCredentialsError,
     IspNoBackupLinkAvailableError,
     IspPrimaryLinkAlreadyExistsError,
+    IspRouteImmutableError,
     MixedWanRoutingWeightsError,
 )
 from app.domains.isp.models import IspHealthCheck, IspLink
@@ -142,8 +154,33 @@ class FakeIspRepository:
     links: dict[uuid.UUID, IspLink] = field(default_factory=dict)
     health_checks: dict[uuid.UUID, IspHealthCheck] = field(default_factory=dict)
 
+    # Every commit() the service makes, in order, recorded as a snapshot of
+    # the link state it was committing. The real point of the explicit
+    # commits is that a failure record survives `get_db_session`'s rollback,
+    # and an in-memory dict cannot roll back -- so the assertion available
+    # here is that the commit was *issued*, at the right moment, with the
+    # right values already written. See TestFailoverDevicePush.
+    commits: list[dict[uuid.UUID, tuple[str, str | None]]] = field(
+        default_factory=list
+    )
+
+    async def commit(self) -> None:
+        self.commits.append(
+            {
+                link_id: (link.failover_push_status, link.failover_push_error)
+                for link_id, link in self.links.items()
+            }
+        )
+
     async def create_link(self, **fields: object) -> IspLink:
         link = IspLink(**_base_fields(**fields))
+        # SQLAlchemy column defaults are applied at INSERT, not on attribute
+        # access, so an unpersisted instance reads None where a real row
+        # reads "pending". Set here rather than in _base_fields, which also
+        # builds IspHealthCheck rows.
+        link.failover_push_status = IspFailoverPushStatus.PENDING.value
+        link.failover_push_error = None
+        link.failover_pushed_at = None
         self.links[link.id] = link
         return link
 
@@ -411,6 +448,100 @@ class FakeIspHealthAdapter:
     next_speed_test_result: SpeedTestResult | None = None
     speed_test_should_raise: Exception | None = None
     speed_test_calls: list[dict[str, object]] = field(default_factory=list)
+    # WAN-failover fakes -- see IspService._push_preferred_uplink. The
+    # default is the two-WAN router this domain's failover exists for:
+    # ether1 preferred at distance 1, ether2 the backup at distance 2, both
+    # live. Every field a real read returns is present, because every one of
+    # them is a different refusal on the service side.
+    default_routes: list[DefaultRouteInfo] = field(
+        default_factory=lambda: [
+            DefaultRouteInfo(
+                route_id="*r1",
+                gateway="192.168.1.1",
+                interface="ether1",
+                distance=1,
+                active=True,
+                disabled=False,
+                dynamic=False,
+                comment="cloudguest-plain-wan1",
+            ),
+            DefaultRouteInfo(
+                route_id="*r2",
+                gateway="192.168.2.1",
+                interface="ether2",
+                distance=2,
+                active=True,
+                disabled=False,
+                dynamic=False,
+                comment="cloudguest-plain-wan2",
+            ),
+        ]
+    )
+    ping_results_by_target: dict[str, PingResult] = field(
+        default_factory=lambda: {
+            "192.168.1.1": PingResult(
+                sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=2.0
+            ),
+            "192.168.2.1": PingResult(
+                sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=4.0
+            ),
+        }
+    )
+    read_routes_should_raise: Exception | None = None
+    set_distances_should_raise: Exception | None = None
+    egress_should_raise: Exception | None = None
+    distance_calls: list[dict[str, int]] = field(default_factory=list)
+    egress_calls: list[str] = field(default_factory=list)
+    read_routes_calls: int = 0
+    # Every device operation in the order it was issued -- the only way to
+    # assert that NAT is ensured BEFORE the route moves, which is what keeps
+    # guests from egressing un-NATed for the width of that window.
+    ops: list[str] = field(default_factory=list)
+
+    async def read_default_routes(
+        self, credentials: IspCredentials
+    ) -> list[DefaultRouteInfo]:
+        self.read_routes_calls += 1
+        self.ops.append("read_default_routes")
+        if self.read_routes_should_raise is not None:
+            raise self.read_routes_should_raise
+        return list(self.default_routes)
+
+    async def set_default_route_distances(
+        self, credentials: IspCredentials, *, distances
+    ) -> None:
+        self.distance_calls.append(dict(distances))
+        self.ops.append("set_default_route_distances")
+        if self.set_distances_should_raise is not None:
+            raise self.set_distances_should_raise
+        # Mirror the write back into the fake's own state, so a second push
+        # against the same adapter sees the router it just changed -- which
+        # is what makes the re-trigger no-op test mean anything.
+        self.default_routes = [
+            (
+                DefaultRouteInfo(
+                    route_id=route.route_id,
+                    gateway=route.gateway,
+                    interface=route.interface,
+                    distance=distances[route.interface],
+                    active=route.active,
+                    disabled=route.disabled,
+                    dynamic=route.dynamic,
+                    comment=route.comment,
+                )
+                if route.interface in distances
+                else route
+            )
+            for route in self.default_routes
+        ]
+
+    async def ensure_wan_egress(
+        self, credentials: IspCredentials, *, interface: str
+    ) -> None:
+        self.egress_calls.append(interface)
+        self.ops.append("ensure_wan_egress")
+        if self.egress_should_raise is not None:
+            raise self.egress_should_raise
 
     async def ping(
         self,
@@ -423,6 +554,20 @@ class FakeIspHealthAdapter:
         self.calls.append({"target_ip": target_ip, "count": count})
         if self.should_raise is not None:
             raise self.should_raise
+        # Per-target results take precedence over `next_result`, because
+        # this adapter is now pinged for two genuinely different questions
+        # against two genuinely different addresses: a link's own
+        # `gateway_ip_address` for routine health, and a default route's
+        # own next hop for the failover-target check. A single global
+        # result would make "the primary's gateway is not answering" also
+        # mean "the backup's next hop is not answering", which is not a
+        # router state that exists. `default_next_hop_ping_results` is
+        # pre-populated for the two next hops
+        # `default_routes` describes, so a test only names one to make it
+        # *unreachable*.
+        by_target = self.ping_results_by_target.get(target_ip)
+        if by_target is not None:
+            return by_target
         return self.next_result or PingResult(
             sent=count, received=count, packet_loss_percentage=0.0, avg_rtt_ms=10.0
         )
@@ -494,8 +639,17 @@ def make_harness(*, health_adapter: FakeIspHealthAdapter | None = None) -> Harne
 
 
 async def _create_primary(
-    h: Harness, router: Router, *, gateway: str | None = "203.0.113.1"
+    h: Harness,
+    router: Router,
+    *,
+    gateway: str | None = "203.0.113.1",
+    interface: str | None = "ether1",
 ) -> IspLink:
+    # An interface is not decoration here: failover is a real device
+    # operation now, and a link with no interface recorded is one this
+    # platform cannot honestly move traffic onto (see
+    # IspLinkRoutingInterfaceUnknownError). The defaults match the two-WAN
+    # router FakeIspHealthAdapter.default_routes describes.
     return await h.service.create_link(
         actor_user_id=uuid.uuid4(),
         requesting_organization_id=router.organization_id,
@@ -504,6 +658,7 @@ async def _create_primary(
         link_type=IspLinkType.FIBER.value,
         role=IspLinkRole.PRIMARY,
         gateway_ip_address=gateway,
+        interface=interface,
     )
 
 
@@ -513,6 +668,7 @@ async def _create_backup(
     *,
     priority: int = 0,
     gateway: str | None = "203.0.113.2",
+    interface: str | None = "ether2",
 ) -> IspLink:
     return await h.service.create_link(
         actor_user_id=uuid.uuid4(),
@@ -523,6 +679,7 @@ async def _create_backup(
         role=IspLinkRole.BACKUP,
         priority=priority,
         gateway_ip_address=gateway,
+        interface=interface,
     )
 
 
@@ -1918,6 +2075,574 @@ class TestFailback:
         current_active = await h.repository.get_active_uplink_for_router(router.id)
         assert current_active.id == primary.id
 
+
+
+# ============================================================================
+# Failover: the device push
+# ============================================================================
+#
+# The defect these exist for: `trigger_failover` used to flip two booleans,
+# write an audit row and return 200 without contacting the router at all --
+# `device_adapters.py` had no write method of any kind. A customer whose
+# primary was down clicked the button, saw a success toast, stayed offline,
+# and watched the "Active uplink" tile start naming the backup. Every test
+# below asserts a fact about the ROUTER, not about the database row, except
+# where it is specifically asserting that the database was NOT written.
+
+
+class TestFailoverDevicePush:
+    async def test_the_adapter_is_told_to_swap_the_two_distances(self) -> None:
+        """Failover on this hardware is a distance swap on the main-table
+        default routes: the target takes the lowest distance in use, and
+        whichever route held it takes the target's. The exact values reach
+        the adapter -- nothing invented, and the operation is its own
+        inverse."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        await _create_backup(h, router)
+
+        await h.service.trigger_failover(
+            router.id, actor_user_id=None, reason="manual_test"
+        )
+
+        assert h.health_adapter.distance_calls == [{"ether2": 1, "ether1": 2}]
+
+    async def test_nat_is_ensured_on_the_target_before_the_route_moves(
+        self,
+    ) -> None:
+        """The masquerade rule on this fleet is bound to
+        `out-interface=ether1`. Move the default route first and there is a
+        window in which guest traffic leaves ether2 NATed by nothing --
+        from an RFC1918 source, dying at the first upstream hop, which
+        looks exactly like the outage the failover was meant to end."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        await _create_backup(h, router)
+
+        await h.service.trigger_failover(
+            router.id, actor_user_id=None, reason="manual_test"
+        )
+
+        assert h.health_adapter.egress_calls == ["ether2"]
+        assert h.health_adapter.ops.index(
+            "ensure_wan_egress"
+        ) < h.health_adapter.ops.index("set_default_route_distances")
+
+    async def test_the_row_records_a_successful_push(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        backup = await _create_backup(h, router)
+
+        promoted = await h.service.trigger_failover(
+            router.id, actor_user_id=None, reason="manual_test"
+        )
+
+        assert promoted.id == backup.id
+        assert promoted.failover_push_status == IspFailoverPushStatus.ACTIVE.value
+        assert promoted.failover_push_error is None
+        assert promoted.failover_pushed_at is not None
+
+    async def test_provisioning_is_committed_before_the_first_socket(self) -> None:
+        """So a customer refreshing during a slow push sees the work in
+        progress rather than the previous attempt's outcome, and a process
+        killed mid-push leaves a row saying nobody confirmed this instead of
+        a stale ACTIVE."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        backup = await _create_backup(h, router)
+
+        await h.service.trigger_failover(
+            router.id, actor_user_id=None, reason="manual_test"
+        )
+
+        first_commit = h.repository.commits[0]
+        assert first_commit[backup.id] == (
+            IspFailoverPushStatus.PROVISIONING.value,
+            None,
+        )
+
+    async def test_a_device_failure_is_recorded_committed_and_re_raised(
+        self,
+    ) -> None:
+        """`GenericRepository.update` only flushes and `get_db_session`
+        rolls the session back on any exception, so without the explicit
+        commit the failure record is discarded and the row still reads
+        `pending` with `failover_push_error` NULL. The commit has to happen
+        BEFORE the raise, which is what the ordering assertion checks."""
+        boom = IspDeviceConnectionError("10.0.0.1", "connection refused")
+        h = make_harness(health_adapter=FakeIspHealthAdapter(egress_should_raise=boom))
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        backup = await _create_backup(h, router)
+
+        with pytest.raises(IspDeviceConnectionError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert backup.failover_push_status == IspFailoverPushStatus.FAILED.value
+        assert "connection refused" in backup.failover_push_error
+        # PROVISIONING, then FAILED -- both committed, the second before the
+        # exception left the method.
+        assert [commit[backup.id][0] for commit in h.repository.commits] == [
+            IspFailoverPushStatus.PROVISIONING.value,
+            IspFailoverPushStatus.FAILED.value,
+        ]
+
+    async def test_a_failed_push_never_flips_the_active_uplink(self) -> None:
+        """The whole point. The database follows the device; it never leads
+        it. A push that failed must leave the dashboard saying the primary
+        is still the active uplink, because it is."""
+        boom = IspDeviceConnectionError("10.0.0.1", "connection refused")
+        h = make_harness(health_adapter=FakeIspHealthAdapter(egress_should_raise=boom))
+        router = h.router_lookup.add(_make_router())
+        primary = await _create_primary(h, router)
+        backup = await _create_backup(h, router)
+
+        with pytest.raises(IspDeviceConnectionError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert primary.is_active_uplink is True
+        assert backup.is_active_uplink is False
+        assert h.audit_writer.entries == [
+            e for e in h.audit_writer.entries if e["action"] != "isp_failover_triggered"
+        ]
+
+    async def test_re_triggering_an_active_failover_writes_nothing(self) -> None:
+        """A clean no-op: no second backup promoted, no route write, no
+        audit row, no database change. The device push still runs, because
+        it is idempotent and it is what repairs a router whose NAT was
+        removed by hand since -- but it writes no distances."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        backup = await _create_backup(h, router)
+        await h.service.trigger_failover(
+            router.id, actor_user_id=None, reason="manual_test"
+        )
+        h.health_adapter.distance_calls.clear()
+        audit_count = len(h.audit_writer.entries)
+        version_before = backup.version
+
+        again = await h.service.trigger_failover(
+            router.id, actor_user_id=None, reason="manual_test"
+        )
+
+        assert again.id == backup.id
+        assert h.health_adapter.distance_calls == []
+        assert len(h.audit_writer.entries) == audit_count
+        # The only writes are the push-status bookkeeping, not a second
+        # promotion of anything.
+        assert backup.is_active_uplink is True
+        assert backup.version > version_before
+
+    async def test_re_triggering_does_not_promote_a_second_backup(self) -> None:
+        """Two backups, one already carrying traffic. Without the
+        already-failed-over branch this would demote the working backup and
+        promote the other one -- a second, entirely gratuitous outage
+        triggered by a customer clicking the button twice."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        first = await _create_backup(h, router, priority=1)
+        second = await _create_backup(
+            h, router, priority=2, gateway="203.0.113.9", interface="ether2"
+        )
+        await h.service.trigger_failover(
+            router.id, actor_user_id=None, reason="manual_test"
+        )
+        assert first.is_active_uplink is True
+
+        await h.service.trigger_failover(
+            router.id, actor_user_id=None, reason="manual_test"
+        )
+
+        assert first.is_active_uplink is True
+        assert second.is_active_uplink is False
+
+    async def test_failback_swaps_the_distances_back(self) -> None:
+        """A real reversal on the device, not the booleans flipped back.
+        Because failover is a swap, its inverse is the same swap, and the
+        router ends up with exactly the distances it started with."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        primary = await _create_primary(h, router)
+        await _create_backup(h, router)
+        await h.service.trigger_failover(
+            router.id, actor_user_id=None, reason="manual_test"
+        )
+        await h.repository.update_link(
+            primary, {"health_status": HealthStatus.HEALTHY.value}
+        )
+
+        restored = await h.service.trigger_failback(router.id, actor_user_id=None)
+
+        assert restored.id == primary.id
+        assert h.health_adapter.distance_calls == [
+            {"ether2": 1, "ether1": 2},
+            {"ether1": 1, "ether2": 2},
+        ]
+        assert {
+            route.interface: route.distance
+            for route in h.health_adapter.default_routes
+        } == {"ether1": 1, "ether2": 2}
+        assert restored.failover_push_status == IspFailoverPushStatus.ACTIVE.value
+
+    async def test_failback_onto_an_already_active_primary_writes_nothing(
+        self,
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        primary = await _create_primary(h, router)
+        await _create_backup(h, router)
+        await h.repository.update_link(
+            primary, {"health_status": HealthStatus.HEALTHY.value}
+        )
+        audit_count = len(h.audit_writer.entries)
+
+        restored = await h.service.trigger_failback(router.id, actor_user_id=None)
+
+        assert restored.id == primary.id
+        assert h.health_adapter.distance_calls == []
+        assert len(h.audit_writer.entries) == audit_count
+
+
+class TestFailoverRefusesRatherThanGuesses:
+    """Each of these is a state in which moving a venue's live traffic
+    would be an act of hope. Every one refuses, and the ones that can be
+    decided without the router refuse before a socket is opened."""
+
+    async def test_no_backup_link_refuses_before_any_device_call(self) -> None:
+        """Which is also, correctly, what a single-WAN router gets. The lab
+        hEX lite has exactly one WAN, and this is how it degrades: an
+        honest 409, with the router never contacted."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+
+        with pytest.raises(IspNoBackupLinkAvailableError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert h.health_adapter.ops == []
+
+    async def test_a_link_with_no_interface_refuses_before_any_device_call(
+        self,
+    ) -> None:
+        """A two-WAN router offers an obvious-looking inference -- "it must
+        be the other port" -- and acting on it would move a venue's traffic
+        onto a port chosen by this codebase rather than by whoever cabled
+        the site."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        await _create_backup(h, router, interface=None)
+
+        with pytest.raises(IspLinkRoutingInterfaceUnknownError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert h.health_adapter.ops == []
+
+    async def test_missing_credentials_refuse_before_any_device_call(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router(), secret=None)
+        await _create_primary(h, router)
+        await _create_backup(h, router)
+
+        with pytest.raises(IspMissingCredentialsError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert h.health_adapter.ops == []
+
+    async def test_a_backup_whose_route_is_not_active_refuses_before_writing(
+        self,
+    ) -> None:
+        """RouterOS marks a default route Inactive the instant its
+        `check-gateway` probe fails. Failing over onto it would add an
+        outage to an outage and make the dashboard lie twice."""
+        adapter = FakeIspHealthAdapter()
+        adapter.default_routes = [
+            adapter.default_routes[0],
+            dataclasses.replace(adapter.default_routes[1], active=False),
+        ]
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        backup = await _create_backup(h, router)
+
+        with pytest.raises(IspFailoverTargetUnreachableError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert adapter.distance_calls == []
+        assert adapter.egress_calls == []
+        assert backup.failover_push_status == IspFailoverPushStatus.FAILED.value
+
+    async def test_a_backup_whose_next_hop_does_not_answer_refuses(self) -> None:
+        """`active` alone is not enough: a route can be freshly added and
+        not yet probed. A real /tool/ping from the router to that route's
+        own next hop is the strongest evidence obtainable before traffic
+        moves."""
+        adapter = FakeIspHealthAdapter()
+        adapter.ping_results_by_target["192.168.2.1"] = PingResult(
+            sent=5, received=0, packet_loss_percentage=100.0, avg_rtt_ms=None
+        )
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        await _create_backup(h, router)
+
+        with pytest.raises(IspFailoverTargetUnreachableError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert adapter.distance_calls == []
+        assert adapter.egress_calls == []
+
+    async def test_a_disabled_route_gets_its_own_message(self) -> None:
+        """An administratively-disabled route is a human decision, not a
+        fault, and an operator reading "check-gateway is failing" about a
+        route they switched off themselves would go looking for the wrong
+        problem."""
+        adapter = FakeIspHealthAdapter()
+        adapter.default_routes = [
+            adapter.default_routes[0],
+            dataclasses.replace(adapter.default_routes[1], disabled=True),
+        ]
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        await _create_backup(h, router)
+
+        with pytest.raises(IspFailoverTargetUnreachableError) as excinfo:
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert "administratively disabled" in str(excinfo.value)
+
+    async def test_a_router_with_no_route_on_the_links_interface_refuses(
+        self,
+    ) -> None:
+        """The database and the router disagree about where this uplink
+        terminates. A failover carried out on the database's belief would
+        write a preference for a path the router does not have."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        await _create_backup(h, router, interface="sfp1")
+
+        with pytest.raises(IspDeviceRouteMismatchError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert h.health_adapter.distance_calls == []
+        assert h.health_adapter.egress_calls == []
+
+    async def test_two_routes_tied_at_the_lowest_distance_refuse(self) -> None:
+        """A tie is RouterOS load sharing, not a preference order. Joining
+        or disturbing it is not a failover, and a distance change made into
+        a tie can split a venue's traffic across an uplink that is down."""
+        adapter = FakeIspHealthAdapter()
+        adapter.default_routes = [
+            adapter.default_routes[0],
+            dataclasses.replace(adapter.default_routes[1], distance=1),
+        ]
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        await _create_backup(h, router)
+
+        with pytest.raises(IspAmbiguousDefaultRouteError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert adapter.distance_calls == []
+
+    async def test_two_default_routes_on_the_same_interface_refuse(self) -> None:
+        adapter = FakeIspHealthAdapter()
+        adapter.default_routes = [
+            *adapter.default_routes,
+            dataclasses.replace(
+                adapter.default_routes[1], route_id="*r3", distance=7
+            ),
+        ]
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        await _create_backup(h, router)
+
+        with pytest.raises(IspAmbiguousDefaultRouteError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert adapter.distance_calls == []
+
+    async def test_a_dynamic_route_refusal_from_the_device_propagates(self) -> None:
+        """The lab router's own shape: its only default route is dynamic,
+        created by RouterOS's dhcp-client, and `/ip route set` is refused
+        on those. The typed refusal reaches the caller as a 409 naming the
+        fix, not as an opaque device error."""
+        adapter = FakeIspHealthAdapter(
+            set_distances_should_raise=IspRouteImmutableError(
+                uuid.uuid4(), "the default route on 'ether2' is dynamic"
+            )
+        )
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        backup = await _create_backup(h, router)
+
+        with pytest.raises(IspRouteImmutableError):
+            await h.service.trigger_failover(
+                router.id, actor_user_id=None, reason="manual_test"
+            )
+
+        assert backup.failover_push_status == IspFailoverPushStatus.FAILED.value
+        assert backup.is_active_uplink is False
+
+    async def test_a_single_default_route_is_a_no_op_not_an_error(self) -> None:
+        """The honest single-WAN answer at the routing layer. Reached only
+        when a router genuinely has one default route while the platform
+        holds two links for it -- nothing is wrong, there is simply
+        nowhere else for traffic to go, so no distance is written."""
+        adapter = FakeIspHealthAdapter()
+        adapter.default_routes = [
+            dataclasses.replace(adapter.default_routes[0], interface="ether2")
+        ]
+        h = make_harness(health_adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        backup = await _create_backup(h, router)
+
+        promoted = await h.service.trigger_failover(
+            router.id, actor_user_id=None, reason="manual_test"
+        )
+
+        assert promoted.id == backup.id
+        assert adapter.distance_calls == []
+        assert adapter.egress_calls == ["ether2"]
+
+    async def test_failover_on_another_organizations_router_is_refused(self) -> None:
+        """This method accepted a `requesting_organization_id` and never
+        read it: the permission check reads the header organization and the
+        handler read the path id, so an operator holding `isp.execute` in
+        one organization could fail over another organization's router by
+        putting its id in the URL."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_primary(h, router)
+        await _create_backup(h, router)
+
+        with pytest.raises(RouterNotFoundError):
+            await h.service.trigger_failover(
+                router.id,
+                actor_user_id=None,
+                reason="manual_test",
+                requesting_organization_id=uuid.uuid4(),
+            )
+
+        assert h.health_adapter.ops == []
+
+
+class TestDistanceSwapPlanning:
+    """The decision itself, as a pure function of raw route rows -- so the
+    arithmetic that moves a venue's traffic can be reasoned about without a
+    device, a database or a service."""
+
+    @staticmethod
+    def _route(interface: str, distance: int, **kw) -> DefaultRouteInfo:
+        return DefaultRouteInfo(
+            route_id=f"*{interface}",
+            gateway=f"192.168.{interface[-1]}.1",
+            interface=interface,
+            distance=distance,
+            active=True,
+            disabled=False,
+            dynamic=False,
+            comment=None,
+            **kw,
+        )
+
+    def test_the_target_takes_the_lowest_distance_and_gives_up_its_own(
+        self,
+    ) -> None:
+        plan = IspService._plan_distance_swap(
+            uuid.uuid4(),
+            [self._route("ether1", 1), self._route("ether2", 2)],
+            "ether2",
+        )
+        assert plan == {"ether2": 1, "ether1": 2}
+
+    def test_the_swap_is_its_own_inverse(self) -> None:
+        """Which is what makes failback a real reversal rather than a
+        second, differently-shaped write that happens to look similar."""
+        router_id = uuid.uuid4()
+        routes = [self._route("ether1", 1), self._route("ether2", 2)]
+        forward = IspService._plan_distance_swap(router_id, routes, "ether2")
+        swapped = [
+            dataclasses.replace(route, distance=forward[route.interface])
+            for route in routes
+        ]
+        back = IspService._plan_distance_swap(router_id, swapped, "ether1")
+        assert back == {"ether1": 1, "ether2": 2}
+
+    def test_an_already_preferred_target_plans_nothing(self) -> None:
+        plan = IspService._plan_distance_swap(
+            uuid.uuid4(),
+            [self._route("ether1", 1), self._route("ether2", 2)],
+            "ether1",
+        )
+        assert plan == {}
+
+    def test_a_three_wan_router_promotes_past_both_others(self) -> None:
+        plan = IspService._plan_distance_swap(
+            uuid.uuid4(),
+            [
+                self._route("ether1", 1),
+                self._route("ether2", 2),
+                self._route("ether3", 3),
+            ],
+            "ether3",
+        )
+        assert plan == {"ether3": 1, "ether1": 3}
+
+    def test_never_decrements_below_the_lowest_distance_in_use(self) -> None:
+        """RouterOS distances start at 1, so "one better than the best"
+        runs out. The swap has no such floor -- it only ever reuses values
+        the router already had."""
+        plan = IspService._plan_distance_swap(
+            uuid.uuid4(),
+            [self._route("ether1", 1), self._route("ether2", 5)],
+            "ether2",
+        )
+        assert min(plan.values()) == 1
+
+    def test_an_incumbent_resolving_to_no_interface_refuses(self) -> None:
+        """Its distance cannot be addressed by interface, so only the half
+        that CAN be addressed would be written -- which is exactly the
+        partial swap that produces a tie."""
+        orphan = dataclasses.replace(self._route("ether1", 1), interface=None)
+        with pytest.raises(IspAmbiguousDefaultRouteError):
+            IspService._plan_distance_swap(
+                uuid.uuid4(), [orphan, self._route("ether2", 2)], "ether2"
+            )
 
 # ============================================================================
 # Availability (computed read-model)

@@ -12,6 +12,7 @@ so no compatibility shim is needed.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
@@ -552,6 +553,46 @@ class SpeedTestResult:
 
 
 @dataclass(frozen=True, slots=True)
+class DefaultRoute:
+    """One ``0.0.0.0/0`` route in the router's own ``main`` routing table,
+    as RouterOS reports it right now.
+
+    This is the shape WAN failover is decided on, and every field in it is
+    read off the device rather than assumed:
+
+    * ``route_id`` -- RouterOS's own ``.id`` for the row, the only handle
+      a write can address it by. Valid for the life of one connection;
+      never persisted anywhere.
+    * ``interface`` -- the egress interface this route actually leaves by,
+      resolved by :func:`mikrotik_adapter._route_interface`, which is the
+      *same* four-tier rule
+      :meth:`MikroTikAdapter.resolve_wan_interface` documents and uses.
+      ``None`` when no tier can name a real interface on this device: the
+      route exists, but nothing here can honestly say where it goes.
+    * ``distance`` -- RouterOS's own administrative distance. ``None``
+      when the row does not carry one (it always does in practice; the
+      Optional is so a malformed reply degrades to "cannot decide" rather
+      than to a fabricated 1).
+    * ``active`` -- RouterOS's live "this is the route currently
+      forwarding matching traffic" flag. It goes false the instant a
+      ``check-gateway`` probe fails, which is what makes it, and not mere
+      presence, the signal a failover target is usable.
+    * ``dynamic`` -- a route RouterOS created itself (a dhcp-client's own
+      auto-route). ``/ip route set`` is refused on these, so a failover
+      that would have to modify one has to say so rather than try.
+    """
+
+    route_id: str
+    gateway: str | None
+    interface: str | None
+    distance: int | None
+    active: bool
+    disabled: bool
+    dynamic: bool
+    comment: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class RawCommandResult:
     """The real, unfiltered outcome of one raw SSH console command --
     ported from
@@ -659,6 +700,65 @@ class DeviceGatewayAdapter(Protocol):
         so editing the VLAN's subnet updates the existing rule instead of
         leaving an orphan behind and adding a second one that masquerades
         a subnet nothing uses any more.
+        """
+        ...
+
+    # -- WAN failover ------------------------------------------------------
+    # Until these existed, this platform's "Trigger failover" button moved
+    # no traffic: it flipped a boolean in a database and wrote an audit
+    # row. The venue stayed offline and the dashboard's "Active uplink"
+    # tile named the backup -- the one screen a customer looks at during an
+    # outage, made actively wrong. See ``read_default_routes`` and
+    # ``set_default_route_distances`` for what failover means on the device.
+
+    async def read_default_routes(
+        self, creds: DeviceCredentials
+    ) -> list[DefaultRoute]:
+        """Every ``0.0.0.0/0`` route in the device's own ``main`` routing
+        table, each resolved to the interface it actually leaves by.
+
+        Read-only, and the single read a failover decision is made from:
+        which uplinks the router believes it has, which one it currently
+        prefers, which are live, and which can be modified at all. A
+        caller that cannot see all of that before it writes is guessing.
+        """
+        ...
+
+    async def set_default_route_distances(
+        self, creds: DeviceCredentials, *, distances: Mapping[str, int]
+    ) -> None:
+        """Set the administrative distance of the default route leaving by
+        each named interface -- the write that actually moves traffic.
+
+        Keyed by interface name rather than by route id, because an id is
+        meaningless outside the connection that read it and the caller's
+        own decision is about links, not rows.
+
+        Every named interface is validated against the device (exactly one
+        modifiable main-table default route each) *before the first write*.
+        A half-applied distance change is worse than none: it can leave two
+        default routes tied at the same distance, which is RouterOS load
+        sharing across an uplink that is down.
+
+        Idempotent: an interface whose route already carries the requested
+        distance is skipped, so re-triggering an already-applied failover
+        issues no write at all.
+        """
+        ...
+
+    async def ensure_wan_egress(
+        self, creds: DeviceCredentials, *, interface: str
+    ) -> None:
+        """Make sure traffic that leaves by ``interface`` is actually
+        NATed and treated as WAN-facing -- additively, never by editing a
+        rule that is already working.
+
+        Moving the default route alone is not failover. A masquerade rule
+        bound to ``out-interface=ether1`` stops matching the moment traffic
+        leaves ``ether2``, so the route moves and every guest loses
+        internet anyway -- from behind an un-NATed private source address,
+        which looks exactly like the outage the failover was supposed to
+        end.
         """
         ...
 

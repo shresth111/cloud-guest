@@ -144,6 +144,17 @@ class IspLinkResponse(BaseModel):
     current_upload_mbps: float | None
     last_checked_at: datetime | None
     consecutive_unhealthy_count: int
+    # The DEVICE half of a failover, alongside `is_active_uplink` above
+    # rather than folded into it. That flag is what this platform intends;
+    # these three are what the router was told and whether it took it.
+    # Surfaced because collapsing them is precisely how the "Active
+    # uplink" tile came to name a backup that was carrying no traffic --
+    # a `failover_push_status` of "failed" with the router's own verbatim
+    # refusal in `failover_push_error` is the difference between a
+    # dashboard that is wrong and one that is useful during an outage.
+    failover_push_status: str
+    failover_push_error: str | None
+    failover_pushed_at: datetime | None
     created_at: datetime
 
 

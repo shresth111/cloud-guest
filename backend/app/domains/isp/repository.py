@@ -107,6 +107,20 @@ class IspRepositoryProtocol(Protocol):
         ]
     ]: ...
 
+    async def commit(self) -> None:
+        """Commits the current transaction.
+
+        Needed by ``IspService``'s failover/failback device push and
+        nothing else. ``GenericRepository.update`` only ``flush()``es and
+        ``get_db_session`` rolls the session back on any exception -- so
+        the failure record written just before a re-raise is discarded,
+        and the link still reads ``pending`` after a real device failure
+        with ``failover_push_error`` NULL. Committing explicitly before
+        raising is what makes the record survive to be read, and is the
+        same conclusion ``VlanRepository.commit`` documents (where the
+        same defect was found live in ``qos``)."""
+        ...
+
 
 class IspRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -118,6 +132,9 @@ class IspRepository:
         self.health_checks = GenericRepository(IspHealthCheck, session)
 
     # -- links -------------------------------------------------------------------
+
+    async def commit(self) -> None:
+        await self.session.commit()
 
     async def create_link(self, **fields: object) -> IspLink:
         return await self.links.create(fields)

@@ -30,6 +30,11 @@ __all__ = [
     "MixedWanRoutingWeightsError",
     "IspLinkInterfaceRequiredError",
     "IspLinkInterfaceInvariantError",
+    "IspLinkRoutingInterfaceUnknownError",
+    "IspFailoverTargetUnreachableError",
+    "IspAmbiguousDefaultRouteError",
+    "IspDeviceRouteMismatchError",
+    "IspRouteImmutableError",
 ]
 
 
@@ -230,5 +235,120 @@ class MixedWanRoutingWeightsError(IspError):
             f"Router '{router_id}' has a load-balance weight set on some "
             "but not all of its enabled WAN links -- weight either every "
             "enabled link or none of them",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+# ============================================================================
+# WAN failover -- refusals that happen instead of a guess
+# ============================================================================
+#
+# Every one of these is a state in which moving a venue's live traffic would
+# be an act of hope. A failover onto a link that is also down does not
+# restore a site: it adds a second outage to the first and leaves the
+# dashboard's "Active uplink" tile naming an uplink no packet uses, which is
+# the single screen a customer looks at while they are already offline.
+# Refusing names the problem and leaves the router exactly as it was.
+
+
+class IspLinkRoutingInterfaceUnknownError(IspError):
+    """The link traffic would move onto has no interface recorded, so
+    there is no way to name what to move it to.
+
+    Checked before a socket is opened. Nothing on the device can be
+    resolved from a link whose ``routing_interface``/``interface`` is
+    NULL, and inferring one ("the router only has one other WAN port")
+    would be a guess about a customer's cabling."""
+
+    def __init__(self, link_id: uuid.UUID) -> None:
+        super().__init__(
+            f"ISP link '{link_id}' has no WAN interface recorded, so traffic "
+            "cannot be moved onto it -- set the link's interface first",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class IspFailoverTargetUnreachableError(IspError):
+    """The router's own live state says the link being failed over to is
+    not usable right now.
+
+    Raised after a read and before any write, on either of two real
+    signals: the target's default route is not RouterOS-``active`` (its
+    ``check-gateway`` probe is failing, or it is administratively
+    disabled), or the router cannot ping the target's own next hop.
+
+    This is the check that stops the worst outcome available here. What it
+    does *not* prove is that the internet is reachable beyond that next
+    hop -- see ``IspService._verify_failover_target``."""
+
+    def __init__(self, link_id: uuid.UUID, reason: str) -> None:
+        super().__init__(
+            f"ISP link '{link_id}' is not usable as a failover target right "
+            f"now: {reason}",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class IspAmbiguousDefaultRouteError(IspError):
+    """The router has more than one plausible default route for the
+    uplink in question, or several tied at the lowest distance.
+
+    Both are states where "which route is this link's" has no single
+    answer, and picking the first row would be choosing by reply order.
+    Worse, a distance change made into a tie is RouterOS load sharing --
+    so guessing here can split a venue's traffic across an uplink that is
+    down rather than moving it off one."""
+
+    #: ``target`` is the owning router's id when this domain's own service
+    #: layer raises it (which is the readable case for an operator) and the
+    #: device host when the adapter does -- the adapter genuinely does not
+    #: know the router id, and inventing one to fill the field would put a
+    #: wrong uuid in a customer-visible message.
+    def __init__(self, target: uuid.UUID | str, reason: str) -> None:
+        super().__init__(
+            f"Router '{target}' has an ambiguous default-route layout, so "
+            f"failover cannot say which route to move: {reason}",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class IspDeviceRouteMismatchError(IspError):
+    """The router's routing table does not contain what this platform's
+    database says it should.
+
+    Specifically: the database holds an ISP link terminating on an
+    interface for which the router has no ``main``-table default route at
+    all. The two disagree about the site's topology, and a failover
+    carried out on the database's belief would write a preference for a
+    path the router does not have."""
+
+    #: ``target`` follows the same router-id-or-host convention as
+    #: :class:`IspAmbiguousDefaultRouteError`.
+    def __init__(self, target: uuid.UUID | str, reason: str) -> None:
+        super().__init__(
+            f"Router '{target}' does not confirm the topology this platform "
+            f"believes it has, so failover is refused: {reason}",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class IspRouteImmutableError(IspError):
+    """The default route that would have to be modified is one RouterOS
+    created itself (a dhcp-client auto-route) and refuses to let anyone
+    change.
+
+    Real and expected on a router not provisioned by this platform's own
+    Setup Script generator, which deliberately sets ``add-default-route=no``
+    on every dhcp-client and provisions a *static* default route per WAN
+    instead -- precisely so this platform's routing decisions are ones it
+    is allowed to make."""
+
+    #: ``target`` follows the same router-id-or-host convention as
+    #: :class:`IspAmbiguousDefaultRouteError`.
+    def __init__(self, target: uuid.UUID | str, reason: str) -> None:
+        super().__init__(
+            f"Router '{target}' cannot be failed over: {reason}. Re-run "
+            "this router's setup script so its default routes are static and "
+            "platform-managed.",
             status_code=status.HTTP_409_CONFLICT,
         )

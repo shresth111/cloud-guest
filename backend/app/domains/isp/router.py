@@ -118,6 +118,9 @@ def _link_response(
         current_upload_mbps=link.current_upload_mbps,
         last_checked_at=link.last_checked_at,
         consecutive_unhealthy_count=link.consecutive_unhealthy_count,
+        failover_push_status=link.failover_push_status,
+        failover_push_error=link.failover_push_error,
+        failover_pushed_at=link.failover_pushed_at,
         created_at=link.created_at,
     )
 
