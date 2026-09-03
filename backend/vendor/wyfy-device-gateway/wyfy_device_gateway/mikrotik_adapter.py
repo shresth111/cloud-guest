@@ -3525,57 +3525,135 @@ class MikroTikAdapter:
             api.close()
 
     def _ensure_content_filter_enforcement_rule(self, api) -> None:  # noqa: ANN001
-        """Real read-before-write dedup for the one, router-global
+        """Real read-before-write convergence for the one, router-global
         ``/ip firewall filter`` DROP rule every ``ip_cidr``-type content
         filter rule relies on -- see
         ``configure_content_filter_rule``'s own docstring for why this
         must exist exactly once, not once per rule.
 
-        **Known gap, deliberately not fixed here: this rule's position in
-        the chain is unmanaged.** The ``add`` below carries no
-        ``place-before``, so RouterOS appends and the DROP lands at the
-        bottom of ``forward``; the dedup check above then reads only the
-        comment, so once the rule exists nothing ever verifies or corrects
-        where it sits. Whether that breaks blocking is per-router: on this
-        platform's lab device the only accept ahead of it is
-        ``cloudguest-fw-fwd-established``, scoped to
-        ``connection-state=established,related``, which a *new* connection
-        does not match -- so a fresh connection is still dropped, while an
-        already-established flow keeps flowing. On a router whose chain
-        carries any broader accept ahead of it, blocking silently stops.
+        ## Position is managed, not left to where RouterOS appends
 
-        Not fixed in this pass, and the reason is the fix rather than the
-        defect. Placing it correctly needs one explicit, stable ordering
-        scheme shared with ``app.domains.firewall`` -- a sentinel and
-        ``place-before``, never an integer index, which goes stale the
-        moment the hotspot adds or removes one of its own dynamic rules.
-        That scheme is being defined for the firewall domain right now,
-        and inventing a second one here would leave two competing schemes
-        writing to the same chain. Reordering a live ``forward`` chain on
-        a guess is also not a recoverable mistake: a drop landing above
-        the guest accepts, or an ``input`` drop matching the management
-        tunnel or port 8728, is a router nobody can reach again.
+        This used to ``add`` with no ``place-before``, so the DROP landed
+        at the bottom of ``forward``, and the dedup check read only the
+        comment -- once the rule existed, nothing ever verified or
+        corrected where it sat. Any ``accept`` ahead of it silently ended
+        blocking.
 
-        What this does mean for callers: an ``ip_cidr`` rule reaching
-        ``ACTIVE`` asserts that *its own* address-list membership and an
-        enforcement rule exist, not that the chain order makes them
-        effective -- see ``app.domains.content_filtering.constants
-        .ContentFilterDevicePushStatus``. "The rule exists" passing on a
-        router that forwards the traffic anyway is exactly the class of
-        false verification ``docs/vlan/BRIDGE_VLAN_FILTERING.md`` writes
-        up."""
-        existing_filters = list(api.path("ip", "firewall", "filter"))
-        already_present = any(
-            row.get("comment") == _CONTENT_FILTER_ENFORCEMENT_COMMENT
-            for row in existing_filters
+        It is now placed immediately **before the first ``accept`` in
+        ``forward``**, and the position is re-checked on every push rather
+        than only at creation.
+
+        Two device tests on RouterOS 7.23.3 (hEX lite) make that placement
+        buildable rather than guessed, and both are recorded in
+        ``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md`` §7:
+
+        * **T1** -- ``librouteros``' ``Path.add()`` accepts ``place-before``
+          and it takes a ``.id``, not an ordinal. Verified: rules added
+          ``a``, ``b``, then ``c`` with ``place-before=<b .id>`` printed in
+          the order ``a, c, b``.
+        * **T2** -- a static rule *can* sit above hotspot's dynamic
+          ``forward`` rules. Verified: a rule placed before the first
+          dynamic row landed at index 0, above both ``jump`` rules.
+
+        ## Why the first accept, and why that is safe here
+
+        Read off the lab router, ``forward`` is two dynamic hotspot
+        ``jump`` rules (both gated ``hotspot=...,!auth``, so authenticated
+        guest traffic does not match them and falls through), three
+        ``cloudguest-block-*`` drops, then
+        ``accept cloudguest-fw-fwd-established``
+        (``connection-state=established,related``) and a drop for
+        ``invalid``.
+
+        Below that accept, a blocked destination is only dropped on a *new*
+        connection: a flow already established when the block was added
+        keeps flowing, so "blocked" does not take effect until the guest's
+        existing connection closes. Above it, the block applies to the
+        traffic already in flight, which is what an operator pressing Block
+        means.
+
+        Placing a rule above the accepts is the dangerous direction in
+        general -- §5.2.2 of that document says so, and a drop over the
+        management tunnel is a router nobody can reach again. It is safe
+        for *this* rule because it is not a general-purpose access rule: it
+        matches ``dst-address-list=<content filter list>`` and nothing else,
+        so it can only ever affect traffic to a destination the customer
+        explicitly blocked. It cannot match the portal, the tunnel, or
+        8728 unless one of those addresses is put in the block list.
+
+        ## Convergence, and what is never touched
+
+        ``librouteros`` exposes no ``move``, so correcting a misplaced rule
+        is an ``add`` at the right position followed by a ``remove`` of the
+        old row -- in that order, so the window has two identical DROPs
+        rather than none. Duplicated drops are harmless; a gap is a site
+        briefly unblocked, and this is a control that must fail closed.
+
+        Only rows carrying this platform's own enforcement comment are ever
+        added, moved or removed. No other rule in the chain is written,
+        reordered, or read for permission. When ``forward`` has no
+        ``accept`` at all there is nothing to sit above, so the rule is
+        appended, which is where it already belongs.
+
+        Still not claimed: that a marked packet reaches this chain at all on
+        an arbitrary router. That is the ordered-band question §5.2 exists
+        for, and it stays the firewall domain's to answer."""
+        menu = api.path("ip", "firewall", "filter")
+        forward = [
+            row for row in menu if str(row.get("chain", "")) == "forward"
+        ]
+
+        ours = [
+            row
+            for row in forward
+            if row.get("comment") == _CONTENT_FILTER_ENFORCEMENT_COMMENT
+        ]
+        anchor_index = next(
+            (
+                index
+                for index, row in enumerate(forward)
+                if str(row.get("action", "")) == "accept"
+            ),
+            None,
         )
-        if not already_present:
-            api.path("ip", "firewall", "filter").add(
-                chain="forward",
-                **{"dst-address-list": _CONTENT_FILTER_ADDRESS_LIST_NAME},
-                action="drop",
-                comment=_CONTENT_FILTER_ENFORCEMENT_COMMENT,
-            )
+        anchor_id = forward[anchor_index][".id"] if anchor_index is not None else None
+
+        if ours:
+            first_index = forward.index(ours[0])
+            correctly_placed = anchor_index is None or first_index < anchor_index
+            # More than one is not a state this method can produce, but a
+            # half-finished reposition (or an older build) can leave one.
+            extras = ours[1:]
+            if correctly_placed and not extras:
+                return
+            if correctly_placed:
+                for row in extras:
+                    menu.remove(row[".id"])
+                return
+
+        self._add_content_filter_enforcement_rule(menu, anchor_id)
+        # Add first, remove second: the chain is never left without a DROP.
+        for row in ours:
+            menu.remove(row[".id"])
+
+    @staticmethod
+    def _add_content_filter_enforcement_rule(menu, anchor_id: str | None) -> None:  # noqa: ANN001
+        """The DROP itself, before ``anchor_id`` when there is one.
+
+        ``place-before`` takes a ``.id`` (T1), so this passes the anchor
+        row's own id rather than an index -- an index would go stale the
+        moment the hotspot adds or removes one of its dynamic rules, which
+        is the failure the ordering scheme exists to avoid.
+        """
+        fields = {
+            "chain": "forward",
+            "dst-address-list": _CONTENT_FILTER_ADDRESS_LIST_NAME,
+            "action": "drop",
+            "comment": _CONTENT_FILTER_ENFORCEMENT_COMMENT,
+        }
+        if anchor_id is not None:
+            fields["place-before"] = anchor_id
+        menu.add(**fields)
 
     # ------------------------------------------------------------------
     # QoS: the packet-mark half

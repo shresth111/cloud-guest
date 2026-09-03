@@ -1107,6 +1107,52 @@ per-`.id` removal, never a broad `find`.
 | **T10** | Does `[:pick [... get $id comment] 0 18]` behave when `comment` is unset? | §4.5's prefix sweep runs over **every** `ip-binding` row, including operator rows with no comment. A script error there aborts the pass and leaves stale bindings. | Create a binding with no comment. Run the pass-2 loop by hand. Check `/log print` for a script error, and that the uncommented binding survives. |
 | **T11** | Does `server=all` vs `server=hotspot1` differ in effect on a single-hotspot router? | Decides whether §4.4 needs the `server=` refinement now or later. | Bypass a MAC with each, confirm the client skips the portal both times, and diff `/ip hotspot ip-binding print detail`. |
 
+#### Results so far — T1 and T2, run 2026-09-03
+
+Run against the lab hEX lite (`rcjgfc`, 10.20.0.14), RouterOS 7.23.3, over
+`librouteros` on 8728 from the API container. Probes are kept in
+`backend/ops/probes/` so both are re-runnable rather than described.
+
+| # | Result | What it means |
+|---|---|---|
+| **T1** | **PASS** | `Path.add()` accepts `place-before` and it takes a **`.id`**, not an ordinal. `a`, `b`, then `c` with `place-before=<b .id>` printed as `a, c, b`. §5.2.3 step 5 is buildable as written; the `add`-then-`move` fallback is not needed. |
+| **T2** | **PASS** | A static rule **can** sit above hotspot's dynamic `forward` rules. Placed before the first dynamic row, it landed at index 0, above both `jump`s. The band is not forced below the hotspot chains. |
+
+Both probes write only `action=passthrough` rules commented `cg-test-*`,
+remove them in a `finally`, refuse to run if any `cg-test-` row is already
+present, and never touch a rule that is not their own. Both reported
+`cleanup leftover: none`.
+
+**The `forward` chain as actually read, which §5.2.2 said it would not guess
+at.** This is the lab router; it is *not* the "27 rules" that section
+imagines, and placement on any other router still has to be read first:
+
+```
+ 0 D jump   -> hs-unauth      hotspot=from-client,!auth
+ 1 D jump   -> hs-unauth-to   hotspot=to-client,!auth
+ 2   drop   cloudguest-block-dot-udp      hotspot=!auth udp/853
+ 3   drop   cloudguest-block-dot-tcp      hotspot=!auth tcp/853
+ 4   drop   cloudguest-block-doh          hotspot=!auth tcp/443 dst-list=cloudguest-doh-ips
+ 5   accept cloudguest-fw-fwd-established connection-state=established,related
+ 6   drop   cloudguest-fw-fwd-drop-invalid connection-state=invalid
+```
+
+Two things follow that were previously assumed rather than known. **Both
+hotspot jumps are gated `!auth`**, so authenticated guest traffic does not
+enter them and falls through to the static rules — there is no broad accept
+above for logged-in guests, and `hs-unauth` itself only `return`s or
+`reject`s, never accepts. And **the only `accept` in the chain is
+`connection-state=established,related`**, so a DROP appended at the bottom
+bites on new connections but lets an already-open flow continue.
+
+`_ensure_content_filter_enforcement_rule` now places its DROP immediately
+before that first `accept`, and re-checks the position on every push instead
+of only at creation. See its own docstring for why that is safe for this
+specific rule and would not be for a general access rule.
+
+**T3–T11 remain unrun.** T3, T4, T7 and T8 all need a real client behind
+`ether2` generating traffic; they cannot be answered from the platform.
+
 **Version coverage.** Run T1, T2, T5, T6 on a RouterOS 6.x router as well as
 7.23.3 before the fleet push. `/ip hotspot ip-binding`, `/ip hotspot active` and
 `/ip firewall filter` exist with the same parameter names in both, and v7 keeps
