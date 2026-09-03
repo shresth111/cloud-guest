@@ -29,4 +29,35 @@ class PortForwardingProtocol(StrEnum):
     BOTH = "both"
 
 
-__all__ = ["MIN_PORT", "MAX_PORT", "PortForwardingProtocol"]
+class PortForwardingDevicePushStatus(StrEnum):
+    """Lifecycle of a :class:`~.models.PortForwardingRule`'s own device
+    push.
+
+    Distinct from ``is_enabled``, which is intent ("this rule should
+    forward"), and independent of ``network_config``'s ``ConfigVersion``
+    status -- that pipeline renders a script and ships it over SSH on port
+    22, which is filtered on the fleet; this is a direct RouterOS-API push
+    on 8728. A rule can be enabled, rendered into a config version, and
+    still never have reached a device.
+
+    * ``PENDING`` -- created, never pushed. The state every pre-existing
+      row is backfilled to, truthfully: until now no code path could push
+      one.
+    * ``ACTIVE`` -- a real ``/ip firewall nat`` DSTNAT rule for this row
+      exists on the router (two of them, for a ``BOTH`` rule -- see
+      ``mikrotik_adapter.configure_port_forward``).
+    * ``FAILED`` -- the last push attempt raised; ``device_push_error``
+      holds the device's own words.
+    """
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    FAILED = "failed"
+
+
+__all__ = [
+    "MIN_PORT",
+    "MAX_PORT",
+    "PortForwardingProtocol",
+    "PortForwardingDevicePushStatus",
+]

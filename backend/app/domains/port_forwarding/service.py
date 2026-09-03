@@ -8,14 +8,24 @@ This module never resolves a router itself. ``RouterLookupProtocol``
 is the identical narrow, duck-typed Protocol composition-over-duplication
 pattern every domain in this codebase establishes.
 
-## No live device push in this pass
+## Live device push
 
-Unlike ``app.domains.isp``, this domain has no ``device_adapters.py`` and
-no Celery task -- it is a pure rules/inventory domain, mirroring
-``app.domains.dhcp``/``app.domains.vlan``'s own "config resource, realized
-onto a device later" precedent. Real RouterOS ``/ip firewall nat`` DSTNAT
-provisioning belongs to the not-yet-built Network Configuration
-Management domain's own provisioning-integration layer, not this one.
+``push_rule_to_device`` realizes a rule on its router over the RouterOS
+API, through ``device_adapters``. This paragraph previously said the
+opposite -- "a pure rules/inventory domain, no ``device_adapters.py`` and
+no Celery task" -- and deferred real ``/ip firewall nat`` DSTNAT
+provisioning to a "not-yet-built Network Configuration Management domain".
+That deferral is what made publishing a port a database-only operation:
+the dashboard listed the forward, the router had none, and the service
+behind it -- a camera, a PMS terminal, an office NAS -- answered nothing
+from outside, with no failure anywhere to point at.
+
+The gateway writer already existed
+(``wyfy_device_gateway.mikrotik_adapter.configure_port_forward``, the real
+``/ip firewall nat add chain=dstnat ... action=dst-nat`` over librouteros
+on 8728) with no callers. Creation still writes only a row, deliberately:
+renaming a rule must not be able to fail with a connection error, and an
+operator must be able to retry a push without re-submitting the form.
 
 ## Validation and conflict detection
 
@@ -37,20 +47,25 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.models import Router
 
-from .constants import PortForwardingProtocol
+from .constants import PortForwardingDevicePushStatus, PortForwardingProtocol
+from .device_adapters import PortForwardingCredentials, get_port_forwarding_adapter
 from .events import (
     PortForwardingRuleCreated,
     PortForwardingRuleDeleted,
+    PortForwardingRulePushed,
     PortForwardingRuleUpdated,
 )
 from .exceptions import (
     CrossOrganizationPortForwardingRuleAccessError,
     PortForwardingConflictError,
+    PortForwardingMissingCredentialsError,
+    PortForwardingRuleNotEnabledError,
     PortForwardingRuleNotFoundError,
 )
 from .models import PortForwardingRule
@@ -86,6 +101,12 @@ class RouterLookupProtocol(Protocol):
         requesting_organization_id: uuid.UUID | None = None,
         include_deleted: bool = False,
     ) -> Router: ...
+
+    # Declared because the device-push path really calls it. Leaving it out
+    # would let this Protocol under-describe what the service requires: a
+    # collaborator could satisfy the annotation and still blow up at
+    # runtime, with no type checker able to see it coming.
+    def get_decrypted_api_secret(self, router: Router) -> str | None: ...
 
 
 class AuditLogWriter(Protocol):
@@ -147,6 +168,12 @@ class PortForwardingService:
             internal_port=internal_port,
             description=description,
             is_enabled=is_enabled,
+            # Written explicitly rather than left to the column default,
+            # which only applies at INSERT: a freshly constructed row would
+            # otherwise carry None until it round-trips through the
+            # database, and "has this reached a device" must never read as
+            # unknown.
+            device_push_status=PortForwardingDevicePushStatus.PENDING.value,
             created_by=actor_user_id,
         )
         event = PortForwardingRuleCreated(id=rule.id, router_id=router.id)
@@ -268,8 +295,30 @@ class PortForwardingService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> PortForwardingRule:
+        """Removes the rule from its router, then soft-deletes the row.
+
+        Deleting used to soft-delete the row and nothing else, so a DSTNAT
+        rule this platform had created went on forwarding a public port
+        into the customer's LAN after the operator deleted it -- the one
+        piece of drift in this codebase that is an exposure rather than
+        just an inconsistency, and invisible from the dashboard precisely
+        because the row it came from is gone.
+
+        **The device comes first, and a device failure aborts the delete.**
+        Removing the row while the forward is still live is exactly the
+        drift this closes. Failing loudly leaves both sides consistent and
+        the delete retryable.
+
+        The trade-off is real: a rule on a permanently unreachable router
+        cannot be deleted through this path. That is the safer side to err
+        on -- an undeletable row is visible, an orphaned live port forward
+        is not.
+        """
         rule = await self.get_rule(
             rule_id, requesting_organization_id=requesting_organization_id
+        )
+        await self._remove_from_device(
+            rule, requesting_organization_id=requesting_organization_id
         )
         deleted = await self.repository.soft_delete_rule(rule)
         event = PortForwardingRuleDeleted(id=deleted.id, router_id=deleted.router_id)
@@ -282,6 +331,146 @@ class PortForwardingService:
             description=f"Port forwarding rule '{deleted.name}' deleted",
         )
         return deleted
+
+    async def push_rule_to_device(
+        self,
+        rule_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> PortForwardingRule:
+        """Realizes one port-forwarding rule on its own router, over the
+        RouterOS API.
+
+        Until this existed, ``create_rule`` wrote a row, returned 201, and
+        the device was never contacted -- this module's own docstring said
+        so and called it deliberate. The visible consequence was a service
+        the dashboard listed as published on a port that answered nothing
+        from outside.
+
+        **Separate from create/update, deliberately.** Renaming a rule must
+        not be able to fail with a connection error, and an operator must be
+        able to retry a push without re-submitting the form.
+
+        **Every precondition is checked before a socket is opened**, so a
+        misconfigured row fails as a 4xx naming the problem rather than as a
+        device timeout.
+
+        **A failure is committed, then re-raised.**
+        ``GenericRepository.update`` only ``flush()``es and
+        ``get_db_session`` rolls back on any exception, so a failure record
+        written just before a re-raise is otherwise discarded and the row
+        still reads ``pending`` with ``device_push_error`` NULL. Committing
+        explicitly is what makes the record survive to be read.
+
+        The exception then propagates as a real non-2xx. It must not become
+        a ``200 {"success": false}``: the frontend interceptor unwraps
+        ``data`` and never reads ``success``, so such a response is
+        indistinguishable from success to every caller in the app.
+        """
+        rule = await self.get_rule(
+            rule_id, requesting_organization_id=requesting_organization_id
+        )
+
+        if not rule.is_enabled:
+            # A disabled rule is intent to *not* forward. Pushing one opens
+            # a live inbound path through the WAN for a row the operator
+            # switched off -- the failure mode here is an exposure, not
+            # drift, so it is refused rather than silently skipped.
+            raise PortForwardingRuleNotEnabledError(rule.id)
+
+        router = await self.router_lookup.get_router(
+            rule.router_id, requesting_organization_id=requesting_organization_id
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_port_forwarding_adapter(router.vendor)
+
+        try:
+            await adapter.configure_port_forward(
+                credentials,
+                rule_id=str(rule.id),
+                protocol=rule.protocol,
+                external_port=rule.destination_port,
+                internal_ip=rule.internal_address,
+                internal_port=rule.internal_port,
+                destination_address=rule.destination_address,
+                source_address=rule.source_address,
+            )
+        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
+            await self.repository.update_rule(
+                rule,
+                {
+                    "device_push_status": (
+                        PortForwardingDevicePushStatus.FAILED.value
+                    ),
+                    "device_push_error": str(exc),
+                },
+            )
+            await self.repository.commit()
+            raise
+
+        updated = await self.repository.update_rule(
+            rule,
+            {
+                "device_push_status": PortForwardingDevicePushStatus.ACTIVE.value,
+                "device_push_error": None,
+                "device_pushed_at": datetime.now(UTC),
+                "updated_by": actor_user_id,
+            },
+        )
+        event = PortForwardingRulePushed(
+            id=updated.id,
+            router_id=updated.router_id,
+            destination_port=updated.destination_port,
+        )
+        logger.info("port_forwarding_rule_pushed", extra=_event_extra(event))
+        await self._audit(
+            actor_user_id,
+            AuditAction.PORT_FORWARDING_RULE_PUSHED,
+            entity_id=updated.id,
+            organization_id=updated.organization_id,
+            description=(
+                f"Port forwarding rule {updated.id} pushed to router "
+                f"{updated.router_id}"
+            ),
+        )
+        return updated
+
+    async def _remove_from_device(
+        self,
+        rule: PortForwardingRule,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> None:
+        """Tears the rule off its router, when there is anything there.
+
+        Skipped entirely unless ``device_push_status`` is ``ACTIVE``: a row
+        that was never pushed, or whose last push failed, has nothing on the
+        device, and opening a connection to delete nothing would make every
+        such delete fail whenever a router happened to be unreachable.
+        """
+        if rule.device_push_status != PortForwardingDevicePushStatus.ACTIVE.value:
+            return
+        router = await self.router_lookup.get_router(
+            rule.router_id, requesting_organization_id=requesting_organization_id
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_port_forwarding_adapter(router.vendor)
+        # Only the id: the rule is found on the device by its identity, so a
+        # rule left from an earlier port or internal host is removed too.
+        await adapter.delete_port_forward(credentials, rule_id=str(rule.id))
+
+    def _resolve_device_credentials(
+        self, router: Router
+    ) -> PortForwardingCredentials:
+        """Raise rather than guess -- mirrors ``dhcp``/``vlan``/``qos``."""
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.router_lookup.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            raise PortForwardingMissingCredentialsError(router.id)
+        return PortForwardingCredentials(
+            host=host, username=router.api_username, password=secret
+        )
 
     async def _check_conflict(
         self,

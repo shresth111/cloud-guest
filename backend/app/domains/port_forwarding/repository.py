@@ -36,6 +36,8 @@ class PortForwardingRepositoryProtocol(Protocol):
         self, rule: PortForwardingRule
     ) -> PortForwardingRule: ...
 
+    async def commit(self) -> None: ...
+
     async def list_rules(
         self,
         *,
@@ -75,6 +77,19 @@ class PortForwardingRepository:
 
     async def soft_delete_rule(self, rule: PortForwardingRule) -> PortForwardingRule:
         return await self.rules.soft_delete(rule)
+
+    async def commit(self) -> None:
+        """Commits the current transaction.
+
+        Needed by ``PortForwardingService.push_rule_to_device`` and nothing
+        else. ``GenericRepository.update`` only ``flush()``es, and
+        ``get_db_session`` rolls the session back on any exception -- so a
+        failure record written just before a re-raise is discarded, and the
+        row still reads ``pending`` after a real device failure with
+        ``device_push_error`` NULL. Committing explicitly before raising is
+        what makes the record survive to be read.
+        """
+        await self.session.commit()
 
     async def list_rules(
         self,

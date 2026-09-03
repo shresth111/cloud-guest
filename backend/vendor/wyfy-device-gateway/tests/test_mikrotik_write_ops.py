@@ -13,6 +13,7 @@ from wyfy_device_gateway.contract import (
     ContentFilterRuleConfig,
     DhcpPoolConfig,
     NatRuleConfig,
+    PortForwardConfig,
     VlanConfig,
     VlanHotspotConfig,
 )
@@ -1632,3 +1633,391 @@ async def test_a_device_error_is_wrapped_and_names_the_operation(
         await MikroTikAdapter().configure_content_filter_rule(
             mikrotik_creds, rule=_domain_rule()
         )
+
+
+# ============================================================================
+# Port forwarding. Same comment-as-identity design as the masquerade rule
+# above, and for the same reason: every RouterOS field on a DSTNAT rule is
+# one a customer edits, so the row id is the only stable handle. A re-push
+# has to find what it wrote last time, not add a second rule beside it.
+# ============================================================================
+
+
+_PF_ID = "9f1c2f2e-0d3a-4c5b-8e7f-1a2b3c4d5e6f"
+
+
+def _forward(
+    *,
+    rule_id: str = _PF_ID,
+    protocol: str = "tcp",
+    external_port: int = 8080,
+    internal_ip: str = "192.168.1.10",
+    internal_port: int = 80,
+    dst_address: str | None = None,
+    src_address: str | None = None,
+) -> PortForwardConfig:
+    return PortForwardConfig(
+        rule_id=rule_id,
+        protocol=protocol,
+        external_port=external_port,
+        internal_ip=internal_ip,
+        internal_port=internal_port,
+        dst_address=dst_address,
+        src_address=src_address,
+    )
+
+
+def _nat_rows(api) -> list[dict[str, object]]:
+    return list(api.path("ip", "firewall", "nat"))
+
+
+@pytest.mark.asyncio
+async def test_port_forward_is_built_from_the_customers_own_values(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_port_forward(
+        mikrotik_creds,
+        rule=_forward(dst_address="203.0.113.9", src_address="198.51.100.0/24"),
+    )
+
+    assert api.add_calls == [
+        (
+            ("ip", "firewall", "nat"),
+            {
+                "chain": "dstnat",
+                "action": "dst-nat",
+                "protocol": "tcp",
+                "dst-port": "8080",
+                "to-addresses": "192.168.1.10",
+                "to-ports": "80",
+                "dst-address": "203.0.113.9",
+                "src-address": "198.51.100.0/24",
+                "comment": f"WyfyGuest PF {_PF_ID} tcp",
+                "disabled": "no",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unset_matchers_are_omitted_rather_than_sent_blank(
+    patch_connect, mikrotik_creds
+):
+    """"Any source" is the absence of a src-address, not an empty one -- an
+    add naming a field with no value is a different request."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_port_forward(mikrotik_creds, rule=_forward())
+
+    fields = api.add_calls[0][1]
+    assert "src-address" not in fields
+    assert "dst-address" not in fields
+
+
+@pytest.mark.asyncio
+async def test_re_pushing_an_unchanged_rule_is_a_clean_no_op(
+    patch_connect, mikrotik_creds
+):
+    """The whole point of the comment identity. This used to be an
+    unconditional add, so the second push died on "already have such item"
+    -- and re-pushing is an ordinary operation, not a recovery step."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+    after_first = list(api.add_calls)
+
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+
+    assert api.add_calls == after_first
+    # No update either: ``disabled`` reads back as a real bool, and
+    # string-comparing it is how an idempotent write issues an update on
+    # every single push.
+    assert api.update_calls == []
+    assert len(_nat_rows(api)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_boolean_read_back_does_not_provoke_an_update(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS accepts "no" on write and answers reads with ``False``."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "firewall", "nat"): [
+                {
+                    ".id": "*1",
+                    "chain": "dstnat",
+                    "action": "dst-nat",
+                    "protocol": "tcp",
+                    "dst-port": "8080",
+                    "to-addresses": "192.168.1.10",
+                    "to-ports": "80",
+                    "disabled": False,
+                    "comment": f"WyfyGuest PF {_PF_ID} tcp",
+                }
+            ]
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_port_forward(mikrotik_creds, rule=_forward())
+
+    assert api.update_calls == []
+    assert api.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_rule_someone_disabled_by_hand_is_re_enabled(
+    patch_connect, mikrotik_creds
+):
+    """A disabled rule forwards nothing, and a re-push is the operator
+    asking for it back."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+    _nat_rows(api)[0]["disabled"] = True
+
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+
+    assert api.update_calls[-1][1]["disabled"] == "no"
+    assert len(_nat_rows(api)) == 1
+
+
+@pytest.mark.asyncio
+async def test_moving_the_internal_host_updates_the_rule_instead_of_adding_one(
+    patch_connect, mikrotik_creds
+):
+    """Keyed on to-addresses instead, this push would match nothing, add a
+    second rule, and leave the first forwarding a live public port at a
+    host that has moved."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+
+    await adapter.configure_port_forward(
+        mikrotik_creds, rule=_forward(internal_ip="192.168.1.55", internal_port=8000)
+    )
+
+    rows = _nat_rows(api)
+    assert len(rows) == 1
+    assert rows[0]["to-addresses"] == "192.168.1.55"
+    assert rows[0]["to-ports"] == "8000"
+    assert len(api.add_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_moving_the_published_port_updates_the_same_rule(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+
+    await adapter.configure_port_forward(
+        mikrotik_creds, rule=_forward(external_port=9090)
+    )
+
+    rows = _nat_rows(api)
+    assert len(rows) == 1
+    assert rows[0]["dst-port"] == "9090"
+
+
+@pytest.mark.asyncio
+async def test_clearing_a_source_restriction_really_clears_it(
+    patch_connect, mikrotik_creds
+):
+    """Left in place, the rule keeps forwarding only for a network the
+    operator has stopped restricting it to -- working-looking and wrong."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(
+        mikrotik_creds, rule=_forward(src_address="198.51.100.0/24")
+    )
+
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+
+    assert _nat_rows(api)[0]["src-address"] == ""
+
+
+@pytest.mark.asyncio
+async def test_a_both_protocol_rule_becomes_one_device_rule_per_transport(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS will not take dst-port without a tcp/udp protocol, and
+    "both" is this domain's own default -- so it is realized, not refused."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_port_forward(
+        mikrotik_creds, rule=_forward(protocol="both")
+    )
+
+    rows = _nat_rows(api)
+    assert sorted(str(row["protocol"]) for row in rows) == ["tcp", "udp"]
+    assert sorted(str(row["comment"]) for row in rows) == [
+        f"WyfyGuest PF {_PF_ID} tcp",
+        f"WyfyGuest PF {_PF_ID} udp",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_re_pushing_a_both_protocol_rule_is_also_a_no_op(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(
+        mikrotik_creds, rule=_forward(protocol="both")
+    )
+
+    await adapter.configure_port_forward(
+        mikrotik_creds, rule=_forward(protocol="both")
+    )
+
+    assert len(api.add_calls) == 2
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_narrowing_both_to_tcp_reaps_the_udp_rule(
+    patch_connect, mikrotik_creds
+):
+    """Left behind, the udp rule keeps forwarding a port the operator has
+    stopped publishing on it."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(
+        mikrotik_creds, rule=_forward(protocol="both")
+    )
+
+    await adapter.configure_port_forward(
+        mikrotik_creds, rule=_forward(protocol="tcp")
+    )
+
+    rows = _nat_rows(api)
+    assert [str(row["protocol"]) for row in rows] == ["tcp"]
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_the_rule(patch_connect, mikrotik_creds):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+
+    await adapter.delete_port_forward(mikrotik_creds, rule=_forward())
+
+    assert _nat_rows(api) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_finds_the_rule_by_id_not_by_its_current_values(
+    patch_connect, mikrotik_creds
+):
+    """A row left from an earlier port is still this rule's row. Matching on
+    what the row says now is how one gets orphaned -- still forwarding a
+    public port, with nothing in this platform pointing at it."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+
+    await adapter.delete_port_forward(
+        mikrotik_creds,
+        rule=_forward(external_port=1, internal_ip="10.0.0.9", internal_port=1),
+    )
+
+    assert _nat_rows(api) == []
+
+
+@pytest.mark.asyncio
+async def test_deleting_twice_is_a_no_op(patch_connect, mikrotik_creds):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+    await adapter.delete_port_forward(mikrotik_creds, rule=_forward())
+    removes_after_first = len(api.remove_calls)
+
+    await adapter.delete_port_forward(mikrotik_creds, rule=_forward())
+
+    assert len(api.remove_calls) == removes_after_first
+    assert _nat_rows(api) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_both_rules_of_a_both_protocol_rule(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(
+        mikrotik_creds, rule=_forward(protocol="both")
+    )
+
+    await adapter.delete_port_forward(mikrotik_creds, rule=_forward(protocol="both"))
+
+    assert _nat_rows(api) == []
+
+
+@pytest.mark.asyncio
+async def test_another_rule_and_an_unrelated_masquerade_are_left_alone(
+    patch_connect, mikrotik_creds
+):
+    """The comment scopes every write to one row. A second customer rule and
+    the VLAN masquerade share the same ``/ip firewall nat`` menu."""
+    other_id = "11111111-2222-3333-4444-555555555555"
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "firewall", "nat"): [
+                {
+                    ".id": "*9",
+                    "chain": "srcnat",
+                    "action": "masquerade",
+                    "src-address": "10.100.0.0/24",
+                    "out-interface": "ether1",
+                    "comment": "WyfyGuest VLAN 100",
+                }
+            ]
+        }
+    )
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_port_forward(mikrotik_creds, rule=_forward())
+    await adapter.configure_port_forward(
+        mikrotik_creds, rule=_forward(rule_id=other_id, external_port=2222)
+    )
+
+    await adapter.delete_port_forward(mikrotik_creds, rule=_forward())
+
+    remaining = sorted(str(row.get("comment")) for row in _nat_rows(api))
+    assert remaining == [
+        f"WyfyGuest PF {other_id} tcp",
+        "WyfyGuest VLAN 100",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_router_that_refuses_the_write_raises(patch_connect, mikrotik_creds):
+    api = FakeRouterOSApi(missing_menus={("ip", "firewall", "nat")})
+    patch_connect(api)
+
+    with pytest.raises(MikroTikDeviceError) as excinfo:
+        await MikroTikAdapter().configure_port_forward(
+            mikrotik_creds, rule=_forward()
+        )
+
+    assert "configure_port_forward" in excinfo.value.detail

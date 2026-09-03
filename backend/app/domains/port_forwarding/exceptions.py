@@ -21,6 +21,11 @@ __all__ = [
     "InvalidPortError",
     "InvalidAddressError",
     "PortForwardingConflictError",
+    "PortForwardingRuleNotEnabledError",
+    "PortForwardingMissingCredentialsError",
+    "UnsupportedPortForwardingVendorError",
+    "PortForwardingDeviceConnectionError",
+    "PortForwardingDeviceOperationError",
 ]
 
 
@@ -89,4 +94,76 @@ class PortForwardingConflictError(PortForwardingError):
             f"Conflicts with existing port forwarding rule "
             f"'{conflicting_rule_id}' on router '{router_id}'",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+# ============================================================================
+# Device push -- preconditions checked before a socket is opened, so a
+# misconfigured row fails as a 4xx naming the problem rather than as a
+# device timeout. All subclass ``CloudGuestError``, so the app-wide handler
+# turns them into a real non-2xx: the frontend interceptor unwraps ``data``
+# and never reads ``success``, so a 200 carrying ``success: false`` would be
+# indistinguishable from a successful push to every caller in the app.
+# ============================================================================
+
+
+class PortForwardingRuleNotEnabledError(PortForwardingError):
+    """A disabled rule is intent to *not* forward. Pushing one would open a
+    live inbound path through the router's WAN for a row the operator has
+    switched off -- the one direction in this domain where doing the wrong
+    thing is an exposure, not just drift."""
+
+    def __init__(self, rule_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Port forwarding rule '{rule_id}' is disabled and cannot be "
+            "pushed to a device",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class PortForwardingMissingCredentialsError(PortForwardingError):
+    """The target router has no reachable host, API username, or decryptable
+    API secret -- raise rather than guess, mirroring ``dhcp``/``vlan``."""
+
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Router '{router_id}' has no usable API credentials for a port "
+            "forwarding push",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class UnsupportedPortForwardingVendorError(PortForwardingError):
+    """``Router.vendor`` is a free ``String(50)``, so a row carrying
+    ``"MikroTik"`` or ``"mikrotik_routeros"`` lands here and gets this
+    domain's typed 400 rather than an opaque error from inside the
+    gateway."""
+
+    def __init__(self, vendor: str) -> None:
+        super().__init__(
+            "No port forwarding device adapter is registered for vendor "
+            f"'{vendor}'",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class PortForwardingDeviceConnectionError(PortForwardingError):
+    """Could not reach the router at all -- a 502, not a 500: the failure is
+    upstream of this service, not inside it."""
+
+    def __init__(self, host: str, detail: str) -> None:
+        super().__init__(
+            f"Could not connect to router at {host}: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class PortForwardingDeviceOperationError(PortForwardingError):
+    """The router was reached and refused, or failed, the operation. Carries
+    the device's own words verbatim."""
+
+    def __init__(self, operation: str, detail: str) -> None:
+        super().__init__(
+            f"Router rejected {operation}: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
         )
