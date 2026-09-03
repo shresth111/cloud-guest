@@ -705,6 +705,11 @@ class LicenseService:
         audit_writer: AuditLogWriter | None = None,
         entitlement_cache: EntitlementCacheProtocol | None = None,
         white_label_reset: WhiteLabelResetProtocol | None = None,
+        # Optional, like every other collaborator here: without it a plan
+        # change updates the license and leaves the subscription pointing at
+        # the old plan, which is the (broken) pre-fix behaviour. See
+        # ``_sync_subscription_plan`` for what it is actually for.
+        subscription_repository: SubscriptionRepositoryProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.plan_repository = plan_repository
@@ -713,6 +718,7 @@ class LicenseService:
         self.audit_writer = audit_writer
         self.entitlement_cache = entitlement_cache
         self.white_label_reset = white_label_reset
+        self.subscription_repository = subscription_repository
 
     async def get_license(self, license_id: uuid.UUID) -> License:
         license_ = await self.repository.get_by_id(license_id)
@@ -1008,6 +1014,7 @@ class LicenseService:
             changed_by_user_id=actor_user_id,
             reason=reason,
         )
+        await self._sync_subscription_plan(updated.organization_id, new_plan)
         await self._sync_subscription_tier(updated.organization_id, new_plan.slug)
         await self._invalidate_entitlement_cache(updated.organization_id)
 
@@ -1097,6 +1104,76 @@ class LicenseService:
         if not plan.is_active:
             raise PlanInactiveError(plan_id)
         return plan
+
+    async def _sync_subscription_plan(
+        self, organization_id: uuid.UUID, new_plan: Plan
+    ) -> None:
+        """Repoints the organization's ``Subscription`` at the plan its
+        ``License`` was just changed to.
+
+        ## The bug this closes
+
+        ``_change_plan`` wrote ``License.plan_id`` and the organization's
+        denormalized ``subscription_tier`` label, and stopped there. The
+        ``Subscription`` row kept its original ``plan_id`` forever -- and
+        the renewal engine reads *that*, not the license:
+        ``RenewalService.process_renewal`` and
+        ``confirm_renewal_payment_succeeded`` both resolve their plan via
+        ``plan_repository.get_by_id(subscription.plan_id)``. So an
+        organization that upgraded went on being charged its old plan's
+        ``base_price``, at renewal after renewal, with a license that said
+        otherwise. A downgrade drifted the same way, in the customer's
+        disfavour.
+
+        ## ``billing_cycle`` moves with the plan, deliberately
+
+        ``_mark_renewed`` extends the period by
+        ``add_billing_cycle(now, subscription.billing_cycle)`` -- the
+        *subscription's* cycle, not the plan's -- and
+        ``list_due_for_renewal`` filters on it via
+        ``CYCLIC_BILLING_CYCLES``. Repointing ``plan_id`` alone would leave
+        a subscription upgraded from a monthly to a yearly plan charging
+        the yearly price every month, and one moved onto a ``NONE``-cycle
+        plan still being swept for renewal. Both columns describe the same
+        single fact -- what this subscription is on -- so both move
+        together.
+
+        Deliberately does **not** touch ``current_period_start``/
+        ``current_period_end``: the customer has paid for the current
+        period and it runs to its end. The new plan's price takes effect at
+        the next renewal, which is where any proration decision belongs and
+        is a separate question this method does not pretend to answer.
+
+        A no-op when no ``subscription_repository`` was wired in, or when
+        the organization has no subscription at all -- a license without a
+        subscription is a legitimate state (a manually assigned license
+        that never went through checkout), not an error.
+        """
+        if self.subscription_repository is None:
+            return
+        subscription = await self.subscription_repository.get_by_organization_id(
+            organization_id
+        )
+        if subscription is None:
+            return
+        if (
+            subscription.plan_id == new_plan.id
+            and subscription.billing_cycle == new_plan.billing_cycle
+        ):
+            return
+        await self.subscription_repository.update_subscription(
+            subscription,
+            {"plan_id": new_plan.id, "billing_cycle": new_plan.billing_cycle},
+        )
+        logger.info(
+            "billing_subscription_plan_synced_to_license",
+            extra={
+                "subscription_id": str(subscription.id),
+                "organization_id": str(organization_id),
+                "plan_id": str(new_plan.id),
+                "billing_cycle": new_plan.billing_cycle,
+            },
+        )
 
     async def _sync_subscription_tier(
         self, organization_id: uuid.UUID, plan_slug: str
