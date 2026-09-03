@@ -82,9 +82,49 @@ class ContentFilterCategory(StrEnum):
     CUSTOM = "custom"
 
 
+class ContentFilterDevicePushStatus(StrEnum):
+    """Lifecycle of a :class:`~.models.ContentFilterRule`'s own device push.
+
+    Distinct from ``is_enabled``, which is intent ("this site should be
+    blocked"), and independent of ``network_config``'s ``ConfigVersion``
+    status -- that pipeline renders a script and ships it over SSH on port
+    22, which is filtered on the fleet; this is a direct RouterOS-API push
+    on 8728. A rule can be enabled, rendered into a config version, and
+    still never have reached a device -- which was the state of every row
+    in this table before this domain had a push at all, and is exactly why
+    a customer could block a site, be shown that it was blocked, and reach
+    it from the guest network unchanged.
+
+    * ``PENDING`` -- created, never pushed. The state every pre-existing
+      row is backfilled to, truthfully: until now no code path could push
+      one.
+    * ``ACTIVE`` -- the real ``/ip dns static`` entries (a domain rule) or
+      ``/ip firewall address-list`` membership (an IP/CIDR rule) for this
+      row exist on the router. Stated exactly that narrowly on purpose:
+      it is a claim about objects this platform wrote and can read back,
+      not a claim that a packet was observed being dropped. Two known
+      limits sit behind it, both documented where they live rather than
+      hidden here -- a guest device that sets its own DNS resolver
+      bypasses a domain rule's sinkhole entirely (see this package's
+      ``__init__`` docstring), and an IP/CIDR rule's shared
+      ``/ip firewall filter`` DROP rule has an unmanaged position in the
+      ``forward`` chain, so a router carrying a broad accept ahead of it
+      forwards the traffic regardless (see
+      ``wyfy_device_gateway.mikrotik_adapter
+      ._ensure_content_filter_enforcement_rule``).
+    * ``FAILED`` -- the last push attempt raised; ``device_push_error``
+      holds the device's own words.
+    """
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    FAILED = "failed"
+
+
 __all__ = [
     "CONTENT_FILTER_SINKHOLE_ADDRESS",
     "CONTENT_FILTER_ADDRESS_LIST_NAME",
     "ContentFilterValueType",
     "ContentFilterCategory",
+    "ContentFilterDevicePushStatus",
 ]

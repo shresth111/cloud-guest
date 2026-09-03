@@ -442,16 +442,28 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # roles, and GrantLevel.FULL resolve to (CREATE, READ, MANAGE) for
     # admin roles that triage/resolve tickets -- see expand_grant_level.
     PermissionModule.SUPPORT_TICKETS: (_A.CREATE, _A.READ, _A.MANAGE),
-    # Content Filtering: a plain CRUD rules/inventory domain -- no
-    # EXECUTE, since this domain has no device-facing action of its own
-    # (real device push is composed via app.domains.network_config's own
-    # EXECUTE-gated push endpoint instead), mirroring QOS/DHCP/VLAN's
-    # identical shape.
+    # Content Filtering: CRUD on the rules plus EXECUTE, the same
+    # CRUD+EXECUTE+MANAGE shape as PermissionModule.DHCP/VLAN above.
+    # EXECUTE gates POST /content-filter-rules/{id}/push -- realizing a
+    # blocked site on a real router, which is a different privilege from
+    # editing the row that describes it. This comment previously said the
+    # opposite ("no EXECUTE, since this domain has no device-facing action
+    # of its own ... real device push is composed via network_config's own
+    # EXECUTE-gated push endpoint instead"); that composition never
+    # existed, which is how a customer came to be shown a site as blocked
+    # that no router had ever been told about.
+    #
+    # NOTE FOR DEPLOY: seeding is a manual entrypoint (see __main__ at the
+    # bottom of this module), not a startup hook. Shipping the push
+    # endpoint without re-running the seed gives every operator a 403 on
+    # it. expand_grant_level already folds EXECUTE into OPERATE and FULL,
+    # so no role table changes are needed.
     PermissionModule.CONTENT_FILTERING: (
         _A.CREATE,
         _A.READ,
         _A.UPDATE,
         _A.DELETE,
+        _A.EXECUTE,
         _A.MANAGE,
     ),
     # Quotations: CREATE covers the one-shot "generate the PDF + email it"
