@@ -18,21 +18,40 @@ for :meth:`QosService.push_rule_to_device`, mirroring
 RouterOS realizes QoS as two independent steps: (1) a mangle **mark**
 (``/ip firewall mangle ... action=mark-packet``), and (2) a
 ``/queue tree`` entry that **references** that mark to actually apply
-priority treatment -- a mark with nothing referencing it is inert.
+priority treatment. Either one without the other is inert.
 
-Step (1) was already real: ``app.domains.network_config.renderers
-.render_qos_traffic_rule`` renders it, pushed through that domain's own
-already-working ``ConfigVersion``/``ProvisioningJob`` pipeline
-(``POST /network-config/routers/{router_id}/push``). Step (2) had no
-code anywhere -- ``docs/qos/FLOW.md`` Section 2 documented this
-explicitly as a deliberate, unclosed gap. :meth:`push_rule_to_device`
-closes it: a real, direct device push (this domain's own new
-``device_adapters.py``, mirroring ``app.domains.queue_management``'s
-established device-push pattern) that creates/updates a ``/queue tree``
-entry referencing this exact rule's own packet-mark identifier
-(``app.domains.qos.identifiers.qos_packet_mark_identifier`` -- the single
-source of truth both this method and ``render_qos_traffic_rule`` derive
-from, so the two halves can never reference different marks).
+:meth:`push_rule_to_device` pushes **both**, in that order, through this
+domain's own ``device_adapters.py``. It did not always: it pushed only
+step (2), on the stated grounds that step (1) was "already real" through
+``app.domains.network_config.renderers.render_qos_traffic_rule`` and that
+domain's ``ConfigVersion``/``ProvisioningJob`` pipeline. That renderer is
+real, but the only endpoint that applies it
+(``POST /network-config/routers/{router_id}/push``) is not reachable from
+any customer surface and no scheduled job calls it -- see
+``docs/qa/NETWORK_FEATURES_AUDIT.md`` §4. So the shipped behaviour was: a
+customer clicks Apply, a real ``/queue tree`` entry appears on their
+router, it matches zero packets, the row reads ``active``, and the
+dashboard says "Applied to your router". Pushing half a mechanism and
+reporting success for it is a worse failure than pushing none, because
+the half that did land makes the claim look corroborated.
+
+Both objects derive their mark from one source of truth
+(``app.domains.qos.identifiers.qos_packet_mark_identifier``, which
+``render_qos_traffic_rule`` also uses), so the two halves can never
+reference different strings.
+
+**What is still unverified, and is not claimed anywhere in the UI.**
+``/ip firewall mangle`` is order-sensitive: this rule sets
+``passthrough=no``, so an earlier rule in ``prerouting`` matching the same
+packet pre-empts it. The push appends, exactly as
+``render_qos_traffic_rule``'s own ``add`` line always has, and introduces
+no ordering scheme of its own -- the ordered-write design (a sentinel band
+plus ``place-before``) lives in
+``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md`` §5.2 and is gated on
+device tests T1/T2 that have not been run. That, and whether RouterOS
+honours ``priority`` on a queue whose parent (``global``) has no ceiling
+(see ``constants.QOS_QUEUE_TREE_PARENT``), are the two open
+hardware questions for this feature.
 
 **Why a separate, explicit push endpoint, not auto-push on every
 create/update/delete.** Every other "config resource" domain in this
@@ -52,9 +71,17 @@ frontend push affordance would call.
 ``delete_rule`` is the one exception: deleting a rule that has already
 been pushed also removes its live device queue tree (see that method's
 own docstring) -- leaving a stale ``/queue tree`` entry referencing a
-mark that will never be set again (the mangle rule is gone/re-rendered
-without it) would be a real, silent device-side leak, not a "config
-resource, realized later" case like ordinary CRUD.
+mark that will never be set again would be a real, silent device-side
+leak, not a "config resource, realized later" case like ordinary CRUD.
+``delete_rule`` removes the mangle rule too, for the mirror-image reason:
+leaving it behind means the router goes on marking packets for a rule the
+customer deleted.
+
+``update_rule`` is the other exception, and a smaller one: it issues no
+device I/O, but an edit to a field the router actually carries demotes
+``device_push_status`` back to ``pending`` in the same write, so a row
+stops claiming ``active`` for values no device has. See
+``app.common.device_push``.
 """
 
 from __future__ import annotations
@@ -66,10 +93,11 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol
 
+from app.common.device_push import demote_device_push_on_edit
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.models import Router
 
-from .constants import QosDevicePushStatus
+from .constants import DEVICE_CARRIED_FIELDS, QosDevicePushStatus
 from .device_adapters import (
     BaseQosPriorityQueueAdapter,
     QosCredentials,
@@ -265,8 +293,21 @@ class QosService:
         if "priority" in fields:
             validate_priority(fields["priority"])
 
+        # An edit to a field the router actually carries invalidates what
+        # the router is holding, so the row stops claiming ``active`` in the
+        # same UPDATE that changes the values -- see
+        # ``app.common.device_push`` for the rule and ``constants
+        # .DEVICE_CARRIED_FIELDS`` for which of this domain's columns count
+        # (``name`` among them here: it is half the packet-mark identifier).
+        demotion = demote_device_push_on_edit(
+            rule,
+            fields,
+            device_carried_fields=DEVICE_CARRIED_FIELDS,
+            active_status=QosDevicePushStatus.ACTIVE.value,
+            pending_status=QosDevicePushStatus.PENDING.value,
+        )
         updated = await self.repository.update_rule(
-            rule, {**fields, "updated_by": actor_user_id}
+            rule, {**fields, **demotion, "updated_by": actor_user_id}
         )
         event = QosTrafficRuleUpdated(id=updated.id)
         logger.info("qos_traffic_rule_updated", extra=_event_extra(event))
@@ -305,15 +346,29 @@ class QosService:
         rule = await self.get_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
-        if rule.device_queue_id is not None:
+        # ``device_pushed_at`` as well as ``device_queue_id``, because the
+        # two halves can come apart: a push whose mangle write landed and
+        # whose queue write then failed has a real mangle rule and no queue
+        # id. Both predicates survive the ``pending`` demotion an edit
+        # applies (see ``app.common.device_push``), which is the point --
+        # a demoted row is one the device is still holding objects for.
+        if rule.device_queue_id is not None or rule.device_pushed_at is not None:
             router = await self.router_lookup.get_router(
                 rule.router_id, requesting_organization_id=requesting_organization_id
             )
             credentials = self._resolve_device_credentials(router)
             adapter = self._get_device_adapter(router.vendor)
-            await adapter.remove_priority_queue(
-                credentials, device_queue_id=rule.device_queue_id
-            )
+            if rule.device_queue_id is not None:
+                await adapter.remove_priority_queue(
+                    credentials, device_queue_id=rule.device_queue_id
+                )
+            # Both halves come off, in the reverse of the order the push
+            # put them on. Removing only the queue used to leave the router
+            # marking packets for a rule the customer had deleted, until
+            # somebody re-pushed a whole config script -- which, on the
+            # customer path, nobody ever does. The mangle removal is
+            # idempotent, so it is safe on a rule that never got one.
+            await adapter.remove_packet_mark(credentials, rule_id=str(rule.id))
             rule = await self.repository.update_rule(
                 rule,
                 {
@@ -348,11 +403,13 @@ class QosService:
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
     ) -> QosTrafficRule:
-        """Pushes (creates, or updates in place) a real ``/queue tree``
-        entry on this rule's own router, referencing this rule's own
-        packet-mark identifier -- the real fix this module exists for. See
-        module docstring's "Real device push" section for the full
-        before/after write-up.
+        """Puts both halves of this rule on its own router: the
+        ``/ip firewall mangle`` rule that sets its packet mark, then the
+        ``/queue tree`` entry that references that mark and applies the
+        priority. See the module docstring's "Real device push" section for
+        why pushing only the second one -- which is what this method used to
+        do -- was worse than pushing neither, and for the one ordering
+        question that remains unverified against hardware.
 
         **Create vs. update.** A rule with no ``device_queue_id`` yet gets
         a fresh ``create_priority_queue`` call. A rule that already has one
@@ -369,14 +426,25 @@ class QosService:
         shape (``packet-mark`` is set at creation) -- so the stale entry
         is removed and a fresh one created against the new identifier.
 
-        **Failure is recorded, then re-raised, never swallowed** -- mirrors
-        ``app.domains.queue_management.service.QueueManagementService
-        .apply_queue``'s identical try/except shape exactly: a connection
-        or RouterOS command failure updates ``device_push_status``/
-        ``device_push_error`` on the row (so a caller inspecting the rule
-        afterward sees the real failure, not silence) and then propagates
-        the real exception -- this method never returns a "success" result
-        for a push that did not actually happen."""
+        **A failure is recorded, committed, then re-raised.** The commit is
+        the whole point, and its absence was a real bug this docstring used
+        to deny: ``GenericRepository.update`` only ``flush()``es and
+        ``get_db_session`` rolls the session back on any exception, so the
+        failure record written here was discarded on the way out. After a
+        real device failure the row still read ``pending`` with
+        ``device_push_error`` NULL, and the dashboard's failure tooltip
+        could never fire. Worse, the rolled-back write took
+        ``device_queue_id`` with it, so a push that failed *after* the
+        queue was created left the platform with no pointer to a queue that
+        exists -- which is why the gateway's ``create_queue_tree`` now
+        keys on the queue's own deterministic name rather than trusting
+        that pointer. ``dhcp`` (``push_pool_to_device``) and ``vlan``
+        (``push_vlan_to_device``) had it right; this now matches them.
+
+        The exception then propagates as a real non-2xx. It must not become
+        a ``200 {"success": false}``: the frontend interceptor unwraps
+        ``data`` and never reads ``success``, so such a response is
+        indistinguishable from success to every caller in the app."""
         rule = await self.get_rule(
             rule_id, requesting_organization_id=requesting_organization_id
         )
@@ -391,6 +459,23 @@ class QosService:
         packet_mark = qos_packet_mark_identifier(rule)
 
         try:
+            # The mark before the queue that reads it: a /queue tree entry
+            # referencing a mark nothing sets is inert, so writing the
+            # queue first would leave the router in the exact state this
+            # method exists to stop -- half a mechanism -- for as long as
+            # the mangle write takes, or forever if it fails. Same
+            # dependency ordering vlan's push uses for interface-before-NAT.
+            await adapter.apply_packet_mark(
+                credentials,
+                rule_id=str(rule.id),
+                packet_mark=packet_mark,
+                label=rule.name,
+                priority=rule.priority,
+                protocol=rule.protocol,
+                port_range_start=rule.port_range_start,
+                port_range_end=rule.port_range_end,
+                dscp_value=rule.dscp_value,
+            )
             if (
                 rule.device_queue_id is not None
                 and rule.device_packet_mark == packet_mark
@@ -405,8 +490,8 @@ class QosService:
                 if rule.device_queue_id is not None:
                     # The identifier changed (a rename) since the last
                     # push -- the stale entry references a mark that no
-                    # longer exists once network_config next re-renders
-                    # this rule, so it must be removed, not left behind.
+                    # longer exists, since apply_packet_mark above just
+                    # rewrote this rule's mangle rule to set the new one.
                     # See this method's own docstring.
                     await adapter.remove_priority_queue(
                         credentials, device_queue_id=rule.device_queue_id
@@ -417,7 +502,7 @@ class QosService:
                     packet_mark=packet_mark,
                     priority=rule.priority,
                 )
-        except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised, see docstring
+        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
             await self.repository.update_rule(
                 rule,
                 {
@@ -425,6 +510,7 @@ class QosService:
                     "device_push_error": str(exc),
                 },
             )
+            await self.repository.commit()
             raise
 
         updated = await self.repository.update_rule(

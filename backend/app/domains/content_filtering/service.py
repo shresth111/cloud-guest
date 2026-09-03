@@ -75,10 +75,12 @@ import uuid
 from datetime import UTC, datetime
 from typing import Protocol
 
+from app.common.device_push import demote_device_push_on_edit
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.models import Router
 
 from .constants import (
+    DEVICE_CARRIED_FIELDS,
     ContentFilterCategory,
     ContentFilterDevicePushStatus,
     ContentFilterValueType,
@@ -286,8 +288,22 @@ class ContentFilterService:
                     )
             fields["value"] = normalized_value
 
+        # An edit to a field the router actually carries invalidates what
+        # the router is holding, so the row stops claiming ``active`` in the
+        # same UPDATE that changes the values -- see
+        # ``app.common.device_push`` for the rule and ``constants
+        # .DEVICE_CARRIED_FIELDS`` for which of this domain's columns count.
+        # Computed after ``value`` has been normalized above, so a re-submit
+        # that only differs in casing is correctly read as no change.
+        demotion = demote_device_push_on_edit(
+            rule,
+            fields,
+            device_carried_fields=DEVICE_CARRIED_FIELDS,
+            active_status=ContentFilterDevicePushStatus.ACTIVE.value,
+            pending_status=ContentFilterDevicePushStatus.PENDING.value,
+        )
         updated = await self.repository.update_rule(
-            rule, {**fields, "updated_by": actor_user_id}
+            rule, {**fields, **demotion, "updated_by": actor_user_id}
         )
         event = ContentFilterRuleUpdated(id=updated.id)
         logger.info("content_filter_rule_updated", extra=_event_extra(event))
@@ -451,11 +467,19 @@ class ContentFilterService:
     ) -> None:
         """Tears the rule off its router, when there is anything there.
 
-        Skipped entirely unless ``device_push_status`` is ``ACTIVE``: a row
-        that was never pushed, or whose last push failed, has nothing on
-        the device, and opening a connection to delete nothing would make
-        every such delete fail whenever a router happened to be
-        unreachable.
+        Skipped entirely unless this row has actually been pushed at some
+        point (``device_pushed_at`` is set): a row that was never pushed,
+        or whose first push failed, has nothing on the device, and opening
+        a connection to delete nothing would make every such delete fail
+        whenever a router happened to be unreachable.
+
+        Keyed on ``device_pushed_at``, not on ``device_push_status ==
+        ACTIVE``, and the difference is load-bearing: an edit to a
+        device-carried field demotes a live row to ``pending`` (see
+        ``app.common.device_push``) precisely *because* the device is still
+        holding the previous values. Reading ``pending`` as "nothing to
+        remove" would orphan exactly the objects the demotion exists to
+        flag.
 
         Only the rule's id is passed on. The current ``value``/
         ``value_type`` are deliberately not consulted: a customer who
@@ -463,7 +487,7 @@ class ContentFilterService:
         matching the *old* value, and matching on the new one is exactly
         how they would be orphaned instead of removed.
         """
-        if rule.device_push_status != ContentFilterDevicePushStatus.ACTIVE.value:
+        if rule.device_pushed_at is None:
             return
         router = await self.router_lookup.get_router(
             rule.router_id, requesting_organization_id=requesting_organization_id

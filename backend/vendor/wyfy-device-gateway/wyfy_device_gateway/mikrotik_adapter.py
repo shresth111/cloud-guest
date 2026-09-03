@@ -86,6 +86,7 @@ from .contract import (
     PingResult,
     PortForwardConfig,
     ProvisionResult,
+    QosPacketMarkConfig,
     QueueDeviceStatus,
     RadiusClientConfig,
     RawCommandResult,
@@ -140,6 +141,18 @@ _CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX = " (subdomains)"
 # an operator edits, so keying on it would leave the old rule behind and add
 # a second one. See ``configure_nat_masquerade``'s own docstring.
 _NAT_RULE_COMMENT_PREFIX = "WyfyGuest VLAN "
+# QoS: the same marker trick again, for the ``/ip firewall mangle`` rule
+# that sets one QoS rule's packet mark. Every RouterOS field on that rule --
+# ``protocol``, ``dst-port``, ``dscp``, even ``new-packet-mark`` itself,
+# which is derived from the customer's own rule name -- is something an
+# edit changes, so the row id is the only stable handle. See
+# ``configure_qos_packet_mark``'s own docstring.
+_QOS_MANGLE_COMMENT_PREFIX = "WyfyGuest qos "
+# The mangle fields that carry a QoS rule's *match*. Listed so a rule
+# re-typed between a port-range match and a DSCP one can be detected: the
+# fields the old match used are still on the device row and are not in the
+# new desired set, and RouterOS's update has no way to unset them.
+_QOS_MANGLE_MATCH_FIELDS = ("protocol", "dst-port", "dscp")
 
 
 def _nat_rule_comment(vlan_id: int) -> str:
@@ -187,6 +200,54 @@ def _owns_port_forward_comment(comment: object, rule_id: str) -> bool:
         return False
     owner = f"{_PORT_FORWARD_COMMENT_PREFIX}{rule_id}"
     return comment == owner or comment.startswith(f"{owner} ")
+def _qos_marker(rule_id: str) -> str:
+    """The identity half of a QoS mangle rule's comment.
+
+    Ends in ``": "`` for the reason :func:`_content_filter_marker` does:
+    the customer's own label follows in the same field, and the marker of
+    one rule must never be a prefix of another's.
+    """
+    return f"{_QOS_MANGLE_COMMENT_PREFIX}{rule_id}: "
+
+
+def _qos_comment(rule_id: str, label: str, priority: int) -> str:
+    """The whole comment: identity first, then what an operator reading
+    ``/ip firewall mangle`` on the router needs to recognize the rule --
+    the customer's name for it and the priority the paired queue applies.
+
+    The priority is *not* configuration here; the ``/queue tree`` entry is
+    what actually sets it. It rides along in the comment because a mangle
+    rule read in isolation otherwise says nothing about what the mark is
+    worth, and ``network_config.renderers.render_qos_traffic_rule``'s own
+    rendered comment already carried it.
+    """
+    return f"{_qos_marker(rule_id)}{label} (priority={priority})"
+
+
+def _qos_mangle_fields(rule: QosPacketMarkConfig) -> dict[str, str]:
+    """The desired ``/ip firewall mangle`` row for one QoS rule.
+
+    Deliberately the same command shape
+    ``network_config.renderers.render_qos_traffic_rule`` already emits --
+    ``chain=prerouting``, the port-range or DSCP match, ``mark-packet``,
+    ``passthrough=no`` -- so a router that has had a config script pushed
+    and a router pushed directly through this method end up carrying the
+    same rule, not two competing ideas of one.
+    """
+    fields: dict[str, str] = {"chain": "prerouting"}
+    if rule.port_range_start is not None and rule.port_range_end is not None:
+        if rule.protocol:
+            fields["protocol"] = rule.protocol
+        fields["dst-port"] = f"{rule.port_range_start}-{rule.port_range_end}"
+    else:
+        fields["dscp"] = str(rule.dscp_value)
+    fields["action"] = "mark-packet"
+    fields["new-packet-mark"] = rule.packet_mark
+    fields["passthrough"] = "no"
+    fields["comment"] = _qos_comment(rule.rule_id, rule.label, rule.priority)
+    return fields
+
+
 def _content_filter_marker(rule_id: str, *, subdomains: bool = False) -> str:
     """The identity half of a content-filtering object's comment.
 
@@ -514,6 +575,52 @@ def _is_truthy(value: object) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "yes"}
+
+
+_RATE_SUFFIX_MULTIPLIERS = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
+
+
+def _rate_to_bps(value: object) -> int | None:
+    """RouterOS rate fields, read back honestly -- :func:`_is_truthy`'s
+    sibling for numbers.
+
+    ``max-limit=0k`` is what goes out on the wire and ``0`` is what comes
+    back; ``1000k`` goes out and ``1000000`` comes back. Comparing the raw
+    values as strings is how an idempotent write turns into an update
+    issued on every single push. Returns ``None`` for anything that is not
+    a rate, so a caller can fall back to comparing it some other way rather
+    than silently treating two unparseable values as equal.
+    """
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    multiplier = 1
+    if text[-1] in _RATE_SUFFIX_MULTIPLIERS:
+        multiplier = _RATE_SUFFIX_MULTIPLIERS[text[-1]]
+        text = text[:-1]
+    try:
+        return int(float(text) * multiplier)
+    except ValueError:
+        return None
+
+
+def _queue_tree_field_differs(field: str, current: object, desired: str) -> bool:
+    """Whether a ``/queue tree`` row's field really differs from what is
+    wanted, comparing each field in the shape RouterOS answers reads in
+    rather than as raw text. See :meth:`MikroTikAdapter.create_queue_tree`.
+    """
+    if field == "max-limit":
+        current_bps, desired_bps = _rate_to_bps(current), _rate_to_bps(desired)
+        if current_bps is not None and desired_bps is not None:
+            return current_bps != desired_bps
+    if field == "priority":
+        # RouterOS answers an integer field with an int on some firmware and
+        # a string on others; the write is always a string.
+        try:
+            return int(str(current)) != int(desired)
+        except (TypeError, ValueError):
+            pass
+    return str(current if current is not None else "") != desired
 
 
 def _smallest_enclosing_network(
@@ -2832,6 +2939,155 @@ class MikroTikAdapter:
             )
 
     # ------------------------------------------------------------------
+    # QoS: the packet-mark half
+    # ------------------------------------------------------------------
+
+    async def configure_qos_packet_mark(
+        self, creds: DeviceCredentials, *, rule: QosPacketMarkConfig
+    ) -> None:
+        """Realizes one QoS rule's ``/ip firewall mangle`` packet mark.
+
+        ## Why this exists
+
+        RouterOS realizes QoS as two independent objects, and this platform
+        only ever wrote one of them on any path a customer can reach.
+        :meth:`create_queue_tree` had a caller
+        (``app.domains.qos.service.QosService.push_rule_to_device``); the
+        mangle rule that *sets* the mark that queue references was rendered
+        only into a config script. That script's push endpoint
+        (``POST /network-config/routers/{router_id}/push``) *is*
+        customer-reachable -- the reason it did not rescue QoS is transport,
+        not routing: the script goes over SSH, and a port sweep run from the
+        platform against a fleet router reached only ``8728``, with ``22``
+        timing out alongside every other port tried, including one nothing
+        listens on. The result on a real router was a queue tree matching
+        zero packets, under a dashboard badge reading "Applied to your
+        router". A mark with no queue is inert; a queue with no mark is
+        equally inert, and harder to notice, because the object the
+        platform records an id for does exist.
+
+        ## The comment is the rule's identity
+
+        ``"WyfyGuest qos <rule_id>: <label> (priority=<n>)"``, found again
+        by the marker in front of the colon -- :meth:`configure_nat_masquerade`'s
+        reasoning, unchanged. Nothing else on this rule can serve as the
+        handle: ``protocol``/``dst-port``/``dscp`` *are* the classification
+        the customer edits, and ``new-packet-mark`` is derived from the
+        name they typed. Keyed on any of them, the push after an edit finds
+        nothing, adds a second mangle rule, and leaves the first one still
+        marking traffic for a classification nobody asked for -- silent,
+        cumulative, and invisible in this platform's own UI.
+
+        ## A re-typed rule is rewritten, not updated
+
+        A rule that switched between a port-range match and a DSCP match is
+        the one case where the fields to write are not the fields already
+        there: leaving ``dst-port`` set on a rule that now matches by DSCP
+        would keep matching the old ports. RouterOS has no "unset these
+        fields" in an update the way it has an ``add``, so the old rule
+        comes off before the new one goes on -- the same shape
+        :meth:`configure_content_filter_rule` uses for a rule re-typed
+        between a DNS sinkhole and an address list.
+
+        ``disabled`` is normalized through :func:`_is_truthy`, never by
+        string comparison, for the reason documented on
+        :meth:`_ensure_dhcp_server`.
+
+        ## Position in the chain: what this does NOT claim
+
+        This appends to ``/ip firewall mangle`` and takes no view on where
+        in the ``prerouting`` chain the rule lands, which is exactly what
+        ``network_config.renderers.render_qos_traffic_rule``'s own
+        ``/ip firewall mangle add`` has always done -- so a router pushed
+        through this method carries the same rule in the same place as one
+        pushed the script way, and no new ordering scheme is introduced
+        here. Mangle is order-sensitive in the same way filter rules are
+        (this rule sets ``passthrough=no``, so an earlier rule that matches
+        the same packet and also stops pre-empts it), and the ordered-write
+        design for that -- a sentinel band and ``place-before`` -- is
+        specified in ``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md``
+        §5.2 and explicitly gated on two device tests (T1, T2) that have not
+        been run. **Whether a marked packet actually reaches this rule on a
+        given router is therefore unverified against hardware**, and is
+        flagged here rather than assumed -- the same posture
+        ``app.domains.qos.constants.QOS_QUEUE_TREE_PARENT`` already takes
+        about ``parent=global``.
+
+        Idempotent: re-pushing an unchanged rule writes nothing and raises
+        nothing."""
+        await asyncio.to_thread(self._configure_qos_packet_mark_sync, creds, rule)
+
+    def _configure_qos_packet_mark_sync(
+        self, creds: DeviceCredentials, rule: QosPacketMarkConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                desired = _qos_mangle_fields(rule)
+                marker = _qos_marker(rule.rule_id)
+                menu = api.path("ip", "firewall", "mangle")
+                for row in list(menu):
+                    if not str(row.get("comment", "")).startswith(marker):
+                        continue
+                    if any(
+                        key not in desired and row.get(key) not in (None, "")
+                        for key in _QOS_MANGLE_MATCH_FIELDS
+                    ):
+                        # Re-typed between a port-range match and a DSCP
+                        # one -- see this method's own docstring.
+                        menu.remove(row[".id"])
+                        break
+                    changed = {
+                        key: value
+                        for key, value in desired.items()
+                        if str(row.get(key, "")) != value
+                    }
+                    if _is_truthy(row.get("disabled")):
+                        changed["disabled"] = "no"
+                    if changed:
+                        menu.update(**{".id": row[".id"], **changed})
+                    return
+                menu.add(**desired, disabled="no")
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_qos_packet_mark: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    async def delete_qos_packet_mark(
+        self, creds: DeviceCredentials, *, rule_id: str
+    ) -> None:
+        """Removes one QoS rule's mangle mark, by the marker the write path
+        stamped it with -- so a rule whose match was edited since its last
+        push is still found.
+
+        Without this, deleting a QoS rule removed its ``/queue tree`` entry
+        and left the router marking packets for a rule the customer had
+        deleted, until somebody re-pushed a whole config script. Idempotent:
+        removing what is already absent is a no-op."""
+        await asyncio.to_thread(self._delete_qos_packet_mark_sync, creds, rule_id)
+
+    def _delete_qos_packet_mark_sync(
+        self, creds: DeviceCredentials, rule_id: str
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                self._remove_where_prefixed(
+                    api,
+                    ("ip", "firewall", "mangle"),
+                    "comment",
+                    _qos_marker(rule_id),
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_qos_packet_mark: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    # ------------------------------------------------------------------
     # queue management (QoS/bandwidth shaping)
     # ------------------------------------------------------------------
     #
@@ -2978,6 +3234,42 @@ class MikroTikAdapter:
         priority: int = 8,
         queue_type_name: str | None = None,
     ) -> str:
+        """Creates the ``/queue tree`` entry, or brings the entry already
+        carrying ``name`` into line with these fields. Returns the
+        device-side queue id either way.
+
+        ## Why this reads before it writes
+
+        This used to be a bare ``add``. Its only protection against a
+        duplicate was the caller's own stored ``device_queue_id`` column,
+        and a caller that lost that pointer -- which
+        ``app.domains.qos.service`` did on every failed push, since the
+        failure record was rolled back rather than committed -- could never
+        push that rule again: RouterOS answers a duplicate ``add`` with
+        "already have such item", forever, with no way out through the
+        dashboard. Idempotency that lives only in the caller's database is
+        not idempotency; it is a pointer that can be lost. ``name`` is the
+        right key because that is what RouterOS itself treats as this row's
+        identity, and this domain's names are deterministic
+        (``cloudguest-qos-<rule id>``), never customer-typed.
+
+        ## And why it updates rather than skipping
+
+        ``priority`` and ``packet-mark`` are precisely what an edited rule
+        changes; skipping would report success and leave the old values, the
+        failure mode ``_ensure_ip_pool`` documents for address ranges.
+
+        ``max-limit`` is compared as a *rate*, not as a string:
+        ``"0k"`` goes out on the wire and ``0`` comes back, so a string
+        comparison would find a difference on every single push and issue a
+        pointless update forever -- the same trap :func:`_is_truthy` exists
+        for on booleans. ``disabled`` goes through :func:`_is_truthy` for
+        exactly that reason: an entry somebody disabled by hand is
+        prioritising nothing, and a re-push is the operator asking for it
+        again.
+
+        Idempotent: re-pushing an unchanged queue writes nothing and raises
+        nothing."""
         fields: dict[str, str] = {
             "name": name,
             "parent": parent,
@@ -2989,8 +3281,36 @@ class MikroTikAdapter:
         if queue_type_name is not None:
             fields["queue"] = queue_type_name
         return await asyncio.to_thread(
-            self._queue_add_sync, creds, ("queue", "tree"), fields, "create_queue_tree"
+            self._ensure_queue_tree_sync, creds, name, fields
         )
+
+    def _ensure_queue_tree_sync(
+        self, creds: DeviceCredentials, name: str, fields: dict[str, str]
+    ) -> str:
+        api = self._connect_api(creds)
+        try:
+            try:
+                menu = api.path("queue", "tree")
+                for row in menu:
+                    if row.get("name") != name:
+                        continue
+                    changed = {
+                        key: value
+                        for key, value in fields.items()
+                        if _queue_tree_field_differs(key, row.get(key), value)
+                    }
+                    if _is_truthy(row.get("disabled")):
+                        changed["disabled"] = "no"
+                    if changed:
+                        menu.update(**{".id": row[".id"], **changed})
+                    return str(row[".id"])
+                return menu.add(**fields, disabled="no")
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"create_queue_tree: {exc}"
+                ) from exc
+        finally:
+            api.close()
 
     async def apply_pcq(
         self,

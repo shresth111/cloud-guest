@@ -15,7 +15,11 @@ from enum import StrEnum
 # own default when a caller doesn't supply one.
 DEFAULT_LEASE_TIME_SECONDS = 86_400
 
-__all__ = ["DEFAULT_LEASE_TIME_SECONDS", "DhcpDevicePushStatus"]
+__all__ = [
+    "DEFAULT_LEASE_TIME_SECONDS",
+    "DhcpDevicePushStatus",
+    "DEVICE_CARRIED_FIELDS",
+]
 
 
 class DhcpDevicePushStatus(StrEnum):
@@ -40,3 +44,24 @@ class DhcpDevicePushStatus(StrEnum):
     PENDING = "pending"
     ACTIVE = "active"
     FAILED = "failed"
+
+
+# Every column ``DhcpService.push_pool_to_device`` actually puts on the
+# router -- the six arguments it hands ``configure_dhcp_pool`` plus the
+# ``interface`` both RouterOS identifiers are derived from. Changing any of
+# them makes an ``ACTIVE`` row describe leases the device is not handing
+# out -- see ``app.common.device_push``.
+#
+# ``name``/``description`` never leave the database, and ``is_enabled`` is
+# intent, not configuration (see ``app.common.device_push``'s own note).
+DEVICE_CARRIED_FIELDS = frozenset(
+    {
+        "interface",
+        "address_range_start",
+        "address_range_end",
+        "gateway_ip_address",
+        "dns_primary",
+        "dns_secondary",
+        "lease_time_seconds",
+    }
+)

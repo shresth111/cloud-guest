@@ -19,7 +19,7 @@ MIN_VLAN_ID = 1
 MAX_VLAN_ID = 4094
 
 
-__all__ = ["MIN_VLAN_ID", "MAX_VLAN_ID"]
+__all__ = ["MIN_VLAN_ID", "MAX_VLAN_ID", "DEVICE_CARRIED_FIELDS"]
 
 
 class VlanDevicePushStatus(StrEnum):
@@ -49,3 +49,31 @@ class VlanDevicePushStatus(StrEnum):
     PROVISIONING = "provisioning"
     ACTIVE = "active"
     FAILED = "failed"
+
+
+# Every column ``VlanService.push_vlan_to_device`` actually puts on the
+# router: ``vlan_id`` and ``interface`` and ``port_mode`` decide which
+# interface is created and on what, ``cidr``/``gateway_ip_address`` become
+# the ``/ip address`` line (see ``VlanService._device_address``),
+# ``enable_hotspot`` creates or deletes the portal, and ``nat_enabled``
+# creates or deletes the masquerade rule. Changing any of them makes an
+# ``ACTIVE`` row describe something the device is not carrying -- see
+# ``app.common.device_push``.
+#
+# ``name`` is not here: the gateway reaches the interface by the
+# deterministic ``vlan{vlan_id}`` and carries ``name`` only as the
+# interface's own RouterOS comment (``mikrotik_adapter._configure_vlan_trunk``),
+# so a rename changes a label, not the network. Nor is ``description``
+# (never leaves the database) or ``is_enabled`` (intent -- see
+# ``app.common.device_push``'s own note).
+DEVICE_CARRIED_FIELDS = frozenset(
+    {
+        "vlan_id",
+        "interface",
+        "port_mode",
+        "cidr",
+        "gateway_ip_address",
+        "enable_hotspot",
+        "nat_enabled",
+    }
+)

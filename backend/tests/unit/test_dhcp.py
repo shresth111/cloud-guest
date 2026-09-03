@@ -902,3 +902,123 @@ class TestDnsServerFallback:
         pool.gateway_ip_address = None
 
         assert h.service._dns_servers(pool) == []
+
+
+# ============================================================================
+# Editing a pushed pool stops it claiming the router has the new values
+# ============================================================================
+
+
+class TestEditDemotesAnAppliedPool:
+    """``active`` renders as a green "Applied" badge. An edit to anything
+    the router actually carries makes that false the moment it is saved,
+    and nothing used to say so -- the row went on reading ``active`` while
+    the device handed out the *old* range."""
+
+    async def _pushed_pool(
+        self, h: Harness, router: Router, adapter: FakeDhcpAdapter
+    ) -> DhcpPool:
+        pool = await _create_pool(h, router)
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        adapter.calls.clear()
+        return pool
+
+    async def test_widening_the_range_demotes_the_row(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+        assert pool.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+
+        updated = await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            address_range_end="192.168.10.200",
+        )
+
+        assert updated.device_push_status == DhcpDevicePushStatus.PENDING.value
+
+    async def test_changing_dns_demotes_the_row(self, adapter: FakeDhcpAdapter) -> None:
+        """A DNS server the router is not advertising is exactly the kind of
+        edit whose effect a customer cannot see from the device."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+
+        updated = await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            dns_primary="1.1.1.1",
+        )
+
+        assert updated.device_push_status == DhcpDevicePushStatus.PENDING.value
+
+    async def test_renaming_the_pool_does_not_demote(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """``name``/``description`` never leave the database. The device
+        state still is exactly what the row describes, so demoting would
+        nag the operator into a pointless re-push."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+
+        updated = await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            name="Lobby Pool",
+            description="Renamed for clarity",
+        )
+
+        assert updated.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+
+    async def test_resubmitting_the_same_range_does_not_demote(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+
+        updated = await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            address_range_start=pool.address_range_start,
+            address_range_end=pool.address_range_end,
+            interface=pool.interface,
+        )
+
+        assert updated.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+
+    async def test_a_demoted_pool_is_still_torn_off_the_device_on_delete(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The demotion says "the router has the old values", so the delete
+        that follows must remove them. Reading ``pending`` as "nothing to
+        remove" would orphan a live DHCP server -- which is why the delete
+        guard keys on ``device_pushed_at``, not on the status."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await self._pushed_pool(h, router, adapter)
+        await h.service.update_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            address_range_end="192.168.10.200",
+        )
+
+        await h.service.delete_pool(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(adapter.deletes) == 1

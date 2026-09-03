@@ -14,6 +14,7 @@ from wyfy_device_gateway.contract import (
     DhcpPoolConfig,
     NatRuleConfig,
     PortForwardConfig,
+    QosPacketMarkConfig,
     VlanConfig,
     VlanHotspotConfig,
 )
@@ -886,7 +887,7 @@ async def test_a_recabled_wan_updates_the_out_interface_in_place(
 
 
 @pytest.mark.asyncio
-async def test_delete_removes_the_rule(patch_connect, mikrotik_creds):
+async def test_delete_nat_masquerade_removes_the_rule(patch_connect, mikrotik_creds):
     api = FakeRouterOSApi(menus=_wan_menus())
     patch_connect(api)
     adapter = MikroTikAdapter()
@@ -1913,7 +1914,7 @@ async def test_narrowing_both_to_tcp_reaps_the_udp_rule(
 
 
 @pytest.mark.asyncio
-async def test_delete_removes_the_rule(patch_connect, mikrotik_creds):
+async def test_delete_port_forward_removes_the_rule(patch_connect, mikrotik_creds):
     api = FakeRouterOSApi()
     patch_connect(api)
     adapter = MikroTikAdapter()
@@ -2218,3 +2219,181 @@ def test_routeros_paths_that_name_the_same_directory_compare_equal():
     assert _same_routeros_path("cloudguest-hotspot", "cloudguest-hotspot")
     assert not _same_routeros_path("flash/hotspot", "cloudguest-hotspot")
     assert not _same_routeros_path(None, "cloudguest-hotspot")
+
+
+# ----------------------------------------------------------------------
+# QoS packet marks -- the mangle half that had no writer at all until now.
+# A queue tree referencing a mark nothing sets matches zero packets, so
+# these assert the mark is written, kept identifiable across an edit, and
+# torn down with its rule.
+# ----------------------------------------------------------------------
+
+
+def _qos_rule(**overrides):
+    fields = {
+        "rule_id": "rule-1",
+        "packet_mark": "cloudguest-qos-rule-1",
+        "label": "VoIP",
+        "priority": 1,
+        "protocol": "udp",
+        "port_range_start": 10000,
+        "port_range_end": 20000,
+    }
+    fields.update(overrides)
+    return QosPacketMarkConfig(**fields)
+
+
+@pytest.mark.asyncio
+async def test_configure_qos_packet_mark_writes_the_port_range_match(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_qos_packet_mark(mikrotik_creds, rule=_qos_rule())
+
+    assert api.add_calls == [
+        (
+            ("ip", "firewall", "mangle"),
+            {
+                "chain": "prerouting",
+                "protocol": "udp",
+                "dst-port": "10000-20000",
+                "action": "mark-packet",
+                "new-packet-mark": "cloudguest-qos-rule-1",
+                "passthrough": "no",
+                "comment": "WyfyGuest qos rule-1: VoIP (priority=1)",
+                "disabled": "no",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_configure_qos_packet_mark_dscp_rule_carries_no_port_match(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    rule = _qos_rule(
+        protocol=None, port_range_start=None, port_range_end=None, dscp_value=46
+    )
+    await MikroTikAdapter().configure_qos_packet_mark(mikrotik_creds, rule=rule)
+
+    written = api.add_calls[0][1]
+    assert written["dscp"] == "46"
+    # A DSCP rule that also carried dst-port/protocol would keep matching
+    # the ports the customer just stopped classifying by.
+    assert "dst-port" not in written
+    assert "protocol" not in written
+
+
+@pytest.mark.asyncio
+async def test_repushing_an_unchanged_qos_mark_writes_nothing(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_qos_packet_mark(mikrotik_creds, rule=_qos_rule())
+    api.add_calls.clear()
+    await adapter.configure_qos_packet_mark(mikrotik_creds, rule=_qos_rule())
+
+    assert api.add_calls == []
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_editing_the_label_updates_the_existing_qos_mark_in_place(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_qos_packet_mark(mikrotik_creds, rule=_qos_rule())
+    api.add_calls.clear()
+    await adapter.configure_qos_packet_mark(
+        mikrotik_creds, rule=_qos_rule(label="Video calls")
+    )
+
+    # Found by the marker, not by the label -- so the rename edits the one
+    # row rather than adding a second mangle rule beside it.
+    assert api.add_calls == []
+    assert len(api.update_calls) == 1
+    assert (
+        api.update_calls[0][1]["comment"]
+        == "WyfyGuest qos rule-1: Video calls (priority=1)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_retyping_a_qos_rule_to_dscp_removes_the_port_range_row(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_qos_packet_mark(mikrotik_creds, rule=_qos_rule())
+    api.add_calls.clear()
+    await adapter.configure_qos_packet_mark(
+        mikrotik_creds,
+        rule=_qos_rule(
+            protocol=None, port_range_start=None, port_range_end=None, dscp_value=46
+        ),
+    )
+
+    # RouterOS has no "unset these fields", so the old row comes off rather
+    # than being updated -- otherwise dst-port would still be matching.
+    assert api.remove_calls
+    rows = list(api.path("ip", "firewall", "mangle"))
+    assert len(rows) == 1
+    assert rows[0]["dscp"] == "46"
+    assert rows[0].get("dst-port") in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_delete_qos_packet_mark_leaves_other_rules_alone(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_qos_packet_mark(mikrotik_creds, rule=_qos_rule())
+    await adapter.configure_qos_packet_mark(
+        mikrotik_creds,
+        rule=_qos_rule(
+            rule_id="rule-2", packet_mark="cloudguest-qos-rule-2", label="Streaming"
+        ),
+    )
+    # Somebody's own hand-written mangle rule, which this platform must
+    # never touch.
+    api.path("ip", "firewall", "mangle").add(
+        chain="prerouting", action="mark-packet", comment="hand written, keep me"
+    )
+
+    await adapter.delete_qos_packet_mark(mikrotik_creds, rule_id="rule-1")
+
+    comments = [row.get("comment") for row in api.path("ip", "firewall", "mangle")]
+    assert comments == [
+        "WyfyGuest qos rule-2: Streaming (priority=1)",
+        "hand written, keep me",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deleting_an_absent_qos_packet_mark_is_a_no_op(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_qos_packet_mark(
+        mikrotik_creds, rule_id="never-pushed"
+    )
+
+    assert api.remove_calls == []
