@@ -89,6 +89,19 @@ class IpAddressInfo:
     address: str  # "192.168.10.1/24" -- an address with a prefix, not a network
     interface: str | None
     disabled: bool
+    # RouterOS marks a row invalid when the interface it names no longer
+    # exists -- an address left behind by a deleted interface. Such a row
+    # occupies no subnet: nothing routes to it and nothing answers on it.
+    #
+    # Carried because a caller that cannot see it treats a dead address as a
+    # live one. A lab router held `10.0.0.1/24 invalid=True` on a vanished
+    # interface `*C`, and the VLAN subnet-overlap preflight refused every
+    # 10.0.0.0/24 VLAN on the strength of it -- a permanent, unexplainable
+    # rejection with nothing on the device actually using the range.
+    #
+    # Defaulted so the several existing constructors of this shape keep
+    # working unchanged.
+    invalid: bool = False
 
 
 @dataclass(frozen=True, slots=True)

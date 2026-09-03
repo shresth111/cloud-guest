@@ -113,6 +113,10 @@ class VlanDeviceAddress:
     address: str
     interface: str | None
     disabled: bool
+    # True when the interface this address names no longer exists. Such a
+    # row holds no subnet -- see the field's own note on
+    # ``wyfy_device_gateway.contract.IpAddressInfo``.
+    invalid: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,7 +331,10 @@ class MikroTikVlanAdapter:
             ],
             addresses=[
                 VlanDeviceAddress(
-                    address=a.address, interface=a.interface, disabled=a.disabled
+                    address=a.address,
+                    interface=a.interface,
+                    disabled=a.disabled,
+                    invalid=a.invalid,
                 )
                 for a in snapshot.ip_addresses
             ],

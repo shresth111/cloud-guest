@@ -872,10 +872,14 @@ def _render_vlan_hotspot(vlan: Vlan, bind_interface: str) -> list[str]:
         f"address-pool={pool_name} disabled=no",
         f"/ip dhcp-server network add address={network} "
         f"gateway={vlan.gateway_ip_address} dns-server={vlan.gateway_ip_address}",
+        # use-radius/login-by are not optional polish: a profile without
+        # them defaults to `use-radius=no login-by=cookie,http-chap`, and
+        # the portal then cannot check any credential against this
+        # platform. Mirrors hsprof1, the working guest profile.
         f"/ip hotspot profile add name={profile_name} "
         f"hotspot-address={vlan.gateway_ip_address} "
         f"html-directory={HOTSPOT_HTML_DIRECTORY} "
-        f"dns-name={dns_name}",
+        f"dns-name={dns_name} use-radius=yes login-by=http-pap",
         f"/ip dns static add name={dns_name} address={vlan.gateway_ip_address} "
         f'comment="{tag}-hotspot-dns-name"',
         f"/ip hotspot add name={tag}-hotspot interface={bind_interface} "

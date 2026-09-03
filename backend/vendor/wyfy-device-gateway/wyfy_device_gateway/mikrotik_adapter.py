@@ -929,6 +929,7 @@ class MikroTikAdapter:
                     address=str(row["address"]),
                     interface=str(row["interface"]) if row.get("interface") else None,
                     disabled=_is_truthy(row.get("disabled", False)),
+                    invalid=_is_truthy(row.get("invalid", False)),
                 )
                 for row in addresses
                 if row.get("address")
@@ -2077,6 +2078,20 @@ class MikroTikAdapter:
             "hotspot-address": hotspot_address,
             "html-directory": html_directory,
             "dns-name": dns_name,
+            # Without these two the portal is decorative. RouterOS defaults
+            # a new profile to `use-radius=no login-by=cookie,http-chap`,
+            # so a per-VLAN portal came up unable to check a credential
+            # against this platform at all: the page appeared, and no OTP,
+            # voucher or password could ever succeed on it. Observed on the
+            # lab router as `vlan95-hsprof use-radius=False`.
+            #
+            # The values mirror `hsprof1`, the router's own working guest
+            # profile (`use-radius=True login-by=http-pap`) -- `http-pap`
+            # because the portal posts the credential, which CHAP's
+            # challenge flow does not carry. `radius-accounting` is left
+            # alone: RouterOS turns it on by default once `use-radius=yes`.
+            "use-radius": "yes",
+            "login-by": "http-pap",
         }
         menu = api.path("ip", "hotspot", "profile")
         for row in menu:
@@ -2091,6 +2106,15 @@ class MikroTikAdapter:
                 if not (
                     key == "html-directory"
                     and _same_routeros_path(row.get(key), value)
+                )
+                # use-radius answers a read as a real bool while accepting
+                # "yes"/"no" on write, so a string compare never matches and
+                # every push re-issues the same set. Same normalization trap
+                # already documented on _ensure_dhcp_server's lease-time and
+                # on `disabled`.
+                and not (
+                    key == "use-radius"
+                    and _is_truthy(row.get(key)) is (value == "yes")
                 )
                 and row.get(key) != value
             }

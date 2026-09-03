@@ -592,6 +592,10 @@ class FakeVlanAdapter:
                 VlanDeviceAddress(
                     address=row[0], interface=row[1],
                     disabled=bool(row[2]) if len(row) > 2 else False,
+                    # 4th element: RouterOS's `invalid`, set when the
+                    # interface this address names no longer exists. Such a
+                    # row reserves no subnet.
+                    invalid=bool(row[3]) if len(row) > 3 else False,
                 )
                 for row in self.snapshot_addresses
             ],
@@ -1159,6 +1163,47 @@ class TestVlanDevicePreflight:
                 requesting_organization_id=router.organization_id,
             )
         assert adapter.calls == []
+
+    async def test_a_dead_address_does_not_reserve_a_subnet(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """RouterOS marks an address invalid when the interface it names is
+        gone. The lab router held `10.0.0.1/24` on a vanished interface
+        `*C`, and every 10.0.0.0/24 VLAN was refused because of it -- a
+        permanent rejection naming an interface the operator cannot find,
+        over a range nothing was using.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+        adapter.snapshot_addresses = [("192.168.10.9/24", "*C", False, True)]
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == VlanDevicePushStatus.ACTIVE.value
+
+    async def test_a_live_address_still_reserves_its_subnet(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The exclusion is for dead rows only -- a real overlapping address
+        must still refuse, or two matching routes end up on the device."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+        adapter.snapshot_addresses = [("192.168.10.9/24", "ether1", False, False)]
+
+        with pytest.raises(VlanSubnetConflictError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
 
     async def test_an_access_push_records_the_bridge_it_takes_the_port_from(
         self, adapter: FakeVlanAdapter

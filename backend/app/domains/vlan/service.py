@@ -833,14 +833,20 @@ class VlanService:
         * addresses on this VLAN's *own* bind interface, or every re-push
           of an unchanged VLAN would conflict with itself;
         * disabled addresses, which are not in the routing table and so
-          collide with nothing.
+          collide with nothing;
+        * addresses RouterOS marks *invalid*, meaning the interface they
+          name no longer exists. A lab router held ``10.0.0.1/24`` on a
+          vanished interface ``*C``, and this check refused every
+          ``10.0.0.0/24`` VLAN on the strength of it -- a permanent
+          rejection naming an interface the operator cannot find, over a
+          range nothing was using. A dead address reserves no subnet.
         """
         if not vlan.cidr:
             return
         wanted = ipaddress.ip_network(vlan.cidr, strict=False)
         bind_interface = self._bind_interface(vlan)
         for row in snapshot.addresses:
-            if row.disabled or row.interface == bind_interface:
+            if row.disabled or row.invalid or row.interface == bind_interface:
                 continue
             try:
                 existing = ipaddress.ip_interface(row.address).network

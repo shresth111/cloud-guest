@@ -24,10 +24,15 @@ import uuid
 sys.path.insert(0, "/app")
 
 KEEP = "--keep" in sys.argv
+# `--no-portal` is the other half of the customer's requirement: the same
+# VLAN with the captive portal switched off. It should produce the interface
+# and its address and NOTHING else -- no pool, no DHCP server, no hotspot.
+PORTAL = "--no-portal" not in sys.argv
 HOST = "10.20.0.14"
-VLAN_ID = 900
-CIDR = "10.90.0.0/24"
-GATEWAY = "10.90.0.1"
+_ids = [a for a in sys.argv[1:] if a.isdigit()]
+VLAN_ID = int(_ids[0]) if _ids else 900
+CIDR = f"10.{VLAN_ID % 250}.0.0/24"
+GATEWAY = f"10.{VLAN_ID % 250}.0.1"
 
 
 class _PermitAll:
@@ -104,6 +109,7 @@ async def main() -> int:
         print(f"no router at {HOST}")
         return 2
     print(f"router={router_row['name']} id={router_row['id']}")
+    print(f"vlan_id={VLAN_ID} cidr={CIDR} portal={PORTAL}")
 
     device_state(router_row, "BEFORE")
 
@@ -123,13 +129,13 @@ async def main() -> int:
             "/api/v1/vlans",
             json={
                 "router_id": str(router_row["id"]),
-                "name": "QA trunk portal 900",
+                "name": f"QA trunk vlan {VLAN_ID} portal={PORTAL}",
                 "vlan_id": VLAN_ID,
                 "interface": "bridge",
                 "cidr": CIDR,
                 "gateway_ip_address": GATEWAY,
                 "port_mode": "trunk",
-                "enable_hotspot": True,
+                "enable_hotspot": PORTAL,
                 "nat_enabled": False,
                 "is_enabled": True,
             },
