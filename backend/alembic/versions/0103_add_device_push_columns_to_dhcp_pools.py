@@ -40,7 +40,7 @@ alternative, keeping a status column whose writer is gone, would leave
 rows asserting ``active`` with nothing able to correct them.
 
 Revision ID: 0103_add_device_push_columns_to_dhcp_pools
-Revises: 0102_add_device_push_columns_to_vlans
+Revises: 0103_add_discount_amount_to_invoices
 Create Date: 2026-09-02
 """
 
@@ -49,7 +49,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0103_add_device_push_columns_to_dhcp_pools"
-down_revision = "0102_add_device_push_columns_to_vlans"
+down_revision = "0103_add_discount_amount_to_invoices"
 branch_labels = None
 depends_on = None
 
