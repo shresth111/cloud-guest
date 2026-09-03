@@ -798,8 +798,34 @@ def render_dhcp_pool(pool: DhcpPool) -> list[str]:
     if pool.gateway_ip_address:
         network_parts.append(f"gateway={pool.gateway_ip_address}")
     dns_servers = [dns for dns in (pool.dns_primary, pool.dns_secondary) if dns]
+    if not dns_servers and pool.gateway_ip_address:
+        # Falls back to the router itself, never to nothing. MikroTik
+        # documents that an *omitted* ``dns-server`` makes the DHCP server
+        # hand out the router's own *upstream* resolvers -- so a pool with
+        # both DNS fields left blank (they are optional, and blank by
+        # default on the customer's screen) points every guest straight
+        # past this router's resolver. Everything that depends on that
+        # resolver then silently stops working: Website Blocking realizes a
+        # blocked domain as an ``/ip dns static`` entry, and a guest asking
+        # 8.8.8.8 never sees it. Nobody touched a DNS setting to cause it.
+        #
+        # ``_render_vlan_hotspot`` below has always emitted
+        # ``dns-server={gateway}`` for exactly this reason; this is the
+        # same rule, applied to the path a plain DHCP pool takes.
+        dns_servers = [pool.gateway_ip_address]
     if dns_servers:
         network_parts.append(f"dns-server={','.join(dns_servers)}")
+    else:
+        # No configured DNS and no gateway to fall back to. Rendering the
+        # line without a value is not an option, so this states the
+        # consequence rather than emitting a pool that quietly bypasses
+        # the router -- the same "skip, don't guess" discipline every
+        # other render_* function here follows.
+        lines.append(
+            f"# {identifier}: no dns-server and no gateway to fall back to "
+            "-- guests will receive this router's upstream resolvers, and "
+            "DNS-based content filtering will not apply to them"
+        )
     lines.append(" ".join(network_parts))
     return lines
 

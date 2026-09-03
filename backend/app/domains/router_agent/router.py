@@ -37,6 +37,10 @@ from app.domains.guest.dependencies import get_guest_repository
 from app.domains.guest.repository import GuestRepositoryProtocol
 from app.domains.isp.dependencies import get_isp_service
 from app.domains.isp.service import IspService
+from app.domains.mac_authorization.dependencies import (
+    get_mac_authorization_service,
+)
+from app.domains.mac_authorization.service import MacAuthorizationService
 from app.domains.monitoring.constants import HeartbeatComponentType
 from app.domains.monitoring.dependencies import get_monitoring_service
 from app.domains.monitoring.service import MonitoringService
@@ -229,16 +233,46 @@ async def agent_complete_action(
 async def agent_authorized_macs(
     identity: AgentIdentity = Depends(CurrentAgent),
     guest_repository: GuestRepositoryProtocol = Depends(get_guest_repository),
+    mac_authorization_service: MacAuthorizationService = Depends(
+        get_mac_authorization_service
+    ),
 ) -> AuthorizedMacsResponse:
-    """The missing link between the real captive-portal OTP flow and this
-    router's physical hotspot: every guest with a currently ``ACTIVE``
-    session against this router, resolved to the MAC address captured at
-    ``login_via_otp`` time. The agent's heartbeat script polls this
-    alongside the heartbeat itself and applies a local
-    ``/ip hotspot ip-binding`` (bypassed) for each MAC returned -- this
-    endpoint only ever reports state, it never grants anything itself, the
-    same "reporting, not live enforcement" posture already established for
-    ``AgentActionItem``/config-pull above."""
+    """Every MAC this router should let straight through: guests with a
+    currently ``ACTIVE`` session, **and** the devices an admin marked
+    Trusted.
+
+    The agent's heartbeat script polls this and applies a local
+    ``/ip hotspot ip-binding type=bypassed`` for each MAC returned. This
+    endpoint only ever reports state; it never grants anything itself.
+
+    ## Why Trusted Devices had to be added here
+
+    This used to return active sessions only, and nothing anywhere else
+    reached a router either -- so "Trusted Devices" was a screen that
+    wrote a row and changed nothing on any device, ever. The circularity
+    is the part worth naming: a device could only appear here by already
+    having a session, which is precisely what being trusted is supposed
+    to grant it. A trusted device that had never logged in could never
+    become trusted.
+
+    ``list_active_entries_for_router`` already returns exactly the right
+    set -- enabled, non-expired, and org/location-scoped to this router --
+    so this is a union, not new policy.
+
+    ## Safe against the scheduler that already runs on the fleet
+
+    That script adds a binding only for a MAC that is *neither* already
+    bound *nor* currently in ``/ip hotspot active``, so unioning a trusted
+    MAC in cannot tear down a live session -- RouterOS drops the host when
+    a binding appears for an active MAC, and the script's own guard is
+    what prevents it. The removal half reconciles against this same list,
+    so un-trusting a device really does withdraw its binding on the next
+    poll.
+
+    Union rather than a second response key, deliberately: a new key would
+    be ignored by every script already deployed, so the fix would do
+    nothing until every router in the fleet was re-provisioned by hand.
+    """
     sessions = await guest_repository.list_active_sessions_for_router(
         identity.router.id
     )
@@ -249,6 +283,15 @@ async def agent_authorized_macs(
         device = await guest_repository.get_device_by_id(session.device_id)
         if device is not None:
             macs.append(device.mac_address)
+
+    # Scoped by the service against this router's own organization and
+    # location; the agent identity is the router, so there is no caller
+    # organization to pass and none to check against.
+    trusted = await mac_authorization_service.list_active_entries_for_router(
+        identity.router.id, requesting_organization_id=None
+    )
+    macs.extend(entry.mac_address for entry in trusted)
+
     return AuthorizedMacsResponse(mac_addresses=sorted(set(macs)))
 
 
