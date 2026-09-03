@@ -195,6 +195,7 @@ from .validators import (
     compute_discount_amount,
     compute_renewal_charge_amount,
     compute_tax_breakdown,
+    compute_taxable_value,
     current_month_period,
     is_payment_retry_eligible,
     normalize_coupon_code,
@@ -2901,6 +2902,14 @@ class InvoiceService:
         note_repository: CreditDebitNoteRepositoryProtocol,
         platform_gst_state: str,
         platform_gst_country: str,
+        # Optional, and defaulting to None, deliberately: without it this
+        # service issues undiscounted invoices, which is exactly the
+        # behaviour every existing caller and test already expects. Making
+        # it required would be a breaking constructor change across the
+        # whole domain in service of a code path that degrades honestly --
+        # the same posture ``SubscriptionService.coupon_service`` already
+        # takes. ``_resolve_coupon_discount`` returns zero when it is absent.
+        coupon_repository: CouponRepositoryProtocol | None = None,
         invoice_due_days: int = 15,
         audit_writer: AuditLogWriter | None = None,
     ) -> None:
@@ -2911,6 +2920,7 @@ class InvoiceService:
         self.tax_rate_repository = tax_rate_repository
         self.number_counter_repository = number_counter_repository
         self.note_repository = note_repository
+        self.coupon_repository = coupon_repository
         self.platform_gst_state = platform_gst_state
         self.platform_gst_country = platform_gst_country
         self.invoice_due_days = invoice_due_days
@@ -2950,6 +2960,61 @@ class InvoiceService:
     async def list_notes(self, invoice_id: uuid.UUID) -> list[CreditDebitNote]:
         return await self.note_repository.list_for_invoice(invoice_id)
 
+    async def _resolve_coupon_discount(self, subscription: Subscription) -> Decimal:
+        """The coupon discount this invoice should grant -- zero in every
+        case except the one, first invoice for a subscription that really
+        redeemed a coupon at signup.
+
+        ## Why this exists at all
+
+        ``CouponService.apply_coupon`` has always run at subscription
+        creation and always written a real ``CouponUsage`` row with a real
+        ``discount_amount_applied``, incremented the coupon's
+        ``current_uses``, and stamped ``Subscription.applied_coupon_id``.
+        Nothing ever read any of it back. The coupon was spent -- counted
+        against ``max_uses``, unavailable to the next customer -- and the
+        organization was invoiced the plan's full ``base_price``. This
+        method is the missing read.
+
+        ## Reads the frozen usage row, never recomputes from the coupon
+
+        The amount comes from ``CouponUsage.discount_amount_applied``, which
+        ``apply_coupon`` froze at redemption time, not from re-deriving
+        ``compute_discount_amount`` against the live ``Coupon``. A coupon's
+        ``discount_value`` is editable and its validity window expires; an
+        invoice must grant what was actually redeemed, not what the coupon
+        is worth on the day the invoice happens to be cut. Same "copy, not
+        reference" rule as ``models.CouponUsage``'s own docstring and as
+        ``billing_snapshot``.
+
+        ## Once, and only once
+
+        ``generate_invoice_for_subscription`` is wired to an
+        operator-triggered endpoint, not to signup, so it can legitimately
+        run more than once for the same subscription. ``CouponService``'s
+        policy is that a redemption is a one-time grant at signup (see
+        ``compute_renewal_charge_amount``'s docstring for why renewals
+        deliberately charge the undiscounted ``base_price``), so
+        ``has_discounted_invoice`` makes the second and later invoices
+        undiscounted. Without that guard one redemption would fund an
+        unlimited number of discounted invoices.
+
+        Returns zero, rather than raising, whenever the pieces are absent:
+        no ``coupon_repository`` wired in, no ``applied_coupon_id`` on the
+        subscription, or no usage row found. An invoice that charges full
+        price is the correct, conservative outcome for a subscription that
+        cannot be shown to have redeemed anything -- and it is exactly the
+        behaviour that existed before this method.
+        """
+        if self.coupon_repository is None or subscription.applied_coupon_id is None:
+            return Decimal("0")
+        if await self.repository.has_discounted_invoice(subscription.id):
+            return Decimal("0")
+        usage = await self.coupon_repository.get_usage_for_subscription(subscription.id)
+        if usage is None:
+            return Decimal("0")
+        return usage.discount_amount_applied
+
     async def generate_invoice_for_subscription(
         self, subscription_id: uuid.UUID
     ) -> Invoice:
@@ -2964,6 +3029,22 @@ class InvoiceService:
         ``confirm_renewal_payment_succeeded`` themselves call. This
         function never independently derives "how much does this
         subscription cost" a second way.
+
+        ## The signup coupon, granted here -- once
+
+        ``subtotal`` is the *gross* charge. If the subscription redeemed a
+        coupon at signup and no live invoice has granted it yet,
+        ``discount_amount`` carries the amount ``CouponService.apply_coupon``
+        froze on the ``CouponUsage`` row, and tax is computed on
+        ``subtotal - discount_amount`` (CGST Act s.15(3)(a) -- see
+        ``validators.compute_taxable_value``). Before this existed the
+        coupon was consumed at signup and silently never granted: the row
+        was written, ``current_uses`` incremented, and the customer billed
+        full price. See ``_resolve_coupon_discount`` for the once-only rule
+        and why the amount is read rather than recomputed. Renewals
+        deliberately carry no discount at all -- that is
+        ``compute_renewal_charge_amount``'s documented policy, not an
+        oversight.
 
         ## Real GST/tax computation, applied via the organization's own
         ## ``BillingProfile``
@@ -3005,6 +3086,8 @@ class InvoiceService:
             raise BillingProfileNotFoundError(subscription.organization_id)
 
         subtotal = compute_renewal_charge_amount(plan)
+        discount_amount = await self._resolve_coupon_discount(subscription)
+        taxable_value = compute_taxable_value(subtotal, discount_amount)
 
         tax_rate: TaxRate | None = None
         if not billing_profile.tax_exempt:
@@ -3012,8 +3095,12 @@ class InvoiceService:
                 billing_profile.billing_country
             )
 
+        # Tax is charged on the *discounted* value, never the gross -- see
+        # ``compute_taxable_value``'s own s.15(3)(a) write-up. When no
+        # coupon applies this is identical to the pre-discount behaviour,
+        # because ``discount_amount`` is then zero.
         breakdown = compute_tax_breakdown(
-            subtotal=subtotal,
+            subtotal=taxable_value,
             tax_type=TaxType(tax_rate.tax_type) if tax_rate is not None else None,
             rate_percentage=(
                 tax_rate.rate_percentage if tax_rate is not None else Decimal("0")
@@ -3024,7 +3111,7 @@ class InvoiceService:
             billing_state=billing_profile.billing_state,
             billing_country=billing_profile.billing_country,
         )
-        total_amount = (subtotal + breakdown.tax_amount).quantize(Decimal("0.01"))
+        total_amount = (taxable_value + breakdown.tax_amount).quantize(Decimal("0.01"))
 
         now = datetime.now(UTC)
         invoice_number = await generate_invoice_number(
@@ -3051,6 +3138,7 @@ class InvoiceService:
             issue_date=now,
             due_date=now + timedelta(days=self.invoice_due_days),
             subtotal=subtotal,
+            discount_amount=discount_amount,
             cgst_amount=breakdown.cgst_amount,
             sgst_amount=breakdown.sgst_amount,
             igst_amount=breakdown.igst_amount,
@@ -3062,6 +3150,12 @@ class InvoiceService:
             currency=plan.currency,
             billing_snapshot=snapshot,
         )
+        # The line item carries the *gross* plan charge. The discount is a
+        # property of the invoice, not of the thing supplied -- the customer
+        # bought one full subscription period and was then given money off
+        # it -- so netting it into the line's ``unit_price``/``amount``
+        # would misstate what was sold and leave the discount invisible on
+        # the only part of the invoice that itemizes anything.
         await self.repository.create_invoice_item(
             invoice_id=invoice.id,
             description=f"{plan.name} subscription ({plan.billing_cycle})",
