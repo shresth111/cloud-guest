@@ -54,6 +54,7 @@ from app.domains.billing.models import (
     LicenseChangeLog,
     Plan,
     PlanFeature,
+    Subscription,
     UsageMetric,
 )
 from app.domains.billing.service import (
@@ -463,6 +464,45 @@ def make_usage_service(
 
 
 @dataclass
+class FakeSubscriptionRepository:
+    """The slice of ``SubscriptionRepositoryProtocol``
+    ``LicenseService._sync_subscription_plan`` uses."""
+
+    subscriptions: dict[uuid.UUID, Subscription] = field(default_factory=dict)
+
+    async def add(self, **fields: object) -> Subscription:
+        subscription = Subscription(
+            id=uuid.uuid4(),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            deleted_at=None,
+            is_deleted=False,
+            created_by=None,
+            updated_by=None,
+            version=1,
+            **fields,
+        )
+        self.subscriptions[subscription.id] = subscription
+        return subscription
+
+    async def get_by_organization_id(
+        self, organization_id: uuid.UUID
+    ) -> Subscription | None:
+        for subscription in self.subscriptions.values():
+            if subscription.organization_id == organization_id:
+                return subscription
+        return None
+
+    async def update_subscription(
+        self, subscription: Subscription, data: dict[str, object]
+    ) -> Subscription:
+        for key, value in data.items():
+            setattr(subscription, key, value)
+        subscription.version += 1
+        return subscription
+
+
+@dataclass
 class LicenseFixture:
     license_repository: FakeLicenseRepository
     plan_repository: FakePlanRepository
@@ -472,6 +512,7 @@ class LicenseFixture:
     usage_fixture: UsageFixture
     service: LicenseService
     white_label_reset: FakeWhiteLabelReset | None = None
+    subscription_repository: FakeSubscriptionRepository | None = None
 
 
 def make_license_service(
@@ -495,6 +536,7 @@ def make_license_service(
         active_session_lookup=active_session_lookup,
     )
 
+    subscription_repository = FakeSubscriptionRepository()
     service = LicenseService(
         license_repository,
         plan_repository,
@@ -502,6 +544,7 @@ def make_license_service(
         usage_validator=usage_fixture.service,
         audit_writer=audit_writer,
         white_label_reset=white_label_reset,
+        subscription_repository=subscription_repository,
     )
     return LicenseFixture(
         license_repository,
@@ -512,6 +555,7 @@ def make_license_service(
         usage_fixture,
         service,
         white_label_reset,
+        subscription_repository,
     )
 
 
@@ -521,6 +565,7 @@ async def _create_plan(
     slug: str = "starter",
     plan_type: str = PlanType.STARTER.value,
     is_active: bool = True,
+    billing_cycle: str = BillingCycle.MONTHLY.value,
     features: list[dict[str, object]] | None = None,
 ) -> Plan:
     plan_service = PlanService(plan_repository)
@@ -530,7 +575,7 @@ async def _create_plan(
         slug=slug,
         plan_type=plan_type,
         description=None,
-        billing_cycle=BillingCycle.MONTHLY.value,
+        billing_cycle=billing_cycle,
         base_price=Decimal("49.99"),
         currency="USD",
         is_active=is_active,
@@ -912,6 +957,153 @@ class TestLicenseLifecycle:
         fx = make_license_service()
         with pytest.raises(LicenseNotFoundError):
             await fx.service.get_license_for_organization(uuid.uuid4())
+
+
+class TestPlanChangeSyncsTheSubscription:
+    """A plan change used to update ``License.plan_id`` and the
+    organization's denormalized tier label, and stop there -- while the
+    renewal engine resolves what to charge from
+    ``subscription.plan_id``. The subscription kept pointing at the old
+    plan forever, so an upgraded customer went on being billed the old
+    price, renewal after renewal."""
+
+    async def _setup(
+        self, *, new_cycle: str = BillingCycle.MONTHLY.value
+    ) -> tuple[LicenseFixture, Plan, Plan, uuid.UUID, Subscription]:
+        org_id = uuid.uuid4()
+        # The downgrade path runs the usage validator, which resolves the
+        # real organization -- so it has to exist in the composer fake.
+        fx = make_license_service(
+            organization_composer=FakeOrganizationComposer(
+                organizations={org_id: _FakeOrganization(id=org_id, msp=False)}
+            )
+        )
+        starter = await _create_plan(fx.plan_repository, slug="starter-sync")
+        pro = await _create_plan(
+            fx.plan_repository,
+            slug="pro-sync",
+            plan_type=PlanType.PROFESSIONAL.value,
+            billing_cycle=new_cycle,
+        )
+        license_ = await fx.service.assign_license(
+            actor_user_id=None, organization_id=org_id, plan_id=starter.id
+        )
+        await fx.service.activate_license(actor_user_id=None, license_id=license_.id)
+        assert fx.subscription_repository is not None
+        now = datetime.now(UTC)
+        subscription = await fx.subscription_repository.add(
+            organization_id=org_id,
+            license_id=license_.id,
+            plan_id=starter.id,
+            status="active",
+            billing_cycle=starter.billing_cycle,
+            current_period_start=now,
+            current_period_end=now + timedelta(days=30),
+            trial_end=None,
+            auto_renew=True,
+            cancel_at_period_end=False,
+            started_at=now,
+        )
+        return fx, starter, pro, license_.id, subscription
+
+    async def test_upgrade_repoints_the_subscription_at_the_new_plan(self) -> None:
+        fx, _starter, pro, license_id, subscription = await self._setup()
+
+        await fx.service.upgrade_license(
+            actor_user_id=None, license_id=license_id, new_plan_id=pro.id
+        )
+
+        # renewal_service resolves its charge amount from THIS field.
+        assert subscription.plan_id == pro.id
+
+    async def test_downgrade_repoints_the_subscription_too(self) -> None:
+        fx, starter, pro, license_id, subscription = await self._setup()
+        await fx.service.upgrade_license(
+            actor_user_id=None, license_id=license_id, new_plan_id=pro.id
+        )
+
+        await fx.service.downgrade_license(
+            actor_user_id=None, license_id=license_id, new_plan_id=starter.id
+        )
+
+        assert subscription.plan_id == starter.id
+
+    async def test_billing_cycle_moves_with_the_plan(self) -> None:
+        """``_mark_renewed`` extends the period by the *subscription's*
+        cycle, and ``list_due_for_renewal`` filters on it. Repointing
+        ``plan_id`` alone would charge a yearly plan every month."""
+        fx, _starter, pro, license_id, subscription = await self._setup(
+            new_cycle=BillingCycle.YEARLY.value
+        )
+        assert subscription.billing_cycle == BillingCycle.MONTHLY.value
+
+        await fx.service.upgrade_license(
+            actor_user_id=None, license_id=license_id, new_plan_id=pro.id
+        )
+
+        assert subscription.billing_cycle == BillingCycle.YEARLY.value
+
+    async def test_the_paid_period_is_left_alone(self) -> None:
+        """The customer paid for the current period; it runs to its end.
+        The new price takes effect at the next renewal."""
+        fx, _starter, pro, license_id, subscription = await self._setup()
+        period_start = subscription.current_period_start
+        period_end = subscription.current_period_end
+
+        await fx.service.upgrade_license(
+            actor_user_id=None, license_id=license_id, new_plan_id=pro.id
+        )
+
+        assert subscription.current_period_start == period_start
+        assert subscription.current_period_end == period_end
+
+    async def test_a_license_with_no_subscription_is_not_an_error(self) -> None:
+        """A manually assigned license that never went through checkout is
+        a legitimate state, not something to raise on."""
+        fx = make_license_service()
+        starter = await _create_plan(fx.plan_repository, slug="starter-nosub")
+        pro = await _create_plan(
+            fx.plan_repository,
+            slug="pro-nosub",
+            plan_type=PlanType.PROFESSIONAL.value,
+        )
+        org_id = uuid.uuid4()
+        license_ = await fx.service.assign_license(
+            actor_user_id=None, organization_id=org_id, plan_id=starter.id
+        )
+        await fx.service.activate_license(actor_user_id=None, license_id=license_.id)
+
+        upgraded = await fx.service.upgrade_license(
+            actor_user_id=None, license_id=license_.id, new_plan_id=pro.id
+        )
+
+        assert upgraded.plan_id == pro.id
+
+    async def test_another_organizations_subscription_is_untouched(self) -> None:
+        fx, starter, pro, license_id, _subscription = await self._setup()
+        assert fx.subscription_repository is not None
+        other_org = uuid.uuid4()
+        now = datetime.now(UTC)
+        other = await fx.subscription_repository.add(
+            organization_id=other_org,
+            license_id=uuid.uuid4(),
+            plan_id=starter.id,
+            status="active",
+            billing_cycle=BillingCycle.MONTHLY.value,
+            current_period_start=now,
+            current_period_end=now + timedelta(days=30),
+            trial_end=None,
+            auto_renew=True,
+            cancel_at_period_end=False,
+            started_at=now,
+        )
+        untouched_plan_id = other.plan_id
+
+        await fx.service.upgrade_license(
+            actor_user_id=None, license_id=license_id, new_plan_id=pro.id
+        )
+
+        assert other.plan_id == untouched_plan_id
 
 
 class TestLicenseUpgradeDowngrade:

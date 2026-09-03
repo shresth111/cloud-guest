@@ -49,6 +49,7 @@ from app.domains.billing.exceptions import (
 from app.domains.billing.invoice_pdf import SellerInfo, render_invoice_pdf
 from app.domains.billing.models import (
     BillingProfile,
+    CouponUsage,
     CreditDebitNote,
     Invoice,
     InvoiceItem,
@@ -59,7 +60,10 @@ from app.domains.billing.models import (
 )
 from app.domains.billing.number_generator import generate_invoice_number
 from app.domains.billing.service import InvoiceService
-from app.domains.billing.validators import compute_tax_breakdown
+from app.domains.billing.validators import (
+    compute_tax_breakdown,
+    compute_taxable_value,
+)
 from app.domains.rbac.enums import AuditAction
 
 # ============================================================================
@@ -291,6 +295,18 @@ class FakeInvoiceRepository:
             if i.status == InvoiceStatus.ISSUED.value and i.due_date <= now
         ]
 
+    async def has_discounted_invoice(self, subscription_id: uuid.UUID) -> bool:
+        # Mirrors InvoiceRepository.has_discounted_invoice's own predicate,
+        # VOID/CANCELLED exclusion included -- a discount on an invoice that
+        # was reversed or never sent was not, in the end, granted.
+        return any(
+            i.subscription_id == subscription_id
+            and i.status
+            not in (InvoiceStatus.VOID.value, InvoiceStatus.CANCELLED.value)
+            and (i.discount_amount or Decimal("0")) > 0
+            for i in self.invoices.values()
+        )
+
     async def create_invoice_item(self, **fields: object) -> InvoiceItem:
         item = InvoiceItem(**_base_fields(**fields))
         self.items[item.id] = item
@@ -308,6 +324,30 @@ class FakeAuditWriter:
         self.entries.append(fields)
 
 
+@dataclass
+class FakeCouponRepository:
+    """The narrow slice of ``CouponRepositoryProtocol``
+    ``InvoiceService._resolve_coupon_discount`` actually uses. Deliberately
+    only the redemption lookup: the service reads the *frozen* usage row and
+    never touches the ``Coupon`` itself, and a fake that cannot serve a
+    coupon makes that impossible to get wrong by accident."""
+
+    usages: dict[uuid.UUID, CouponUsage] = field(default_factory=dict)
+
+    async def create_coupon_usage(self, **fields: object) -> CouponUsage:
+        usage = CouponUsage(**_base_fields(**fields))
+        self.usages[usage.id] = usage
+        return usage
+
+    async def get_usage_for_subscription(
+        self, subscription_id: uuid.UUID
+    ) -> CouponUsage | None:
+        candidates = [
+            u for u in self.usages.values() if u.subscription_id == subscription_id
+        ]
+        return min(candidates, key=lambda u: u.used_at) if candidates else None
+
+
 def _make_invoice_service(
     *,
     invoice_repository: FakeInvoiceRepository | None = None,
@@ -317,6 +357,7 @@ def _make_invoice_service(
     tax_rate_repository: FakeTaxRateRepository | None = None,
     number_counter_repository: FakeNumberCounterRepository | None = None,
     note_repository: FakeCreditDebitNoteRepository | None = None,
+    coupon_repository: FakeCouponRepository | None = None,
     platform_gst_state: str = "Maharashtra",
     platform_gst_country: str = "IN",
     audit_writer: FakeAuditWriter | None = None,
@@ -350,6 +391,7 @@ def _make_invoice_service(
         note_repository=note_repository,
         platform_gst_state=platform_gst_state,
         platform_gst_country=platform_gst_country,
+        coupon_repository=coupon_repository,
         invoice_due_days=15,
         audit_writer=audit_writer,
     )
@@ -370,6 +412,7 @@ async def _make_subscription_and_plan(
     organization_id: uuid.UUID,
     base_price: Decimal = Decimal("29.99"),
     currency: str = "INR",
+    applied_coupon_id: uuid.UUID | None = None,
 ) -> tuple[Plan, Subscription]:
     plan = await plan_repository.create_plan(
         name="Professional",
@@ -397,6 +440,7 @@ async def _make_subscription_and_plan(
         auto_renew=True,
         cancel_at_period_end=False,
         started_at=now,
+        applied_coupon_id=applied_coupon_id,
     )
     return plan, subscription
 
@@ -1003,6 +1047,7 @@ class TestInvoicePdfGeneration:
                 issue_date=_now(),
                 due_date=_now() + timedelta(days=15),
                 subtotal=Decimal("1000.00"),
+                discount_amount=Decimal("0.00"),
                 cgst_amount=Decimal("90.00"),
                 sgst_amount=Decimal("90.00"),
                 igst_amount=Decimal("0.00"),
@@ -1070,6 +1115,40 @@ class TestInvoicePdfGeneration:
         # EOF/size checks above already establish that).
         assert b"CGST" in pdf_bytes or len(pdf_bytes) > 1000
         assert b"SGST" in pdf_bytes or len(pdf_bytes) > 1000
+
+    def test_render_invoice_pdf_emits_a_discount_row_only_when_discounted(
+        self,
+    ) -> None:
+        """The Discount row is conditional, like the CGST/SGST/IGST rows.
+
+        Asserted differentially rather than by grepping the bytes for
+        ``b"Discount"``: reportlab embeds subset fonts and writes text as
+        glyph indices, so the literal never appears in the file even after
+        inflating the content streams (verified -- it is absent from both
+        the discounted and the undiscounted render). A same-input pair that
+        differs *only* in ``discount_amount`` and produces a larger document
+        is real evidence the extra row was drawn; a byte-grep here would
+        assert nothing at all.
+        """
+        seller = SellerInfo(
+            legal_business_name="CloudGuest",
+            gstin="",
+            state="Maharashtra",
+            country="IN",
+        )
+        plain_invoice, plain_items = self._sample_invoice_and_items()
+        plain_invoice.discount_amount = Decimal("0.00")
+        plain_pdf = render_invoice_pdf(plain_invoice, plain_items, seller=seller)
+
+        discounted_invoice, discounted_items = self._sample_invoice_and_items()
+        discounted_invoice.discount_amount = Decimal("200.00")
+        discounted_pdf = render_invoice_pdf(
+            discounted_invoice, discounted_items, seller=seller
+        )
+
+        assert plain_pdf[:4] == b"%PDF"
+        assert discounted_pdf[:4] == b"%PDF"
+        assert len(discounted_pdf) > len(plain_pdf)
 
     def test_render_invoice_pdf_with_credit_notes(self) -> None:
         invoice, items = self._sample_invoice_and_items()
@@ -1315,3 +1394,392 @@ class TestRecordInvoiceEmailed:
         assert len(emailed_entries) == 1
         assert "FAILED" in emailed_entries[0]["description"]
         assert "SMTP connection timed out" in emailed_entries[0]["description"]
+
+
+# ============================================================================
+# The signup coupon: consumed at signup, and -- until this was fixed --
+# never actually granted on any invoice
+# ============================================================================
+
+
+async def _make_coupon_usage(
+    coupon_repository: FakeCouponRepository,
+    *,
+    subscription_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    discount_amount_applied: Decimal,
+    coupon_id: uuid.UUID | None = None,
+    used_at: datetime | None = None,
+) -> CouponUsage:
+    return await coupon_repository.create_coupon_usage(
+        coupon_id=coupon_id or uuid.uuid4(),
+        organization_id=organization_id,
+        subscription_id=subscription_id,
+        used_at=used_at or _now(),
+        discount_amount_applied=discount_amount_applied,
+    )
+
+
+class TestComputeTaxableValue:
+    """The pure discount-before-tax rule (CGST Act s.15(3)(a))."""
+
+    def test_discount_is_subtracted_before_tax_is_computed(self) -> None:
+        assert compute_taxable_value(Decimal("1000.00"), Decimal("250.00")) == Decimal(
+            "750.00"
+        )
+
+    def test_zero_discount_leaves_the_subtotal_untouched(self) -> None:
+        assert compute_taxable_value(Decimal("1000.00"), Decimal("0")) == Decimal(
+            "1000.00"
+        )
+
+    def test_discount_larger_than_the_subtotal_clamps_to_zero_never_negative(
+        self,
+    ) -> None:
+        # A fixed-amount coupon can outlive the plan repricing that made it
+        # bigger than base_price. The honest outcome is a free period, not a
+        # negative taxable value that would compute negative tax and turn an
+        # invoice into a silent credit note.
+        assert compute_taxable_value(Decimal("500.00"), Decimal("800.00")) == Decimal(
+            "0"
+        )
+
+
+class TestSignupCouponDiscountOnInvoice:
+    async def test_invoice_grants_the_coupon_and_taxes_the_discounted_value(
+        self,
+    ) -> None:
+        """The whole point of the fix.
+
+        Before it, ``apply_coupon`` wrote the usage row, incremented the
+        coupon's ``current_uses`` and stamped ``applied_coupon_id`` -- and
+        the invoice charged the full ``base_price`` anyway. The coupon was
+        spent and never granted.
+        """
+        coupon_repository = FakeCouponRepository()
+        coupon_id = uuid.uuid4()
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            tax_rate_repository,
+        ) = _make_invoice_service(coupon_repository=coupon_repository)
+        org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository,
+            plan_repository,
+            organization_id=org_id,
+            base_price=Decimal("1000.00"),
+            applied_coupon_id=coupon_id,
+        )
+        await _make_billing_profile(
+            billing_profile_repository,
+            organization_id=org_id,
+            billing_state="Maharashtra",  # same as platform -> CGST + SGST
+        )
+        await tax_rate_repository.create_tax_rate(
+            name="India GST",
+            tax_type=TaxType.GST.value,
+            rate_percentage=Decimal("18.00"),
+            country_code="IN",
+            is_active=True,
+        )
+        await _make_coupon_usage(
+            coupon_repository,
+            subscription_id=subscription.id,
+            organization_id=org_id,
+            discount_amount_applied=Decimal("200.00"),
+            coupon_id=coupon_id,
+        )
+
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+
+        assert invoice.subtotal == Decimal("1000.00")  # gross, unchanged
+        assert invoice.discount_amount == Decimal("200.00")
+        # 18% of 800, not of 1000 -- taxing the gross would over-collect GST
+        # on 200 the customer never paid.
+        assert invoice.tax_amount == Decimal("144.00")
+        assert invoice.cgst_amount == Decimal("72.00")
+        assert invoice.sgst_amount == Decimal("72.00")
+        assert invoice.total_amount == Decimal("944.00")
+
+    async def test_line_item_carries_the_gross_charge_not_the_discounted_one(
+        self,
+    ) -> None:
+        coupon_repository = FakeCouponRepository()
+        coupon_id = uuid.uuid4()
+        (
+            service,
+            invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service(coupon_repository=coupon_repository)
+        org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository,
+            plan_repository,
+            organization_id=org_id,
+            base_price=Decimal("1000.00"),
+            applied_coupon_id=coupon_id,
+        )
+        await _make_billing_profile(
+            billing_profile_repository, organization_id=org_id, tax_exempt=True
+        )
+        await _make_coupon_usage(
+            coupon_repository,
+            subscription_id=subscription.id,
+            organization_id=org_id,
+            discount_amount_applied=Decimal("250.00"),
+            coupon_id=coupon_id,
+        )
+
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+        items = await invoice_repository.list_items(invoice.id)
+
+        # The customer bought one full subscription period and was then
+        # given money off it. Netting the discount into the line would
+        # misstate what was sold.
+        assert len(items) == 1
+        assert items[0].unit_price == Decimal("1000.00")
+        assert items[0].amount == Decimal("1000.00")
+        assert invoice.discount_amount == Decimal("250.00")
+        assert invoice.total_amount == Decimal("750.00")
+
+    async def test_the_coupon_is_granted_once_second_invoice_is_undiscounted(
+        self,
+    ) -> None:
+        """``generate_invoice_for_subscription`` is wired to an
+        operator-triggered endpoint, so it can legitimately run twice. One
+        redemption must not fund an unlimited number of discounted
+        invoices."""
+        coupon_repository = FakeCouponRepository()
+        coupon_id = uuid.uuid4()
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service(coupon_repository=coupon_repository)
+        org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository,
+            plan_repository,
+            organization_id=org_id,
+            base_price=Decimal("1000.00"),
+            applied_coupon_id=coupon_id,
+        )
+        await _make_billing_profile(
+            billing_profile_repository, organization_id=org_id, tax_exempt=True
+        )
+        await _make_coupon_usage(
+            coupon_repository,
+            subscription_id=subscription.id,
+            organization_id=org_id,
+            discount_amount_applied=Decimal("200.00"),
+            coupon_id=coupon_id,
+        )
+
+        first = await service.generate_invoice_for_subscription(subscription.id)
+        second = await service.generate_invoice_for_subscription(subscription.id)
+
+        assert first.discount_amount == Decimal("200.00")
+        assert first.total_amount == Decimal("800.00")
+        assert second.discount_amount == Decimal("0")
+        assert second.total_amount == Decimal("1000.00")
+
+    async def test_voiding_the_discounted_invoice_frees_the_grant_again(
+        self,
+    ) -> None:
+        """A discount on a formally reversed invoice was not, in the end,
+        granted -- the reissue must carry it rather than silently charging
+        full price for a coupon the organization already spent."""
+        coupon_repository = FakeCouponRepository()
+        coupon_id = uuid.uuid4()
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service(coupon_repository=coupon_repository)
+        org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository,
+            plan_repository,
+            organization_id=org_id,
+            base_price=Decimal("1000.00"),
+            applied_coupon_id=coupon_id,
+        )
+        await _make_billing_profile(
+            billing_profile_repository, organization_id=org_id, tax_exempt=True
+        )
+        await _make_coupon_usage(
+            coupon_repository,
+            subscription_id=subscription.id,
+            organization_id=org_id,
+            discount_amount_applied=Decimal("200.00"),
+            coupon_id=coupon_id,
+        )
+
+        first = await service.generate_invoice_for_subscription(subscription.id)
+        await service.void_invoice(actor_user_id=None, invoice_id=first.id)
+        reissued = await service.generate_invoice_for_subscription(subscription.id)
+
+        assert reissued.discount_amount == Decimal("200.00")
+        assert reissued.total_amount == Decimal("800.00")
+
+    async def test_discount_is_read_from_the_frozen_usage_row(self) -> None:
+        """The amount comes from ``CouponUsage.discount_amount_applied``,
+        frozen at redemption -- never re-derived from the live ``Coupon``,
+        whose ``discount_value`` is editable. ``FakeCouponRepository``
+        cannot even serve a coupon, so a recomputation would fail loudly."""
+        coupon_repository = FakeCouponRepository()
+        coupon_id = uuid.uuid4()
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service(coupon_repository=coupon_repository)
+        org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository,
+            plan_repository,
+            organization_id=org_id,
+            base_price=Decimal("1000.00"),
+            applied_coupon_id=coupon_id,
+        )
+        await _make_billing_profile(
+            billing_profile_repository, organization_id=org_id, tax_exempt=True
+        )
+        await _make_coupon_usage(
+            coupon_repository,
+            subscription_id=subscription.id,
+            organization_id=org_id,
+            discount_amount_applied=Decimal("137.50"),
+            coupon_id=coupon_id,
+        )
+
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+
+        assert invoice.discount_amount == Decimal("137.50")
+        assert invoice.total_amount == Decimal("862.50")
+
+    async def test_discount_exceeding_the_plan_price_gives_a_free_zero_tax_period(
+        self,
+    ) -> None:
+        coupon_repository = FakeCouponRepository()
+        coupon_id = uuid.uuid4()
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            tax_rate_repository,
+        ) = _make_invoice_service(coupon_repository=coupon_repository)
+        org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository,
+            plan_repository,
+            organization_id=org_id,
+            base_price=Decimal("500.00"),
+            applied_coupon_id=coupon_id,
+        )
+        await _make_billing_profile(billing_profile_repository, organization_id=org_id)
+        await tax_rate_repository.create_tax_rate(
+            name="India GST",
+            tax_type=TaxType.GST.value,
+            rate_percentage=Decimal("18.00"),
+            country_code="IN",
+            is_active=True,
+        )
+        await _make_coupon_usage(
+            coupon_repository,
+            subscription_id=subscription.id,
+            organization_id=org_id,
+            discount_amount_applied=Decimal("800.00"),
+            coupon_id=coupon_id,
+        )
+
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+
+        assert invoice.discount_amount == Decimal("800.00")
+        assert invoice.tax_amount == Decimal("0.00")
+        assert invoice.total_amount == Decimal("0.00")
+
+    async def test_subscription_without_a_coupon_is_billed_exactly_as_before(
+        self,
+    ) -> None:
+        """Regression guard: the discount path must be inert for the
+        overwhelming majority of subscriptions, which redeemed nothing."""
+        coupon_repository = FakeCouponRepository()
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            tax_rate_repository,
+        ) = _make_invoice_service(coupon_repository=coupon_repository)
+        org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository,
+            plan_repository,
+            organization_id=org_id,
+            base_price=Decimal("1000.00"),
+        )
+        await _make_billing_profile(billing_profile_repository, organization_id=org_id)
+        await tax_rate_repository.create_tax_rate(
+            name="India GST",
+            tax_type=TaxType.GST.value,
+            rate_percentage=Decimal("18.00"),
+            country_code="IN",
+            is_active=True,
+        )
+
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+
+        assert invoice.discount_amount == Decimal("0")
+        assert invoice.tax_amount == Decimal("180.00")
+        assert invoice.total_amount == Decimal("1180.00")
+
+    async def test_no_coupon_repository_wired_in_degrades_to_no_discount(
+        self,
+    ) -> None:
+        """``coupon_repository`` is optional, and its absence must produce a
+        full-price invoice rather than an AttributeError -- the honest,
+        conservative outcome, and exactly the pre-fix behaviour."""
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service()  # no coupon repository
+        org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository,
+            plan_repository,
+            organization_id=org_id,
+            base_price=Decimal("1000.00"),
+            applied_coupon_id=uuid.uuid4(),
+        )
+        await _make_billing_profile(
+            billing_profile_repository, organization_id=org_id, tax_exempt=True
+        )
+
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+
+        assert invoice.discount_amount == Decimal("0")
+        assert invoice.total_amount == Decimal("1000.00")

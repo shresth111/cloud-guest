@@ -293,6 +293,28 @@ class FakeSubscriptionRepository:
             and s.current_period_end <= now
         ]
 
+    async def list_lapsed_non_renewing(
+        self, *, now: datetime
+    ) -> list[Subscription]:
+        # The exact complement of list_due_for_renewal's auto_renew
+        # predicate, otherwise the identical filter -- mirrors
+        # SubscriptionRepository.list_lapsed_non_renewing.
+        cyclic = {BillingCycle.MONTHLY.value, BillingCycle.YEARLY.value}
+        # ACTIVE/TRIALING only -- PAST_DUE belongs to the grace-period
+        # phase, not this one.
+        renewable = {
+            SubscriptionStatus.TRIALING.value,
+            SubscriptionStatus.ACTIVE.value,
+        }
+        return [
+            s
+            for s in self.subscriptions.values()
+            if not s.auto_renew
+            and s.billing_cycle in cyclic
+            and s.status in renewable
+            and s.current_period_end <= now
+        ]
+
 
 @dataclass
 class FakeCouponRepository:
@@ -1227,6 +1249,126 @@ class TestRenewalSweep:
 
 
 class TestGracePeriodExpiry:
+    async def _non_renewing(
+        self,
+        fx: RenewalFixture,
+        *,
+        status: str = SubscriptionStatus.ACTIVE.value,
+        auto_renew: bool = False,
+        days_past_period_end: int = 5,
+    ):
+        plan = await _make_plan(fx.plan_repository)
+        org_id = uuid.uuid4()
+        license_ = await _assign_and_activate_license(
+            fx.license_fixture, organization_id=org_id, plan_id=plan.id
+        )
+        now = _now()
+        subscription = await fx.subscription_repository.create_subscription(
+            organization_id=org_id,
+            license_id=license_.id,
+            plan_id=plan.id,
+            status=status,
+            billing_cycle=plan.billing_cycle,
+            current_period_start=now - timedelta(days=30 + days_past_period_end),
+            current_period_end=now - timedelta(days=days_past_period_end),
+            trial_end=None,
+            auto_renew=auto_renew,
+            cancel_at_period_end=False,
+            started_at=now - timedelta(days=30 + days_past_period_end),
+        )
+        return subscription, license_
+
+    async def test_auto_renew_off_past_period_end_ends_the_subscription(self) -> None:
+        """The bug: turning auto-renewal off made a subscription immortal.
+
+        ``list_due_for_renewal`` requires ``auto_renew=True``, so the row
+        never entered the sweep; never charged, it never became
+        ``PAST_DUE``, so the grace-period phase never saw it either. It sat
+        ``ACTIVE`` past its paid period with a valid license, for free.
+        """
+        fx = make_renewal_service()
+        subscription, license_ = await self._non_renewing(fx)
+
+        lapsed_ids = await fx.service.lapse_non_renewing_subscriptions()
+        assert lapsed_ids == [subscription.id]
+
+        after = await fx.subscription_repository.get_by_id(subscription.id)
+        assert after.status == SubscriptionStatus.CANCELLED.value
+        assert after.cancelled_at is not None
+        # The real, unmodified LicenseService.suspend_license ran -- checked
+        # by its own state transition, not a reimplementation of it here.
+        license_after = await fx.license_fixture.license_repository.get_by_id(
+            license_.id
+        )
+        assert license_after.status == LicenseStatus.SUSPENDED.value
+
+    async def test_still_inside_the_paid_period_is_left_alone(self) -> None:
+        """Auto-renewal off does not end the subscription early -- the
+        customer paid for this period and it runs to its end."""
+        fx = make_renewal_service()
+        subscription, _license = await self._non_renewing(
+            fx, days_past_period_end=-5  # period ends 5 days from now
+        )
+
+        assert await fx.service.lapse_non_renewing_subscriptions() == []
+        after = await fx.subscription_repository.get_by_id(subscription.id)
+        assert after.status == SubscriptionStatus.ACTIVE.value
+
+    async def test_auto_renew_on_is_never_lapsed_here(self) -> None:
+        """A renewing subscription belongs to ``process_due_renewals``.
+        These two phases must never both claim one row."""
+        fx = make_renewal_service()
+        subscription, _license = await self._non_renewing(fx, auto_renew=True)
+
+        assert await fx.service.lapse_non_renewing_subscriptions() == []
+        after = await fx.subscription_repository.get_by_id(subscription.id)
+        assert after.status == SubscriptionStatus.ACTIVE.value
+
+    async def test_past_due_is_left_to_the_grace_period_phase(self) -> None:
+        """Turning auto-renewal off while past due must not cut the
+        customer off before the grace days they still had."""
+        fx = make_renewal_service(grace_period_days=7)
+        subscription, _license = await self._non_renewing(
+            fx, status=SubscriptionStatus.PAST_DUE.value
+        )
+
+        assert await fx.service.lapse_non_renewing_subscriptions() == []
+        after = await fx.subscription_repository.get_by_id(subscription.id)
+        assert after.status == SubscriptionStatus.PAST_DUE.value
+
+    async def test_a_lapse_failure_does_not_strand_its_siblings(self) -> None:
+        """Per-subscription isolation, same as every other sweep phase."""
+        fx = make_renewal_service()
+        doomed, _l1 = await self._non_renewing(fx)
+        healthy, _l2 = await self._non_renewing(fx)
+
+        real_suspend = fx.license_fixture.service.suspend_license
+
+        async def _explode_for_doomed(*, actor_user_id, license_id, reason):
+            if license_id == doomed.license_id:
+                raise RuntimeError("suspension blew up")
+            return await real_suspend(
+                actor_user_id=actor_user_id, license_id=license_id, reason=reason
+            )
+
+        fx.license_fixture.service.suspend_license = _explode_for_doomed  # type: ignore[method-assign]
+
+        lapsed_ids = await fx.service.lapse_non_renewing_subscriptions()
+
+        assert lapsed_ids == [healthy.id]
+
+    async def test_the_sweep_reports_lapsed_separately_from_expired(self) -> None:
+        """``lapsed_subscription_ids`` is its own field: "the customer chose
+        to stop paying" and "a charge failed and grace ran out" are
+        different outcomes and are reported as such."""
+        fx = make_renewal_service()
+        subscription, _license = await self._non_renewing(fx)
+
+        report = await fx.service.run_renewal_sweep()
+
+        assert report.lapsed_subscription_ids == [subscription.id]
+        assert report.expired_subscription_ids == []
+
     async def test_expire_lapsed_subscriptions_calls_real_expire_license(self) -> None:
         fx = make_renewal_service(grace_period_days=7)
         plan = await _make_plan(fx.plan_repository)

@@ -258,6 +258,10 @@ class RenewalSweepReport:
     logs/returns."""
 
     renewal: RenewalSweepResult
+    #: Subscriptions ended because auto-renewal was off and their paid
+    #: period ran out -- distinct from ``expired_subscription_ids``, which
+    #: is the grace-period-exhausted-after-a-failed-charge outcome.
+    lapsed_subscription_ids: list[uuid.UUID]
     expired_subscription_ids: list[uuid.UUID]
     renewal_reminders_sent: int
     expiry_reminders_sent: int
@@ -507,6 +511,94 @@ class RenewalService:
         )
         return updated
 
+    async def lapse_non_renewing_subscriptions(self) -> list[uuid.UUID]:
+        """Ends every subscription whose paid period has run out and which
+        is not going to renew, because the customer turned auto-renewal off.
+
+        ## What was broken
+
+        Turning auto-renewal off made a subscription immortal.
+        ``list_due_for_renewal`` filters ``auto_renew=True``, so such a row
+        never entered the sweep; never being charged, it never became
+        ``PAST_DUE``, so ``expire_lapsed_subscriptions`` never saw it
+        either; and ``cancel_subscription``'s scheduled path sets
+        ``cancel_at_period_end`` while deliberately leaving ``auto_renew``
+        alone, so that finalizer did not apply. The subscription simply sat
+        ``ACTIVE`` past ``current_period_end`` with a valid license --
+        indefinitely, for free. ``send_renewal_reminders`` skips
+        ``auto_renew=False`` too, so nobody was even told.
+
+        ## What this does instead
+
+        The subscription runs to the end of the period the customer paid
+        for, and then ends -- the standard meaning of "auto-renewal is off",
+        and the same terminal outcome
+        ``_finalize_scheduled_cancellation`` already produces for
+        ``cancel_at_period_end``: ``CANCELLED``, ``cancelled_at`` stamped,
+        and the license suspended via the same unmodified
+        ``LicenseService.suspend_license`` call. It is deliberately *not* a
+        new terminal status: "the customer chose to stop paying and the
+        period ended" is the same fact whether they expressed it by
+        scheduling a cancellation or by switching renewal off, and inventing
+        a second status for it would give two names to one outcome.
+
+        Ordered after ``process_due_renewals`` in ``run_renewal_sweep`` so a
+        subscription can never be renewed and lapsed in the same tick (it
+        cannot be in both queries anyway -- their ``auto_renew`` predicates
+        are opposites -- but the ordering keeps that true independently of
+        the two queries agreeing). ``PAST_DUE`` rows are excluded from this
+        phase entirely and left to ``expire_lapsed_subscriptions``, so that
+        turning auto-renewal off while past due cannot cut a customer off
+        before the grace days they still had.
+
+        Per-subscription failure isolation, same as every other phase: one
+        organization's suspension failing must not strand the rest.
+        """
+        now = datetime.now(UTC)
+        lapsed = await self.repository.list_lapsed_non_renewing(now=now)
+        lapsed_ids: list[uuid.UUID] = []
+        for subscription in lapsed:
+            try:
+                updated = await self.repository.update_subscription(
+                    subscription,
+                    {
+                        "status": SubscriptionStatus.CANCELLED.value,
+                        "cancelled_at": now,
+                        "past_due_at": None,
+                    },
+                )
+                await self.license_service.suspend_license(
+                    actor_user_id=None,
+                    license_id=updated.license_id,
+                    reason="Subscription's billing period ended with "
+                    "auto-renewal turned off",
+                )
+            except Exception:  # noqa: BLE001 -- per-subscription isolation
+                logger.exception(
+                    "billing_subscription_lapse_failed",
+                    extra={"subscription_id": str(subscription.id)},
+                )
+                continue
+            lapsed_ids.append(updated.id)
+            event = SubscriptionCancelled(
+                subscription_id=updated.id,
+                organization_id=updated.organization_id,
+                immediate=False,
+            )
+            logger.info(
+                "billing_subscription_lapsed_auto_renew_off",
+                extra=_event_extra(event),
+            )
+            await self._audit(
+                AuditAction.SUBSCRIPTION_CANCELLED,
+                updated,
+                description=(
+                    f"Subscription {updated.id} lapsed at period end "
+                    "(auto-renewal was off)"
+                ),
+            )
+        return lapsed_ids
+
     # ========================================================================
     # Grace period -> license expiry (composes Part 1's deferred
     # LicenseService.expire_license -- see module docstring)
@@ -738,7 +830,8 @@ class RenewalService:
 
     async def run_renewal_sweep(self) -> RenewalSweepReport:
         """The one method the Celery Beat task calls -- runs every phase in
-        a defensible order (renew due subscriptions first, then expire
+        a defensible order (renew due subscriptions first, then lapse the
+        ones whose paid period ran out with auto-renewal off, then expire
         whichever ones have now exhausted their grace period, then send
         both kinds of reminder for whatever remains), with each phase
         isolated from the others' failures the same way each phase already
@@ -749,6 +842,14 @@ class RenewalService:
         except Exception:  # noqa: BLE001 -- phase isolation
             logger.exception(
                 "billing_renewal_sweep_phase_failed", extra={"phase": "renew"}
+            )
+
+        lapsed_ids: list[uuid.UUID] = []
+        try:
+            lapsed_ids = await self.lapse_non_renewing_subscriptions()
+        except Exception:  # noqa: BLE001 -- phase isolation
+            logger.exception(
+                "billing_renewal_sweep_phase_failed", extra={"phase": "lapse"}
             )
 
         expired_ids: list[uuid.UUID] = []
@@ -779,6 +880,7 @@ class RenewalService:
 
         return RenewalSweepReport(
             renewal=renewal_result,
+            lapsed_subscription_ids=lapsed_ids,
             expired_subscription_ids=expired_ids,
             renewal_reminders_sent=renewal_reminders_sent,
             expiry_reminders_sent=expiry_reminders_sent,

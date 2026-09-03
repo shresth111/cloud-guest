@@ -138,6 +138,7 @@ def run_subscription_renewal_sweep() -> dict[str, object]:
             "subscriptions_checked": report.renewal.subscriptions_checked,
             "renewed": report.renewal.renewed,
             "failed_count": len(report.renewal.failed),
+            "lapsed_count": len(report.lapsed_subscription_ids),
             "expired_count": len(report.expired_subscription_ids),
             "renewal_reminders_sent": report.renewal_reminders_sent,
             "expiry_reminders_sent": report.expiry_reminders_sent,
@@ -149,6 +150,9 @@ def run_subscription_renewal_sweep() -> dict[str, object]:
         "failed": [
             {"subscription_id": str(sub_id), "error": error}
             for sub_id, error in report.renewal.failed
+        ],
+        "lapsed_subscription_ids": [
+            str(sub_id) for sub_id in report.lapsed_subscription_ids
         ],
         "expired_subscription_ids": [
             str(sub_id) for sub_id in report.expired_subscription_ids
