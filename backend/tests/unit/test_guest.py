@@ -356,6 +356,16 @@ class FakeRouterService:
 
     routers: dict[uuid.UUID, Router] = field(default_factory=dict)
 
+    def get_decrypted_api_secret(self, router: Router) -> str | None:
+        """The real ``RouterService`` decrypts ``api_credentials_encrypted``
+        with Fernet. These fakes never encrypt one, so a fixed plaintext
+        stands in -- what the device-push path needs is *a* secret and the
+        refusal behaviour when there is none, not a real key.
+        """
+        if getattr(router, "api_credentials_encrypted", None) is None:
+            return None
+        return "fake-api-secret"
+
     def add(
         self,
         *,
@@ -645,6 +655,18 @@ class FakeGuestRepository:
     real repository's SQL aggregates compute (the same "test the arithmetic
     against a hand-rolled fake" convention ``test_voucher.py``'s
     ``FakeVoucherRepository.get_batch_status_counts`` already established)."""
+
+    async def commit(self) -> None:
+        """A no-op: this fake mutates objects in place, so there is no
+        transaction to commit.
+
+        Present because the RADIUS device-push path calls it deliberately --
+        the real repository only ``flush()``es and the session rolls back on
+        any exception, so a failure record has to be committed before the
+        re-raise. Its absence here would make that path untestable rather
+        than making the fake simpler.
+        """
+        return None
 
     guests: dict[uuid.UUID, Guest] = field(default_factory=dict)
     devices: dict[uuid.UUID, GuestDevice] = field(default_factory=dict)

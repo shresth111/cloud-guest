@@ -181,6 +181,56 @@ class NoReconnectableSessionError(GuestError):
         )
 
 
+class RadiusNasDeviceOperationError(GuestError):
+    """A router-side RADIUS write failed.
+
+    502, not 200-with-an-error-body: the frontend's response interceptor
+    unwraps ``data`` and never reads ``success``, so a ``200 {"success":
+    false}`` is indistinguishable from a working push to every caller in
+    the app -- which is the exact failure mode a device-push path exists to
+    remove.
+    """
+
+    def __init__(self, operation: str, detail: str) -> None:
+        super().__init__(
+            f"RADIUS NAS device operation '{operation}' failed: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class RadiusNasMissingCredentialsError(GuestError):
+    """The router has no reachable API credentials, so no push is possible.
+
+    Refuses rather than reporting a push that never happened -- mirrors
+    ``VlanMissingCredentialsError``.
+    """
+
+    def __init__(self, router_id: object) -> None:
+        super().__init__(
+            f"Router {router_id} has no management address or API credentials, "
+            "so its RADIUS registration cannot be pushed",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class RadiusNasNotSyncedError(GuestError):
+    """The NAS row has no tunnel address, so there is nothing to send as
+    ``src-address``.
+
+    Refuses rather than pushing a registration without it: the hub matches
+    an incoming request to a ``client{}`` stanza by source address, so such
+    a registration would sit on the router looking correct and never
+    authenticate anybody.
+    """
+
+    def __init__(self, nas_id: object) -> None:
+        super().__init__(
+            f"RADIUS NAS client {nas_id} has no tunnel address yet "
+            "(the hub has not confirmed it), so it cannot be pushed to the router",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class RadiusNasClientNotFoundError(GuestError):
     def __init__(self, nas_identifier: str) -> None:
         super().__init__(

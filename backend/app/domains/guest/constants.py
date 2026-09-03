@@ -547,3 +547,38 @@ __all__ = [
     "NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES",
     "MAX_BULK_DEVICE_LOOKUP_IDS",
 ]
+
+
+class RadiusNasDevicePushStatus(StrEnum):
+    """Lifecycle of a :class:`~.models.RadiusNasClient`'s **router-side**
+    push -- the device's own ``/radius`` row and its ``/radius incoming``
+    CoA listener.
+
+    Deliberately separate from ``hub_client_synced_ip``/``_at``, which
+    record the *other* half: that the hub's FreeRADIUS confirmed a
+    ``client{}`` stanza. Both halves are required and neither implies the
+    other. A NAS registration synced to the hub but never pushed to the
+    router is the state the whole fleet was in, because until now nothing
+    in this application called the gateway writer for it.
+
+    * ``PENDING`` -- registered, never pushed from here. Every pre-existing
+      row is backfilled to this, truthfully: no code path could push one.
+      It does **not** mean the router has nothing -- a router provisioned
+      by pasting the generated setup script has a ``/radius`` row this
+      platform never wrote and cannot account for. ``PENDING`` says only
+      that *this* path has not run.
+    * ``ACTIVE`` -- the ``/radius`` row for this server exists on the
+      device carrying this platform's secret and ``src-address``, and
+      ``/radius incoming`` accepts on the CoA port. Stated that narrowly on
+      purpose: it is a claim about objects written and read back, **not**
+      that a Disconnect-Request from the hub arrives. That is device test
+      T8 (``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md``), unrun,
+      and it needs a shell on the RADIUS host. ``guest_access``'s block
+      enforcement is built not to depend on CoA for exactly this reason.
+    * ``FAILED`` -- the last attempt raised; ``device_push_error`` holds the
+      device's own words.
+    """
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    FAILED = "failed"

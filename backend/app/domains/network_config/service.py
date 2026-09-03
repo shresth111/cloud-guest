@@ -71,6 +71,7 @@ from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJo
 from app.domains.vlan.models import Vlan
 from app.domains.wireguard.exceptions import WireGuardPeerNotFoundError
 from app.domains.wireguard.models import WireGuardPeer, WireGuardServer
+from app.domains.wireguard.validators import hub_reserved_ip
 
 from .exceptions import (
     EmptyNetworkConfigError,
@@ -319,6 +320,19 @@ class BasicWanPushResult:
     wan_link_count: int
 
 
+
+def _radius_server_address(server: WireGuardServer | None) -> str | None:
+    """The address a router should send RADIUS to: the hub's own tunnel
+    address, derived from the tunnel network rather than hand-copied.
+
+    See ``app.domains.wireguard.validators.hub_reserved_ip`` -- its own
+    docstring names this exact caller as the reason it exists.
+    """
+    if server is None:
+        return None
+    return hub_reserved_ip(server.tunnel_network_cidr)
+
+
 class NetworkConfigService:
     """Core Network Configuration Management business logic -- see module
     docstring."""
@@ -520,12 +534,18 @@ class NetworkConfigService:
             wireguard_peer=peer,
             wireguard_server=server,
             radius_nas_client=nas_client,
-            # See renderers.render_network_config's own docstring: this
-            # deployment's hub and its FreeRADIUS instance are co-located
-            # on the same VM, confirmed live this session -- there is no
-            # separate "RADIUS server host" column anywhere to draw from
-            # instead.
-            radius_server_host=server.endpoint_host if server is not None else None,
+            # The hub's TUNNEL address, not ``endpoint_host``. Those are
+            # different facts: ``endpoint_host`` is the public WireGuard
+            # endpoint (``hub.wyfyguest.com``), while RADIUS has to traverse
+            # the tunnel -- the router sends from its own tunnel address and
+            # the hub's FreeRADIUS matches the ``client{}`` stanza on it, so
+            # a request aimed at the public host leaves by the WAN with a
+            # source address that is not valid there and is answered by
+            # nobody. ``hub_reserved_ip``'s own docstring states this is
+            # exactly what it exists for; passing ``endpoint_host`` here was
+            # a straight bug, and the lab router's working, hand-written
+            # ``/radius`` row holds the tunnel address, not the hostname.
+            radius_server_host=_radius_server_address(server),
             mac_authorization_entries=mac_authorization_entries,
             content_filter_rules=content_filter_rules,
         )
@@ -583,7 +603,7 @@ class NetworkConfigService:
             wireguard_peer=peer,
             wireguard_server=server,
             radius_nas_client=nas_client,
-            radius_server_host=server.endpoint_host if server is not None else None,
+            radius_server_host=_radius_server_address(server),
             mac_authorization_entries=mac_authorization_entries,
             content_filter_rules=content_filter_rules,
         )

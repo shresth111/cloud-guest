@@ -107,11 +107,14 @@ class ContentFilterDevicePushStatus(StrEnum):
       hidden here -- a guest device that sets its own DNS resolver
       bypasses a domain rule's sinkhole entirely (see this package's
       ``__init__`` docstring), and an IP/CIDR rule's shared
-      ``/ip firewall filter`` DROP rule has an unmanaged position in the
-      ``forward`` chain, so a router carrying a broad accept ahead of it
-      forwards the traffic regardless (see
+      ``/ip firewall filter`` DROP rule sits above the first ``accept`` in
+      ``forward`` but takes no view on whether a marked packet reaches that
+      chain at all on an arbitrary router (see
       ``wyfy_device_gateway.mikrotik_adapter
-      ._ensure_content_filter_enforcement_rule``).
+      ._ensure_content_filter_enforcement_rule``). Its position used to be
+      unmanaged entirely, which meant any accept ahead of it silently ended
+      blocking; that is fixed, and the position is now re-checked on every
+      push rather than only at creation.
     * ``FAILED`` -- the last push attempt raised; ``device_push_error``
       holds the device's own words.
     """

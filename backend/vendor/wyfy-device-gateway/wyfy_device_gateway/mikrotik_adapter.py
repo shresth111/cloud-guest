@@ -124,6 +124,11 @@ _PROVISIONING_ENGINE_BACKUP_FILENAME = "cloudguest-backup.backup"
 # *values* identical across both copies is what keeps them describing the
 # same real device-side objects.
 _CONTENT_FILTER_SINKHOLE_ADDRESS = "127.0.0.1"
+# Stamped on the ``/radius`` NAS row this platform manages. Not used as
+# the lookup key -- see ``set_radius_client_config`` for why the natural
+# key (service + server address) is, and why an existing hand-written row
+# is adopted rather than duplicated.
+_RADIUS_CLIENT_COMMENT = "WyfyGuest RADIUS NAS client"
 _CONTENT_FILTER_ADDRESS_LIST_NAME = "wyfyguest-content-filter-blocked"
 _CONTENT_FILTER_ENFORCEMENT_COMMENT = (
     "Wyfy Guest content filtering: block listed addresses"
@@ -3218,8 +3223,46 @@ class MikroTikAdapter:
         port=3799`` (RFC 5176 Change-of-Authorization enablement, a
         router-global setting, not per-client) operations, issued directly
         over the structured API. See module docstring for why
-        ``src-address`` (the original's WireGuard-tunnel-IP field) is
-        intentionally not part of this vendor-agnostic port."""
+        ``src-address`` is carried here, unlike in an earlier version of
+        this port that dropped it as tunnel-specific: the hub's FreeRADIUS
+        matches a request to a ``client{}`` stanza by source address, so a
+        ``/radius`` row without it registers a client that cannot
+        authenticate. See :class:`RadiusClientConfig`.
+
+        ## This converges; it used to append
+
+        The previous implementation issued a bare ``/radius add`` every
+        time, with no read first. Two pushes meant two ``/radius`` rows for
+        the same server -- and two NAS registrations with possibly
+        different secrets is a router that authenticates intermittently
+        depending on which row RouterOS consults. The script half
+        (``render_radius_client``) still has that shape; this one no longer
+        does.
+
+        **Identity is the natural key, not the comment.** Everywhere else
+        in this adapter the comment is the handle, because every other
+        field is something a customer edits. Here the row is identified by
+        ``service=hotspot`` plus ``address=<radius server>``, because that
+        pair *is* the identity as far as RouterOS is concerned -- one NAS
+        registration per server -- and because the row already on the lab
+        router carries ``comment=cloudguest-radius``, a marker this
+        codebase has never written. Somebody set it by hand at
+        provisioning. Keying on our own comment would not find it, and we
+        would add a second row beside a working one. So an existing row for
+        this server is **adopted**: updated in place and stamped with this
+        platform's comment, which makes it ours from then on.
+
+        ## The CoA half
+
+        ``/ip radius incoming`` is router-global, not per-client, and is
+        converged the same way: read, compare, write only on a difference.
+        ``accept`` is resolved through :func:`_is_truthy` rather than a
+        string compare, for the reason documented on
+        :meth:`_ensure_dhcp_server` -- the API answers a read with a real
+        ``bool`` while accepting ``"yes"``/``"no"`` on write.
+
+        Idempotent throughout: re-pushing an unchanged registration issues
+        no write at all."""
         await asyncio.to_thread(self._set_radius_client_config_sync, creds, config)
 
     def _set_radius_client_config_sync(
@@ -3228,22 +3271,64 @@ class MikroTikAdapter:
         api = self._connect_api(creds)
         try:
             try:
-                api.path("radius").add(
-                    service="hotspot",
-                    address=config.radius_server_host,
-                    secret=config.radius_secret,
-                    **{
-                        "authentication-port": str(config.auth_port),
-                        "accounting-port": str(config.acct_port),
-                    },
-                )
-                api.path("radius", "incoming").update(accept="yes", port="3799")
+                self._ensure_radius_client_row(api, config)
+                self._ensure_radius_incoming(api, config)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"set_radius_client_config: {exc}"
                 ) from exc
         finally:
             api.close()
+
+    def _ensure_radius_client_row(self, api, config: RadiusClientConfig) -> None:  # noqa: ANN001
+        """The ``/radius`` NAS registration, one per server -- see
+        :meth:`set_radius_client_config` for why the natural key and not
+        the comment."""
+        desired = {
+            "service": "hotspot",
+            "address": config.radius_server_host,
+            "secret": config.radius_secret,
+            "authentication-port": str(config.auth_port),
+            "accounting-port": str(config.acct_port),
+            "comment": _RADIUS_CLIENT_COMMENT,
+        }
+        if config.src_address:
+            desired["src-address"] = config.src_address
+
+        menu = api.path("radius")
+        for row in list(menu):
+            same_server = (
+                str(row.get("service", "")) == "hotspot"
+                and str(row.get("address", "")) == config.radius_server_host
+            )
+            if not same_server:
+                continue
+            changed = {
+                key: value
+                for key, value in desired.items()
+                if str(row.get(key, "")) != value
+            }
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(**desired, disabled="no")
+
+    def _ensure_radius_incoming(self, api, config: RadiusClientConfig) -> None:  # noqa: ANN001
+        """RFC 5176 Change-of-Authorization enablement.
+
+        Router-global: RouterOS has exactly one ``/radius incoming``
+        settings object, so this is written once regardless of how many
+        client rows exist, and re-writing it per push is a no-op rather
+        than a duplicate.
+        """
+        wanted_port = str(config.coa_port)
+        for row in api.path("radius", "incoming"):
+            if _is_truthy(row.get("accept")) and str(row.get("port", "")) == wanted_port:
+                return
+            break
+        api.path("radius", "incoming").update(accept="yes", port=wanted_port)
 
     async def configure_content_filter_rule(
         self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig

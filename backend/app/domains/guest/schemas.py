@@ -513,6 +513,11 @@ class RadiusNasResponse(BaseModel):
     # See models.RadiusNasClient.hub_client_synced_ip.
     hub_client_synced_ip: str | None = None
     hub_client_synced_at: datetime | None = None
+    # The router half. Separate from the hub half above and implying
+    # nothing about it -- see constants.RadiusNasDevicePushStatus.
+    device_push_status: str = "pending"
+    device_push_error: str | None = None
+    device_pushed_at: datetime | None = None
     vendor: str
     created_at: datetime
     updated_at: datetime
