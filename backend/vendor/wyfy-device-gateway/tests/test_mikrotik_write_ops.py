@@ -15,6 +15,7 @@ from wyfy_device_gateway.contract import (
     NatRuleConfig,
     PortForwardConfig,
     QosPacketMarkConfig,
+    RadiusClientConfig,
     VlanConfig,
     VlanHotspotConfig,
 )
@@ -2571,3 +2572,177 @@ async def test_with_no_accept_in_forward_the_drop_is_appended(
     ]
     assert "place-before" not in filter_adds[0]
     assert _forward_comments(api)[-1] == _ENFORCEMENT_COMMENT
+
+
+# ----------------------------------------------------------------------
+# The /radius NAS registration and its CoA listener.
+#
+# This writer existed with zero callers in app/ and no test at all. Wiring
+# it up as it stood would have added a second /radius row on every push,
+# and registered a client with no src-address -- which the hub's
+# FreeRADIUS matches on, so it could never have authenticated.
+# ----------------------------------------------------------------------
+
+_RADIUS_COMMENT = "WyfyGuest RADIUS NAS client"
+
+
+def _radius_config(**overrides):
+    fields = {
+        "radius_server_host": "10.20.0.1",
+        "radius_secret": "s3cret",
+        "src_address": "10.20.0.14",
+    }
+    fields.update(overrides)
+    return RadiusClientConfig(**fields)
+
+
+def _radius_rows(api):
+    return list(api.path("radius"))
+
+
+@pytest.mark.asyncio
+async def test_radius_registration_carries_the_tunnel_source_address(
+    patch_connect, mikrotik_creds
+):
+    """The hub matches a request to a client{} stanza by source address, so
+    a row without it is a registration that cannot authenticate."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().set_radius_client_config(
+        mikrotik_creds, config=_radius_config()
+    )
+
+    written = next(
+        fields for segments, fields in api.add_calls if segments == ("radius",)
+    )
+    assert written["src-address"] == "10.20.0.14"
+    assert written["service"] == "hotspot"
+    assert written["comment"] == _RADIUS_COMMENT
+
+
+@pytest.mark.asyncio
+async def test_a_second_push_does_not_add_a_second_radius_row(
+    patch_connect, mikrotik_creds
+):
+    # A real router always carries exactly one /radius incoming row -- it is
+    # a settings object, not a list -- so the fake is given one. Starting it
+    # empty would model a device that cannot exist.
+    api = FakeRouterOSApi(
+        menus={("radius", "incoming"): [
+            {".id": "*1", "accept": False, "port": "1700"}
+        ]}
+    )
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.set_radius_client_config(mikrotik_creds, config=_radius_config())
+    api.add_calls.clear()
+    api.update_calls.clear()
+    await adapter.set_radius_client_config(mikrotik_creds, config=_radius_config())
+
+    assert len(_radius_rows(api)) == 1
+    assert api.add_calls == []
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_existing_hand_written_row_is_adopted_not_duplicated(
+    patch_connect, mikrotik_creds
+):
+    """The lab router's row carries `comment=cloudguest-radius`, which this
+    codebase has never written -- somebody set it by hand. Keyed on our own
+    comment we would not find it and would add a second registration for
+    the same server."""
+    api = FakeRouterOSApi(
+        menus={
+            ("radius",): [
+                {".id": "*1", "service": "hotspot", "address": "10.20.0.1",
+                 "secret": "old", "authentication-port": "1812",
+                 "accounting-port": "1813", "comment": "cloudguest-radius"}
+            ]
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().set_radius_client_config(
+        mikrotik_creds, config=_radius_config()
+    )
+
+    rows = _radius_rows(api)
+    assert len(rows) == 1
+    assert rows[0][".id"] == "*1"  # the same row, not a replacement
+    assert rows[0]["src-address"] == "10.20.0.14"
+    assert rows[0]["secret"] == "s3cret"
+    assert rows[0]["comment"] == _RADIUS_COMMENT  # ours from now on
+
+
+@pytest.mark.asyncio
+async def test_a_radius_row_for_a_different_server_is_left_alone(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(
+        menus={
+            ("radius",): [
+                {".id": "*1", "service": "hotspot", "address": "192.0.2.9",
+                 "secret": "someone-elses", "comment": "not ours"}
+            ]
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().set_radius_client_config(
+        mikrotik_creds, config=_radius_config()
+    )
+
+    rows = _radius_rows(api)
+    assert len(rows) == 2
+    untouched = next(r for r in rows if r[".id"] == "*1")
+    assert untouched["secret"] == "someone-elses"
+    assert untouched["comment"] == "not ours"
+
+
+@pytest.mark.asyncio
+async def test_coa_listener_is_enabled_on_the_documented_port(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS's own default is 1700; 3799 is the RFC-assigned port and
+    what this platform writes."""
+    api = FakeRouterOSApi(
+        menus={("radius", "incoming"): [
+            {".id": "*1", "accept": False, "port": "1700"}
+        ]}
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().set_radius_client_config(
+        mikrotik_creds, config=_radius_config()
+    )
+
+    written = next(
+        fields for segments, fields in api.update_calls
+        if segments == ("radius", "incoming")
+    )
+    assert written == {"accept": "yes", "port": "3799"}
+
+
+@pytest.mark.asyncio
+async def test_an_already_enabled_coa_listener_is_not_rewritten(
+    patch_connect, mikrotik_creds
+):
+    """`accept` reads back as a real bool. A string compare would see a
+    live True as disabled and rewrite it on every single push."""
+    api = FakeRouterOSApi(
+        menus={("radius", "incoming"): [
+            {".id": "*1", "accept": True, "port": "3799"}
+        ]}
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().set_radius_client_config(
+        mikrotik_creds, config=_radius_config()
+    )
+
+    assert [
+        s for s, _ in api.update_calls if s == ("radius", "incoming")
+    ] == []

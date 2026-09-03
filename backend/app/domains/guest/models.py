@@ -132,7 +132,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-from .constants import GuestSessionStatus, NasStatus
+from .constants import (
+    GuestSessionStatus,
+    NasStatus,
+    RadiusNasDevicePushStatus,
+)
 
 
 class Guest(BaseModel):
@@ -711,6 +715,24 @@ class RadiusNasClient(BaseModel):
         String(45), nullable=True
     )
     hub_client_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # -- Router-side push state, the other half of the two above. The pair
+    # above records that the HUB's FreeRADIUS confirmed a client{} stanza;
+    # these record that the ROUTER's own /radius row and CoA listener were
+    # written. Both are required and neither implies the other -- see
+    # constants.RadiusNasDevicePushStatus for why ACTIVE is a narrow claim
+    # about objects written and read back, and explicitly not a claim that
+    # a Disconnect-Request from the hub arrives.
+    device_push_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=RadiusNasDevicePushStatus.PENDING.value,
+        server_default=RadiusNasDevicePushStatus.PENDING.value,
+    )
+    device_push_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    device_pushed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     # Every Router in this codebase is a MikroTik RouterOS device today

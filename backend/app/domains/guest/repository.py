@@ -239,6 +239,8 @@ class GuestRepositoryProtocol(Protocol):
         self, router_id: uuid.UUID
     ) -> RadiusNasClient | None: ...
 
+    async def commit(self) -> None: ...
+
     async def get_nas_client_by_id(
         self, nas_id: uuid.UUID, *, include_deleted: bool = False
     ) -> RadiusNasClient | None: ...
@@ -353,6 +355,20 @@ class GuestRepository:
         self.consents = GenericRepository(GuestConsent, session)
         self.nas_clients = GenericRepository(RadiusNasClient, session)
         self.quota_usages = GenericRepository(GuestQuotaUsage, session)
+
+    async def commit(self) -> None:
+        """Commits the current transaction.
+
+        Needed by the RADIUS NAS device-push path and nothing else.
+        ``GenericRepository.update`` only ``flush()``es and
+        ``get_db_session`` rolls the session back on any exception, so a
+        ``failed`` record written just before the re-raise would be
+        discarded -- leaving a row that still reads as though the push had
+        reached the router. Mirrors
+        ``app.domains.guest_access.repository``'s own identical method and
+        the reasoning on it.
+        """
+        await self.session.commit()
 
     # -- guests ----------------------------------------------------------------
 

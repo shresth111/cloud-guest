@@ -294,6 +294,12 @@ from .constants import (
     GuestSessionStatus,
     NasStatus,
     QuotaPeriodType,
+    RadiusNasDevicePushStatus,
+)
+from .device_adapters import (
+    RadiusNasCredentials,
+    RadiusNasDeviceConfig,
+    get_radius_nas_adapter,
 )
 from .events import (
     GuestBlocked,
@@ -339,7 +345,10 @@ from .exceptions import (
     NoReconnectableSessionError,
     RadiusNasAlreadyRegisteredError,
     RadiusNasAuthenticationError,
+    RadiusNasClientNotFoundError,
+    RadiusNasMissingCredentialsError,
     RadiusNasNotFoundError,
+    RadiusNasNotSyncedError,
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
     TooManyDeviceIdsError,
@@ -752,6 +761,16 @@ class RouterLookupProtocol(Protocol):
         requesting_organization_id: uuid.UUID | None = None,
         include_deleted: bool = False,
     ) -> Router: ...
+
+    def get_decrypted_api_secret(self, router: Router) -> str | None:
+        """The router's API password, decrypted, for a real device push.
+
+        Synchronous and separate from ``get_router`` on purpose: it is
+        Fernet work on an already-loaded row, not a query, and the
+        push path is the only caller. Satisfied structurally by the real
+        ``RouterService``, exactly as ``vlan``/``qos`` already rely on.
+        """
+        ...
 
 
 class LocationLookupProtocol(Protocol):
@@ -4298,6 +4317,118 @@ class RadiusService:
     # ========================================================================
     # NAS lifecycle: read/list/update/activate/disable/regenerate/delete
     # ========================================================================
+
+    async def push_nas_client_to_device(
+        self,
+        *,
+        nas_id: uuid.UUID,
+        radius_server_host: str,
+        actor_user_id: uuid.UUID | None = None,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> RadiusNasClient:
+        """Writes this NAS registration onto the router itself.
+
+        The other half of ``record_hub_client_sync``. That one records that
+        the hub's FreeRADIUS confirmed a ``client{}`` stanza; this one
+        writes the router's own ``/radius`` row and its ``/radius incoming``
+        CoA listener, over the RouterOS API on 8728 -- the only port that
+        reaches a fleet router. Until this existed, the gateway method that
+        does the writing had no caller anywhere in this application, so the
+        router half could only ever land by somebody pasting the generated
+        setup script by hand at provisioning.
+
+        ``src-address`` is the NAS row's own ``ip_address``, which
+        ``record_hub_client_sync`` keeps equal to the router's tunnel
+        address. It is not optional and not cosmetic: the hub matches an
+        incoming request to a ``client{}`` stanza by source address, so a
+        registration pushed without it is one the hub will never answer.
+        A row that has never been synced has no tunnel address to send, and
+        this refuses rather than writing a registration that cannot work.
+
+        **The failure record is committed before the re-raise.**
+        ``GenericRepository.update`` only ``flush()``es and
+        ``get_db_session`` rolls the session back on any exception, so a
+        ``failed`` row written just before the raise would be discarded --
+        leaving a record that still reads as though the push had reached the
+        router. The exception then propagates as a real 502; it must not
+        become a ``200 {"success": false}``, which the frontend's response
+        interceptor cannot distinguish from success.
+        """
+        nas_client = await self.repository.get_nas_client_by_id(nas_id)
+        if nas_client is None or nas_client.is_deleted:
+            raise RadiusNasClientNotFoundError(str(nas_id))
+        if (
+            requesting_organization_id is not None
+            and nas_client.organization_id != requesting_organization_id
+        ):
+            raise RadiusNasClientNotFoundError(str(nas_id))
+
+        tunnel_ip = nas_client.ip_address
+        if not tunnel_ip:
+            raise RadiusNasNotSyncedError(nas_id)
+
+        router = await self.router_lookup.get_router(
+            nas_client.router_id,
+            requesting_organization_id=requesting_organization_id,
+        )
+        credentials = self._resolve_nas_device_credentials(router)
+        adapter = get_radius_nas_adapter(router.vendor)
+
+        try:
+            await adapter.push_nas_client(
+                credentials,
+                config=RadiusNasDeviceConfig(
+                    radius_server_host=radius_server_host,
+                    radius_secret=decrypt_secret(nas_client.shared_secret_encrypted),
+                    src_address=tunnel_ip,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
+            await self.repository.update_nas_client(
+                nas_client,
+                {
+                    "device_push_status": RadiusNasDevicePushStatus.FAILED.value,
+                    "device_push_error": str(exc),
+                },
+            )
+            await self.repository.commit()
+            logger.warning(
+                "radius_nas_device_push_failed",
+                extra={
+                    "event_nas_id": str(nas_id),
+                    "event_router_id": str(nas_client.router_id),
+                    "event_error": str(exc),
+                },
+            )
+            raise
+
+        updated = await self.repository.update_nas_client(
+            nas_client,
+            {
+                "device_push_status": RadiusNasDevicePushStatus.ACTIVE.value,
+                "device_push_error": None,
+                "device_pushed_at": datetime.now(UTC),
+            },
+        )
+        await self.repository.commit()
+        logger.info(
+            "radius_nas_device_push_succeeded",
+            extra={
+                "event_nas_id": str(nas_id),
+                "event_router_id": str(nas_client.router_id),
+            },
+        )
+        return updated
+
+    def _resolve_nas_device_credentials(self, router: Router) -> RadiusNasCredentials:
+        """Raise rather than guess -- mirrors ``vlan``/``qos``."""
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.router_lookup.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            raise RadiusNasMissingCredentialsError(router.id)
+        return RadiusNasCredentials(
+            host=host, username=router.api_username, password=secret
+        )
 
     async def get_nas_client(
         self,

@@ -339,10 +339,31 @@ class NatRuleConfig:
 
 @dataclass(frozen=True, slots=True)
 class RadiusClientConfig:
+    """One router's registration as a RADIUS/hotspot NAS client.
+
+    ``src_address`` is the router's own address on the management tunnel,
+    and it is the field this whole shape turns on: the hub's FreeRADIUS
+    matches an incoming request to a ``client{}`` stanza **by source
+    address**, so a ``/radius`` row without it sends from whatever address
+    the routing table picks and the hub answers nothing. It is optional
+    only because a vendor with no tunnel has nothing to put here;
+    ``network_config.renderers.render_radius_client`` calls it "this
+    function's single most important parameter", and the caller that omits
+    it on MikroTik is registering a client that cannot authenticate.
+
+    ``coa_port`` is the RFC 5176 Change-of-Authorization listener port,
+    router-global rather than per-client (RouterOS has exactly one
+    ``/radius incoming`` object). RouterOS's own default is ``1700``; this
+    platform uses ``3799``, the RFC-assigned port, which is why finding
+    ``3799`` on a device is evidence this platform wrote it.
+    """
+
     radius_server_host: str
     radius_secret: str
     auth_port: int = 1812
     acct_port: int = 1813
+    src_address: str | None = None
+    coa_port: int = 3799
 
 
 @dataclass(frozen=True, slots=True)

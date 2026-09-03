@@ -54,6 +54,7 @@ from app.domains.rbac.dependencies import (
 from app.domains.rbac.enums import ScopeType
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
+from app.domains.wireguard.validators import hub_reserved_ip
 
 from .constants import (
     MAX_BULK_DEVICE_LOOKUP_IDS,
@@ -342,6 +343,9 @@ def _nas_response(nas_client: RadiusNasClient) -> RadiusNasResponse:
         ip_address=nas_client.ip_address,
         hub_client_synced_ip=nas_client.hub_client_synced_ip,
         hub_client_synced_at=nas_client.hub_client_synced_at,
+        device_push_status=nas_client.device_push_status,
+        device_push_error=nas_client.device_push_error,
+        device_pushed_at=nas_client.device_pushed_at,
         vendor=nas_client.vendor,
         created_at=nas_client.created_at,
         updated_at=nas_client.updated_at,
@@ -1476,6 +1480,47 @@ async def get_radius_nas(
     return build_response(
         success=True,
         message="RADIUS NAS client retrieved",
+        data=_nas_response(nas_client).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@nas_router.post(
+    "/{nas_id}/push",
+    response_model=ApiResponse[RadiusNasResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("radius.update"))],
+)
+async def push_radius_nas_to_device(
+    request: Request,
+    nas_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: RadiusService = Depends(get_radius_service),
+    wireguard: WireGuardService = Depends(get_wireguard_service),
+):
+    """Writes this NAS registration onto the router itself.
+
+    The counterpart to the hub-side sync. A failure here is a real 502 from
+    ``RadiusNasDeviceOperationError`` -- never a 200 carrying an error body,
+    which the frontend's interceptor cannot tell apart from success.
+
+    The RADIUS server address is the hub's own tunnel address, derived from
+    the active server's ``tunnel_network_cidr`` rather than its
+    ``endpoint_host``: RADIUS has to traverse the tunnel, because the hub
+    matches the ``client{}`` stanza on the router's tunnel source address.
+    See ``app.domains.wireguard.validators.hub_reserved_ip``.
+    """
+    server = await wireguard.get_active_server()
+    nas_client = await service.push_nas_client_to_device(
+        nas_id=nas_id,
+        radius_server_host=hub_reserved_ip(server.tunnel_network_cidr),
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="RADIUS NAS client pushed to router",
         data=_nas_response(nas_client).model_dump(),
         request_id=_request_id(request),
     )
