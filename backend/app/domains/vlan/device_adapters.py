@@ -44,7 +44,12 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
-from wyfy_device_gateway.contract import DeviceVendor, NatRuleConfig, VlanConfig
+from wyfy_device_gateway.contract import (
+    DeviceVendor,
+    NatRuleConfig,
+    VlanConfig,
+    VlanHotspotConfig,
+)
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikConnectionError,
     MikroTikDeviceError,
@@ -80,11 +85,70 @@ class VlanCredentials:
     timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS
 
 
+@dataclass(frozen=True, slots=True)
+class VlanDeviceInterface:
+    """One interface as the router currently has it.
+
+    ``is_bridge_port`` is the field ``app.domains.router.device_adapters
+    .DeviceInterface`` does not carry, and the VLAN form needs it: an
+    access-mode VLAN takes a port *out of* a bridge, so a port that is in
+    no bridge is not a candidate. Derivable from ``bridge`` only by a
+    caller that already knows the convention, which a frontend picker
+    should not have to.
+    """
+
+    name: str
+    type: str | None
+    running: bool
+    disabled: bool
+    bridge: str | None
+    is_bridge_port: bool
+    has_ip_address: bool
+
+
+@dataclass(frozen=True, slots=True)
+class VlanDeviceAddress:
+    """One row of the router's live ``/ip address`` table."""
+
+    address: str
+    interface: str | None
+    disabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class VlanNetworkSnapshot:
+    """One router read, answering every device-side precondition at once.
+
+    "Is this router reachable", "does the named interface exist on it" and
+    "is this subnet already taken there" are three questions with one
+    source. Asking them over three connections triples what an operator
+    waits for before a validation failure, and lets the three answers come
+    from three different moments.
+    """
+
+    interfaces: list[VlanDeviceInterface]
+    addresses: list[VlanDeviceAddress]
+
+
 class BaseVlanAdapter(Protocol):
     """What a vendor implements to plug real VLAN operations into this
     domain."""
 
     vendor: str
+
+    async def read_network_snapshot(
+        self, credentials: VlanCredentials
+    ) -> VlanNetworkSnapshot:
+        """Reads the router's interfaces and ``/ip address`` table.
+
+        Read-only, and the only device read the push preflight performs.
+        Deliberately unfiltered, unlike ``app.domains.router
+        .device_adapters.list_available_device_interfaces``: that one
+        exists to back a DHCP picker and drops every interface already
+        carrying an ``/ip dhcp-server``, which on a real router removes
+        ``bridge`` -- exactly the interface a VLAN trunk hangs off.
+        """
+        ...
 
     async def configure_vlan(
         self,
@@ -132,6 +196,55 @@ class BaseVlanAdapter(Protocol):
         and the interface kept carrying traffic. Idempotent: removing what
         is already absent is a no-op, so a retry after a partial failure
         completes cleanly.
+        """
+        ...
+
+    async def configure_hotspot(
+        self,
+        credentials: VlanCredentials,
+        *,
+        vlan_id: int,
+        interface: str,
+        cidr: str,
+        gateway: str,
+        dns_name: str,
+        html_directory: str,
+    ) -> None:
+        """Puts this VLAN's own captive portal on ``interface``.
+
+        Six real RouterOS objects (pool, DHCP server, DHCP network,
+        hotspot profile, static DNS record, hotspot server), all named
+        from ``vlan_id`` and bound to this interface, so one VLAN's portal
+        never touches another's or the router's default ``hotspot1``.
+
+        ``interface`` is passed in rather than derived: in trunk mode the
+        portal belongs on ``vlan<id>``, in access mode on the physical
+        port, and only the caller knows which.
+
+        Idempotent, and updating rather than skipping where a field the
+        operator can edit changed -- a portal still pointing at last
+        week's subnet after a re-push is a portal that reports success and
+        challenges nobody.
+        """
+        ...
+
+    async def delete_hotspot(
+        self,
+        credentials: VlanCredentials,
+        *,
+        vlan_id: int,
+        interface: str,
+        cidr: str,
+        gateway: str,
+        dns_name: str,
+        html_directory: str,
+    ) -> None:
+        """Takes this VLAN's captive portal back off the device.
+
+        Serves both intents that reach it -- the operator turned the
+        portal off, or deleted the VLAN -- because both mean the same
+        thing on the device. Idempotent, so removing a portal that was
+        never created is a no-op.
         """
         ...
 
@@ -185,6 +298,116 @@ class MikroTikVlanAdapter:
             port=credentials.api_port,
             timeout_seconds=credentials.timeout_seconds,
         )
+
+    async def read_network_snapshot(
+        self, credentials: VlanCredentials
+    ) -> VlanNetworkSnapshot:
+        creds = self._gateway_credentials(credentials)
+        try:
+            snapshot = await get_adapter(DeviceVendor.MIKROTIK).read_network_snapshot(
+                creds
+            )
+        except MikroTikConnectionError as exc:
+            raise VlanDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise VlanDeviceOperationError("read_network_snapshot", exc.detail) from exc
+        return VlanNetworkSnapshot(
+            interfaces=[
+                VlanDeviceInterface(
+                    name=i.name,
+                    type=i.type,
+                    running=i.running,
+                    disabled=i.disabled,
+                    bridge=i.bridge,
+                    is_bridge_port=i.is_bridge_port,
+                    has_ip_address=i.has_ip_address,
+                )
+                for i in snapshot.interfaces
+            ],
+            addresses=[
+                VlanDeviceAddress(
+                    address=a.address, interface=a.interface, disabled=a.disabled
+                )
+                for a in snapshot.ip_addresses
+            ],
+        )
+
+    def _hotspot_config(
+        self,
+        *,
+        vlan_id: int,
+        interface: str,
+        cidr: str,
+        gateway: str,
+        dns_name: str,
+        html_directory: str,
+    ) -> VlanHotspotConfig:
+        return VlanHotspotConfig(
+            vlan_id=vlan_id,
+            interface=interface,
+            cidr=cidr,
+            gateway=gateway,
+            dns_name=dns_name,
+            html_directory=html_directory,
+        )
+
+    async def configure_hotspot(
+        self,
+        credentials: VlanCredentials,
+        *,
+        vlan_id: int,
+        interface: str,
+        cidr: str,
+        gateway: str,
+        dns_name: str,
+        html_directory: str,
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        hotspot = self._hotspot_config(
+            vlan_id=vlan_id,
+            interface=interface,
+            cidr=cidr,
+            gateway=gateway,
+            dns_name=dns_name,
+            html_directory=html_directory,
+        )
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).configure_vlan_hotspot(
+                creds, hotspot=hotspot
+            )
+        except MikroTikConnectionError as exc:
+            raise VlanDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise VlanDeviceOperationError("configure_hotspot", exc.detail) from exc
+
+    async def delete_hotspot(
+        self,
+        credentials: VlanCredentials,
+        *,
+        vlan_id: int,
+        interface: str,
+        cidr: str,
+        gateway: str,
+        dns_name: str,
+        html_directory: str,
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        hotspot = self._hotspot_config(
+            vlan_id=vlan_id,
+            interface=interface,
+            cidr=cidr,
+            gateway=gateway,
+            dns_name=dns_name,
+            html_directory=html_directory,
+        )
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).delete_vlan_hotspot(
+                creds, hotspot=hotspot
+            )
+        except MikroTikConnectionError as exc:
+            raise VlanDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise VlanDeviceOperationError("delete_hotspot", exc.detail) from exc
 
     async def configure_vlan(
         self,
@@ -311,6 +534,9 @@ __all__ = [
     "BaseVlanAdapter",
     "MikroTikVlanAdapter",
     "VlanCredentials",
+    "VlanDeviceAddress",
+    "VlanDeviceInterface",
+    "VlanNetworkSnapshot",
     "get_vlan_adapter",
     "list_supported_vlan_vendors",
 ]

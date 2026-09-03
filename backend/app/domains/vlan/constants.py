@@ -32,11 +32,20 @@ class VlanDevicePushStatus(StrEnum):
     and still never have reached a device.
 
     * ``PENDING`` -- created, never pushed.
-    * ``ACTIVE`` -- a real device object for this VLAN exists now.
+    * ``PROVISIONING`` -- a push is in flight right now. Written and
+      committed before the first socket is opened, so a customer watching
+      the row sees the work happening instead of the previous outcome. It
+      also makes an interrupted push visible: a process killed mid-write
+      leaves ``PROVISIONING`` rather than a stale ``ACTIVE`` that claims
+      device state nobody confirmed.
+    * ``ACTIVE`` -- a real device object for this VLAN exists now. Only
+      ever written after the device has accepted every write, never
+      optimistically.
     * ``FAILED`` -- the last push attempt raised; ``device_push_error``
-      holds why.
+      holds why, verbatim, and is what the customer is shown.
     """
 
     PENDING = "pending"
+    PROVISIONING = "provisioning"
     ACTIVE = "active"
     FAILED = "failed"

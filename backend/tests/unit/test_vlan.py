@@ -28,17 +28,27 @@ from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 from app.domains.vlan.constants import VlanDevicePushStatus
+from app.domains.vlan.device_adapters import (
+    VlanDeviceAddress,
+    VlanDeviceInterface,
+    VlanNetworkSnapshot,
+)
 from app.domains.vlan.exceptions import (
     CrossOrganizationVlanAccessError,
     InvalidCidrError,
     InvalidGatewayIpAddressError,
     InvalidVlanIdError,
+    VlanAccessPortNotFoundError,
     VlanDeviceConnectionError,
     VlanDeviceOperationError,
+    VlanHotspotDhcpPoolConflictError,
+    VlanHotspotRequiresSubnetError,
     VlanIdAlreadyExistsError,
     VlanMissingInterfaceError,
     VlanNatRequiresCidrError,
     VlanNotFoundError,
+    VlanParentInterfaceNotFoundError,
+    VlanSubnetConflictError,
 )
 from app.domains.vlan.models import Vlan
 from app.domains.vlan.router import router as vlan_router
@@ -228,23 +238,51 @@ class FakeRouterLookup:
 
 
 @dataclass
+class FakeDhcpPool:
+    """Only the three fields ``DhcpPoolLookupProtocol`` reads."""
+
+    name: str
+    interface: str | None
+    is_enabled: bool = True
+
+
+@dataclass
+class FakeDhcpPoolLookup:
+    """Stands in for ``app.domains.dhcp.repository.DhcpRepository`` at the
+    narrow Protocol boundary the VLAN service composes it through."""
+
+    pools: dict[uuid.UUID, list[FakeDhcpPool]] = field(default_factory=dict)
+
+    async def list_pools_for_router(self, router_id: uuid.UUID) -> list[FakeDhcpPool]:
+        return self.pools.get(router_id, [])
+
+
+@dataclass
 class Harness:
     service: VlanService
     repository: FakeVlanRepository
     router_lookup: FakeRouterLookup
     audit_writer: FakeAuditLogWriter
+    dhcp_pool_lookup: FakeDhcpPoolLookup
 
 
 def make_harness() -> Harness:
     repository = FakeVlanRepository()
     router_lookup = FakeRouterLookup()
     audit_writer = FakeAuditLogWriter()
-    service = VlanService(repository, router_lookup, audit_writer=audit_writer)
+    dhcp_pool_lookup = FakeDhcpPoolLookup()
+    service = VlanService(
+        repository,
+        router_lookup,
+        dhcp_pool_lookup=dhcp_pool_lookup,
+        audit_writer=audit_writer,
+    )
     return Harness(
         service=service,
         repository=repository,
         router_lookup=router_lookup,
         audit_writer=audit_writer,
+        dhcp_pool_lookup=dhcp_pool_lookup,
     )
 
 
@@ -487,11 +525,11 @@ class TestListVlansForRouter:
 
 class TestEveryRouteRequiresPermission:
     def test_every_vlan_route_has_a_permission_dependency(self) -> None:
-        # 6, not 5: POST /vlans/{vlan_pk}/push was added when this domain
-        # gained a real device push. The count is asserted on purpose so a
+        # 7, not 6: GET /vlans/device-interfaces was added to back the VLAN
+        # form's own interface picker. The count is asserted on purpose so a
         # new route cannot slip in unguarded -- bump it deliberately, having
         # checked the new route actually carries a permission dependency.
-        assert len(vlan_router.routes) == 6
+        assert len(vlan_router.routes) == 7
         for route in vlan_router.routes:
             assert (
                 route.dependencies != []
@@ -517,6 +555,84 @@ class FakeVlanAdapter:
     nat_calls: list[dict[str, object]] = field(default_factory=list)
     nat_deletes: list[dict[str, object]] = field(default_factory=list)
     nat_raises: Exception | None = None
+    hotspot_calls: list[dict[str, object]] = field(default_factory=list)
+    hotspot_deletes: list[dict[str, object]] = field(default_factory=list)
+    hotspot_raises: Exception | None = None
+    #: What the preflight read sees. Defaults to a router carrying every
+    #: interface the tests name and no addresses, so a test that is not
+    #: about the preflight does not have to describe one.
+    snapshot_interfaces: list[str] = field(
+        default_factory=lambda: ["bridge", "ether1", "ether2", "ether3"]
+    )
+    snapshot_addresses: list[tuple] = field(default_factory=list)
+    snapshot_raises: Exception | None = None
+    snapshot_reads: int = 0
+
+    async def read_network_snapshot(self, credentials) -> VlanNetworkSnapshot:
+        self.snapshot_reads += 1
+        if self.snapshot_raises is not None:
+            raise self.snapshot_raises
+        return VlanNetworkSnapshot(
+            interfaces=[
+                VlanDeviceInterface(
+                    name=name,
+                    type="ether",
+                    running=True,
+                    disabled=False,
+                    bridge="bridge" if name.startswith("ether") else None,
+                    is_bridge_port=name.startswith("ether"),
+                    has_ip_address=False,
+                )
+                for name in self.snapshot_interfaces
+            ],
+            addresses=[
+                # (address, interface) or (address, interface, disabled) --
+                # disabled addresses are in no routing table and collide
+                # with nothing, which the service relies on.
+                VlanDeviceAddress(
+                    address=row[0], interface=row[1],
+                    disabled=bool(row[2]) if len(row) > 2 else False,
+                )
+                for row in self.snapshot_addresses
+            ],
+        )
+
+    async def configure_hotspot(
+        self,
+        credentials,
+        *,
+        vlan_id: int,
+        interface: str,
+        cidr: str,
+        gateway: str,
+        dns_name: str,
+        html_directory: str,
+    ) -> None:
+        self.hotspot_calls.append(
+            {
+                "vlan_id": vlan_id,
+                "interface": interface,
+                "cidr": cidr,
+                "gateway": gateway,
+                "dns_name": dns_name,
+                "html_directory": html_directory,
+            }
+        )
+        if self.hotspot_raises is not None:
+            raise self.hotspot_raises
+
+    async def delete_hotspot(
+        self,
+        credentials,
+        *,
+        vlan_id: int,
+        interface: str,
+        cidr: str,
+        gateway: str,
+        dns_name: str,
+        html_directory: str,
+    ) -> None:
+        self.hotspot_deletes.append({"vlan_id": vlan_id, "interface": interface})
 
     async def configure_vlan(
         self,
@@ -639,7 +755,12 @@ class TestVlanDevicePush:
 
         assert vlan.device_push_status == VlanDevicePushStatus.FAILED.value
         assert "already have such item" in (vlan.device_push_error or "")
-        assert h.repository.commits == 1
+        # Two, not one: the push commits PROVISIONING before it opens a
+        # socket and the failure record after. Both have to survive the
+        # session rollback -- the first so a concurrent reader sees work in
+        # flight rather than the previous outcome, the second so the row
+        # does not read "provisioning" forever after a real failure.
+        assert h.repository.commits == 2
 
     async def test_a_vlan_with_no_interface_is_refused_before_connecting(
         self, adapter: FakeVlanAdapter
@@ -879,7 +1000,9 @@ class TestVlanNatIsPartOfThePush:
 
         assert vlan.device_push_status == VlanDevicePushStatus.FAILED.value
         assert "WAN interface" in (vlan.device_push_error or "")
-        assert h.repository.commits == 1
+        # PROVISIONING before the socket, FAILED after -- see
+        # test_a_device_failure_is_recorded_committed_and_re_raised.
+        assert h.repository.commits == 2
 
     async def test_deleting_a_vlan_takes_its_nat_rule_off_the_router(
         self, adapter: FakeVlanAdapter
@@ -984,3 +1107,345 @@ class TestVlanNatIsPartOfThePush:
 
         assert adapter.nat_deletes == []
         assert adapter.deletes == []
+
+
+# ============================================================================
+# Device preflight. Three questions -- is the router reachable, does the
+# named interface exist on it, is this subnet already taken -- answered
+# from one read, before anything is written.
+# ============================================================================
+
+
+class TestVlanDevicePreflight:
+    async def test_a_parent_interface_the_router_does_not_have_is_refused(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="bridgeLocal")
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+
+        with pytest.raises(VlanParentInterfaceNotFoundError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_access_mode_gets_its_own_error_for_a_missing_port(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """"There is no such trunk" and "there is no such port on this
+        hardware" are different problems with different fixes."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(
+            h, router, interface="ether9", port_mode="access"
+        )
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+
+        with pytest.raises(VlanAccessPortNotFoundError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_a_subnet_the_router_already_carries_is_refused(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Compared against the device's live table, not other VLAN rows:
+        the LAN bridge and the uplink have no row in this database, and it
+        is the device's set that decides whether the push leaves two
+        matching routes."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        adapter.snapshot_addresses = [("192.168.10.1/24", "ether7")]
+
+        with pytest.raises(VlanSubnetConflictError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_a_vlan_does_not_conflict_with_its_own_address(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Otherwise every re-push of an unchanged VLAN would refuse."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        adapter.snapshot_addresses = [("192.168.10.1/24", "vlan100")]
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        assert len(adapter.calls) == 1
+
+    async def test_a_disabled_address_collides_with_nothing(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A disabled address is in no routing table."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        adapter.snapshot_addresses = [("192.168.10.1/24", "ether7", True)]
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        assert len(adapter.calls) == 1
+
+    async def test_the_preflight_costs_one_read_not_three(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Three separate sessions would triple the wait on a validation
+        failure and let the three answers disagree."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        assert adapter.snapshot_reads == 1
+
+
+class TestCaptivePortalOnAVlan:
+    async def _portal_vlan(self, h: Harness, router: Router) -> Vlan:
+        vlan = await _create_vlan(h, router)
+        return await h.service.update_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            enable_hotspot=True,
+        )
+
+    async def test_enabling_the_portal_pushes_it_to_the_bind_interface(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await self._portal_vlan(h, router)
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(adapter.hotspot_calls) == 1
+        call = adapter.hotspot_calls[0]
+        assert call["vlan_id"] == 100
+        assert call["interface"] == "vlan100"
+        assert call["gateway"] == "192.168.10.1"
+
+    async def test_turning_the_portal_off_removes_it_rather_than_doing_nothing(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A no-op would leave the last-pushed portal challenging guests on
+        a network the operator has since decided must not have one -- and
+        this push would report success."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.hotspot_calls == []
+        assert len(adapter.hotspot_deletes) == 1
+
+    async def test_a_portal_without_a_subnet_is_refused_before_connecting(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A portal has to hand out addresses and answer DNS on a real
+        address of its own."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, cidr=None)
+        vlan = await h.service.update_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            enable_hotspot=True,
+        )
+
+        with pytest.raises(VlanHotspotRequiresSubnetError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+
+    async def test_a_portal_is_refused_when_a_dhcp_pool_already_serves_that_interface(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Both features create an /ip dhcp-server, RouterOS permits one
+        per interface, and a portal cannot go without. Refused from a
+        database read, so it arrives before any connection rather than as
+        an opaque device error halfway through a partial portal."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await self._portal_vlan(h, router)
+        h.dhcp_pool_lookup.pools[router.id] = [
+            FakeDhcpPool(name="Guest addresses", interface="vlan100")
+        ]
+
+        with pytest.raises(VlanHotspotDhcpPoolConflictError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.calls == []
+        assert adapter.hotspot_calls == []
+
+    async def test_a_disabled_pool_does_not_block_the_portal(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A disabled pool row is intent this platform has not realized and
+        will not realize, so it occupies no interface on the device."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await self._portal_vlan(h, router)
+        h.dhcp_pool_lookup.pools[router.id] = [
+            FakeDhcpPool(name="Off", interface="vlan100", is_enabled=False)
+        ]
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        assert len(adapter.hotspot_calls) == 1
+
+    async def test_a_pool_on_a_different_interface_does_not_block_the_portal(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await self._portal_vlan(h, router)
+        h.dhcp_pool_lookup.pools[router.id] = [
+            FakeDhcpPool(name="Other", interface="vlan999")
+        ]
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        assert len(adapter.hotspot_calls) == 1
+
+
+class TestDeviceInterfacePicker:
+    """`GET /vlans/device-interfaces`. An empty list has three different
+    meanings and a picker that renders the same empty dropdown for all
+    three teaches an operator the feature is broken -- so the method
+    returns the sentence with the list."""
+
+    async def test_it_returns_what_the_router_actually_has(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.snapshot_interfaces = ["bridge", "ether2", "ether3"]
+
+        interfaces, message = await h.service.list_device_interfaces(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert [i.name for i in interfaces] == ["bridge", "ether2", "ether3"]
+        assert message
+
+    async def test_bridge_is_offered_unlike_the_router_domains_endpoint(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """`/routers/{id}/device-interfaces` drops every interface bound to
+        an `/ip dhcp-server`, which on a real router removes `bridge` --
+        confirmed on the lab device, where it was simply absent. `bridge`
+        is the interface customers most need as a trunk parent."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.snapshot_interfaces = ["bridge", "ether2"]
+
+        interfaces, _ = await h.service.list_device_interfaces(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert "bridge" in {i.name for i in interfaces}
+
+    async def test_is_bridge_port_is_carried_through(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The form filters access-mode candidates on this. Deriving it
+        from `bridge` being non-null is a convention a picker should not
+        have to know."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.snapshot_interfaces = ["bridge", "ether2"]
+
+        interfaces, _ = await h.service.list_device_interfaces(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        by_name = {i.name: i for i in interfaces}
+        assert by_name["ether2"].is_bridge_port is True
+        assert by_name["bridge"].is_bridge_port is False
+
+    async def test_an_unreachable_router_is_an_empty_list_not_an_error(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The form is being filled in. Refusing to render it because a
+        device is momentarily unreachable helps nobody, and the push path
+        is where unreachability has to be fatal."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.snapshot_raises = VlanDeviceConnectionError("10.0.0.1", "timed out")
+
+        interfaces, message = await h.service.list_device_interfaces(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert interfaces == []
+        assert message  # says why, rather than an empty dropdown
+
+    async def test_a_router_with_no_credentials_is_also_an_empty_list(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        h.router_lookup.secret = None
+
+        interfaces, message = await h.service.list_device_interfaces(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert interfaces == []
+        assert message
+
+    async def test_another_organizations_router_is_not_readable(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(RouterNotFoundError):
+            await h.service.list_device_interfaces(
+                router.id, requesting_organization_id=uuid.uuid4()
+            )

@@ -9,6 +9,7 @@ import ipaddress
 
 from .constants import MAX_VLAN_ID, MIN_VLAN_ID
 from .exceptions import (
+    GatewayOutsideCidrError,
     InvalidCidrError,
     InvalidGatewayIpAddressError,
     InvalidVlanIdError,
@@ -46,4 +47,35 @@ def validate_gateway_ip_address(gateway_ip_address: str | None) -> None:
         raise InvalidGatewayIpAddressError(gateway_ip_address) from exc
 
 
-__all__ = ["validate_vlan_id", "validate_cidr", "validate_gateway_ip_address"]
+def validate_gateway_within_cidr(
+    gateway_ip_address: str | None, cidr: str | None
+) -> None:
+    """Raises :class:`~.exceptions.GatewayOutsideCidrError` when both
+    values are present and the gateway does not sit inside the block.
+
+    Kept separate from the two single-value validators because it is a
+    check on the *pair*: each half can be perfectly valid on its own and
+    the combination still describe a router address on a subnet the VLAN
+    does not have. Both being optional is real -- a tagged interface with
+    no address is a legitimate VLAN -- so an absent half is a no-op here,
+    not a failure.
+    """
+    if not gateway_ip_address or not cidr:
+        return
+    try:
+        network = ipaddress.ip_network(cidr, strict=False)
+        gateway = ipaddress.ip_address(gateway_ip_address)
+    except ValueError:
+        # Each half has its own validator with its own error; re-reporting
+        # a malformed value as a mismatch would name the wrong problem.
+        return
+    if gateway not in network:
+        raise GatewayOutsideCidrError(gateway_ip_address, cidr)
+
+
+__all__ = [
+    "validate_vlan_id",
+    "validate_cidr",
+    "validate_gateway_ip_address",
+    "validate_gateway_within_cidr",
+]

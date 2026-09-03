@@ -9,9 +9,15 @@ from __future__ import annotations
 import pytest
 
 from tests.fake_write_transport import FakeRouterOSApi
-from wyfy_device_gateway.contract import DhcpPoolConfig, NatRuleConfig, VlanConfig
+from wyfy_device_gateway.contract import (
+    DhcpPoolConfig,
+    NatRuleConfig,
+    VlanConfig,
+    VlanHotspotConfig,
+)
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikAdapter,
+    MikroTikDeviceError,
     MikroTikWanInterfaceError,
 )
 
@@ -991,3 +997,212 @@ async def test_nat_leaves_an_unrelated_port_forward_alone(
     remaining = list(api.path("ip", "firewall", "nat"))
     assert len(remaining) == 1
     assert remaining[0]["chain"] == "dstnat"
+
+
+# ============================================================================
+# Captive portal. Six objects per VLAN, all named from the tag, so one
+# VLAN's portal can never touch another's or the router's own hotspot1.
+# ============================================================================
+
+
+def _hotspot(vlan_id: int = 100, gateway: str = "10.100.0.1",
+             cidr: str = "10.100.0.0/24", interface: str = "vlan100"):
+    return VlanHotspotConfig(
+        vlan_id=vlan_id,
+        interface=interface,
+        cidr=cidr,
+        gateway=gateway,
+        dns_name=f"vlan{vlan_id}.wifi.example.com",
+        html_directory="cloudguest-hotspot",
+    )
+
+
+def _added(api, *segments):
+    return [fields for seg, fields in api.add_calls if seg == segments]
+
+
+@pytest.mark.asyncio
+async def test_configure_vlan_hotspot_creates_all_six_objects(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_vlan_hotspot(mikrotik_creds, hotspot=_hotspot())
+
+    assert _added(api, "ip", "pool")[0]["name"] == "vlan100-hs-pool"
+    assert _added(api, "ip", "dhcp-server")[0]["name"] == "vlan100-hs-dhcp"
+    assert _added(api, "ip", "dhcp-server", "network")[0]["gateway"] == "10.100.0.1"
+    assert _added(api, "ip", "hotspot", "profile")[0]["name"] == "vlan100-hsprof"
+    assert _added(api, "ip", "dns", "static")[0]["name"] == "vlan100.wifi.example.com"
+    server = _added(api, "ip", "hotspot")[0]
+    assert server["name"] == "vlan100-hotspot"
+    assert server["interface"] == "vlan100"
+    assert server["profile"] == "vlan100-hsprof"
+
+
+@pytest.mark.asyncio
+async def test_re_pushing_an_unchanged_hotspot_is_a_no_op(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_vlan_hotspot(mikrotik_creds, hotspot=_hotspot())
+    first = list(api.add_calls)
+
+    await adapter.configure_vlan_hotspot(mikrotik_creds, hotspot=_hotspot())
+
+    assert api.add_calls == first
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_pool_never_spans_the_gateway(patch_connect, mikrotik_creds):
+    """`_render_vlan_hotspot` emits `first-last` over every host except the
+    gateway, which spans it when the gateway is not at an edge -- and the
+    DHCP server can then lease the router its own address."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_vlan_hotspot(
+        mikrotik_creds, hotspot=_hotspot(gateway="10.100.0.100")
+    )
+
+    import ipaddress
+
+    ranges = _added(api, "ip", "pool")[0]["ranges"]
+    start, end = (ipaddress.ip_address(p) for p in ranges.split("-"))
+    assert not start <= ipaddress.ip_address("10.100.0.100") <= end
+    # The larger of the two gateway-free runs in a /24 split at .100.
+    assert ranges == "10.100.0.101-10.100.0.254"
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_at_the_bottom_gives_the_conventional_range(
+    patch_connect, mikrotik_creds
+):
+    """The common shape every VLAN this platform creates -- identical to
+    what the renderer would emit, so the two paths agree."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_vlan_hotspot(mikrotik_creds, hotspot=_hotspot())
+
+    assert _added(api, "ip", "pool")[0]["ranges"] == "10.100.0.2-10.100.0.254"
+
+
+@pytest.mark.asyncio
+async def test_a_subnet_with_nothing_left_to_hand_out_is_refused_unwritten(
+    patch_connect, mikrotik_creds
+):
+    """A portal with an empty pool accepts guests and gives them nothing.
+    Refused before the connection rather than half-applied.
+
+    A ``/32`` whose only host is the gateway is the real empty case. A
+    ``/31`` is not: RFC 3021 gives it two usable addresses and Python's
+    ``ip_network.hosts()`` returns both, so one survives the gateway.
+    """
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    with pytest.raises(MikroTikDeviceError):
+        await MikroTikAdapter().configure_vlan_hotspot(
+            mikrotik_creds,
+            hotspot=_hotspot(cidr="10.100.0.1/32", gateway="10.100.0.1"),
+        )
+
+    assert api.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_moving_the_gateway_updates_rather_than_duplicating(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_vlan_hotspot(mikrotik_creds, hotspot=_hotspot())
+    await adapter.configure_vlan_hotspot(
+        mikrotik_creds, hotspot=_hotspot(gateway="10.100.0.254")
+    )
+
+    assert len(_added(api, "ip", "hotspot", "profile")) == 1
+    profile_updates = [
+        f for seg, f in api.update_calls if seg == ("ip", "hotspot", "profile")
+    ]
+    assert profile_updates and profile_updates[-1]["hotspot-address"] == "10.100.0.254"
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_the_whole_portal_and_twice_is_a_no_op(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_vlan_hotspot(mikrotik_creds, hotspot=_hotspot())
+
+    await adapter.delete_vlan_hotspot(mikrotik_creds, hotspot=_hotspot())
+
+    for path in (("ip", "pool"), ("ip", "dhcp-server"), ("ip", "hotspot"),
+                 ("ip", "hotspot", "profile"), ("ip", "dns", "static")):
+        assert list(api.path(*path)) == [], path
+
+    await adapter.delete_vlan_hotspot(mikrotik_creds, hotspot=_hotspot())  # no raise
+
+
+@pytest.mark.asyncio
+async def test_one_vlans_portal_leaves_another_and_hotspot1_alone(
+    patch_connect, mikrotik_creds
+):
+    """The router's own default `hotspot1` sits on the bridge and must
+    survive any per-VLAN portal being torn down."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "hotspot"): [
+                {".id": "*1", "name": "hotspot1", "interface": "bridge"}
+            ]
+        }
+    )
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_vlan_hotspot(mikrotik_creds, hotspot=_hotspot(100))
+    await adapter.configure_vlan_hotspot(
+        mikrotik_creds,
+        hotspot=_hotspot(200, gateway="10.200.0.1", cidr="10.200.0.0/24",
+                         interface="vlan200"),
+    )
+
+    await adapter.delete_vlan_hotspot(mikrotik_creds, hotspot=_hotspot(100))
+
+    remaining = sorted(str(h.get("name")) for h in api.path("ip", "hotspot"))
+    assert remaining == ["hotspot1", "vlan200-hotspot"]
+
+
+@pytest.mark.asyncio
+async def test_read_network_snapshot_reports_interfaces_and_addresses(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi(
+        menus={
+            ("interface"): [],
+            ("ip", "address"): [
+                {".id": "*1", "address": "10.5.50.1/24", "interface": "bridge"},
+                {".id": "*2", "address": "10.9.9.1/24", "interface": "vlan9",
+                 "disabled": True},
+            ],
+        }
+    )
+    patch_connect(api)
+
+    snapshot = await MikroTikAdapter().read_network_snapshot(mikrotik_creds)
+
+    addresses = {a.address: a for a in snapshot.ip_addresses}
+    assert addresses["10.5.50.1/24"].interface == "bridge"
+    assert addresses["10.5.50.1/24"].disabled is False
+    # A disabled address is in no routing table and collides with nothing --
+    # the caller needs the flag, not a pre-filtered list.
+    assert addresses["10.9.9.1/24"].disabled is True

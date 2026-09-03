@@ -35,6 +35,8 @@ from .models import Vlan
 from .schemas import (
     MessageResponse,
     VlanCreateRequest,
+    VlanDeviceInterfaceResponse,
+    VlanDeviceInterfacesResponse,
     VlanListResponse,
     VlanResponse,
     VlanUpdateRequest,
@@ -78,6 +80,7 @@ def _vlan_response(vlan: Vlan) -> VlanResponse:
         device_push_status=vlan.device_push_status,
         device_push_error=vlan.device_push_error,
         device_pushed_at=vlan.device_pushed_at,
+        mikrotik_interface_name=vlan.mikrotik_interface_name,
         created_at=vlan.created_at,
     )
 
@@ -146,6 +149,70 @@ async def list_vlans(
     return build_response(
         success=True,
         message="VLANs retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/device-interfaces",
+    response_model=ApiResponse[VlanDeviceInterfacesResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("vlan.read"))],
+)
+async def list_device_interfaces(
+    request: Request,
+    router_id: uuid.UUID = Query(...),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: VlanService = Depends(get_vlan_service),
+):
+    """The router's real interfaces, backing this domain's own VLAN form.
+
+    **Registered before ``GET /{vlan_pk}`` deliberately.** Starlette
+    resolves first-match-wins, so below it this literal path would be
+    handed to a ``uuid.UUID`` parser and answer 422 forever.
+
+    **Gated on ``vlan.read``, not ``routers.manage``.** This is a
+    customer-facing form field. ``routers.manage`` folds out of a FULL
+    grant only -- an Organization *Admin*, a Location Manager and every
+    OPERATE-level role hold ``vlan.read`` and would 403 here on the exact
+    screen they are allowed to use. Reading a router's interface names is
+    also strictly less than what ``vlan.read`` already implies: the VLAN
+    rows it returns name those same interfaces.
+
+    **Deliberately not ``GET /routers/{id}/device-interfaces``.** That one
+    filters out every interface already bound to an ``/ip dhcp-server``,
+    which on a real router removes ``bridge`` -- confirmed on the lab
+    device, where ``bridge`` was simply absent from its output. It is the
+    right filter for a DHCP picker and the wrong one here, because
+    ``bridge`` is what most VLAN trunks hang off.
+
+    A router with no stored credentials, or one that does not answer,
+    returns an empty list and a message saying which -- not a 500, and not
+    a ``200 {"success": false}`` the frontend interceptor would discard
+    along with the explanation. The push endpoint is where unreachability
+    is fatal, and it is.
+    """
+    interfaces, message = await service.list_device_interfaces(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    payload = VlanDeviceInterfacesResponse(
+        interfaces=[
+            VlanDeviceInterfaceResponse(
+                name=i.name,
+                type=i.type,
+                running=i.running,
+                disabled=i.disabled,
+                bridge=i.bridge,
+                is_bridge_port=i.is_bridge_port,
+                has_ip_address=i.has_ip_address,
+            )
+            for i in interfaces
+        ]
+    )
+    return build_response(
+        success=True,
+        message=message,
         data=payload.model_dump(),
         request_id=_request_id(request),
     )

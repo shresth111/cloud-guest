@@ -24,6 +24,7 @@ __all__ = [
     "DhcpPoolNotEnabledError",
     "DhcpPoolMissingInterfaceError",
     "DhcpPoolMissingGatewayError",
+    "DhcpPoolHotspotConflictError",
     "DhcpMissingCredentialsError",
     "UnsupportedDhcpVendorError",
     "DhcpDeviceConnectionError",
@@ -199,4 +200,41 @@ class DhcpDeviceOperationError(DhcpError):
         super().__init__(
             f"Router rejected {operation}: {detail}",
             status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class DhcpPoolHotspotConflictError(DhcpError):
+    """This pool's interface already belongs to a VLAN's captive portal.
+
+    The mirror image of ``app.domains.vlan.exceptions
+    .VlanHotspotDhcpPoolConflictError``, and it exists for the same single
+    rule: **a VLAN's captive portal owns DHCP on that VLAN's own
+    interface.** A portal must create its own ``/ip pool`` and ``/ip
+    dhcp-server`` on the interface it challenges, RouterOS permits one
+    DHCP server per interface, and this domain's push creates a second.
+
+    Guarding only the VLAN side would have made the rule half-true: the
+    collision is reachable from either direction, and the direction that
+    stayed open is the one where a customer configures a portal first --
+    the normal order -- and then adds a pool.
+
+    Refused rather than resolved by deleting the portal's objects. Both
+    are things an operator deliberately created and can still see in the
+    dashboard; silently removing one would report a successful push while
+    a captive portal that is supposed to be intercepting guests simply
+    stops.
+
+    The message names the VLAN so the fix is actionable, and the fix is
+    the operator's to choose: point this pool at another interface, or
+    turn that VLAN's portal off.
+    """
+
+    def __init__(self, pool_id: uuid.UUID, interface: str, vlan_tag: int) -> None:
+        super().__init__(
+            f"DHCP pool '{pool_id}' serves interface '{interface}', which "
+            f"already carries the captive portal of VLAN {vlan_tag} -- a "
+            "portal brings its own DHCP server and RouterOS allows only one "
+            "per interface. Re-point this pool, or turn that VLAN's portal "
+            "off",
+            status_code=status.HTTP_409_CONFLICT,
         )

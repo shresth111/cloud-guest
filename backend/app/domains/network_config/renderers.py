@@ -704,6 +704,14 @@ WIREGUARD_INTERFACE_NAME = "wg-cloudguard"
 # validation and dropping guests onto plain HTTP.
 HOTSPOT_DNS_NAME = "wifi.wyfyguest.com"
 
+# RouterOS's ``/ip hotspot profile html-directory`` -- which uploaded page
+# set a portal serves. Was a bare literal inside ``_render_vlan_hotspot``
+# until ``app.domains.vlan.device_adapters`` had to push the same profile
+# over the API: the script path and the direct-push path must name the same
+# directory or a VLAN's portal serves different pages depending on which
+# path last touched the router.
+HOTSPOT_HTML_DIRECTORY = "cloudguest-hotspot"
+
 
 def _sanitize_identifier(name: str) -> str:
     """Lowercases and replaces every character that is not alphanumeric/
@@ -839,7 +847,8 @@ def _render_vlan_hotspot(vlan: Vlan, bind_interface: str) -> list[str]:
         f"/ip dhcp-server network add address={network} "
         f"gateway={vlan.gateway_ip_address} dns-server={vlan.gateway_ip_address}",
         f"/ip hotspot profile add name={profile_name} "
-        f"hotspot-address={vlan.gateway_ip_address} html-directory=cloudguest-hotspot "
+        f"hotspot-address={vlan.gateway_ip_address} "
+        f"html-directory={HOTSPOT_HTML_DIRECTORY} "
         f"dns-name={dns_name}",
         f"/ip dns static add name={dns_name} address={vlan.gateway_ip_address} "
         f'comment="{tag}-hotspot-dns-name"',
@@ -2557,6 +2566,7 @@ def _idempotent_lines(lines: list[str]) -> list[str]:
 
 __all__ = [
     "HOTSPOT_DNS_NAME",
+    "HOTSPOT_HTML_DIRECTORY",
     "MANAGED_WALLED_GARDEN_COMMENT",
     "WALLED_GARDEN_SECTION_HEADER",
     "render_dhcp_pool",

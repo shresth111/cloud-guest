@@ -23,6 +23,8 @@ __all__ = [
     "VlanUpdateRequest",
     "VlanResponse",
     "VlanListResponse",
+    "VlanDeviceInterfaceResponse",
+    "VlanDeviceInterfacesResponse",
 ]
 
 
@@ -75,9 +77,19 @@ class VlanResponse(BaseModel):
     # Independent of is_enabled: a VLAN can be enabled for months and never
     # have been on a device, which was true of every row before this domain
     # had a push at all.
+    # PENDING / PROVISIONING / ACTIVE / FAILED. Never ACTIVE until the
+    # device has accepted every write.
     device_push_status: str
+    # The spec's ``error_message``: the device's own words from the last
+    # failed push, verbatim, shown to the customer. There is no second
+    # column -- one fact, one place to look.
     device_push_error: str | None
     device_pushed_at: datetime | None
+    # What the router was actually told to call this interface --
+    # ``vlan<id>`` on a trunk, the physical port in access mode. NULL until
+    # the first successful push, because before one this platform has no
+    # claim about what any router carries.
+    mikrotik_interface_name: str | None
     created_at: datetime
 
 
@@ -89,3 +101,26 @@ class VlanListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class VlanDeviceInterfaceResponse(BaseModel):
+    """One interface as the router currently has it.
+
+    ``is_bridge_port`` is the field ``app.domains.router``'s own
+    ``DeviceInterfaceResponse`` does not carry, and the reason this shape
+    is not simply reused: an access-mode VLAN takes a port *out of* a
+    bridge, so a port in no bridge is not a candidate, and a picker should
+    not have to infer that from whether ``bridge`` happens to be null.
+    """
+
+    name: str
+    type: str | None
+    running: bool
+    disabled: bool
+    bridge: str | None
+    is_bridge_port: bool
+    has_ip_address: bool
+
+
+class VlanDeviceInterfacesResponse(BaseModel):
+    interfaces: list[VlanDeviceInterfaceResponse]

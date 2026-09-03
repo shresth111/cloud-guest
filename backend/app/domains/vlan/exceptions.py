@@ -24,6 +24,7 @@ __all__ = [
     "InvalidVlanIdError",
     "InvalidCidrError",
     "InvalidGatewayIpAddressError",
+    "GatewayOutsideCidrError",
 ]
 
 
@@ -102,6 +103,26 @@ class InvalidGatewayIpAddressError(VlanError):
         )
 
 
+class GatewayOutsideCidrError(VlanError):
+    """``gateway_ip_address`` is a real IP address, and ``cidr`` is a real
+    block, but the address does not sit inside the block.
+
+    Each value passing its own validator is not enough: the pair is what
+    the device is given. ``_device_address`` builds the router's own
+    address by pasting the gateway onto the CIDR's prefix length, so a
+    gateway outside the block produces an address on a subnet the VLAN
+    does not have -- which RouterOS accepts happily and which routes
+    nothing. The DHCP network row derived from the same pair then hands
+    guests a gateway they cannot reach.
+    """
+
+    def __init__(self, gateway_ip_address: str, cidr: str) -> None:
+        super().__init__(
+            f"Gateway '{gateway_ip_address}' is not inside '{cidr}'",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Device push
 #
@@ -155,25 +176,63 @@ class VlanMissingInterfaceError(VlanError):
         )
 
 
-class VlanHotspotPushUnsupportedError(VlanError):
-    """Asked to push a VLAN with ``enable_hotspot`` set.
+class VlanHotspotRequiresSubnetError(VlanError):
+    """Asked to push a VLAN with ``enable_hotspot`` set but no ``cidr``,
+    no ``gateway_ip_address``, or both.
 
-    The rendered script realizes that toggle as six further RouterOS
-    commands (pool, dhcp-server, dhcp-server network, hotspot profile, dns
-    static, hotspot server -- see ``renderers._render_vlan_hotspot``). The
-    device adapter implements none of them yet.
+    A captive portal is not a flag on an interface: it is a pool of real
+    addresses to hand out and a real address of its own to answer DHCP,
+    DNS and the login page on. ``_render_vlan_hotspot`` refuses the same
+    combination by emitting a skip comment; on a direct push the
+    equivalent honesty is a 409 before a connection is opened, because
+    pushing the interface and silently dropping the portal would report
+    success for a VLAN whose guests never see one.
 
-    Rejected rather than partially applied: pushing the interface and
-    address while silently dropping the captive portal would report success
-    for a VLAN whose guests never see a portal, which is precisely the
-    failure shape this work exists to remove.
+    Deliberately not resolved by inventing a gateway at ``.1``. A network
+    fact this platform made up is worse than a refusal that names what is
+    missing.
     """
 
     def __init__(self, vlan_pk: uuid.UUID) -> None:
         super().__init__(
-            f"VLAN '{vlan_pk}' has a hotspot enabled, which this push does not "
-            "configure yet -- push the router's full configuration instead, or "
-            "disable the hotspot on this VLAN",
+            f"VLAN '{vlan_pk}' has a captive portal enabled but no subnet -- "
+            "set both a CIDR and a gateway IP address, or turn the portal off",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class VlanHotspotDhcpPoolConflictError(VlanError):
+    """A captive portal and a separately-configured DHCP Pool both want to
+    serve the same interface.
+
+    **The rule this enforces: a VLAN's captive portal owns DHCP on that
+    VLAN's own interface, and nothing else may serve it.** A portal is not
+    optional about this -- RouterOS's hotspot needs its own ``/ip pool``
+    and its own ``/ip dhcp-server`` bound to the hotspot interface -- and
+    RouterOS rejects a second ``/ip dhcp-server`` on an interface that
+    already has one. Two features on this platform can each create one:
+    this VLAN's ``enable_hotspot`` and the DHCP Pool domain's own push.
+
+    Refused, in both directions (pushing the portal while such a pool
+    exists, and pushing such a pool while the portal exists), rather than
+    resolved by picking a winner. Whichever object lost would be one the
+    operator deliberately created and can still see in the dashboard,
+    reporting a successful push while serving nobody -- and if the portal
+    lost, guests would get leases from a pool with no login page and no
+    walled garden, which is a captive portal that is simply off.
+
+    The message names the pool so the operator can act on it, because the
+    fix is theirs to choose: delete that pool, point it at another
+    interface, or turn the portal off.
+    """
+
+    def __init__(self, vlan_pk: uuid.UUID, interface: str, pool_name: str) -> None:
+        super().__init__(
+            f"VLAN '{vlan_pk}' has a captive portal on '{interface}', but the "
+            f"DHCP pool '{pool_name}' already serves that interface -- a "
+            "portal brings its own DHCP server and RouterOS allows only one "
+            "per interface. Delete or re-point that pool, or turn the portal "
+            "off",
             status_code=status.HTTP_409_CONFLICT,
         )
 
@@ -268,4 +327,72 @@ class VlanDeviceOperationError(VlanError):
         super().__init__(
             f"Device operation '{operation}' failed: {detail}",
             status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+
+class VlanParentInterfaceNotFoundError(VlanError):
+    """The trunk parent this VLAN is tagged on does not exist on the
+    router.
+
+    RouterOS does reject an unknown ``interface=`` on ``/interface vlan
+    add``, but with a message about an input not matching a value,
+    attributed to the VLAN write -- and by then the push has already
+    connected and started. Reading the device's own interface list first
+    lets the failure name the interface the operator typed, and lets it
+    arrive before anything was attempted.
+
+    A 409 rather than a 422: the name is well-formed, and whether it is
+    correct is a fact about this particular router's current state, not
+    about the request.
+    """
+
+    def __init__(self, interface: str, host: str) -> None:
+        super().__init__(
+            f"No interface named '{interface}' exists on device '{host}'",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class VlanAccessPortNotFoundError(VlanError):
+    """The dedicated physical port an access-mode VLAN claims does not
+    exist on the router.
+
+    Separated from :class:`VlanParentInterfaceNotFoundError` because the
+    two mean different things to the operator -- one is "your trunk is
+    wrong", the other is "there is no such port on this hardware" -- and
+    because access mode's own failure is the quieter of the two: the port
+    write would otherwise be attempted against a name RouterOS has never
+    heard of.
+    """
+
+    def __init__(self, port: str, host: str) -> None:
+        super().__init__(
+            f"No port named '{port}' exists on device '{host}' -- "
+            "an access-mode VLAN needs a real physical port",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class VlanSubnetConflictError(VlanError):
+    """This VLAN's subnet overlaps an address the router already carries
+    on a different interface.
+
+    Compared against the device's own live ``/ip address`` table, not
+    against other ``Vlan`` rows. Those are two different sets: a router
+    carries its LAN bridge, its uplink, and anything configured outside
+    this platform, none of which has a row here -- and it is the device's
+    set, not this database's, that decides whether the push produces a
+    routing table with two matching entries and traffic that goes to
+    whichever one RouterOS picked.
+
+    Addresses already on *this VLAN's own* bind interface are excluded, or
+    every re-push of an unchanged VLAN would conflict with itself.
+    """
+
+    def __init__(self, cidr: str, existing_address: str, interface: str) -> None:
+        super().__init__(
+            f"Subnet '{cidr}' overlaps '{existing_address}', already configured "
+            f"on interface '{interface}' of this router",
+            status_code=status.HTTP_409_CONFLICT,
         )
