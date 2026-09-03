@@ -19,6 +19,8 @@ from wyfy_device_gateway.contract import (
 )
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikAdapter,
+    _same_routeros_duration,
+    _same_routeros_path,
     MikroTikDeviceError,
     MikroTikWanInterfaceError,
 )
@@ -2021,3 +2023,198 @@ async def test_a_router_that_refuses_the_write_raises(patch_connect, mikrotik_cr
         )
 
     assert "configure_port_forward" in excinfo.value.detail
+
+
+# ============================================================================
+# Findings from the first hardware verification run. Every one of these was
+# invisible to the fake-transport tests that shipped with the features --
+# they asserted rows, and these are defects in *which* rows and *how often*.
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_dhcp_pool_leaves_a_portals_network_row_alone(
+    patch_connect, mikrotik_creds
+):
+    """The one that can break a live captive portal.
+
+    Both features write an `/ip dhcp-server network` row, and RouterOS
+    identifies that row by subnet alone. Observed on hardware: tearing down
+    a DHCP pool removed the portal's row, taking its gateway and DNS with
+    it -- no error, no warning. The portal then hands out addresses with no
+    way off the subnet.
+    """
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+
+    await adapter.configure_vlan_hotspot(mikrotik_creds, hotspot=_hotspot())
+    portal_rows = list(api.path("ip", "dhcp-server", "network"))
+    assert len(portal_rows) == 1
+
+    # A pool on the same subnet, torn down again.
+    same_subnet = DhcpPoolConfig(
+        interface="vlan100",
+        range_start="10.100.0.20",
+        range_end="10.100.0.30",
+        gateway="10.100.0.1",
+        dns_servers=["1.1.1.1"],
+        lease_time_seconds=600,
+    )
+    await adapter.delete_dhcp_pool(mikrotik_creds, pool=same_subnet)
+
+    surviving = list(api.path("ip", "dhcp-server", "network"))
+    assert len(surviving) == 1, "the portal's network row was destroyed"
+    assert surviving[0].get("gateway") == "10.100.0.1"
+
+
+@pytest.mark.asyncio
+async def test_a_network_row_we_did_not_write_is_never_removed(
+    patch_connect, mikrotik_creds
+):
+    """A row with no marker was written by a human or an older build.
+    Leaving a stale row is visible and correctable; deleting someone
+    else's is silent and breaks a running service."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "dhcp-server", "network"): [
+                {".id": "*9", "address": "10.30.30.0/24", "gateway": "10.30.30.9"}
+            ]
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_dhcp_pool(
+        mikrotik_creds,
+        pool=DhcpPoolConfig(
+            interface="vlan300",
+            range_start="10.30.30.100",
+            range_end="10.30.30.200",
+            gateway="10.30.30.1",
+            dns_servers=[],
+            lease_time_seconds=600,
+        ),
+    )
+
+    assert len(list(api.path("ip", "dhcp-server", "network"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_interface_already_serving_dhcp_is_refused_before_anything_is_created(
+    patch_connect, mikrotik_creds
+):
+    """Observed on hardware: the pool add succeeded, the server add failed
+    with "server or relay with such interface already exists", and the pool
+    was left orphaned with nothing referencing it -- while the caller
+    recorded a failed push."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "dhcp-server"): [
+                {".id": "*1", "name": "someone-elses-dhcp", "interface": "vlan100"}
+            ]
+        }
+    )
+    patch_connect(api)
+
+    with pytest.raises(MikroTikDeviceError):
+        await MikroTikAdapter().configure_dhcp_pool(
+            mikrotik_creds,
+            pool=DhcpPoolConfig(
+                interface="vlan100",
+                range_start="10.100.0.20",
+                range_end="10.100.0.30",
+                gateway="10.100.0.1",
+                dns_servers=[],
+                lease_time_seconds=600,
+            ),
+        )
+
+    assert list(api.path("ip", "pool")) == [], "an orphaned pool was left behind"
+    assert api.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_lease_time_is_compared_as_a_duration_not_a_string(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS accepts `600s` and reads it back as `10m`. A string
+    comparison can never match, so the guarded write re-issues its `set`
+    on every push, forever. Observed on hardware."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "dhcp-server"): [
+                {
+                    ".id": "*4",
+                    "name": "vlan300-dhcp",
+                    "interface": "vlan300",
+                    "address-pool": "vlan300-pool",
+                    "lease-time": "10m",      # what the device reports
+                    "disabled": False,
+                }
+            ]
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_dhcp_pool(
+        mikrotik_creds,
+        pool=DhcpPoolConfig(
+            interface="vlan300",
+            range_start="10.30.30.100",
+            range_end="10.30.30.200",
+            gateway="10.30.30.1",
+            dns_servers=[],
+            lease_time_seconds=600,           # what we send: "600s"
+        ),
+    )
+
+    server_updates = [
+        f for seg, f in api.update_calls if seg == ("ip", "dhcp-server")
+    ]
+    assert server_updates == [], f"pointless set re-issued: {server_updates}"
+
+
+@pytest.mark.asyncio
+async def test_html_directory_is_compared_as_a_path_not_a_string(
+    patch_connect, mikrotik_creds
+):
+    """Written as `cloudguest-hotspot`, stored by RouterOS as
+    `flash/cloudguest-hotspot`. Same defect as lease-time, same effect."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "hotspot", "profile"): [
+                {
+                    ".id": "*2",
+                    "name": "vlan100-hsprof",
+                    "hotspot-address": "10.100.0.1",
+                    "html-directory": "flash/cloudguest-hotspot",
+                    "dns-name": "vlan100.wifi.example.com",
+                }
+            ]
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_vlan_hotspot(mikrotik_creds, hotspot=_hotspot())
+
+    profile_updates = [
+        f for seg, f in api.update_calls if seg == ("ip", "hotspot", "profile")
+    ]
+    assert profile_updates == [], f"pointless set re-issued: {profile_updates}"
+
+
+def test_routeros_durations_that_mean_the_same_span_compare_equal():
+    assert _same_routeros_duration("10m", "600s")
+    assert _same_routeros_duration("1h", "3600s")
+    assert _same_routeros_duration("1d", "86400s")
+    assert _same_routeros_duration("600", "10m")     # bare seconds
+    assert not _same_routeros_duration("10m", "601s")
+    assert not _same_routeros_duration("none", "600s")
+    assert not _same_routeros_duration(None, "600s")
+
+
+def test_routeros_paths_that_name_the_same_directory_compare_equal():
+    assert _same_routeros_path("flash/cloudguest-hotspot", "cloudguest-hotspot")
+    assert _same_routeros_path("cloudguest-hotspot", "cloudguest-hotspot")
+    assert not _same_routeros_path("flash/hotspot", "cloudguest-hotspot")
+    assert not _same_routeros_path(None, "cloudguest-hotspot")
