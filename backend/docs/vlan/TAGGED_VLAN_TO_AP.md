@@ -18,7 +18,7 @@ which are documented, and which are neither.
 | Captive portal on/off per VLAN | **Exists** — `Vlan.enable_hotspot` |
 | Pool + DHCP + gateway + DNS created automatically | **Exists** — `configure_vlan_hotspot` writes `/ip pool`, `/ip dhcp-server`, its network row, the hotspot profile and the hotspot server |
 | Internet for that VLAN | **Exists** — `Vlan.nat_enabled` writes the masquerade |
-| **The tag reaching the AP's port** | **Missing entirely** |
+| **The tag reaching the AP's port** | **Nothing in the platform writes it** — whether anything *needs* to is the open question below |
 
 The customer chose `port_mode="access"` because their access point is on that
 port and "access" read as the matching word. Access mode does the opposite of
@@ -32,12 +32,13 @@ Their VLAN also created no IP pool because nothing does in that combination:
 `access` + `enable_hotspot=false` writes an interface and an address and
 stops. `trunk` + `enable_hotspot=true` writes the whole set.
 
-## Why the missing piece is missing
+## What the platform does and does not write
 
 `grep` over `wyfy_device_gateway/mikrotik_adapter.py` finds **no occurrence of
 `vlan-filtering` and none of `tagged=`**. `_configure_vlan_trunk` creates the
 sub-interface and the address; nothing ever tells the bridge which ports carry
-that tag.
+that tag. Whether that is a gap or simply unnecessary depends on the open
+question below.
 
 Read off the lab router (`rcjgfc`, 10.20.0.14, RouterOS 7.23.3):
 
@@ -53,12 +54,34 @@ Read off the lab router (`rcjgfc`, 10.20.0.14, RouterOS 7.23.3):
 
 Two things in that read matter.
 
-**`vlan-filtering=False`.** With filtering off the bridge ignores 802.1Q tags
-completely. A `/interface vlan` on that bridge exists, holds an address, and
-can host a DHCP server — and no client frame ever arrives on it. This is the
-limitation to state plainly: **creating the VLAN interface alone cannot carry
-client traffic.** It is not a bug in the VLAN code; it is the switch the VLAN
-code never touches.
+**`vlan-filtering=False`.** MikroTik documents this as the bridge ignoring
+VLAN tags and working in shared-VLAN-learning (SVL) mode, unable to modify
+tags.
+
+**What that does NOT settle, and an earlier draft of this document wrongly
+claimed it did:** whether a `/interface vlan` created *on top of* the bridge
+still receives frames tagged with its VID when filtering is off. "The bridge
+does not do VLAN-aware forwarding" and "a VLAN interface on the bridge cannot
+receive tagged frames" are different statements, and MikroTik's Bridging and
+Switching page states only the first
+[DOC — [Bridging and Switching](https://help.mikrotik.com/docs/spaces/ROS/pages/328068/Bridging+and+Switching); checked, and it does not address the second].
+
+This is the single question that decides the whole architecture:
+
+* **If a VLAN interface on the bridge does receive tagged frames** with
+  filtering off, then the platform needs no bridge changes at all. Trunk mode
+  already creates that interface, `enable_hotspot` already gives it a pool, a
+  DHCP server and a portal, and the only remaining work is on the access
+  point. No `vlan-filtering`, no switch-chip reset, no risk to the live guest
+  network. What is lost is isolation: with no ingress filtering, tagged frames
+  flood to every bridge port and any port could inject any VID.
+* **If it does not**, bridge VLAN filtering is required, and the sequence
+  below applies with all of its risk.
+
+It is cheap to find out and it has not been done: put one SSID on VLAN 900 at
+the access point, then read `rx-packet`/`rx-byte` on the `vlan900` interface.
+Non-zero counters answer it without needing a client to complete DHCP — the
+AP's own broadcast traffic is enough.
 
 **There is already a stale entry for `vlan-ids=100`, tagged on `bridge` only.**
 `ether2` is not in its tagged list. So even with filtering enabled, VLAN 100
