@@ -454,8 +454,24 @@ async def ensure_routers(
                 model=ROUTER_MODELS[(loc_idx + r_idx) % len(ROUTER_MODELS)],
                 vendor="mikrotik",
                 routeros_version=ROUTEROS_VERSION,
+                # RFC1918, and outside the WireGuard tunnel network
+                # (10.20.0.0/24) for as long as this stays under 20
+                # locations. Three seeded demo routers once carried
+                # management addresses inside that range, one of which was
+                # a live router's real tunnel address -- check this if you
+                # add entries to DEMO_LOCATIONS or the tunnel CIDR widens.
                 management_ip_address=f"10.{loc_idx}.{r_idx}.1",
-                public_ip_address=f"49.36.{loc_idx}.{r_idx}",
+                # TEST-NET-2 (RFC 5737), reserved for documentation and
+                # examples. This used to read ``49.36.{loc_idx}.{r_idx}``,
+                # which is inside 49.32.0.0/12 -- real, currently-allocated
+                # space belonging to Reliance Jio Infocomm (confirmed via
+                # APNIC RDAP). Demo fixtures must never carry somebody
+                # else's routable addresses: they show up in the dashboard
+                # as this platform's own infrastructure, and anyone who
+                # copies one out of a screenshot is looking at a stranger's
+                # network. The other demo dataset in this database already
+                # used 198.51.100.x correctly; this one did not.
+                public_ip_address=f"198.51.100.{loc_idx * 10 + r_idx}",
                 status=RouterStatus.ONLINE.value,
                 last_seen_at=now - timedelta(minutes=random.randint(0, 4)),
                 last_health_check_at=now - timedelta(minutes=random.randint(0, 4)),
