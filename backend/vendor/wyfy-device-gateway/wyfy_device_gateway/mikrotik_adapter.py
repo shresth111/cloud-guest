@@ -80,6 +80,7 @@ from .contract import (
     DeviceVendor,
     DhcpPoolConfig,
     InterfaceInfo,
+    NatRuleConfig,
     PingResult,
     PortForwardConfig,
     ProvisionResult,
@@ -118,6 +119,18 @@ _CONTENT_FILTER_ADDRESS_LIST_NAME = "wyfyguest-content-filter-blocked"
 _CONTENT_FILTER_ENFORCEMENT_COMMENT = (
     "Wyfy Guest content filtering: block listed addresses"
 )
+# NAT / internet access: the marker that makes one VLAN's masquerade rule
+# findable again on the next push. It is deliberately the rule's *identity*
+# rather than any of its RouterOS fields -- ``src-address`` is exactly what
+# an operator edits, so keying on it would leave the old rule behind and add
+# a second one. See ``configure_nat_masquerade``'s own docstring.
+_NAT_RULE_COMMENT_PREFIX = "WyfyGuest VLAN "
+
+
+def _nat_rule_comment(vlan_id: int) -> str:
+    return f"{_NAT_RULE_COMMENT_PREFIX}{vlan_id}"
+
+
 _MAC_ADDRESS_PATTERN = re.compile(
     r"^([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})"
     r"[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})[:\-]([0-9A-Fa-f]{2})$"
@@ -171,6 +184,24 @@ class MikroTikConnectionError(MikroTikDeviceError):
     caught there at all and propagates as a real exception). Callers that
     need to preserve that distinction should catch this subclass first,
     then the base class."""
+
+
+class MikroTikWanInterfaceError(MikroTikDeviceError):
+    """Raised when the router's own WAN-facing interface cannot honestly
+    be determined from its live state -- see
+    :meth:`MikroTikAdapter.resolve_wan_interface`.
+
+    A distinct type because the caller genuinely wants to distinguish it:
+    every other failure here means "the device rejected an operation", but
+    this one means "the device is not currently telling us where the
+    internet is", which is a real, operator-fixable condition (no usable
+    default route, or a default route whose gateway sits on no known
+    interface) and reads as nonsense when reported as a NAT push failure.
+
+    Deliberately raised instead of falling back to a guess. Masquerading
+    out of the wrong interface does not fail loudly -- it silently NATs
+    guest traffic onto an internal segment, or matches nothing at all and
+    leaves a VLAN with no internet while the push reports success."""
 
 
 def normalize_mac_address(value: object) -> str | None:
@@ -1139,6 +1170,119 @@ class MikroTikAdapter:
                 return
         api.path("ip", "address").add(address=ip_cidr, interface=interface)
 
+    async def delete_vlan(
+        self, creds: DeviceCredentials, *, vlan: VlanConfig
+    ) -> None:
+        """Removes what :meth:`configure_vlan` created, for the same
+        ``port_mode``.
+
+        Deleting a VLAN row never touched the device, and the gateway had
+        no teardown method to call even if it had wanted to -- so a VLAN
+        the platform created went on carrying traffic after the operator
+        deleted it, with nothing in the UI to say so.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error. A delete retried after a partial failure completes cleanly,
+        and deleting a row that was never pushed does nothing.
+        """
+        await asyncio.to_thread(self._delete_vlan_sync, creds, vlan)
+
+    def _delete_vlan_sync(self, creds: DeviceCredentials, vlan: VlanConfig) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if vlan.port_mode == "access":
+                    self._delete_vlan_access(api, vlan)
+                else:
+                    self._delete_vlan_trunk(api, vlan)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"delete_vlan: {exc}") from exc
+        finally:
+            api.close()
+
+    def _delete_vlan_trunk(self, api, vlan: VlanConfig) -> None:
+        vlan_interface = f"vlan{vlan.vlan_id}"
+        # Address first, then the interface carrying it. RouterOS would
+        # cascade, but removing the address explicitly keeps the teardown
+        # symmetric with the two writes configure_vlan made and leaves
+        # nothing behind if the interface row is already gone.
+        self._remove_ip_address(api, vlan.ip_cidr, vlan_interface)
+        for row in list(api.path("interface", "vlan")):
+            if row.get("name") == vlan_interface:
+                api.path("interface", "vlan").remove(row[".id"])
+
+    def _delete_vlan_access(self, api, vlan: VlanConfig) -> None:
+        """Access mode gave a physical port the subnet directly, after
+        pulling it out of the shared bridge.
+
+        The address is removed. The port is **not** put back into a bridge:
+        which bridge it belonged to was never recorded, and re-adding it to
+        a guessed one would silently rejoin a port to the wrong L2 segment.
+        The port is left out of every bridge, holding no address -- inert
+        and safe, and visible to an operator as an unbridged port.
+        """
+        self._remove_ip_address(api, vlan.ip_cidr, vlan.interface)
+
+    def _remove_ip_address(self, api, ip_cidr: str | None, interface: str) -> None:
+        """Removes that exact address from that exact interface.
+
+        Matches on address *and* interface, the same pair
+        ``_ensure_ip_address`` adds on: the same subnet existing elsewhere
+        on the router is not this VLAN's address and must not be removed.
+        """
+        if not ip_cidr:
+            return
+        for row in list(api.path("ip", "address")):
+            if row.get("address") == ip_cidr and row.get("interface") == interface:
+                api.path("ip", "address").remove(row[".id"])
+
+    async def delete_dhcp_pool(
+        self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
+    ) -> None:
+        """Removes the three objects :meth:`configure_dhcp_pool` created.
+
+        Order matters and is not cosmetic: the DHCP server holds a
+        reference to the address pool, so the server goes first or RouterOS
+        refuses to remove a pool still in use.
+
+        Idempotent, for the same reasons as :meth:`delete_vlan`.
+        """
+        await asyncio.to_thread(self._delete_dhcp_pool_sync, creds, pool)
+
+    def _delete_dhcp_pool_sync(
+        self, creds: DeviceCredentials, pool: DhcpPoolConfig
+    ) -> None:
+        identifier = re.sub(r"[^A-Za-z0-9_-]", "-", pool.interface)
+        pool_name = f"{identifier}-pool"
+        server_name = f"{identifier}-dhcp"
+        network = str(
+            _smallest_enclosing_network(pool.range_start, pool.range_end)
+        )
+        api = self._connect_api(creds)
+        try:
+            try:
+                self._remove_where(
+                    api, ("ip", "dhcp-server", "network"), "address", network
+                )
+                # Server before pool: the server references the pool, and
+                # RouterOS refuses to remove a pool that is still in use.
+                self._remove_where(api, ("ip", "dhcp-server"), "name", server_name)
+                self._remove_where(api, ("ip", "pool"), "name", pool_name)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_dhcp_pool: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _remove_where(
+        self, api, path_segments: tuple[str, ...], field: str, value: str
+    ) -> None:
+        menu = api.path(*path_segments)
+        for row in list(menu):
+            if row.get(field) == value:
+                menu.remove(row[".id"])
+
     async def configure_dhcp_pool(
         self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
     ) -> None:
@@ -1306,6 +1450,262 @@ class MikroTikAdapter:
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"configure_port_forward: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    # ------------------------------------------------------------------
+    # NAT / internet access
+    # ------------------------------------------------------------------
+
+    async def resolve_wan_interface(self, creds: DeviceCredentials) -> str:
+        """The router's own WAN-facing interface, derived from its live
+        state -- never a hardcoded ``"WAN"``/``"ether1"``.
+
+        **The rule: the interface the currently-usable default route
+        leaves by.** A default route is the router's own statement of
+        where the internet is, and it is the only signal on the box that
+        is true by construction rather than by convention. Interface
+        *names* are pure convention: a fleet router may call its uplink
+        ``ether1``, ``WAN``, ``pppoe-out1`` or ``sfp1``, and this platform
+        stores that name nowhere.
+
+        The default route itself is picked by the same two-tier rule every
+        other WAN read here uses (:func:`_select_default_route_row`:
+        dynamic first, then an *active*, non-disabled static one) -- so
+        this agrees with ``get_wan_health`` and ``get_active_default
+        _gateway`` by construction rather than by a second, drifting copy.
+
+        From that one route, four ordered ways to name its interface, each
+        checked against the real ``/interface`` list before it is
+        accepted:
+
+        1. the route row's own ``interface`` field, when RouterOS
+           populates it -- the device saying it outright;
+        2. its ``immediate-gw``/``gateway`` token's ``%``-suffix
+           (``"192.168.1.1%ether1"``), RouterOS v7's own way of naming the
+           egress interface of a gateway route;
+        3. the ``/ip address`` whose subnet actually contains the
+           gateway -- the gateway is by definition reachable on the
+           interface holding an address in its subnet, so this is a
+           derivation, not a heuristic. This is the tier that resolves the
+           ordinary DHCP-WAN router (uplink ``192.168.1.100/24`` on
+           ``ether1``, gateway ``192.168.1.1``);
+        4. the ``/ip dhcp-client`` that negotiated that same gateway. Not
+           redundant with tier 3: a client mid-renewal has withdrawn its
+           dynamic ``/ip address`` row while the default route still
+           stands, which is precisely when a DHCP-WAN router would
+           otherwise resolve to nothing.
+
+        Note what is *not* used: bridge membership, name matching, "the
+        first ethernet port", or the single interface holding an address.
+        Each would return an answer on a router where the honest answer is
+        "cannot tell".
+
+        Raises :class:`MikroTikWanInterfaceError` when no tier produces a
+        real interface -- the router has no usable default route at all
+        (a genuine outage, or an uplink RouterOS has stopped considering
+        active), or its gateway sits on nothing this router knows about.
+        Guessing here is worse than failing: the wrong ``out-interface``
+        either masquerades guest traffic onto an internal segment or
+        matches nothing, and both report success.
+        """
+        return await asyncio.to_thread(self._resolve_wan_interface_sync, creds)
+
+    def _resolve_wan_interface_sync(self, creds: DeviceCredentials) -> str:
+        api = self._connect_api(creds)
+        try:
+            return self._resolve_wan_interface(api, creds)
+        finally:
+            api.close()
+
+    def _resolve_wan_interface(self, api, creds: DeviceCredentials) -> str:
+        """Same resolution as :meth:`resolve_wan_interface`, against an
+        already-open connection -- so a NAT push resolves the WAN and
+        writes the rule over one connection rather than two."""
+        try:
+            route_rows = list(api.path("ip", "route"))
+            address_rows = list(api.path("ip", "address"))
+            interface_rows = list(api.path("interface"))
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(
+                creds.host, f"resolve_wan_interface: {exc}"
+            ) from exc
+        try:
+            dhcp_client_rows = list(api.path("ip", "dhcp-client"))
+        except LibRouterosError:
+            # Tier 4 only. An unreadable optional menu must not sink a
+            # resolution the earlier tiers can already make on their own.
+            dhcp_client_rows = []
+
+        interface_names = {
+            str(row["name"]) for row in interface_rows if row.get("name")
+        }
+        resolved = _select_wan_interface(
+            route_rows, address_rows, dhcp_client_rows, interface_names
+        )
+        if resolved is None:
+            raise MikroTikWanInterfaceError(
+                creds.host,
+                "could not determine the WAN interface: no usable default "
+                "route, or its gateway is on no known interface",
+            )
+        return resolved
+
+    async def configure_nat_masquerade(
+        self, creds: DeviceCredentials, *, rule: NatRuleConfig
+    ) -> None:
+        """Realizes ``/ip firewall nat add chain=srcnat
+        src-address=<subnet> out-interface=<wan> action=masquerade
+        comment="WyfyGuest VLAN <id>"`` -- the rule that turns a routed
+        but isolated VLAN into one whose guests actually reach the
+        internet.
+
+        Nothing in it is hardcoded. The subnet is the VLAN's own
+        ``src_address``; the interface is resolved from the router's live
+        default route (:meth:`resolve_wan_interface`) unless the caller
+        passed an explicit override; the comment carries the VLAN's real
+        id.
+
+        **The comment is the rule's identity, and that is the whole
+        design.** Every other field is something an operator edits:
+        re-subnet a VLAN and ``src-address`` changes, re-cable a site and
+        ``out-interface`` changes. Keyed on any of those, the next push
+        would find no match, add a second rule, and leave the first one
+        masquerading a subnet nothing uses -- silent, cumulative, and
+        invisible in this platform's own UI. Keyed on the comment, the
+        same push finds the rule it wrote last time and *updates* it,
+        which is what "if the VLAN config changes, update the existing
+        rule" actually requires.
+
+        ``disabled`` is normalized back to ``no`` via :func:`_is_truthy`,
+        never by string comparison: a rule someone disabled by hand is not
+        providing internet access, and a re-push is the operator asking
+        for it.
+        """
+        await asyncio.to_thread(self._configure_nat_masquerade_sync, creds, rule)
+
+    def _configure_nat_masquerade_sync(
+        self, creds: DeviceCredentials, rule: NatRuleConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            # The WAN is resolved before anything is written: a rule whose
+            # out-interface could not be determined must not exist at all,
+            # half-written and matching everything.
+            out_interface = self._nat_out_interface(api, creds, rule)
+            try:
+                self._ensure_nat_masquerade_rule(api, rule, out_interface)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_nat_masquerade: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _nat_out_interface(
+        self, api, creds: DeviceCredentials, rule: NatRuleConfig
+    ) -> str:
+        """The interface to masquerade out of -- resolved from the router
+        unless the caller named one, and in either case confirmed to be a
+        real interface on this device first.
+
+        The check is not redundant for the override path: RouterOS does
+        reject an unknown interface name on a firewall rule, but with a
+        message about an input not matching a value, attributed to the NAT
+        write. Checking first names the missing interface instead.
+        """
+        if rule.out_interface is None:
+            return self._resolve_wan_interface(api, creds)
+        try:
+            names = {
+                str(row["name"])
+                for row in api.path("interface")
+                if row.get("name")
+            }
+        except LibRouterosError as exc:
+            raise MikroTikDeviceError(
+                creds.host, f"configure_nat_masquerade: {exc}"
+            ) from exc
+        if rule.out_interface not in names:
+            raise MikroTikWanInterfaceError(
+                creds.host,
+                f"no interface named '{rule.out_interface}' exists on this device",
+            )
+        return rule.out_interface
+
+    def _ensure_nat_masquerade_rule(
+        self, api, rule: NatRuleConfig, out_interface: str
+    ) -> None:
+        """Creates this VLAN's masquerade rule, or brings the one already
+        carrying its comment into line with what is wanted now.
+
+        ``chain`` and ``action`` are part of the desired state, not just of
+        the ``add``: a rule found by this VLAN's comment but sitting on the
+        wrong chain is this VLAN's rule in a broken state, and correcting
+        it is right where adding a second one alongside it would not be.
+        """
+        comment = _nat_rule_comment(rule.vlan_id)
+        desired = {
+            "chain": "srcnat",
+            "action": "masquerade",
+            "src-address": rule.src_address,
+            "out-interface": out_interface,
+        }
+        menu = api.path("ip", "firewall", "nat")
+        for row in menu:
+            if row.get("comment") != comment:
+                continue
+            changed = {
+                key: value for key, value in desired.items() if row.get(key) != value
+            }
+            # Boolean, never string -- see ``_is_truthy``. Comparing the raw
+            # value against "no" reports a difference on every single push
+            # and issues a pointless update forever.
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(**desired, comment=comment, disabled="no")
+
+    async def delete_nat_masquerade(
+        self, creds: DeviceCredentials, *, rule: NatRuleConfig
+    ) -> None:
+        """Removes this VLAN's masquerade rule, by the same comment
+        identity :meth:`configure_nat_masquerade` writes it under.
+
+        Only ``rule.vlan_id`` is read. ``src_address`` deliberately is not:
+        a rule left from an older subnet is still this VLAN's rule, and
+        matching on the current subnet is exactly how it would be orphaned
+        instead of removed.
+
+        **No WAN resolution happens here**, unlike on the write path. A
+        VLAN must stay removable from a router whose uplink is down --
+        which is the state a router is often in when someone is tearing
+        its configuration down -- and the comment is enough to find the
+        rule without knowing where the internet is.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error.
+        """
+        await asyncio.to_thread(self._delete_nat_masquerade_sync, creds, rule)
+
+    def _delete_nat_masquerade_sync(
+        self, creds: DeviceCredentials, rule: NatRuleConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                self._remove_where(
+                    api,
+                    ("ip", "firewall", "nat"),
+                    "comment",
+                    _nat_rule_comment(rule.vlan_id),
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_nat_masquerade: {exc}"
                 ) from exc
         finally:
             api.close()
@@ -1887,6 +2287,8 @@ class MikroTikAdapter:
             "configure_vlan": True,
             "configure_dhcp_pool": True,
             "configure_port_forward": True,
+            "configure_nat_masquerade": True,
+            "delete_nat_masquerade": True,
             "set_radius_client_config": True,
             "configure_content_filter_rule": True,
             "disconnect_device": True,
@@ -1977,6 +2379,28 @@ def _select_default_route(
     ``_get_wan_health_sync``, which also needs to know *which* interface
     the default route rides on to resolve PPPoE status/traffic counters
     against it."""
+    winning_row = _select_default_route_row(rows)
+    if winning_row is None:
+        return None, None
+    gateway = winning_row.get("gateway")
+    interface = winning_row.get("interface")
+    return (
+        str(gateway) if gateway else None,
+        str(interface) if interface else None,
+    )
+
+
+def _select_default_route_row(
+    rows: list[dict[str, object]],
+) -> dict[str, object] | None:
+    """The raw ``/ip/route`` row the two-tier rule above selects, or
+    ``None``.
+
+    Extracted so WAN-interface resolution reads the *same* winning route
+    as the gateway/health reads rather than re-implementing the choice --
+    it needs fields (``immediate-gw``) the two-value view above does not
+    carry, and a second copy of "which default route counts" is exactly
+    the kind of drift that produced the 2026-08-17 incident."""
     dynamic_row: dict[str, object] | None = None
     active_fallback_row: dict[str, object] | None = None
     for row in rows:
@@ -1992,15 +2416,114 @@ def _select_default_route(
         is_disabled = str(row.get("disabled", "false")).lower() == "true"
         if is_active and not is_disabled and row.get("gateway"):
             active_fallback_row = row
-    winning_row = dynamic_row if dynamic_row is not None else active_fallback_row
-    if winning_row is None:
-        return None, None
-    gateway = winning_row.get("gateway")
-    interface = winning_row.get("interface")
-    return (
-        str(gateway) if gateway else None,
-        str(interface) if interface else None,
+    return dynamic_row if dynamic_row is not None else active_fallback_row
+
+
+def _gateway_address(value: object) -> str | None:
+    """The bare gateway IP from a RouterOS gateway token.
+
+    RouterOS v7 qualifies a gateway with the interface it is reachable on
+    -- ``"192.168.1.1%ether1"`` -- in ``gateway`` and ``immediate-gw``
+    alike. Everything that has to *match* the gateway against something
+    else (an address's subnet, a dhcp-client's own gateway) needs the
+    address half alone."""
+    text = _safe_str(value)
+    if not text:
+        return None
+    return text.split("%", 1)[0].strip() or None
+
+
+def _gateway_token_interface(value: object) -> str | None:
+    """The interface half of that same token, when RouterOS supplies one
+    -- the device naming its own egress interface for this route."""
+    text = _safe_str(value)
+    if not text or "%" not in text:
+        return None
+    return text.split("%", 1)[1].strip() or None
+
+
+def _interface_holding_gateway(
+    gateway: str | None, address_rows: list[dict[str, object]]
+) -> str | None:
+    """The interface carrying an address whose subnet contains
+    ``gateway``.
+
+    A derivation rather than a heuristic: a next-hop gateway is reachable
+    precisely because the router holds an address in its subnet, and the
+    interface that address is on is the one traffic to it leaves by. This
+    is the tier that resolves an ordinary DHCP-WAN router, whose default
+    route names no interface of its own."""
+    if not gateway:
+        return None
+    try:
+        gateway_ip = ipaddress.ip_address(gateway)
+    except ValueError:
+        return None
+    for row in address_rows:
+        address = _safe_str(row.get("address"))
+        interface = _safe_str(row.get("interface"))
+        if not address or not interface:
+            continue
+        try:
+            network = ipaddress.ip_interface(address).network
+        except ValueError:
+            continue
+        if gateway_ip in network:
+            return interface
+    return None
+
+
+def _dhcp_client_interface_for_gateway(
+    gateway: str | None, dhcp_client_rows: list[dict[str, object]]
+) -> str | None:
+    """The interface of the ``/ip dhcp-client`` that negotiated exactly
+    this gateway.
+
+    Matched on the gateway, never on "there is only one dhcp-client": a
+    router with a second dhcp-client on an internal link would otherwise
+    have guest traffic masqueraded onto that internal segment."""
+    if not gateway:
+        return None
+    for row in dhcp_client_rows:
+        interface = _safe_str(row.get("interface"))
+        if interface and _gateway_address(row.get("gateway")) == gateway:
+            return interface
+    return None
+
+
+def _select_wan_interface(
+    route_rows: list[dict[str, object]],
+    address_rows: list[dict[str, object]],
+    dhcp_client_rows: list[dict[str, object]],
+    interface_names: set[str],
+) -> str | None:
+    """The WAN-facing interface name, or ``None`` when the router's own
+    live state does not honestly identify one.
+
+    The full rule -- which default route counts, the four ordered ways to
+    name its interface, and what is deliberately not used -- is documented
+    on :meth:`MikroTikAdapter.resolve_wan_interface`. This function is
+    that rule with no I/O in it, so it can be reasoned about (and tested)
+    against raw RouterOS reply rows.
+
+    Every candidate is checked against ``interface_names`` before it wins,
+    so a stale name in a route row can never become an ``out-interface``
+    referring to an interface this device does not have."""
+    row = _select_default_route_row(route_rows)
+    if row is None:
+        return None
+    gateway = _gateway_address(row.get("gateway"))
+    candidates = (
+        _safe_str(row.get("interface")),
+        _gateway_token_interface(row.get("immediate-gw")),
+        _gateway_token_interface(row.get("gateway")),
+        _interface_holding_gateway(gateway, address_rows),
+        _dhcp_client_interface_for_gateway(gateway, dhcp_client_rows),
     )
+    for candidate in candidates:
+        if candidate and candidate in interface_names:
+            return candidate
+    return None
 
 
 def _parse_ping_rows(

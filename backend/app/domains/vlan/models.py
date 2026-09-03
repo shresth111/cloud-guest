@@ -84,6 +84,17 @@ class Vlan(BaseModel):
     enable_hotspot: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False
     )
+    # NAT / Internet Access. When true, the device push also realizes a
+    # source-NAT masquerade rule for this VLAN's own ``cidr`` on the
+    # router's real WAN interface -- the difference between a working
+    # local network and one whose guests reach the internet. Without it a
+    # pushed VLAN hands out leases and routes nowhere, with no error
+    # anywhere to say so. Defaults false: turning it on is a deliberate
+    # decision, and inferring it would put a segment somebody built as
+    # isolated onto the public internet on its next push.
+    nat_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 

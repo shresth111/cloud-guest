@@ -141,6 +141,37 @@ class PortForwardConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class NatRuleConfig:
+    """One VLAN's source-NAT (masquerade) rule -- what turns a routed but
+    isolated VLAN subnet into one whose guests actually reach the
+    internet.
+
+    Sibling of :class:`PortForwardConfig`: both land in ``/ip firewall
+    nat``, but on opposite chains and in opposite directions
+    (``dstnat``/``dst-nat`` inbound there, ``srcnat``/``masquerade``
+    outbound here).
+
+    ``vlan_id`` is carried for identity, not for any RouterOS field: the
+    rule is found again on a later push by the comment derived from it
+    (``"WyfyGuest VLAN <id>"``), because ``src_address`` is precisely the
+    field an operator edits and so cannot be the handle -- see
+    ``mikrotik_adapter.configure_nat_masquerade``'s own docstring.
+
+    ``out_interface`` is ``None`` by default and that is the normal case:
+    it means "whichever interface this router's own live default route
+    leaves by". The caller (cloud-guest-repo) has no honest way to know a
+    given router's WAN port -- it is not stored anywhere, differs per
+    site, and a hardcoded ``"WAN"``/``"ether1"`` would masquerade out of
+    the wrong interface or silently match nothing. Pass a real name only
+    to override that resolution deliberately.
+    """
+
+    vlan_id: int
+    src_address: str  # the VLAN's own subnet as a CIDR, e.g. "10.100.0.0/24"
+    out_interface: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RadiusClientConfig:
     radius_server_host: str
     radius_secret: str
@@ -324,6 +355,58 @@ class DeviceGatewayAdapter(Protocol):
     # -- network config push ---------------------------------------------
     async def configure_vlan(self, creds: DeviceCredentials, *, vlan: VlanConfig) -> None: ...
     async def configure_dhcp_pool(self, creds: DeviceCredentials, *, pool: DhcpPoolConfig) -> None: ...
+
+    async def configure_nat_masquerade(
+        self, creds: DeviceCredentials, *, rule: NatRuleConfig
+    ) -> None:
+        """Gives one VLAN's subnet real internet access, by realizing a
+        source-NAT masquerade rule for it on the device's own WAN-facing
+        interface.
+
+        A VLAN with an address and a DHCP pool is a working *local*
+        network and nothing more: without this, its guests get a lease, a
+        gateway, and no route off the router. This is the toggle that
+        makes the difference.
+
+        Idempotent, and idempotent on *identity* rather than on content:
+        the rule is found again by a marker derived from ``rule.vlan_id``,
+        so editing the VLAN's subnet updates the existing rule instead of
+        leaving an orphan behind and adding a second one that masquerades
+        a subnet nothing uses any more.
+        """
+        ...
+
+    # -- network config teardown ------------------------------------------
+    # Deleting a row never removed anything from the device: the platform
+    # could create a VLAN or a pool on a router and then had no way to take
+    # it back off, so a "deleted" object went on serving traffic forever.
+    # Both are idempotent -- removing what is already absent is a no-op, not
+    # an error, so a retry after a partial failure completes cleanly.
+    async def delete_vlan(
+        self, creds: DeviceCredentials, *, vlan: VlanConfig
+    ) -> None: ...
+
+    async def delete_dhcp_pool(
+        self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
+    ) -> None: ...
+
+    async def delete_nat_masquerade(
+        self, creds: DeviceCredentials, *, rule: NatRuleConfig
+    ) -> None:
+        """Takes one VLAN's internet access back off the device.
+
+        The same call serves two different intents -- the operator turned
+        the NAT toggle off, or deleted the VLAN outright -- because both
+        mean the same thing on the device: this VLAN's masquerade rule
+        must not be there. Only ``rule.vlan_id`` is consulted; a rule left
+        over from an older subnet is still this VLAN's rule and is removed
+        too.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error.
+        """
+        ...
+
     async def configure_port_forward(
         self, creds: DeviceCredentials, *, rule: PortForwardConfig
     ) -> None: ...
@@ -605,6 +688,7 @@ __all__ = [
     "ConnectedDevice",
     "VlanConfig",
     "DhcpPoolConfig",
+    "NatRuleConfig",
     "PortForwardConfig",
     "RadiusClientConfig",
     "ContentFilterRuleConfig",
