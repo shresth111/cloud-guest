@@ -28,6 +28,11 @@ from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 from app.domains.vlan.constants import VlanDevicePushStatus
+from app.domains.vlan.device_adapters import (
+    VlanDeviceAddress,
+    VlanDeviceInterface,
+    VlanNetworkSnapshot,
+)
 from app.domains.vlan.exceptions import (
     CrossOrganizationVlanAccessError,
     InvalidCidrError,
@@ -228,23 +233,51 @@ class FakeRouterLookup:
 
 
 @dataclass
+class FakeDhcpPool:
+    """Only the three fields ``DhcpPoolLookupProtocol`` reads."""
+
+    name: str
+    interface: str | None
+    is_enabled: bool = True
+
+
+@dataclass
+class FakeDhcpPoolLookup:
+    """Stands in for ``app.domains.dhcp.repository.DhcpRepository`` at the
+    narrow Protocol boundary the VLAN service composes it through."""
+
+    pools: dict[uuid.UUID, list[FakeDhcpPool]] = field(default_factory=dict)
+
+    async def list_pools_for_router(self, router_id: uuid.UUID) -> list[FakeDhcpPool]:
+        return self.pools.get(router_id, [])
+
+
+@dataclass
 class Harness:
     service: VlanService
     repository: FakeVlanRepository
     router_lookup: FakeRouterLookup
     audit_writer: FakeAuditLogWriter
+    dhcp_pool_lookup: FakeDhcpPoolLookup
 
 
 def make_harness() -> Harness:
     repository = FakeVlanRepository()
     router_lookup = FakeRouterLookup()
     audit_writer = FakeAuditLogWriter()
-    service = VlanService(repository, router_lookup, audit_writer=audit_writer)
+    dhcp_pool_lookup = FakeDhcpPoolLookup()
+    service = VlanService(
+        repository,
+        router_lookup,
+        dhcp_pool_lookup=dhcp_pool_lookup,
+        audit_writer=audit_writer,
+    )
     return Harness(
         service=service,
         repository=repository,
         router_lookup=router_lookup,
         audit_writer=audit_writer,
+        dhcp_pool_lookup=dhcp_pool_lookup,
     )
 
 
@@ -517,6 +550,78 @@ class FakeVlanAdapter:
     nat_calls: list[dict[str, object]] = field(default_factory=list)
     nat_deletes: list[dict[str, object]] = field(default_factory=list)
     nat_raises: Exception | None = None
+    hotspot_calls: list[dict[str, object]] = field(default_factory=list)
+    hotspot_deletes: list[dict[str, object]] = field(default_factory=list)
+    hotspot_raises: Exception | None = None
+    #: What the preflight read sees. Defaults to a router carrying every
+    #: interface the tests name and no addresses, so a test that is not
+    #: about the preflight does not have to describe one.
+    snapshot_interfaces: list[str] = field(
+        default_factory=lambda: ["bridge", "ether1", "ether2", "ether3"]
+    )
+    snapshot_addresses: list[tuple[str, str]] = field(default_factory=list)
+    snapshot_raises: Exception | None = None
+    snapshot_reads: int = 0
+
+    async def read_network_snapshot(self, credentials) -> VlanNetworkSnapshot:
+        self.snapshot_reads += 1
+        if self.snapshot_raises is not None:
+            raise self.snapshot_raises
+        return VlanNetworkSnapshot(
+            interfaces=[
+                VlanDeviceInterface(
+                    name=name,
+                    type="ether",
+                    running=True,
+                    disabled=False,
+                    bridge="bridge" if name.startswith("ether") else None,
+                    is_bridge_port=name.startswith("ether"),
+                    has_ip_address=False,
+                )
+                for name in self.snapshot_interfaces
+            ],
+            addresses=[
+                VlanDeviceAddress(address=address, interface=interface, disabled=False)
+                for address, interface in self.snapshot_addresses
+            ],
+        )
+
+    async def configure_hotspot(
+        self,
+        credentials,
+        *,
+        vlan_id: int,
+        interface: str,
+        cidr: str,
+        gateway: str,
+        dns_name: str,
+        html_directory: str,
+    ) -> None:
+        self.hotspot_calls.append(
+            {
+                "vlan_id": vlan_id,
+                "interface": interface,
+                "cidr": cidr,
+                "gateway": gateway,
+                "dns_name": dns_name,
+                "html_directory": html_directory,
+            }
+        )
+        if self.hotspot_raises is not None:
+            raise self.hotspot_raises
+
+    async def delete_hotspot(
+        self,
+        credentials,
+        *,
+        vlan_id: int,
+        interface: str,
+        cidr: str,
+        gateway: str,
+        dns_name: str,
+        html_directory: str,
+    ) -> None:
+        self.hotspot_deletes.append({"vlan_id": vlan_id, "interface": interface})
 
     async def configure_vlan(
         self,
@@ -639,7 +744,12 @@ class TestVlanDevicePush:
 
         assert vlan.device_push_status == VlanDevicePushStatus.FAILED.value
         assert "already have such item" in (vlan.device_push_error or "")
-        assert h.repository.commits == 1
+        # Two, not one: the push commits PROVISIONING before it opens a
+        # socket and the failure record after. Both have to survive the
+        # session rollback -- the first so a concurrent reader sees work in
+        # flight rather than the previous outcome, the second so the row
+        # does not read "provisioning" forever after a real failure.
+        assert h.repository.commits == 2
 
     async def test_a_vlan_with_no_interface_is_refused_before_connecting(
         self, adapter: FakeVlanAdapter
@@ -879,7 +989,9 @@ class TestVlanNatIsPartOfThePush:
 
         assert vlan.device_push_status == VlanDevicePushStatus.FAILED.value
         assert "WAN interface" in (vlan.device_push_error or "")
-        assert h.repository.commits == 1
+        # PROVISIONING before the socket, FAILED after -- see
+        # test_a_device_failure_is_recorded_committed_and_re_raised.
+        assert h.repository.commits == 2
 
     async def test_deleting_a_vlan_takes_its_nat_rule_off_the_router(
         self, adapter: FakeVlanAdapter

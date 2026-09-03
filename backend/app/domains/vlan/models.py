@@ -114,7 +114,23 @@ class Vlan(BaseModel):
     )
     # The raw ``str(exc)`` from the last failed push. Shown to the operator
     # verbatim -- a device error is more useful unedited than summarized.
+    # This *is* the spec's ``error_message``: same column, same content,
+    # same audience. A second column would be two places to look for one
+    # fact, and only one of them would be maintained.
     device_push_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The name the interface actually carries on the router, recorded by
+    # the push that created it rather than recomputed by whoever reads the
+    # row. In trunk mode that is the deterministic ``vlan<id>``; in access
+    # mode there is no ``/interface vlan`` entry at all and the VLAN lives
+    # on the physical port, so this holds the port's name -- storing
+    # ``vlan<id>`` there would name an interface that does not exist on the
+    # device, which is worse than storing nothing.
+    #
+    # NULL until the first successful push, truthfully: before one, this
+    # platform has no claim about what any router carries.
+    mikrotik_interface_name: Mapped[str | None] = mapped_column(
+        String(100), nullable=True
+    )
     device_pushed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

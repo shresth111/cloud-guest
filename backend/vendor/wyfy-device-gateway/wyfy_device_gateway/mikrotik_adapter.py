@@ -80,7 +80,9 @@ from .contract import (
     DeviceVendor,
     DhcpPoolConfig,
     InterfaceInfo,
+    IpAddressInfo,
     NatRuleConfig,
+    NetworkSnapshot,
     PingResult,
     PortForwardConfig,
     ProvisionResult,
@@ -91,6 +93,7 @@ from .contract import (
     TracerouteHop,
     TracerouteResult,
     VlanConfig,
+    VlanHotspotConfig,
     WanHealth,
 )
 
@@ -129,6 +132,67 @@ _NAT_RULE_COMMENT_PREFIX = "WyfyGuest VLAN "
 
 def _nat_rule_comment(vlan_id: int) -> str:
     return f"{_NAT_RULE_COMMENT_PREFIX}{vlan_id}"
+
+
+class _HotspotNames:
+    """The six RouterOS object names one VLAN's captive portal occupies.
+
+    Derived from ``vlan_id`` alone, exactly as
+    ``network_config.renderers._render_vlan_hotspot`` derives them, so a
+    portal this adapter pushes and the same portal rendered into a config
+    script are the same objects rather than two competing sets. ``vlan_id``
+    is the real, per-router-unique identity; the VLAN's display name is
+    not unique and never appears in an object name.
+    """
+
+    __slots__ = ("tag", "pool", "dhcp_server", "profile", "server")
+
+    def __init__(self, vlan_id: int) -> None:
+        self.tag = f"vlan{vlan_id}"
+        self.pool = f"{self.tag}-hs-pool"
+        self.dhcp_server = f"{self.tag}-hs-dhcp"
+        self.profile = f"{self.tag}-hsprof"
+        self.server = f"{self.tag}-hotspot"
+
+    @property
+    def dns_comment(self) -> str:
+        return f"{self.tag}-hotspot-dns-name"
+
+
+def _hotspot_pool_range(cidr: str, gateway: str) -> str | None:
+    """The address range a VLAN's captive portal hands out: the largest
+    run of hosts in ``cidr`` that does not contain ``gateway``.
+
+    ``_render_vlan_hotspot`` computes this as "every host except the
+    gateway", then emits ``first-last`` -- which is the same answer
+    whenever the gateway sits at either end of the subnet (``.1`` in a
+    ``/24``, the shape every VLAN this platform creates actually has), and
+    a real defect when it does not: with a gateway at ``.100`` the emitted
+    ``.1-.254`` spans it, and the DHCP server can lease the router's own
+    address to a guest. Taking the largest gateway-free run instead is
+    identical in the common case and correct in the uncommon one.
+
+    ``None`` when the subnet has no host left to hand out -- a ``/32``,
+    a ``/31``, or a gateway that is the only host. The caller refuses
+    rather than pushing a pool with an empty range.
+    """
+    network = ipaddress.ip_network(cidr, strict=False)
+    gateway_ip = ipaddress.ip_address(gateway)
+    runs: list[list[object]] = []
+    current: list[object] = []
+    for host in network.hosts():
+        if host == gateway_ip:
+            if current:
+                runs.append(current)
+                current = []
+            continue
+        current.append(host)
+    if current:
+        runs.append(current)
+    if not runs:
+        return None
+    widest = max(runs, key=len)
+    return f"{widest[0]}-{widest[-1]}"
 
 
 _MAC_ADDRESS_PATTERN = re.compile(
@@ -456,9 +520,83 @@ class MikroTikAdapter:
                     disabled=bool(row.get("disabled", False)),
                     bridge=bridge_of.get(name),
                     has_ip_address=name in has_ip,
+                    is_bridge_port=name in bridge_of,
                 )
             )
         return result
+
+    async def read_network_snapshot(self, creds: DeviceCredentials) -> NetworkSnapshot:
+        """Every interface and every ``/ip address`` on the device, in one
+        connection, filtered by nothing but ``lo``.
+
+        Not a variant of :meth:`get_interface_list` and not replaceable by
+        it. That method exists to back a DHCP picker, so it drops every
+        interface already bound to an ``/ip dhcp-server`` -- and on a real
+        router (verified on the lab hEX) that drops ``bridge``, which is
+        precisely the interface a VLAN trunk hangs off. Reusing it for a
+        VLAN form hides the one answer the form needs.
+
+        The ``/ip address`` half is here rather than in a second method
+        because it is read for the same reason at the same moment: a VLAN
+        push has to know whether the subnet it is about to claim already
+        exists on this device before it writes anything, and "reachable",
+        "interface exists" and "subnet free" are one round trip, not three
+        that can disagree with each other.
+        """
+        return await asyncio.to_thread(self._read_network_snapshot_sync, creds)
+
+    def _read_network_snapshot_sync(self, creds: DeviceCredentials) -> NetworkSnapshot:
+        api = self._connect_api(creds)
+        try:
+            try:
+                interfaces = list(api.path("interface"))
+                bridge_ports = list(api.path("interface", "bridge", "port"))
+                addresses = list(api.path("ip", "address"))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, _describe_exception(exc)) from exc
+        finally:
+            api.close()
+
+        bridge_of: dict[str, str] = {
+            str(p.get("interface")): str(p.get("bridge"))
+            for p in bridge_ports
+            if p.get("interface") and p.get("bridge")
+        }
+        has_ip: set[str] = {
+            str(a.get("interface")) for a in addresses if a.get("interface")
+        }
+
+        listed: list[InterfaceInfo] = []
+        for row in interfaces:
+            raw_name = row.get("name")
+            if not raw_name:
+                continue
+            name = str(raw_name)
+            if name == "lo":
+                continue
+            listed.append(
+                InterfaceInfo(
+                    name=name,
+                    type=str(row.get("type")) if row.get("type") else None,
+                    running=_is_truthy(row.get("running", False)),
+                    disabled=_is_truthy(row.get("disabled", False)),
+                    bridge=bridge_of.get(name),
+                    has_ip_address=name in has_ip,
+                    is_bridge_port=name in bridge_of,
+                )
+            )
+        return NetworkSnapshot(
+            interfaces=listed,
+            ip_addresses=[
+                IpAddressInfo(
+                    address=str(row["address"]),
+                    interface=str(row["interface"]) if row.get("interface") else None,
+                    disabled=_is_truthy(row.get("disabled", False)),
+                )
+                for row in addresses
+                if row.get("address")
+            ],
+        )
 
     async def get_wan_health(self, creds: DeviceCredentials, *, target_ip: str) -> WanHealth:
         """Composes three real, independently-audited read operations from
@@ -1236,6 +1374,255 @@ class MikroTikAdapter:
             if row.get("address") == ip_cidr and row.get("interface") == interface:
                 api.path("ip", "address").remove(row[".id"])
 
+    async def configure_vlan_hotspot(
+        self, creds: DeviceCredentials, *, hotspot: VlanHotspotConfig
+    ) -> None:
+        """Puts a captive portal on one VLAN's own interface.
+
+        Ported command-for-command from
+        ``network_config/renderers.py::_render_vlan_hotspot`` -- the same
+        six real RouterOS objects, in the same order, issued over the
+        structured API instead of as script text:
+
+        1. ``/ip pool`` -- the addresses the portal hands out.
+        2. ``/ip dhcp-server`` on this VLAN's interface, drawing from it.
+        3. ``/ip dhcp-server network`` -- gateway and DNS for the subnet,
+           both the VLAN's own gateway address so guests resolve through
+           the router that is about to intercept them.
+        4. ``/ip hotspot profile`` -- ``hotspot-address``, the uploaded
+           page set, and the ``dns-name`` RouterOS puts in its redirect.
+        5. ``/ip dns static`` -- what makes that ``dns-name`` resolve.
+           MikroTik's own documentation is explicit that ``dns-name``
+           changes the redirect URL and does not by itself create a
+           record; without this line guests are redirected to a hostname
+           that answers NXDOMAIN.
+        6. ``/ip hotspot`` -- the server, referencing 1 and 4.
+
+        The order is the reference order and is not cosmetic: the hotspot
+        server names the pool and the profile, and the DHCP server names
+        the pool, so each must exist before the object that points at it.
+
+        **Every write is existence-checked, and updates rather than skips
+        when a mutable field changed.** Re-pushing is ordinary -- an
+        operator edits a subnet and saves again -- and a portal whose pool
+        still hands out the old subnet after a re-push is a portal that
+        reports success and does not work.
+
+        Nothing here touches the router's own default ``hotspot1`` or any
+        other VLAN's portal: every object is named from ``vlan_id`` and
+        bound to ``hotspot.interface``.
+        """
+        await asyncio.to_thread(self._configure_vlan_hotspot_sync, creds, hotspot)
+
+    def _configure_vlan_hotspot_sync(
+        self, creds: DeviceCredentials, hotspot: VlanHotspotConfig
+    ) -> None:
+        ranges = _hotspot_pool_range(hotspot.cidr, hotspot.gateway)
+        if ranges is None:
+            # Refused before the connection, not half-applied: a portal
+            # with an empty pool accepts guests and hands out nothing.
+            raise MikroTikDeviceError(
+                creds.host,
+                f"configure_vlan_hotspot: {hotspot.cidr} has no address left to "
+                f"hand out once {hotspot.gateway} is reserved for the router",
+            )
+        names = _HotspotNames(hotspot.vlan_id)
+        network = str(ipaddress.ip_network(hotspot.cidr, strict=False))
+        api = self._connect_api(creds)
+        try:
+            try:
+                self._ensure_ip_pool(api, names.pool, ranges)
+                # No lease-time: _render_vlan_hotspot does not set one
+                # either, and inventing one would change how long every
+                # portal guest holds an address.
+                self._ensure_dhcp_server(
+                    api,
+                    names.dhcp_server,
+                    interface=hotspot.interface,
+                    address_pool=names.pool,
+                )
+                self._ensure_dhcp_network(
+                    api,
+                    network,
+                    {
+                        "address": network,
+                        "gateway": hotspot.gateway,
+                        "dns-server": hotspot.gateway,
+                    },
+                )
+                self._ensure_hotspot_profile(
+                    api,
+                    names.profile,
+                    hotspot_address=hotspot.gateway,
+                    html_directory=hotspot.html_directory,
+                    dns_name=hotspot.dns_name,
+                )
+                self._ensure_dns_static(
+                    api,
+                    hotspot.dns_name,
+                    address=hotspot.gateway,
+                    comment=names.dns_comment,
+                )
+                self._ensure_hotspot_server(
+                    api,
+                    names.server,
+                    interface=hotspot.interface,
+                    address_pool=names.pool,
+                    profile=names.profile,
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_vlan_hotspot: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _ensure_hotspot_profile(
+        self,
+        api,
+        name: str,
+        *,
+        hotspot_address: str,
+        html_directory: str,
+        dns_name: str,
+    ) -> None:
+        """Creates this VLAN's hotspot profile, or brings the existing one
+        of that name into line.
+
+        All three fields are things an operator can change -- re-address
+        the VLAN, upload a new page set, rename the portal host -- so a
+        found profile is updated, never skipped. Skipping is how a portal
+        keeps redirecting to a gateway the VLAN no longer has.
+        """
+        desired = {
+            "hotspot-address": hotspot_address,
+            "html-directory": html_directory,
+            "dns-name": dns_name,
+        }
+        menu = api.path("ip", "hotspot", "profile")
+        for row in menu:
+            if row.get("name") != name:
+                continue
+            changed = {
+                key: value for key, value in desired.items() if row.get(key) != value
+            }
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(name=name, **desired)
+
+    def _ensure_dns_static(
+        self, api, name: str, *, address: str, comment: str
+    ) -> None:
+        """Creates the ``/ip dns static`` record that makes the profile's
+        ``dns-name`` resolve, keyed on the name -- which is what RouterOS
+        itself treats as this row's identity, and what a second ``add``
+        collides on.
+
+        ``disabled`` is normalized through :func:`_is_truthy`, never by
+        string comparison: a disabled record answers nothing, so a
+        re-push -- the operator asking for the portal again -- has to
+        re-enable it, and comparing the raw value against ``"no"`` would
+        instead issue a pointless update on every single push.
+        """
+        desired = {"address": address, "comment": comment}
+        menu = api.path("ip", "dns", "static")
+        for row in menu:
+            if row.get("name") != name:
+                continue
+            changed = {
+                key: value for key, value in desired.items() if row.get(key) != value
+            }
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(name=name, **desired, disabled="no")
+
+    def _ensure_hotspot_server(
+        self,
+        api,
+        name: str,
+        *,
+        interface: str,
+        address_pool: str,
+        profile: str,
+    ) -> None:
+        """Creates the ``/ip hotspot`` server itself, or corrects the one
+        already carrying this VLAN's name.
+
+        ``interface`` is part of the desired state rather than only of the
+        ``add``: a server found by this VLAN's name but bound to another
+        interface is this VLAN's portal challenging the wrong network,
+        which is worth fixing where adding a second server beside it would
+        not be.
+        """
+        desired = {
+            "interface": interface,
+            "address-pool": address_pool,
+            "profile": profile,
+        }
+        menu = api.path("ip", "hotspot")
+        for row in menu:
+            if row.get("name") != name:
+                continue
+            changed = {
+                key: value for key, value in desired.items() if row.get(key) != value
+            }
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(name=name, **desired, disabled="no")
+
+    async def delete_vlan_hotspot(
+        self, creds: DeviceCredentials, *, hotspot: VlanHotspotConfig
+    ) -> None:
+        """Takes one VLAN's captive portal back off the device.
+
+        The exact reverse of :meth:`configure_vlan_hotspot`'s order, and
+        that is a RouterOS requirement rather than a tidiness preference:
+        the hotspot server holds the profile and the pool, and the DHCP
+        server holds the pool, so RouterOS refuses to remove any of them
+        while something still points at it.
+
+        Idempotent, so it serves both intents that reach it -- the
+        operator turned the portal off, or deleted the VLAN outright -- and
+        a re-run after a partial failure completes cleanly.
+        """
+        await asyncio.to_thread(self._delete_vlan_hotspot_sync, creds, hotspot)
+
+    def _delete_vlan_hotspot_sync(
+        self, creds: DeviceCredentials, hotspot: VlanHotspotConfig
+    ) -> None:
+        names = _HotspotNames(hotspot.vlan_id)
+        network = str(ipaddress.ip_network(hotspot.cidr, strict=False))
+        api = self._connect_api(creds)
+        try:
+            try:
+                self._remove_where(api, ("ip", "hotspot"), "name", names.server)
+                self._remove_where(
+                    api, ("ip", "dns", "static"), "name", hotspot.dns_name
+                )
+                self._remove_where(
+                    api, ("ip", "hotspot", "profile"), "name", names.profile
+                )
+                self._remove_where(
+                    api, ("ip", "dhcp-server", "network"), "address", network
+                )
+                self._remove_where(
+                    api, ("ip", "dhcp-server"), "name", names.dhcp_server
+                )
+                self._remove_where(api, ("ip", "pool"), "name", names.pool)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_vlan_hotspot: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
     async def delete_dhcp_pool(
         self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
     ) -> None:
@@ -1364,15 +1751,21 @@ class MikroTikAdapter:
         *,
         interface: str,
         address_pool: str,
-        lease_time: str,
+        lease_time: str | None = None,
     ) -> None:
         """Creates the DHCP server, or brings an existing one of that name
-        into line with the requested interface/pool/lease-time."""
-        desired = {
-            "interface": interface,
-            "address-pool": address_pool,
-            "lease-time": lease_time,
-        }
+        into line with the requested interface/pool/lease-time.
+
+        ``lease_time`` is optional because one caller genuinely has none to
+        state: ``_render_vlan_hotspot``'s own ``/ip dhcp-server add`` omits
+        it and lets RouterOS apply its default, and passing a fabricated
+        one here would change the lease behaviour of every captive portal
+        this platform pushes. Omitted means "leave whatever the device
+        has", not "set it to a default".
+        """
+        desired = {"interface": interface, "address-pool": address_pool}
+        if lease_time is not None:
+            desired["lease-time"] = lease_time
         for row in api.path("ip", "dhcp-server"):
             if row.get("name") == name:
                 changed = {
@@ -1392,12 +1785,7 @@ class MikroTikAdapter:
                         **{".id": row[".id"], **changed}
                     )
                 return
-        api.path("ip", "dhcp-server").add(
-            name=name,
-            interface=interface,
-            **{"address-pool": address_pool, "lease-time": lease_time},
-            disabled="no",
-        )
+        api.path("ip", "dhcp-server").add(name=name, **desired, disabled="no")
 
     def _ensure_dhcp_network(
         self, api, address: str, fields: dict[str, str]
@@ -2285,6 +2673,9 @@ class MikroTikAdapter:
             "provision_device": True,
             "reboot_device": True,
             "configure_vlan": True,
+            "configure_vlan_hotspot": True,
+            "delete_vlan_hotspot": True,
+            "read_network_snapshot": True,
             "configure_dhcp_pool": True,
             "configure_port_forward": True,
             "configure_nat_masquerade": True,

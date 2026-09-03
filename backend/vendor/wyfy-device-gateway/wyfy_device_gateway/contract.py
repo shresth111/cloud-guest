@@ -66,6 +66,44 @@ class InterfaceInfo:
     disabled: bool
     bridge: str | None
     has_ip_address: bool
+    # Whether this interface is a *member port* of some bridge, as opposed
+    # to being a bridge itself. ``bridge`` already carries which bridge, so
+    # this is derivable -- but only for a caller that knows the convention,
+    # and a VLAN access port picker needs the fact directly: an access port
+    # has to be a bridge port to be pulled out of one. Defaulted so the
+    # several existing constructors of this shape keep working unchanged.
+    is_bridge_port: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class IpAddressInfo:
+    """One row of the device's own ``/ip address`` table.
+
+    Read, never written, by the callers of :class:`NetworkSnapshot`. The
+    subnet a VLAN is about to claim has to be checked against what the
+    router already carries -- other VLAN *rows* in this platform's database
+    are not the same set, and are not the set RouterOS will reject against.
+    """
+
+    address: str  # "192.168.10.1/24" -- an address with a prefix, not a network
+    interface: str | None
+    disabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkSnapshot:
+    """Everything a VLAN preflight needs, read in one connection.
+
+    Deliberately one shape rather than two calls. "Is the router
+    reachable", "does the parent interface exist", and "does this subnet
+    collide with something already on the device" are three questions with
+    one answer source, and asking them over three separate RouterOS
+    sessions triples the time an operator waits for a validation failure --
+    and makes it possible for the three answers to disagree.
+    """
+
+    interfaces: list[InterfaceInfo]
+    ip_addresses: list[IpAddressInfo]
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +158,44 @@ class VlanConfig:
     interface: str
     ip_cidr: str | None
     port_mode: str = "trunk"
+
+
+@dataclass(frozen=True, slots=True)
+class VlanHotspotConfig:
+    """One VLAN's own standalone captive portal.
+
+    Mirrors ``network_config.renderers._render_vlan_hotspot`` command for
+    command: an ``/ip pool``, an ``/ip dhcp-server`` and its network row,
+    an ``/ip hotspot profile``, an ``/ip dns static`` record for that
+    profile's ``dns-name``, and the ``/ip hotspot`` server itself -- all
+    bound to ``interface`` and named after ``vlan_id``, so one VLAN's
+    portal cannot touch another's or the router's own default ``hotspot1``.
+
+    ``interface`` is the *bind* interface, which is not always
+    ``vlan<id>``: in access mode the VLAN is realized as a physical port
+    with no ``/interface vlan`` entry at all, and the portal belongs on
+    that port. The caller resolves it; this shape does not guess.
+
+    ``gateway`` is required, not optional as it is on ``VlanConfig``. A
+    portal has to hand out addresses and answer DNS on a real address of
+    its own, and ``_render_vlan_hotspot`` skips with an explanatory comment
+    rather than inventing one -- the direct-push equivalent is the caller
+    refusing before it connects.
+    """
+
+    vlan_id: int
+    interface: str
+    cidr: str
+    gateway: str
+    # The ``dns-name`` RouterOS puts in the portal redirect URL, and the
+    # ``/ip dns static`` name that makes it resolve. Passed in rather than
+    # built here: the platform-wide base name lives in
+    # ``network_config.renderers.HOTSPOT_DNS_NAME`` and this package cannot
+    # import ``app.domains`` (see the module docstring).
+    dns_name: str
+    # RouterOS's ``html-directory`` -- which uploaded portal page set this
+    # profile serves. Same reasoning as ``dns_name``.
+    html_directory: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +412,23 @@ class DeviceGatewayAdapter(Protocol):
 
     # -- discovery / telemetry (read-only) -----------------------------
     async def get_interface_list(self, creds: DeviceCredentials) -> list[InterfaceInfo]: ...
+
+    async def read_network_snapshot(self, creds: DeviceCredentials) -> NetworkSnapshot:
+        """Every interface and every ``/ip address`` on the device, read in
+        one connection and filtered by nothing.
+
+        Distinct from :meth:`get_interface_list`, which exists to back a
+        *DHCP* picker and therefore drops every interface already carrying
+        an ``/ip dhcp-server`` -- on a real router that removes ``bridge``,
+        which is exactly the interface a VLAN trunk hangs off. A picker
+        that cannot offer the trunk parent is not a VLAN picker.
+
+        Read-only, and the single read a VLAN push preflight makes: whether
+        the router answers at all, whether the named parent/port exists,
+        and whether the subnet collides with one the device already carries
+        are one question asked once, not three sessions that can disagree.
+        """
+        ...
     async def get_wan_health(self, creds: DeviceCredentials, *, target_ip: str) -> WanHealth: ...
     async def list_connected_devices(self, creds: DeviceCredentials) -> list[ConnectedDevice]: ...
 
@@ -354,6 +447,29 @@ class DeviceGatewayAdapter(Protocol):
 
     # -- network config push ---------------------------------------------
     async def configure_vlan(self, creds: DeviceCredentials, *, vlan: VlanConfig) -> None: ...
+
+    async def configure_vlan_hotspot(
+        self, creds: DeviceCredentials, *, hotspot: VlanHotspotConfig
+    ) -> None:
+        """Puts a captive portal on one VLAN's own interface.
+
+        The six objects ``network_config.renderers._render_vlan_hotspot``
+        renders, issued as real API operations: pool, DHCP server, DHCP
+        network, hotspot profile, the static DNS record that makes the
+        profile's ``dns-name`` resolve, and the hotspot server. Scoped to
+        this VLAN's interface and named after its id, so it never disturbs
+        the router's default ``hotspot1`` or another VLAN's portal.
+
+        Idempotent, and *updating* where a field an operator can edit
+        changed -- a re-push after re-subnetting a VLAN has to move the
+        pool, not silently leave the old one.
+
+        Callers must not point this and :meth:`configure_dhcp_pool` at the
+        same interface: a portal brings its own ``/ip dhcp-server``, and
+        RouterOS refuses a second one on an interface that already has
+        one.
+        """
+        ...
     async def configure_dhcp_pool(self, creds: DeviceCredentials, *, pool: DhcpPoolConfig) -> None: ...
 
     async def configure_nat_masquerade(
@@ -385,6 +501,18 @@ class DeviceGatewayAdapter(Protocol):
     async def delete_vlan(
         self, creds: DeviceCredentials, *, vlan: VlanConfig
     ) -> None: ...
+
+    async def delete_vlan_hotspot(
+        self, creds: DeviceCredentials, *, hotspot: VlanHotspotConfig
+    ) -> None:
+        """Takes one VLAN's captive portal back off the device.
+
+        Removes the six objects in the reverse of the order they were
+        created, because RouterOS enforces the references between them: the
+        hotspot server holds the profile and the pool, and the DHCP server
+        holds the pool. Idempotent.
+        """
+        ...
 
     async def delete_dhcp_pool(
         self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
@@ -684,9 +812,12 @@ __all__ = [
     "UnsupportedVendorError",
     "DeviceCredentials",
     "InterfaceInfo",
+    "IpAddressInfo",
+    "NetworkSnapshot",
     "WanHealth",
     "ConnectedDevice",
     "VlanConfig",
+    "VlanHotspotConfig",
     "DhcpPoolConfig",
     "NatRuleConfig",
     "PortForwardConfig",
