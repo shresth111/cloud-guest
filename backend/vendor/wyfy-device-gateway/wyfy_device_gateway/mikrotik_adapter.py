@@ -122,6 +122,18 @@ _CONTENT_FILTER_ADDRESS_LIST_NAME = "wyfyguest-content-filter-blocked"
 _CONTENT_FILTER_ENFORCEMENT_COMMENT = (
     "Wyfy Guest content filtering: block listed addresses"
 )
+# The marker that makes one content-filtering rule's own objects findable
+# again on the next push, exactly as ``_NAT_RULE_COMMENT_PREFIX`` does for a
+# VLAN's masquerade rule. It is deliberately built from the rule's id rather
+# than from anything RouterOS matches on: ``name``/``regexp``/``address``
+# are the blocked target -- the one field a customer edits -- and ``label``
+# is the name they gave it, so keying on either leaves the previous objects
+# behind still blocking a site the customer already unblocked. See
+# ``configure_content_filter_rule``'s own docstring.
+_CONTENT_FILTER_RULE_COMMENT_PREFIX = "WyfyGuest content filter "
+# Appended to the marker of the second, subdomain-matching DNS entry, so the
+# two entries one domain rule creates stay individually addressable.
+_CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX = " (subdomains)"
 # NAT / internet access: the marker that makes one VLAN's masquerade rule
 # findable again on the next push. It is deliberately the rule's *identity*
 # rather than any of its RouterOS fields -- ``src-address`` is exactly what
@@ -175,6 +187,30 @@ def _owns_port_forward_comment(comment: object, rule_id: str) -> bool:
         return False
     owner = f"{_PORT_FORWARD_COMMENT_PREFIX}{rule_id}"
     return comment == owner or comment.startswith(f"{owner} ")
+def _content_filter_marker(rule_id: str, *, subdomains: bool = False) -> str:
+    """The identity half of a content-filtering object's comment.
+
+    Ends in ``": "`` so the customer's own label can follow it in the same
+    field without the marker ever being a prefix of another rule's -- and
+    so the non-subdomain marker is not a prefix of the subdomain one, which
+    branches at ``" ("`` before the colon is reached.
+    """
+    suffix = _CONTENT_FILTER_SUBDOMAIN_MARKER_SUFFIX if subdomains else ""
+    return f"{_CONTENT_FILTER_RULE_COMMENT_PREFIX}{rule_id}{suffix}: "
+
+
+def _content_filter_comment(
+    rule_id: str, label: str, *, subdomains: bool = False
+) -> str:
+    """The whole comment: identity first, then the customer's label.
+
+    The label is carried onto the device rather than dropped because it is
+    the only thing that tells an operator reading ``/ip dns static`` on the
+    router what a sinkholed name is for. It is mutable, and treated as
+    such: a renamed rule updates this field in place, found by the marker
+    the rename cannot touch.
+    """
+    return f"{_content_filter_marker(rule_id, subdomains=subdomains)}{label}"
 
 
 class _HotspotNames:
@@ -1713,6 +1749,20 @@ class MikroTikAdapter:
             if row.get(field) == value:
                 menu.remove(row[".id"])
 
+    def _remove_where_prefixed(
+        self, api, path_segments: tuple[str, ...], field: str, prefix: str
+    ) -> None:
+        """:meth:`_remove_where`'s sibling for a field that carries an
+        identity marker *and* a mutable tail -- a content-filtering
+        comment, which is ``"<marker>: <the customer's label>"``. Matching
+        the whole value would miss every rule renamed since its last push,
+        which is precisely the rule this has to find.
+        """
+        menu = api.path(*path_segments)
+        for row in list(menu):
+            if str(row.get(field, "")).startswith(prefix):
+                menu.remove(row[".id"])
+
     async def configure_dhcp_pool(
         self, creds: DeviceCredentials, *, pool: DhcpPoolConfig
     ) -> None:
@@ -2365,7 +2415,41 @@ class MikroTikAdapter:
         inspect or block encrypted traffic by content. See
         ``app.domains.content_filtering``'s own module docstring
         (cloud-guest-repo) for the full customer-facing scope write-up
-        this ports; that same reasoning applies here unchanged."""
+        this ports; that same reasoning applies here unchanged.
+
+        ## The comment is the rule's identity, and that is the whole design
+
+        Every object above carries
+        ``"WyfyGuest content filter <rule_id>[ (subdomains)]: <label>"``,
+        and each write finds its object again by the marker in front of
+        the colon. Nothing else on the row can serve: ``name``/``regexp``/
+        ``address`` *are* the blocked target, and ``label`` is the name
+        the customer typed, so both change the moment somebody edits the
+        rule. Keyed on either, the next push would match nothing, add a
+        second sinkhole, and leave the first one still blocking a site the
+        customer already unblocked -- silent, cumulative, and invisible in
+        this platform's own UI. Keyed on the marker, the same push finds
+        what it wrote last time and *updates* it. This is
+        :meth:`configure_nat_masquerade`'s reasoning applied to a domain
+        with two objects per rule instead of one.
+
+        A rule that changed ``value_type`` since its last push is the one
+        case where the objects to write are not the objects already there,
+        so the mechanism it is no longer using is torn down first -- a
+        domain rule re-typed to ``ip_cidr`` would otherwise leave its DNS
+        sinkhole answering forever, with this push reporting success.
+
+        ``disabled`` is normalized back to ``no`` through
+        :func:`_is_truthy`, never by string comparison: an entry somebody
+        disabled by hand is blocking nothing, a re-push is the customer
+        asking for it again, and comparing the raw value against ``"no"``
+        would instead issue a pointless update on every single push.
+
+        Idempotent throughout: re-pushing an unchanged rule adds nothing
+        and raises nothing. RouterOS answers a duplicate ``add`` with
+        "already have such item", and re-pushing is an ordinary operation
+        -- the customer pressing the button twice, or a retry after a
+        partial failure."""
         await asyncio.to_thread(self._configure_content_filter_rule_sync, creds, rule)
 
     def _configure_content_filter_rule_sync(
@@ -2375,29 +2459,184 @@ class MikroTikAdapter:
         try:
             try:
                 if rule.value_type == "ip_cidr":
-                    api.path("ip", "firewall", "address-list").add(
-                        list=_CONTENT_FILTER_ADDRESS_LIST_NAME,
-                        address=rule.value,
-                        comment=rule.label,
-                    )
+                    # A rule re-typed from "domain" leaves two DNS entries
+                    # still answering for a name nobody is blocking any
+                    # more; the objects this rule no longer uses come off
+                    # before the ones it does go on.
+                    self._remove_content_filter_dns_entries(api, rule.rule_id)
+                    self._ensure_content_filter_address_list_entry(api, rule)
                     self._ensure_content_filter_enforcement_rule(api)
                 else:
-                    domain = rule.value
-                    api.path("ip", "dns", "static").add(
-                        name=domain,
-                        type="A",
-                        address=_CONTENT_FILTER_SINKHOLE_ADDRESS,
-                        comment=rule.label,
+                    self._remove_where_prefixed(
+                        api,
+                        ("ip", "firewall", "address-list"),
+                        "comment",
+                        _content_filter_marker(rule.rule_id),
                     )
-                    api.path("ip", "dns", "static").add(
-                        regexp=_domain_subdomain_regex(domain),
-                        type="A",
-                        address=_CONTENT_FILTER_SINKHOLE_ADDRESS,
-                        comment=f"{rule.label} (subdomains)",
-                    )
+                    self._ensure_content_filter_dns_entries(api, rule)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"configure_content_filter_rule: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _ensure_content_filter_address_list_entry(
+        self, api, rule: ContentFilterRuleConfig
+    ) -> None:
+        """Puts this rule's IP/CIDR in the shared blocked address-list, or
+        corrects the entry already carrying this rule's marker.
+
+        ``address`` is part of the desired state, not only of the ``add``:
+        an entry found by this rule's marker but holding a different
+        address is this rule blocking the wrong destination, and correcting
+        it is right where adding a second entry beside it would not be.
+        """
+        self._ensure_content_filter_object(
+            api,
+            ("ip", "firewall", "address-list"),
+            marker=_content_filter_marker(rule.rule_id),
+            desired={
+                "list": _CONTENT_FILTER_ADDRESS_LIST_NAME,
+                "address": rule.value,
+                "comment": _content_filter_comment(rule.rule_id, rule.label),
+            },
+        )
+
+    def _ensure_content_filter_dns_entries(
+        self, api, rule: ContentFilterRuleConfig
+    ) -> None:
+        """The two ``/ip dns static`` entries one blocked domain becomes.
+
+        Two, not one, because RouterOS treats ``name=`` and ``regexp=`` as
+        mutually exclusive per entry: the first sinkholes the domain
+        itself, the second every subdomain of it. They carry different
+        markers so a later push can find and correct each on its own --
+        one marker for both would make the second write update the first
+        entry and the domain's subdomains stop being blocked at all.
+        """
+        domain = rule.value
+        self._ensure_content_filter_object(
+            api,
+            ("ip", "dns", "static"),
+            marker=_content_filter_marker(rule.rule_id),
+            desired={
+                "name": domain,
+                "type": "A",
+                "address": _CONTENT_FILTER_SINKHOLE_ADDRESS,
+                "comment": _content_filter_comment(rule.rule_id, rule.label),
+            },
+        )
+        self._ensure_content_filter_object(
+            api,
+            ("ip", "dns", "static"),
+            marker=_content_filter_marker(rule.rule_id, subdomains=True),
+            desired={
+                "regexp": _domain_subdomain_regex(domain),
+                "type": "A",
+                "address": _CONTENT_FILTER_SINKHOLE_ADDRESS,
+                "comment": _content_filter_comment(
+                    rule.rule_id, rule.label, subdomains=True
+                ),
+            },
+        )
+
+    def _ensure_content_filter_object(
+        self,
+        api,
+        path_segments: tuple[str, ...],
+        *,
+        marker: str,
+        desired: dict[str, str],
+    ) -> None:
+        """Creates one content-filtering object, or brings the one already
+        carrying ``marker`` into line with ``desired``.
+
+        The row is found by the marker *prefix* of its comment rather than
+        by the whole comment, because the customer's label lives in the
+        same field behind it -- see :func:`_content_filter_comment`. A
+        renamed rule therefore updates its comment in place instead of
+        being missed and duplicated.
+
+        ``disabled`` is compared as a boolean through :func:`_is_truthy`,
+        never as a string: RouterOS accepts ``"no"`` on write and answers
+        reads with a real ``bool``, so a string comparison reports a
+        difference on every single push and issues a pointless update
+        forever.
+        """
+        menu = api.path(*path_segments)
+        for row in menu:
+            if not str(row.get("comment", "")).startswith(marker):
+                continue
+            changed = {
+                key: value for key, value in desired.items() if row.get(key) != value
+            }
+            if _is_truthy(row.get("disabled")):
+                changed["disabled"] = "no"
+            if changed:
+                menu.update(**{".id": row[".id"], **changed})
+            return
+        menu.add(**desired, disabled="no")
+
+    def _remove_content_filter_dns_entries(self, api, rule_id: str) -> None:
+        """Both of one rule's DNS entries, by their own two markers."""
+        for subdomains in (False, True):
+            self._remove_where_prefixed(
+                api,
+                ("ip", "dns", "static"),
+                "comment",
+                _content_filter_marker(rule_id, subdomains=subdomains),
+            )
+
+    async def delete_content_filter_rule(
+        self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig
+    ) -> None:
+        """Removes the objects :meth:`configure_content_filter_rule`
+        created, by the same marker identity it writes them under.
+
+        Only ``rule.rule_id`` is read. ``value`` and ``value_type``
+        deliberately are not: an entry left from a domain the customer has
+        since edited -- or from before they switched the rule from a
+        domain to an address -- is still *this rule's* entry, and matching
+        on the current value is exactly how it would be orphaned instead of
+        removed. Both mechanisms are swept for the same reason.
+
+        **The shared ``/ip firewall filter`` DROP rule is deliberately left
+        in place.** It is router-global, referencing the address-list by
+        name rather than any one entry, and every other ``ip_cidr`` rule on
+        this router depends on it -- removing it here would silently
+        unblock all of them. Once this rule's own membership is gone the
+        DROP rule simply matches one fewer address, and against an empty
+        list it drops nothing at all. It is created once, by
+        :meth:`_ensure_content_filter_enforcement_rule`, and belongs to the
+        router rather than to any rule that made it necessary.
+
+        Idempotent: removing what is already absent is a no-op, not an
+        error, so a retry after a partial failure completes cleanly.
+        """
+        await asyncio.to_thread(self._delete_content_filter_rule_sync, creds, rule)
+
+    def _delete_content_filter_rule_sync(
+        self, creds: DeviceCredentials, rule: ContentFilterRuleConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                # The address-list entry goes before the DNS ones for the
+                # only ordering that matters here: it is the object the
+                # surviving DROP rule's match depends on, so it stops being
+                # dropped first and nothing is ever half-enforced against a
+                # list this rule has already left.
+                self._remove_where_prefixed(
+                    api,
+                    ("ip", "firewall", "address-list"),
+                    "comment",
+                    _content_filter_marker(rule.rule_id),
+                )
+                self._remove_content_filter_dns_entries(api, rule.rule_id)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_content_filter_rule: {exc}"
                 ) from exc
         finally:
             api.close()
@@ -2407,7 +2646,41 @@ class MikroTikAdapter:
         ``/ip firewall filter`` DROP rule every ``ip_cidr``-type content
         filter rule relies on -- see
         ``configure_content_filter_rule``'s own docstring for why this
-        must exist exactly once, not once per rule."""
+        must exist exactly once, not once per rule.
+
+        **Known gap, deliberately not fixed here: this rule's position in
+        the chain is unmanaged.** The ``add`` below carries no
+        ``place-before``, so RouterOS appends and the DROP lands at the
+        bottom of ``forward``; the dedup check above then reads only the
+        comment, so once the rule exists nothing ever verifies or corrects
+        where it sits. Whether that breaks blocking is per-router: on this
+        platform's lab device the only accept ahead of it is
+        ``cloudguest-fw-fwd-established``, scoped to
+        ``connection-state=established,related``, which a *new* connection
+        does not match -- so a fresh connection is still dropped, while an
+        already-established flow keeps flowing. On a router whose chain
+        carries any broader accept ahead of it, blocking silently stops.
+
+        Not fixed in this pass, and the reason is the fix rather than the
+        defect. Placing it correctly needs one explicit, stable ordering
+        scheme shared with ``app.domains.firewall`` -- a sentinel and
+        ``place-before``, never an integer index, which goes stale the
+        moment the hotspot adds or removes one of its own dynamic rules.
+        That scheme is being defined for the firewall domain right now,
+        and inventing a second one here would leave two competing schemes
+        writing to the same chain. Reordering a live ``forward`` chain on
+        a guess is also not a recoverable mistake: a drop landing above
+        the guest accepts, or an ``input`` drop matching the management
+        tunnel or port 8728, is a router nobody can reach again.
+
+        What this does mean for callers: an ``ip_cidr`` rule reaching
+        ``ACTIVE`` asserts that *its own* address-list membership and an
+        enforcement rule exist, not that the chain order makes them
+        effective -- see ``app.domains.content_filtering.constants
+        .ContentFilterDevicePushStatus``. "The rule exists" passing on a
+        router that forwards the traffic anyway is exactly the class of
+        false verification ``docs/vlan/BRIDGE_VLAN_FILTERING.md`` writes
+        up."""
         existing_filters = list(api.path("ip", "firewall", "filter"))
         already_present = any(
             row.get("comment") == _CONTENT_FILTER_ENFORCEMENT_COMMENT

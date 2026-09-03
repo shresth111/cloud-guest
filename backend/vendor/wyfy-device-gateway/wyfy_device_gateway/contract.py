@@ -297,11 +297,22 @@ class ContentFilterRuleConfig:
     that docstring's own "Honest scope" section). Ported from
     ``cloud-guest-repo/backend/app/domains/content_filtering`` (see that
     domain's own module docstring for the full customer-facing scope
-    write-up this vendor-agnostic shape mirrors)."""
+    write-up this vendor-agnostic shape mirrors).
 
+    ``rule_id`` is carried for identity, not for any RouterOS field: the
+    objects this rule becomes are found again on a later push by the
+    comment marker derived from it, because ``value`` -- the blocked
+    domain or address -- is precisely what a customer edits and so cannot
+    be the handle. Keyed on ``value``, the push after an edit finds
+    nothing, adds a second sinkhole, and leaves the first one blocking a
+    site nobody asked to block any more. Same reasoning and the same
+    shape as :class:`NatRuleConfig`'s own ``vlan_id`` -- see
+    ``mikrotik_adapter.configure_content_filter_rule``'s own docstring."""
+
+    rule_id: str  # this rule's own stable id, and its device-side identity
     value_type: str  # "domain" | "ip_cidr"
     value: str  # a bare domain name ("facebook.com") or an IP/CIDR
-    label: str  # human-readable label, rendered into the device's own comment
+    label: str  # human-readable label, carried in the device's own comment
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,7 +612,24 @@ class DeviceGatewayAdapter(Protocol):
         (``rule.value_type == "ip_cidr"``). See the MikroTik
         implementation's own docstring for the full, honest scope this
         deliberately does and does not cover (no Layer7, no web-proxy, no
-        TLS interception -- ever)."""
+        TLS interception -- ever).
+
+        Idempotent on ``rule.rule_id``: re-realizing an unchanged rule adds
+        nothing and raises nothing, and editing the blocked value updates
+        the objects already carrying this rule's marker rather than adding
+        a second set beside them."""
+        ...
+
+    async def delete_content_filter_rule(
+        self, creds: DeviceCredentials, *, rule: ContentFilterRuleConfig
+    ) -> None:
+        """Takes one content-filtering rule back off the device, by the
+        same ``rule.rule_id`` identity the write path stamps it with -- so
+        a rule whose blocked value was edited since the last push is still
+        found and removed rather than orphaned.
+
+        Idempotent: removing what is already absent is a no-op, so a retry
+        after a partial failure completes cleanly."""
         ...
 
     # -- disconnect / kick -------------------------------------------------

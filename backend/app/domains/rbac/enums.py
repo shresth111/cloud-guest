@@ -939,13 +939,17 @@ class AuditAction(StrEnum):
     # Content Filtering domain events -- written through this same table
     # by ``app.domains.content_filtering.service.ContentFilterService``
     # via the same narrow ``AuditLogWriter`` protocol shape every other
-    # domain's service uses. A pure rules/inventory domain (no live
-    # device push in this pass -- see that module's own docstring), so
-    # create/update/delete are its only lifecycle events, mirroring
-    # FIREWALL_RULE_CREATED/_UPDATED/_DELETED's identical shape above.
+    # domain's service uses.
     CONTENT_FILTER_RULE_CREATED = "content_filter_rule_created"
     CONTENT_FILTER_RULE_UPDATED = "content_filter_rule_updated"
     CONTENT_FILTER_RULE_DELETED = "content_filter_rule_deleted"
+    # The real device-push event: the rule was realized on a router, not
+    # merely written to a row. Distinct from CONTENT_FILTER_RULE_CREATED,
+    # which says nothing about any device -- and used to be the only
+    # evidence a block existed, which is how "blocked" came to mean "a row
+    # exists" on a dashboard that showed it as enforced. Same distinction,
+    # and the same reason, as DHCP_POOL_PUSHED and VLAN_PUSHED above.
+    CONTENT_FILTER_RULE_PUSHED = "content_filter_rule_pushed"
 
     # Support Tickets domain events -- written through this same table by
     # ``app.domains.support_tickets.service.TicketService`` via the same

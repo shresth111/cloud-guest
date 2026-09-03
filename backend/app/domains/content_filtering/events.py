@@ -38,8 +38,27 @@ class ContentFilterRuleDeleted:
     occurred_at: datetime = field(default_factory=_now)
 
 
+@dataclass(frozen=True, slots=True)
+class ContentFilterRulePushed:
+    """A blocked site was realized on a real device.
+
+    Unlike the three events above, this one records something that happened
+    *outside* this database -- so it is the only one whose absence is
+    detectable by looking at a router. It is also the only one that means
+    the site is actually blocked; ``ContentFilterRuleCreated`` says nothing
+    about any device, and for most of this domain's life that was all a
+    "created" rule was.
+    """
+
+    id: uuid.UUID
+    router_id: uuid.UUID
+    value_type: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "ContentFilterRuleCreated",
     "ContentFilterRuleUpdated",
     "ContentFilterRuleDeleted",
+    "ContentFilterRulePushed",
 ]

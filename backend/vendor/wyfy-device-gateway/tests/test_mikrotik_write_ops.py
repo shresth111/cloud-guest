@@ -10,6 +10,7 @@ import pytest
 
 from tests.fake_write_transport import FakeRouterOSApi
 from wyfy_device_gateway.contract import (
+    ContentFilterRuleConfig,
     DhcpPoolConfig,
     NatRuleConfig,
     PortForwardConfig,
@@ -1207,6 +1208,431 @@ async def test_read_network_snapshot_reports_interfaces_and_addresses(
     # A disabled address is in no routing table and collides with nothing --
     # the caller needs the flag, not a pre-filtered list.
     assert addresses["10.9.9.1/24"].disabled is True
+
+
+# ---------------------------------------------------------------------------
+# content filtering
+#
+# What a blocked site actually becomes on the device: a domain is two
+# ``/ip dns static`` entries pointed at 127.0.0.1 (an exact ``name=`` match
+# and a ``regexp=`` match for its subdomains -- RouterOS treats the two as
+# mutually exclusive per entry), an IP/CIDR is one
+# ``/ip firewall address-list`` membership plus the one router-global
+# ``/ip firewall filter`` DROP rule that gives that list any effect.
+#
+# Every one of them carries "WyfyGuest content filter <rule_id>: <label>",
+# and the marker in front of the colon is what the next push matches on.
+# The tests below are mostly about that choice: the blocked value and the
+# label are exactly what a customer edits, so neither can be the handle.
+# ---------------------------------------------------------------------------
+
+_RULE_ID = "3f2a1c64-0000-4000-8000-000000000001"
+
+
+def _domain_rule(
+    value: str = "facebook.com",
+    label: str = "Block Facebook",
+    rule_id: str = _RULE_ID,
+) -> ContentFilterRuleConfig:
+    return ContentFilterRuleConfig(
+        rule_id=rule_id, value_type="domain", value=value, label=label
+    )
+
+
+def _cidr_rule(
+    value: str = "203.0.113.0/24",
+    label: str = "Block bad range",
+    rule_id: str = _RULE_ID,
+) -> ContentFilterRuleConfig:
+    return ContentFilterRuleConfig(
+        rule_id=rule_id, value_type="ip_cidr", value=value, label=label
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_domain_becomes_two_sinkholed_dns_entries(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_content_filter_rule(
+        mikrotik_creds, rule=_domain_rule()
+    )
+
+    assert api.add_calls == [
+        (
+            ("ip", "dns", "static"),
+            {
+                "name": "facebook.com",
+                "type": "A",
+                "address": "127.0.0.1",
+                "comment": (
+                    f"WyfyGuest content filter {_RULE_ID}: Block Facebook"
+                ),
+                "disabled": "no",
+            },
+        ),
+        (
+            ("ip", "dns", "static"),
+            {
+                "regexp": r"^.*\.facebook\.com$",
+                "type": "A",
+                "address": "127.0.0.1",
+                "comment": (
+                    f"WyfyGuest content filter {_RULE_ID} (subdomains): "
+                    "Block Facebook"
+                ),
+                "disabled": "no",
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_cidr_becomes_a_list_entry_and_the_shared_drop_rule(
+    patch_connect, mikrotik_creds
+):
+    """The address-list on its own blocks nothing. A populated list with no
+    filter rule referencing it is the "looks wired up but isn't" shape this
+    whole domain exists to stop."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_content_filter_rule(
+        mikrotik_creds, rule=_cidr_rule()
+    )
+
+    assert api.add_calls == [
+        (
+            ("ip", "firewall", "address-list"),
+            {
+                "list": "wyfyguest-content-filter-blocked",
+                "address": "203.0.113.0/24",
+                "comment": (
+                    f"WyfyGuest content filter {_RULE_ID}: Block bad range"
+                ),
+                "disabled": "no",
+            },
+        ),
+        (
+            ("ip", "firewall", "filter"),
+            {
+                "chain": "forward",
+                "dst-address-list": "wyfyguest-content-filter-blocked",
+                "action": "drop",
+                "comment": "Wyfy Guest content filtering: block listed addresses",
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_re_pushing_an_unchanged_domain_rule_is_a_clean_no_op(
+    patch_connect, mikrotik_creds
+):
+    """Re-pushing is an ordinary operation -- the customer pressing the
+    button twice, or a retry after a partial failure. RouterOS answers a
+    duplicate add with "already have such item"."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+
+    assert len(api.add_calls) == 2  # the first push's two entries, and no more
+    assert api.update_calls == []
+    assert len(list(api.path("ip", "dns", "static"))) == 2
+
+
+@pytest.mark.asyncio
+async def test_re_pushing_an_unchanged_cidr_rule_is_a_clean_no_op(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_cidr_rule())
+
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_cidr_rule())
+
+    assert len(api.add_calls) == 2  # the list entry and the one DROP rule
+    assert api.update_calls == []
+    assert len(list(api.path("ip", "firewall", "address-list"))) == 1
+    assert len(list(api.path("ip", "firewall", "filter"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_entry_is_compared_as_a_boolean_not_a_string(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS accepts "no" on write and answers reads with a real bool.
+    String-comparing ``disabled`` makes this "idempotent" write issue a
+    pointless update on every single push, forever."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+    for row in api.path("ip", "dns", "static"):
+        row["disabled"] = False  # what a real read answers, not the "no" written
+
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_entry_disabled_by_hand_is_re_enabled_by_a_re_push(
+    patch_connect, mikrotik_creds
+):
+    """A disabled sinkhole answers nothing, so the site is reachable again.
+    A re-push is the customer asking for the block back."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+    for row in api.path("ip", "dns", "static"):
+        row["disabled"] = True
+
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+
+    assert [fields["disabled"] for _, fields in api.update_calls] == ["no", "no"]
+
+
+@pytest.mark.asyncio
+async def test_editing_the_blocked_domain_updates_both_entries_in_place(
+    patch_connect, mikrotik_creds
+):
+    """The whole reason the marker is the identity. Keyed on ``name``, this
+    push would match nothing, add a second pair of entries, and leave the
+    first pair still sinkholing a site the customer already unblocked."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+
+    await adapter.configure_content_filter_rule(
+        mikrotik_creds, rule=_domain_rule(value="instagram.com")
+    )
+
+    assert len(api.add_calls) == 2
+    assert api.update_calls == [
+        (("ip", "dns", "static"), {".id": "*1", "name": "instagram.com"}),
+        (
+            ("ip", "dns", "static"),
+            {".id": "*2", "regexp": r"^.*\.instagram\.com$"},
+        ),
+    ]
+    entries = list(api.path("ip", "dns", "static"))
+    assert len(entries) == 2
+    assert entries[0]["name"] == "instagram.com"
+    assert "facebook" not in str(entries)
+
+
+@pytest.mark.asyncio
+async def test_editing_the_blocked_address_updates_the_list_entry_in_place(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_cidr_rule())
+
+    await adapter.configure_content_filter_rule(
+        mikrotik_creds, rule=_cidr_rule(value="198.51.100.0/24")
+    )
+
+    assert len(api.add_calls) == 2  # list entry + DROP rule, both from push one
+    assert api.update_calls == [
+        (
+            ("ip", "firewall", "address-list"),
+            {".id": "*1", "address": "198.51.100.0/24"},
+        )
+    ]
+    entries = list(api.path("ip", "firewall", "address-list"))
+    assert len(entries) == 1
+    assert entries[0]["address"] == "198.51.100.0/24"
+
+
+@pytest.mark.asyncio
+async def test_renaming_a_rule_updates_its_comment_rather_than_losing_it(
+    patch_connect, mikrotik_creds
+):
+    """The label lives behind the marker in the same comment field, so it
+    is mutable state like any other -- and the marker in front of it is
+    what survives the rename and finds the entry."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_cidr_rule())
+
+    await adapter.configure_content_filter_rule(
+        mikrotik_creds, rule=_cidr_rule(label="Blocked by head office")
+    )
+
+    assert len(api.add_calls) == 2
+    entries = list(api.path("ip", "firewall", "address-list"))
+    assert len(entries) == 1
+    assert entries[0]["comment"] == (
+        f"WyfyGuest content filter {_RULE_ID}: Blocked by head office"
+    )
+
+
+@pytest.mark.asyncio
+async def test_switching_a_rule_from_a_domain_to_an_address_tears_the_old_one_down(
+    patch_connect, mikrotik_creds
+):
+    """Otherwise the DNS sinkhole answers forever for a name nobody is
+    blocking any more, and this push reports success."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_cidr_rule())
+
+    assert list(api.path("ip", "dns", "static")) == []
+    assert len(list(api.path("ip", "firewall", "address-list"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_switching_a_rule_from_an_address_to_a_domain_tears_the_old_one_down(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_cidr_rule())
+
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+
+    assert list(api.path("ip", "firewall", "address-list")) == []
+    assert len(list(api.path("ip", "dns", "static"))) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_second_rule_gets_its_own_objects(patch_connect, mikrotik_creds):
+    """Two rules, two markers. One rule's push must never find, update or
+    remove another's -- that is what makes per-rule pushes independent."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    other_id = "3f2a1c64-0000-4000-8000-000000000002"
+
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+    await adapter.configure_content_filter_rule(
+        mikrotik_creds,
+        rule=_domain_rule(value="tiktok.com", label="Block TikTok", rule_id=other_id),
+    )
+
+    assert api.update_calls == []
+    names = sorted(
+        str(row["name"]) for row in api.path("ip", "dns", "static") if "name" in row
+    )
+    assert names == ["facebook.com", "tiktok.com"]
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_this_rules_objects(patch_connect, mikrotik_creds):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+
+    await adapter.delete_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+
+    assert list(api.path("ip", "dns", "static")) == []
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_content_filter_rule_twice_is_a_no_op(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_cidr_rule())
+    await adapter.delete_content_filter_rule(mikrotik_creds, rule=_cidr_rule())
+
+    await adapter.delete_content_filter_rule(  # no raise
+        mikrotik_creds, rule=_cidr_rule()
+    )
+
+    assert list(api.path("ip", "firewall", "address-list")) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_finds_the_rule_after_the_blocked_value_changed(
+    patch_connect, mikrotik_creds
+):
+    """Teardown matches on the rule's identity, never on its current value:
+    an entry left from an older domain is still this rule's entry, and
+    matching on the current one is exactly how it would be orphaned."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_domain_rule())
+
+    await adapter.delete_content_filter_rule(
+        mikrotik_creds, rule=_domain_rule(value="something-else.com", label="renamed")
+    )
+
+    assert list(api.path("ip", "dns", "static")) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_leaves_another_rule_and_unrelated_entries_alone(
+    patch_connect, mikrotik_creds
+):
+    """The shared DROP rule stays: it is router-global and every other
+    ip_cidr rule depends on it, so removing it here would silently unblock
+    all of them. So do the operator's own hand-written entries."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "dns", "static"): [
+                {".id": "*90", "name": "portal.wyfyguest.local", "address": "10.0.0.1"}
+            ],
+            ("ip", "firewall", "filter"): [
+                {".id": "*91", "chain": "input", "action": "accept"}
+            ],
+        }
+    )
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    other_id = "3f2a1c64-0000-4000-8000-000000000002"
+    await adapter.configure_content_filter_rule(mikrotik_creds, rule=_cidr_rule())
+    await adapter.configure_content_filter_rule(
+        mikrotik_creds,
+        rule=_cidr_rule(value="192.0.2.0/24", label="Other", rule_id=other_id),
+    )
+
+    await adapter.delete_content_filter_rule(mikrotik_creds, rule=_cidr_rule())
+
+    remaining = list(api.path("ip", "firewall", "address-list"))
+    assert [row["address"] for row in remaining] == ["192.0.2.0/24"]
+    assert len(list(api.path("ip", "firewall", "filter"))) == 2
+    assert [row["name"] for row in api.path("ip", "dns", "static")] == [
+        "portal.wyfyguest.local"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_device_error_is_wrapped_and_names_the_operation(
+    patch_connect, mikrotik_creds
+):
+    from librouteros.exceptions import LibRouterosError
+
+    class _ExplodingApi(FakeRouterOSApi):
+        def path(self, *segments: str):
+            raise LibRouterosError("no such command")
+
+    patch_connect(_ExplodingApi())
+
+    with pytest.raises(MikroTikDeviceError, match="configure_content_filter_rule"):
+        await MikroTikAdapter().configure_content_filter_rule(
+            mikrotik_creds, rule=_domain_rule()
+        )
 
 
 # ============================================================================

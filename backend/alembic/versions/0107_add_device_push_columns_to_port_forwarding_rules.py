@@ -50,8 +50,8 @@ to rolling back a schema behind a live-device feature, not something this
 migration can honestly fix, and it is why the rollback direction is to
 forget rather than to assert.
 
-Revision ID: 0106_add_device_push_columns_to_port_forwarding_rules
-Revises: 0105_add_mikrotik_interface_name_to_vlans
+Revision ID: 0107_add_device_push_columns_to_port_forwarding_rules
+Revises: 0106_add_device_push_columns_to_content_filter_rules
 Create Date: 2026-09-03
 """
 
@@ -59,8 +59,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0106_add_device_push_columns_to_port_forwarding_rules"
-down_revision = "0105_add_mikrotik_interface_name_to_vlans"
+revision = "0107_add_device_push_columns_to_port_forwarding_rules"
+down_revision = "0106_add_device_push_columns_to_content_filter_rules"
 branch_labels = None
 depends_on = None
 
