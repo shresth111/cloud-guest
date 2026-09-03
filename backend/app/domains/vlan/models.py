@@ -134,6 +134,17 @@ class Vlan(BaseModel):
     device_pushed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # The bridge this VLAN's physical port belonged to before an
+    # access-mode push took it, recorded so the delete can put it back.
+    # Only ever set for ``port_mode="access"``; ``None`` on a trunk VLAN,
+    # and ``None`` on an access VLAN whose port was in no bridge to begin
+    # with -- which is a real answer, not a missing one.
+    #
+    # Without this the product could take a port and not give it back: a
+    # venue's access point was left on an unbridged port with the guest
+    # network down, and an engineer had to restore it by hand. See
+    # ``wyfy_device_gateway.contract.VlanConfig.previous_bridge``.
+    previous_bridge: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     __table_args__ = (
         Index("ix_vlans_router_id", "router_id"),

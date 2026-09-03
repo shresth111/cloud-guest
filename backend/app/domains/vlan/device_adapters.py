@@ -113,6 +113,10 @@ class VlanDeviceAddress:
     address: str
     interface: str | None
     disabled: bool
+    # True when the interface this address names no longer exists. Such a
+    # row holds no subnet -- see the field's own note on
+    # ``wyfy_device_gateway.contract.IpAddressInfo``.
+    invalid: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +192,7 @@ class BaseVlanAdapter(Protocol):
         interface: str,
         ip_cidr: str | None,
         port_mode: str,
+        previous_bridge: str | None = None,
     ) -> None:
         """Removes what ``configure_vlan`` created, for the same
         ``port_mode``.
@@ -326,7 +331,10 @@ class MikroTikVlanAdapter:
             ],
             addresses=[
                 VlanDeviceAddress(
-                    address=a.address, interface=a.interface, disabled=a.disabled
+                    address=a.address,
+                    interface=a.interface,
+                    disabled=a.disabled,
+                    invalid=a.invalid,
                 )
                 for a in snapshot.ip_addresses
             ],
@@ -445,6 +453,7 @@ class MikroTikVlanAdapter:
         interface: str,
         ip_cidr: str | None,
         port_mode: str,
+        previous_bridge: str | None = None,
     ) -> None:
         creds = self._gateway_credentials(credentials)
         config = VlanConfig(
@@ -453,6 +462,7 @@ class MikroTikVlanAdapter:
             interface=interface,
             ip_cidr=ip_cidr,
             port_mode=port_mode,
+            previous_bridge=previous_bridge,
         )
         try:
             await get_adapter(DeviceVendor.MIKROTIK).delete_vlan(creds, vlan=config)

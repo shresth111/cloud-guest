@@ -3,8 +3,14 @@
 # API container.  Usage: run_probe.sh t2_above_dynamic.py [router-ip]
 set -u
 SRC="$(cd "$(dirname "$0")" && pwd)"
-PROBE="${1:?usage: run_probe.sh <probe.py> [router-ip]}"
-ROUTER="${2:-10.20.0.14}"
+PROBE="${1:?usage: run_probe.sh <probe.py> [args...]}"
+shift
+# Forward EVERY remaining argument, not just the first. Passing only $2
+# silently dropped flags like --no-portal and --apply, so a probe ran with
+# the opposite of the requested behaviour and looked like it had disagreed
+# with its own code.
+ARGS=("$@")
+[ ${#ARGS[@]} -eq 0 ] && ARGS=("10.20.0.14")
 D=/Users/shresth/.claude/jobs/333a326b/tmp
 mkdir -p "$D"
 [ -f "$D/eic_key" ] || ssh-keygen -q -t ed25519 -N '' -f "$D/eic_key"
@@ -19,4 +25,4 @@ aws ec2-instance-connect send-ssh-public-key \
   --query RequestId --output text >/dev/null 2>&1
 
 ssh $SSHOPTS $HOST "cat > /tmp/$PROBE" < "$SRC/$PROBE"
-ssh $SSHOPTS $HOST "docker cp /tmp/$PROBE deploy-api-1:/tmp/$PROBE && docker exec deploy-api-1 python /tmp/$PROBE $ROUTER"
+ssh $SSHOPTS $HOST "docker cp /tmp/$PROBE deploy-api-1:/tmp/$PROBE && docker exec deploy-api-1 python /tmp/$PROBE ${ARGS[*]}"

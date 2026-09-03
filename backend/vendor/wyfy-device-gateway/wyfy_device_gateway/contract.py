@@ -89,6 +89,19 @@ class IpAddressInfo:
     address: str  # "192.168.10.1/24" -- an address with a prefix, not a network
     interface: str | None
     disabled: bool
+    # RouterOS marks a row invalid when the interface it names no longer
+    # exists -- an address left behind by a deleted interface. Such a row
+    # occupies no subnet: nothing routes to it and nothing answers on it.
+    #
+    # Carried because a caller that cannot see it treats a dead address as a
+    # live one. A lab router held `10.0.0.1/24 invalid=True` on a vanished
+    # interface `*C`, and the VLAN subnet-overlap preflight refused every
+    # 10.0.0.0/24 VLAN on the strength of it -- a permanent, unexplainable
+    # rejection with nothing on the device actually using the range.
+    #
+    # Defaulted so the several existing constructors of this shape keep
+    # working unchanged.
+    invalid: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +172,18 @@ class VlanConfig:
     interface: str
     ip_cidr: str | None
     port_mode: str = "trunk"
+    # The bridge this port belonged to before an access-mode VLAN took it,
+    # so deleting the VLAN can put it back. Set by the caller from the
+    # device snapshot taken before the push; ``None`` means the port was in
+    # no bridge, and the delete leaves it that way.
+    #
+    # This exists because the alternative was unrecoverable. ``delete_vlan``
+    # used to leave the port out of every bridge on the grounds that "which
+    # bridge it belonged to was never recorded" -- which is true, and the
+    # consequence was a venue whose access point sat on an unbridged port
+    # until somebody restored it by hand. Recording it is what makes the
+    # operation reversible by the product rather than by an engineer.
+    previous_bridge: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

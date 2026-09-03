@@ -929,6 +929,7 @@ class MikroTikAdapter:
                     address=str(row["address"]),
                     interface=str(row["interface"]) if row.get("interface") else None,
                     disabled=_is_truthy(row.get("disabled", False)),
+                    invalid=_is_truthy(row.get("invalid", False)),
                 )
                 for row in addresses
                 if row.get("address")
@@ -1904,13 +1905,40 @@ class MikroTikAdapter:
         """Access mode gave a physical port the subnet directly, after
         pulling it out of the shared bridge.
 
-        The address is removed. The port is **not** put back into a bridge:
-        which bridge it belonged to was never recorded, and re-adding it to
-        a guessed one would silently rejoin a port to the wrong L2 segment.
-        The port is left out of every bridge, holding no address -- inert
-        and safe, and visible to an operator as an unbridged port.
+        The address is removed, and the port is put back into
+        ``vlan.previous_bridge`` when the caller recorded one.
+
+        This used to deliberately leave the port unbridged, reasoning that
+        which bridge it came from "was never recorded" and that rejoining a
+        guessed one would be worse. Both halves of that were right; the
+        conclusion was not. A venue's access point sat on an unbridged port
+        with the guest network down, and the product had no way to undo what
+        it had done -- an engineer restored it by hand. The fix was to record
+        the bridge (see :class:`VlanConfig.previous_bridge`), not to keep
+        declining to.
+
+        Still no guessing: with ``previous_bridge`` unset the port is left
+        out of every bridge exactly as before, because "in no bridge" is
+        then the truthful previous state rather than an unknown one.
+
+        ``pvid`` is copied from a sibling port of that same bridge rather
+        than defaulted to 1 -- on a VLAN-filtering bridge the siblings'
+        value is the one that makes untagged ingress land where the rest of
+        that segment lands, and 1 would be a guess dressed as a default.
         """
         self._remove_ip_address(api, vlan.ip_cidr, vlan.interface)
+        if not vlan.previous_bridge:
+            return
+        ports = list(api.path("interface", "bridge", "port"))
+        if any(row.get("interface") == vlan.interface for row in ports):
+            return  # already bridged -- somebody restored it first
+        siblings = [
+            row for row in ports if row.get("bridge") == vlan.previous_bridge
+        ]
+        pvid = str(siblings[0].get("pvid")) if siblings else "1"
+        api.path("interface", "bridge", "port").add(
+            interface=vlan.interface, bridge=vlan.previous_bridge, pvid=pvid
+        )
 
     def _remove_ip_address(self, api, ip_cidr: str | None, interface: str) -> None:
         """Removes that exact address from that exact interface.
@@ -2050,6 +2078,20 @@ class MikroTikAdapter:
             "hotspot-address": hotspot_address,
             "html-directory": html_directory,
             "dns-name": dns_name,
+            # Without these two the portal is decorative. RouterOS defaults
+            # a new profile to `use-radius=no login-by=cookie,http-chap`,
+            # so a per-VLAN portal came up unable to check a credential
+            # against this platform at all: the page appeared, and no OTP,
+            # voucher or password could ever succeed on it. Observed on the
+            # lab router as `vlan95-hsprof use-radius=False`.
+            #
+            # The values mirror `hsprof1`, the router's own working guest
+            # profile (`use-radius=True login-by=http-pap`) -- `http-pap`
+            # because the portal posts the credential, which CHAP's
+            # challenge flow does not carry. `radius-accounting` is left
+            # alone: RouterOS turns it on by default once `use-radius=yes`.
+            "use-radius": "yes",
+            "login-by": "http-pap",
         }
         menu = api.path("ip", "hotspot", "profile")
         for row in menu:
@@ -2064,6 +2106,15 @@ class MikroTikAdapter:
                 if not (
                     key == "html-directory"
                     and _same_routeros_path(row.get(key), value)
+                )
+                # use-radius answers a read as a real bool while accepting
+                # "yes"/"no" on write, so a string compare never matches and
+                # every push re-issues the same set. Same normalization trap
+                # already documented on _ensure_dhcp_server's lease-time and
+                # on `disabled`.
+                and not (
+                    key == "use-radius"
+                    and _is_truthy(row.get(key)) is (value == "yes")
                 )
                 and row.get(key) != value
             }
