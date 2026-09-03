@@ -30,6 +30,7 @@ from app.domains.dhcp.exceptions import (
     DhcpDeviceConnectionError,
     DhcpDeviceOperationError,
     DhcpMissingCredentialsError,
+    DhcpPoolHotspotConflictError,
     DhcpPoolMissingGatewayError,
     DhcpPoolMissingInterfaceError,
     DhcpPoolNotEnabledError,
@@ -216,23 +217,53 @@ class FakeRouterLookup:
 
 
 @dataclass
+class FakeVlan:
+    """Only the five fields ``VlanLookupProtocol`` reads."""
+
+    vlan_id: int
+    port_mode: str = "trunk"
+    interface: str | None = None
+    enable_hotspot: bool = False
+    is_enabled: bool = True
+
+
+@dataclass
+class FakeVlanLookup:
+    """Stands in for ``app.domains.vlan.repository.VlanRepository`` at the
+    narrow Protocol boundary this service composes it through."""
+
+    vlans: dict[uuid.UUID, list[FakeVlan]] = field(default_factory=dict)
+
+    async def list_vlans_for_router(self, router_id: uuid.UUID) -> list[FakeVlan]:
+        return self.vlans.get(router_id, [])
+
+
+@dataclass
 class Harness:
     service: DhcpService
     repository: FakeDhcpRepository
     router_lookup: FakeRouterLookup
     audit_writer: FakeAuditLogWriter
+    vlan_lookup: FakeVlanLookup
 
 
 def make_harness() -> Harness:
     repository = FakeDhcpRepository()
     router_lookup = FakeRouterLookup()
     audit_writer = FakeAuditLogWriter()
-    service = DhcpService(repository, router_lookup, audit_writer=audit_writer)
+    vlan_lookup = FakeVlanLookup()
+    service = DhcpService(
+        repository,
+        router_lookup,
+        vlan_lookup=vlan_lookup,
+        audit_writer=audit_writer,
+    )
     return Harness(
         service=service,
         repository=repository,
         router_lookup=router_lookup,
         audit_writer=audit_writer,
+        vlan_lookup=vlan_lookup,
     )
 
 
@@ -836,3 +867,113 @@ class TestDhcpPoolDeleteReachesTheDevice:
 
         assert pool.is_deleted is False
         assert await h.repository.get_pool_by_id(pool.id) is not None
+
+
+# ============================================================================
+# Captive portal conflict
+#
+# A VLAN's captive portal owns DHCP on that VLAN's own interface: a portal
+# must create its own `/ip dhcp-server`, and RouterOS permits one per
+# interface. Guarded from this side too, because the direction a customer
+# hits first is configuring the portal and then adding a pool.
+# ============================================================================
+
+
+class TestPoolVersusCaptivePortal:
+    async def test_a_portal_on_the_same_interface_refuses_the_pool(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router, interface="vlan100")
+        h.vlan_lookup.vlans[router.id] = [FakeVlan(vlan_id=100, enable_hotspot=True)]
+
+        with pytest.raises(DhcpPoolHotspotConflictError) as exc:
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        # Names the VLAN, so the operator can act: re-point this pool, or
+        # turn that portal off.
+        assert "100" in exc.value.message
+        # A database read -- refused before any connection is opened.
+        assert adapter.calls == []
+
+    async def test_an_access_mode_portal_is_matched_on_its_physical_port(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """In access mode a VLAN's portal sits on the port, not on
+        `vlan<id>`. Comparing against the wrong name would find nothing and
+        let both create a DHCP server on one interface."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router, interface="ether3")
+        h.vlan_lookup.vlans[router.id] = [
+            FakeVlan(
+                vlan_id=100,
+                port_mode="access",
+                interface="ether3",
+                enable_hotspot=True,
+            )
+        ]
+
+        with pytest.raises(DhcpPoolHotspotConflictError):
+            await h.service.push_pool_to_device(
+                pool.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+    async def test_a_vlan_without_a_portal_creates_no_dhcp_server(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Without a portal the VLAN brings no DHCP server, so a pool on its
+        interface is exactly how you give that VLAN addresses."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router, interface="vlan100")
+        h.vlan_lookup.vlans[router.id] = [FakeVlan(vlan_id=100, enable_hotspot=False)]
+
+        pushed = await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+
+    async def test_a_disabled_vlan_occupies_no_interface(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router, interface="vlan100")
+        h.vlan_lookup.vlans[router.id] = [
+            FakeVlan(vlan_id=100, enable_hotspot=True, is_enabled=False)
+        ]
+
+        pushed = await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+
+    async def test_a_portal_on_another_interface_is_no_conflict(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router, interface="ether2")
+        h.vlan_lookup.vlans[router.id] = [FakeVlan(vlan_id=100, enable_hotspot=True)]
+
+        pushed = await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == DhcpDevicePushStatus.ACTIVE.value

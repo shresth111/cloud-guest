@@ -49,6 +49,7 @@ from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.models import Router
+from app.domains.vlan.identifiers import vlan_bind_interface
 
 from .constants import DEFAULT_LEASE_TIME_SECONDS, DhcpDevicePushStatus
 from .device_adapters import DhcpCredentials, get_dhcp_adapter
@@ -61,6 +62,7 @@ from .events import (
 from .exceptions import (
     CrossOrganizationDhcpPoolAccessError,
     DhcpMissingCredentialsError,
+    DhcpPoolHotspotConflictError,
     DhcpPoolMissingGatewayError,
     DhcpPoolMissingInterfaceError,
     DhcpPoolNotEnabledError,
@@ -106,6 +108,34 @@ class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
 
+class VlanRow(Protocol):
+    """The four fields this domain reads off a VLAN. Deliberately not
+    ``app.domains.vlan.models.Vlan``: the only fact needed is whether some
+    VLAN's captive portal already owns an interface, and naming the
+    concrete model would couple two domains through their ORM classes."""
+
+    vlan_id: int
+    port_mode: str
+    interface: str | None
+    enable_hotspot: bool
+    is_enabled: bool
+
+
+class VlanLookupProtocol(Protocol):
+    """Satisfied structurally by ``app.domains.vlan.repository
+    .VlanRepository``.
+
+    The *repository*, not ``VlanService``: that service composes this
+    domain's repository back the other way for the same rule from the
+    other side, and two services depending on each other is a FastAPI
+    dependency cycle that never resolves. Tenant scoping is already
+    settled by the caller, which resolved the router within the requesting
+    organization before it got here.
+    """
+
+    async def list_vlans_for_router(self, router_id: uuid.UUID) -> list[VlanRow]: ...
+
+
 class DhcpService:
     """Core DHCP Pool Management business logic."""
 
@@ -114,10 +144,16 @@ class DhcpService:
         repository: DhcpRepositoryProtocol,
         router_lookup: RouterLookupProtocol,
         *,
+        vlan_lookup: VlanLookupProtocol,
         audit_writer: AuditLogWriter | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
+        # Required, not optional-with-a-None-default. This is the only
+        # thing standing between a customer and two DHCP servers on one
+        # interface from this side, and a default would let a mis-wired
+        # construction skip it silently.
+        self.vlan_lookup = vlan_lookup
         self.audit_writer = audit_writer
 
     async def create_pool(
@@ -340,6 +376,51 @@ class DhcpService:
             ):
                 raise DhcpPoolRangeConflictError(router_id, other.id)
 
+    async def _check_hotspot_conflict(self, pool: DhcpPool) -> None:
+        """Refuses a pool on an interface a VLAN's captive portal owns.
+
+        **The rule: a VLAN's captive portal owns DHCP on that VLAN's own
+        interface.** A portal has to create its own ``/ip pool`` and
+        ``/ip dhcp-server`` on the interface it challenges, RouterOS
+        permits one DHCP server per interface, and this push creates a
+        second one.
+
+        Enforced from *both* sides -- ``VlanService`` raises its own
+        mirror-image error when a portal is pushed onto an interface a
+        pool already serves. Guarding only that side would have left the
+        rule half-true, and the open direction is the likelier one: a
+        customer sets up the portal first, then adds a pool.
+
+        Refused rather than resolved by deleting the portal's objects.
+        Both are things an operator deliberately created and can still see
+        in the dashboard, and a push that quietly removed one would report
+        success while a captive portal stops intercepting anybody.
+
+        Only *enabled* VLAN rows with the portal actually on are
+        considered: a disabled row is intent this platform will not
+        realize, so it occupies no interface on the device. And the
+        interface name comes from ``vlan_bind_interface`` -- the same
+        function the VLAN push uses -- because in access mode a VLAN's
+        portal sits on the physical port, not on ``vlan<id>``, and
+        comparing against the wrong name would find nothing and let the
+        collision through.
+
+        A database read, so this lands before any socket is opened.
+        """
+        vlans = await self.vlan_lookup.list_vlans_for_router(pool.router_id)
+        for vlan in vlans:
+            if not (vlan.is_enabled and vlan.enable_hotspot):
+                continue
+            bind_interface = vlan_bind_interface(
+                port_mode=vlan.port_mode,
+                vlan_id=vlan.vlan_id,
+                interface=vlan.interface,
+            )
+            if bind_interface == pool.interface:
+                raise DhcpPoolHotspotConflictError(
+                    pool.id, bind_interface, vlan.vlan_id
+                )
+
     async def push_pool_to_device(
         self,
         pool_id: uuid.UUID,
@@ -394,6 +475,7 @@ class DhcpService:
             # no route off the subnet. Defaulting to ``.1`` would be a
             # fabricated network fact.
             raise DhcpPoolMissingGatewayError(pool.id)
+        await self._check_hotspot_conflict(pool)
 
         router = await self.router_lookup.get_router(
             pool.router_id, requesting_organization_id=requesting_organization_id

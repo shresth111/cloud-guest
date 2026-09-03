@@ -6,14 +6,22 @@ text."""
 
 from __future__ import annotations
 
-import pytest
+import ipaddress
 
-from tests.fake_write_transport import FakeRouterOSApi
-from wyfy_device_gateway.contract import DhcpPoolConfig, NatRuleConfig, VlanConfig
+import pytest
+from wyfy_device_gateway.contract import (
+    DhcpPoolConfig,
+    NatRuleConfig,
+    VlanConfig,
+    VlanHotspotConfig,
+)
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikAdapter,
+    MikroTikDeviceError,
     MikroTikWanInterfaceError,
 )
+
+from tests.fake_write_transport import FakeRouterOSApi
 
 
 @pytest.mark.asyncio
@@ -991,3 +999,464 @@ async def test_nat_leaves_an_unrelated_port_forward_alone(
     remaining = list(api.path("ip", "firewall", "nat"))
     assert len(remaining) == 1
     assert remaining[0]["chain"] == "dstnat"
+
+
+# ---------------------------------------------------------------------------
+# Captive portal
+#
+# `_render_vlan_hotspot`'s six commands, as real API operations. The whole
+# point of a portal is that it intercepts; an "idempotent" push that skips a
+# changed field leaves one pointing at a subnet the VLAN no longer has, and
+# reports success doing it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hotspot_creates_the_six_objects_in_reference_order(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS enforces the references: the hotspot server names the pool
+    and the profile, and the DHCP server names the pool, so each has to
+    exist before the object pointing at it."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_vlan_hotspot(
+        mikrotik_creds,
+        hotspot=VlanHotspotConfig(
+            vlan_id=50,
+            interface="vlan50",
+            cidr="10.50.0.0/24",
+            gateway="10.50.0.1",
+            dns_name="vlan50.wifi.wyfyguest.com",
+            html_directory="cloudguest-hotspot",
+        ),
+    )
+
+    assert [call[0] for call in api.add_calls] == [
+        ("ip", "pool"),
+        ("ip", "dhcp-server"),
+        ("ip", "dhcp-server", "network"),
+        ("ip", "hotspot", "profile"),
+        ("ip", "dns", "static"),
+        ("ip", "hotspot"),
+    ]
+    fields = {call[0]: call[1] for call in api.add_calls}
+    # The gateway is reserved for the router, never handed out.
+    assert fields[("ip", "pool")]["ranges"] == "10.50.0.2-10.50.0.254"
+    assert fields[("ip", "dhcp-server")]["interface"] == "vlan50"
+    # No lease-time: the renderer sets none, and inventing one would change
+    # how long every portal guest holds an address.
+    assert "lease-time" not in fields[("ip", "dhcp-server")]
+    network = fields[("ip", "dhcp-server", "network")]
+    assert network["gateway"] == "10.50.0.1"
+    # Guests resolve through the router that is about to intercept them.
+    assert network["dns-server"] == "10.50.0.1"
+    profile = fields[("ip", "hotspot", "profile")]
+    assert profile["hotspot-address"] == "10.50.0.1"
+    assert profile["dns-name"] == "vlan50.wifi.wyfyguest.com"
+    assert fields[("ip", "dns", "static")]["address"] == "10.50.0.1"
+    server = fields[("ip", "hotspot")]
+    assert server["profile"] == "vlan50-hsprof"
+    assert server["address-pool"] == "vlan50-hs-pool"
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_in_the_middle_is_never_inside_the_pool(
+    patch_connect, mikrotik_creds
+):
+    """`_render_vlan_hotspot` emits `first-last`, which spans a gateway that
+    is not at either end -- so the DHCP server can lease the router's own
+    address to a guest. The largest gateway-free run cannot."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_vlan_hotspot(
+        mikrotik_creds,
+        hotspot=VlanHotspotConfig(
+            vlan_id=51,
+            interface="vlan51",
+            cidr="10.51.0.0/24",
+            gateway="10.51.0.100",
+            dns_name="vlan51.wifi.wyfyguest.com",
+            html_directory="cloudguest-hotspot",
+        ),
+    )
+
+    ranges = dict(api.add_calls)[("ip", "pool")]["ranges"]
+    start, end = ranges.split("-")
+    assert ipaddress.ip_address("10.51.0.100") not in ipaddress.summarize_address_range(
+        ipaddress.ip_address(start), ipaddress.ip_address(end)
+    ).__next__()
+    # The wider of the two runs: .101-.254 (154 addresses) beats .1-.99 (99).
+    assert ranges == "10.51.0.101-10.51.0.254"
+
+
+@pytest.mark.asyncio
+async def test_a_subnet_with_nothing_left_to_hand_out_is_refused(
+    patch_connect, mikrotik_creds
+):
+    """A portal with an empty pool accepts guests and gives them nothing.
+    Refused before anything is written, not half-applied."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+
+    with pytest.raises(MikroTikDeviceError):
+        await MikroTikAdapter().configure_vlan_hotspot(
+            mikrotik_creds,
+            hotspot=VlanHotspotConfig(
+                vlan_id=52,
+                interface="vlan52",
+                cidr="10.52.0.1/32",
+                gateway="10.52.0.1",
+                dns_name="vlan52.wifi.wyfyguest.com",
+                html_directory="cloudguest-hotspot",
+            ),
+        )
+    assert api.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_re_pushing_an_unchanged_hotspot_is_a_no_op(
+    patch_connect, mikrotik_creds
+):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    hotspot = VlanHotspotConfig(
+        vlan_id=60,
+        interface="vlan60",
+        cidr="10.60.0.0/24",
+        gateway="10.60.0.1",
+        dns_name="vlan60.wifi.wyfyguest.com",
+        html_directory="cloudguest-hotspot",
+    )
+    adapter = MikroTikAdapter()
+    await adapter.configure_vlan_hotspot(mikrotik_creds, hotspot=hotspot)
+    api.add_calls.clear()
+    api.update_calls.clear()
+
+    await adapter.configure_vlan_hotspot(mikrotik_creds, hotspot=hotspot)
+
+    assert api.add_calls == []
+    # Nothing changed, so nothing is written -- not even a "harmless"
+    # update, which on a real router is a rewrite of live config on every
+    # push forever.
+    assert api.update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_re_subnetting_moves_the_pool_instead_of_leaving_the_old_one(
+    patch_connect, mikrotik_creds
+):
+    """The range is exactly what an operator edits. Skipping because a pool
+    of that name already exists reports success and keeps handing out the
+    old subnet."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    adapter = MikroTikAdapter()
+    await adapter.configure_vlan_hotspot(
+        mikrotik_creds,
+        hotspot=VlanHotspotConfig(
+            vlan_id=61,
+            interface="vlan61",
+            cidr="10.61.0.0/25",
+            gateway="10.61.0.1",
+            dns_name="vlan61.wifi.wyfyguest.com",
+            html_directory="cloudguest-hotspot",
+        ),
+    )
+    api.add_calls.clear()
+    api.update_calls.clear()
+
+    await adapter.configure_vlan_hotspot(
+        mikrotik_creds,
+        hotspot=VlanHotspotConfig(
+            vlan_id=61,
+            interface="vlan61",
+            cidr="10.61.0.0/24",
+            gateway="10.61.0.1",
+            dns_name="vlan61.wifi.wyfyguest.com",
+            html_directory="cloudguest-hotspot",
+        ),
+    )
+
+    updated = {call[0]: call[1] for call in api.update_calls}
+    assert updated[("ip", "pool")]["ranges"] == "10.61.0.2-10.61.0.254"
+    # A second pool alongside the first would leave both live.
+    assert ("ip", "pool") not in [call[0] for call in api.add_calls]
+
+
+@pytest.mark.asyncio
+async def test_a_hotspot_disabled_by_hand_is_re_enabled_by_a_re_push(
+    patch_connect, mikrotik_creds
+):
+    """A disabled hotspot challenges nobody, and a re-push is the operator
+    asking for the portal. `disabled` is read back as a real bool, so a
+    string comparison would instead update on every push forever."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "hotspot"): [
+                {
+                    ".id": "*1",
+                    "name": "vlan62-hotspot",
+                    "interface": "vlan62",
+                    "address-pool": "vlan62-hs-pool",
+                    "profile": "vlan62-hsprof",
+                    "disabled": True,
+                }
+            ]
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_vlan_hotspot(
+        mikrotik_creds,
+        hotspot=VlanHotspotConfig(
+            vlan_id=62,
+            interface="vlan62",
+            cidr="10.62.0.0/24",
+            gateway="10.62.0.1",
+            dns_name="vlan62.wifi.wyfyguest.com",
+            html_directory="cloudguest-hotspot",
+        ),
+    )
+
+    hotspot_updates = [c[1] for c in api.update_calls if c[0] == ("ip", "hotspot")]
+    assert hotspot_updates == [{".id": "*1", "disabled": "no"}]
+
+
+@pytest.mark.asyncio
+async def test_a_hotspot_read_back_with_a_real_bool_is_not_updated_forever(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS answers reads with a real `False` and accepts `"no"` on
+    write. Comparing the two as strings reports a difference on every push
+    and rewrites live config each time."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "hotspot"): [
+                {
+                    ".id": "*1",
+                    "name": "vlan63-hotspot",
+                    "interface": "vlan63",
+                    "address-pool": "vlan63-hs-pool",
+                    "profile": "vlan63-hsprof",
+                    "disabled": False,
+                }
+            ]
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_vlan_hotspot(
+        mikrotik_creds,
+        hotspot=VlanHotspotConfig(
+            vlan_id=63,
+            interface="vlan63",
+            cidr="10.63.0.0/24",
+            gateway="10.63.0.1",
+            dns_name="vlan63.wifi.wyfyguest.com",
+            html_directory="cloudguest-hotspot",
+        ),
+    )
+
+    assert [c for c in api.update_calls if c[0] == ("ip", "hotspot")] == []
+
+
+@pytest.mark.asyncio
+async def test_a_hotspot_bound_to_the_wrong_interface_is_corrected(
+    patch_connect, mikrotik_creds
+):
+    """A server carrying this VLAN's name on another interface is this
+    VLAN's portal challenging the wrong network -- fixed, where adding a
+    second server beside it would leave both."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "hotspot"): [
+                {
+                    ".id": "*1",
+                    "name": "vlan64-hotspot",
+                    "interface": "ether9",
+                    "address-pool": "vlan64-hs-pool",
+                    "profile": "vlan64-hsprof",
+                    "disabled": False,
+                }
+            ]
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_vlan_hotspot(
+        mikrotik_creds,
+        hotspot=VlanHotspotConfig(
+            vlan_id=64,
+            interface="vlan64",
+            cidr="10.64.0.0/24",
+            gateway="10.64.0.1",
+            dns_name="vlan64.wifi.wyfyguest.com",
+            html_directory="cloudguest-hotspot",
+        ),
+    )
+
+    updates = [c[1] for c in api.update_calls if c[0] == ("ip", "hotspot")]
+    assert updates == [{".id": "*1", "interface": "vlan64"}]
+    assert [c for c in api.add_calls if c[0] == ("ip", "hotspot")] == []
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_the_hotspot_before_what_it_references(
+    patch_connect, mikrotik_creds
+):
+    """RouterOS refuses to remove a profile or a pool something still points
+    at, so the order is the reverse of creation and is not cosmetic."""
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    hotspot = VlanHotspotConfig(
+        vlan_id=70,
+        interface="vlan70",
+        cidr="10.70.0.0/24",
+        gateway="10.70.0.1",
+        dns_name="vlan70.wifi.wyfyguest.com",
+        html_directory="cloudguest-hotspot",
+    )
+    adapter = MikroTikAdapter()
+    await adapter.configure_vlan_hotspot(mikrotik_creds, hotspot=hotspot)
+
+    await adapter.delete_vlan_hotspot(mikrotik_creds, hotspot=hotspot)
+
+    assert [call[0] for call in api.remove_calls] == [
+        ("ip", "hotspot"),
+        ("ip", "dns", "static"),
+        ("ip", "hotspot", "profile"),
+        ("ip", "dhcp-server", "network"),
+        ("ip", "dhcp-server"),
+        ("ip", "pool"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_hotspot_twice_is_a_no_op(patch_connect, mikrotik_creds):
+    api = FakeRouterOSApi()
+    patch_connect(api)
+    hotspot = VlanHotspotConfig(
+        vlan_id=71,
+        interface="vlan71",
+        cidr="10.71.0.0/24",
+        gateway="10.71.0.1",
+        dns_name="vlan71.wifi.wyfyguest.com",
+        html_directory="cloudguest-hotspot",
+    )
+    adapter = MikroTikAdapter()
+    await adapter.configure_vlan_hotspot(mikrotik_creds, hotspot=hotspot)
+    await adapter.delete_vlan_hotspot(mikrotik_creds, hotspot=hotspot)
+    api.remove_calls.clear()
+
+    await adapter.delete_vlan_hotspot(mikrotik_creds, hotspot=hotspot)
+
+    assert api.remove_calls == []
+
+
+@pytest.mark.asyncio
+async def test_another_vlans_hotspot_is_left_alone(patch_connect, mikrotik_creds):
+    """Every object is named from `vlan_id`, so one VLAN's teardown cannot
+    reach another's portal -- or the router's own `hotspot1`."""
+    api = FakeRouterOSApi(
+        menus={
+            ("ip", "hotspot"): [
+                {".id": "*9", "name": "hotspot1", "interface": "bridge"},
+                {".id": "*8", "name": "vlan99-hotspot", "interface": "vlan99"},
+            ]
+        }
+    )
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_vlan_hotspot(
+        mikrotik_creds,
+        hotspot=VlanHotspotConfig(
+            vlan_id=72,
+            interface="vlan72",
+            cidr="10.72.0.0/24",
+            gateway="10.72.0.1",
+            dns_name="vlan72.wifi.wyfyguest.com",
+            html_directory="cloudguest-hotspot",
+        ),
+    )
+
+    surviving = {row["name"] for row in api.path("ip", "hotspot")}
+    assert surviving == {"hotspot1", "vlan99-hotspot"}
+
+
+# ---------------------------------------------------------------------------
+# read_network_snapshot
+#
+# The VLAN form and the push preflight both read this. `get_interface_list`
+# cannot serve either: it drops interfaces bound to an `/ip dhcp-server`,
+# which on a real router drops `bridge` -- the interface most VLAN trunks
+# hang off.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_keeps_the_bridge_that_get_interface_list_drops(
+    patch_connect, mikrotik_creds
+):
+    menus = {
+        ("interface",): [
+            {"name": "bridge", "type": "bridge", "running": True, "disabled": False},
+            {"name": "ether1", "type": "ether", "running": True, "disabled": False},
+            {"name": "lo", "type": "loopback", "running": True, "disabled": False},
+        ],
+        ("interface", "bridge", "port"): [
+            {".id": "*1", "interface": "ether1", "bridge": "bridge"}
+        ],
+        ("ip", "address"): [
+            {".id": "*1", "address": "192.168.88.1/24", "interface": "bridge"}
+        ],
+        ("ip", "dhcp-server"): [
+            {".id": "*1", "name": "defconf", "interface": "bridge"}
+        ],
+        ("ip", "dhcp-client"): [{".id": "*1", "interface": "ether1"}],
+    }
+    patch_connect(FakeRouterOSApi(menus=menus))
+    filtered = await MikroTikAdapter().get_interface_list(mikrotik_creds)
+    patch_connect(FakeRouterOSApi(menus=menus))
+    snapshot = await MikroTikAdapter().read_network_snapshot(mikrotik_creds)
+
+    # The DHCP picker sees neither: bridge has a dhcp-server, ether1 a
+    # dhcp-client. That is right for DHCP and useless for VLAN.
+    assert [i.name for i in filtered] == []
+    assert [i.name for i in snapshot.interfaces] == ["bridge", "ether1"]
+    assert [(a.address, a.interface) for a in snapshot.ip_addresses] == [
+        ("192.168.88.1/24", "bridge")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bridge_membership_distinguishes_a_port_from_a_bridge(
+    patch_connect, mikrotik_creds
+):
+    """An access port has to be a bridge port. `bridge` itself is not one,
+    and a picker that cannot tell them apart offers the bridge as a port to
+    pull out of a bridge."""
+    patch_connect(
+        FakeRouterOSApi(
+            menus={
+                ("interface",): [
+                    {"name": "bridge", "type": "bridge"},
+                    {"name": "ether3", "type": "ether"},
+                    {"name": "ether9", "type": "ether"},
+                ],
+                ("interface", "bridge", "port"): [
+                    {".id": "*1", "interface": "ether3", "bridge": "bridge"}
+                ],
+            }
+        )
+    )
+
+    snapshot = await MikroTikAdapter().read_network_snapshot(mikrotik_creds)
+
+    by_name = {i.name: i for i in snapshot.interfaces}
+    assert by_name["ether3"].is_bridge_port is True
+    assert by_name["ether3"].bridge == "bridge"
+    assert by_name["bridge"].is_bridge_port is False
+    assert by_name["ether9"].is_bridge_port is False

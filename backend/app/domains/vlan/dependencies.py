@@ -13,15 +13,31 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
-from app.domains.dhcp.dependencies import get_dhcp_repository
-from app.domains.dhcp.repository import DhcpRepositoryProtocol
+from app.domains.dhcp.repository import DhcpRepository
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 
 from .repository import VlanRepository, VlanRepositoryProtocol
-from .service import VlanService
+from .service import DhcpPoolLookupProtocol, VlanService
+
+
+def get_dhcp_pool_lookup(
+    db: AsyncSession = Depends(get_db_session),
+) -> DhcpPoolLookupProtocol:
+    """The DHCP repository, constructed here rather than imported from
+    ``app.domains.dhcp.dependencies``.
+
+    The two domains compose each other -- this service refuses a captive
+    portal on an interface a DHCP pool serves, and ``DhcpService`` refuses
+    the mirror image -- so importing that module would make the two
+    ``dependencies`` modules import each other at load time, which Python
+    fails outright. The *repositories* have no such problem: each depends
+    on the session and nothing else, which is the whole reason the conflict
+    rule is enforced at that layer.
+    """
+    return DhcpRepository(db)
 
 
 def get_vlan_repository(
@@ -33,7 +49,7 @@ def get_vlan_repository(
 def get_vlan_service(
     repository: VlanRepositoryProtocol = Depends(get_vlan_repository),
     router_service: RouterService = Depends(get_router_service),
-    dhcp_repository: DhcpRepositoryProtocol = Depends(get_dhcp_repository),
+    dhcp_pool_lookup: DhcpPoolLookupProtocol = Depends(get_dhcp_pool_lookup),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ) -> VlanService:
     # The DHCP *repository*, not ``DhcpService``. The DHCP service composes
@@ -46,9 +62,9 @@ def get_vlan_service(
     return VlanService(
         repository,
         router_service,
-        dhcp_pool_lookup=dhcp_repository,
+        dhcp_pool_lookup=dhcp_pool_lookup,
         audit_writer=audit_repository,
     )
 
 
-__all__ = ["get_vlan_repository", "get_vlan_service"]
+__all__ = ["get_dhcp_pool_lookup", "get_vlan_repository", "get_vlan_service"]

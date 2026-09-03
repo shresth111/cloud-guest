@@ -25,6 +25,10 @@ from datetime import UTC, datetime
 import pytest
 
 from app.database.utils.pagination import PageParams, PaginationMeta
+from app.domains.network_config.renderers import (
+    HOTSPOT_DNS_NAME,
+    HOTSPOT_HTML_DIRECTORY,
+)
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 from app.domains.vlan.constants import VlanDevicePushStatus
@@ -35,15 +39,21 @@ from app.domains.vlan.device_adapters import (
 )
 from app.domains.vlan.exceptions import (
     CrossOrganizationVlanAccessError,
+    GatewayOutsideCidrError,
     InvalidCidrError,
     InvalidGatewayIpAddressError,
     InvalidVlanIdError,
+    VlanAccessPortNotFoundError,
     VlanDeviceConnectionError,
     VlanDeviceOperationError,
+    VlanHotspotDhcpPoolConflictError,
+    VlanHotspotRequiresSubnetError,
     VlanIdAlreadyExistsError,
     VlanMissingInterfaceError,
     VlanNatRequiresCidrError,
     VlanNotFoundError,
+    VlanParentInterfaceNotFoundError,
+    VlanSubnetConflictError,
 )
 from app.domains.vlan.models import Vlan
 from app.domains.vlan.router import router as vlan_router
@@ -1096,3 +1106,622 @@ class TestVlanNatIsPartOfThePush:
 
         assert adapter.nat_deletes == []
         assert adapter.deletes == []
+
+
+# ============================================================================
+# Preconditions and preflight
+#
+# Everything answerable without the router is answered before one is opened,
+# and the three that need it are answered in a single read. The point of each
+# test below is a failure the old push would have surfaced as an opaque
+# RouterOS error, or not at all.
+# ============================================================================
+
+
+class TestPreconditionsAreCheckedBeforeConnecting:
+    async def test_a_gateway_outside_the_cidr_is_rejected_at_create(self) -> None:
+        """Both halves pass their own validator. The pair still puts the
+        router on a subnet the VLAN does not have: `_device_address` pastes
+        the gateway onto the CIDR's prefix length."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(GatewayOutsideCidrError):
+            await h.service.create_vlan(
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+                router_id=router.id,
+                vlan_id=10,
+                name="Wrong gateway",
+                gateway_ip_address="10.9.9.1",
+                cidr="192.168.10.0/24",
+            )
+
+    async def test_editing_only_the_gateway_is_checked_against_the_stored_cidr(
+        self,
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+
+        with pytest.raises(GatewayOutsideCidrError):
+            await h.service.update_vlan(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+                gateway_ip_address="172.16.0.1",
+            )
+
+    async def test_a_hotspot_without_a_subnet_is_refused_before_connecting(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A portal is a pool of real addresses plus an address of its own
+        to answer on. Pushing the interface and dropping the portal would
+        report success for a VLAN whose guests never see one."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, cidr=None)
+        vlan.enable_hotspot = True
+
+        with pytest.raises(VlanHotspotRequiresSubnetError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+        assert adapter.snapshot_reads == 0
+        assert adapter.calls == []
+
+    async def test_a_missing_trunk_parent_is_named_rather_than_attempted(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """RouterOS rejects an unknown `interface=`, but with a message about
+        an input not matching a value, attributed to the VLAN write -- and
+        only after the push has already started."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether99")
+        adapter.snapshot_interfaces = ["bridge", "ether1"]
+
+        with pytest.raises(VlanParentInterfaceNotFoundError) as exc:
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert "ether99" in exc.value.message
+        assert adapter.calls == []
+
+    async def test_a_missing_access_port_raises_its_own_error(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """"There is no such trunk" and "there is no such port on this
+        hardware" are different problems with different fixes."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(
+            h, router, interface="ether99", port_mode="access"
+        )
+        adapter.snapshot_interfaces = ["bridge", "ether1"]
+
+        with pytest.raises(VlanAccessPortNotFoundError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+    async def test_the_three_device_checks_share_one_connection(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Reachable, interface exists, subnet free -- one read. Three would
+        triple the wait before a validation failure and let the answers come
+        from three different moments."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.snapshot_reads == 1
+
+    async def test_an_unreachable_router_fails_the_push_and_is_recorded(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """"Router reachable" is not a separate check -- it is this read."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        adapter.snapshot_raises = VlanDeviceConnectionError(
+            "10.0.0.1", "connection attempt timed out"
+        )
+
+        with pytest.raises(VlanDeviceConnectionError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert vlan.device_push_status == VlanDevicePushStatus.FAILED.value
+        assert "timed out" in (vlan.device_push_error or "")
+        assert adapter.calls == []
+
+
+class TestSubnetConflictUsesTheDevicesOwnAddresses:
+    async def test_an_overlapping_address_on_another_interface_is_a_conflict(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The router's LAN bridge has no `Vlan` row here, so comparing
+        against other rows would have found nothing and left two matching
+        routes on the device."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        adapter.snapshot_addresses = [("192.168.10.1/24", "bridge")]
+
+        with pytest.raises(VlanSubnetConflictError) as exc:
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert "bridge" in exc.value.message
+        assert adapter.calls == []
+
+    async def test_a_re_push_does_not_conflict_with_its_own_address(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The VLAN's own bind interface is excluded, or every re-push of an
+        unchanged VLAN would collide with itself."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        adapter.snapshot_addresses = [("192.168.10.1/24", "vlan100")]
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == VlanDevicePushStatus.ACTIVE.value
+
+    async def test_a_disabled_address_collides_with_nothing(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A disabled address is not in the routing table."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        adapter.snapshot_addresses = [("192.168.10.1/24", "bridge")]
+        # Rebuild the snapshot with that row disabled.
+        original = adapter.read_network_snapshot
+
+        async def _disabled_snapshot(credentials):
+            snapshot = await original(credentials)
+            return VlanNetworkSnapshot(
+                interfaces=snapshot.interfaces,
+                addresses=[
+                    VlanDeviceAddress(
+                        address=a.address, interface=a.interface, disabled=True
+                    )
+                    for a in snapshot.addresses
+                ],
+            )
+
+        adapter.read_network_snapshot = _disabled_snapshot
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == VlanDevicePushStatus.ACTIVE.value
+
+    async def test_a_neighbouring_subnet_is_not_a_conflict(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        adapter.snapshot_addresses = [("192.168.11.1/24", "bridge")]
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == VlanDevicePushStatus.ACTIVE.value
+
+
+# ============================================================================
+# Captive portal
+# ============================================================================
+
+
+class TestCaptivePortalIsPartOfThePush:
+    async def test_the_portal_lands_on_the_vlans_own_interface(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Bound to `vlan<id>`, never to the shared bridge -- turning a
+        portal on for one VLAN must not challenge another's guests."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        vlan.enable_hotspot = True
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.hotspot_calls == [
+            {
+                "vlan_id": 100,
+                "interface": "vlan100",
+                "cidr": "192.168.10.0/24",
+                "gateway": "192.168.10.1",
+                "dns_name": f"vlan100.{HOTSPOT_DNS_NAME}",
+                "html_directory": HOTSPOT_HTML_DIRECTORY,
+            }
+        ]
+
+    async def test_an_access_mode_portal_binds_to_the_physical_port(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Access mode creates no `/interface vlan` entry at all, so a portal
+        on `vlan<id>` would bind to an interface that does not exist."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether3", port_mode="access")
+        vlan.enable_hotspot = True
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.hotspot_calls[0]["interface"] == "ether3"
+
+    async def test_turning_the_portal_off_removes_it_rather_than_doing_nothing(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The flag is current intent; the objects on the device are history.
+        A no-op would leave the last-pushed portal challenging guests on a
+        network the operator decided must not have one -- and report
+        success."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.hotspot_calls == []
+        assert adapter.hotspot_deletes == [{"vlan_id": 100, "interface": "vlan100"}]
+
+    async def test_a_portal_failure_is_recorded_committed_and_re_raised(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        vlan.enable_hotspot = True
+        adapter.hotspot_raises = VlanDeviceOperationError(
+            "configure_hotspot", "no such item"
+        )
+
+        with pytest.raises(VlanDeviceOperationError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert vlan.device_push_status == VlanDevicePushStatus.FAILED.value
+        assert "no such item" in (vlan.device_push_error or "")
+        assert h.repository.commits == 2
+
+    async def test_deleting_a_vlan_takes_its_portal_off_the_router(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        vlan.enable_hotspot = True
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        adapter.hotspot_deletes.clear()
+
+        await h.service.delete_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.hotspot_deletes == [{"vlan_id": 100, "interface": "vlan100"}]
+
+    async def test_teardown_removes_the_portal_even_when_the_flag_is_now_off(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A VLAN pushed with a portal and switched off without a re-push
+        still has one. Reading the flag would leave it behind on an
+        interface that is about to stop existing."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        vlan.enable_hotspot = True
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+        vlan.enable_hotspot = False
+        adapter.hotspot_deletes.clear()
+
+        await h.service.delete_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.hotspot_deletes == [{"vlan_id": 100, "interface": "vlan100"}]
+
+
+class TestCaptivePortalVersusDhcpPool:
+    async def test_a_pool_on_the_same_interface_refuses_the_portal(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A portal brings its own `/ip dhcp-server` and RouterOS allows one
+        per interface. Colliding silently is what this replaces."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        vlan.enable_hotspot = True
+        h.dhcp_pool_lookup.pools[router.id] = [
+            FakeDhcpPool(name="Guest pool", interface="vlan100")
+        ]
+
+        with pytest.raises(VlanHotspotDhcpPoolConflictError) as exc:
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        # The message names the pool, because the fix is the operator's to
+        # choose: delete it, re-point it, or turn the portal off.
+        assert "Guest pool" in exc.value.message
+        # Refused before any connection at all -- this is a database read.
+        assert adapter.snapshot_reads == 0
+        assert adapter.calls == []
+
+    async def test_a_pool_on_another_interface_is_no_conflict(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        vlan.enable_hotspot = True
+        h.dhcp_pool_lookup.pools[router.id] = [
+            FakeDhcpPool(name="Office pool", interface="ether5")
+        ]
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(adapter.hotspot_calls) == 1
+
+    async def test_a_disabled_pool_occupies_no_interface(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A disabled row is intent this platform will not realize, so it
+        holds nothing on the device."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        vlan.enable_hotspot = True
+        h.dhcp_pool_lookup.pools[router.id] = [
+            FakeDhcpPool(name="Retired pool", interface="vlan100", is_enabled=False)
+        ]
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert len(adapter.hotspot_calls) == 1
+
+    async def test_a_pool_is_only_checked_when_the_portal_is_on(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Without a portal this VLAN creates no DHCP server, so a pool on
+        its interface is a perfectly ordinary configuration."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        h.dhcp_pool_lookup.pools[router.id] = [
+            FakeDhcpPool(name="Guest pool", interface="vlan100")
+        ]
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == VlanDevicePushStatus.ACTIVE.value
+
+
+# ============================================================================
+# Status and the recorded interface name
+# ============================================================================
+
+
+class TestPushStatusAndInterfaceName:
+    async def test_provisioning_is_committed_before_the_first_socket(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A customer refreshing during a slow push has to see work in
+        flight, not the previous attempt's outcome -- and a process killed
+        mid-write must not leave a stale ACTIVE claiming device state nobody
+        confirmed."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+        seen: list[tuple[str, int]] = []
+
+        async def _record_then_read(credentials):
+            seen.append((vlan.device_push_status, h.repository.commits))
+            return VlanNetworkSnapshot(
+                interfaces=[
+                    VlanDeviceInterface(
+                        name="bridge",
+                        type="bridge",
+                        running=True,
+                        disabled=False,
+                        bridge=None,
+                        is_bridge_port=False,
+                        has_ip_address=False,
+                    )
+                ],
+                addresses=[],
+            )
+
+        adapter.read_network_snapshot = _record_then_read
+
+        await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert seen == [(VlanDevicePushStatus.PROVISIONING.value, 1)]
+        assert vlan.device_push_status == VlanDevicePushStatus.ACTIVE.value
+
+    async def test_the_recorded_name_is_the_trunk_sub_interface(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.mikrotik_interface_name == "vlan100"
+
+    async def test_an_access_row_records_the_port_not_a_name_the_device_lacks(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Access mode creates no `/interface vlan` entry, so `vlan100` names
+        nothing on that router."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether3", port_mode="access")
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.mikrotik_interface_name == "ether3"
+
+    async def test_a_row_that_never_pushed_claims_no_device_name(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router)
+
+        assert vlan.mikrotik_interface_name is None
+        assert vlan.device_push_status == VlanDevicePushStatus.PENDING.value
+
+
+# ============================================================================
+# The interface picker
+# ============================================================================
+
+
+class TestDeviceInterfaceListing:
+    async def test_it_returns_what_the_router_has(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether3"]
+
+        interfaces, message = await h.service.list_device_interfaces(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert [i.name for i in interfaces] == ["bridge", "ether1", "ether3"]
+        assert message == "Device interfaces retrieved"
+
+    async def test_a_router_with_no_credentials_says_so_instead_of_failing(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The form is being filled in. An empty dropdown with no
+        explanation teaches an operator the feature is broken."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        h.router_lookup.secret = None
+
+        interfaces, message = await h.service.list_device_interfaces(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert interfaces == []
+        assert "credentials" in message
+
+    async def test_an_unreachable_router_returns_the_devices_own_words(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.snapshot_raises = VlanDeviceConnectionError(
+            "10.0.0.1", "connection attempt timed out"
+        )
+
+        interfaces, message = await h.service.list_device_interfaces(
+            router.id, requesting_organization_id=router.organization_id
+        )
+
+        assert interfaces == []
+        assert "timed out" in message
+
+    async def test_a_router_in_another_organization_is_still_refused(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Degrading gracefully on an unreachable device is not a reason to
+        degrade on a tenancy violation."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(RouterNotFoundError):
+            await h.service.list_device_interfaces(
+                router.id, requesting_organization_id=uuid.uuid4()
+            )

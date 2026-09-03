@@ -17,9 +17,21 @@ from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
+from app.domains.vlan.repository import VlanRepository
 
 from .repository import DhcpRepository, DhcpRepositoryProtocol
-from .service import DhcpService
+from .service import DhcpService, VlanLookupProtocol
+
+
+def get_vlan_lookup(
+    db: AsyncSession = Depends(get_db_session),
+) -> VlanLookupProtocol:
+    """The VLAN repository, constructed here rather than imported from
+    ``app.domains.vlan.dependencies`` -- see that module's own
+    ``get_dhcp_pool_lookup`` for why importing it would deadlock the two
+    modules at load time.
+    """
+    return VlanRepository(db)
 
 
 def get_dhcp_repository(
@@ -31,13 +43,20 @@ def get_dhcp_repository(
 def get_dhcp_service(
     repository: DhcpRepositoryProtocol = Depends(get_dhcp_repository),
     router_service: RouterService = Depends(get_router_service),
+    vlan_lookup: VlanLookupProtocol = Depends(get_vlan_lookup),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ) -> DhcpService:
+    # The VLAN *repository*, not ``VlanService`` -- see that domain's own
+    # ``get_vlan_service``, which composes this domain's repository back
+    # the other way for the other half of the captive-portal/DHCP conflict
+    # rule. Two services depending on each other is a dependency cycle
+    # FastAPI never resolves; repositories depend only on the session.
     return DhcpService(
         repository,
         router_service,
+        vlan_lookup=vlan_lookup,
         audit_writer=audit_repository,
     )
 
 
-__all__ = ["get_dhcp_repository", "get_dhcp_service"]
+__all__ = ["get_dhcp_repository", "get_dhcp_service", "get_vlan_lookup"]

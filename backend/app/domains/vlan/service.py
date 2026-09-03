@@ -173,6 +173,7 @@ from .exceptions import (
     VlanParentInterfaceNotFoundError,
     VlanSubnetConflictError,
 )
+from .identifiers import vlan_bind_interface
 from .models import Vlan
 from .repository import VlanRepositoryProtocol
 from .validators import (
@@ -818,16 +819,18 @@ class VlanService:
         """The interface this VLAN's address, portal and DHCP actually sit
         on -- which is not always ``vlan<id>``.
 
-        In trunk mode the VLAN is a tagged sub-interface named
-        deterministically from its tag. In access mode there is no
-        ``/interface vlan`` entry at all: the VLAN is realized as the
-        physical port itself, and everything binds there. Both branches
-        mirror ``render_vlan``, which is what the operator was shown when
-        they chose the mode.
+        Delegates to ``identifiers.vlan_bind_interface`` rather than
+        computing it here: ``app.domains.dhcp.service`` has to derive the
+        identical name to enforce the other half of the captive-portal
+        conflict rule, and two copies that drift would let both domains
+        create a DHCP server on one interface while each check found
+        nothing.
         """
-        if vlan.port_mode == "access" and vlan.interface:
-            return vlan.interface
-        return f"vlan{vlan.vlan_id}"
+        return vlan_bind_interface(
+            port_mode=vlan.port_mode,
+            vlan_id=vlan.vlan_id,
+            interface=vlan.interface,
+        )
 
     @staticmethod
     def _hotspot_dns_name(vlan: Vlan) -> str:
