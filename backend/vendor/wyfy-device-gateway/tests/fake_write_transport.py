@@ -48,13 +48,35 @@ class FakePath:
 
     def add(self, **fields: Any) -> str:
         new_id = f"*{len(self._rows) + 1}"
+        # RouterOS *consumes* place-before: it decides where the row lands
+        # and is not itself stored on the row. Verified on 7.23.3 (hEX
+        # lite) as device test T1 -- adding a, b, then c with
+        # place-before=<b .id> prints in the order a, c, b -- so it takes a
+        # .id, never an ordinal. A fake that appended regardless would let
+        # an ordering bug pass every test in this suite.
+        anchor_id = fields.pop("place-before", None)
         row = {".id": new_id, **fields}
-        self._rows.append(row)
-        self._recorder.add_calls.append((self._segments, fields))
+        index = None
+        if anchor_id is not None:
+            index = next(
+                (i for i, r in enumerate(self._rows) if r.get(".id") == anchor_id),
+                None,
+            )
+        if index is None:
+            self._rows.append(row)
+        else:
+            self._rows.insert(index, row)
+        recorded = (
+            dict(fields) if anchor_id is None
+            else {**fields, "place-before": anchor_id}
+        )
+        self._recorder.add_calls.append((self._segments, recorded))
+        self._recorder.ops.append(("add", self._segments, recorded))
         return new_id
 
     def update(self, **fields: Any) -> None:
         self._recorder.update_calls.append((self._segments, fields))
+        self._recorder.ops.append(("update", self._segments, fields))
         target_id = fields.get(".id")
         for row in self._rows:
             if target_id is None or row.get(".id") == target_id:
@@ -64,6 +86,7 @@ class FakePath:
 
     def remove(self, *ids: Any) -> None:
         self._recorder.remove_calls.append((self._segments, ids))
+        self._recorder.ops.append(("remove", self._segments, ids))
         self._rows[:] = [row for row in self._rows if row.get(".id") not in ids]
 
 
@@ -91,6 +114,12 @@ class FakeRouterOSApi:
         self.add_calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
         self.update_calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
         self.remove_calls: list[tuple[tuple[str, ...], tuple[Any, ...]]] = []
+        # One interleaved log of every write, in the order it was issued.
+        # The three lists above cannot answer "did the add happen before the
+        # remove", and for a security control that must fail closed --
+        # never leaving the chain without its DROP -- that ordering is the
+        # thing worth asserting.
+        self.ops: list[tuple[str, tuple[str, ...], Any]] = []
 
     def path(self, *segments: str) -> FakePath:
         from librouteros.exceptions import LibRouterosError

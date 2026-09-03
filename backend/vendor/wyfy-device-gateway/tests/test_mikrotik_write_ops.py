@@ -2397,3 +2397,177 @@ async def test_deleting_an_absent_qos_packet_mark_is_a_no_op(
     )
 
     assert api.remove_calls == []
+
+
+# ----------------------------------------------------------------------
+# Where the content-filter enforcement DROP lands in `forward`.
+#
+# The chain below is the real one read off the lab hEX lite (RouterOS
+# 7.23.3): two dynamic hotspot jumps gated `!auth`, three cloudguest drops,
+# then the established/related accept and the invalid drop. Placement is
+# only buildable because device test T1 proved `place-before` takes a `.id`
+# and T2 proved a static rule can sit above the dynamic rows.
+# ----------------------------------------------------------------------
+
+_ENFORCEMENT_COMMENT = "Wyfy Guest content filtering: block listed addresses"
+
+
+def _lab_forward_chain() -> list[dict]:
+    return [
+        {".id": "*1", "chain": "forward", "action": "jump",
+         "jump-target": "hs-unauth", "dynamic": "true"},
+        {".id": "*2", "chain": "forward", "action": "jump",
+         "jump-target": "hs-unauth-to", "dynamic": "true"},
+        {".id": "*3", "chain": "forward", "action": "drop",
+         "comment": "cloudguest-block-dot-udp"},
+        {".id": "*4", "chain": "forward", "action": "drop",
+         "comment": "cloudguest-block-doh"},
+        {".id": "*5", "chain": "forward", "action": "accept",
+         "comment": "cloudguest-fw-fwd-established",
+         "connection-state": "established,related"},
+        {".id": "*6", "chain": "forward", "action": "drop",
+         "comment": "cloudguest-fw-fwd-drop-invalid",
+         "connection-state": "invalid"},
+    ]
+
+
+def _forward_comments(api) -> list[str]:
+    return [
+        row.get("comment") or f"<{row.get('action')}>"
+        for row in api.path("ip", "firewall", "filter")
+        if str(row.get("chain", "")) == "forward"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_enforcement_drop_lands_above_the_first_accept(
+    patch_connect, mikrotik_creds
+):
+    """Below the established/related accept, a block only bites on a *new*
+    connection -- a flow already open when the customer pressed Block keeps
+    flowing. Above it, the block applies to traffic already in flight."""
+    api = FakeRouterOSApi(menus={("ip", "firewall", "filter"): _lab_forward_chain()})
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_content_filter_rule(
+        mikrotik_creds, rule=_cidr_rule()
+    )
+
+    order = _forward_comments(api)
+    assert order.index(_ENFORCEMENT_COMMENT) < order.index(
+        "cloudguest-fw-fwd-established"
+    )
+    # And above the accept means above it only -- the hotspot jumps and the
+    # drops in front of it are untouched.
+    assert order[:4] == [
+        "<jump>", "<jump>", "cloudguest-block-dot-udp", "cloudguest-block-doh",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_enforcement_drop_is_placed_by_id_not_by_an_index(
+    patch_connect, mikrotik_creds
+):
+    """An ordinal goes stale the moment the hotspot adds or removes one of
+    its dynamic rules. T1 established that `place-before` takes a `.id`."""
+    api = FakeRouterOSApi(menus={("ip", "firewall", "filter"): _lab_forward_chain()})
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_content_filter_rule(
+        mikrotik_creds, rule=_cidr_rule()
+    )
+
+    filter_adds = [
+        fields for segments, fields in api.add_calls
+        if segments == ("ip", "firewall", "filter")
+    ]
+    assert filter_adds[0]["place-before"] == "*5"  # the accept's own .id
+
+
+@pytest.mark.asyncio
+async def test_a_misplaced_enforcement_drop_is_moved_up_on_the_next_push(
+    patch_connect, mikrotik_creds
+):
+    """The defect this closes: the rule used to be appended once and then
+    never re-checked, so a router carrying it at the bottom stayed that way
+    forever."""
+    chain = _lab_forward_chain()
+    chain.append(
+        {".id": "*9", "chain": "forward", "action": "drop",
+         "dst-address-list": "wyfyguest-content-filter-blocked",
+         "comment": _ENFORCEMENT_COMMENT}
+    )
+    api = FakeRouterOSApi(menus={("ip", "firewall", "filter"): chain})
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_content_filter_rule(
+        mikrotik_creds, rule=_cidr_rule()
+    )
+
+    order = _forward_comments(api)
+    assert order.count(_ENFORCEMENT_COMMENT) == 1
+    assert order.index(_ENFORCEMENT_COMMENT) < order.index(
+        "cloudguest-fw-fwd-established"
+    )
+    # Added before the stale row was removed: the chain is never left with
+    # no DROP at all. This is a control that must fail closed, so the
+    # ordering is asserted against the interleaved log rather than inferred
+    # from two separate ones.
+    filter_ops = [
+        (op, payload)
+        for op, segments, payload in api.ops
+        if segments == ("ip", "firewall", "filter")
+    ]
+    assert [op for op, _ in filter_ops] == ["add", "remove"]
+    assert filter_ops[1][1] == ("*9",)
+
+
+@pytest.mark.asyncio
+async def test_a_correctly_placed_enforcement_drop_is_left_alone(
+    patch_connect, mikrotik_creds
+):
+    """Re-pushing must not churn the chain: no add, no remove."""
+    chain = _lab_forward_chain()
+    chain.insert(
+        4,
+        {".id": "*9", "chain": "forward", "action": "drop",
+         "dst-address-list": "wyfyguest-content-filter-blocked",
+         "comment": _ENFORCEMENT_COMMENT},
+    )
+    api = FakeRouterOSApi(menus={("ip", "firewall", "filter"): chain})
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_content_filter_rule(
+        mikrotik_creds, rule=_cidr_rule()
+    )
+
+    filter_writes = [
+        segments for segments, _ in api.add_calls
+        if segments == ("ip", "firewall", "filter")
+    ]
+    assert filter_writes == []
+    assert [s for s, _ in api.remove_calls if s == ("ip", "firewall", "filter")] == []
+
+
+@pytest.mark.asyncio
+async def test_with_no_accept_in_forward_the_drop_is_appended(
+    patch_connect, mikrotik_creds
+):
+    """Nothing to sit above, so the bottom is where it belongs -- and no
+    `place-before` is sent at all."""
+    chain = [
+        row for row in _lab_forward_chain() if row["action"] != "accept"
+    ]
+    api = FakeRouterOSApi(menus={("ip", "firewall", "filter"): chain})
+    patch_connect(api)
+
+    await MikroTikAdapter().configure_content_filter_rule(
+        mikrotik_creds, rule=_cidr_rule()
+    )
+
+    filter_adds = [
+        fields for segments, fields in api.add_calls
+        if segments == ("ip", "firewall", "filter")
+    ]
+    assert "place-before" not in filter_adds[0]
+    assert _forward_comments(api)[-1] == _ENFORCEMENT_COMMENT
