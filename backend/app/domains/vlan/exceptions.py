@@ -374,6 +374,46 @@ class VlanAccessPortNotFoundError(VlanError):
         )
 
 
+class VlanTakesBridgePortNotAcknowledgedError(VlanError):
+    """An access-mode push would pull a port out of a bridge, and nobody
+    said that was intended.
+
+    This is the incident, stated as a rule. A customer created a VLAN in
+    ``access`` mode on ``ether2``. That port carried the venue's access
+    point and was a member of the bridge the guest captive portal is bound
+    to. The push pulled it out, the access point went dark, and guest Wi-Fi
+    stopped serving.
+
+    Two fixes have already landed and neither stops it happening again.
+    ``Vlan.previous_bridge`` makes it *reversible* -- the delete puts the
+    port back -- which helps only after the outage. The dashboard *warns*
+    when the chosen port is a bridge member, which is advisory: the push
+    still takes the port. This is the refusal, and it is the only one of
+    the three that turns taking a bridge port into a deliberate act.
+
+    A 409, alongside this domain's other push refusals: the request is
+    well-formed and the row is valid, and whether that port is in a bridge
+    is a fact about this particular router's current state. It is raised
+    from the push rather than from create/update because bridge membership
+    is only knowable from the device, and only the push reads it.
+
+    Names both the port and the bridge, because the operator's decision
+    needs both: which port is about to move, and what it is about to stop
+    being part of. A message saying only "this port is in a bridge" would
+    leave them to go and find out which one.
+    """
+
+    def __init__(self, port: str, bridge: str) -> None:
+        super().__init__(
+            f"Port '{port}' is currently a member of bridge '{bridge}' on this "
+            "router. Pushing this VLAN in access mode removes that port from "
+            f"'{bridge}', cutting off whatever is behind it -- an access point "
+            "on that port stops serving. Set 'confirm_takes_port' on the VLAN "
+            "to acknowledge this, or choose a port that is not in a bridge",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class VlanSubnetConflictError(VlanError):
     """This VLAN's subnet overlaps an address the router already carries
     on a different interface.

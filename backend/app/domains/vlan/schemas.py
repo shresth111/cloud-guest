@@ -40,6 +40,14 @@ class VlanCreateRequest(BaseModel):
     nat_enabled: bool = False
     description: str | None = None
     is_enabled: bool = True
+    # Acknowledges that an access-mode push may take this VLAN's port out
+    # of a bridge and cut off whatever is behind it. Defaults false: the
+    # whole point is that taking a bridge port has to be said out loud, and
+    # a default of true would make this field decorative.
+    #
+    # Stored on the row rather than consumed here, because the push that
+    # acts on it is a separate request -- see ``Vlan.confirm_takes_port``.
+    confirm_takes_port: bool = False
 
 
 class VlanUpdateRequest(BaseModel):
@@ -53,6 +61,10 @@ class VlanUpdateRequest(BaseModel):
     nat_enabled: bool | None = None
     description: str | None = None
     is_enabled: bool | None = None
+    # ``None`` means "not part of this edit", as every field here does --
+    # the router drops ``None``s before calling the service. ``False`` is a
+    # real value and survives that filter, so consent can be withdrawn.
+    confirm_takes_port: bool | None = None
 
 
 class VlanResponse(BaseModel):
@@ -83,6 +95,11 @@ class VlanResponse(BaseModel):
     nat_enabled: bool
     description: str | None
     is_enabled: bool
+    # Whether the operator has acknowledged that an access-mode push may
+    # take this VLAN's port out of a bridge. Returned so the dashboard's
+    # existing warning can show whether it has already been answered --
+    # otherwise the only way to find out is to push and read the 409.
+    confirm_takes_port: bool
     # Whether this row has ever reached a real router, and what happened.
     # Independent of is_enabled: a VLAN can be enabled for months and never
     # have been on a device, which was true of every row before this domain

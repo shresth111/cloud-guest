@@ -124,6 +124,18 @@ configured outside this platform, none of which has a row here, and it is
 the device's set that decides whether the push produces two matching
 routes.
 
+A fourth needs the router and is answered from that same read: in access
+mode, whether the chosen port is currently a member of a bridge. If it is,
+the push **refuses** unless ``Vlan.confirm_takes_port`` says the operator
+acknowledged it (``VlanTakesBridgePortNotAcknowledgedError``). Access mode
+pulls the port out of its bridge, and doing that to the port carrying a
+venue's access point took guest Wi-Fi down for a real customer.
+``previous_bridge`` made that reversible and the dashboard warns about it;
+neither refuses, and a warning is not a decision. The acknowledgement lives
+on the row, not on the push request, because the push is a different --
+possibly much later, possibly retried -- request from the one where the
+port was chosen.
+
 ``vlan_id`` must fall within IEEE 802.1Q's real 1-4094 usable range
 (``validators.validate_vlan_id``) and must be unique per router among
 non-deleted rows (``VlanIdAlreadyExistsError``). ``cidr``/
@@ -173,6 +185,7 @@ from .exceptions import (
     VlanNotFoundError,
     VlanParentInterfaceNotFoundError,
     VlanSubnetConflictError,
+    VlanTakesBridgePortNotAcknowledgedError,
 )
 from .models import Vlan
 from .repository import VlanRepositoryProtocol
@@ -287,6 +300,7 @@ class VlanService:
         nat_enabled: bool = False,
         description: str | None = None,
         is_enabled: bool = True,
+        confirm_takes_port: bool = False,
     ) -> Vlan:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
@@ -315,6 +329,11 @@ class VlanService:
             nat_enabled=nat_enabled,
             description=description,
             is_enabled=is_enabled,
+            # Carried onto the row rather than acted on here: whether this
+            # VLAN's port is in a bridge is only knowable from the device,
+            # and create deliberately never opens a connection. The push is
+            # where the answer is read and the refusal happens.
+            confirm_takes_port=confirm_takes_port,
             # Written explicitly rather than left to the column default,
             # which only applies at INSERT: a freshly constructed row would
             # otherwise carry None until it round-trips through the
@@ -476,6 +495,28 @@ class VlanService:
         if fields.get("port_mode") not in (None, "trunk", "access"):
             raise ValueError("port_mode must be 'trunk' or 'access'")
 
+        # Consent is given for a *particular port*, so moving the VLAN to
+        # another one -- or into access mode for the first time -- takes it
+        # back. Without this, acknowledging that ether2 may leave the
+        # bridge would silently authorize taking ether3 out of a different
+        # bridge on a later edit, which is the accident this whole
+        # acknowledgement exists to stop.
+        #
+        # Only when the caller has not spoken in this same edit: a request
+        # that sets the interface *and* confirms it has answered the
+        # question for the port it is setting, and overriding that would
+        # make the field unusable from a form that submits both together.
+        rebind = (
+            "confirm_takes_port" not in fields
+            and vlan.confirm_takes_port
+            and (
+                fields.get("interface", vlan.interface) != vlan.interface
+                or fields.get("port_mode", vlan.port_mode) != vlan.port_mode
+            )
+        )
+        if rebind:
+            fields = {**fields, "confirm_takes_port": False}
+
         # An edit to a field the router actually carries invalidates what
         # the router is holding, so the row stops claiming ``active`` in the
         # same UPDATE that changes the values -- see
@@ -616,6 +657,12 @@ class VlanService:
             # Inside the try because a preflight failure is a real push
             # failure and belongs in device_push_error like any other.
             snapshot = await self._preflight_device(vlan, credentials, adapter)
+
+            # Refuses to take a bridge port nobody said could be taken.
+            # Before the recording below, because a push that is about to
+            # be refused must not leave a previous_bridge behind claiming
+            # this VLAN owns a port it never touched.
+            self._check_takes_bridge_port(vlan, snapshot)
 
             # Before the push takes the port, record which bridge it is in.
             # Access mode pulls a physical port out of its bridge, and until
@@ -850,6 +897,45 @@ class VlanService:
             raise VlanParentInterfaceNotFoundError(vlan.interface, credentials.host)
         self._check_subnet_conflict(vlan, snapshot, credentials.host)
         return snapshot
+
+    @staticmethod
+    def _check_takes_bridge_port(vlan: Vlan, snapshot: VlanNetworkSnapshot) -> None:
+        """Refuses an access-mode push that would pull a port out of a
+        bridge, unless the operator acknowledged exactly that.
+
+        The incident: an access VLAN on ``ether2`` took the port carrying a
+        venue's access point out of the bridge the guest portal is bound
+        to, and guest Wi-Fi stopped serving. ``previous_bridge`` made that
+        reversible and the dashboard warns about it, but nothing refused --
+        the push still took the port, and a warning an operator can click
+        past is not a decision they made.
+
+        Only ``port_mode="access"`` is checked, because only access mode
+        moves a port. A trunk VLAN hangs a tagged sub-interface off its
+        parent and changes no bridge membership, so the same port being a
+        bridge member is not merely tolerable there, it is the normal case
+        (``bridge`` itself is the usual trunk parent).
+
+        Read off the snapshot ``_preflight_device`` already returned rather
+        than a second device read: two reads could disagree, and the one
+        the refusal is based on must be the one ``previous_bridge`` is then
+        recorded from.
+
+        An interface the snapshot does not describe is not refused here --
+        ``_preflight_device`` has already established the name exists, and
+        a port this platform cannot see the bridge membership of is not
+        evidence that it has one. Nor is a port whose ``bridge`` is
+        ``None``: that is a real answer meaning it is in none, and there is
+        nothing to take it out of.
+        """
+        if vlan.port_mode != "access" or vlan.confirm_takes_port:
+            return
+        current = next(
+            (i for i in snapshot.interfaces if i.name == vlan.interface), None
+        )
+        if current is None or not current.is_bridge_port or not current.bridge:
+            return
+        raise VlanTakesBridgePortNotAcknowledgedError(current.name, current.bridge)
 
     def _check_subnet_conflict(
         self, vlan: Vlan, snapshot: VlanNetworkSnapshot, host: str

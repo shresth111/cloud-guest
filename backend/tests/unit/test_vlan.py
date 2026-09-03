@@ -27,7 +27,7 @@ import pytest
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
-from app.domains.vlan.constants import VlanDevicePushStatus
+from app.domains.vlan.constants import DEVICE_CARRIED_FIELDS, VlanDevicePushStatus
 from app.domains.vlan.device_adapters import (
     VlanDeviceAddress,
     VlanDeviceInterface,
@@ -49,6 +49,7 @@ from app.domains.vlan.exceptions import (
     VlanNotFoundError,
     VlanParentInterfaceNotFoundError,
     VlanSubnetConflictError,
+    VlanTakesBridgePortNotAcknowledgedError,
 )
 from app.domains.vlan.models import Vlan
 from app.domains.vlan.router import router as vlan_router
@@ -295,6 +296,10 @@ async def _create_vlan(
     port_mode: str = "trunk",
     nat_enabled: bool = False,
     cidr: str | None = "192.168.10.0/24",
+    # Defaults false, exactly as the API does. Access-mode tests that are
+    # not *about* the refusal have to pass this, which is the point: the
+    # push now declines to take a bridge port nobody agreed to give up.
+    confirm_takes_port: bool = False,
 ) -> Vlan:
     return await h.service.create_vlan(
         actor_user_id=uuid.uuid4(),
@@ -307,6 +312,7 @@ async def _create_vlan(
         interface=interface,
         port_mode=port_mode,
         nat_enabled=nat_enabled,
+        confirm_takes_port=confirm_takes_port,
     )
 
 
@@ -1254,7 +1260,16 @@ class TestVlanDevicePreflight:
         """
         h = make_harness()
         router = h.router_lookup.add(_make_router())
-        vlan = await _create_vlan(h, router, interface="ether2", port_mode="access")
+        # Acknowledged, because taking a bridge port is now something the
+        # operator has to say out loud -- see TestVlanTakesBridgePort. What
+        # is under test here is the recording that happens once they have.
+        vlan = await _create_vlan(
+            h,
+            router,
+            interface="ether2",
+            port_mode="access",
+            confirm_takes_port=True,
+        )
         adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
 
         pushed = await h.service.push_vlan_to_device(
@@ -1270,7 +1285,13 @@ class TestVlanDevicePreflight:
     ) -> None:
         h = make_harness()
         router = h.router_lookup.add(_make_router())
-        vlan = await _create_vlan(h, router, interface="ether2", port_mode="access")
+        vlan = await _create_vlan(
+            h,
+            router,
+            interface="ether2",
+            port_mode="access",
+            confirm_takes_port=True,
+        )
         adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
         await h.service.push_vlan_to_device(
             vlan.id,
@@ -1601,3 +1622,277 @@ class TestDeviceInterfacePicker:
             await h.service.list_device_interfaces(
                 router.id, requesting_organization_id=uuid.uuid4()
             )
+
+
+# ============================================================================
+# Taking a bridge port has to be asked for
+#
+# The incident, once more: a customer created a VLAN in ``access`` mode on
+# ``ether2``. That port carried the venue's access point and belonged to the
+# bridge the guest captive portal is bound to. The push pulled it out and
+# guest Wi-Fi stopped serving.
+#
+# ``Vlan.previous_bridge`` made that REVERSIBLE and the dashboard WARNS about
+# it. Neither refuses. These tests are about the third thing: the push
+# declining to take the port at all unless somebody said it could.
+# ============================================================================
+
+
+class TestVlanTakesBridgePort:
+    async def test_an_unacknowledged_access_push_onto_a_bridge_port_is_refused(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether2", port_mode="access")
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+
+        with pytest.raises(VlanTakesBridgePortNotAcknowledgedError) as excinfo:
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        # A refusal the frontend can actually see: a real 409, never a
+        # 200 {"success": false} the response interceptor would read as
+        # success.
+        assert excinfo.value.status_code == 409
+        # Both facts the operator's decision needs -- which port moves, and
+        # what it stops being part of.
+        assert "ether2" in excinfo.value.message
+        assert "bridge" in excinfo.value.message
+
+    async def test_the_refusal_happens_before_the_device_is_written_to(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """The whole value of this is that the port is still in its bridge
+        afterwards. A refusal issued after ``configure_vlan`` would be a
+        report of an outage, not a prevention of one."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether2", port_mode="access")
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+
+        with pytest.raises(VlanTakesBridgePortNotAcknowledgedError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert adapter.calls == []
+        assert adapter.hotspot_calls == []
+        assert adapter.nat_calls == []
+
+    async def test_a_refused_push_records_the_reason_and_commits_it(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A refusal is a push failure like any other, so it lands in
+        ``device_push_error`` and is committed before the re-raise --
+        ``GenericRepository.update`` only flushes, and ``get_db_session``
+        rolls back on any exception, so an uncommitted record would be
+        discarded and the row would still read ``pending``."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether2", port_mode="access")
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+        commits_before = h.repository.commits
+
+        with pytest.raises(VlanTakesBridgePortNotAcknowledgedError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        stored = h.repository.vlans[vlan.id]
+        assert stored.device_push_status == VlanDevicePushStatus.FAILED.value
+        assert "ether2" in (stored.device_push_error or "")
+        assert h.repository.commits > commits_before
+
+    async def test_a_refused_push_claims_no_previous_bridge(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """``previous_bridge`` means "this VLAN took the port out of that
+        bridge". A refused push took nothing, and a value here would tell a
+        later delete to put a port back that never left -- moving an
+        interface this VLAN does not own."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether2", port_mode="access")
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+
+        with pytest.raises(VlanTakesBridgePortNotAcknowledgedError):
+            await h.service.push_vlan_to_device(
+                vlan.id,
+                actor_user_id=None,
+                requesting_organization_id=router.organization_id,
+            )
+
+        assert h.repository.vlans[vlan.id].previous_bridge is None
+
+    async def test_the_acknowledgement_lets_the_same_push_through(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(
+            h,
+            router,
+            interface="ether2",
+            port_mode="access",
+            confirm_takes_port=True,
+        )
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == VlanDevicePushStatus.ACTIVE.value
+        assert adapter.calls[-1]["interface"] == "ether2"
+
+    async def test_a_port_in_no_bridge_needs_no_acknowledgement(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Nothing is taken from anything, so there is no decision to
+        make. Asking anyway would train operators to tick the box."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="sfp1", port_mode="access")
+        # The fake marks only ``ether*`` ports as bridge members, so
+        # ``sfp1`` arrives with bridge=None / is_bridge_port=False -- a real
+        # answer meaning "in no bridge", not a missing one.
+        adapter.snapshot_interfaces = ["bridge", "ether1", "sfp1"]
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == VlanDevicePushStatus.ACTIVE.value
+        assert pushed.previous_bridge is None
+
+    async def test_a_trunk_on_a_bridge_member_is_not_refused(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A trunk hangs a tagged sub-interface off its parent and moves no
+        port, so a bridge member is not merely tolerable there -- it is the
+        ordinary case. Refusing it would break every trunk VLAN on the
+        fleet."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether1", port_mode="trunk")
+        adapter.snapshot_interfaces = ["bridge", "ether1", "ether2"]
+
+        pushed = await h.service.push_vlan_to_device(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == VlanDevicePushStatus.ACTIVE.value
+
+    async def test_moving_the_port_takes_the_acknowledgement_back(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Consent is given for one port. Carrying it over to another would
+        authorize taking ether3 out of a different bridge on the strength
+        of an answer about ether2 -- the accident this exists to stop."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(
+            h,
+            router,
+            interface="ether2",
+            port_mode="access",
+            confirm_takes_port=True,
+        )
+
+        updated = await h.service.update_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            interface="ether3",
+        )
+
+        assert updated.confirm_takes_port is False
+
+    async def test_switching_into_access_mode_takes_it_back_too(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A trunk VLAN's flag was never a decision about taking a port --
+        a trunk takes none. Turning it into an access VLAN is the first
+        time the question actually applies."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(
+            h,
+            router,
+            interface="ether2",
+            port_mode="trunk",
+            confirm_takes_port=True,
+        )
+
+        updated = await h.service.update_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            port_mode="access",
+        )
+
+        assert updated.confirm_takes_port is False
+
+    async def test_confirming_in_the_same_edit_that_moves_the_port_is_kept(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """A form that submits the port and the acknowledgement together
+        has answered the question for the port it is setting. Clearing it
+        anyway would make the field impossible to use."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(h, router, interface="ether2", port_mode="access")
+
+        updated = await h.service.update_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            interface="ether3",
+            confirm_takes_port=True,
+        )
+
+        assert updated.confirm_takes_port is True
+
+    async def test_an_unrelated_edit_leaves_the_acknowledgement_alone(
+        self, adapter: FakeVlanAdapter
+    ) -> None:
+        """Renaming a VLAN is not a change of mind about its port."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        vlan = await _create_vlan(
+            h,
+            router,
+            interface="ether2",
+            port_mode="access",
+            confirm_takes_port=True,
+        )
+
+        updated = await h.service.update_vlan(
+            vlan.id,
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            name="Renamed",
+        )
+
+        assert updated.confirm_takes_port is True
+
+    async def test_the_acknowledgement_is_not_a_device_carried_field(self) -> None:
+        """No router carries it -- it records a decision. In
+        ``DEVICE_CARRIED_FIELDS`` it would demote a live ACTIVE row to
+        ``pending``, claiming the device had drifted when nothing on it
+        changed."""
+        assert "confirm_takes_port" not in DEVICE_CARRIED_FIELDS

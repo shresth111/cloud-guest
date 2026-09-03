@@ -145,6 +145,31 @@ class Vlan(BaseModel):
     # network down, and an engineer had to restore it by hand. See
     # ``wyfy_device_gateway.contract.VlanConfig.previous_bridge``.
     previous_bridge: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # The operator's explicit acknowledgement that pushing this VLAN in
+    # access mode may take its port out of a bridge. ``previous_bridge``
+    # made that REVERSIBLE and the dashboard WARNS about it; neither
+    # refuses, so the push still takes the port on a mis-click. This is the
+    # consent the push checks before it does.
+    #
+    # **A column rather than a flag on the push request, because the push
+    # is a different request from the one that made the decision.**
+    # ``POST /vlans/{pk}/push`` carries no body and can be issued days
+    # later, by a retry, or by anyone with ``vlan.execute``; the only thing
+    # it has to read is this row. A transient flag on create/update would
+    # be gone by then, and a flag on the push itself would ask the question
+    # of whoever pressed "retry" rather than of whoever chose the port.
+    #
+    # Deliberately *not* in ``constants.DEVICE_CARRIED_FIELDS``: no router
+    # carries it. It is a record of a decision, and demoting a live
+    # ``ACTIVE`` row to ``pending`` because consent was granted or revoked
+    # would claim the device had drifted when nothing on it changed.
+    #
+    # Reset to ``False`` when ``interface`` or ``port_mode`` changes, so
+    # consent stays attached to the port it was given for -- see
+    # ``VlanService.update_vlan``.
+    confirm_takes_port: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
 
     __table_args__ = (
         Index("ix_vlans_router_id", "router_id"),
