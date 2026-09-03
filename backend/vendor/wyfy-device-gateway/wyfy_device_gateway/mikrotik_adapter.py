@@ -237,6 +237,16 @@ class _HotspotNames:
     def dns_comment(self) -> str:
         return f"{self.tag}-hotspot-dns-name"
 
+    @property
+    def network_owner(self) -> str:
+        """Marker stamped on this portal's ``/ip dhcp-server network`` row.
+
+        A DHCP pool on the same subnet writes a row keyed identically --
+        RouterOS identifies that row by subnet alone -- so without a marker
+        one feature's teardown silently removes the other's.
+        """
+        return f"WyfyGuest portal {self.tag}"
+
 
 def _hotspot_pool_range(cidr: str, gateway: str) -> str | None:
     """The address range a VLAN's captive portal hands out: the largest
@@ -436,6 +446,60 @@ def _domain_subdomain_regex(domain: str) -> str:
     ``configure_content_filter_rule``'s own docstring)."""
     escaped = domain.replace(".", r"\.")
     return f"^.*\\.{escaped}$"
+
+
+def _routeros_seconds(value: object) -> int | None:
+    """A RouterOS duration in seconds, or ``None`` if it is not one.
+
+    RouterOS accepts ``600s`` on write and answers the read with ``10m``.
+    Comparing the two as strings can never match, so a write guarded by
+    ``row.get(key) != value`` re-issues its ``set`` on **every** push,
+    forever -- the exact defect this file already documents fixing for
+    ``disabled``, in a field nobody re-checked. Observed on real hardware:
+    a DHCP server push issued ``set lease-time=600s`` on every call.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    total, number = 0, ""
+    for char in text:
+        if char.isdigit():
+            number += char
+        elif char in units and number:
+            total += int(number) * units[char]
+            number = ""
+        else:
+            return None
+    if number:  # a bare count of seconds, e.g. "600"
+        total += int(number)
+    return total
+
+
+def _same_routeros_duration(current: object, wanted: object) -> bool:
+    """Whether two RouterOS durations mean the same span of time."""
+    a, b = _routeros_seconds(current), _routeros_seconds(wanted)
+    return a is not None and a == b
+
+
+def _same_routeros_path(current: object, wanted: object) -> bool:
+    """Whether two RouterOS file paths name the same directory.
+
+    ``html-directory=cloudguest-hotspot`` is stored and read back as
+    ``flash/cloudguest-hotspot`` on a device with flash storage -- observed
+    on real hardware. Same consequence as the duration case: a pointless
+    ``set`` on every push. Compared on the trailing segment, which is the
+    part this platform chooses; the prefix is the device's own storage
+    layout.
+    """
+    if current is None or wanted is None:
+        return False
+    return (
+        str(current).strip("/").split("/")[-1]
+        == str(wanted).strip("/").split("/")[-1]
+    )
 
 
 def _is_truthy(value: object) -> bool:
@@ -1528,6 +1592,7 @@ class MikroTikAdapter:
                         "gateway": hotspot.gateway,
                         "dns-server": hotspot.gateway,
                     },
+                    owner=names.network_owner,
                 )
                 self._ensure_hotspot_profile(
                     api,
@@ -1583,7 +1648,16 @@ class MikroTikAdapter:
             if row.get("name") != name:
                 continue
             changed = {
-                key: value for key, value in desired.items() if row.get(key) != value
+                key: value
+                for key, value in desired.items()
+                # html-directory compared as a path: RouterOS stores
+                # "cloudguest-hotspot" and reads back
+                # "flash/cloudguest-hotspot".
+                if not (
+                    key == "html-directory"
+                    and _same_routeros_path(row.get(key), value)
+                )
+                and row.get(key) != value
             }
             if changed:
                 menu.update(**{".id": row[".id"], **changed})
@@ -1688,8 +1762,11 @@ class MikroTikAdapter:
                 self._remove_where(
                     api, ("ip", "hotspot", "profile"), "name", names.profile
                 )
-                self._remove_where(
-                    api, ("ip", "dhcp-server", "network"), "address", network
+                # Only this portal's own row -- a DHCP pool on the same
+                # subnet writes one keyed identically. See
+                # _remove_dhcp_network.
+                self._remove_dhcp_network(
+                    api, network, owner=names.network_owner
                 )
                 self._remove_where(
                     api, ("ip", "dhcp-server"), "name", names.dhcp_server
@@ -1727,8 +1804,12 @@ class MikroTikAdapter:
         api = self._connect_api(creds)
         try:
             try:
-                self._remove_where(
-                    api, ("ip", "dhcp-server", "network"), "address", network
+                # Only our own row -- the per-VLAN portal writes a network
+                # row for the same subnet, keyed identically by RouterOS.
+                # Observed on hardware: this delete removed a live portal's
+                # row, taking its gateway and DNS with it.
+                self._remove_dhcp_network(
+                    api, network, owner=f"WyfyGuest DHCP {identifier}"
                 )
                 # Server before pool: the server references the pool, and
                 # RouterOS refuses to remove a pool that is still in use.
@@ -1798,6 +1879,25 @@ class MikroTikAdapter:
                 # "already have such item" -- and re-pushing is an ordinary
                 # operation (an operator widens a range and saves again).
                 # Same fix, same reasoning as ``_ensure_ip_address`` above.
+                # Checked before anything is created, not discovered
+                # halfway through. RouterOS permits one dhcp-server per
+                # interface; observed on hardware, the pool add succeeded,
+                # the server add failed with "server or relay with such
+                # interface already exists", and the pool was left orphaned
+                # on the device with nothing referencing it while the
+                # caller recorded a failed push.
+                for existing in api.path("ip", "dhcp-server"):
+                    if (
+                        existing.get("interface") == pool.interface
+                        and existing.get("name") != server_name
+                    ):
+                        raise MikroTikDeviceError(
+                            creds.host,
+                            f"configure_dhcp_pool: interface {pool.interface!r} "
+                            f"already serves DHCP through "
+                            f"{existing.get('name')!r}; RouterOS permits one "
+                            "server per interface",
+                        )
                 self._ensure_ip_pool(
                     api, pool_name, f"{pool.range_start}-{pool.range_end}"
                 )
@@ -1813,7 +1913,12 @@ class MikroTikAdapter:
                     network_fields["gateway"] = pool.gateway
                 if pool.dns_servers:
                     network_fields["dns-server"] = ",".join(pool.dns_servers)
-                self._ensure_dhcp_network(api, str(network), network_fields)
+                self._ensure_dhcp_network(
+                    api,
+                    str(network),
+                    network_fields,
+                    owner=f"WyfyGuest DHCP {identifier}",
+                )
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(
                     creds.host, f"configure_dhcp_pool: {exc}"
@@ -1864,7 +1969,13 @@ class MikroTikAdapter:
                 changed = {
                     key: value
                     for key, value in desired.items()
-                    if row.get(key) != value
+                    # lease-time compared as a duration, not a string:
+                    # RouterOS stores "600s" and reads it back as "10m".
+                    if not (
+                        key == "lease-time"
+                        and _same_routeros_duration(row.get(key), value)
+                    )
+                    and row.get(key) != value
                 }
                 # ``disabled`` is compared as a boolean, not a string.
                 # RouterOS accepts "no"/"false" on write and answers reads
@@ -1881,20 +1992,31 @@ class MikroTikAdapter:
         api.path("ip", "dhcp-server").add(name=name, **desired, disabled="no")
 
     def _ensure_dhcp_network(
-        self, api, address: str, fields: dict[str, str]
+        self, api, address: str, fields: dict[str, str], *, owner: str
     ) -> None:
         """Creates the ``/ip dhcp-server network`` row for this subnet, or
         updates the existing row for that exact address.
 
-        Keyed on ``address`` because that is what RouterOS itself treats as
-        the row's identity here -- adding a second row for the same subnet
-        is what produces "already have such item".
+        Matched on ``address`` because that is what RouterOS itself treats
+        as the row's identity -- a second row for the same subnet is what
+        produces "already have such item".
+
+        ``owner`` is stamped into the row's ``comment`` and exists for the
+        *delete* path, not this one. Two different features create a
+        network row for the same subnet -- a DHCP pool and a per-VLAN
+        captive portal both do -- and until this marker existed, deleting
+        either one removed whichever row was there, because the delete
+        matched on the subnet alone. Observed on real hardware: tearing
+        down a DHCP pool silently removed a live portal's network row,
+        taking its gateway and DNS with it. No error, no warning; the
+        portal then hands out addresses with no way off the subnet.
         """
+        stamped = {**fields, "comment": owner}
         for row in api.path("ip", "dhcp-server", "network"):
             if row.get("address") == address:
                 changed = {
                     key: value
-                    for key, value in fields.items()
+                    for key, value in stamped.items()
                     if row.get(key) != value
                 }
                 if changed:
@@ -1902,7 +2024,22 @@ class MikroTikAdapter:
                         **{".id": row[".id"], **changed}
                     )
                 return
-        api.path("ip", "dhcp-server", "network").add(**fields)
+        api.path("ip", "dhcp-server", "network").add(**stamped)
+
+    def _remove_dhcp_network(self, api, address: str, *, owner: str) -> None:
+        """Removes this subnet's network row **only if we wrote it**.
+
+        A row for the same subnet that carries someone else's marker -- or
+        no marker at all, meaning a human or an older build of this
+        platform created it -- is left exactly where it is. Deleting one
+        feature's configuration while tearing down another's is worse than
+        leaving a stale row behind: the stale row is visible and
+        correctable, the deletion is silent and breaks a running service.
+        """
+        menu = api.path("ip", "dhcp-server", "network")
+        for row in list(menu):
+            if row.get("address") == address and row.get("comment") == owner:
+                menu.remove(row[".id"])
 
     async def configure_port_forward(
         self, creds: DeviceCredentials, *, rule: PortForwardConfig
