@@ -108,6 +108,26 @@ class GuestAccessRuleResponse(BaseModel):
     email: str | None
     expires_at: datetime | None
     is_active: bool
+    # -- block enforcement -------------------------------------------------
+    #
+    # Surfaced so the dashboard can stop asserting something it has no way
+    # of knowing. "Blocked" and "blocked, and the two sessions they were in
+    # were ended" are different outcomes, and before these fields existed
+    # the UI showed the same toast for both -- and for the case where the
+    # router could not be reached at all.
+    #
+    # ``sessions_ended`` is a count of sessions *confirmed* gone from the
+    # router's own active table, never of removals attempted. It is
+    # legitimately ``0`` for a blocked guest who was not online, which is
+    # why the status is carried alongside it rather than inferred from it.
+    #
+    # See ``constants.BlockEnforcementStatus``. ``None`` on rows written
+    # before enforcement existed -- see migration 0107 for why those are
+    # not backfilled.
+    enforcement_status: str | None = None
+    enforcement_error: str | None = None
+    enforced_at: datetime | None = None
+    sessions_ended: int | None = None
     created_at: datetime
     updated_at: datetime
 

@@ -95,6 +95,21 @@ class GuestAccessRepositoryProtocol(Protocol):
         now: datetime,
     ) -> list[DeviceAccessRule]: ...
 
+    # -- transaction -----------------------------------------------------------
+    async def commit(self) -> None:
+        """Commits the current transaction.
+
+        Needed by ``GuestAccessService``'s block-enforcement path and
+        nothing else. ``GenericRepository.create``/``update`` only
+        ``flush()``, and ``get_db_session`` rolls the session back on any
+        exception -- so both a block written just before a device failure
+        and the failure record written just before the re-raise would be
+        discarded, leaving no rule and no explanation. Committing
+        explicitly is what makes each survive. Same fix, same reason, as
+        ``app.domains.vlan.repository.VlanRepositoryProtocol.commit``.
+        """
+        ...
+
 
 class GuestAccessRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -117,6 +132,9 @@ class GuestAccessRepository:
         self, rule: GuestAccessRule, data: dict[str, object]
     ) -> GuestAccessRule:
         return await self.guest_rules.update(rule, data)
+
+    async def commit(self) -> None:
+        await self.session.commit()
 
     async def delete_guest_rule(self, rule: GuestAccessRule) -> None:
         await self.guest_rules.soft_delete(rule)

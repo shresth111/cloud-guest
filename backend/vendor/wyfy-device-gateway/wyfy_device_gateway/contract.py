@@ -345,6 +345,76 @@ class RadiusClientConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class HotspotActiveSession:
+    """One row of the router's live ``/ip hotspot active`` table.
+
+    This is the table that decides whether a guest's packets are
+    forwarded. A ``GuestSession`` row in this platform's own database is a
+    *record* of a login; this is the router's own notion of who is
+    currently logged in, and the two can disagree -- which is the entire
+    reason this type exists. ``routeros_id`` is carried so a removal can
+    be issued per-row by ``.id`` rather than as a broad ``remove [find]``.
+    """
+
+    routeros_id: str
+    user: str | None
+    mac_address: str | None
+    address: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotSessionControl:
+    """What this router can currently be asked to do about a live hotspot
+    session, read from the device rather than assumed.
+
+    ``coa_accept`` is ``/radius incoming``'s own ``accept`` value, read
+    back through :func:`mikrotik_adapter._is_truthy` -- never a string
+    compare, because RouterOS answers a read with a real ``bool`` while
+    accepting ``"no"``/``"false"`` on write.
+
+    The distinction matters because this fleet is currently *in* the
+    disagreement it guards against: the lab router holds
+    ``/radius incoming accept=false port=3799``, and port 3799 is not
+    RouterOS's default (1700) -- it is exactly what
+    :meth:`MikroTikAdapter.set_radius_client_config` writes, in the same
+    statement that sets ``accept=yes``. One half of that write survives on
+    the device and the other does not, and nothing in this platform knows
+    why. So CoA availability is a per-router runtime fact that must be
+    read, and may never be inferred from "we configured it".
+    """
+
+    hotspot_servers: int
+    coa_accept: bool
+    coa_port: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotDisconnectResult:
+    """The honest outcome of asking a router to end one guest's live
+    hotspot session.
+
+    ``still_active`` is the field that carries the truth: it is a *second*
+    read of ``/ip hotspot active``, taken after the removals, listing rows
+    that still match. A non-empty ``still_active`` means the removal was
+    issued, raised nothing, and the router is still tracking the guest as
+    logged in -- which a caller must report as a failure rather than as a
+    green toast.
+
+    A re-read is deliberately not claimed to be proof about the *data
+    plane*. It distinguishes "the row is gone" from "the remove returned
+    quietly and the row is still there"; whether an already-established
+    flow keeps forwarding after the row disappears is a question only real
+    hardware and a real transfer can answer (see
+    ``docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md`` §7, test T7).
+    """
+
+    control: HotspotSessionControl
+    matched: tuple[HotspotActiveSession, ...]
+    removed_ids: tuple[str, ...]
+    still_active: tuple[HotspotActiveSession, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ContentFilterRuleConfig:
     """One content-filtering rule to realize on the device -- either a
     domain to DNS-sinkhole or an IP/CIDR to address-list-and-drop. See
@@ -720,6 +790,45 @@ class DeviceGatewayAdapter(Protocol):
         self, creds: DeviceCredentials, *, mac_address: str, interface: str | None
     ) -> None: ...
 
+    async def read_hotspot_session_control(
+        self, creds: DeviceCredentials
+    ) -> HotspotSessionControl:
+        """Reads whether this router runs a hotspot at all, and whether it
+        currently accepts an RFC 5176 Disconnect-Request.
+
+        Read-only. Exists so a caller can *report* CoA availability per
+        router instead of inferring it from this platform's own
+        configuration history -- see :class:`HotspotSessionControl`.
+        """
+        ...
+
+    async def end_hotspot_sessions(
+        self,
+        creds: DeviceCredentials,
+        *,
+        mac_address: str | None,
+        username: str | None,
+    ) -> HotspotDisconnectResult:
+        """Ends every live ``/ip hotspot active`` session belonging to one
+        guest, identified by MAC address and/or hotspot ``user``.
+
+        This is the operation that actually cuts a guest off. Removing a
+        row from ``/ip hotspot active`` is the device-local equivalent of
+        the Disconnect-Request a RADIUS server would send, and unlike CoA
+        it needs no inbound UDP reachability and no ``/radius incoming
+        accept=yes`` -- it rides the same port-8728 API every other write
+        in this gateway uses.
+
+        Idempotent: a guest with no live session matches nothing, removes
+        nothing, and raises nothing.
+
+        Never widens the match. A ``None`` ``mac_address`` and a ``None``
+        ``username`` match *nothing* rather than everything -- a
+        block whose subject could not be identified must end zero sessions,
+        not every session on the router.
+        """
+        ...
+
     # -- diagnostics (network_diagnostics + isp call sites share `ping`) --
     async def ping(
         self, creds: DeviceCredentials, *, target: str, count: int, timeout_seconds: int
@@ -985,6 +1094,9 @@ __all__ = [
     "RadiusClientConfig",
     "ContentFilterRuleConfig",
     "QosPacketMarkConfig",
+    "HotspotActiveSession",
+    "HotspotSessionControl",
+    "HotspotDisconnectResult",
     "ProvisionResult",
     "SpeedTestResult",
     "PingResult",
