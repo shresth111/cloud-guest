@@ -11,6 +11,9 @@
 #      commit SHA points at, and a rollback is "point the var at the old tag".
 #      Building on the box meant prod ran whatever was in two checkouts that
 #      are (confirmed 2026-08-27) both dirty with uncommitted local edits.
+#      (Point-in-time: both were tidied later the same day and are clean now.
+#      See the CORRECTION in deploy/remote-deploy.sh -- the `.env`-not-in-git
+#      hazard is what actually carries this change, and it is unchanged.)
 #
 #   2. The postgres and pgadmin passwords are no longer literals in this file,
 #      because this file is now in git. They come from ~/deploy/.deploy.env,
