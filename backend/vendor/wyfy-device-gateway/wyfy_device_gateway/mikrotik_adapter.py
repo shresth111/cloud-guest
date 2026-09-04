@@ -3592,8 +3592,13 @@ class MikroTikAdapter:
         the same server -- and two NAS registrations with possibly
         different secrets is a router that authenticates intermittently
         depending on which row RouterOS consults. The script half
-        (``render_radius_client``) still has that shape; this one no longer
-        does.
+        (``network_config.renderers.render_radius_client``) carried the
+        identical defect and has since been converged the same way -- it
+        guards its ``add`` behind a ``find where address=`` and falls back
+        to a ``set``, and it stamps ``renderers.RADIUS_CLIENT_COMMENT``,
+        which is kept byte-equal to :data:`_RADIUS_CLIENT_COMMENT` exactly
+        so each path finds a row the other wrote instead of adding a
+        second one beside it.
 
         **Identity is the natural key, not the comment.** Everywhere else
         in this adapter the comment is the handle, because every other
