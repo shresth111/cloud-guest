@@ -74,6 +74,18 @@ class InterfaceInfo:
     # has to be a bridge port to be pulled out of one. Defaulted so the
     # several existing constructors of this shape keep working unchanged.
     is_bridge_port: bool = False
+    # The interface's own hardware address, as the device reports it.
+    #
+    # Carried because a caller configuring `/ip dhcp-server alert` has to
+    # name the DHCP server it trusts, and the only trustworthy source for
+    # that is the router's own MAC on the segment being watched. A wrong
+    # value there is worse than no alert: every legitimate lease reply looks
+    # rogue and the log fills with false alarms, which is how a real one
+    # gets missed. Resolved from the same read the caller already does
+    # rather than typed in or defaulted.
+    #
+    # `None` for interfaces that have no hardware address of their own.
+    mac_address: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

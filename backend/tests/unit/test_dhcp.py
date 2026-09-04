@@ -490,7 +490,22 @@ class FakeDhcpAdapter:
     calls: list[dict[str, object]] = field(default_factory=list)
     raises: Exception | None = None
     deletes: list[dict[str, object]] = field(default_factory=list)
+    # The rogue-DHCP watch the service asks for after a successful push.
+    # `alert_mac` is what the device would report as the trusted server;
+    # None models an interface with no hardware address, where the alert
+    # must be skipped rather than written with a guessed value.
+    alerts: list[str] = field(default_factory=list)
+    alert_mac: str | None = "04:F4:1C:25:EC:79"
+    alert_raises: Exception | None = None
     delete_raises: Exception | None = None
+
+    async def ensure_rogue_dhcp_alert(self, credentials, *, interface: str):
+        if self.alert_raises is not None:
+            raise self.alert_raises
+        if self.alert_mac is None:
+            return None
+        self.alerts.append(interface)
+        return self.alert_mac
 
     async def delete_dhcp_pool(
         self,
@@ -600,6 +615,66 @@ class TestDhcpPoolDevicePush:
         )
 
         assert adapter.calls[0]["dns_servers"] == ["8.8.8.8"]
+
+    async def test_a_pushed_pool_gets_a_rogue_dhcp_watch_on_its_interface(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """A DHCP server appearing on a segment is the moment it becomes
+        worth guarding: a consumer router plugged in there answers leases
+        too, and wins whenever it answers first."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+
+        await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.alerts == ["ether2"]
+
+    async def test_a_watch_that_cannot_be_set_does_not_fail_the_push(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The alert is a guard around the feature, not the feature. A pool
+        that reached the router must not be reported as failed because a
+        watch could not be set beside it -- the operator would be told the
+        addresses are not being handed out when they are."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        adapter.alert_raises = RuntimeError("device said no")
+
+        pushed = await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert pushed.device_push_status == DhcpDevicePushStatus.ACTIVE.value
+        assert pushed.device_push_error is None
+        assert adapter.alerts == []
+
+    async def test_an_interface_with_no_mac_is_left_unwatched(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """`valid-server` would have to be guessed, and a wrong trusted
+        server makes every legitimate lease reply look rogue -- which is how
+        a real one gets ignored. Skipped, not defaulted."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, router)
+        adapter.alert_mac = None
+
+        pushed = await h.service.push_pool_to_device(
+            pool.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=router.organization_id,
+        )
+
+        assert adapter.alerts == []
+        assert pushed.device_push_status == DhcpDevicePushStatus.ACTIVE.value
 
     async def test_push_writes_a_real_audit_entry(
         self, adapter: FakeDhcpAdapter
