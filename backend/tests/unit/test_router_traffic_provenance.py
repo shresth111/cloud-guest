@@ -36,17 +36,34 @@ What these tests pin, in the order they matter:
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass
 
-from app.domains.provisioning_engine.service import _interface_counter_rows
-from app.domains.router_provisioning.constants import MetricsSource
-from wyfy_device_gateway.contract import DeviceInterfaceCounters
+from librouteros.exceptions import LibRouterosError
+from wyfy_device_gateway.contract import (
+    DeviceCredentials,
+    DeviceInterfaceCounters,
+    DeviceVendor,
+)
 from wyfy_device_gateway.mikrotik_adapter import (
+    MikroTikAdapter,
     _interface_counters_from_rows,
     _routeros_row_index,
 )
 from wyfy_device_gateway.snmp_poller import SnmpInterfaceCounters
+
+from app.domains.provisioning_engine.device_adapters import DeviceHealthResult
+from app.domains.provisioning_engine.service import (
+    _interface_counter_rows,
+    run_router_health_poll_sweep,
+)
+from app.domains.router_provisioning.constants import MetricsSource
+from tests.unit.test_provisioning_engine import (
+    FakeProvisioningEngineRepository,
+    FakeRouterLookup,
+    FakeRouterProvisioningLookup,
+    _HealthPollAdapter,
+    _make_router,
+)
 
 
 class TestRouterOsRowIndex:
@@ -202,9 +219,6 @@ class TestHealthCheckCarriesInterfaces:
     """The adapter's own read, exercised through the real method."""
 
     async def _health_check(self, api: _FakeApi):
-        from wyfy_device_gateway.contract import DeviceCredentials, DeviceVendor
-        from wyfy_device_gateway.mikrotik_adapter import MikroTikAdapter
-
         adapter = MikroTikAdapter()
         adapter._connect_api = lambda creds: api  # type: ignore[method-assign]
         return await adapter.health_check(
@@ -247,8 +261,6 @@ class TestHealthCheckCarriesInterfaces:
         that successfully proved the device is up into an error, and the
         router would be reported unreachable when it plainly answered.
         """
-        from librouteros.exceptions import LibRouterosError
-
         api = _FakeApi(
             interface_rows=[],
             interface_error=LibRouterosError("no such command prefix"),
@@ -265,16 +277,6 @@ class TestApiSweepStampsProvenance:
     """The end-to-end assertion: what the sweep actually persists."""
 
     async def test_sweep_records_source_and_counters(self) -> None:
-        from tests.unit.test_provisioning_engine import (
-            FakeProvisioningEngineRepository,
-            FakeRouterLookup,
-            FakeRouterProvisioningLookup,
-            _HealthPollAdapter,
-            _make_router,
-        )
-        from app.domains.provisioning_engine.device_adapters import DeviceHealthResult
-        from app.domains.provisioning_engine.service import run_router_health_poll_sweep
-
         repository = FakeProvisioningEngineRepository()
         router_lookup = FakeRouterLookup()
         router_provisioning = FakeRouterProvisioningLookup()
@@ -332,16 +334,6 @@ class TestApiSweepStampsProvenance:
         re-create the original defect on exactly the polls most worth
         being able to trace.
         """
-        from tests.unit.test_provisioning_engine import (
-            FakeProvisioningEngineRepository,
-            FakeRouterLookup,
-            FakeRouterProvisioningLookup,
-            _HealthPollAdapter,
-            _make_router,
-        )
-        from app.domains.provisioning_engine.device_adapters import DeviceHealthResult
-        from app.domains.provisioning_engine.service import run_router_health_poll_sweep
-
         repository = FakeProvisioningEngineRepository()
         router_lookup = FakeRouterLookup()
         router_provisioning = FakeRouterProvisioningLookup()
