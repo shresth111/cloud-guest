@@ -84,6 +84,7 @@ def _vlan_response(
         nat_enabled=vlan.nat_enabled,
         description=vlan.description,
         is_enabled=vlan.is_enabled,
+        confirm_takes_port=vlan.confirm_takes_port,
         device_push_status=vlan.device_push_status,
         device_push_error=vlan.device_push_error,
         device_pushed_at=vlan.device_pushed_at,
@@ -119,6 +120,7 @@ async def create_vlan(
         nat_enabled=payload.nat_enabled,
         description=payload.description,
         is_enabled=payload.is_enabled,
+        confirm_takes_port=payload.confirm_takes_port,
     )
     return build_response(
         success=True,
@@ -344,6 +346,12 @@ async def push_vlan(
     device connection or operation failure, 409/400/403/404 for the rest),
     and the app-wide ``CloudGuestError`` handler turns it into a real
     non-2xx.
+
+    One of those 409s is worth knowing about from the UI side: an
+    access-mode VLAN whose port is currently in a bridge is **refused**
+    until ``confirm_takes_port`` is set on the row (via create or update).
+    Taking that port out of its bridge cuts off whatever is behind it, so
+    it has to be asked for rather than warned about.
 
     Returning ``200 {"success": false}`` instead would be invisible: the
     frontend's response interceptor unwraps ``response.data.data`` and never
