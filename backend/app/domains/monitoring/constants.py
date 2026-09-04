@@ -103,6 +103,13 @@ STORAGE_UNHEALTHY_USED_PERCENT = 95.0
 # signal, not a live daemon ping. Deliberately generous (an hour) since
 # guest WiFi traffic is naturally bursty (e.g. overnight at a hotel), unlike
 # WireGuard's much tighter keepalive-driven staleness window.
+#
+# Crossing it reports UNKNOWN, not DEGRADED, and that distinction matters
+# more than the number does. This is not "how long before RADIUS is broken"
+# -- nothing here can see the daemon. It is "how long before silence stops
+# being informative", after which the honest answer is that this check no
+# longer knows. Moving it changes when the page stops claiming to know; it
+# never turns a quiet venue into a faulty one.
 FREERADIUS_ACTIVITY_STALE_MINUTES = 60
 
 # ============================================================================
@@ -129,13 +136,17 @@ class HeartbeatComponentType(StrEnum):
       more devices). A future BE-011 part may add this the same way.
     * ``SERVICE`` -- ``component_id`` is any platform-service's own stable
       identifier (not a foreign key into any existing table -- e.g. a
-      worker/daemon process that self-registers). Reserved for a future
-      platform self-heartbeat source (a Celery worker, once one exists, or
-      a scheduled sweep process) -- nothing in this codebase emits one yet
-      (there is no background task runner at all, see the Celery honesty
-      note above), so this value currently has no live writer either, the
-      same honest "defined, not fabricated" posture as ``HealthComponent
-      .CELERY``.
+      worker/daemon process that self-registers). Still has no live writer,
+      which remains the honest "defined, not fabricated" posture.
+
+      The *reason* has changed, though, and the old wording no longer holds:
+      it said "there is no background task runner at all". There is --
+      ``app.core.celery_app`` carries a twenty-entry ``beat_schedule`` and
+      ``deploy/docker-compose.prod.yml`` runs ``celery-worker`` and
+      ``celery-beat``. So a Celery worker emitting its own heartbeat here is
+      no longer waiting on infrastructure; it is simply unbuilt. Corrected
+      alongside ``HealthComponent``'s own stale Celery paragraph, which had
+      drifted the same way and was read as current on 2026-09-04.
     """
 
     ROUTER = "router"
