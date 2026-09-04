@@ -806,6 +806,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # independent real-device-I/O path alongside the RouterOS-API-based
     # sweep above -- see app.domains.provisioning_engine.service
     # .run_router_snmp_metrics_poll_sweep's own module docstring.
+    # DHCP domain adds a nineteenth Beat entry ("dhcp-rogue-detection-sweep")
+    # -- the scheduled rogue-DHCP detector, and the first caller
+    # ``wyfy_device_gateway.mikrotik_adapter.read_rogue_dhcp_alerts`` has
+    # ever had. See app.domains.dhcp.tasks's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -838,6 +842,13 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "notification-dispatch-sweep",
         "monitoring-alert-rule-evaluation-sweep",
         "provisioning-engine-router-snmp-metrics-poll-sweep",
+        # Reads /ip dhcp-server alert per DHCP-serving router and persists
+        # the answer for the readiness checklist to display. Its absence
+        # from this set is not a missing schedule entry, it is a fleet in
+        # which a router that is not watching for a rogue DHCP server looks
+        # exactly like one that is -- there is no alert row, no error, and
+        # nothing anywhere that says so.
+        "dhcp-rogue-detection-sweep",
     }
 
 

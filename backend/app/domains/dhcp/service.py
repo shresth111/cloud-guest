@@ -55,8 +55,13 @@ from .constants import (
     DEFAULT_LEASE_TIME_SECONDS,
     DEVICE_CARRIED_FIELDS,
     DhcpDevicePushStatus,
+    RogueDhcpAlertState,
 )
-from .device_adapters import DhcpCredentials, get_dhcp_adapter
+from .device_adapters import (
+    DhcpCredentials,
+    RogueDhcpInterfaceReading,
+    get_dhcp_adapter,
+)
 from .events import (
     DhcpPoolCreated,
     DhcpPoolDeleted,
@@ -65,6 +70,7 @@ from .events import (
 )
 from .exceptions import (
     CrossOrganizationDhcpPoolAccessError,
+    DhcpError,
     DhcpMissingCredentialsError,
     DhcpPoolMissingGatewayError,
     DhcpPoolMissingInterfaceError,
@@ -72,7 +78,7 @@ from .exceptions import (
     DhcpPoolNotFoundError,
     DhcpPoolRangeConflictError,
 )
-from .models import DhcpPool
+from .models import DhcpPool, RouterRogueDhcpStatus
 from .repository import DhcpRepositoryProtocol
 from .validators import ranges_overlap, validate_address_range, validate_ip_address
 
@@ -89,6 +95,23 @@ def _event_extra(event: object) -> dict[str, object]:
         else str(value)
         for f in dataclasses.fields(event)
     }
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RogueDhcpDetectionSummary:
+    """What one router's detection pass actually established.
+
+    ``unknown`` is its own count, never folded into ``unguarded``. A
+    router we could not reach is not a router we know is unwatched, and a
+    summary that reported them as one number would be the same conflation
+    the tri-state exists to prevent -- twice over, since the number is what
+    gets logged and read later.
+    """
+
+    interfaces: int = 0
+    guarded: int = 0
+    unguarded: int = 0
+    unknown: int = 0
 
 
 class RouterLookupProtocol(Protocol):
@@ -577,6 +600,206 @@ class DhcpService:
             return configured
         return [pool.gateway_ip_address] if pool.gateway_ip_address else []
 
+
+    # ========================================================================
+    # Rogue-DHCP detection -- the reader, on a schedule
+    # ========================================================================
+
+    async def get_rogue_dhcp_statuses(
+        self, router_id: uuid.UUID
+    ) -> list[RouterRogueDhcpStatus]:
+        """Every persisted rogue-DHCP finding for this router. Reads the
+        database only -- **no device I/O, ever**.
+
+        This is the method the readiness checklist composes, and the
+        no-device-I/O property is the whole reason it can.
+        ``ReadinessService.get_checklist`` re-runs every AUTO item on every
+        single GET, so anything it calls is on a hot request path; a
+        RouterOS round trip there would put a device timeout behind a
+        dashboard page load. The device read already happened, off the
+        request path, in ``run_rogue_dhcp_detection_for_router`` below.
+
+        Deliberately takes no ``requesting_organization_id``: it performs no
+        authorization of its own and must never be called before the caller
+        has resolved the router through its own scoped lookup. Readiness
+        does exactly that -- ``get_checklist`` resolves the router (and
+        raises on a cross-tenant id) before ``_run_auto_detection`` is
+        reached. Accepting an org id here and then filtering on
+        ``router_id`` anyway is the precise shape of the path-id scoping
+        defect found across this codebase: the check reads one thing and
+        the query reads another.
+        """
+        return await self.repository.list_rogue_dhcp_statuses(router_id)
+
+    async def run_rogue_dhcp_detection_for_router(
+        self, router_id: uuid.UUID
+    ) -> RogueDhcpDetectionSummary:
+        """Ask one router which of its DHCP-serving interfaces are actually
+        being watched, and persist the answer.
+
+        Called only from ``tasks.detect_rogue_dhcp_for_router`` -- a
+        scheduled, fanned-out leaf task on the device-I/O queue. Nothing on
+        a request path calls this.
+
+        ## An unreachable router is an unanswered question
+
+        Every way this can fail to get an answer -- no credentials, an
+        unsupported vendor, a refused connection, a RouterOS error -- lands
+        as ``RogueDhcpAlertState.UNKNOWN`` with the reason in ``detail``,
+        never as ``UNGUARDED``. Only a device that *answered*, and answered
+        either "no alert row" or "row present, switched off", is unguarded.
+
+        That distinction is not decoration. ``UNGUARDED`` says a real
+        segment is handing out addresses with nothing watching it, and the
+        readiness item fails on it. ``UNKNOWN`` says we do not know, and
+        maps to NOT_CHECKED. Reporting an unreachable router as unguarded
+        would produce a failure an operator cannot act on, on every
+        offline router in the fleet -- and reporting it as guarded would be
+        worse. This is the same posture
+        ``app.domains.monitoring.constants.HealthStatus.UNKNOWN`` already
+        documents, and this codebase has been bitten by collapsing the two
+        before.
+        """
+        checked_at = datetime.now(UTC)
+        try:
+            router = await self.router_lookup.get_router(router_id)
+            credentials = self._resolve_device_credentials(router)
+            adapter = get_dhcp_adapter(router.vendor)
+            readings = await adapter.read_rogue_dhcp_alerts(credentials)
+        except DhcpError as exc:
+            # Every domain failure mode -- missing credentials, unsupported
+            # vendor, connection refused, RouterOS error -- is the same
+            # answer: we did not learn anything. Narrowed to ``DhcpError``
+            # rather than a bare ``except Exception`` on purpose: a bug in
+            # this method (an AttributeError from a collaborator that does
+            # not implement the reader, say) must surface as a failed task,
+            # not be quietly recorded as an unreachable router. A blanket
+            # handler swallowing exactly that AttributeError is how a fake
+            # missing the new method let untested wiring pass in this domain
+            # once already (cloud-guest#131).
+            return await self._record_rogue_dhcp_unknown(
+                router_id, checked_at=checked_at, detail=str(exc)
+            )
+        return await self._record_rogue_dhcp_readings(
+            router_id, readings, checked_at=checked_at
+        )
+
+    async def _record_rogue_dhcp_readings(
+        self,
+        router_id: uuid.UUID,
+        readings: list[RogueDhcpInterfaceReading],
+        *,
+        checked_at: datetime,
+    ) -> RogueDhcpDetectionSummary:
+        """Persist a successful read, and retire rows the device no longer
+        reports.
+
+        The reader returns one entry per interface serving DHCP *and* one
+        per alert row present, so an interface absent from the answer has
+        neither -- there is no finding left to make about it, and a stale
+        ``unguarded`` row would keep failing the readiness item for a
+        segment that no longer exists. See
+        ``repository.delete_rogue_dhcp_statuses``.
+        """
+        summary_counts = {"guarded": 0, "unguarded": 0}
+        seen: set[str] = set()
+        for reading in readings:
+            interface = reading.interface
+            seen.add(interface)
+            watched = reading.watched
+            state = (
+                RogueDhcpAlertState.GUARDED
+                if watched
+                else RogueDhcpAlertState.UNGUARDED
+            )
+            summary_counts["guarded" if watched else "unguarded"] += 1
+            await self.repository.upsert_rogue_dhcp_status(
+                router_id,
+                interface,
+                {
+                    "alert_state": state.value,
+                    # Stored beside the rolled-up state, never merged into
+                    # it: "no row at all" and "row present, switched off"
+                    # are both unguarded, and only these two columns say
+                    # which. RouterOS's default produces the second.
+                    "alert_present": reading.alert_present,
+                    "enabled": reading.enabled,
+                    "serves_dhcp": reading.serves_dhcp,
+                    "checked_at": checked_at,
+                    "detail": _rogue_dhcp_detail(reading),
+                },
+            )
+        existing = await self.repository.list_rogue_dhcp_statuses(router_id)
+        stale = {row.interface for row in existing} - seen
+        if stale:
+            await self.repository.delete_rogue_dhcp_statuses(router_id, stale)
+        return RogueDhcpDetectionSummary(
+            interfaces=len(seen),
+            guarded=summary_counts["guarded"],
+            unguarded=summary_counts["unguarded"],
+            unknown=0,
+        )
+
+    async def _record_rogue_dhcp_unknown(
+        self,
+        router_id: uuid.UUID,
+        *,
+        checked_at: datetime,
+        detail: str,
+    ) -> RogueDhcpDetectionSummary:
+        """Record that this pass learned nothing, without inventing a
+        finding.
+
+        Marks every interface we already had a row for, plus every enabled
+        pool interface this platform believes it serves. Nothing is
+        deleted: the previous answer's *shape* is still the best guess at
+        which interfaces exist, and dropping the rows would silently turn
+        "we could not reach this router" into "this router has nothing to
+        report", which reads as fine.
+
+        ``alert_present``/``enabled``/``serves_dhcp`` are all forced false
+        alongside ``UNKNOWN`` rather than left at their last-known values.
+        A stale ``enabled=True`` beside an ``UNKNOWN`` state invites
+        exactly the reading this whole change exists to prevent -- a
+        consumer glancing at the boolean and concluding the segment is
+        watched, on evidence that is now of unknown age. ``alert_state`` is
+        the only field that carries an answer here; ``detail`` carries why.
+        """
+        interfaces = {
+            row.interface
+            for row in await self.repository.list_rogue_dhcp_statuses(router_id)
+        }
+        for pool in await self.repository.list_pools_for_router(router_id):
+            if pool.is_enabled and pool.interface:
+                interfaces.add(pool.interface)
+        for interface in sorted(interfaces):
+            await self.repository.upsert_rogue_dhcp_status(
+                router_id,
+                interface,
+                {
+                    "alert_state": RogueDhcpAlertState.UNKNOWN.value,
+                    "alert_present": False,
+                    "enabled": False,
+                    "serves_dhcp": False,
+                    "checked_at": checked_at,
+                    "detail": detail,
+                },
+            )
+        logger.warning(
+            "dhcp_rogue_detection_unknown",
+            extra={
+                "event_router_id": str(router_id),
+                "event_interfaces": len(interfaces),
+                "event_error": detail,
+            },
+        )
+        return RogueDhcpDetectionSummary(
+            interfaces=len(interfaces),
+            guarded=0,
+            unguarded=0,
+            unknown=len(interfaces),
+        )
+
     def _resolve_device_credentials(self, router: Router) -> DhcpCredentials:
         """Raise rather than guess -- mirrors ``vlan``/``qos``."""
         host = router.management_ip_address or router.public_ip_address
@@ -608,4 +831,32 @@ class DhcpService:
         )
 
 
-__all__ = ["RouterLookupProtocol", "AuditLogWriter", "DhcpService"]
+def _rogue_dhcp_detail(reading: RogueDhcpInterfaceReading) -> str:
+    """One short, human-readable sentence for one interface's finding.
+
+    Detector-only wording, everywhere, without exception. ``/ip
+    dhcp-server alert`` writes a log entry and does nothing else -- it does
+    not drop the offer, block the port, or rate-limit anything. Copy that
+    says "protected" or "blocked" would describe a capability RouterOS does
+    not have, and an operator who believed it would stop looking for the
+    rogue server. See ``constants.RogueDhcpAlertState``.
+    """
+    if reading.watched:
+        return "Detection is active on this interface."
+    if reading.alert_present:
+        # The state RouterOS's own default creates, and the reason
+        # ``alert_present`` and ``enabled`` are separate columns: this row
+        # reads as configured and watches nothing.
+        return (
+            "Detection is configured on this interface but switched off, "
+            "so nothing is being watched."
+        )
+    return "This interface hands out addresses with no detection configured."
+
+
+__all__ = [
+    "RouterLookupProtocol",
+    "AuditLogWriter",
+    "DhcpService",
+    "RogueDhcpDetectionSummary",
+]

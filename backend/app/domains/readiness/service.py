@@ -98,6 +98,36 @@ class ConfigVersionLookupProtocol(Protocol):
     ) -> tuple[list[Any], object]: ...
 
 
+class RogueDhcpStatusLookupProtocol(Protocol):
+    """The one read this domain needs from ``dhcp``: what did the last
+    rogue-DHCP detection pass see on this router's interfaces?
+
+    Satisfied by the real ``DhcpService.get_rogue_dhcp_statuses`` -- the
+    same "smallest interface the sibling already implements" convention
+    every other lookup in this module follows.
+
+    **This read touches the database only.** That is a requirement of this
+    Protocol, not an accident of its current implementation:
+    ``get_checklist`` re-runs every AUTO item on every GET, so any
+    collaborator here is on a hot request path. The device read that
+    produced these rows happens on a six-hour schedule in
+    ``app.domains.dhcp.tasks``, off the request path entirely. A future
+    implementation that reached for a router here would silently put a
+    RouterOS timeout behind a dashboard page load.
+
+    No ``requesting_organization_id`` parameter, deliberately.
+    ``get_checklist`` has already resolved the router through its own
+    org-scoped ``router_lookup.get_router`` before ``_run_auto_detection``
+    is reached, so authorization has happened. Passing an org id here that
+    the implementation then ignored in favour of the router id would be the
+    exact shape of the path-id scoping defect this codebase has found
+    across a number of handlers: the permission check reads one thing and
+    the query reads another.
+    """
+
+    async def get_rogue_dhcp_statuses(self, router_id: uuid.UUID) -> list[Any]: ...
+
+
 class RouterAgentCredentialLookupProtocol(Protocol):
     async def get_credential_for_router(self, router_id: uuid.UUID) -> Any | None: ...
 
@@ -113,6 +143,7 @@ class ReadinessService:
         wireguard_lookup: WireGuardLookupProtocol,
         router_agent_lookup: RouterAgentCredentialLookupProtocol,
         config_version_lookup: ConfigVersionLookupProtocol | None = None,
+        rogue_dhcp_lookup: RogueDhcpStatusLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
@@ -124,6 +155,11 @@ class ReadinessService:
         # back to the ISP-link evidence alone and says so rather than
         # silently passing.
         self.config_version_lookup = config_version_lookup
+        # Optional for the same reason ``config_version_lookup`` above is:
+        # every existing construction of this service keeps working
+        # unchanged. When absent, ROGUE_DHCP_GUARD reports NOT_CHECKED and
+        # says why, rather than silently passing a router nobody looked at.
+        self.rogue_dhcp_lookup = rogue_dhcp_lookup
 
     # ========================================================================
     # Read path
@@ -253,6 +289,9 @@ class ReadinessService:
         )
         results[ChecklistItemKey.API_REACHABILITY.value] = self._check_api_reachability(
             router
+        )
+        results[ChecklistItemKey.ROGUE_DHCP_GUARD.value] = (
+            await self._check_rogue_dhcp_detection(router)
         )
         return results
 
@@ -427,6 +466,112 @@ class ReadinessService:
                 "it has no enabled WAN link and no applied config version. "
                 "Guests will authenticate successfully and have no internet."
             ),
+            evidence,
+        )
+
+    async def _check_rogue_dhcp_detection(
+        self, router: Any
+    ) -> tuple[ChecklistItemStatus, str, dict[str, Any]]:
+        """Is this router watching for a DHCP server on the guest network
+        that isn't ours?
+
+        Reads only the rows ``app.domains.dhcp.tasks``'s scheduled detector
+        persisted -- **no device I/O**, which is what allows an AUTO item
+        sourced from a real device fact to live on a read path that re-runs
+        on every GET. See ``RogueDhcpStatusLookupProtocol``.
+
+        ## Three outcomes, and why ``unknown`` is not one of the failures
+
+        * **FAIL** -- at least one interface where the device *answered*
+          and the answer was "nothing is watching this". That covers both
+          "no alert row at all" and "row present, ``enabled=False``" -- and
+          the second is the one RouterOS's own default produces, a row that
+          reads as configured in a ``/export`` and watches nothing.
+        * **NOT_CHECKED** -- no row yet (the detector has not reached this
+          router), or every row is ``unknown`` (it tried and could not get
+          an answer). ``ChecklistItemStatus.NOT_CHECKED`` is absent from
+          ``FAILING_STATUSES``, so this never counts against a venue.
+        * **PASS** -- every interface answered, and every one is watched.
+
+        A router the detector could not reach is **never** a FAIL. That is
+        not a nicety: an unreachable router is an unanswered question, and
+        answering it "unguarded" would raise a failure on every offline
+        router in the fleet that no operator could act on -- while telling
+        them nothing true about rogue DHCP. Same posture
+        ``app.domains.monitoring.constants.HealthStatus.UNKNOWN`` documents
+        for its own no-data-to-judge-from case; this codebase has been
+        bitten by collapsing the two more than once.
+
+        Note the ordering: a known-unguarded interface outranks an unknown
+        one. If one interface answered "nothing watching" and another timed
+        out, the failure is real and is reported -- it was established by a
+        device that answered, and the unknown beside it does not soften it.
+
+        ## Detection only
+
+        Every string this method produces says detection, never protection.
+        ``/ip dhcp-server alert`` logs and does nothing else -- see
+        ``constants.CHECKLIST_ITEMS``'s own note on this item.
+        """
+        if self.rogue_dhcp_lookup is None:
+            return (
+                ChecklistItemStatus.NOT_CHECKED,
+                "Rogue DHCP detection results are not available here.",
+                {"lookup_available": False},
+            )
+        rows = await self.rogue_dhcp_lookup.get_rogue_dhcp_statuses(router.id)
+        # Compared as plain strings rather than imported as an enum: this
+        # domain composes ``dhcp`` through a duck-typed Protocol and never
+        # imports its module, the same loose coupling every other lookup
+        # here keeps. The values are ``app.domains.dhcp.constants
+        # .RogueDhcpAlertState``.
+        unguarded = [r for r in rows if getattr(r, "alert_state", None) == "unguarded"]
+        unknown = [r for r in rows if getattr(r, "alert_state", None) == "unknown"]
+        guarded = [r for r in rows if getattr(r, "alert_state", None) == "guarded"]
+        last_checked = max(
+            (r.checked_at for r in rows if getattr(r, "checked_at", None)),
+            default=None,
+        )
+        evidence: dict[str, Any] = {
+            "lookup_available": True,
+            "interface_count": len(rows),
+            "guarded_count": len(guarded),
+            "unguarded_count": len(unguarded),
+            "unknown_count": len(unknown),
+            "unguarded_interfaces": [r.interface for r in unguarded],
+            "last_checked_at": last_checked.isoformat() if last_checked else None,
+        }
+        if not rows:
+            return (
+                ChecklistItemStatus.NOT_CHECKED,
+                "This router has not been checked for rogue DHCP detection yet.",
+                evidence,
+            )
+        if unguarded:
+            names = ", ".join(sorted(r.interface for r in unguarded))
+            return (
+                ChecklistItemStatus.FAIL,
+                (
+                    f"No rogue DHCP detection is active on: {names}. "
+                    "These interfaces hand out addresses, so another DHCP "
+                    "server on the segment would go unnoticed."
+                ),
+                evidence,
+            )
+        if unknown:
+            # Deliberately NOT a FAIL. We did not learn anything about this
+            # router; saying it is unwatched would be inventing a finding.
+            return (
+                ChecklistItemStatus.NOT_CHECKED,
+                (
+                    "The last check could not reach this router, so its "
+                    "rogue DHCP detection state is unknown."
+                ),
+                evidence,
+            )
+        return (
+            ChecklistItemStatus.PASS,
+            "Rogue DHCP detection is active on every interface serving DHCP.",
             evidence,
         )
 

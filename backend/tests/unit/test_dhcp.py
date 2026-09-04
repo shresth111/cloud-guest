@@ -24,7 +24,8 @@ from datetime import UTC, datetime
 import pytest
 
 from app.database.utils.pagination import PageParams, PaginationMeta
-from app.domains.dhcp.constants import DhcpDevicePushStatus
+from app.domains.dhcp.constants import DhcpDevicePushStatus, RogueDhcpAlertState
+from app.domains.dhcp.device_adapters import RogueDhcpInterfaceReading
 from app.domains.dhcp.exceptions import (
     CrossOrganizationDhcpPoolAccessError,
     DhcpDeviceConnectionError,
@@ -39,7 +40,7 @@ from app.domains.dhcp.exceptions import (
     InvalidIpAddressError,
     UnsupportedDhcpVendorError,
 )
-from app.domains.dhcp.models import DhcpPool
+from app.domains.dhcp.models import DhcpPool, RouterRogueDhcpStatus
 from app.domains.dhcp.router import router as dhcp_router
 from app.domains.dhcp.service import DhcpService
 from app.domains.rbac.enums import AuditAction
@@ -165,6 +166,64 @@ class FakeDhcpRepository:
             for v in self.pools.values()
             if v.router_id == router_id and not v.is_deleted
         ]
+
+    # ------------------------------------------------------------------
+    # Rogue-DHCP detection state.
+    #
+    # TAUGHT TO THIS FAKE BEFORE A SINGLE ASSERTION WAS WRITTEN AGAINST
+    # IT, deliberately. ``DhcpService.run_rogue_dhcp_detection_for_router``
+    # catches ``DhcpError`` and records UNKNOWN; a fake missing one of
+    # these methods would raise ``AttributeError``, which is NOT a
+    # ``DhcpError`` and so surfaces as a real test failure rather than
+    # being silently recorded as an unreachable router. That narrowing is
+    # itself a response to cloud-guest#131, where a blanket
+    # ``except Exception`` in this domain swallowed exactly that
+    # AttributeError and let untested wiring pass as green.
+    # ------------------------------------------------------------------
+
+    rogue_statuses: dict[tuple[uuid.UUID, str], RouterRogueDhcpStatus] = field(
+        default_factory=dict
+    )
+
+    async def list_router_ids_serving_dhcp(self) -> list[uuid.UUID]:
+        seen: dict[uuid.UUID, None] = {}
+        for pool in self.pools.values():
+            if pool.is_enabled and not pool.is_deleted:
+                seen.setdefault(pool.router_id, None)
+        return list(seen)
+
+    async def list_rogue_dhcp_statuses(
+        self, router_id: uuid.UUID
+    ) -> list[RouterRogueDhcpStatus]:
+        return [
+            row
+            for (rid, _iface), row in self.rogue_statuses.items()
+            if rid == router_id
+        ]
+
+    async def upsert_rogue_dhcp_status(
+        self, router_id: uuid.UUID, interface: str, data: dict[str, object]
+    ) -> RouterRogueDhcpStatus:
+        existing = self.rogue_statuses.get((router_id, interface))
+        if existing is None:
+            row = RouterRogueDhcpStatus(
+                **_base_fields(router_id=router_id, interface=interface, **data)
+            )
+        else:
+            row = existing
+            for key, value in data.items():
+                setattr(row, key, value)
+        self.rogue_statuses[(router_id, interface)] = row
+        return row
+
+    async def delete_rogue_dhcp_statuses(
+        self, router_id: uuid.UUID, interfaces: set[str]
+    ) -> int:
+        deleted = 0
+        for interface in interfaces:
+            if self.rogue_statuses.pop((router_id, interface), None) is not None:
+                deleted += 1
+        return deleted
 
 
 @dataclass
@@ -506,6 +565,30 @@ class FakeDhcpAdapter:
             return None
         self.alerts.append(interface)
         return self.alert_mac
+
+    #: What ``read_rogue_dhcp_alerts`` reports back, and what it raises
+    #: instead. Both default to the honest empty case rather than to a
+    #: healthy one -- a fake that answers "all good" by default lets a
+    #: wiring bug read as a pass.
+    readings: list[RogueDhcpInterfaceReading] = field(default_factory=list)
+    read_raises: Exception | None = None
+    reads: int = 0
+
+    async def read_rogue_dhcp_alerts(
+        self, credentials
+    ) -> list[RogueDhcpInterfaceReading]:
+        """Taught to this fake before any assertion was written against it.
+
+        Without it, ``get_dhcp_adapter`` would hand the service an object
+        with no such attribute and the service would die on an
+        ``AttributeError`` -- which is the failure cloud-guest#131 showed
+        can hide inside a broad ``except``. Here it cannot: the service
+        catches only ``DhcpError``.
+        """
+        self.reads += 1
+        if self.read_raises is not None:
+            raise self.read_raises
+        return list(self.readings)
 
     async def delete_dhcp_pool(
         self,
@@ -1097,3 +1180,328 @@ class TestEditDemotesAnAppliedPool:
         )
 
         assert len(adapter.deletes) == 1
+
+
+# ============================================================================
+# Rogue-DHCP detection -- the reader, which had zero callers.
+#
+# ``wyfy_device_gateway.mikrotik_adapter.read_rogue_dhcp_alerts`` was
+# implemented, documented, and called from nowhere in ``app/``. The writer
+# was wired on both config paths; the reader was not. A router that is not
+# being watched has no alert row, raises no error and appears nowhere -- it
+# is invisible precisely because it is unwatched.
+#
+# THE DISTINCTION UNDER TEST throughout this section is ``unknown`` vs
+# ``unguarded``. A router we could not reach is not a router we know is
+# unwatched. Every test below that produces one asserts it is not the other.
+# ============================================================================
+
+
+def _reading(
+    interface: str = "ether2",
+    *,
+    serves_dhcp: bool = True,
+    alert_present: bool = True,
+    enabled: bool = True,
+) -> RogueDhcpInterfaceReading:
+    return RogueDhcpInterfaceReading(
+        interface=interface,
+        serves_dhcp=serves_dhcp,
+        alert_present=alert_present,
+        enabled=enabled,
+    )
+
+
+async def _detect(h: Harness, router: Router):  # noqa: ANN202 -- test helper
+    return await h.service.run_rogue_dhcp_detection_for_router(router.id)
+
+
+def _state(h: Harness, router: Router, interface: str = "ether2") -> str:
+    return h.repository.rogue_statuses[(router.id, interface)].alert_state
+
+
+class TestRogueDhcpDetection:
+    async def test_a_watched_interface_reads_as_guarded(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [_reading(alert_present=True, enabled=True)]
+
+        summary = await _detect(h, router)
+
+        assert adapter.reads == 1
+        assert _state(h, router) == RogueDhcpAlertState.GUARDED.value
+        assert summary.guarded == 1
+        assert summary.unguarded == 0
+        assert summary.unknown == 0
+
+    async def test_no_alert_row_at_all_reads_as_unguarded(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """An interface handing out addresses with nothing watching it.
+
+        This is the finding the whole reader exists for, and it has no
+        alert row of its own to be listed by -- the gateway's
+        ``_build_rogue_dhcp_alert_statuses`` synthesises it from the set of
+        DHCP-serving interfaces precisely so it cannot be a silence the
+        caller has to notice.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [_reading(alert_present=False, enabled=False)]
+
+        summary = await _detect(h, router)
+
+        row = h.repository.rogue_statuses[(router.id, "ether2")]
+        assert row.alert_state == RogueDhcpAlertState.UNGUARDED.value
+        assert row.alert_present is False
+        assert row.enabled is False
+        assert summary.unguarded == 1
+        # Not the same answer as "we could not check".
+        assert summary.unknown == 0
+
+    async def test_a_row_present_but_disabled_reads_as_unguarded(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """THE STATE ROUTEROS'S OWN DEFAULT PRODUCES.
+
+        ``/ip dhcp-server alert`` rows are created **disabled**. Such a row
+        appears in a ``/export`` looking exactly like a configured watch and
+        observes nothing -- the first careful by-hand attempt on the lab
+        router left three of them. A check that tested only for presence
+        would certify this router as watched.
+
+        ``alert_present`` and ``enabled`` stay legible as separate columns
+        rather than collapsing into a bare ``unguarded``, so an operator can
+        tell a switched-off watch from an interface nobody ever configured.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [_reading(alert_present=True, enabled=False)]
+
+        await _detect(h, router)
+
+        row = h.repository.rogue_statuses[(router.id, "ether2")]
+        assert row.alert_state == RogueDhcpAlertState.UNGUARDED.value
+        # Present, and switched off -- both facts survive.
+        assert row.alert_present is True
+        assert row.enabled is False
+        assert "switched off" in (row.detail or "")
+
+    async def test_an_unreachable_router_reads_as_unknown_not_unguarded(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """A router we could not reach is an unanswered question.
+
+        Reporting it as ``unguarded`` would raise a finding on every
+        offline router in the fleet that no operator could act on, while
+        saying nothing true about rogue DHCP. Same posture
+        ``monitoring.constants.HealthStatus.UNKNOWN`` documents.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_pool(h, router)
+        adapter.read_raises = DhcpDeviceConnectionError(
+            "10.0.0.1", "connection refused"
+        )
+
+        summary = await _detect(h, router)
+
+        row = h.repository.rogue_statuses[(router.id, "ether2")]
+        assert row.alert_state == RogueDhcpAlertState.UNKNOWN.value
+        # THE ASSERTION THIS TEST EXISTS FOR: unknown is never unguarded.
+        assert row.alert_state != RogueDhcpAlertState.UNGUARDED.value
+        assert summary.unknown == 1
+        assert summary.unguarded == 0
+        assert summary.guarded == 0
+        # And it says why, rather than leaving an unanswered question with
+        # no reason attached.
+        assert "connection refused" in (row.detail or "")
+
+    async def test_an_unknown_row_does_not_keep_stale_liveness_booleans(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """A router that was watched, then became unreachable.
+
+        ``enabled`` must not stay True beside an ``unknown`` state: a
+        consumer glancing at the boolean would conclude the segment is
+        watched, on evidence that is now of unknown age. ``alert_state`` is
+        the only field carrying an answer here.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [_reading(alert_present=True, enabled=True)]
+        await _detect(h, router)
+        assert _state(h, router) == RogueDhcpAlertState.GUARDED.value
+
+        adapter.read_raises = DhcpDeviceConnectionError("10.0.0.1", "timed out")
+        await _detect(h, router)
+
+        row = h.repository.rogue_statuses[(router.id, "ether2")]
+        assert row.alert_state == RogueDhcpAlertState.UNKNOWN.value
+        assert row.enabled is False
+        assert row.alert_present is False
+
+    async def test_missing_credentials_is_unknown_not_a_finding(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Every way of failing to get an answer lands as ``unknown`` --
+        not only a refused connection. A router with no API credentials was
+        never asked, so nothing about it is known either way."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_pool(h, router)
+        # No decryptable API secret -- ``_resolve_device_credentials``
+        # raises rather than guessing, and the detector never opens a
+        # connection at all.
+        h.router_lookup.secret = None
+
+        summary = await _detect(h, router)
+
+        assert summary.unknown == 1
+        assert summary.unguarded == 0
+        assert _state(h, router) == RogueDhcpAlertState.UNKNOWN.value
+
+    async def test_a_bug_in_the_reader_fails_loudly_rather_than_reading_unknown(
+        self,
+        adapter: FakeDhcpAdapter,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """cloud-guest#131, guarded against directly.
+
+        The detector catches ``DhcpError`` and records UNKNOWN. It must NOT
+        catch everything: an ``AttributeError`` from a collaborator that
+        does not implement the reader is a bug in this code, and recording
+        it as "router unreachable" is exactly how broken wiring passes as
+        green. That precise failure -- a fake missing a new method, an
+        ``except Exception`` swallowing the AttributeError -- already
+        happened once in this domain's own test file.
+        """
+
+        class AdapterWithoutTheReader:
+            vendor = "mikrotik"
+
+        monkeypatch.setattr(
+            "app.domains.dhcp.service.get_dhcp_adapter",
+            lambda vendor: AdapterWithoutTheReader(),
+        )
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+
+        with pytest.raises(AttributeError):
+            await _detect(h, router)
+
+        # And nothing was recorded -- no fabricated "unknown" row papering
+        # over a code defect.
+        assert h.repository.rogue_statuses == {}
+
+    async def test_every_dhcp_serving_interface_appears_even_with_no_row(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The union, not the alert rows alone."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [
+            _reading("ether2", alert_present=True, enabled=True),
+            _reading("ether3", alert_present=False, enabled=False),
+            _reading("vlan10", alert_present=True, enabled=False),
+        ]
+
+        summary = await _detect(h, router)
+
+        assert summary.interfaces == 3
+        assert summary.guarded == 1
+        assert summary.unguarded == 2
+        assert _state(h, router, "ether2") == RogueDhcpAlertState.GUARDED.value
+        assert _state(h, router, "ether3") == RogueDhcpAlertState.UNGUARDED.value
+        assert _state(h, router, "vlan10") == RogueDhcpAlertState.UNGUARDED.value
+
+    async def test_an_interface_the_device_stops_reporting_is_retired(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """A stale ``unguarded`` row for an interface that no longer serves
+        DHCP would fail the readiness item forever, with nothing an
+        operator could do to clear it."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [
+            _reading("ether2", alert_present=False, enabled=False),
+            _reading("ether3", alert_present=False, enabled=False),
+        ]
+        await _detect(h, router)
+        assert (router.id, "ether3") in h.repository.rogue_statuses
+
+        adapter.readings = [_reading("ether2", alert_present=True, enabled=True)]
+        await _detect(h, router)
+
+        assert (router.id, "ether3") not in h.repository.rogue_statuses
+        assert _state(h, router, "ether2") == RogueDhcpAlertState.GUARDED.value
+
+    async def test_an_unreachable_router_never_retires_its_rows(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """Deleting on a failed read would turn "we could not reach this
+        router" into "this router has nothing to report", which reads as
+        fine."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [
+            _reading("ether2", alert_present=False, enabled=False),
+            _reading("ether3", alert_present=False, enabled=False),
+        ]
+        await _detect(h, router)
+
+        adapter.read_raises = DhcpDeviceConnectionError("10.0.0.1", "no route to host")
+        summary = await _detect(h, router)
+
+        assert (router.id, "ether2") in h.repository.rogue_statuses
+        assert (router.id, "ether3") in h.repository.rogue_statuses
+        assert summary.unknown == 2
+
+    async def test_get_rogue_dhcp_statuses_performs_no_device_io(
+        self, adapter: FakeDhcpAdapter
+    ) -> None:
+        """The property that lets the readiness checklist compose this at
+        all: ``get_checklist`` re-runs every AUTO item on every GET, so a
+        device read here would put a RouterOS timeout behind a dashboard
+        page load."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        adapter.readings = [_reading()]
+        await _detect(h, router)
+        reads_after_detection = adapter.reads
+
+        rows = await h.service.get_rogue_dhcp_statuses(router.id)
+
+        assert len(rows) == 1
+        assert adapter.reads == reads_after_detection
+
+
+class TestRogueDhcpSweepTargets:
+    async def test_only_routers_with_an_enabled_pool_are_swept(self) -> None:
+        """A disabled pool hands out nothing, so RouterOS's own alert would
+        have no baseline either -- polling that router spends a real device
+        round trip to learn nothing."""
+        h = make_harness()
+        serving = h.router_lookup.add(_make_router())
+        idle = h.router_lookup.add(_make_router())
+        pool = await _create_pool(h, serving)
+        assert pool.is_enabled
+
+        router_ids = await h.repository.list_router_ids_serving_dhcp()
+
+        assert router_ids == [serving.id]
+        assert idle.id not in router_ids
+
+    async def test_a_router_with_many_pools_is_swept_once(self) -> None:
+        """``read_rogue_dhcp_alerts`` answers for every interface in a
+        single pass, so six pools is still one API read."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await _create_pool(h, router, start="192.168.10.10", end="192.168.10.100")
+        await _create_pool(
+            h, router, start="192.168.11.10", end="192.168.11.100", interface="ether3"
+        )
+
+        assert await h.repository.list_router_ids_serving_dhcp() == [router.id]

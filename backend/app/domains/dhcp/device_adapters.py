@@ -90,6 +90,39 @@ class DhcpCredentials:
     timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS
 
 
+@dataclass(frozen=True, slots=True)
+class RogueDhcpInterfaceReading:
+    """One interface's rogue-DHCP detection state, as the device reported
+    it on a single read.
+
+    An independently-defined shape rather than a re-export of
+    ``wyfy_device_gateway.contract.RogueDhcpAlertStatus`` -- the same
+    posture ``DhcpCredentials`` above takes towards the gateway's own
+    ``DeviceCredentials``. The service layer and the readiness checklist
+    consume this; neither imports the vendor contract, so a gateway field
+    rename cannot reach into a domain that never asked about RouterOS.
+
+    Carries the two facts separately that must never be merged:
+    ``alert_present`` (a row exists) and ``enabled`` (it is switched on).
+    RouterOS creates these rows disabled, so presence alone certifies a
+    router that is watching nothing -- see
+    ``constants.RogueDhcpAlertState``.
+    """
+
+    interface: str
+    serves_dhcp: bool
+    alert_present: bool
+    enabled: bool
+
+    @property
+    def watched(self) -> bool:
+        """Is this interface's DHCP actually being watched right now --
+        both halves, never just presence. Mirrors the gateway contract's
+        own ``RogueDhcpAlertStatus.guarded`` property deliberately, so the
+        two layers cannot drift on what the answer means."""
+        return self.alert_present and self.enabled
+
+
 class BaseDhcpAdapter(Protocol):
     """What a vendor implements to plug real DHCP operations into this
     domain."""
@@ -130,6 +163,21 @@ class BaseDhcpAdapter(Protocol):
         interface, which is the one case where the alert must NOT be
         written: `valid-server` would have to be guessed, and a wrong value
         makes every legitimate lease reply look rogue.
+        """
+        ...
+
+    async def read_rogue_dhcp_alerts(
+        self, credentials: DhcpCredentials
+    ) -> list[RogueDhcpInterfaceReading]:
+        """Which of this router's interfaces are actually being watched for
+        a DHCP server that is not ours. Reads only; writes nothing.
+
+        Every interface serving DHCP appears in the answer whether or not
+        it has an alert row. That is not an implementation detail to be
+        tidied away: "hands out addresses, nothing watching it" is the
+        finding worth having, and it has no alert row of its own to be
+        listed by. An answer built only from the rows present would be
+        silent about exactly the routers worth knowing about.
         """
         ...
 
@@ -237,6 +285,34 @@ class MikroTikDhcpAdapter:
                 "ensure_rogue_dhcp_alert", exc.detail
             ) from exc
 
+    async def read_rogue_dhcp_alerts(
+        self, credentials: DhcpCredentials
+    ) -> list[RogueDhcpInterfaceReading]:
+        creds = self._gateway_credentials(credentials)
+        try:
+            statuses = await get_adapter(DeviceVendor.MIKROTIK).read_rogue_dhcp_alerts(
+                creds
+            )
+        # MikroTikConnectionError subclasses MikroTikDeviceError -- catch the
+        # narrower one first, or every connection failure is mislabelled.
+        # The caller relies on the distinction: a connection failure is an
+        # unanswered question (RogueDhcpAlertState.UNKNOWN), never a finding.
+        except MikroTikConnectionError as exc:
+            raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DhcpDeviceOperationError(
+                "read_rogue_dhcp_alerts", exc.detail
+            ) from exc
+        return [
+            RogueDhcpInterfaceReading(
+                interface=status.interface,
+                serves_dhcp=status.serves_dhcp,
+                alert_present=status.alert_present,
+                enabled=status.enabled,
+            )
+            for status in statuses
+        ]
+
     async def delete_dhcp_pool(
         self,
         credentials: DhcpCredentials,
@@ -285,6 +361,7 @@ def list_supported_dhcp_vendors() -> list[str]:
 __all__ = [
     "BaseDhcpAdapter",
     "DhcpCredentials",
+    "RogueDhcpInterfaceReading",
     "MikroTikDhcpAdapter",
     "get_dhcp_adapter",
     "list_supported_dhcp_vendors",
