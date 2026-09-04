@@ -33,15 +33,29 @@ class HealthComponent(StrEnum):
     ``RouterEvent`` (BE-008/BE-009). See ``models.py``'s module docstring for
     the full "why no ``DeviceHealth`` table" write-up.
 
-    ``CELERY``/``WEBSOCKET`` are real, first-class enum members even though
-    neither piece of infrastructure exists in this codebase yet (no Celery
-    worker/broker anywhere, no WebSocket support anywhere) -- per this
-    module's honesty mandate, a health-check *type* is defined and wired
-    into every dashboard/history endpoint now, so no migration is needed
-    once a real deployment exists; ``service.py``'s
-    ``check_celery_health``/``check_websocket_health`` return an honest
-    ``HealthStatus.UNKNOWN`` with a documented reason, never a fabricated
-    ``HEALTHY``.
+    ``CELERY``/``WEBSOCKET`` were once placeholders here, defined ahead of
+    the infrastructure so that no migration would be needed once it
+    existed, and returning an honest ``HealthStatus.UNKNOWN`` in the
+    meantime. **Both are real checks now**, and this paragraph used to say
+    otherwise: it claimed "neither piece of infrastructure exists in this
+    codebase yet (no Celery worker/broker anywhere, no WebSocket support
+    anywhere)" long after ``app.core.celery_app`` shipped a genuine Celery
+    deployment with a nineteen-entry ``beat_schedule``,
+    ``deploy/docker-compose.prod.yml`` began running ``celery-worker`` and
+    ``celery-beat`` services, and BE-011 Part 3 added real WebSocket
+    endpoints.
+
+    That is not a harmless stale line. It was read as current on
+    2026-09-04 and taken as evidence that this platform has no recurring
+    scheduler at all -- which is exactly why nobody noticed the Health
+    Engine itself had no Beat entry and the System Health page was showing
+    two-day-old rows. A comment that describes infrastructure the reader
+    cannot see is load-bearing, and this one pointed the wrong way.
+
+    See ``service.py``'s ``check_celery_health`` (a real
+    ``control.inspect().ping()`` against the configured broker, with three
+    distinct real outcomes) and ``check_websocket_health`` for what each
+    actually does today.
     """
 
     DATABASE = "database"
