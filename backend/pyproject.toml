@@ -9,6 +9,27 @@ description = "CloudGuest backend foundation for a cloud-managed MikroTik networ
 requires-python = ">=3.13"
 readme = "README.md"
 authors = [{ name = "CloudGuest Engineering" }]
+# These must be everything `app/` actually imports. They were not.
+#
+# `requirements.txt` is what Docker and CI install, and it had thirteen
+# entries this list lacked -- including `boto3`, `Pillow`, `pyotp`,
+# `litellm`, `python-multipart` and the vendored gateway itself. A venv
+# built from this file alone could not import the application: 57 test
+# modules failed to collect, and the gateway resolved to whatever stale
+# copy happened to be on the path rather than to `vendor/`, which is how a
+# test run can exercise gateway code that is not the source in the tree
+# and still pass.
+#
+# The two files are not redundant. `requirements.txt` additionally pins
+# transitive packages (`greenlet`, `pyasn1`, `psycopg2-binary`) so a
+# rebuilt image is byte-identical; this list is the honest set of DIRECT
+# dependencies. Every entry here that `app/` imports is named below with
+# where it is imported, so the next person adding an import can see
+# immediately that this file is one of the two places to update.
+#
+# Nothing under `tests/` can prove this list is complete -- only installing
+# from it into a clean environment can. That is the check to run when you
+# change it.
 dependencies = [
     "alembic==1.14.0",
     "argon2-cffi==23.1.0",
@@ -34,6 +55,26 @@ dependencies = [
     "razorpay==2.0.1",
     "redis==5.2.1",
     "reportlab==4.4.4",
+    # app/domains/assistant/service.py
+    "litellm==1.55.3",
+    # app/core/storage.py, app/domains/otp/service.py,
+    # app/domains/branding/service.py -- S3/SES.
+    "boto3==1.35.74",
+    # app/domains/branding/service.py -- logo processing (imported as PIL).
+    "Pillow==11.0.0",
+    # app/domains/auth/mfa.py -- TOTP.
+    "pyotp==2.10.0",
+    # No import names it: FastAPI needs it to parse multipart bodies, and
+    # app/domains/branding/router.py accepts UploadFile. Without it that
+    # endpoint fails at request time, not at import time -- which is why
+    # nobody noticed it was missing here.
+    "python-multipart==0.0.20",
+    # app/domains/provisioning_engine/service.py imports
+    # `wyfy_device_gateway`. Installed from the tree, not from an index:
+    # this is the vendored source, and installing it any other way is how a
+    # stale copy ends up on the path. It brings librouteros/asyncssh/pysnmp
+    # with it through its own pyproject.
+    "wyfy-device-gateway",
     "SQLAlchemy==2.0.36",
     "stripe==15.3.1",
     "uvicorn[standard]==0.34.0",
@@ -41,7 +82,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "httpx==0.28.1",
+    # Pinned to match `requirements.txt`, which is what Docker and CI
+    # actually install. It was 0.28.1 here and 0.27.2 there, so the test
+    # suite ran against a different httpx than production -- and 0.28.1 is
+    # outright incompatible with `litellm`'s `httpx>=0.23,<0.28`, which is
+    # why adding litellm to the dependency list above is what surfaced
+    # this. The disagreement predates that change; it was simply invisible
+    # while the two files were allowed to drift.
+    "httpx==0.27.2",
     "pytest==8.3.4",
     "pytest-asyncio==0.25.0",
     "ruff==0.8.4",
@@ -80,3 +128,7 @@ ignore = ["B008"]
 "app/core/email_layout.py" = ["E501"]
 "app/domains/network_config/wan/renderers.py" = ["E501"]
 
+[tool.uv.sources]
+# The gateway is vendored, so it is installed editable from the tree. See
+# the dependency list's own comment for what goes wrong when it is not.
+wyfy-device-gateway = { path = "vendor/wyfy-device-gateway", editable = true }
