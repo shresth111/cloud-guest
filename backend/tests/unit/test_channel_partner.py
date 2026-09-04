@@ -27,7 +27,11 @@ from app.database.exceptions import DuplicateRecordError
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.channel_partner.constants import (
     CHANNEL_PARTNER_PRODUCT_NAME,
+    EMAIL_PROVIDER_NOT_CONFIGURED,
+    SMS_PROVIDER_NOT_CONFIGURED,
     ChannelPartnerStatus,
+    WelcomeDeliveryStatus,
+    welcome_delivery_status,
 )
 from app.domains.channel_partner.exceptions import (
     ChannelPartnerEmailMissingError,
@@ -215,6 +219,92 @@ def _make_request(**overrides: object) -> ChannelPartnerCreateRequest:
 # ============================================================================
 # GSTIN validator
 # ============================================================================
+
+
+class TestWelcomeDeliveryStatus:
+    """The console reads these, and it must not call a server-configuration
+    fact a per-partner failure.
+
+    On the live fleet all five channel partners carried a red *Welcome
+    failed* badge. Three of them had had their welcome email delivered
+    successfully; the badge came entirely from SMS, which that deployment
+    has no provider for at all. Nothing was wrong with those three
+    partners, and no amount of following up on them would have changed
+    anything.
+    """
+
+    def test_a_delivered_channel_is_sent(self) -> None:
+        assert (
+            welcome_delivery_status(
+                sent_at=datetime(2026, 8, 26, tzinfo=UTC),
+                error=None,
+                not_configured_message=SMS_PROVIDER_NOT_CONFIGURED,
+            )
+            is WelcomeDeliveryStatus.SENT
+        )
+
+    def test_a_missing_provider_is_not_a_failure(self) -> None:
+        assert (
+            welcome_delivery_status(
+                sent_at=None,
+                error=SMS_PROVIDER_NOT_CONFIGURED,
+                not_configured_message=SMS_PROVIDER_NOT_CONFIGURED,
+            )
+            is WelcomeDeliveryStatus.NOT_CONFIGURED
+        )
+
+    def test_a_real_send_error_is_a_failure(self) -> None:
+        """The one partner on the live fleet that genuinely failed carried
+        `(535, b'Authentication Failed')` from the mailbox that was
+        misconfigured at the time. That one is worth chasing; the other
+        four were not."""
+        assert (
+            welcome_delivery_status(
+                sent_at=None,
+                error="(535, b'Authentication Failed')",
+                not_configured_message=EMAIL_PROVIDER_NOT_CONFIGURED,
+            )
+            is WelcomeDeliveryStatus.FAILED
+        )
+
+    def test_a_channel_never_attempted_is_neither(self) -> None:
+        """A partner onboarded without an email address never had one
+        attempted -- that is not a failure and not a missing provider."""
+        assert (
+            welcome_delivery_status(
+                sent_at=None,
+                error=None,
+                not_configured_message=EMAIL_PROVIDER_NOT_CONFIGURED,
+            )
+            is WelcomeDeliveryStatus.NOT_ATTEMPTED
+        )
+
+    def test_a_later_success_outranks_stale_error_text(self) -> None:
+        """A resend clears the error, but if any path ever left both set,
+        the recorded send is the fact that actually happened."""
+        assert (
+            welcome_delivery_status(
+                sent_at=datetime(2026, 8, 26, tzinfo=UTC),
+                error=SMS_PROVIDER_NOT_CONFIGURED,
+                not_configured_message=SMS_PROVIDER_NOT_CONFIGURED,
+            )
+            is WelcomeDeliveryStatus.SENT
+        )
+
+    def test_the_service_writes_exactly_the_message_the_classifier_reads(
+        self,
+    ) -> None:
+        """The classification is a string compare, so the writer and the
+        reader must not be allowed to drift apart. Both now import the same
+        constant; this pins that they still do."""
+        import inspect
+
+        from app.domains.channel_partner import service as service_module
+
+        source = inspect.getsource(service_module)
+        assert "SMS_PROVIDER_NOT_CONFIGURED" in source
+        assert "EMAIL_PROVIDER_NOT_CONFIGURED" in source
+        assert "No real SMS delivery provider is configured" not in source
 
 
 class TestGstinValidator:
