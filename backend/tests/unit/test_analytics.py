@@ -950,3 +950,82 @@ def test_run_daily_aggregation_for_organization_task_bridges_into_async(monkeypa
         "organization_id": str(organization_id),
         "snapshot_count": 3,
     }
+
+
+class TestFleetCountExcludesArchivedParents:
+    """The platform router total must count the fleet an operator can
+    actually reach.
+
+    Live on 2026-09-04 the Master console showed `ROUTERS ONLINE 7/11`
+    while Router Fleet listed 8. Neither number was wrong about what it
+    counted: `count_routers_by_status` filtered on `Router.is_deleted`
+    alone, while the fleet screen walks the org -> location tree and
+    `RouterService.list_routers` 404s on a soft-deleted location.
+    `LocationService.archive_location` soft-deletes the location row and
+    does **not** cascade to the routers under it, so those routers stay
+    `is_deleted = False` -- counted platform-wide, unreachable and
+    unmanageable everywhere else.
+
+    This repo has no database-backed test harness, so these capture the
+    statement the method actually builds rather than executing it. That is
+    enough for the regression that matters: someone dropping the join.
+    """
+
+    @staticmethod
+    def _compiled(statement) -> str:
+        from sqlalchemy.dialects import postgresql
+
+        return str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    class _CapturingSession:
+        def __init__(self) -> None:
+            self.statement = None
+
+        async def execute(self, statement):
+            self.statement = statement
+
+            class _Empty:
+                @staticmethod
+                def all():
+                    return []
+
+            return _Empty()
+
+    async def _statement_for(self, repository_factory):
+        session = self._CapturingSession()
+        repository = repository_factory(session)
+        await repository.count_routers_by_status(organization_id=None)
+        return self._compiled(session.statement)
+
+    async def test_analytics_count_excludes_archived_locations_and_orgs(
+        self,
+    ) -> None:
+        from app.domains.analytics.repository import AnalyticsRepository
+
+        sql = await self._statement_for(AnalyticsRepository)
+
+        assert "JOIN locations" in sql
+        assert "JOIN organizations" in sql
+        assert "locations.is_deleted IS false" in sql
+        assert "organizations.is_deleted IS false" in sql
+        assert "routers.is_deleted IS false" in sql
+
+    async def test_monitoring_count_excludes_archived_locations_and_orgs(
+        self,
+    ) -> None:
+        """The two domains carry the same query and must not drift apart --
+        the console reads one and the fleet page's KPIs the other."""
+        from app.domains.monitoring.repository import MonitoringRepository
+
+        sql = await self._statement_for(MonitoringRepository)
+
+        assert "JOIN locations" in sql
+        assert "JOIN organizations" in sql
+        assert "locations.is_deleted IS false" in sql
+        assert "organizations.is_deleted IS false" in sql
+        assert "routers.is_deleted IS false" in sql

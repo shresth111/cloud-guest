@@ -41,6 +41,8 @@ from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 from app.domains.guest.models import GuestSession, RadiusNasClient
 from app.domains.isp.models import IspLink
+from app.domains.location.models import Location
+from app.domains.organization.models import Organization
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.models import Router
 from app.domains.router_provisioning.constants import ProvisioningJobStatus
@@ -1167,10 +1169,31 @@ class MonitoringRepository:
         self, *, organization_id: uuid.UUID | None = None
     ) -> list[tuple[str, int]]:
         """Real SQL ``GROUP BY`` -- the module brief's "Device Statistics:
-        router counts by RouterStatus" bullet."""
+        router counts by RouterStatus" bullet.
+
+        A router whose Location or Organization has been archived is
+        **excluded**. Archiving a location soft-deletes only the location
+        row (``LocationService.archive_location``); it does not cascade to
+        the routers underneath it, so those keep ``is_deleted = False`` and
+        used to be counted here. The fleet screen never showed them --
+        ``RouterService.list_routers`` resolves the location first and a
+        soft-deleted one 404s -- so the platform total read 11 while Router
+        Fleet listed 8, and neither number was wrong about what it was
+        actually counting. Counting a router nobody can reach or manage as
+        part of the fleet is the misleading half, so this joins.
+
+        The same join lives in the sibling with this name in the other
+        domain; both must move together.
+        """
         statement = (
             select(Router.status, func.count())
-            .where(Router.is_deleted.is_(False))
+            .join(Location, Location.id == Router.location_id)
+            .join(Organization, Organization.id == Router.organization_id)
+            .where(
+                Router.is_deleted.is_(False),
+                Location.is_deleted.is_(False),
+                Organization.is_deleted.is_(False),
+            )
             .group_by(Router.status)
         )
         if organization_id is not None:
