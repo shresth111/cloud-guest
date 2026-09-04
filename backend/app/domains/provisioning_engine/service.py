@@ -61,6 +61,7 @@ import contextlib
 import dataclasses
 import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -78,7 +79,10 @@ from app.domains.policy.service import ResolvedPolicy
 from app.domains.rbac.enums import AuditAction
 from app.domains.router.models import Router
 from app.domains.router_provisioning.adapters import get_provisioning_adapter
-from app.domains.router_provisioning.constants import ConfigVariableScope
+from app.domains.router_provisioning.constants import (
+    ConfigVariableScope,
+    MetricsSource,
+)
 from app.domains.router_provisioning.exceptions import DuplicateConfigVariableError
 from app.domains.router_provisioning.models import ConfigTemplate, ConfigVersion
 from app.domains.router_provisioning.service import render_template
@@ -1389,6 +1393,55 @@ class ProvisioningEngineService:
         )
 
 
+class _InterfaceCounterLike(Protocol):
+    """The five fields both transports report for one interface.
+
+    ``snmp_poller.SnmpInterfaceCounters`` and
+    ``contract.DeviceInterfaceCounters`` are separate dataclasses -- they
+    are read off genuinely different wires, and neither package should
+    import the other's shape -- but they were written field-for-field
+    alike so that one reading is not structurally distinguishable from
+    the other once persisted. This Protocol is where that agreement is
+    actually enforced: add a field to one and not the other, and the
+    sweep using the odd one out stops type-checking here.
+    """
+
+    if_index: int
+    if_name: str
+    if_oper_status_up: bool | None
+    in_octets: int | None
+    out_octets: int | None
+
+
+def _interface_counter_rows(
+    interfaces: Sequence[_InterfaceCounterLike] | None,
+) -> list[dict[str, Any]] | None:
+    """Per-interface counters -> the JSON rows the snapshot column holds.
+
+    Both sweeps go through here so that an SNMP-sourced row and a
+    RouterOS-API-sourced row are identical in shape and differ only in
+    ``metrics_source``. They are read back by one chart out of one
+    column; the day they disagree about a key name, that chart silently
+    drops a series rather than failing.
+
+    ``None`` in, ``None`` out -- and ``None`` out for an empty sequence
+    too. ``[]`` would assert "we read the interfaces and there were
+    none", which is never true of a router that answered a poll.
+    """
+    if not interfaces:
+        return None
+    return [
+        {
+            "if_index": iface.if_index,
+            "if_name": iface.if_name,
+            "up": iface.if_oper_status_up,
+            "in_octets": iface.in_octets,
+            "out_octets": iface.out_octets,
+        }
+        for iface in interfaces
+    ]
+
+
 async def run_router_health_poll_sweep(
     repository: ProvisioningEngineRepositoryProtocol,
     router_lookup: RouterLookupProtocol,
@@ -1483,11 +1536,23 @@ async def run_router_health_poll_sweep(
             adapter = device_adapter_resolver(router.vendor)
             result: DeviceHealthResult = await adapter.health_check(credentials)
             if result.healthy:
+                # `metrics_source` is stamped, not left to default. It
+                # spent its entire life unset on this path, so every
+                # RouterOS-API-sourced row read back as NULL and the
+                # dashboard labelled it "Not recorded" -- a claim that
+                # the transport was unknown, when it was known exactly.
+                # The provenance of a reading is not optional metadata: a
+                # chart that cannot say where a number came from cannot
+                # be argued with.
                 await router_provisioning.record_health_snapshot(
                     router_id=router.id,
                     requesting_organization_id=router.organization_id,
                     cpu_usage_percent=result.cpu_load_percent,
                     uptime_seconds=result.uptime_seconds,
+                    interface_traffic_counters=_interface_counter_rows(
+                        result.interfaces
+                    ),
+                    metrics_source=MetricsSource.ROUTEROS_API.value,
                 )
                 checked += 1
             else:
@@ -1620,7 +1685,7 @@ async def run_router_snmp_metrics_poll_sweep(
                     router_id=router.id,
                     requesting_organization_id=router.organization_id,
                     detail=str(exc),
-                    metrics_source="snmp",
+                    metrics_source=MetricsSource.SNMP.value,
                 )
                 unreachable += 1
                 logger.warning(
@@ -1629,16 +1694,7 @@ async def run_router_snmp_metrics_poll_sweep(
                 )
                 continue
 
-            interface_counters = [
-                {
-                    "if_index": iface.if_index,
-                    "if_name": iface.if_name,
-                    "up": iface.if_oper_status_up,
-                    "in_octets": iface.in_octets,
-                    "out_octets": iface.out_octets,
-                }
-                for iface in metrics.interfaces
-            ] or None
+            interface_counters = _interface_counter_rows(metrics.interfaces)
             await router_provisioning.record_health_snapshot(
                 router_id=router.id,
                 requesting_organization_id=router.organization_id,
@@ -1646,7 +1702,7 @@ async def run_router_snmp_metrics_poll_sweep(
                 memory_usage_percent=metrics.memory_usage_percent,
                 uptime_seconds=metrics.uptime_seconds,
                 interface_traffic_counters=interface_counters,
-                metrics_source="snmp",
+                metrics_source=MetricsSource.SNMP.value,
                 call_heartbeat=False,
             )
             checked += 1

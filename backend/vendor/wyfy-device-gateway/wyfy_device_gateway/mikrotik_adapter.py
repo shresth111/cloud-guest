@@ -79,6 +79,7 @@ from .contract import (
     DeviceCredentials,
     DeviceDiscoveryResult,
     DeviceHealthResult,
+    DeviceInterfaceCounters,
     DeviceVendor,
     DhcpPoolConfig,
     HotspotActiveSession,
@@ -663,6 +664,71 @@ def _same_routeros_path(current: object, wanted: object) -> bool:
         str(current).strip("/").split("/")[-1]
         == str(wanted).strip("/").split("/")[-1]
     )
+
+
+def _routeros_row_index(raw_id: object) -> int | None:
+    """RouterOS's own ``.id`` for a row (``"*1"``, ``"*A"``, ...) as an int.
+
+    The leading ``*`` is a sigil, and what follows it is **hexadecimal**
+    -- ``"*A"`` is 10. Reading it as decimal raises on exactly the rows
+    past the ninth, which is why this is a named function with a test
+    rather than an inline ``int(...)``.
+
+    Returns ``None`` for anything that is not that shape, so a caller can
+    skip the row instead of inventing an index for it.
+    """
+    text = str(raw_id).strip()
+    if not text.startswith("*"):
+        return None
+    try:
+        return int(text[1:], 16)
+    except ValueError:
+        return None
+
+
+def _interface_counters_from_rows(
+    rows: list[dict[str, object]],
+) -> tuple[DeviceInterfaceCounters, ...] | None:
+    """RouterOS ``/interface`` rows -> the shape the health snapshot stores.
+
+    Returns ``None`` -- never ``()`` -- for an empty read, because the
+    column this ends up in treats "nothing" as "no per-interface reading
+    was taken" and an empty list as "we looked and there were none". A
+    router that answered a poll always has interfaces, so an empty list
+    here could only ever be a lie about a failed read.
+
+    ``lo`` is dropped, matching ``_read_network_snapshot_sync``: it is
+    RouterOS's loopback, it carries no traffic anyone charts, and letting
+    it through would put a permanently flat series in front of the
+    operator on every device.
+
+    Counters are read with ``default=None``, not ``0``. An absent
+    ``rx-byte`` means the field was not reported; charting it as zero
+    invents an idle interface, and makes the *next* poll's delta enormous
+    when the real counter reappears.
+    """
+    counters: list[DeviceInterfaceCounters] = []
+    for row in rows:
+        raw_name = row.get("name")
+        if not raw_name:
+            continue
+        name = str(raw_name)
+        if name == "lo":
+            continue
+        if_index = _routeros_row_index(row.get(".id"))
+        if if_index is None:
+            # No usable identity for the series this row would join.
+            continue
+        counters.append(
+            DeviceInterfaceCounters(
+                if_index=if_index,
+                if_name=name,
+                if_oper_status_up=_is_truthy(row.get("running", False)),
+                in_octets=_safe_int(row.get("rx-byte"), default=None),
+                out_octets=_safe_int(row.get("tx-byte"), default=None),
+            )
+        )
+    return tuple(counters) or None
 
 
 def _is_truthy(value: object) -> bool:
@@ -4652,7 +4718,9 @@ class MikroTikAdapter:
         :class:`MikroTikConnectionError` subclass) is deliberately not
         caught here and propagates, exactly like the original."""
         try:
-            resource = await asyncio.to_thread(self._health_check_sync, creds)
+            resource, interface_rows = await asyncio.to_thread(
+                self._health_check_sync, creds
+            )
         except MikroTikConnectionError as exc:
             return DeviceHealthResult(
                 healthy=False,
@@ -4666,15 +4734,45 @@ class MikroTikAdapter:
             cpu_load_percent=_as_float(resource.get("cpu-load")),
             free_memory_bytes=_as_int(resource.get("free-memory")),
             uptime_seconds=_parse_routeros_uptime(resource.get("uptime")),
+            interfaces=_interface_counters_from_rows(interface_rows),
         )
 
-    def _health_check_sync(self, creds: DeviceCredentials) -> dict[str, object]:
+    def _health_check_sync(
+        self, creds: DeviceCredentials
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        """One session, two reads.
+
+        ``/interface`` is fetched here rather than by a second call
+        because the connection, the TLS handshake and the login are the
+        expensive part of a poll; the extra command costs one round trip
+        on a socket that is already open. Those counters were already
+        being fetched wholesale by
+        ``_get_interface_traffic_counters_sync`` (which reads the entire
+        table and then keeps exactly one row) -- this stops throwing the
+        rest away.
+
+        The interface read is deliberately non-fatal. CPU and uptime are
+        what "is this router alive" is decided on, and losing that answer
+        because the interface table could not be listed would turn a
+        richer reading into a *worse* one. A failure here yields an empty
+        list, which the caller turns into ``interfaces=None`` -- "not
+        measured", honestly distinct from "measured, and empty".
+        """
         api = self._connect_api(creds)
         try:
             try:
-                return next(iter(api("/system/resource/print")), {})
+                resource = next(iter(api("/system/resource/print")), {})
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(creds.host, f"health_check: {exc}") from exc
+            try:
+                interface_rows = list(api.path("interface"))
+            except LibRouterosError as exc:
+                logger.warning(
+                    "mikrotik_health_check_interface_read_failed",
+                    extra={"host": creds.host, "error": _describe_exception(exc)},
+                )
+                interface_rows = []
+            return resource, interface_rows
         finally:
             api.close()
 

@@ -29,6 +29,7 @@ import pytest
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.isp.constants import (
     DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER,
+    MAX_RATE_INTERVAL_SECONDS,
     SPEED_TEST_DOWNLOAD_URL,
     SPEED_TEST_TIMEOUT_SECONDS,
     HealthStatus,
@@ -1902,6 +1903,113 @@ class TestTrafficLoad:
         # left untouched rather than blanked to None.
         assert updated.current_download_mbps == 8.0
         assert updated.current_upload_mbps == 4.0
+
+    async def test_a_gap_too_long_to_average_over_yields_no_rate(self) -> None:
+        """A delta across hours is a real total and a fictional rate.
+
+        The failure this pins is not a crash -- it is a *plausible
+        number*. If the sweep stops for six hours (a stopped worker, a
+        redeployed stack) and then resumes, the next tick sees a genuinely
+        enormous byte delta and divides it by six hours. Out comes a small,
+        calm figure that renders as an ordinary point on the card, and the
+        saturated evening inside that window is averaged into nothing.
+        Nobody can tell by looking; there is no gap in the line and no
+        marker on the point.
+
+        Roughly 100 Mbps sustained across a six-hour hole is the shape
+        used here, because it comes out around 0.7 Mbps -- exactly the
+        kind of number an operator would read straight past. The correct
+        output is no rate at all.
+
+        The counters still advance, so the *next* tick measures across a
+        normal window instead of inheriting the hole -- one long outage
+        must not poison the series indefinitely.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="Static ISP",
+            link_type=IspLinkType.FIBER.value,
+            role=IspLinkRole.PRIMARY,
+            gateway_ip_address="203.0.113.1",
+            interface="ether1",
+        )
+        six_hours_ago = datetime.now(UTC) - timedelta(hours=6)
+        link = await h.repository.update_link(
+            link,
+            {
+                "last_rx_bytes": 0,
+                "last_tx_bytes": 0,
+                "last_checked_at": six_hours_ago,
+                "current_download_mbps": 8.0,
+                "current_upload_mbps": 4.0,
+            },
+        )
+        traffic = TrafficCounters(rx_bytes=270_000_000_000, tx_bytes=135_000_000_000)
+        updated = await h.service.record_health_check_result(
+            link,
+            ping_result=PingResult(
+                sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=10.0
+            ),
+            traffic=traffic,
+        )
+
+        checks, _ = await h.repository.list_health_checks_for_link(
+            link.id, page=1, page_size=10
+        )
+        assert checks[0].download_mbps is None
+        assert checks[0].upload_mbps is None
+        # Last known-real rate is left standing, not blanked -- same
+        # posture as the counter-regression case above.
+        assert updated.current_download_mbps == 8.0
+        # The baseline moves on regardless, so the next tick recovers.
+        assert updated.last_rx_bytes == 270_000_000_000
+        assert updated.last_tx_bytes == 135_000_000_000
+
+    async def test_a_gap_just_inside_the_cap_still_produces_a_rate(self) -> None:
+        """The other half of the boundary.
+
+        A cap set too tight is its own defect: it would blank the card
+        during ordinary jitter -- a slow sweep, a worker restart -- and
+        train operators to read an empty chart as normal, which is how a
+        real outage stops being visible.
+        """
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        link = await h.service.create_link(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            router_id=router.id,
+            provider_name="Static ISP",
+            link_type=IspLinkType.FIBER.value,
+            role=IspLinkRole.PRIMARY,
+            gateway_ip_address="203.0.113.1",
+            interface="ether1",
+        )
+        just_inside = datetime.now(UTC) - timedelta(
+            seconds=MAX_RATE_INTERVAL_SECONDS - 60
+        )
+        link = await h.repository.update_link(
+            link,
+            {
+                "last_rx_bytes": 0,
+                "last_tx_bytes": 0,
+                "last_checked_at": just_inside,
+            },
+        )
+        # 1740s at 8 Mbps down.
+        traffic = TrafficCounters(rx_bytes=1_740_000_000, tx_bytes=0)
+        updated = await h.service.record_health_check_result(
+            link,
+            ping_result=PingResult(
+                sent=5, received=5, packet_loss_percentage=0.0, avg_rtt_ms=10.0
+            ),
+            traffic=traffic,
+        )
+        assert updated.current_download_mbps == pytest.approx(8.0, rel=0.05)
 
     async def test_pppoe_link_samples_traffic_on_its_own_virtual_interface(
         self,
