@@ -52,7 +52,11 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
-from wyfy_device_gateway.contract import DeviceVendor, DhcpPoolConfig
+from wyfy_device_gateway.contract import (
+    DeviceVendor,
+    DhcpPoolConfig,
+    RogueDhcpAlertConfig,
+)
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikConnectionError,
     MikroTikDeviceError,
@@ -113,6 +117,19 @@ class BaseDhcpAdapter(Protocol):
         is the field an operator actually edits, so a widened pool really
         widens on the device instead of silently reporting success against
         the old range.
+        """
+        ...
+
+    async def ensure_rogue_dhcp_alert(
+        self, credentials: DhcpCredentials, *, interface: str
+    ) -> str | None:
+        """Ask the device to log any DHCP server on ``interface`` that is not
+        the router itself, and report the trusted MAC it used.
+
+        Returns ``None`` when the router has no hardware address on that
+        interface, which is the one case where the alert must NOT be
+        written: `valid-server` would have to be guessed, and a wrong value
+        makes every legitimate lease reply look rogue.
         """
         ...
 
@@ -182,6 +199,42 @@ class MikroTikDhcpAdapter:
         except MikroTikDeviceError as exc:
             raise DhcpDeviceOperationError(
                 "configure_dhcp_pool", exc.detail
+            ) from exc
+
+    async def ensure_rogue_dhcp_alert(
+        self, credentials: DhcpCredentials, *, interface: str
+    ) -> str | None:
+        creds = self._gateway_credentials(credentials)
+        gateway = get_adapter(DeviceVendor.MIKROTIK)
+        try:
+            snapshot = await gateway.read_network_snapshot(creds)
+            mac = next(
+                (
+                    i.mac_address
+                    for i in snapshot.interfaces
+                    if i.name == interface and i.mac_address
+                ),
+                None,
+            )
+            if mac is None:
+                # Refuse rather than default. See the Protocol docstring:
+                # a guessed trusted server turns every real lease into an
+                # alert, which is how a genuine one gets ignored.
+                return None
+            await gateway.configure_rogue_dhcp_alerts(
+                creds,
+                alerts=[
+                    RogueDhcpAlertConfig(
+                        interface=interface, valid_servers=(mac,)
+                    )
+                ],
+            )
+            return mac
+        except MikroTikConnectionError as exc:
+            raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DhcpDeviceOperationError(
+                "ensure_rogue_dhcp_alert", exc.detail
             ) from exc
 
     async def delete_dhcp_pool(

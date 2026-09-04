@@ -913,6 +913,11 @@ class MikroTikAdapter:
                     bridge=bridge_of.get(name),
                     has_ip_address=name in has_ip,
                     is_bridge_port=name in bridge_of,
+                    mac_address=(
+                        str(row.get("mac-address"))
+                        if row.get("mac-address")
+                        else None
+                    ),
                 )
             )
         return result
@@ -975,6 +980,11 @@ class MikroTikAdapter:
                     bridge=bridge_of.get(name),
                     has_ip_address=name in has_ip,
                     is_bridge_port=name in bridge_of,
+                    mac_address=(
+                        str(row.get("mac-address"))
+                        if row.get("mac-address")
+                        else None
+                    ),
                 )
             )
         return NetworkSnapshot(

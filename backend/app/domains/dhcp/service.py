@@ -428,6 +428,40 @@ class DhcpService:
                 dns_servers=self._dns_servers(pool),
                 lease_time_seconds=pool.lease_time_seconds,
             )
+            # A DHCP server has just appeared on this interface, which is
+            # the moment the segment becomes worth guarding: a consumer
+            # router plugged in here would answer leases too, and win
+            # whenever it answers first. One was seen on this fleet's guest
+            # bridge announcing the WAN gateway's address.
+            #
+            # Deliberately NOT part of the push's success or failure. The
+            # alert is a guard around the feature, not the feature, and a
+            # pool that reached the router must not be reported as failed
+            # because a watch could not be set beside it. It is logged
+            # instead, and `read_rogue_dhcp_alerts` reports the truth
+            # separately -- so this stays quiet without ever claiming the
+            # segment is guarded when it is not.
+            try:
+                trusted = await adapter.ensure_rogue_dhcp_alert(
+                    credentials, interface=pool.interface
+                )
+                if trusted is None:
+                    logger.warning(
+                        "dhcp_rogue_alert_skipped_no_mac",
+                        extra={
+                            "event_pool_id": str(pool.id),
+                            "event_interface": pool.interface,
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001 -- never fails the push
+                logger.warning(
+                    "dhcp_rogue_alert_failed",
+                    extra={
+                        "event_pool_id": str(pool.id),
+                        "event_interface": pool.interface,
+                        "event_error": str(exc),
+                    },
+                )
         except Exception as exc:  # noqa: BLE001 -- committed, then re-raised
             await self.repository.update_pool(
                 pool,
