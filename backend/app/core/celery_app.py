@@ -124,6 +124,11 @@ from app.domains.connected_devices.constants import (
     TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
     TASK_SYNC_SINGLE_ROUTER_DEVICES,
 )
+from app.domains.dhcp.constants import (
+    ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,
+    TASK_DETECT_ROGUE_DHCP_FOR_ROUTER,
+    TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
+)
 from app.domains.guest.constants import (
     FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
     QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
@@ -208,6 +213,7 @@ celery_app = Celery(
         "app.domains.billing.tasks",
         "app.domains.campaigns.tasks",
         "app.domains.connected_devices.tasks",
+        "app.domains.dhcp.tasks",
         "app.domains.guest.tasks",
         "app.domains.hub_reconciliation.tasks",
         "app.domains.isp.tasks",
@@ -274,6 +280,15 @@ celery_app.conf.update(
         # .TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP's own docstring), so it
         # belongs on the real-device-I/O queue for the identical reason.
         TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The rogue-DHCP detector's per-router fan-out *leaf* task -- a real
+        # RouterOS API read of ``/ip dhcp-server alert`` per router (see
+        # app.domains.dhcp.tasks's own module docstring). On this queue for
+        # the identical reason TASK_POLL_SINGLE_ROUTER_HEALTH is: it is
+        # where the actual device round trip happens. Its Beat-scheduled
+        # coordinator (TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP) is deliberately
+        # left off -- one DB query plus N .delay() calls, no device I/O of
+        # its own.
+        TASK_DETECT_ROGUE_DHCP_FOR_ROUTER: {"queue": DEVICE_IO_QUEUE_NAME},
     },
     beat_schedule={
         # Hub reconciliation -- every 5 minutes, the shortest cadence in
@@ -461,6 +476,29 @@ celery_app.conf.update(
         "provisioning-engine-router-snmp-metrics-poll-sweep": {
             "task": TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP,
             "schedule": ROUTER_SNMP_METRICS_POLL_SWEEP_INTERVAL_SECONDS,
+        },
+        # Rogue-DHCP detection -- every 6 hours, by a wide margin the
+        # slowest cadence in this schedule, and deliberately so. What it
+        # reads is configuration, not liveness: an ``/ip dhcp-server alert``
+        # row changes when this platform pushes a DHCP pool (which writes
+        # the alert in the same call, so that transition is already known
+        # without a sweep) or when a human edits the router by hand -- an
+        # out-of-band event with no deadline. Against that, the cost is a
+        # real RouterOS round trip per DHCP-serving router, forever. See
+        # app.domains.dhcp.constants
+        # .ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS's own docstring for
+        # the full cadence reasoning, and app.domains.dhcp.tasks's module
+        # docstring for why this is a separate task rather than extra work
+        # folded into the 10-minute health poll above.
+        #
+        # This is the entry that gives
+        # ``wyfy_device_gateway.mikrotik_adapter.read_rogue_dhcp_alerts``
+        # its first caller: a router that is not being watched has no alert
+        # row, raises no error, and was invisible precisely because it was
+        # unguarded.
+        "dhcp-rogue-detection-sweep": {
+            "task": TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
+            "schedule": ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,
         },
         # Queue Management Engine: re-evaluates every ACTIVE/SUSPENDED
         # QueueAssignment scoped to a QueueSchedule and flips its device

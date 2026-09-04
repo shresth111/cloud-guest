@@ -14,6 +14,8 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
+from app.domains.dhcp.dependencies import get_dhcp_service
+from app.domains.dhcp.service import DhcpService
 from app.domains.isp.dependencies import get_isp_service
 from app.domains.isp.service import IspService
 from app.domains.router.dependencies import get_router_service
@@ -46,6 +48,7 @@ def get_readiness_service(
     router_provisioning_service: RouterProvisioningService = Depends(
         get_router_provisioning_service
     ),
+    dhcp_service: DhcpService = Depends(get_dhcp_service),
 ) -> ReadinessService:
     return ReadinessService(
         repository,
@@ -58,6 +61,14 @@ def get_readiness_service(
         # check can only see ISP links, and would fail a router that was
         # genuinely configured by a push.
         router_provisioning_service,
+        # Supplies ROGUE_DHCP_GUARD's evidence, and supplies it from the
+        # database only. ``DhcpService.get_rogue_dhcp_statuses`` reads the
+        # rows ``app.domains.dhcp.tasks``'s six-hourly detector persisted;
+        # the RouterOS round trip happened there, off this request path.
+        # Wiring anything here that talks to a device would put a device
+        # timeout behind every checklist GET -- see that method's own
+        # docstring and ``service.RogueDhcpStatusLookupProtocol``'s.
+        dhcp_service,
     )
 
 

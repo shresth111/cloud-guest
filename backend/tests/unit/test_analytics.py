@@ -812,6 +812,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # as old as the last time a human pressed "Run health checks now". See
     # app.domains.monitoring.constants
     # .HEALTH_CHECK_SWEEP_INTERVAL_SECONDS's own comment.
+    # DHCP domain adds a twentieth Beat entry ("dhcp-rogue-detection-sweep")
+    # -- the scheduled rogue-DHCP detector, and the first caller
+    # ``wyfy_device_gateway.mikrotik_adapter.read_rogue_dhcp_alerts`` has
+    # ever had. See app.domains.dhcp.tasks's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -852,6 +856,13 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "notification-dispatch-sweep",
         "monitoring-alert-rule-evaluation-sweep",
         "provisioning-engine-router-snmp-metrics-poll-sweep",
+        # Reads /ip dhcp-server alert per DHCP-serving router and persists
+        # the answer for the readiness checklist to display. Its absence
+        # from this set is not a missing schedule entry, it is a fleet in
+        # which a router that is not watching for a rogue DHCP server looks
+        # exactly like one that is -- there is no alert row, no error, and
+        # nothing anywhere that says so.
+        "dhcp-rogue-detection-sweep",
     }
 
 

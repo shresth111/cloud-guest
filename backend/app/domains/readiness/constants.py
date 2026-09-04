@@ -1,7 +1,7 @@
 """Enumerations and the fixed checklist-item registry for the Router
 Readiness Checklist domain.
 
-``CHECKLIST_ITEMS`` is the single source of truth for which 14 items exist,
+``CHECKLIST_ITEMS`` is the single source of truth for which 16 items exist,
 their display copy, and whether each is auto-detectable today. Adding a new
 item is additive (append here; no migration needed -- ``item_key`` is a
 plain string column, the same "no native enum type" posture
@@ -11,7 +11,15 @@ document).
 **Auto-detected today** (``DetectionMode.AUTO``, zero new device I/O --
 computed live in ``service.py``'s ``run_auto_detection`` from telemetry this
 platform already collects): ``HEARTBEAT``, ``SAAS_PROVISIONING``,
-``WAN_CONNECTIVITY``, ``WIREGUARD``, ``API_REACHABILITY``.
+``WAN_CONNECTIVITY``, ``WIREGUARD``, ``API_REACHABILITY``,
+``GUEST_DATA_PATH``, and ``ROGUE_DHCP_GUARD``.
+
+``ROGUE_DHCP_GUARD`` is the one AUTO item whose evidence originates on a
+device rather than in telemetry this platform already holds -- and it still
+costs this domain zero new device I/O, because it reads only the row
+``app.domains.dhcp.tasks``'s scheduled detector persisted hours earlier.
+That split (detector writes, surface reads) is what lets a real device fact
+appear on a checklist whose read path re-runs on every GET.
 
 **Manual-only for now** (``DetectionMode.MANUAL`` -- an operator ticks these
 after checking on-site or via another tab; ``service.py``'s
@@ -80,6 +88,7 @@ class ChecklistItemKey(StrEnum):
     FIREWALL = "firewall"
     RADIUS_AUTH = "radius_auth"
     RADIUS_ACCOUNTING = "radius_accounting"
+    ROGUE_DHCP_GUARD = "rogue_dhcp_guard"
     DOH_DOT_BLOCKING = "doh_dot_blocking"
     REBOOT_PERSISTENCE = "reboot_persistence"
 
@@ -224,6 +233,33 @@ CHECKLIST_ITEMS: tuple[ChecklistItemDefinition, ...] = (
         label="RADIUS accounting",
         description="RADIUS accounting records are being received for this router.",
         detection_mode=DetectionMode.MANUAL,
+        category=ChecklistCategory.SECURITY,
+    ),
+    # Reads a persisted row and nothing else. The device read that produced
+    # it happened hours earlier, off the request path, in
+    # ``app.domains.dhcp.tasks`` -- which is what lets an AUTO item exist
+    # here at all without breaking this domain's zero-new-device-I/O rule
+    # (``service.get_checklist`` re-runs every AUTO item on every GET, so
+    # anything it calls is on a hot path).
+    #
+    # DETECTION ONLY, and the copy must stay that way. RouterOS's
+    # ``/ip dhcp-server alert`` writes a log entry when it sees a DHCP
+    # server it does not trust. It does not drop the offer, block the port,
+    # or rate-limit anything. "Protected"/"blocked"/"guarded" would each
+    # describe a capability the feature does not have, and an operator who
+    # believed it would stop looking for the rogue server -- which is the
+    # actual harm. The item KEY says guard for continuity with
+    # ``app.domains.dhcp.constants.RogueDhcpAlertState``'s own vocabulary
+    # and the gateway contract's ``guarded`` property; the label and
+    # description, the only parts a human reads, say detection.
+    ChecklistItemDefinition(
+        key=ChecklistItemKey.ROGUE_DHCP_GUARD,
+        label="Rogue DHCP detection",
+        description=(
+            "This router is watching for another DHCP server on the guest "
+            "network. Detection only -- it logs, it does not block."
+        ),
+        detection_mode=DetectionMode.AUTO,
         category=ChecklistCategory.SECURITY,
     ),
     ChecklistItemDefinition(
