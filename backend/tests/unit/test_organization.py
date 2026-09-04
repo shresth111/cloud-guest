@@ -394,9 +394,7 @@ class TestOrganizationBranding:
 
     async def test_update_branding_rejects_archived_organization(self) -> None:
         service, repo, _ = make_service()
-        org = await make_organization(
-            repo, "Acme", status=OrganizationStatus.ARCHIVED
-        )
+        org = await make_organization(repo, "Acme", status=OrganizationStatus.ARCHIVED)
 
         with pytest.raises(OrganizationArchivedError):
             await service.update_branding(
@@ -411,9 +409,7 @@ class TestOrganizationBranding:
         org = await make_organization(repo, "Acme")
 
         with pytest.raises(CrossOrganizationAccessError):
-            await service.get_branding(
-                org.id, requesting_organization_id=uuid.uuid4()
-            )
+            await service.get_branding(org.id, requesting_organization_id=uuid.uuid4())
 
 
 # ============================================================================
@@ -754,6 +750,7 @@ class TestMembershipLifecycle:
             actor_user_id=inviter_id,
             organization_id=organization.id,
             user_id=invitee_id,
+            requesting_organization_id=None,
         )
 
         assert member.status == MembershipStatus.INVITED.value
@@ -772,6 +769,7 @@ class TestMembershipLifecycle:
                 actor_user_id=uuid.uuid4(),
                 organization_id=organization.id,
                 user_id=user_id,
+                requesting_organization_id=None,
             )
 
     async def test_invite_already_pending_member_raises(self) -> None:
@@ -782,6 +780,7 @@ class TestMembershipLifecycle:
             actor_user_id=uuid.uuid4(),
             organization_id=organization.id,
             user_id=user_id,
+            requesting_organization_id=None,
         )
 
         with pytest.raises(DuplicateMembershipError):
@@ -789,6 +788,7 @@ class TestMembershipLifecycle:
                 actor_user_id=uuid.uuid4(),
                 organization_id=organization.id,
                 user_id=user_id,
+                requesting_organization_id=None,
             )
 
     async def test_invite_suspended_member_raises_must_reactivate(self) -> None:
@@ -807,6 +807,7 @@ class TestMembershipLifecycle:
                 actor_user_id=uuid.uuid4(),
                 organization_id=organization.id,
                 user_id=user_id,
+                requesting_organization_id=None,
             )
 
     async def test_invite_removed_member_allows_re_invite(self) -> None:
@@ -822,6 +823,7 @@ class TestMembershipLifecycle:
             actor_user_id=uuid.uuid4(),
             organization_id=organization.id,
             user_id=user_id,
+            requesting_organization_id=None,
         )
 
         assert new_invite.status == MembershipStatus.INVITED.value
@@ -835,6 +837,7 @@ class TestMembershipLifecycle:
             actor_user_id=uuid.uuid4(),
             organization_id=organization.id,
             user_id=user_id,
+            requesting_organization_id=None,
         )
 
         accepted = await service.accept_invite(
@@ -853,6 +856,7 @@ class TestMembershipLifecycle:
             actor_user_id=uuid.uuid4(),
             organization_id=organization.id,
             user_id=invitee_id,
+            requesting_organization_id=None,
         )
 
         with pytest.raises(OrganizationMembershipNotFoundError):
@@ -893,6 +897,7 @@ class TestMembershipLifecycle:
             actor_user_id=uuid.uuid4(),
             organization_id=organization.id,
             member_id=member.id,
+            requesting_organization_id=None,
         )
 
         assert removed.status == MembershipStatus.REMOVED.value
@@ -911,6 +916,7 @@ class TestMembershipLifecycle:
                 actor_user_id=uuid.uuid4(),
                 organization_id=organization.id,
                 member_id=member.id,
+                requesting_organization_id=None,
             )
 
     async def test_remove_already_removed_member_raises(self) -> None:
@@ -927,6 +933,7 @@ class TestMembershipLifecycle:
             actor_user_id=uuid.uuid4(),
             organization_id=organization.id,
             member_id=member.id,
+            requesting_organization_id=None,
         )
 
         with pytest.raises(InvalidMembershipStatusTransitionError):
@@ -934,6 +941,7 @@ class TestMembershipLifecycle:
                 actor_user_id=uuid.uuid4(),
                 organization_id=organization.id,
                 member_id=member.id,
+                requesting_organization_id=None,
             )
 
     async def test_change_member_status_suspends_member(self) -> None:

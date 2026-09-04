@@ -499,9 +499,24 @@ class OrganizationService:
         actor_user_id: uuid.UUID,
         organization_id: uuid.UUID,
         user_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         is_primary_contact: bool = False,
     ) -> OrganizationMember:
+        """Invites ``user_id`` into ``organization_id``.
+
+        ``requesting_organization_id`` has no default on purpose. This
+        method took its target organization from the path while
+        ``RequirePermission("organizations.manage")`` scoped off the
+        ``X-Organization-Id`` header, so a caller holding it on its **own**
+        organization could plant a member -- itself, or any user id it
+        knows -- inside any other tenant. Its siblings
+        (``update_organization``, ``activate_organization``) already call
+        ``_enforce_tenant_access``; these two membership writers were the
+        pair that did not. Without a default, a caller that forgets is a
+        ``TypeError`` rather than a silent cross-tenant write.
+        """
         organization = await self.get_organization(organization_id)
+        self._enforce_tenant_access(organization, requesting_organization_id)
         if organization.status == OrganizationStatus.ARCHIVED.value:
             raise OrganizationArchivedError(organization_id)
 
@@ -578,7 +593,15 @@ class OrganizationService:
         actor_user_id: uuid.UUID,
         organization_id: uuid.UUID,
         member_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> OrganizationMember:
+        """Removes a membership. See ``invite_member`` for why
+        ``requesting_organization_id`` is required rather than defaulted --
+        unguarded, this evicted members from any tenant by id, and
+        ``LastActiveMemberError`` means the last one out locks the
+        organization's own people out of it."""
+        organization = await self.get_organization(organization_id)
+        self._enforce_tenant_access(organization, requesting_organization_id)
         member = await self._get_member_in_organization(organization_id, member_id)
         if member.status == MembershipStatus.REMOVED.value:
             raise InvalidMembershipStatusTransitionError(

@@ -422,9 +422,7 @@ class Fixture:
     branding_lookup: FakeBrandingLookup | None = None
 
 
-def make_service(
-    *, with_cache: bool = False, with_branding: bool = False
-) -> Fixture:
+def make_service(*, with_cache: bool = False, with_branding: bool = False) -> Fixture:
     repository = FakeCaptivePortalRepository()
     audit_writer = FakeAuditLogWriter()
     organization_lookup = FakeOrganizationLookup()
@@ -1617,9 +1615,7 @@ class TestBrandingFoldedIntoResolveCache:
         resolve and never again while the entry is cached."""
         fx = make_service(with_cache=True, with_branding=True)
         await _create_config(fx, name="Org default", is_default=True)
-        fx.branding_lookup.add(
-            fx.organization.id, logo_key="branding/x/logo/a.png"
-        )
+        fx.branding_lookup.add(fx.organization.id, logo_key="branding/x/logo/a.png")
 
         await fx.service.resolve_portal_config(
             organization_id=fx.organization.id, location_id=None
@@ -1706,9 +1702,7 @@ class TestBrandingFoldedIntoResolveCache:
         class of bug the route's own comment records an incident for."""
         fx = make_service(with_cache=True, with_branding=True)
         await _create_config(fx, name="Org default", is_default=True)
-        fx.branding_lookup.add(
-            fx.organization.id, logo_key="branding/x/logo/a.png"
-        )
+        fx.branding_lookup.add(fx.organization.id, logo_key="branding/x/logo/a.png")
 
         await fx.service.resolve_portal_config(
             organization_id=fx.organization.id, location_id=None
@@ -1727,9 +1721,7 @@ class TestBrandingFoldedIntoResolveCache:
         await _create_config(fx, name="Org default", is_default=True)
         location_a = fx.location_lookup.add(organization_id=fx.organization.id)
         location_b = fx.location_lookup.add(organization_id=fx.organization.id)
-        fx.branding_lookup.add(
-            fx.organization.id, logo_key="branding/x/logo/old.png"
-        )
+        fx.branding_lookup.add(fx.organization.id, logo_key="branding/x/logo/old.png")
 
         for location in (location_a, location_b):
             await fx.service.resolve_portal_config(
@@ -1766,9 +1758,7 @@ class TestBrandingWritesInvalidateTheResolveCache:
         from app.domains.branding.service import BrandingService
 
         class _ExplodingCache:
-            async def invalidate_organization(
-                self, organization_id: uuid.UUID
-            ) -> None:
+            async def invalidate_organization(self, organization_id: uuid.UUID) -> None:
                 raise RuntimeError("redis down")
 
         service = BrandingService(
@@ -1783,7 +1773,6 @@ class TestBrandingWritesInvalidateTheResolveCache:
 
         service = BrandingService(repository=SimpleNamespace())
         await service._invalidate_portal_resolve_cache(uuid.uuid4())
-
 
 
 class TestResolveCacheFailsOpen:
@@ -2341,21 +2330,11 @@ _WELCOME_AT_LIMIT = {
         "Welcome to The Grand Palace Hotel. Enjoy complimentary WiFi"
         " during your stay."
     ),
-    "hi": (
-        "ग्रैंड पैलेस होटल में आपका स्वागत है।"
-        " निःशुल्क वाईफाई का आनंद लें।"
-    ),
-    "ta": (
-        "கிராண்ட் பேலஸ் ஹோட்டலுக்கு வரவேற்கிறோம்."
-        " இலவச வைஃபையை அனுபவியுங்கள்."
-    ),
-    "ml": (
-        "ഗ്രാൻഡ് പാലസിലേക്ക് സ്വാഗതം."
-        " സൗജന്യ വൈഫൈ ആസ്വദിക്കൂ. നന്ദി."
-    ),
+    "hi": ("ग्रैंड पैलेस होटल में आपका स्वागत है।" " निःशुल्क वाईफाई का आनंद लें।"),
+    "ta": ("கிராண்ட் பேலஸ் ஹோட்டலுக்கு வரவேற்கிறோம்." " இலவச வைஃபையை அனுபவியுங்கள்."),
+    "ml": ("ഗ്രാൻഡ് പാലസിലേക്ക് സ്വാഗതം." " സൗജന്യ വൈഫൈ ആസ്വദിക്കൂ. നന്ദി."),
     "ar": (
-        "مرحبًا بكم في فندق جراند بالاس."
-        " استمتعوا بإنترنت لاسلكي مجاني طوال إقامتكم."
+        "مرحبًا بكم في فندق جراند بالاس." " استمتعوا بإنترنت لاسلكي مجاني طوال إقامتكم."
     ),
 }
 
@@ -2440,9 +2419,9 @@ class TestSplashTextLengthValidator:
         self, language: str
     ) -> None:
         sample = _WELCOME_AT_LIMIT[language]
-        assert len(sample) <= SPLASH_WELCOME_MESSAGE_MAX_LENGTH, (
-            f"{language} sample is {len(sample)} chars, over the limit"
-        )
+        assert (
+            len(sample) <= SPLASH_WELCOME_MESSAGE_MAX_LENGTH
+        ), f"{language} sample is {len(sample)} chars, over the limit"
         validate_splash_text_length("splash_welcome_message", sample)
 
     @pytest.mark.parametrize("language", sorted(_WELCOME_AT_LIMIT))
@@ -2454,9 +2433,7 @@ class TestSplashTextLengthValidator:
         # whichever script the venue writes in.
         sample = _WELCOME_AT_LIMIT[language]
         padding = "०" if language in {"hi"} else "a"
-        over = sample + padding * (
-            SPLASH_WELCOME_MESSAGE_MAX_LENGTH - len(sample) + 1
-        )
+        over = sample + padding * (SPLASH_WELCOME_MESSAGE_MAX_LENGTH - len(sample) + 1)
         with pytest.raises(SplashTextTooLongError) as exc:
             validate_splash_text_length("splash_welcome_message", over)
         assert exc.value.data["actual_length"] == len(over)
@@ -3026,9 +3003,7 @@ class TestPoweredByAttributionReset:
 
         assert count == 0
         # No pointless fan-out: the cached entry survives untouched.
-        assert await fx.resolve_cache.get(fx.organization.id, None) == {
-            "cached": True
-        }
+        assert await fx.resolve_cache.get(fx.organization.id, None) == {"cached": True}
         assert fx.audit_writer.entries == []
 
     async def test_reset_is_idempotent(self) -> None:
@@ -3114,11 +3089,16 @@ class TestPoweredByAttributionReset:
             actor_user_id=None, organization_id=org_id, plan_id=pro.id
         )
         await license_service.activate_license(
-            actor_user_id=None, license_id=license_.id
+            actor_user_id=None,
+            license_id=license_.id,
+            requesting_organization_id=None,
         )
 
         await license_service.downgrade_license(
-            actor_user_id=None, license_id=license_.id, new_plan_id=starter.id
+            actor_user_id=None,
+            license_id=license_.id,
+            new_plan_id=starter.id,
+            requesting_organization_id=None,
         )
 
         assert config.powered_by_enabled is True

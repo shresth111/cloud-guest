@@ -461,21 +461,75 @@ class RouterProvisioningService:
         )
         return variable
 
-    async def get_variable(self, variable_id: uuid.UUID) -> ConfigVariable:
+    async def get_variable(
+        self,
+        variable_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> ConfigVariable:
+        """One variable, refused when it belongs to another tenant.
+
+        ``requesting_organization_id`` is a **required** keyword, with no
+        default, deliberately. This method used to be a bare lookup by id,
+        and both writers below reached it without saying whose request they
+        were serving -- so ``PUT``/``DELETE
+        /router-templates/variables/{id}`` overwrote and removed any
+        tenant's variables by id. A default of ``None`` would have kept
+        that hole open for the next caller who forgot; without one, a
+        caller that forgets is a ``TypeError`` at import-time-adjacent
+        distance rather than a silent cross-tenant write.
+
+        ``None`` still means platform-level (the Master console), which may
+        reach every row, and matches ``_resolve_variable_scope_fks``.
+        """
         variable = await self.repository.get_variable(variable_id)
         if variable is None:
             raise ConfigVariableNotFoundError(variable_id)
+        self._enforce_variable_scope(variable, requesting_organization_id)
         return variable
+
+    @staticmethod
+    def _enforce_variable_scope(
+        variable: ConfigVariable, requesting_organization_id: uuid.UUID | None
+    ) -> None:
+        """Whether ``requesting_organization_id`` may act on ``variable``.
+
+        Mirrors the rule ``_resolve_variable_scope_fks`` already applies on
+        create, so read/update/delete cannot be looser than create was:
+
+        * a platform-level caller (no organization context) may act on
+          anything, including the ``organization_id IS NULL`` global
+          defaults;
+        * an organization-scoped caller may act only on its own rows. A
+          global default is refused rather than allowed read-only: such a
+          caller cannot create one, so being able to overwrite one would be
+          strictly more power than it has anywhere else in this domain.
+        """
+        if requesting_organization_id is None:
+            return
+        if variable.organization_id == requesting_organization_id:
+            return
+        raise CrossOrganizationVariableAccessError()
 
     async def list_variables(
         self,
         *,
         scope_type: ConfigVariableScope | None = None,
+        requesting_organization_id: uuid.UUID | None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[ConfigVariable], object]:
+        """A page of config variables, narrowed to the caller's tenant.
+
+        The narrowing is not cosmetic: ``_variable_response`` returns each
+        row's ``organization_id``/``location_id``/``router_id`` and, for
+        anything not marked secret, its **plaintext value**. Unnarrowed,
+        this endpoint handed every tenant the whole platform's variables
+        *and* the ids needed to address them one by one.
+        """
         return await self.repository.list_variables(
             scope_type=scope_type.value if scope_type else None,
+            organization_id=requesting_organization_id,
             page=page,
             page_size=page_size,
         )
@@ -485,10 +539,13 @@ class RouterProvisioningService:
         *,
         actor_user_id: uuid.UUID | None,
         variable_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         value: str | None = None,
         is_secret: bool | None = None,
     ) -> ConfigVariable:
-        variable = await self.get_variable(variable_id)
+        variable = await self.get_variable(
+            variable_id, requesting_organization_id=requesting_organization_id
+        )
         new_is_secret = is_secret if is_secret is not None else variable.is_secret
         update_data: dict[str, object] = {"updated_by": actor_user_id}
         if value is not None:
@@ -498,9 +555,15 @@ class RouterProvisioningService:
         return await self.repository.update_variable(variable, update_data)
 
     async def delete_variable(
-        self, *, actor_user_id: uuid.UUID | None, variable_id: uuid.UUID
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        variable_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> ConfigVariable:
-        variable = await self.get_variable(variable_id)
+        variable = await self.get_variable(
+            variable_id, requesting_organization_id=requesting_organization_id
+        )
         return await self.repository.soft_delete_variable(variable)
 
     async def resolve_variables(self, router: Router) -> dict[str, str]:
@@ -914,9 +977,7 @@ class RouterProvisioningService:
         # leaves a clean, correctly-FAILED job/version (never a silently
         # stuck "queued"/"pending_apply" pair) -- see
         # `_push_version_and_complete`'s own docstring.
-        final_job = await self._push_version_and_complete(
-            router, job, updated_version
-        )
+        final_job = await self._push_version_and_complete(router, job, updated_version)
         final_version = await self.repository.get_version(updated_version.id)
         return (final_version or updated_version), final_job
 
@@ -972,9 +1033,7 @@ class RouterProvisioningService:
             )
         return await self.complete_provisioning_job(started.id, success=True)
 
-    async def _complete_job_immediately(
-        self, job: ProvisioningJob
-    ) -> ProvisioningJob:
+    async def _complete_job_immediately(self, job: ProvisioningJob) -> ProvisioningJob:
         """For job types whose real work (per `_complete_job_success`) is
         entirely a platform-side database change -- BACKUP, RESTORE,
         FACTORY_RESET, none of which involve a real device call by this

@@ -2381,13 +2381,24 @@ class IncidentService:
         self,
         incident_id: uuid.UUID,
         *,
+        requesting_organization_id: uuid.UUID | None,
         status: IncidentStatus | None = None,
         title: str | None = None,
         description: str | None = None,
         assigned_to_user_id: uuid.UUID | None = None,
         resolution_notes: str | None = None,
     ) -> Incident:
-        incident = await self.get_incident(incident_id)
+        """Updates one incident.
+
+        ``requesting_organization_id`` has no default. The handler took its
+        target from the path while ``RequirePermission`` scoped off the
+        ``X-Organization-Id`` header, so the check and the write named
+        different tenants. The guarded lookup below already existed and
+        already accepted the argument -- it simply was never given one.
+        """
+        incident = await self.get_incident(
+            incident_id, requesting_organization_id=requesting_organization_id
+        )
         data: dict[str, object] = {}
         if title is not None:
             data["title"] = title
@@ -2418,9 +2429,23 @@ class IncidentService:
         return await self.repository.update_incident(incident, data)
 
     async def attach_alert(
-        self, incident_id: uuid.UUID, alert_id: uuid.UUID
+        self,
+        incident_id: uuid.UUID,
+        alert_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
     ) -> Incident:
-        incident = await self.get_incident(incident_id)
+        """Attaches an alert to an incident.
+
+        ``requesting_organization_id`` has no default. The handler took its
+        target from the path while ``RequirePermission`` scoped off the
+        ``X-Organization-Id`` header, so the check and the write named
+        different tenants. The guarded lookup below already existed and
+        already accepted the argument -- it simply was never given one.
+        """
+        incident = await self.get_incident(
+            incident_id, requesting_organization_id=requesting_organization_id
+        )
         already_attached = await self.repository.incident_alert_exists(
             incident.id, alert_id
         )
@@ -2519,7 +2544,11 @@ class SlaService:
         )
 
     async def generate_report(
-        self, target_id: uuid.UUID, *, period_days: int | None = None
+        self,
+        target_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        period_days: int | None = None,
     ) -> SlaReport:
         """Computes ``achieved_percentage = healthy_checks / total_checks *
         100`` over the target's own ``measurement_window_days`` (or an
@@ -2554,7 +2583,9 @@ class SlaService:
         data (the identical honesty posture Part 1's Health Engine already
         established).
         """
-        target = await self.get_target(target_id)
+        target = await self.get_target(
+            target_id, requesting_organization_id=requesting_organization_id
+        )
         window_days = period_days or target.measurement_window_days
         period_end = datetime.now(UTC)
         period_start = period_end - timedelta(days=window_days)

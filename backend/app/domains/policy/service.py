@@ -602,18 +602,40 @@ class PolicyService:
         self,
         *,
         guest_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> PolicyAssignment | None:
         """The guest's current active GUEST-targeted BANDWIDTH-policy
         assignment, if any -- "which group is this guest already in"
         for Group Policies' Map users modal to show *before* it lets the
         caller pick a different group (see
         ``exceptions.PolicyAssignmentGuestAlreadyMappedError``'s own
-        docstring for why only one may ever be active)."""
-        return await self.repository.find_active_target_assignment(
+        docstring for why only one may ever be active).
+
+        The lookup is by ``guest_id`` alone, which is a path parameter --
+        so without the check below, any caller holding ``policy.read`` on
+        its own organization could ask whether an arbitrary guest id
+        anywhere on the platform is mapped, and read back the policy's name
+        and assignment id. ``requesting_organization_id`` is required
+        rather than defaulted so a future caller cannot reopen that by
+        omission.
+
+        A foreign guest reads as **not mapped** rather than raising: the
+        answer this endpoint exists to give is "may I map this guest", and
+        an error would confirm that someone else's guest exists and is in a
+        group. Same "never a leak" posture as ``get_invoice``/
+        ``get_payment`` reporting a foreign row as not-found.
+        """
+        assignment = await self.repository.find_active_target_assignment(
             policy_type=PolicyType.BANDWIDTH.value,
             target_type=PolicyAssignmentTargetType.GUEST.value,
             target_id=guest_id,
         )
+        if assignment is None or requesting_organization_id is None:
+            return assignment
+        policy = await self.repository.get_policy_by_id(assignment.policy_id)
+        if policy is None or policy.organization_id != requesting_organization_id:
+            return None
+        return assignment
 
     async def deactivate_assignment(
         self,

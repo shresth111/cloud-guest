@@ -558,14 +558,28 @@ class LicenseLifecycleProtocol(Protocol):
     ) -> License: ...
 
     async def activate_license(
-        self, *, actor_user_id: uuid.UUID | None, license_id: uuid.UUID
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        license_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> License: ...
 
     async def suspend_license(
-        self, *, actor_user_id: uuid.UUID | None, license_id: uuid.UUID, reason: str
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        license_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        reason: str,
     ) -> License: ...
 
-    async def get_license(self, license_id: uuid.UUID) -> License: ...
+    async def get_license(
+        self,
+        license_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None = None,
+    ) -> License: ...
 
     async def expire_license(self, *, license_id: uuid.UUID) -> License: ...
 
@@ -625,9 +639,7 @@ class EntitlementSnapshot:
             plan_id=uuid.UUID(str(payload["plan_id"])),
             license_status=str(payload["license_status"]),
             expires_at=(
-                datetime.fromisoformat(str(expires_at_raw))
-                if expires_at_raw
-                else None
+                datetime.fromisoformat(str(expires_at_raw)) if expires_at_raw else None
             ),
             enabled_features=frozenset(payload.get("enabled_features", [])),
             limits={
@@ -683,9 +695,7 @@ class EntitlementChecker:
         cached = await self._cache.get(organization_id)
         if cached is not None:
             return EntitlementSnapshot.from_cache_payload(cached)
-        snapshot = await self._snapshot_source.get_entitlement_snapshot(
-            organization_id
-        )
+        snapshot = await self._snapshot_source.get_entitlement_snapshot(organization_id)
         await self._cache.set(organization_id, snapshot.to_cache_payload())
         return snapshot
 
@@ -720,9 +730,26 @@ class LicenseService:
         self.white_label_reset = white_label_reset
         self.subscription_repository = subscription_repository
 
-    async def get_license(self, license_id: uuid.UUID) -> License:
+    async def get_license(
+        self,
+        license_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None = None,
+    ) -> License:
+        """``organization_id``, when supplied, enforces tenant isolation --
+        the "not-found, never a leak" convention ``get_invoice`` and
+        ``get_payment`` already use.
+
+        This matters more here than anywhere else in the domain: a
+        ``License``'s status is what ``EntitlementChecker`` reads, so
+        suspending or cancelling one takes that organization's product
+        away. Every ``/licenses/{license_id}/...`` route reached this by id
+        alone.
+        """
         license_ = await self.repository.get_by_id(license_id)
-        if license_ is None:
+        if license_ is None or (
+            organization_id is not None and license_.organization_id != organization_id
+        ):
             raise LicenseNotFoundError(license_id)
         return license_
 
@@ -773,9 +800,13 @@ class LicenseService:
             await self.entitlement_cache.invalidate(organization_id)
 
     async def list_change_history(
-        self, license_id: uuid.UUID
+        self,
+        license_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None,
     ) -> list[LicenseChangeLog]:
-        await self.get_license(license_id)
+        # The guard lives on the license: reaching its history is reaching it.
+        await self.get_license(license_id, organization_id=requesting_organization_id)
         return await self.repository.list_change_logs(license_id)
 
     async def assign_license(
@@ -822,9 +853,15 @@ class LicenseService:
         return license_
 
     async def activate_license(
-        self, *, actor_user_id: uuid.UUID | None, license_id: uuid.UUID
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        license_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> License:
-        license_ = await self.get_license(license_id)
+        license_ = await self.get_license(
+            license_id, organization_id=requesting_organization_id
+        )
         _assert_transition(license_.status, LicenseStatus.ACTIVE)
         now = datetime.now(UTC)
         data: dict[str, object] = {
@@ -851,9 +888,16 @@ class LicenseService:
         return updated
 
     async def suspend_license(
-        self, *, actor_user_id: uuid.UUID | None, license_id: uuid.UUID, reason: str
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        license_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        reason: str,
     ) -> License:
-        license_ = await self.get_license(license_id)
+        license_ = await self.get_license(
+            license_id, organization_id=requesting_organization_id
+        )
         _assert_transition(license_.status, LicenseStatus.SUSPENDED)
         updated = await self.repository.update_license(
             license_,
@@ -880,9 +924,15 @@ class LicenseService:
         return updated
 
     async def cancel_license(
-        self, *, actor_user_id: uuid.UUID | None, license_id: uuid.UUID
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        license_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> License:
-        license_ = await self.get_license(license_id)
+        license_ = await self.get_license(
+            license_id, organization_id=requesting_organization_id
+        )
         _assert_transition(license_.status, LicenseStatus.CANCELLED)
         updated = await self.repository.update_license(
             license_,
@@ -931,12 +981,14 @@ class LicenseService:
         *,
         actor_user_id: uuid.UUID | None,
         license_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         new_plan_id: uuid.UUID,
         reason: str | None = None,
     ) -> License:
         return await self._change_plan(
             actor_user_id=actor_user_id,
             license_id=license_id,
+            requesting_organization_id=requesting_organization_id,
             new_plan_id=new_plan_id,
             reason=reason,
             change_type=LicenseChangeType.UPGRADED,
@@ -947,12 +999,14 @@ class LicenseService:
         *,
         actor_user_id: uuid.UUID | None,
         license_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         new_plan_id: uuid.UUID,
         reason: str | None = None,
     ) -> License:
         return await self._change_plan(
             actor_user_id=actor_user_id,
             license_id=license_id,
+            requesting_organization_id=requesting_organization_id,
             new_plan_id=new_plan_id,
             reason=reason,
             change_type=LicenseChangeType.DOWNGRADED,
@@ -981,10 +1035,13 @@ class LicenseService:
         actor_user_id: uuid.UUID | None,
         license_id: uuid.UUID,
         new_plan_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         reason: str | None,
         change_type: LicenseChangeType,
     ) -> License:
-        license_ = await self.get_license(license_id)
+        license_ = await self.get_license(
+            license_id, organization_id=requesting_organization_id
+        )
         if license_.status != LicenseStatus.ACTIVE.value:
             raise InvalidLicenseStatusTransitionError(license_.status, "plan_change")
         if license_.plan_id == new_plan_id:
@@ -1829,9 +1886,21 @@ class SubscriptionService:
         self.trial_period_days = trial_period_days
         self.audit_writer = audit_writer
 
-    async def get_subscription(self, subscription_id: uuid.UUID) -> Subscription:
+    async def get_subscription(
+        self,
+        subscription_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None = None,
+    ) -> Subscription:
+        """``organization_id``, when supplied, enforces tenant isolation --
+        same "not-found, never a leak" convention as
+        ``InvoiceService.get_invoice`` and ``PaymentService.get_payment``,
+        which this method was the only sibling not to follow."""
         subscription = await self.repository.get_by_id(subscription_id)
-        if subscription is None:
+        if subscription is None or (
+            organization_id is not None
+            and subscription.organization_id != organization_id
+        ):
             raise SubscriptionNotFoundError(subscription_id)
         return subscription
 
@@ -1885,7 +1954,11 @@ class SubscriptionService:
             plan_id=plan.id,
         )
         license_ = await self.license_service.activate_license(
-            actor_user_id=actor_user_id, license_id=license_.id
+            actor_user_id=actor_user_id,
+            license_id=license_.id,
+            # Assigned to `organization_id` one statement above, so there is
+            # nothing left to compare it against.
+            requesting_organization_id=None,
         )
 
         now = datetime.now(UTC)
@@ -1944,9 +2017,22 @@ class SubscriptionService:
         *,
         actor_user_id: uuid.UUID | None,
         subscription_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         immediate: bool,
     ) -> Subscription:
-        subscription = await self.get_subscription(subscription_id)
+        """Cancels a subscription.
+
+        ``requesting_organization_id`` has no default on purpose. This
+        method reached its row by id alone, so a caller holding the
+        permission at its **own** organization could act on any tenant's by
+        putting a foreign UUID in the URL -- ``RequirePermission`` scopes
+        off the ``X-Organization-Id`` header, never the path. Without a
+        default, a caller that forgets is a ``TypeError``, not a silent
+        cross-tenant write. ``None`` still means platform-level.
+        """
+        subscription = await self.get_subscription(
+            subscription_id, organization_id=requesting_organization_id
+        )
         current_status = SubscriptionStatus(subscription.status)
         if current_status not in (
             SubscriptionStatus.TRIALING,
@@ -1977,6 +2063,9 @@ class SubscriptionService:
             await self.license_service.suspend_license(
                 actor_user_id=actor_user_id,
                 license_id=subscription.license_id,
+                # The subscription this license hangs off was already
+                # tenant-checked at the top of this method.
+                requesting_organization_id=None,
                 reason="Subscription cancelled",
             )
         else:
@@ -2005,17 +2094,36 @@ class SubscriptionService:
         return updated
 
     async def reactivate_subscription(
-        self, *, actor_user_id: uuid.UUID | None, subscription_id: uuid.UUID
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        subscription_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> Subscription:
-        subscription = await self.get_subscription(subscription_id)
+        """
+        ``requesting_organization_id`` has no default on purpose. This
+        method reached its row by id alone, so a caller holding the
+        permission at its **own** organization could act on any tenant's by
+        putting a foreign UUID in the URL -- ``RequirePermission`` scopes
+        off the ``X-Organization-Id`` header, never the path. Without a
+        default, a caller that forgets is a ``TypeError``, not a silent
+        cross-tenant write. ``None`` still means platform-level.
+        """
+        subscription = await self.get_subscription(
+            subscription_id, organization_id=requesting_organization_id
+        )
         _assert_subscription_transition(subscription.status, SubscriptionStatus.ACTIVE)
 
+        # Reached through the subscription, which this method already
+        # tenant-checked -- so the license is this caller's by construction.
         license_ = await self.license_service.get_license(subscription.license_id)
         if license_.status == LicenseStatus.EXPIRED.value:
             raise SubscriptionReactivationNotAllowedError(subscription.id)
         if license_.status == LicenseStatus.SUSPENDED.value:
             await self.license_service.activate_license(
-                actor_user_id=actor_user_id, license_id=license_.id
+                actor_user_id=actor_user_id,
+                license_id=license_.id,
+                requesting_organization_id=None,
             )
 
         now = datetime.now(UTC)
@@ -2046,9 +2154,24 @@ class SubscriptionService:
         return updated
 
     async def pause_subscription(
-        self, *, actor_user_id: uuid.UUID | None, subscription_id: uuid.UUID
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        subscription_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> Subscription:
-        subscription = await self.get_subscription(subscription_id)
+        """
+        ``requesting_organization_id`` has no default on purpose. This
+        method reached its row by id alone, so a caller holding the
+        permission at its **own** organization could act on any tenant's by
+        putting a foreign UUID in the URL -- ``RequirePermission`` scopes
+        off the ``X-Organization-Id`` header, never the path. Without a
+        default, a caller that forgets is a ``TypeError``, not a silent
+        cross-tenant write. ``None`` still means platform-level.
+        """
+        subscription = await self.get_subscription(
+            subscription_id, organization_id=requesting_organization_id
+        )
         _assert_subscription_transition(subscription.status, SubscriptionStatus.PAUSED)
         updated = await self.repository.update_subscription(
             subscription,
@@ -2067,9 +2190,24 @@ class SubscriptionService:
         return updated
 
     async def resume_subscription(
-        self, *, actor_user_id: uuid.UUID | None, subscription_id: uuid.UUID
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        subscription_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> Subscription:
-        subscription = await self.get_subscription(subscription_id)
+        """
+        ``requesting_organization_id`` has no default on purpose. This
+        method reached its row by id alone, so a caller holding the
+        permission at its **own** organization could act on any tenant's by
+        putting a foreign UUID in the URL -- ``RequirePermission`` scopes
+        off the ``X-Organization-Id`` header, never the path. Without a
+        default, a caller that forgets is a ``TypeError``, not a silent
+        cross-tenant write. ``None`` still means platform-level.
+        """
+        subscription = await self.get_subscription(
+            subscription_id, organization_id=requesting_organization_id
+        )
         _assert_subscription_transition(subscription.status, SubscriptionStatus.ACTIVE)
         now = datetime.now(UTC)
         data: dict[str, object] = {
@@ -2441,15 +2579,11 @@ class PaymentService:
                 "to be wired -- see dependencies.get_payment_service."
             )
 
-        existing = await self.payment_repository.get_by_idempotency_key(
-            idempotency_key
-        )
+        existing = await self.payment_repository.get_by_idempotency_key(idempotency_key)
         if existing is not None:
             return existing
 
-        license_ = await self.license_repository.get_by_organization_id(
-            organization_id
-        )
+        license_ = await self.license_repository.get_by_organization_id(organization_id)
         if license_ is None:
             raise LicenseNotFoundError(organization_id)
         if license_.status not in (
@@ -2516,9 +2650,23 @@ class PaymentService:
         *,
         actor_user_id: uuid.UUID | None,
         payment_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         amount: Decimal | None = None,
     ) -> Payment:
-        payment = await self.get_payment(payment_id)
+        """Refunds a payment -- real money, so the tenant check is not
+        optional.
+
+        ``requesting_organization_id`` has no default on purpose. This
+        method reached its row by id alone, so a caller holding the
+        permission at its **own** organization could act on any tenant's by
+        putting a foreign UUID in the URL -- ``RequirePermission`` scopes
+        off the ``X-Organization-Id`` header, never the path. Without a
+        default, a caller that forgets is a ``TypeError``, not a silent
+        cross-tenant write. ``None`` still means platform-level.
+        """
+        payment = await self.get_payment(
+            payment_id, organization_id=requesting_organization_id
+        )
         if payment.status not in (
             PaymentStatus.SUCCEEDED.value,
             PaymentStatus.PARTIALLY_REFUNDED.value,
@@ -2553,9 +2701,24 @@ class PaymentService:
         return updated
 
     async def retry_failed_payment(
-        self, *, actor_user_id: uuid.UUID | None, payment_id: uuid.UUID
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        payment_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> Payment:
-        payment = await self.get_payment(payment_id)
+        """
+        ``requesting_organization_id`` has no default on purpose. This
+        method reached its row by id alone, so a caller holding the
+        permission at its **own** organization could act on any tenant's by
+        putting a foreign UUID in the URL -- ``RequirePermission`` scopes
+        off the ``X-Organization-Id`` header, never the path. Without a
+        default, a caller that forgets is a ``TypeError``, not a silent
+        cross-tenant write. ``None`` still means platform-level.
+        """
+        payment = await self.get_payment(
+            payment_id, organization_id=requesting_organization_id
+        )
         if not is_payment_retry_eligible(payment.status):
             raise PaymentNotRetryableError(payment_id, payment.status)
 
@@ -2675,9 +2838,24 @@ class PaymentMethodService:
         return payment_method
 
     async def remove_payment_method(
-        self, *, actor_user_id: uuid.UUID | None, payment_method_id: uuid.UUID
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        payment_method_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> PaymentMethod:
-        payment_method = await self.get_payment_method(payment_method_id)
+        """
+        ``requesting_organization_id`` has no default on purpose. This
+        method reached its row by id alone, so a caller holding the
+        permission at its **own** organization could act on any tenant's by
+        putting a foreign UUID in the URL -- ``RequirePermission`` scopes
+        off the ``X-Organization-Id`` header, never the path. Without a
+        default, a caller that forgets is a ``TypeError``, not a silent
+        cross-tenant write. ``None`` still means platform-level.
+        """
+        payment_method = await self.get_payment_method(
+            payment_method_id, organization_id=requesting_organization_id
+        )
         updated = await self.repository.update_payment_method(
             payment_method,
             {
@@ -3309,7 +3487,11 @@ class InvoiceService:
         )
 
     async def void_invoice(
-        self, *, actor_user_id: uuid.UUID | None, invoice_id: uuid.UUID
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        invoice_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
     ) -> Invoice:
         """Voids an invoice -- a ``DRAFT`` (never sent) becomes
         ``CANCELLED``; an ``ISSUED``/``OVERDUE`` (already sent) becomes
@@ -3317,8 +3499,19 @@ class InvoiceService:
         real accounting distinction between the two terminal outcomes. A
         ``PAID`` invoice cannot be voided through this method -- correct it
         via ``issue_credit_note`` instead (voiding a paid invoice directly
-        would silently discard the fact that real money changed hands)."""
-        invoice = await self.get_invoice(invoice_id)
+        would silently discard the fact that real money changed hands).
+
+        ``requesting_organization_id`` has no default on purpose. This
+        method reached its row by id alone, so a caller holding the
+        permission at its **own** organization could act on any tenant's by
+        putting a foreign UUID in the URL -- ``RequirePermission`` scopes
+        off the ``X-Organization-Id`` header, never the path. Without a
+        default, a caller that forgets is a ``TypeError``, not a silent
+        cross-tenant write. ``None`` still means platform-level.
+        """
+        invoice = await self.get_invoice(
+            invoice_id, organization_id=requesting_organization_id
+        )
         current_status = InvoiceStatus(invoice.status)
         if current_status == InvoiceStatus.DRAFT:
             target = InvoiceStatus.CANCELLED
@@ -3385,6 +3578,7 @@ class InvoiceService:
         *,
         actor_user_id: uuid.UUID | None,
         invoice_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         amount: Decimal,
         reason: str,
     ) -> CreditDebitNote:
@@ -3392,8 +3586,19 @@ class InvoiceService:
         legal only against an invoice that was actually sent
         (``ISSUED``/``OVERDUE``/``PAID``), and its own amount can never
         exceed the invoice's own ``total_amount`` (a credit note cannot
-        credit more than was ever charged)."""
-        invoice = await self.get_invoice(invoice_id)
+        credit more than was ever charged).
+
+        ``requesting_organization_id`` has no default on purpose. This
+        method reached its row by id alone, so a caller holding the
+        permission at its **own** organization could act on any tenant's by
+        putting a foreign UUID in the URL -- ``RequirePermission`` scopes
+        off the ``X-Organization-Id`` header, never the path. Without a
+        default, a caller that forgets is a ``TypeError``, not a silent
+        cross-tenant write. ``None`` still means platform-level.
+        """
+        invoice = await self.get_invoice(
+            invoice_id, organization_id=requesting_organization_id
+        )
         if InvoiceStatus(invoice.status) not in (
             InvoiceStatus.ISSUED,
             InvoiceStatus.OVERDUE,
@@ -3441,6 +3646,7 @@ class InvoiceService:
         *,
         actor_user_id: uuid.UUID | None,
         invoice_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         amount: Decimal,
         reason: str,
     ) -> CreditDebitNote:
@@ -3448,8 +3654,19 @@ class InvoiceService:
         under-billed correction) -- legal against the same set of invoice
         statuses a credit note is (``ISSUED``/``OVERDUE``/``PAID``), with
         its own, entirely independent number sequence (never the credit
-        note's, never the invoice's -- see ``number_generator.py``)."""
-        invoice = await self.get_invoice(invoice_id)
+        note's, never the invoice's -- see ``number_generator.py``).
+
+        ``requesting_organization_id`` has no default on purpose. This
+        method reached its row by id alone, so a caller holding the
+        permission at its **own** organization could act on any tenant's by
+        putting a foreign UUID in the URL -- ``RequirePermission`` scopes
+        off the ``X-Organization-Id`` header, never the path. Without a
+        default, a caller that forgets is a ``TypeError``, not a silent
+        cross-tenant write. ``None`` still means platform-level.
+        """
+        invoice = await self.get_invoice(
+            invoice_id, organization_id=requesting_organization_id
+        )
         if InvoiceStatus(invoice.status) not in (
             InvoiceStatus.ISSUED,
             InvoiceStatus.OVERDUE,
@@ -3502,9 +3719,7 @@ class InvoiceService:
         per-organization model, the organization's one current subscription
         otherwise."""
         if subscription_id is not None:
-            subscription = await self.subscription_repository.get_by_id(
-                subscription_id
-            )
+            subscription = await self.subscription_repository.get_by_id(subscription_id)
             if subscription is None or subscription.organization_id != organization_id:
                 raise SubscriptionNotFoundError(subscription_id)
             return subscription.id

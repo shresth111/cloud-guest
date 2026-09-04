@@ -144,9 +144,7 @@ class LicenseActivationProtocol(Protocol):
 
     async def get_license_for_organization(self, organization_id: Any) -> Any: ...
 
-    async def activate_license(
-        self, *, actor_user_id: Any, license_id: Any
-    ) -> Any: ...
+    async def activate_license(self, *, actor_user_id: Any, license_id: Any) -> Any: ...
 
 
 class WebhookAuditWriterProtocol(Protocol):
@@ -439,7 +437,11 @@ async def _activate_license_if_needed(
         return
     try:
         await license_activation.activate_license(
-            actor_user_id=None, license_id=license_.id
+            actor_user_id=None,
+            license_id=license_.id,
+            # Gateway webhook: no caller organization to compare against, and
+            # the license was resolved from the webhook's own organization.
+            requesting_organization_id=None,
         )
     except InvalidLicenseStatusTransitionError:  # pragma: no cover - defensive
         logger.warning(

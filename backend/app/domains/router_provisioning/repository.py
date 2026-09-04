@@ -149,6 +149,7 @@ class RouterProvisioningRepositoryProtocol(Protocol):
         self,
         *,
         scope_type: str | None,
+        organization_id: uuid.UUID | None,
         page: int,
         page_size: int,
     ) -> tuple[list[ConfigVariable], PaginationMeta]: ...
@@ -385,13 +386,26 @@ class RouterProvisioningRepository:
         self,
         *,
         scope_type: str | None,
+        organization_id: uuid.UUID | None,
         page: int,
         page_size: int,
     ) -> tuple[list[ConfigVariable], PaginationMeta]:
+        """``organization_id`` narrows the page to one tenant's variables.
+
+        ``None`` means *no narrowing* and returns every organization's rows,
+        which is correct only for a platform-level caller. The service
+        decides which of the two this is; the parameter is required rather
+        than defaulted so that a future caller has to say.
+        """
+        filters: dict[str, object] = {}
+        if scope_type:
+            filters["scope_type"] = scope_type
+        if organization_id is not None:
+            filters["organization_id"] = organization_id
         return await self.variables.paginate(
             page=page,
             page_size=page_size,
-            filters={"scope_type": scope_type} if scope_type else None,
+            filters=filters or None,
             sort_by="created_at",
             sort_order=SortOrder.DESC,
         )

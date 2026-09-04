@@ -142,9 +142,7 @@ class FakePaymentRepository:
                 return payment
         return None
 
-    async def get_by_razorpay_order_id(
-        self, razorpay_order_id: str
-    ) -> Payment | None:
+    async def get_by_razorpay_order_id(self, razorpay_order_id: str) -> Payment | None:
         for payment in self.payments.values():
             if getattr(payment, "razorpay_order_id", None) == razorpay_order_id:
                 return payment
@@ -326,7 +324,9 @@ class _StubLicenseService:
     async def suspend_license(self, **kwargs: object) -> object:
         raise NotImplementedError
 
-    async def get_license(self, license_id: uuid.UUID) -> object:
+    async def get_license(
+        self, license_id: uuid.UUID, *, organization_id=None
+    ) -> object:
         raise NotImplementedError
 
     async def expire_license(self, *, license_id: uuid.UUID) -> object:
@@ -775,6 +775,52 @@ class TestRefund:
             refunded_amount=Decimal("0"),
         )
 
+    async def test_a_tenant_cannot_refund_another_tenants_payment(self) -> None:
+        """`RequirePermission("billing.manage")` checks the header
+        organization; the handler took the payment from the path. Any tenant
+        holding it at its own org could move another tenant's money by id.
+        Reported as not-found rather than forbidden, so the endpoint does not
+        confirm the payment exists."""
+        payment_repository = FakePaymentRepository()
+        service = PaymentService(
+            payment_repository,
+            FakePaymentMethodRepository(),
+            gateways={"stripe": FakeGateway()},
+        )
+        payment = await self._make_succeeded_payment(
+            payment_repository, amount=Decimal("100.00")
+        )
+
+        with pytest.raises(PaymentNotFoundError):
+            await service.refund_payment(
+                actor_user_id=None,
+                payment_id=payment.id,
+                requesting_organization_id=uuid.uuid4(),
+            )
+
+        assert payment.refunded_amount == Decimal("0")
+        assert payment.status == PaymentStatus.SUCCEEDED.value
+
+    async def test_the_owning_tenant_can_still_refund(self) -> None:
+        """The guard must refuse the neighbour without refusing the owner."""
+        payment_repository = FakePaymentRepository()
+        service = PaymentService(
+            payment_repository,
+            FakePaymentMethodRepository(),
+            gateways={"stripe": FakeGateway()},
+        )
+        payment = await self._make_succeeded_payment(
+            payment_repository, amount=Decimal("100.00")
+        )
+
+        refunded = await service.refund_payment(
+            actor_user_id=None,
+            payment_id=payment.id,
+            requesting_organization_id=payment.organization_id,
+        )
+
+        assert refunded.status == PaymentStatus.REFUNDED.value
+
     async def test_full_refund_sets_status_refunded(self) -> None:
         payment_repository = FakePaymentRepository()
         gateway = FakeGateway()
@@ -788,7 +834,9 @@ class TestRefund:
         )
 
         refunded = await service.refund_payment(
-            actor_user_id=None, payment_id=payment.id
+            actor_user_id=None,
+            payment_id=payment.id,
+            requesting_organization_id=None,
         )
         assert refunded.status == PaymentStatus.REFUNDED.value
         assert refunded.refunded_amount == Decimal("100.00")
@@ -810,14 +858,20 @@ class TestRefund:
         )
 
         refunded = await service.refund_payment(
-            actor_user_id=None, payment_id=payment.id, amount=Decimal("30.00")
+            actor_user_id=None,
+            payment_id=payment.id,
+            amount=Decimal("30.00"),
+            requesting_organization_id=None,
         )
         assert refunded.status == PaymentStatus.PARTIALLY_REFUNDED.value
         assert refunded.refunded_amount == Decimal("30.00")
 
         # A second partial refund of the remainder completes it.
         refunded_again = await service.refund_payment(
-            actor_user_id=None, payment_id=payment.id, amount=Decimal("70.00")
+            actor_user_id=None,
+            payment_id=payment.id,
+            amount=Decimal("70.00"),
+            requesting_organization_id=None,
         )
         assert refunded_again.status == PaymentStatus.REFUNDED.value
         assert refunded_again.refunded_amount == Decimal("100.00")
@@ -834,7 +888,10 @@ class TestRefund:
         )
         with pytest.raises(RefundExceedsRefundableAmountError):
             await service.refund_payment(
-                actor_user_id=None, payment_id=payment.id, amount=Decimal("500.00")
+                actor_user_id=None,
+                payment_id=payment.id,
+                amount=Decimal("500.00"),
+                requesting_organization_id=None,
             )
 
     async def test_refund_of_non_refundable_status_rejected(self) -> None:
@@ -856,7 +913,11 @@ class TestRefund:
             refunded_amount=Decimal("0"),
         )
         with pytest.raises(PaymentNotRefundableError):
-            await service.refund_payment(actor_user_id=None, payment_id=payment.id)
+            await service.refund_payment(
+                actor_user_id=None,
+                payment_id=payment.id,
+                requesting_organization_id=None,
+            )
 
 
 # ============================================================================
@@ -900,7 +961,9 @@ class TestRetry:
         original_key = payment.idempotency_key
 
         retried = await service.retry_failed_payment(
-            actor_user_id=None, payment_id=payment.id
+            actor_user_id=None,
+            payment_id=payment.id,
+            requesting_organization_id=None,
         )
 
         assert retried.id == original_id
@@ -935,7 +998,9 @@ class TestRetry:
         )
         with pytest.raises(PaymentNotRetryableError):
             await service.retry_failed_payment(
-                actor_user_id=None, payment_id=payment.id
+                actor_user_id=None,
+                payment_id=payment.id,
+                requesting_organization_id=None,
             )
 
 
@@ -1063,7 +1128,9 @@ class TestPaymentMethodService:
         )
 
         removed = await service.remove_payment_method(
-            actor_user_id=None, payment_method_id=payment_method.id
+            actor_user_id=None,
+            payment_method_id=payment_method.id,
+            requesting_organization_id=None,
         )
         assert removed.is_active is False
         assert removed.is_default is False

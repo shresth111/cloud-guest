@@ -187,6 +187,7 @@ async def resolve_effective_policy(
 async def get_guest_group_assignment(
     request: Request,
     guest_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: PolicyService = Depends(get_policy_service),
 ):
     """Group Policies' Map users modal calls this before offering to map a
@@ -195,7 +196,10 @@ async def get_guest_group_assignment(
     second, ambiguous membership (see
     ``exceptions.PolicyAssignmentGuestAlreadyMappedError``'s own
     docstring)."""
-    assignment = await service.get_guest_group_assignment(guest_id=guest_id)
+    assignment = await service.get_guest_group_assignment(
+        guest_id=guest_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     if assignment is None:
         payload = GuestGroupAssignmentResponse(mapped=False)
     else:

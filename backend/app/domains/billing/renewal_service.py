@@ -489,6 +489,7 @@ class RenewalService:
         await self.license_service.suspend_license(
             actor_user_id=None,
             license_id=updated.license_id,
+            requesting_organization_id=None,
             reason="Subscription's scheduled (cancel-at-period-end) cancellation "
             "took effect",
         )
@@ -570,6 +571,7 @@ class RenewalService:
                 await self.license_service.suspend_license(
                     actor_user_id=None,
                     license_id=updated.license_id,
+                    requesting_organization_id=None,
                     reason="Subscription's billing period ended with "
                     "auto-renewal turned off",
                 )
