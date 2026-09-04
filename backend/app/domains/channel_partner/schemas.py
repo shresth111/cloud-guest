@@ -22,11 +22,17 @@ from pydantic import (
     ConfigDict,
     EmailStr,
     Field,
+    computed_field,
     field_validator,
     model_validator,
 )
 
-from .constants import WelcomeDeliveryStatus
+from .constants import (
+    EMAIL_PROVIDER_NOT_CONFIGURED,
+    SMS_PROVIDER_NOT_CONFIGURED,
+    WelcomeDeliveryStatus,
+    welcome_delivery_status,
+)
 
 # India's GSTIN is always exactly 15 characters:
 # [state code:2][PAN:10][entity code:1][default "Z":1][checksum:1].
@@ -169,16 +175,39 @@ class ChannelPartnerResponse(BaseModel):
     welcome_sms_error: str | None
     welcome_email_sent_at: datetime | None
     welcome_email_error: str | None
-    # Derived, not stored. The console needs to tell "this server has no SMS
-    # provider" apart from "this partner's SMS failed" -- the row holds only
-    # free text, and reading "is there error text?" as "failed" is what made
-    # five partners show a red *Welcome failed* badge while three of them had
-    # had their welcome email delivered. See
-    # `constants.welcome_delivery_status`.
-    welcome_sms_status: WelcomeDeliveryStatus
-    welcome_email_status: WelcomeDeliveryStatus
     created_at: datetime
     updated_at: datetime
+
+    # Derived from the two fields above, not stored and not accepted as
+    # input. The console needs to tell "this server has no SMS provider"
+    # apart from "this partner's SMS failed" -- the row holds only free
+    # text, and reading "is there error text?" as "failed" is what made
+    # five partners show a red *Welcome failed* badge while three of them
+    # had had their welcome email delivered.
+    #
+    # Computed fields rather than something the caller passes in: this
+    # model is built by `model_validate(partner)` straight off the ORM
+    # row, so a required field the row does not carry cannot be satisfied,
+    # and a field the *builder* has to remember to supply is a field some
+    # future second builder will forget. Deriving here means every
+    # response carries it by construction.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def welcome_sms_status(self) -> WelcomeDeliveryStatus:
+        return welcome_delivery_status(
+            sent_at=self.welcome_sms_sent_at,
+            error=self.welcome_sms_error,
+            not_configured_message=SMS_PROVIDER_NOT_CONFIGURED,
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def welcome_email_status(self) -> WelcomeDeliveryStatus:
+        return welcome_delivery_status(
+            sent_at=self.welcome_email_sent_at,
+            error=self.welcome_email_error,
+            not_configured_message=EMAIL_PROVIDER_NOT_CONFIGURED,
+        )
 
 
 class ChannelPartnerChannelDeliveryResult(BaseModel):
