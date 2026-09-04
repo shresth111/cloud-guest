@@ -741,12 +741,43 @@ class MonitoringService:
             )
         stale_after = timedelta(minutes=FREERADIUS_ACTIVITY_STALE_MINUTES)
         if datetime.now(UTC) - latest_activity > stale_after:
+            # UNKNOWN, not DEGRADED. This branch fires when NAS clients are
+            # registered and simply nobody has connected lately -- which is
+            # what a quiet venue looks like, and the threshold's own comment
+            # says as much ("guest WiFi traffic is naturally bursty, e.g.
+            # overnight at a hotel"). It then called that bursty silence a
+            # degradation, which is the opposite of what the comment argued
+            # for.
+            #
+            # This was invisible until the Health Engine got a schedule.
+            # Once checks ran every five minutes, a venue with no guests
+            # online accumulated a `consecutive_failure_count` that climbs
+            # forever -- observed at 25 within two hours of the sweep
+            # starting, on a platform whose newest guest session was 15
+            # hours old. Overall platform status reads Degraded permanently,
+            # and an indicator that is always red is one nobody reads.
+            #
+            # ``HealthStatus.UNKNOWN``'s own docstring already names this
+            # exact shape: "a component that exists but currently has no
+            # data to judge from", with FREERADIUS as its example. Silence
+            # is an absence of evidence, and this check -- a proxy signal
+            # that cannot see the daemon at all (see this method's
+            # docstring) -- has no standing to read it as evidence of a
+            # fault. The branch above, where NAS clients exist and there has
+            # NEVER been any accounting activity, stays DEGRADED: that one
+            # is diagnostic, because it says something was registered and
+            # then never worked once.
             return HealthCheckResult(
                 component=HealthComponent.FREERADIUS,
-                status=HealthStatus.DEGRADED,
+                status=HealthStatus.UNKNOWN,
                 response_time_ms=round(elapsed_ms, 3),
                 details=details,
-                error_message="No recent RADIUS accounting activity",
+                error_message=(
+                    "No RADIUS accounting activity in the last "
+                    f"{FREERADIUS_ACTIVITY_STALE_MINUTES} minutes -- this is "
+                    "what a quiet venue looks like, and this check cannot "
+                    "tell it apart from an outage"
+                ),
             )
         return HealthCheckResult(
             component=HealthComponent.FREERADIUS,

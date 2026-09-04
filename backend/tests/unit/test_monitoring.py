@@ -550,10 +550,40 @@ async def test_check_freeradius_health_recent_activity_is_healthy():
     assert result.status == HealthStatus.HEALTHY
 
 
-async def test_check_freeradius_health_stale_activity_is_degraded():
+async def test_check_freeradius_health_quiet_venue_is_unknown_not_degraded():
+    """A venue with nobody online is not a broken venue.
+
+    This check is a proxy signal -- it cannot see the FreeRADIUS daemon at
+    all (see `check_freeradius_health`'s docstring), it infers from whether
+    any guest has been accounted for lately. So silence is an absence of
+    evidence, and reading it as evidence of a fault is inventing a reading.
+
+    It used to report DEGRADED here, and that was invisible until the
+    Health Engine got a schedule: once checks ran every five minutes, an
+    ordinary quiet night accumulated a `consecutive_failure_count` that
+    climbs forever -- observed at 25 within two hours on a platform whose
+    newest guest session was 15 hours old, with the overall platform status
+    stuck on Degraded. An indicator that is always red is one nobody reads.
+    """
     repo = FakeMonitoringRepository(
         active_nas_count=2, latest_guest_activity=_now() - timedelta(hours=5)
     )
+    service, _ = _make_service(repository=repo)
+    result = await service.check_freeradius_health()
+    assert result.status == HealthStatus.UNKNOWN
+    # The reason must say it does not know, not that something failed.
+    assert "cannot tell it apart" in (result.error_message or "")
+
+
+async def test_check_freeradius_health_never_any_activity_stays_degraded():
+    """The neighbouring branch must NOT be softened with it.
+
+    "Registered, and never worked once" is diagnostic in a way "registered,
+    and quiet since lunchtime" is not: something was set up and has never
+    authenticated anybody. That one is worth waking someone for, and this
+    pins that the fix above did not sweep it up too.
+    """
+    repo = FakeMonitoringRepository(active_nas_count=2, latest_guest_activity=None)
     service, _ = _make_service(repository=repo)
     result = await service.check_freeradius_health()
     assert result.status == HealthStatus.DEGRADED
