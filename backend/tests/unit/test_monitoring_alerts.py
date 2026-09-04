@@ -42,12 +42,18 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
+from app.domains.dhcp.constants import RogueDhcpAlertState
 from app.domains.isp.constants import HealthStatus as IspHealthStatus
 from app.domains.isp.constants import IspLinkRole, IspLinkType
 from app.domains.isp.device_adapters import PingResult
 from app.domains.monitoring.constants import (
     ALERT_TARGET_ISP_LINK,
+    ALERT_TARGET_MONITORED_HARDWARE,
+    ALERT_TARGET_ROGUE_DHCP_GUARD,
     ALERT_TARGET_ROUTER,
+    ROGUE_DHCP_STATE_GUARDED,
+    ROGUE_DHCP_STATE_UNGUARDED,
+    ROGUE_DHCP_STATE_UNKNOWN,
     AlertSeverity,
     AlertStatus,
     AlertTriggerType,
@@ -93,6 +99,7 @@ from app.domains.monitoring.validators import (
     validate_notification_channel_config,
     validate_sla_target_config,
 )
+from app.domains.organization.router import _create_default_alert_rules
 from app.domains.router.crypto import decrypt_secret
 from tests.unit.test_isp import FakeIspHealthAdapter, _make_router, make_harness
 
@@ -158,6 +165,21 @@ class FakeIspLink:
 
 
 @dataclass
+class FakeRogueDhcpStatus:
+    """Duck-typed stand-in for
+    ``app.domains.dhcp.models.RouterRogueDhcpStatus`` -- only the two
+    attributes ``AlertService._evaluate_rogue_dhcp_guard_rule`` actually
+    reads. The real row carries ``alert_present``/``enabled``/
+    ``serves_dhcp``/``checked_at``/``detail`` beside these; the alert
+    engine reads none of them, because the detector has already rolled them
+    up into ``alert_state`` and re-deriving that here would be a second
+    opinion about a device this process never spoke to."""
+
+    interface: str
+    alert_state: str
+
+
+@dataclass
 class FakeRepository:
     """Stand-in for ``MonitoringRepositoryProtocol``'s BE-011 Part 2 surface
     -- covers every method ``AlertService``/``NotificationService``/
@@ -170,6 +192,9 @@ class FakeRepository:
     alerts: dict[uuid.UUID, Alert] = field(default_factory=dict)
     routers: list[FakeRouter] = field(default_factory=list)
     isp_links: list[FakeIspLink] = field(default_factory=list)
+    rogue_dhcp_rows: list[tuple[FakeRouter, FakeRogueDhcpStatus]] = field(
+        default_factory=list
+    )
     snapshots: dict[uuid.UUID, FakeSnapshot] = field(default_factory=dict)
     service_health_rows: dict[str, ServiceHealth] = field(default_factory=dict)
     platform_events: list[PlatformEvent] = field(default_factory=list)
@@ -289,6 +314,43 @@ class FakeRepository:
         return [
             link for link in self.isp_links if link.organization_id == organization_id
         ]
+
+    async def list_rogue_dhcp_statuses_with_routers(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[tuple[FakeRouter, FakeRogueDhcpStatus]]:
+        """Taught to this fake *before* any assertion below relies on it.
+
+        That ordering is not ceremony. cloud-guest#131 landed wiring in this
+        same domain that no test actually exercised, because a fake was
+        missing the new method and a broad ``except Exception`` upstream
+        swallowed the resulting ``AttributeError`` -- the suite went green
+        over code that had never run. A fake that answers every method the
+        service calls is what keeps that from happening twice.
+        """
+        if organization_id is None:
+            return list(self.rogue_dhcp_rows)
+        return [
+            (router, status)
+            for router, status in self.rogue_dhcp_rows
+            if router.organization_id == organization_id
+        ]
+
+    async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]:
+        """The bulk de-duplication read. Same predicate and same
+        newest-first ordering as ``find_active_alert`` above, because the
+        real repository's two methods are deliberately the same query
+        asked for one target vs. all of them."""
+        return sorted(
+            (
+                alert
+                for alert in self.alerts.values()
+                if alert.rule_id == rule_id
+                and not alert.is_deleted
+                and alert.status != AlertStatus.RESOLVED.value
+            ),
+            key=lambda alert: alert.triggered_at,
+            reverse=True,
+        )
 
     async def get_latest_router_health_snapshot(
         self, router_id: uuid.UUID
@@ -872,6 +934,433 @@ def test_validate_health_status_change_accepts_isp_link_target():
         ALERT_TARGET_ISP_LINK,
         {"expected_status": "unhealthy"},
     )
+
+
+# ============================================================================
+# Alert Engine: evaluation -- ALERT_TARGET_ROGUE_DHCP_GUARD
+# ============================================================================
+#
+# The push half of cloud-guest#139's rogue-DHCP detector. #139 persisted a
+# ``RouterRogueDhcpStatus`` row per ``(router_id, interface)`` and put a
+# readiness checklist item over it; an unguarded router therefore only ever
+# appeared if somebody opened that router's checklist, which nobody does.
+#
+# Every test below builds its rows through ``_rogue_router``/``_rogue_rows``
+# and drives the real ``AlertService.evaluate_alert_rules`` -- never the
+# private branch directly -- so the wiring from ``evaluate_alert_rules``
+# through the new repository surface is what is under test, not just the
+# branch's arithmetic.
+
+
+def _rogue_router(org_id: uuid.UUID, name: str = "Lobby Router") -> FakeRouter:
+    return FakeRouter(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name=name,
+        health_status="healthy",
+    )
+
+
+def _rogue_rows(
+    router: FakeRouter, states: dict[str, str]
+) -> list[tuple[FakeRouter, FakeRogueDhcpStatus]]:
+    return [
+        (router, FakeRogueDhcpStatus(interface=iface, alert_state=state))
+        for iface, state in states.items()
+    ]
+
+
+async def _rogue_dhcp_harness(
+    org_id: uuid.UUID,
+) -> tuple[FakeRepository, AlertService]:
+    repo = FakeRepository()
+    service = AlertService(repo)
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ROGUE_DHCP_GUARD,
+            condition_config={"expected_status": ROGUE_DHCP_STATE_UNGUARDED},
+            organization_id=org_id,
+            severity=AlertSeverity.WARNING,
+        )
+    )
+    return repo, service
+
+
+def test_rogue_dhcp_state_constants_match_the_detector_enum():
+    """``app.domains.monitoring`` holds these as plain strings rather than
+    importing ``dhcp``'s enum, keeping this module's zero-cross-domain-import
+    shape. That is only safe if the two cannot drift apart silently, which
+    is what this pins."""
+    assert RogueDhcpAlertState.GUARDED.value == ROGUE_DHCP_STATE_GUARDED
+    assert RogueDhcpAlertState.UNGUARDED.value == ROGUE_DHCP_STATE_UNGUARDED
+    assert RogueDhcpAlertState.UNKNOWN.value == ROGUE_DHCP_STATE_UNKNOWN
+
+
+def test_validate_health_status_change_accepts_rogue_dhcp_guard_target():
+    validate_alert_rule_condition_config(
+        AlertTriggerType.HEALTH_STATUS_CHANGE,
+        ALERT_TARGET_ROGUE_DHCP_GUARD,
+        {"expected_status": ROGUE_DHCP_STATE_UNGUARDED},
+    )
+
+
+def test_validate_rogue_dhcp_guard_rejects_guarded_and_unknown_expected_status():
+    """A rule asking for ``guarded`` would fire when everything is fine, and
+    one asking for ``unknown`` would page somebody for every router the
+    detector could not reach. Both are rejected when the rule is saved, not
+    silently evaluated to nothing six hours later."""
+    for bad in (ROGUE_DHCP_STATE_GUARDED, ROGUE_DHCP_STATE_UNKNOWN):
+        with pytest.raises(InvalidAlertRuleConfigError):
+            validate_alert_rule_condition_config(
+                AlertTriggerType.HEALTH_STATUS_CHANGE,
+                ALERT_TARGET_ROGUE_DHCP_GUARD,
+                {"expected_status": bad},
+            )
+
+
+async def test_rogue_dhcp_guard_rule_triggers_on_unguarded_interface():
+    """A device that *answered*, and answered "nothing is watching this",
+    is a real finding and raises a real alert."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(
+            router,
+            {
+                "ether2": ROGUE_DHCP_STATE_UNGUARDED,
+                "vlan10": ROGUE_DHCP_STATE_GUARDED,
+            },
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    alert = result.triggered[0]
+    assert alert.router_id == router.id
+    assert alert.organization_id == org_id
+    assert alert.location_id == router.location_id
+    # The interface an operator has to go and fix is named, and the one
+    # that is fine is not.
+    assert "ether2" in alert.message
+    assert "vlan10" not in alert.message
+
+    # Second pass, same condition: de-duplicated, never a second alert.
+    assert (await service.evaluate_alert_rules()).triggered == []
+
+
+async def test_rogue_dhcp_guard_rule_never_triggers_on_unknown():
+    """A router the detector could not reach is **not** a router we know is
+    unwatched.
+
+    The tri-state is carried end to end -- the gateway reader, the
+    persisted ``alert_state``, the detector's per-router summary counts,
+    and the readiness item's NOT_CHECKED-not-FAIL branch all keep
+    ``unknown`` separate from ``unguarded``. This is the last step, and it
+    does not collapse it either. Reporting every unreachable router as
+    unguarded would page somebody for every offline router in the fleet
+    while telling them nothing true about rogue DHCP -- the same conflation
+    that once rendered a missing SMS provider as "delivery failed" and
+    silently dropped locations from a fleet list.
+    """
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id, name="Unreachable Router")
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(
+            router,
+            {
+                "ether2": ROGUE_DHCP_STATE_UNKNOWN,
+                "vlan10": ROGUE_DHCP_STATE_UNKNOWN,
+            },
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert result.triggered == []
+    assert result.resolved == []
+    assert repo.alerts == {}
+
+
+async def test_rogue_dhcp_guard_unknown_beside_unguarded_still_triggers():
+    """Ordering, and it matters: a known-unguarded interface outranks an
+    unknown one beside it. The finding was established by a device that
+    answered, and the unknown next to it does not soften it -- the same
+    ordering ``ReadinessService._check_rogue_dhcp_detection`` uses on these
+    same rows."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(
+            router,
+            {
+                "ether2": ROGUE_DHCP_STATE_UNGUARDED,
+                "vlan10": ROGUE_DHCP_STATE_UNKNOWN,
+            },
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert "ether2" in result.triggered[0].message
+
+
+async def test_rogue_dhcp_guard_unknown_never_resolves_an_open_alert():
+    """The half that is easy to get wrong. An alert is open, then the
+    detector loses contact with the router: that is not evidence anybody
+    fixed anything, so the alert stays open. Auto-resolving on a timeout
+    would tell an operator "the guard is back" on the strength of no answer
+    at all."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_UNGUARDED})
+    )
+    triggered = (await service.evaluate_alert_rules()).triggered
+    assert len(triggered) == 1
+
+    repo.rogue_dhcp_rows[:] = _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_UNKNOWN})
+    result = await service.evaluate_alert_rules()
+
+    assert result.resolved == []
+    assert result.triggered == []
+    assert repo.alerts[triggered[0].id].status == AlertStatus.TRIGGERED.value
+
+
+async def test_rogue_dhcp_guard_rule_resolves_when_the_guard_is_restored():
+    """An alert that fires when a router becomes unguarded and never clears
+    when the guard comes back trains people to ignore alerts. Same
+    no-separate-recovery-rule design every other target here uses: the
+    condition is re-evaluated each pass and the open alert is transitioned
+    straight to RESOLVED."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_UNGUARDED})
+    )
+    triggered = (await service.evaluate_alert_rules()).triggered
+    assert len(triggered) == 1
+
+    repo.rogue_dhcp_rows[:] = _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_GUARDED})
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.resolved) == 1
+    assert result.resolved[0].id == triggered[0].id
+    assert result.resolved[0].status == AlertStatus.RESOLVED.value
+    assert result.resolved[0].resolved_at is not None
+    # The text is replaced at resolution time, so the "[RESOLVED]" prefix
+    # _format_alert_message adds cannot produce "[RESOLVED] ... detection
+    # is off" -- the contradiction a real operator read in a real email
+    # once already.
+    assert "is off" not in result.resolved[0].message
+    assert "active again" in result.resolved[0].message
+
+    # And it stays resolved: a resolved alert is not re-resolved next pass.
+    assert (await service.evaluate_alert_rules()).resolved == []
+
+
+async def test_rogue_dhcp_guard_alert_text_never_claims_protection():
+    """``/ip dhcp-server alert`` logs. It blocks nothing, drops nothing and
+    rate-limits nothing. Copy that says otherwise describes a defence this
+    platform has never had and leaves an operator believing the fix
+    restores one -- so both the trigger and the resolution wording are
+    pinned here, on the real ``Alert.message`` the notifiers send."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_UNGUARDED})
+    )
+    triggered = (await service.evaluate_alert_rules()).triggered
+    # Snapshotted *before* resolving, and this is load-bearing:
+    # ``_auto_resolve`` replaces the message on the very same ``Alert``
+    # object it resolves, so ``triggered[0]`` and ``resolved[0]`` are one
+    # object and reading ``.message`` afterwards would silently check the
+    # resolution copy twice and never look at the trigger copy at all.
+    # Caught by mutation-testing this test -- putting "protection" into the
+    # trigger wording left it green.
+    trigger_message = triggered[0].message
+    repo.rogue_dhcp_rows[:] = _rogue_rows(router, {"ether2": ROGUE_DHCP_STATE_GUARDED})
+    resolved = (await service.evaluate_alert_rules()).resolved
+    resolved_message = resolved[0].message
+
+    forbidden = (
+        "protect",
+        "protection",
+        "protected",
+        "unprotected",
+        "block",
+        "blocked",
+        "blocking",
+        "prevent",
+        "prevented",
+        "defend",
+        "defence",
+        "defense",
+        "secured",
+        "guard",  # incl. "guarded"/"unguarded" -- internal vocabulary
+        "shield",
+        "stop",
+    )
+    assert trigger_message != resolved_message
+    for message in (trigger_message, resolved_message):
+        lowered = message.lower()
+        for word in forbidden:
+            # "it does not block" is the one permitted use, and it is a
+            # denial of protection, not a claim of it.
+            occurrences = lowered.count(word)
+            allowed = 1 if word == "block" and "does not block" in lowered else 0
+            assert occurrences == allowed, (
+                f"alert copy claims protection via {word!r}: {message}"
+            )
+        assert "detection only -- it logs, it does not block" in lowered
+
+
+async def test_rogue_dhcp_guard_two_unguarded_interfaces_are_one_alert():
+    """The de-duplication key is ``(rule_id, organization_id, location_id,
+    router_id)`` and has no interface dimension. Evaluating per interface
+    would address two findings to one key -- one alert plus one silently
+    swallowed duplicate, with whichever interface the query returned first
+    in the message. So the rows are grouped per router and both interfaces
+    are named."""
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    router = _rogue_router(org_id)
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(
+            router,
+            {
+                "vlan10": ROGUE_DHCP_STATE_UNGUARDED,
+                "ether2": ROGUE_DHCP_STATE_UNGUARDED,
+            },
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    # Sorted, not insertion-ordered: the message must read the same however
+    # the rows came back.
+    assert "ether2, vlan10" in result.triggered[0].message
+
+
+async def test_rogue_dhcp_guard_rule_is_scoped_to_its_organization():
+    org_id = uuid.uuid4()
+    other_org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    mine = _rogue_router(org_id, name="Mine")
+    theirs = _rogue_router(other_org_id, name="Theirs")
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(mine, {"ether2": ROGUE_DHCP_STATE_UNGUARDED})
+    )
+    repo.rogue_dhcp_rows.extend(
+        _rogue_rows(theirs, {"ether2": ROGUE_DHCP_STATE_UNGUARDED})
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 1
+    assert result.triggered[0].router_id == mine.id
+
+
+async def test_rogue_dhcp_guard_rule_reads_state_only_never_a_device():
+    """The engine's standing promise, and the reason cloud-guest#139 split
+    detector-writes from surface-reads in the first place: evaluation reads
+    already-persisted rows and performs no per-device I/O. A fake with no
+    device surface at all is the assertion -- if the branch ever tried to
+    reach a router it would have nothing to reach it with.
+
+    It is also O(1) queries in fleet size: one bulk status read and one
+    bulk open-alert read per rule, not one of each per router. Counted
+    here, because "don't make evaluation scale with router count" is the
+    kind of promise that quietly stops being true.
+    """
+    org_id = uuid.uuid4()
+    repo, service = await _rogue_dhcp_harness(org_id)
+    calls: list[str] = []
+    real_statuses = repo.list_rogue_dhcp_statuses_with_routers
+    real_open = repo.list_open_alerts_for_rule
+    real_find = repo.find_active_alert
+
+    async def counted_statuses(**kwargs):
+        calls.append("statuses")
+        return await real_statuses(**kwargs)
+
+    async def counted_open(**kwargs):
+        calls.append("open_alerts")
+        return await real_open(**kwargs)
+
+    async def counted_find(**kwargs):
+        calls.append("find_active_alert")
+        return await real_find(**kwargs)
+
+    repo.list_rogue_dhcp_statuses_with_routers = counted_statuses
+    repo.list_open_alerts_for_rule = counted_open
+    repo.find_active_alert = counted_find
+    for index in range(12):
+        repo.rogue_dhcp_rows.extend(
+            _rogue_rows(
+                _rogue_router(org_id, name=f"Router {index}"),
+                {"ether2": ROGUE_DHCP_STATE_UNGUARDED},
+            )
+        )
+
+    result = await service.evaluate_alert_rules()
+
+    assert len(result.triggered) == 12
+    assert calls == ["statuses", "open_alerts"]
+
+
+async def test_new_organizations_get_a_working_rogue_dhcp_rule_from_day_one():
+    """This is the answer to the foreign key that blocked this feature.
+
+    ``Alert.rule_id`` is a non-nullable FK to ``alert_rules``, so the
+    detector in ``app.domains.dhcp.tasks`` could not raise anything without
+    a rule existing first -- which is exactly why cloud-guest#139 stopped at
+    a persisted row and a checklist item. The fix is the mechanism this
+    codebase already uses for ``ALERT_TARGET_MONITORED_HARDWARE``: a default
+    rule created with the organization, at the router/orchestration layer,
+    non-fatally. Not a nullable column, and not a new seeding path.
+
+    Exercised through the real ``AlertService.create_alert_rule`` (which
+    runs ``validate_alert_rule_condition_config``), so a default whose
+    ``condition_config`` the validator would reject fails here rather than
+    silently logging "default_alert_rule_creation_failed" in production and
+    leaving a new customer with no rule -- the failure mode that
+    ``except Exception`` is deliberately wide enough to hide.
+    """
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+
+    await _create_default_alert_rules(service, org_id)
+
+    rules = {rule.target_component: rule for rule in repo.alert_rules.values()}
+    assert set(rules) == {
+        ALERT_TARGET_MONITORED_HARDWARE,
+        ALERT_TARGET_ROGUE_DHCP_GUARD,
+    }
+    rogue_rule = rules[ALERT_TARGET_ROGUE_DHCP_GUARD]
+    assert rogue_rule.organization_id == org_id
+    assert rogue_rule.is_active
+    assert rogue_rule.condition_config == {
+        "expected_status": ROGUE_DHCP_STATE_UNGUARDED
+    }
+    assert rogue_rule.trigger_type == AlertTriggerType.HEALTH_STATUS_CHANGE.value
+    # Detector-only naming, same rule as the alert copy itself: nothing an
+    # operator reads about this may imply /ip dhcp-server alert protects
+    # anything.
+    for text in (rogue_rule.name.lower(), (rogue_rule.description or "").lower()):
+        assert "protect" not in text
+        assert text.count("block") == ("does not block" in text)
 
 
 # ============================================================================

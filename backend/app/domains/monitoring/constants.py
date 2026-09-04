@@ -215,8 +215,11 @@ class AlertTriggerType(StrEnum):
       it), the sentinel :data:`ALERT_TARGET_ROUTER` (watches every in-scope
       ``app.domains.router.models.Router.health_status`` directly), or the
       sentinel :data:`ALERT_TARGET_ISP_LINK` (watches every in-scope
-      ``app.domains.isp.models.IspLink.health_status`` directly) -- all
-      three read-only, the same "read another domain's table directly"
+      ``app.domains.isp.models.IspLink.health_status`` directly), or the
+      sentinel :data:`ALERT_TARGET_ROGUE_DHCP_GUARD` (watches every
+      in-scope router's persisted
+      ``app.domains.dhcp.models.RouterRogueDhcpStatus.alert_state``) -- all
+      read-only, the same "read another domain's table directly"
       precedent ``repository.py`` already establishes for
       ``RadiusNasClient``/``WireGuardPeer``/``RouterEvent``.
       ``condition_config`` shape: ``{"expected_status": <str>}``.
@@ -302,6 +305,75 @@ ALERT_TARGET_ISP_LINK = "isp_link"
 # "never observed yet" is an honest gap in data, not a real outage, the same
 # distinction that domain's own module docstring already draws.
 ALERT_TARGET_MONITORED_HARDWARE = "monitored_hardware"
+
+# Sentinel ``AlertRule.target_component`` value for a ``HEALTH_STATUS_CHANGE``
+# rule that watches, per router, whether that router is still *watching* for
+# a DHCP server on the guest network that isn't ours -- the rolled-up
+# ``app.domains.dhcp.models.RouterRogueDhcpStatus.alert_state`` that
+# ``app.domains.dhcp.tasks``'s scheduled detector persists every six hours.
+#
+# ## Why this target exists at all
+#
+# cloud-guest#139 built the detector and a ``ROGUE_DHCP_GUARD`` readiness
+# checklist item that reads its rows. That surface is pull-only: an
+# unguarded router shows up if -- and only if -- somebody opens that
+# router's checklist. Nobody does. This target is the push half, and it is
+# the same "already-tracked signal another domain persists" composition
+# ``ALERT_TARGET_ROUTER``/``ALERT_TARGET_ISP_LINK`` above already establish.
+#
+# ## No per-device I/O, and none needed
+#
+# ``app.domains.monitoring.tasks``'s module docstring commits this engine to
+# reading already-persisted state only. That promise is what forced #139's
+# detector-writes/surface-reads split in the first place, so honouring it
+# here costs nothing: ``RouterRogueDhcpStatus`` *is* already-persisted
+# state, written hours earlier off the request path. See
+# ``service.AlertService._evaluate_rogue_dhcp_guard_rule``, which reads it
+# through ``repository.list_rogue_dhcp_statuses_with_routers`` -- one
+# query for the whole rule, not one per router.
+#
+# ## Only ``unguarded`` is alertable, and only per router
+#
+# ``expected_status`` is ``"unguarded"`` -- the sole value with a finding
+# behind it. ``app.domains.dhcp.constants.RogueDhcpAlertState`` is
+# deliberately tri-state, and ``unknown`` ("the detector could not reach
+# this router") never triggers and never resolves: a router we could not
+# reach is not a router we know is unwatched, and it is not a router we
+# know has been fixed either. Same posture ``ALERT_TARGET_MONITORED_HARDWARE``
+# above documents for ``HardwareStatus.UNKNOWN``, same posture
+# ``HealthStatus.UNKNOWN`` documents for its own no-data case, and the same
+# distinction the readiness item's own NOT_CHECKED-not-FAIL branch draws.
+# This codebase has collapsed that distinction twice and paid for it both
+# times (a missing SMS provider rendered as "delivery failed"; locations
+# silently dropped from a fleet list).
+#
+# The detector persists one row per ``(router_id, interface)``, but the
+# alert de-duplication key (see ``AlertService``'s own docstring) has no
+# interface dimension -- so this target evaluates one *router* at a time,
+# with the affected interface names in the alert message. Two unguarded
+# interfaces on one router are one alert, not two.
+#
+# ## Detection only
+#
+# ``/ip dhcp-server alert`` logs. It does not block, drop, or rate-limit
+# anything. No copy derived from this target may imply otherwise -- see
+# ``RogueDhcpAlertState``'s own note on this and
+# ``service._rogue_dhcp_guard_message``/``_rogue_dhcp_guard_resolved_message``,
+# which carry the same "detection only -- it logs, it does not block"
+# sentence the readiness item already shows.
+ALERT_TARGET_ROGUE_DHCP_GUARD = "rogue_dhcp_guard"
+
+# The one ``expected_status`` an ``ALERT_TARGET_ROGUE_DHCP_GUARD`` rule may
+# carry, and the ``alert_state`` string the evaluator matches it against.
+# Held here as a plain string rather than importing
+# ``app.domains.dhcp.constants.RogueDhcpAlertState`` so this module keeps
+# the zero-imports-from-other-domains shape every other constant here has;
+# ``dhcp``'s enum stores plain strings for exactly this reason, and
+# ``tests/unit/test_monitoring_alerts.py`` pins the two to each other so
+# they cannot drift apart silently.
+ROGUE_DHCP_STATE_UNGUARDED = "unguarded"
+ROGUE_DHCP_STATE_GUARDED = "guarded"
+ROGUE_DHCP_STATE_UNKNOWN = "unknown"
 
 
 class ThresholdMetric(StrEnum):
@@ -617,6 +689,10 @@ __all__ = [
     "ALERT_TARGET_ROUTER",
     "ALERT_TARGET_ISP_LINK",
     "ALERT_TARGET_MONITORED_HARDWARE",
+    "ALERT_TARGET_ROGUE_DHCP_GUARD",
+    "ROGUE_DHCP_STATE_UNGUARDED",
+    "ROGUE_DHCP_STATE_GUARDED",
+    "ROGUE_DHCP_STATE_UNKNOWN",
     "ThresholdMetric",
     "ThresholdOperator",
     "AlertSeverity",
