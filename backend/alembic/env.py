@@ -8,11 +8,39 @@ from app.database.base import Base
 
 # Import domain models so their tables are registered on Base.metadata
 # before autogenerate compares it against the database.
+# Every domain that defines ORM models must be imported here, not just the
+# ones a past migration happened to need.
+#
+# `target_metadata` below is `Base.metadata`, and a model class only lands in
+# it when its module is imported. Nineteen domains -- vlan, dhcp, qos,
+# port_forwarding, content_filtering, hotspot, isp, campaigns,
+# channel_partner, support_tickets, quotation and others -- were missing, so
+# Alembic could not see **30 tables** that exist in the database.
+#
+# Nothing had gone wrong yet only because every migration in this directory
+# is hand-written. The first person to run `alembic revision --autogenerate`
+# would have been handed a migration that DROPS all thirty, including
+# `vlans`, `dhcp_pools`, `channel_partners`, `campaigns`, `support_tickets`
+# and `quotations` -- because autogenerate reads "in the database, not in the
+# metadata" as "this table was deleted".
+#
+# `tests/unit/test_migrations.py` asserts this list stays complete, so the
+# next domain to define models cannot quietly reopen it.
 from app.domains.analytics import models as analytics_models  # noqa: F401
 from app.domains.api_keys import models as api_keys_models  # noqa: F401
+from app.domains.assistant import models as assistant_models  # noqa: F401
 from app.domains.auth import models as auth_models  # noqa: F401
 from app.domains.billing import models as billing_models  # noqa: F401
+from app.domains.branding import models as branding_models  # noqa: F401
+from app.domains.campaigns import models as campaigns_models  # noqa: F401
 from app.domains.captive_portal import models as captive_portal_models  # noqa: F401
+from app.domains.channel_partner import models as channel_partner_models  # noqa: F401
+from app.domains.connected_devices import (
+    models as connected_devices_models,  # noqa: F401,E501
+)
+from app.domains.content_filtering import (
+    models as content_filtering_models,  # noqa: F401,E501
+)
 
 # demo_request is imported alongside demo_booking, not for its own sake:
 # DemoBooking.demo_request_id is a ForeignKey("demo_requests.id"), and
@@ -23,24 +51,39 @@ from app.domains.captive_portal import models as captive_portal_models  # noqa: 
 # autogenerate coverage, not something this migration introduced.)
 from app.domains.demo_booking import models as demo_booking_models  # noqa: F401
 from app.domains.demo_request import models as demo_request_models  # noqa: F401
+from app.domains.device_sync import models as device_sync_models  # noqa: F401
+from app.domains.dhcp import models as dhcp_models  # noqa: F401
 from app.domains.dns import models as dns_models  # noqa: F401
 from app.domains.firewall import models as firewall_models  # noqa: F401
 from app.domains.guest import models as guest_models  # noqa: F401
 from app.domains.guest_access import models as guest_access_models  # noqa: F401
 from app.domains.guest_teams import models as guest_teams_models  # noqa: F401
+from app.domains.hotspot import models as hotspot_models  # noqa: F401
+from app.domains.isp import models as isp_models  # noqa: F401
+from app.domains.isp_routing import models as isp_routing_models  # noqa: F401
 from app.domains.location import models as location_models  # noqa: F401
+from app.domains.mac_authorization import (
+    models as mac_authorization_models,  # noqa: F401,E501
+)
 from app.domains.monitored_hardware import (
     models as monitored_hardware_models,  # noqa: F401
 )
 from app.domains.monitoring import models as monitoring_models  # noqa: F401
 from app.domains.network_device import models as network_device_models  # noqa: F401
+from app.domains.network_diagnostics import (
+    models as network_diagnostics_models,  # noqa: F401,E501
+)
 from app.domains.notification import models as notification_models  # noqa: F401
 from app.domains.organization import models as organization_models  # noqa: F401
 from app.domains.otp import models as otp_models  # noqa: F401
 from app.domains.policy import models as policy_models  # noqa: F401
+from app.domains.port_forwarding import models as port_forwarding_models  # noqa: F401
 from app.domains.provisioning_engine import (
     models as provisioning_engine_models,  # noqa: F401,E501
 )
+from app.domains.qos import models as qos_models  # noqa: F401
+from app.domains.queue_management import models as queue_management_models  # noqa: F401
+from app.domains.quotation import models as quotation_models  # noqa: F401
 from app.domains.rbac import models as rbac_models  # noqa: F401
 from app.domains.readiness import models as readiness_models  # noqa: F401
 from app.domains.router import models as router_models  # noqa: F401
@@ -48,7 +91,9 @@ from app.domains.router_agent import models as router_agent_models  # noqa: F401
 from app.domains.router_provisioning import (
     models as router_provisioning_models,  # noqa: F401,E501
 )
+from app.domains.support_tickets import models as support_tickets_models  # noqa: F401
 from app.domains.system_settings import models as system_settings_models  # noqa: F401
+from app.domains.vlan import models as vlan_models  # noqa: F401
 from app.domains.voucher import models as voucher_models  # noqa: F401
 from app.domains.wireguard import models as wireguard_models  # noqa: F401
 
