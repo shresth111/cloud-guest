@@ -33,15 +33,29 @@ class HealthComponent(StrEnum):
     ``RouterEvent`` (BE-008/BE-009). See ``models.py``'s module docstring for
     the full "why no ``DeviceHealth`` table" write-up.
 
-    ``CELERY``/``WEBSOCKET`` are real, first-class enum members even though
-    neither piece of infrastructure exists in this codebase yet (no Celery
-    worker/broker anywhere, no WebSocket support anywhere) -- per this
-    module's honesty mandate, a health-check *type* is defined and wired
-    into every dashboard/history endpoint now, so no migration is needed
-    once a real deployment exists; ``service.py``'s
-    ``check_celery_health``/``check_websocket_health`` return an honest
-    ``HealthStatus.UNKNOWN`` with a documented reason, never a fabricated
-    ``HEALTHY``.
+    ``CELERY``/``WEBSOCKET`` were once placeholders here, defined ahead of
+    the infrastructure so that no migration would be needed once it
+    existed, and returning an honest ``HealthStatus.UNKNOWN`` in the
+    meantime. **Both are real checks now**, and this paragraph used to say
+    otherwise: it claimed "neither piece of infrastructure exists in this
+    codebase yet (no Celery worker/broker anywhere, no WebSocket support
+    anywhere)" long after ``app.core.celery_app`` shipped a genuine Celery
+    deployment with a nineteen-entry ``beat_schedule``,
+    ``deploy/docker-compose.prod.yml`` began running ``celery-worker`` and
+    ``celery-beat`` services, and BE-011 Part 3 added real WebSocket
+    endpoints.
+
+    That is not a harmless stale line. It was read as current on
+    2026-09-04 and taken as evidence that this platform has no recurring
+    scheduler at all -- which is exactly why nobody noticed the Health
+    Engine itself had no Beat entry and the System Health page was showing
+    two-day-old rows. A comment that describes infrastructure the reader
+    cannot see is load-bearing, and this one pointed the wrong way.
+
+    See ``service.py``'s ``check_celery_health`` (a real
+    ``control.inspect().ping()`` against the configured broker, with three
+    distinct real outcomes) and ``check_websocket_health`` for what each
+    actually does today.
     """
 
     DATABASE = "database"
@@ -387,6 +401,26 @@ ALERT_EVENT_LOOKBACK_MINUTES = 15
 # "within about one cycle of the faster underlying sweep," typically
 # under a minute end-to-end (health check catches the change, next
 # evaluation pass alerts + emails on it), never truly immediate.
+# How often the Health Engine actually runs.
+#
+# It did not run at all. `GET /monitoring/health` only *reads* the stored
+# `service_health` rows; the sole writer is `POST /monitoring/health/run`,
+# which is the Master console's own "Run health checks now" button. There
+# was no Beat entry and nothing else called `run_all_health_checks`, so on
+# 2026-09-04 that page showed component timestamps two days old while
+# calling itself live -- and FreeRADIUS sat on "Degraded, 5 consecutive
+# failures" from a check nobody had re-run since.
+#
+# Five minutes, matching the hub-reconciliation sweep rather than the
+# 30-second alert sweep: these checks touch the database, Redis, disk and
+# the hub's own agents, so they are an order of magnitude more expensive
+# than reading already-persisted state, and nothing here changes on a
+# 30-second timescale. Health that is five minutes old is honest; health
+# that is two days old is a lie with a timestamp on it.
+HEALTH_CHECK_SWEEP_INTERVAL_SECONDS = 300.0
+
+TASK_RUN_HEALTH_CHECK_SWEEP = "app.domains.monitoring.tasks.run_health_check_sweep"
+
 ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS = 30.0
 
 TASK_RUN_ALERT_RULE_EVALUATION_SWEEP = (
@@ -590,7 +624,9 @@ __all__ = [
     "ALERT_STATUS_TRANSITIONS",
     "ALERT_EVENT_LOOKBACK_MINUTES",
     "ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS",
+    "HEALTH_CHECK_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_ALERT_RULE_EVALUATION_SWEEP",
+    "TASK_RUN_HEALTH_CHECK_SWEEP",
     "NotificationChannelType",
     "NotificationStatus",
     "HTTP_NOTIFICATION_TIMEOUT_SECONDS",

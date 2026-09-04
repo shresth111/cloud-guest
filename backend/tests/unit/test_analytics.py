@@ -806,7 +806,13 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # independent real-device-I/O path alongside the RouterOS-API-based
     # sweep above -- see app.domains.provisioning_engine.service
     # .run_router_snmp_metrics_poll_sweep's own module docstring.
-    # DHCP domain adds a nineteenth Beat entry ("dhcp-rogue-detection-sweep")
+    # Monitoring domain adds a nineteenth Beat entry
+    # ("monitoring-health-check-sweep") -- the Health Engine had no
+    # schedule at all, so every row on the System Health page was exactly
+    # as old as the last time a human pressed "Run health checks now". See
+    # app.domains.monitoring.constants
+    # .HEALTH_CHECK_SWEEP_INTERVAL_SECONDS's own comment.
+    # DHCP domain adds a twentieth Beat entry ("dhcp-rogue-detection-sweep")
     # -- the scheduled rogue-DHCP detector, and the first caller
     # ``wyfy_device_gateway.mikrotik_adapter.read_rogue_dhcp_alerts`` has
     # ever had. See app.domains.dhcp.tasks's own module docstring.
@@ -826,6 +832,14 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "campaigns-sweep-status-transitions",
         "provisioning-engine-router-health-poll-sweep",
         "router-provisioning-token-cleanup-sweep",
+        # `GET /monitoring/health` only reads the stored `service_health`
+        # table; it probes nothing. Without this entry the sole writer is
+        # the Master console's own button, so the page's timestamps are as
+        # old as the last human click -- found at two days on 2026-09-04,
+        # while the page described itself as live. Its absence from this
+        # set is not a missing schedule entry, it is a reliability page
+        # reporting a moment nobody chose.
+        "monitoring-health-check-sweep",
         # The only writer of ONLINE -> OFFLINE on the platform. Before it
         # existed, `heartbeat()` wrote ONLINE and nothing ever wrote it
         # back, so a router that died weeks ago read as online to every
