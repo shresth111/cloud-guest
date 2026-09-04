@@ -748,8 +748,19 @@ async def get_my_license(
 async def get_license(
     request: Request,
     organization_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    organization_service: OrganizationService = Depends(get_organization_service),
     service: LicenseService = Depends(get_license_service),
 ):
+    # RequirePermission scopes off the X-Organization-Id header, not this
+    # path id -- without threading the caller's own organization through,
+    # the check and the write name different tenants. See
+    # organization/scoping.py.
+    await enforce_target_organization(
+        target_organization_id=organization_id,
+        requesting_organization_id=requesting_organization_id,
+        organization_service=organization_service,
+    )
     license_ = await service.get_license_for_organization(organization_id)
     return build_response(
         success=True,
@@ -768,9 +779,12 @@ async def get_license(
 async def get_license_history(
     request: Request,
     license_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: LicenseService = Depends(get_license_service),
 ):
-    entries = await service.list_change_history(license_id)
+    entries = await service.list_change_history(
+        license_id, requesting_organization_id=requesting_organization_id
+    )
     return build_response(
         success=True,
         message="License change history retrieved",
@@ -789,10 +803,13 @@ async def activate_license(
     request: Request,
     license_id: uuid.UUID,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: LicenseService = Depends(get_license_service),
 ):
     license_ = await service.activate_license(
-        actor_user_id=uuid.UUID(user.id), license_id=license_id
+        actor_user_id=uuid.UUID(user.id),
+        license_id=license_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
@@ -813,10 +830,14 @@ async def suspend_license(
     license_id: uuid.UUID,
     payload: LicenseSuspendRequest,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: LicenseService = Depends(get_license_service),
 ):
     license_ = await service.suspend_license(
-        actor_user_id=uuid.UUID(user.id), license_id=license_id, reason=payload.reason
+        actor_user_id=uuid.UUID(user.id),
+        license_id=license_id,
+        requesting_organization_id=requesting_organization_id,
+        reason=payload.reason,
     )
     return build_response(
         success=True,
@@ -836,10 +857,13 @@ async def cancel_license(
     request: Request,
     license_id: uuid.UUID,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: LicenseService = Depends(get_license_service),
 ):
     license_ = await service.cancel_license(
-        actor_user_id=uuid.UUID(user.id), license_id=license_id
+        actor_user_id=uuid.UUID(user.id),
+        license_id=license_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
@@ -860,11 +884,13 @@ async def upgrade_license(
     license_id: uuid.UUID,
     payload: LicenseUpgradeRequest,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: LicenseService = Depends(get_license_service),
 ):
     license_ = await service.upgrade_license(
         actor_user_id=uuid.UUID(user.id),
         license_id=license_id,
+        requesting_organization_id=requesting_organization_id,
         new_plan_id=payload.new_plan_id,
         reason=payload.reason,
     )
@@ -887,11 +913,13 @@ async def downgrade_license(
     license_id: uuid.UUID,
     payload: LicenseDowngradeRequest,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: LicenseService = Depends(get_license_service),
 ):
     license_ = await service.downgrade_license(
         actor_user_id=uuid.UUID(user.id),
         license_id=license_id,
+        requesting_organization_id=requesting_organization_id,
         new_plan_id=payload.new_plan_id,
         reason=payload.reason,
     )
@@ -1067,11 +1095,13 @@ async def cancel_subscription(
     subscription_id: uuid.UUID,
     payload: SubscriptionCancelRequest,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: SubscriptionService = Depends(get_subscription_service),
 ):
     subscription = await service.cancel_subscription(
         actor_user_id=uuid.UUID(user.id),
         subscription_id=subscription_id,
+        requesting_organization_id=requesting_organization_id,
         immediate=payload.immediate,
     )
     return build_response(
@@ -1092,10 +1122,13 @@ async def reactivate_subscription(
     request: Request,
     subscription_id: uuid.UUID,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: SubscriptionService = Depends(get_subscription_service),
 ):
     subscription = await service.reactivate_subscription(
-        actor_user_id=uuid.UUID(user.id), subscription_id=subscription_id
+        actor_user_id=uuid.UUID(user.id),
+        subscription_id=subscription_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
@@ -1115,10 +1148,13 @@ async def pause_subscription(
     request: Request,
     subscription_id: uuid.UUID,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: SubscriptionService = Depends(get_subscription_service),
 ):
     subscription = await service.pause_subscription(
-        actor_user_id=uuid.UUID(user.id), subscription_id=subscription_id
+        actor_user_id=uuid.UUID(user.id),
+        subscription_id=subscription_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
@@ -1138,10 +1174,13 @@ async def resume_subscription(
     request: Request,
     subscription_id: uuid.UUID,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: SubscriptionService = Depends(get_subscription_service),
 ):
     subscription = await service.resume_subscription(
-        actor_user_id=uuid.UUID(user.id), subscription_id=subscription_id
+        actor_user_id=uuid.UUID(user.id),
+        subscription_id=subscription_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
@@ -1640,10 +1679,13 @@ async def remove_payment_method(
     request: Request,
     payment_method_id: uuid.UUID,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: PaymentMethodService = Depends(get_payment_method_service),
 ):
     await service.remove_payment_method(
-        actor_user_id=uuid.UUID(user.id), payment_method_id=payment_method_id
+        actor_user_id=uuid.UUID(user.id),
+        payment_method_id=payment_method_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
@@ -1690,10 +1732,14 @@ async def refund_payment(
     payment_id: uuid.UUID,
     payload: PaymentRefundRequest,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: PaymentService = Depends(get_payment_service),
 ):
     payment = await service.refund_payment(
-        actor_user_id=uuid.UUID(user.id), payment_id=payment_id, amount=payload.amount
+        actor_user_id=uuid.UUID(user.id),
+        payment_id=payment_id,
+        requesting_organization_id=requesting_organization_id,
+        amount=payload.amount,
     )
     return build_response(
         success=True,
@@ -1713,10 +1759,13 @@ async def retry_payment(
     request: Request,
     payment_id: uuid.UUID,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: PaymentService = Depends(get_payment_service),
 ):
     payment = await service.retry_failed_payment(
-        actor_user_id=uuid.UUID(user.id), payment_id=payment_id
+        actor_user_id=uuid.UUID(user.id),
+        payment_id=payment_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,
@@ -1783,9 +1832,7 @@ async def razorpay_webhook(
             payload, signature=signature, secret=settings.razorpay_webhook_secret
         )
     except WebhookSignatureInvalidError as exc:
-        await log_signature_failure(
-            "razorpay", str(exc), audit_writer=audit_repository
-        )
+        await log_signature_failure("razorpay", str(exc), audit_writer=audit_repository)
         raise
     body = json.loads(payload or b"{}")
     body["_event_id"] = request.headers.get("x-razorpay-event-id", "")
@@ -2284,10 +2331,13 @@ async def void_invoice(
     request: Request,
     invoice_id: uuid.UUID,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: InvoiceService = Depends(get_invoice_service),
 ):
     invoice = await service.void_invoice(
-        actor_user_id=uuid.UUID(user.id), invoice_id=invoice_id
+        actor_user_id=uuid.UUID(user.id),
+        invoice_id=invoice_id,
+        requesting_organization_id=requesting_organization_id,
     )
     items = await service.list_items(invoice.id)
     notes = await service.list_notes(invoice.id)
@@ -2310,11 +2360,13 @@ async def issue_credit_note(
     invoice_id: uuid.UUID,
     payload: CreditNoteIssueRequest,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: InvoiceService = Depends(get_invoice_service),
 ):
     note = await service.issue_credit_note(
         actor_user_id=uuid.UUID(user.id),
         invoice_id=invoice_id,
+        requesting_organization_id=requesting_organization_id,
         amount=payload.amount,
         reason=payload.reason,
     )
@@ -2337,11 +2389,13 @@ async def issue_debit_note(
     invoice_id: uuid.UUID,
     payload: DebitNoteIssueRequest,
     user: AuthUser = Depends(get_current_user),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: InvoiceService = Depends(get_invoice_service),
 ):
     note = await service.issue_debit_note(
         actor_user_id=uuid.UUID(user.id),
         invoice_id=invoice_id,
+        requesting_organization_id=requesting_organization_id,
         amount=payload.amount,
         reason=payload.reason,
     )

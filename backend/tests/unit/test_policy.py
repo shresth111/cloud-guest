@@ -365,9 +365,11 @@ class FakePolicyRepository:
         return matches[0] if matches else None
 
 
-def _build_service() -> tuple[
-    PolicyService, FakePolicyRepository, FakeOrganizationLookup, FakeAuditLogWriter
-]:
+def _build_service() -> (
+    tuple[
+        PolicyService, FakePolicyRepository, FakeOrganizationLookup, FakeAuditLogWriter
+    ]
+):
     repo = FakePolicyRepository()
     org_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup()
@@ -400,9 +402,9 @@ class FakeRoleLookup:
         return object() if role_id in self.known_role_ids else None
 
 
-def _build_service_with_targeting() -> tuple[
-    PolicyService, FakePolicyRepository, FakeUserLookup, FakeRoleLookup
-]:
+def _build_service_with_targeting() -> (
+    tuple[PolicyService, FakePolicyRepository, FakeUserLookup, FakeRoleLookup]
+):
     repo = FakePolicyRepository()
     org_lookup = FakeOrganizationLookup()
     location_lookup = FakeLocationLookup()
@@ -1979,7 +1981,13 @@ class TestOneGuestOneGroupConstraint:
 
     async def test_get_guest_group_assignment_returns_none_when_unmapped(self) -> None:
         service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
-        assert await service.get_guest_group_assignment(guest_id=uuid.uuid4()) is None
+        assert (
+            await service.get_guest_group_assignment(
+                guest_id=uuid.uuid4(),
+                requesting_organization_id=None,
+            )
+            is None
+        )
 
     async def test_get_guest_group_assignment_returns_the_active_mapping(self) -> None:
         service, _repo, _user_lookup, _role_lookup = _build_service_with_targeting()
@@ -1999,7 +2007,10 @@ class TestOneGuestOneGroupConstraint:
             target_id=guest_id,
         )
 
-        found = await service.get_guest_group_assignment(guest_id=guest_id)
+        found = await service.get_guest_group_assignment(
+            guest_id=guest_id,
+            requesting_organization_id=None,
+        )
         assert found is not None
         assert found.id == created.id
         assert found.policy_id == group.id
@@ -2138,6 +2149,6 @@ class TestEveryRouteRequiresPermission:
             # docstring -- there is no guest-facing route at all here), so
             # every one of them must carry the RequirePermission dependency
             # supplied via its own @router.<method>(..., dependencies=[...]).
-            assert route.dependencies != [], (
-                f"{route.path} ({route.methods}) has no permission dependency"
-            )
+            assert (
+                route.dependencies != []
+            ), f"{route.path} ({route.methods}) has no permission dependency"

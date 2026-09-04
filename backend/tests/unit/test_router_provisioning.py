@@ -448,10 +448,12 @@ class FakeRouterProvisioningRepository:
             and v.router_id == router_id
         ]
 
-    async def list_variables(self, *, scope_type, page, page_size):
+    async def list_variables(self, *, scope_type, organization_id, page, page_size):
         values = [v for v in self.variables.values() if not v.is_deleted]
         if scope_type:
             values = [v for v in values if v.scope_type == scope_type]
+        if organization_id is not None:
+            values = [v for v in values if v.organization_id == organization_id]
         values.sort(key=lambda v: v.created_at, reverse=True)
         params = PageParams(page=page, page_size=page_size)
         paged = values[params.offset : params.offset + params.page_size]
@@ -1044,7 +1046,10 @@ class TestConfigVariables:
             requesting_organization_id=None,
         )
         updated = await service.update_variable(
-            actor_user_id=uuid.uuid4(), variable_id=variable.id, value="Second"
+            actor_user_id=uuid.uuid4(),
+            variable_id=variable.id,
+            requesting_organization_id=None,
+            value="Second",
         )
         assert decrypt_secret(updated.value) == "Second"
 
@@ -1058,7 +1063,9 @@ class TestConfigVariables:
             requesting_organization_id=None,
         )
         deleted = await service.delete_variable(
-            actor_user_id=uuid.uuid4(), variable_id=variable.id
+            actor_user_id=uuid.uuid4(),
+            variable_id=variable.id,
+            requesting_organization_id=None,
         )
         assert deleted.is_deleted is True
 
@@ -2344,6 +2351,154 @@ class TestTenantIsolation:
         with pytest.raises(ProvisioningJobRouterMismatchError):
             validate_job_belongs_to_router(job, router_b.id)
 
+    async def test_a_tenant_does_not_see_another_tenants_variables(self) -> None:
+        """`GET /router-templates/variables` returned every organization's
+        rows -- including, for anything not marked secret, the plaintext
+        value -- and the ids needed to address them one at a time. That is
+        what turned the two unscoped writers below from "needs a guessed
+        UUID" into "pick one off the list"."""
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        org_a = org_lookup.add()
+        org_b = org_lookup.add()
+        for organization, key in ((org_a, "a_key"), (org_b, "b_key")):
+            await service.create_variable(
+                actor_user_id=uuid.uuid4(),
+                scope_type=ConfigVariableScope.ORGANIZATION,
+                key=key,
+                value="v",
+                organization_id=organization.id,
+                requesting_organization_id=organization.id,
+            )
+
+        mine, _meta = await service.list_variables(requesting_organization_id=org_a.id)
+
+        assert [v.key for v in mine] == ["a_key"]
+
+    async def test_platform_caller_still_sees_every_tenants_variables(self) -> None:
+        """The Master console has no organization context and must keep the
+        unnarrowed view -- the fix must scope tenants, not blind the
+        platform."""
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        org_a = org_lookup.add()
+        org_b = org_lookup.add()
+        for organization, key in ((org_a, "a_key"), (org_b, "b_key")):
+            await service.create_variable(
+                actor_user_id=uuid.uuid4(),
+                scope_type=ConfigVariableScope.ORGANIZATION,
+                key=key,
+                value="v",
+                organization_id=organization.id,
+                requesting_organization_id=organization.id,
+            )
+
+        everything, _meta = await service.list_variables(
+            requesting_organization_id=None
+        )
+
+        assert {v.key for v in everything} == {"a_key", "b_key"}
+
+    async def test_a_tenant_cannot_overwrite_another_tenants_variable(self) -> None:
+        """These feed `resolve_variables`, which is what renders a router's
+        RouterOS config -- so this was a write into another tenant's device
+        configuration, not only into their data."""
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        org_a = org_lookup.add()
+        org_b = org_lookup.add()
+        theirs = await service.create_variable(
+            actor_user_id=uuid.uuid4(),
+            scope_type=ConfigVariableScope.ORGANIZATION,
+            key="ntp_server",
+            value="pool.ntp.org",
+            organization_id=org_b.id,
+            requesting_organization_id=org_b.id,
+        )
+
+        with pytest.raises(CrossOrganizationVariableAccessError):
+            await service.update_variable(
+                actor_user_id=uuid.uuid4(),
+                variable_id=theirs.id,
+                requesting_organization_id=org_a.id,
+                value="attacker.pool.ntp.org",
+            )
+
+    async def test_a_tenant_cannot_delete_another_tenants_variable(self) -> None:
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        org_a = org_lookup.add()
+        org_b = org_lookup.add()
+        theirs = await service.create_variable(
+            actor_user_id=uuid.uuid4(),
+            scope_type=ConfigVariableScope.ORGANIZATION,
+            key="ntp_server",
+            value="pool.ntp.org",
+            organization_id=org_b.id,
+            requesting_organization_id=org_b.id,
+        )
+
+        with pytest.raises(CrossOrganizationVariableAccessError):
+            await service.delete_variable(
+                actor_user_id=uuid.uuid4(),
+                variable_id=theirs.id,
+                requesting_organization_id=org_a.id,
+            )
+
+    async def test_a_tenant_cannot_overwrite_a_global_default(self) -> None:
+        """A global default (`organization_id IS NULL`) applies to every
+        tenant's routers. An organization-scoped caller cannot create one
+        -- `_resolve_variable_scope_fks` already refuses that -- so it must
+        not be able to overwrite one either, or the write path would be
+        strictly more permissive than the create path."""
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        org_a = org_lookup.add()
+        platform_default = await service.create_variable(
+            actor_user_id=uuid.uuid4(),
+            scope_type=ConfigVariableScope.ORGANIZATION,
+            key="ntp_server",
+            value="pool.ntp.org",
+            requesting_organization_id=None,
+        )
+
+        with pytest.raises(CrossOrganizationVariableAccessError):
+            await service.update_variable(
+                actor_user_id=uuid.uuid4(),
+                variable_id=platform_default.id,
+                requesting_organization_id=org_a.id,
+                value="attacker.pool.ntp.org",
+            )
+
+    async def test_a_tenant_can_still_manage_its_own_variable(self) -> None:
+        """The guard must refuse the neighbour without refusing the owner."""
+        service, _repo, _router_service, _router_repo, _loc, org_lookup, *_ = (
+            make_services()
+        )
+        organization = org_lookup.add()
+        mine = await service.create_variable(
+            actor_user_id=uuid.uuid4(),
+            scope_type=ConfigVariableScope.ORGANIZATION,
+            key="ntp_server",
+            value="pool.ntp.org",
+            organization_id=organization.id,
+            requesting_organization_id=organization.id,
+        )
+
+        updated = await service.update_variable(
+            actor_user_id=uuid.uuid4(),
+            variable_id=mine.id,
+            requesting_organization_id=organization.id,
+            value="in.pool.ntp.org",
+        )
+
+        assert updated.value == "in.pool.ntp.org"
+
 
 # ============================================================================
 # Provisioning Engine extension: vendor adapters
@@ -2757,6 +2912,8 @@ class TestHealthSnapshotResponseCarriesSnmpFields:
         assert counter.up is None
         assert counter.in_octets is None
         assert counter.out_octets is None
+
+
 class TestEnrollmentApprovalCannotSetPlatformCredentials:
     """The second door onto the same secret, found while fixing the first.
 

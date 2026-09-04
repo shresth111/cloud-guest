@@ -1144,10 +1144,12 @@ async def update_incident(
     request: Request,
     incident_id: uuid.UUID,
     payload: IncidentUpdateRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: IncidentService = Depends(get_incident_service),
 ):
     incident = await service.update_incident(
         incident_id,
+        requesting_organization_id=requesting_organization_id,
         status=payload.status,
         title=payload.title,
         description=payload.description,
@@ -1172,9 +1174,14 @@ async def attach_alert_to_incident(
     request: Request,
     incident_id: uuid.UUID,
     payload: IncidentAlertAttachRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: IncidentService = Depends(get_incident_service),
 ):
-    incident = await service.attach_alert(incident_id, payload.alert_id)
+    incident = await service.attach_alert(
+        incident_id,
+        payload.alert_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message="Alert attached to incident",
@@ -1330,9 +1337,14 @@ async def generate_sla_report(
     request: Request,
     target_id: uuid.UUID,
     payload: SlaReportGenerateRequest,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: SlaService = Depends(get_sla_service),
 ):
-    report = await service.generate_report(target_id, period_days=payload.period_days)
+    report = await service.generate_report(
+        target_id,
+        requesting_organization_id=requesting_organization_id,
+        period_days=payload.period_days,
+    )
     return build_response(
         success=True,
         message="SLA report generated",

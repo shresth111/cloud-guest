@@ -488,12 +488,14 @@ async def invite_organization_member(
     organization_id: uuid.UUID,
     payload: OrganizationMemberInviteRequest,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     organization_service: OrganizationService = Depends(get_organization_service),
 ):
     member = await organization_service.invite_member(
         actor_user_id=uuid.UUID(user.id),
         organization_id=organization_id,
         user_id=payload.user_id,
+        requesting_organization_id=requesting_organization_id,
         is_primary_contact=payload.is_primary_contact,
     )
     return build_response(
@@ -515,12 +517,14 @@ async def remove_organization_member(
     organization_id: uuid.UUID,
     member_id: uuid.UUID,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     organization_service: OrganizationService = Depends(get_organization_service),
 ):
     await organization_service.remove_member(
         actor_user_id=uuid.UUID(user.id),
         organization_id=organization_id,
         member_id=member_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,

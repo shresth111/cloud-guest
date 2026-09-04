@@ -906,6 +906,91 @@ class TestMarkInvoicePaid:
 
 
 class TestVoidInvoice:
+    async def test_a_tenant_cannot_void_another_tenants_invoice(self) -> None:
+        """Voiding, credit notes and debit notes all reached their invoice by
+        path id under a header-scoped permission check, so any tenant holding
+        `invoices.manage` on its own organization could rewrite another
+        tenant's billing record. Not-found rather than forbidden: the
+        endpoint must not confirm the invoice exists."""
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service()
+        owner_org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository, plan_repository, organization_id=owner_org_id
+        )
+        await _make_billing_profile(
+            billing_profile_repository, organization_id=owner_org_id
+        )
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+        status_before = invoice.status
+
+        with pytest.raises(InvoiceNotFoundError):
+            await service.void_invoice(
+                actor_user_id=None,
+                invoice_id=invoice.id,
+                requesting_organization_id=uuid.uuid4(),
+            )
+
+        assert invoice.status == status_before
+
+    async def test_a_tenant_cannot_credit_note_another_tenants_invoice(self) -> None:
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service()
+        owner_org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository, plan_repository, organization_id=owner_org_id
+        )
+        await _make_billing_profile(
+            billing_profile_repository, organization_id=owner_org_id
+        )
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+
+        with pytest.raises(InvoiceNotFoundError):
+            await service.issue_credit_note(
+                actor_user_id=None,
+                invoice_id=invoice.id,
+                requesting_organization_id=uuid.uuid4(),
+                amount=Decimal("1.00"),
+                reason="not mine to credit",
+            )
+
+    async def test_the_owning_tenant_can_still_void(self) -> None:
+        """The guard must refuse the neighbour without refusing the owner."""
+        (
+            service,
+            _invoice_repository,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax_rate_repository,
+        ) = _make_invoice_service()
+        org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository, plan_repository, organization_id=org_id
+        )
+        await _make_billing_profile(billing_profile_repository, organization_id=org_id)
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+
+        voided = await service.void_invoice(
+            actor_user_id=None,
+            invoice_id=invoice.id,
+            requesting_organization_id=org_id,
+        )
+
+        assert voided.status == InvoiceStatus.VOID.value
+
     async def test_void_issued_invoice_transitions_to_void(self) -> None:
         (
             service,
@@ -922,7 +1007,11 @@ class TestVoidInvoice:
         await _make_billing_profile(billing_profile_repository, organization_id=org_id)
         invoice = await service.generate_invoice_for_subscription(subscription.id)
 
-        voided = await service.void_invoice(actor_user_id=None, invoice_id=invoice.id)
+        voided = await service.void_invoice(
+            actor_user_id=None,
+            invoice_id=invoice.id,
+            requesting_organization_id=None,
+        )
         assert voided.status == InvoiceStatus.VOID.value
 
     async def test_void_paid_invoice_rejected(self) -> None:
@@ -943,7 +1032,11 @@ class TestVoidInvoice:
         await service.mark_invoice_paid(invoice_id=invoice.id, payment_id=uuid.uuid4())
 
         with pytest.raises(InvalidInvoiceStatusTransitionError):
-            await service.void_invoice(actor_user_id=None, invoice_id=invoice.id)
+            await service.void_invoice(
+                actor_user_id=None,
+                invoice_id=invoice.id,
+                requesting_organization_id=None,
+            )
 
 
 # ============================================================================
@@ -979,6 +1072,7 @@ class TestCreditDebitNotes:
             invoice_id=invoice.id,
             amount=Decimal("25.00"),
             reason="Service outage credit",
+            requesting_organization_id=None,
         )
         assert note.note_type == NoteType.CREDIT.value
         assert note.note_number.startswith("CN-")
@@ -992,6 +1086,7 @@ class TestCreditDebitNotes:
                 invoice_id=invoice.id,
                 amount=invoice.total_amount + Decimal("1.00"),
                 reason="Too much",
+                requesting_organization_id=None,
             )
 
     async def test_credit_note_non_positive_amount_rejected(self) -> None:
@@ -1002,6 +1097,7 @@ class TestCreditDebitNotes:
                 invoice_id=invoice.id,
                 amount=Decimal("0"),
                 reason="x",
+                requesting_organization_id=None,
             )
 
     async def test_issue_debit_note_real_number_independent_of_credit_note_sequence(
@@ -1013,12 +1109,14 @@ class TestCreditDebitNotes:
             invoice_id=invoice.id,
             amount=Decimal("10.00"),
             reason="credit",
+            requesting_organization_id=None,
         )
         debit_note = await service.issue_debit_note(
             actor_user_id=None,
             invoice_id=invoice.id,
             amount=Decimal("5.00"),
             reason="under-billed correction",
+            requesting_organization_id=None,
         )
         assert debit_note.note_type == NoteType.DEBIT.value
         assert debit_note.note_number.startswith("DN-")
@@ -1629,7 +1727,11 @@ class TestSignupCouponDiscountOnInvoice:
         )
 
         first = await service.generate_invoice_for_subscription(subscription.id)
-        await service.void_invoice(actor_user_id=None, invoice_id=first.id)
+        await service.void_invoice(
+            actor_user_id=None,
+            invoice_id=first.id,
+            requesting_organization_id=None,
+        )
         reissued = await service.generate_invoice_for_subscription(subscription.id)
 
         assert reissued.discount_amount == Decimal("200.00")

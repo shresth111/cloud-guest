@@ -1444,18 +1444,27 @@ async def test_incident_lifecycle_transitions():
     assert incident.status == IncidentStatus.OPEN.value
 
     investigating = await service.update_incident(
-        incident.id, status=IncidentStatus.INVESTIGATING
+        incident.id,
+        status=IncidentStatus.INVESTIGATING,
+        requesting_organization_id=None,
     )
     assert investigating.status == IncidentStatus.INVESTIGATING.value
 
     resolved = await service.update_incident(
-        incident.id, status=IncidentStatus.RESOLVED, resolution_notes="Fixed"
+        incident.id,
+        status=IncidentStatus.RESOLVED,
+        resolution_notes="Fixed",
+        requesting_organization_id=None,
     )
     assert resolved.status == IncidentStatus.RESOLVED.value
     assert resolved.resolved_at is not None
     assert resolved.resolution_notes == "Fixed"
 
-    closed = await service.update_incident(incident.id, status=IncidentStatus.CLOSED)
+    closed = await service.update_incident(
+        incident.id,
+        status=IncidentStatus.CLOSED,
+        requesting_organization_id=None,
+    )
     assert closed.status == IncidentStatus.CLOSED.value
     assert closed.closed_at is not None
 
@@ -1469,9 +1478,17 @@ async def test_incident_invalid_transition_raises():
         severity=AlertSeverity.INFO.value,
         organization_id=None,
     )
-    await service.update_incident(incident.id, status=IncidentStatus.CLOSED)
+    await service.update_incident(
+        incident.id,
+        status=IncidentStatus.CLOSED,
+        requesting_organization_id=None,
+    )
     with pytest.raises(InvalidIncidentStatusTransitionError):
-        await service.update_incident(incident.id, status=IncidentStatus.OPEN)
+        await service.update_incident(
+            incident.id,
+            status=IncidentStatus.OPEN,
+            requesting_organization_id=None,
+        )
 
 
 async def test_incident_attach_alert_is_idempotent():
@@ -1499,8 +1516,16 @@ async def test_incident_attach_alert_is_idempotent():
         severity="warning",
     )
 
-    await service.attach_alert(incident.id, alert.id)
-    await service.attach_alert(incident.id, alert.id)
+    await service.attach_alert(
+        incident.id,
+        alert.id,
+        requesting_organization_id=None,
+    )
+    await service.attach_alert(
+        incident.id,
+        alert.id,
+        requesting_organization_id=None,
+    )
 
     alerts = await service.list_alerts_for_incident(incident.id)
     assert len(alerts) == 1
@@ -1540,7 +1565,10 @@ async def test_generate_report_computes_simple_ratio():
         measurement_window_days=30,
     )
 
-    report = await service.generate_report(target.id)
+    report = await service.generate_report(
+        target.id,
+        requesting_organization_id=None,
+    )
     assert report.total_checks == 100
     assert report.healthy_checks == 80
     assert report.achieved_percentage == 80.0
@@ -1558,7 +1586,10 @@ async def test_generate_report_raises_when_no_health_check_data():
         measurement_window_days=30,
     )
     with pytest.raises(InsufficientSlaDataError):
-        await service.generate_report(target.id)
+        await service.generate_report(
+            target.id,
+            requesting_organization_id=None,
+        )
 
 
 async def test_sla_target_not_found_raises():
@@ -1581,7 +1612,10 @@ async def test_list_targets_with_latest_report_pairs_correctly():
     pairs_before = await service.list_targets_with_latest_report()
     assert pairs_before == [(target, None)]
 
-    report = await service.generate_report(target.id)
+    report = await service.generate_report(
+        target.id,
+        requesting_organization_id=None,
+    )
     pairs_after = await service.list_targets_with_latest_report()
     assert pairs_after == [(target, report)]
 
@@ -1938,6 +1972,7 @@ def test_alerts_listings_resolve_org_from_auth_scope_not_query_param(
     # ... it is resolved via the CurrentOrganization dependency instead.
     dependency_calls = {dep.call for dep in dependant.dependencies}
     assert CurrentOrganization in dependency_calls
+
 
 @pytest.mark.parametrize(
     ("path", "method"),

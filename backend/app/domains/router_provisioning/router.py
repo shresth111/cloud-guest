@@ -388,10 +388,14 @@ async def list_variables(
     scope_type: ConfigVariableScope | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RouterProvisioningService = Depends(get_router_provisioning_service),
 ):
     variables, meta = await service.list_variables(
-        scope_type=scope_type, page=page, page_size=page_size
+        scope_type=scope_type,
+        requesting_organization_id=requesting_organization_id,
+        page=page,
+        page_size=page_size,
     )
     payload = ConfigVariableListResponse(
         items=[_variable_response(v) for v in variables], **_pagination_fields(meta)
@@ -543,11 +547,13 @@ async def update_variable(
     variable_id: uuid.UUID,
     payload: ConfigVariableUpdateRequest,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RouterProvisioningService = Depends(get_router_provisioning_service),
 ):
     updated = await service.update_variable(
         actor_user_id=uuid.UUID(user.id),
         variable_id=variable_id,
+        requesting_organization_id=requesting_organization_id,
         value=payload.value,
         is_secret=payload.is_secret,
     )
@@ -569,10 +575,13 @@ async def delete_variable(
     request: Request,
     variable_id: uuid.UUID,
     user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: RouterProvisioningService = Depends(get_router_provisioning_service),
 ):
     await service.delete_variable(
-        actor_user_id=uuid.UUID(user.id), variable_id=variable_id
+        actor_user_id=uuid.UUID(user.id),
+        variable_id=variable_id,
+        requesting_organization_id=requesting_organization_id,
     )
     return build_response(
         success=True,

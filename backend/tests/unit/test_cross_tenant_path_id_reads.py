@@ -55,9 +55,7 @@ class _FakeOrgService:
         self._parent = parent_of_target
 
     async def get_organization(self, organization_id: uuid.UUID):
-        return SimpleNamespace(
-            id=organization_id, parent_organization_id=self._parent
-        )
+        return SimpleNamespace(id=organization_id, parent_organization_id=self._parent)
 
 
 class TestEnforceTargetOrganization:
@@ -127,9 +125,7 @@ class TestAlertTenantScoping:
         victim, attacker = uuid.uuid4(), uuid.uuid4()
         service = AlertService(_FakeAlertRepo(_alert_owned_by(victim)))
         with pytest.raises(CrossOrganizationAccessError):
-            await service.get_alert(
-                uuid.uuid4(), requesting_organization_id=attacker
-            )
+            await service.get_alert(uuid.uuid4(), requesting_organization_id=attacker)
 
     async def test_foreign_alert_cannot_be_acknowledged(self) -> None:
         """The write path matters more than the read: acknowledging another
@@ -212,6 +208,18 @@ class _FakeByIdRepo:
         raise _ReachedRead
 
     async def list_sla_reports(self, **kwargs):
+        self.mutated = True
+        raise _ReachedRead
+
+    # -- licenses ---------------------------------------------------------
+    async def get_by_id(self, license_id):
+        return self._row
+
+    async def update_license(self, license_, data):
+        self.mutated = True
+        raise _ReachedRead
+
+    async def list_change_logs(self, license_id):
         self.mutated = True
         raise _ReachedRead
 
@@ -329,6 +337,88 @@ class TestSlaTargetTenantScoping:
         assert repo.mutated is False
 
 
+class TestLicenseTenantScoping:
+    """The highest-consequence member of this defect class.
+
+    ``EntitlementChecker`` reads ``License.status``, so a suspend or cancel
+    is not a data write -- it takes that organization's product away. Every
+    ``/licenses/{license_id}/...`` route reached its row by id alone.
+    """
+
+    def _service(self, owner_organization_id: uuid.UUID | None):
+        from app.domains.billing.service import LicenseService
+
+        repo = _FakeByIdRepo(_owned_by(owner_organization_id))
+        # `plan_repository` is only reached on the plan-change paths, which
+        # these tests never get to -- the guard fires first, which is the
+        # whole point.
+        return LicenseService(repo, plan_repository=None), repo
+
+    async def test_a_foreign_license_cannot_be_suspended(self) -> None:
+        from app.domains.billing.exceptions import LicenseNotFoundError
+
+        service, repo = self._service(uuid.uuid4())
+
+        with pytest.raises(LicenseNotFoundError):
+            await service.suspend_license(
+                actor_user_id=None,
+                license_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+                reason="not mine to suspend",
+            )
+
+        assert repo.mutated is False
+
+    async def test_a_foreign_license_cannot_be_cancelled(self) -> None:
+        from app.domains.billing.exceptions import LicenseNotFoundError
+
+        service, repo = self._service(uuid.uuid4())
+
+        with pytest.raises(LicenseNotFoundError):
+            await service.cancel_license(
+                actor_user_id=None,
+                license_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+            )
+
+        assert repo.mutated is False
+
+    async def test_a_foreign_licenses_history_cannot_be_read(self) -> None:
+        from app.domains.billing.exceptions import LicenseNotFoundError
+
+        service, repo = self._service(uuid.uuid4())
+
+        with pytest.raises(LicenseNotFoundError):
+            await service.list_change_history(
+                uuid.uuid4(), requesting_organization_id=uuid.uuid4()
+            )
+
+        assert repo.mutated is False
+
+    async def test_the_owning_tenant_still_reaches_its_own_license(self) -> None:
+        """The guard must refuse the neighbour without refusing the owner --
+        ``_ReachedRead`` means execution got past the check to the write."""
+        organization_id = uuid.uuid4()
+        service, repo = self._service(organization_id)
+
+        with pytest.raises(_ReachedRead):
+            await service.list_change_history(
+                uuid.uuid4(), requesting_organization_id=organization_id
+            )
+
+        assert repo.mutated is True
+
+    async def test_a_platform_caller_still_reaches_any_license(self) -> None:
+        service, repo = self._service(uuid.uuid4())
+
+        with pytest.raises(_ReachedRead):
+            await service.list_change_history(
+                uuid.uuid4(), requesting_organization_id=None
+            )
+
+        assert repo.mutated is True
+
+
 # ---------------------------------------------------------------------------
 # Structural: the routes still declare an organization dependency
 # ---------------------------------------------------------------------------
@@ -374,6 +464,56 @@ _PATH_ID_ROUTES = [
     ("/api/v1/incidents/{incident_id}", "GET"),
     ("/api/v1/incidents/{incident_id}/alerts", "GET"),
     ("/api/v1/sla/{target_id}/reports", "GET"),
+    # Added after a 2026-09-04 sweep found seventeen more handlers of this
+    # exact shape -- every one of them a *writer*, where the original audit
+    # had only closed readers. A write under the wrong tenant does not leak
+    # data, it destroys or forges it, so these matter more than the rows
+    # above, not less.
+    #
+    # Config variables. `resolve_variables` merges these into the values
+    # RouterOS config is rendered from, so overwriting another tenant's is a
+    # write into their device configuration. The GET is a list rather than a
+    # path-id read, and belongs here for the same reason: unnarrowed it
+    # returned every tenant's rows -- plaintext values included -- and the
+    # ids needed to address them, which is what turned the two writers below
+    # from "guess a UUID" into "pick one off the list".
+    ("/api/v1/router-templates/variables", "GET"),
+    ("/api/v1/router-templates/variables/{variable_id}", "PUT"),
+    ("/api/v1/router-templates/variables/{variable_id}", "DELETE"),
+    # Licenses. `EntitlementChecker` reads License.status, so suspending or
+    # cancelling one takes that organization's product away.
+    ("/api/v1/licenses/{organization_id}", "GET"),
+    ("/api/v1/licenses/{license_id}/history", "GET"),
+    ("/api/v1/licenses/{license_id}/activate", "POST"),
+    ("/api/v1/licenses/{license_id}/suspend", "POST"),
+    ("/api/v1/licenses/{license_id}/cancel", "POST"),
+    ("/api/v1/licenses/{license_id}/upgrade", "POST"),
+    ("/api/v1/licenses/{license_id}/downgrade", "POST"),
+    # Subscription lifecycle. The sibling PATCH .../renewal-settings already
+    # threaded the organization, which is what makes these an oversight.
+    ("/api/v1/subscriptions/{subscription_id}/cancel", "POST"),
+    ("/api/v1/subscriptions/{subscription_id}/reactivate", "POST"),
+    ("/api/v1/subscriptions/{subscription_id}/pause", "POST"),
+    ("/api/v1/subscriptions/{subscription_id}/resume", "POST"),
+    # Money.
+    ("/api/v1/payments/methods/{payment_method_id}", "DELETE"),
+    ("/api/v1/payments/{payment_id}/refund", "POST"),
+    ("/api/v1/payments/{payment_id}/retry", "POST"),
+    ("/api/v1/invoices/{invoice_id}/void", "POST"),
+    ("/api/v1/invoices/{invoice_id}/credit-note", "POST"),
+    ("/api/v1/invoices/{invoice_id}/debit-note", "POST"),
+    # Membership. Unguarded, the first plants a member inside any tenant and
+    # the second evicts one -- and LastActiveMemberError means the last one
+    # out locks that organization's own people out of it.
+    ("/api/v1/organizations/{organization_id}/members", "POST"),
+    ("/api/v1/organizations/{organization_id}/members/{member_id}", "DELETE"),
+    # Incidents and SLA.
+    ("/api/v1/incidents/{incident_id}", "PUT"),
+    ("/api/v1/incidents/{incident_id}/alerts", "POST"),
+    ("/api/v1/sla/{target_id}/generate-report", "POST"),
+    # Discloses whether an arbitrary guest id anywhere on the platform is
+    # mapped to a bandwidth policy, and names the policy.
+    ("/api/v1/policies/guest-mapping/{guest_id}", "GET"),
 ]
 
 
@@ -457,6 +597,6 @@ def test_admin_login_attempts_are_gated_at_global_scope() -> None:
                 for cell in scope
                 if isinstance(cell.cell_contents, ScopeType)
             )
-    assert ScopeType.GLOBAL in scopes, (
-        "platform-wide login attempts must require GLOBAL scope"
-    )
+    assert (
+        ScopeType.GLOBAL in scopes
+    ), "platform-wide login attempts must require GLOBAL scope"
