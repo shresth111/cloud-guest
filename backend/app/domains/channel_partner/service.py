@@ -54,7 +54,12 @@ from app.domains.otp.service import (
 )
 from app.domains.rbac.enums import AuditAction
 
-from .constants import CHANNEL_PARTNER_PRODUCT_NAME, ChannelPartnerStatus
+from .constants import (
+    CHANNEL_PARTNER_PRODUCT_NAME,
+    EMAIL_PROVIDER_NOT_CONFIGURED,
+    SMS_PROVIDER_NOT_CONFIGURED,
+    ChannelPartnerStatus,
+)
 from .exceptions import (
     ChannelPartnerEmailMissingError,
     ChannelPartnerNotActiveError,
@@ -173,12 +178,7 @@ class ChannelPartnerService:
         ):
             return await self.repository.update_partner(
                 partner,
-                {
-                    "welcome_sms_error": (
-                        "No real SMS delivery provider is configured on "
-                        "this server."
-                    )
-                },
+                {"welcome_sms_error": SMS_PROVIDER_NOT_CONFIGURED},
             )
 
         message = WELCOME_SMS_TEMPLATE.format(
@@ -209,12 +209,7 @@ class ChannelPartnerService:
         ):
             return await self.repository.update_partner(
                 partner,
-                {
-                    "welcome_email_error": (
-                        "No real email delivery provider is configured on "
-                        "this server."
-                    )
-                },
+                {"welcome_email_error": EMAIL_PROVIDER_NOT_CONFIGURED},
             )
 
         try:

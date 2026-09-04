@@ -26,6 +26,8 @@ from pydantic import (
     model_validator,
 )
 
+from .constants import WelcomeDeliveryStatus
+
 # India's GSTIN is always exactly 15 characters:
 # [state code:2][PAN:10][entity code:1][default "Z":1][checksum:1].
 GSTIN_PATTERN = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}Z[A-Z\d]{1}$")
@@ -167,6 +169,14 @@ class ChannelPartnerResponse(BaseModel):
     welcome_sms_error: str | None
     welcome_email_sent_at: datetime | None
     welcome_email_error: str | None
+    # Derived, not stored. The console needs to tell "this server has no SMS
+    # provider" apart from "this partner's SMS failed" -- the row holds only
+    # free text, and reading "is there error text?" as "failed" is what made
+    # five partners show a red *Welcome failed* badge while three of them had
+    # had their welcome email delivered. See
+    # `constants.welcome_delivery_status`.
+    welcome_sms_status: WelcomeDeliveryStatus
+    welcome_email_status: WelcomeDeliveryStatus
     created_at: datetime
     updated_at: datetime
 

@@ -19,6 +19,11 @@ from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
 from app.domains.rbac.dependencies import CurrentUser, RequirePermission
 
+from .constants import (
+    EMAIL_PROVIDER_NOT_CONFIGURED,
+    SMS_PROVIDER_NOT_CONFIGURED,
+    welcome_delivery_status,
+)
 from .dependencies import get_channel_partner_service
 from .models import ChannelPartner
 from .schemas import (
@@ -43,7 +48,25 @@ def _request_id(request: Request) -> str:
 
 
 def _build_partner_response(partner: ChannelPartner) -> ChannelPartnerResponse:
-    return ChannelPartnerResponse.model_validate(partner)
+    # The two statuses are derived here rather than stored, so no migration
+    # and no second source of truth: the row keeps holding exactly what the
+    # send attempt recorded, and the classification of that text lives in
+    # one function the console does not have to reimplement.
+    return ChannelPartnerResponse.model_validate(
+        partner,
+        update={
+            "welcome_sms_status": welcome_delivery_status(
+                sent_at=partner.welcome_sms_sent_at,
+                error=partner.welcome_sms_error,
+                not_configured_message=SMS_PROVIDER_NOT_CONFIGURED,
+            ),
+            "welcome_email_status": welcome_delivery_status(
+                sent_at=partner.welcome_email_sent_at,
+                error=partner.welcome_email_error,
+                not_configured_message=EMAIL_PROVIDER_NOT_CONFIGURED,
+            ),
+        },
+    )
 
 
 def _onboard_message(partner: ChannelPartner) -> str:
