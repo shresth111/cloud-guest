@@ -387,6 +387,26 @@ ALERT_EVENT_LOOKBACK_MINUTES = 15
 # "within about one cycle of the faster underlying sweep," typically
 # under a minute end-to-end (health check catches the change, next
 # evaluation pass alerts + emails on it), never truly immediate.
+# How often the Health Engine actually runs.
+#
+# It did not run at all. `GET /monitoring/health` only *reads* the stored
+# `service_health` rows; the sole writer is `POST /monitoring/health/run`,
+# which is the Master console's own "Run health checks now" button. There
+# was no Beat entry and nothing else called `run_all_health_checks`, so on
+# 2026-09-04 that page showed component timestamps two days old while
+# calling itself live -- and FreeRADIUS sat on "Degraded, 5 consecutive
+# failures" from a check nobody had re-run since.
+#
+# Five minutes, matching the hub-reconciliation sweep rather than the
+# 30-second alert sweep: these checks touch the database, Redis, disk and
+# the hub's own agents, so they are an order of magnitude more expensive
+# than reading already-persisted state, and nothing here changes on a
+# 30-second timescale. Health that is five minutes old is honest; health
+# that is two days old is a lie with a timestamp on it.
+HEALTH_CHECK_SWEEP_INTERVAL_SECONDS = 300.0
+
+TASK_RUN_HEALTH_CHECK_SWEEP = "app.domains.monitoring.tasks.run_health_check_sweep"
+
 ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS = 30.0
 
 TASK_RUN_ALERT_RULE_EVALUATION_SWEEP = (
@@ -590,7 +610,9 @@ __all__ = [
     "ALERT_STATUS_TRANSITIONS",
     "ALERT_EVENT_LOOKBACK_MINUTES",
     "ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS",
+    "HEALTH_CHECK_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_ALERT_RULE_EVALUATION_SWEEP",
+    "TASK_RUN_HEALTH_CHECK_SWEEP",
     "NotificationChannelType",
     "NotificationStatus",
     "HTTP_NOTIFICATION_TIMEOUT_SECONDS",

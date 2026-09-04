@@ -2052,3 +2052,52 @@ async def test_list_alerts_without_location_still_returns_the_whole_org():
 
     assert len(items) == 2
     assert repo.alerts.last_filters["location_id"] is None  # type: ignore[union-attr]
+
+
+class TestHealthCheckSweepIsScheduled:
+    """The Health Engine had no schedule at all.
+
+    `GET /monitoring/health` only reads stored `service_health` rows, and
+    the only writer was the Master console's own "Run health checks now"
+    button. So the System Health page's component timestamps were exactly
+    as old as the last time a human clicked it -- two days, when this was
+    found on 2026-09-04, while the page described itself as live and
+    FreeRADIUS sat on "Degraded, 5 consecutive failures" from a check
+    nobody had re-run.
+
+    A scheduled sweep that is registered but not in `beat_schedule`, or in
+    `beat_schedule` under a task name nothing registered, fails exactly the
+    same way and just as silently -- so both halves are asserted, and that
+    they name the same task.
+    """
+
+    def test_the_task_is_registered_and_scheduled_under_the_same_name(
+        self,
+    ) -> None:
+        import app.domains.monitoring.tasks  # noqa: F401 -- registers the task
+        from app.core.celery_app import celery_app
+        from app.domains.monitoring.constants import (
+            HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
+            TASK_RUN_HEALTH_CHECK_SWEEP,
+        )
+
+        entry = celery_app.conf.beat_schedule.get("monitoring-health-check-sweep")
+        assert entry is not None, "the Health Engine has no Beat entry again"
+        assert entry["task"] == TASK_RUN_HEALTH_CHECK_SWEEP
+        assert entry["schedule"] == HEALTH_CHECK_SWEEP_INTERVAL_SECONDS
+        assert TASK_RUN_HEALTH_CHECK_SWEEP in celery_app.tasks, (
+            "scheduled under a task name nothing registered"
+        )
+
+    def test_the_cadence_is_not_silently_widened(self) -> None:
+        """Five minutes is a deliberate choice, not a default: these checks
+        touch the database, Redis, disk and the hub's own agents, so they
+        are far more expensive than the 30-second alert sweep that only
+        reads persisted state. Widening this to hours would restore the
+        stale-data problem without removing the entry, which is the change
+        that would not look like a regression in review."""
+        from app.domains.monitoring.constants import (
+            HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
+        )
+
+        assert 60.0 <= HEALTH_CHECK_SWEEP_INTERVAL_SECONDS <= 900.0

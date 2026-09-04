@@ -142,7 +142,9 @@ from app.domains.isp.constants import (
 )
 from app.domains.monitoring.constants import (
     ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS,
+    HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_ALERT_RULE_EVALUATION_SWEEP,
+    TASK_RUN_HEALTH_CHECK_SWEEP,
 )
 from app.domains.notification.constants import TASK_RUN_NOTIFICATION_DISPATCH_SWEEP
 from app.domains.provisioning_engine.constants import (
@@ -296,6 +298,21 @@ celery_app.conf.update(
         # calls to the hub's own agents on the private network, not a
         # per-router RouterOS round trip, and it is capped and
         # overlap-locked. It belongs with the pure sweeps.
+        # The Health Engine had no schedule at all. `GET /monitoring/health`
+        # only reads stored `service_health` rows, and the sole writer was
+        # the Master console's own "Run health checks now" button -- so the
+        # System Health page's timestamps were exactly as old as the last
+        # time a human clicked it. Found 2026-09-04 showing two-day-old
+        # rows while the page called itself live, with FreeRADIUS parked on
+        # "Degraded, 5 consecutive failures" from a check nobody had re-run.
+        #
+        # Not on DEVICE_IO_QUEUE_NAME: these checks touch this platform's
+        # own database, Redis, disk and hub agents, never a per-router
+        # RouterOS round trip.
+        "monitoring-health-check-sweep": {
+            "task": TASK_RUN_HEALTH_CHECK_SWEEP,
+            "schedule": HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
+        },
         "hub-reconciliation-sweep": {
             "task": TASK_RUN_HUB_RECONCILIATION_SWEEP,
             "schedule": HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
