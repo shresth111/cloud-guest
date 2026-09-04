@@ -26,9 +26,9 @@ from .collector import collect_snapshot_fields
 from .compatibility import evaluate_compatibility
 from .constants import SNAPSHOT_SCHEMA_VERSION, SnapshotStatus, SnapshotTrigger
 from .exceptions import (
-    DiscoveryPreconditionsUnmetError,
     DiscoveryDeviceConnectionError,
     DiscoveryMissingCredentialsError,
+    DiscoveryPreconditionsUnmetError,
     NoRouterSnapshotError,
     RouterSnapshotNotFoundError,
 )
@@ -45,13 +45,13 @@ from .preflight import (
 )
 from .repository import RouterSnapshotRepositoryProtocol
 from .schemas import (
-    DiscoveryPreconditionCheck,
-    DiscoveryPreflightResponse,
     BridgeSnapshot,
     CompatibilityReport,
     DhcpClientSnapshot,
     DhcpServerSnapshot,
     DiscoverRouterResponse,
+    DiscoveryPreconditionCheck,
+    DiscoveryPreflightResponse,
     HotspotStateSnapshot,
     InterfaceSnapshot,
     IpAddressSnapshot,
