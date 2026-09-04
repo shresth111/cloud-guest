@@ -306,6 +306,29 @@ TASK_RUN_ISP_HEALTH_CHECK_SWEEP = "app.domains.isp.tasks.run_isp_health_check_sw
 # silently leaving it here forever.
 ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS = 30.0
 
+# Longest hole between two counter readings still worth expressing as a
+# rate. Beyond it the delta is a real *total* but a meaningless *rate*: a
+# saturated evening averaged over six hours reads as a calm one, and it
+# reads that way at a plausible-looking number, which is worse than an
+# admitted gap -- nothing on the card tells the operator that the point
+# they are reading spans a quarter of a day.
+#
+# Deliberately NOT derived from ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS
+# above. The question this answers is "how long can traffic hold still
+# enough for an average across it to mean anything", which is a property
+# of the traffic, not of how often we happen to sample it -- a multiple of
+# the cadence would have silently become a 200-minute ceiling the day
+# somebody raised the sweep back to 600s, which is exactly the drift this
+# is here to stop.
+#
+# 1800s is the same ceiling the per-interface chart already applies
+# client-side (`MAX_INTERVAL_MINUTES = 30` in
+# cloudguest-foundation/src/lib/device-health.ts). The two pipelines are
+# unrelated -- different table, writer and transport -- but they answer
+# the same question about the same physical link, so they must not
+# disagree about which intervals are plottable. Change one, change both.
+MAX_RATE_INTERVAL_SECONDS = 1800.0
+
 
 __all__ = [
     "IspLinkType",
@@ -330,4 +353,5 @@ __all__ = [
     "UNHEALTHY_SINCE_LOOKBACK_LIMIT",
     "TASK_RUN_ISP_HEALTH_CHECK_SWEEP",
     "ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS",
+    "MAX_RATE_INTERVAL_SECONDS",
 ]

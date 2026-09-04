@@ -66,6 +66,7 @@ from .constants import (
     DEFAULT_CONSECUTIVE_FAILURES_BEFORE_FAILOVER,
     ISP_PING_COUNT,
     ISP_PING_TIMEOUT_SECONDS,
+    MAX_RATE_INTERVAL_SECONDS,
     SPEED_TEST_ACTIVE_REDIS_KEY_TEMPLATE,
     SPEED_TEST_ACTIVE_REDIS_TTL_SECONDS,
     SPEED_TEST_COOLDOWN_REDIS_KEY_TEMPLATE,
@@ -1220,7 +1221,16 @@ class IspService:
             and current.last_checked_at is not None
         ):
             elapsed_seconds = (now - current.last_checked_at).total_seconds()
-            if elapsed_seconds > 0:
+            # Upper bound as well as lower. A delta measured across a
+            # long hole -- a stopped worker, a redeployed stack, a
+            # container that sat unscheduled -- is a real total but not a
+            # rate, and dividing by the hole yields a small, calm,
+            # entirely plausible number that hides the busiest window it
+            # spans. An honest gap is the only correct output here; see
+            # MAX_RATE_INTERVAL_SECONDS. Both raw counters are still
+            # stored below either way, so the *next* tick measures across
+            # a normal window rather than inheriting the hole.
+            if 0 < elapsed_seconds <= MAX_RATE_INTERVAL_SECONDS:
                 rx_delta = traffic.rx_bytes - current.last_rx_bytes
                 tx_delta = traffic.tx_bytes - current.last_tx_bytes
                 if rx_delta >= 0:

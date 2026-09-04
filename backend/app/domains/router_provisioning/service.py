@@ -1737,12 +1737,15 @@ class RouterProvisioningService:
         snapshot" fields don't retain -- composition, not a second heartbeat
         endpoint.
 
-        ``interface_traffic_counters``/``metrics_source`` are the SNMP
-        metrics-polling extension's own additive fields -- see
-        ``RouterHealthSnapshot``'s own updated docstring; both are simply
-        forwarded through to the repository, ``None`` by default so the
-        original RouterOS-API-sourced call sites
-        (``run_router_health_poll_sweep``) are unaffected.
+        ``interface_traffic_counters``/``metrics_source`` arrived with the
+        SNMP metrics-polling extension -- see ``RouterHealthSnapshot``'s
+        own docstring -- and are forwarded straight through to the
+        repository. They default to ``None`` because "not measured" and
+        "unrecorded transport" are real, distinct answers that must stay
+        expressible, **not** as an invitation to omit them: a caller that
+        knows its own transport and leaves ``metrics_source`` unset
+        writes a row claiming not to know where it came from. Both sweeps
+        now pass both.
 
         ``call_heartbeat=False`` (used by
         ``app.domains.provisioning_engine.service

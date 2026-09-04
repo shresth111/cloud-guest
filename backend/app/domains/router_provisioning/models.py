@@ -477,14 +477,27 @@ class RouterHealthSnapshot(BaseModel):
     deliberately composed onto this existing table rather than a second,
     disconnected metrics table: both are, structurally, exactly the same
     fact ("this router's real CPU/memory/uptime at this instant"), merely
-    obtained via two different transports. ``metrics_source`` is ``NULL``
-    for every pre-existing row (all predate this extension and were, by
-    construction, RouterOS-API-sourced; a real, honest backfill would set
-    them to ``"routeros_api"``, not fabricate a value for rows recorded
-    before this column existed) and ``"routeros_api"``/``"snmp"`` for every
-    row recorded after, mirroring ``app.domains.isp.constants
-    .HealthStatusSource``'s own "a source tag on the *existing* vocabulary,
-    never a parallel table" precedent."""
+    obtained via two different transports. ``metrics_source`` mirrors
+    ``app.domains.isp.constants.HealthStatusSource``'s own "a source tag
+    on the *existing* vocabulary, never a parallel table" precedent, and
+    takes its values from
+    ``app.domains.router_provisioning.constants.MetricsSource``.
+
+    ``NULL`` means the transport is genuinely unrecorded, and there are
+    two populations of such rows -- worth separating, because this
+    docstring long claimed there was only one:
+
+    * rows written before migration 0079 added the column at all;
+    * **every row the RouterOS-API sweep wrote between 0079 and
+      2026-09-04.** That sweep was given a ``metrics_source`` parameter
+      and never passed it, so it kept defaulting to ``None``. The result
+      was indistinguishable from the first population, and the dashboard
+      labelled all of it "Not recorded" -- an admission of ignorance
+      about readings whose transport was known exactly. Fixed by stamping
+      it at the call site in
+      ``provisioning_engine.service.run_router_health_poll_sweep``; the
+      historical rows are left alone, because backfilling a provenance
+      nobody recorded would replace a true "unknown" with a guess."""
 
     __tablename__ = "router_health_snapshots"
 

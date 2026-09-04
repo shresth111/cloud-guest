@@ -693,15 +693,57 @@ class DeviceDiscoveryResult:
 
 
 @dataclass(frozen=True, slots=True)
+class DeviceInterfaceCounters:
+    """One interface's real, current byte counters as the *device API*
+    reports them -- a single snapshot, never a rate, exactly like
+    ``snmp_poller.SnmpInterfaceCounters``. Turning two successive
+    snapshots into Mbps is the caller's own job.
+
+    Field-for-field identical to the SNMP shape on purpose: both are
+    persisted into the same
+    ``router_health_snapshots.interface_traffic_counters`` column and read
+    back by one chart, so a reading's transport must change its
+    *provenance tag*, never its structure.
+
+    ``if_index`` is the one field where the two transports are not
+    interchangeable, and it is worth being exact about. SNMP reports a
+    genuine IF-MIB ``ifIndex``. RouterOS's API has no such field -- the
+    only per-row handle it returns is its own internal ``.id`` (``*1``,
+    ``*2``, ...), which is what the MikroTik adapter parses into this
+    field. The two numbering schemes are commonly equal on RouterOS, but
+    this package does not assert that, because nothing here has verified
+    it against hardware. What follows from that: **``if_index`` is a
+    stable identity only within one transport.** Anything that must match
+    an interface across transports keys on ``if_name``, which both report
+    identically -- see the dashboard's own series key, which does exactly
+    that for this reason.
+    """
+
+    if_index: int
+    if_name: str
+    if_oper_status_up: bool | None
+    in_octets: int | None
+    out_octets: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceHealthResult:
     """Ported from
-    ``app.domains.provisioning_engine.device_adapters.DeviceHealthResult``."""
+    ``app.domains.provisioning_engine.device_adapters.DeviceHealthResult``.
+
+    ``interfaces`` is additive and defaults to ``None``, which means "this
+    adapter took no per-interface reading" -- never "this device has no
+    interfaces". An adapter that cannot read them leaves it ``None`` and
+    the caller persists ``None``, keeping "not measured" distinguishable
+    from "measured, and empty".
+    """
 
     healthy: bool
     cpu_load_percent: float | None
     free_memory_bytes: int | None
     uptime_seconds: int | None
     detail: str | None = None
+    interfaces: tuple[DeviceInterfaceCounters, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1417,6 +1459,7 @@ __all__ = [
     "QueueDeviceStatus",
     "DeviceDiscoveryResult",
     "DeviceHealthResult",
+    "DeviceInterfaceCounters",
     "RawCommandResult",
     "DeviceGatewayAdapter",
 ]

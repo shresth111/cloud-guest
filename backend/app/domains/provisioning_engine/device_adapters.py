@@ -86,7 +86,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
-from wyfy_device_gateway.contract import DeviceVendor
+from wyfy_device_gateway.contract import DeviceInterfaceCounters, DeviceVendor
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikConnectionError,
     MikroTikDeviceError,
@@ -143,11 +143,22 @@ class DeviceDiscoveryResult:
 
 @dataclass(frozen=True, slots=True)
 class DeviceHealthResult:
+    """One health poll's result.
+
+    ``interfaces`` carries the device's own per-interface byte counters
+    when the adapter read them, and ``None`` when it did not. The
+    gateway's ``DeviceInterfaceCounters`` is reused verbatim rather than
+    restated here: a parallel dataclass with the same five fields is a
+    drift waiting to happen, and this wrapper's entire job is to not lose
+    fields on the way through.
+    """
+
     healthy: bool
     cpu_load_percent: float | None
     free_memory_bytes: int | None
     uptime_seconds: int | None
     detail: str | None = None
+    interfaces: tuple[DeviceInterfaceCounters, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +333,7 @@ class MikroTikProvisionAdapter:
             free_memory_bytes=result.free_memory_bytes,
             uptime_seconds=result.uptime_seconds,
             detail=result.detail,
+            interfaces=result.interfaces,
         )
 
     async def backup(self, credentials: DeviceCredentials) -> bytes:
@@ -403,6 +415,7 @@ __all__ = [
     "DeviceCredentials",
     "DeviceDiscoveryResult",
     "DeviceHealthResult",
+    "DeviceInterfaceCounters",
     "RawCommandResult",
     "BaseProvisionAdapter",
     "MikroTikProvisionAdapter",

@@ -454,13 +454,19 @@ class RouterHealthSnapshotResponse(BaseModel):
     Both stay ``None``-able rather than defaulted, because ``None`` is a
     real, distinct answer in each case and must not be flattened:
 
-    * ``metrics_source is None`` -- a row written before 0079. Its true
-      transport is genuinely unrecorded; reporting it as ``"routeros_api"``
-      would be a fabricated provenance claim.
-    * ``interface_traffic_counters is None`` -- either a RouterOS-API-sourced
-      row (that path has no per-interface breakdown) or an SNMP poll that
-      returned no interfaces at all. The sweep persists ``None``, never
-      ``[]``, for both.
+    * ``metrics_source is None`` -- a row whose transport is genuinely
+      unrecorded: one written before 0079, or one the RouterOS-API sweep
+      wrote before it began stamping the field (see
+      ``RouterHealthSnapshot``'s own docstring for that second, larger
+      population). Reporting either as ``"routeros_api"`` would be a
+      fabricated provenance claim.
+    * ``interface_traffic_counters is None`` -- no per-interface reading
+      was taken for this row: an older RouterOS-API row from before that
+      sweep read the interface table, a poll whose interface read failed,
+      or an SNMP poll that returned no interfaces at all. ``None``, never
+      ``[]``, in every case -- a router that answered a poll always has
+      interfaces, so ``[]`` could only ever be a lie about a failed
+      read.
     """
 
     id: str
