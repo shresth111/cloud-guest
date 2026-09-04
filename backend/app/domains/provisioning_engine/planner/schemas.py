@@ -191,6 +191,38 @@ class DiscoverRouterResponse(BaseModel):
     compatibility: CompatibilityReport
 
 
+class DiscoveryPreconditionCheck(BaseModel):
+    """One precondition as the API reports it.
+
+    ``key`` is a plain string rather than the enum so the wire contract
+    stays readable and stable; the UI keys its rendering off these
+    values, so renaming one is a frontend change.
+    """
+
+    key: str
+    label: str
+    status: str
+    detail: str
+    next_step: str | None = None
+
+
+class DiscoveryPreflightResponse(BaseModel):
+    """What Discovery would find blocking, *before* it dials anything.
+
+    ``blocking_count`` and ``unverified_count`` are separate on purpose.
+    "Nothing is blocking" is not "everything is fine": two preconditions
+    cannot be established without making the very connection that may be
+    failing, and a caller that renders only the blocking count would show
+    a clean bill of health over a report that never checked half of it.
+    """
+
+    can_attempt: bool
+    summary: str | None = None
+    blocking_count: int
+    unverified_count: int
+    checks: list[DiscoveryPreconditionCheck]
+
+
 class VerificationCheck(BaseModel):
     name: str
     status: VerificationCheckStatus
@@ -377,6 +409,8 @@ __all__ = [
     "RouterSnapshotResponse",
     "RouterSnapshotListResponse",
     "DiscoverRouterResponse",
+    "DiscoveryPreconditionCheck",
+    "DiscoveryPreflightResponse",
     "VerificationCheck",
     "WanLinkVerificationResponse",
     "WanVerificationRunResponse",
