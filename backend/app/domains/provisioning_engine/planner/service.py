@@ -28,6 +28,7 @@ from .constants import SNAPSHOT_SCHEMA_VERSION, SnapshotStatus, SnapshotTrigger
 from .exceptions import (
     DiscoveryDeviceConnectionError,
     DiscoveryMissingCredentialsError,
+    DiscoveryPreconditionsUnmetError,
     NoRouterSnapshotError,
     RouterSnapshotNotFoundError,
 )
@@ -36,6 +37,12 @@ from .managed_resource_repository import (
 )
 from .managed_resources import build_managed_resource_backfill_rows
 from .models import RouterSnapshot
+from .preflight import (
+    DiscoveryPreflightReport,
+    SecretResolution,
+    WireGuardTunnelLookupProtocol,
+    build_discovery_preflight,
+)
 from .repository import RouterSnapshotRepositoryProtocol
 from .schemas import (
     BridgeSnapshot,
@@ -43,6 +50,8 @@ from .schemas import (
     DhcpClientSnapshot,
     DhcpServerSnapshot,
     DiscoverRouterResponse,
+    DiscoveryPreconditionCheck,
+    DiscoveryPreflightResponse,
     HotspotStateSnapshot,
     InterfaceSnapshot,
     IpAddressSnapshot,
@@ -163,12 +172,81 @@ class DiscoveryService:
             ManagedRouterResourceRepositoryProtocol | None
         ) = None,
         reader_factory: Any | None = None,
+        wireguard_lookup: WireGuardTunnelLookupProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.managed_resource_repository = managed_resource_repository
         # Injection seam for unit tests (defaults to ReadOnlyDeviceReader).
         self._reader_factory = reader_factory or ReadOnlyDeviceReader
+        # Optional: without it the two tunnel preconditions simply come
+        # back unclassified rather than being asserted as satisfied.
+        self.wireguard_lookup = wireguard_lookup
+
+    def _resolve_secret(self, router: Router) -> SecretResolution:
+        """Decrypt the stored API secret, keeping "cannot" distinct from
+        "absent".
+
+        ``get_decrypted_api_secret`` raises when the platform's router
+        encryption key has been rotated out from under stored ciphertext.
+        Letting that escape turns a nameable precondition into a 500;
+        collapsing it into ``None`` tells the operator to re-enter a
+        password that is already stored. Neither is the truth, so it gets
+        its own value.
+        """
+        try:
+            return SecretResolution(
+                secret=self.router_lookup.get_decrypted_api_secret(router)
+            )
+        except Exception as exc:  # noqa: BLE001 -- classified, not swallowed
+            return SecretResolution(undecryptable_reason=type(exc).__name__)
+
+    async def _preflight(
+        self, router: Router, requesting_organization_id: uuid.UUID | None
+    ) -> tuple[DiscoveryPreflightReport, SecretResolution]:
+        secret = self._resolve_secret(router)
+        report = await build_discovery_preflight(
+            host=router.management_ip_address or router.public_ip_address,
+            api_username=router.api_username,
+            secret=secret,
+            router_id=router.id,
+            requesting_organization_id=requesting_organization_id,
+            wireguard_lookup=self.wireguard_lookup,
+        )
+        return report, secret
+
+    async def get_discovery_preflight(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> DiscoveryPreflightResponse:
+        """Report every precondition without dialling anything.
+
+        Read-only and side-effect free, so a UI can render "here is what
+        is missing" beside a disabled Discover button instead of offering
+        the button in a state where it cannot possibly succeed.
+        """
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        report, _ = await self._preflight(router, requesting_organization_id)
+        return DiscoveryPreflightResponse(
+            can_attempt=report.can_attempt,
+            summary=report.summary,
+            blocking_count=len(report.blocking),
+            unverified_count=len(report.unverified),
+            checks=[
+                DiscoveryPreconditionCheck(
+                    key=str(check.key),
+                    label=check.label,
+                    status=str(check.status),
+                    detail=check.detail,
+                    next_step=check.next_step,
+                )
+                for check in report.checks
+            ],
+        )
 
     async def discover_router(
         self,
@@ -188,8 +266,23 @@ class DiscoveryService:
             router_id, requesting_organization_id=requesting_organization_id
         )
         host = router.management_ip_address or router.public_ip_address
-        secret = self.router_lookup.get_decrypted_api_secret(router)
+        # Preconditions first, socket second. Every one of these is
+        # knowable from the platform's own records, and dialling a device
+        # that provably cannot answer returns a timeout that names none of
+        # them -- see `preflight`'s module docstring for the production
+        # incident this replaces.
+        report, resolved_secret = await self._preflight(
+            router, requesting_organization_id
+        )
+        if report.blocking:
+            raise DiscoveryPreconditionsUnmetError(report)
+
+        secret = resolved_secret.secret
         if not host or not router.api_username or not secret:
+            # Unreachable via the report above, which fails on each of
+            # these by name. Kept as a belt-and-braces guard so a future
+            # change to the checks cannot silently hand `None` to the
+            # credential builder.
             raise DiscoveryMissingCredentialsError(router.id)
 
         creds = _build_credentials(router, secret)
@@ -226,7 +319,17 @@ class DiscoveryService:
                     "created_by": actor_user_id,
                 }
             )
-            raise DiscoveryDeviceConnectionError(host, str(detail)) from exc
+            # Nothing checkable was wrong, and it still did not answer.
+            # Name what is left rather than stopping at the transport's
+            # word: the preconditions that cannot be established without
+            # connecting, plus the one this platform has no check for at
+            # all -- whether a route into the overlay exists on our side.
+            raise DiscoveryDeviceConnectionError(
+                host,
+                str(detail),
+                candidates=[c.label for c in report.unverified]
+                + ["no network route from this platform to that address"],
+            ) from exc
 
         fields = collect_snapshot_fields(capture)
         row = await self.repository.create(
