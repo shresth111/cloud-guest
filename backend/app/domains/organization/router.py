@@ -33,6 +33,8 @@ from app.domains.billing.constants import PlanFeatureKey
 from app.domains.billing.dependencies import RequireFeature
 from app.domains.monitoring.constants import (
     ALERT_TARGET_MONITORED_HARDWARE,
+    ALERT_TARGET_ROGUE_DHCP_GUARD,
+    ROGUE_DHCP_STATE_UNGUARDED,
     AlertTriggerType,
 )
 from app.domains.monitoring.dependencies import get_alert_service
@@ -108,6 +110,95 @@ def _member_response(member: OrganizationMember) -> OrganizationMemberResponse:
     )
 
 
+# Every new organization gets these real, working alert rules from day one.
+# Before the first of them existed this had to be created by hand per org
+# (confirmed live: neither of the two organizations that existed before it
+# had one until created manually), so a real customer's access points,
+# printers and cameras going down produced no notification at all unless
+# someone remembered a separate step.
+#
+# Deliberately kept out of OrganizationService itself (a foundational domain
+# with no business knowing about alerting) -- composed here at the
+# router/orchestration layer, the same layer that already composes billing's
+# RequireFeature for this endpoint.
+#
+# This tuple is also what solves the ``Alert.rule_id`` foreign key for a
+# detector that has findings but no rule to hang them on. ``Alert.rule_id``
+# is a non-nullable FK to ``alert_rules``, so no alert can exist for a
+# target until an ``AlertRule`` for it does -- the exact reason
+# ``app.domains.dhcp.tasks`` left ALERT_TARGET_ROGUE_DHCP_GUARD unbuilt in
+# cloud-guest#139. The answer is the one already in this file, not a
+# nullable column and not a new seeding mechanism: a default rule created
+# with the organization.
+_DEFAULT_ALERT_RULES: tuple[dict[str, object], ...] = (
+    {
+        "name": "Network hardware down",
+        "description": (
+            "Fires when a registered access point, printer, camera, or "
+            "other monitored device goes from up to down."
+        ),
+        "trigger_type": AlertTriggerType.HEALTH_STATUS_CHANGE,
+        "target_component": ALERT_TARGET_MONITORED_HARDWARE,
+        "condition_config": {"expected_status": "down"},
+        "severity": "warning",
+    },
+    {
+        # Detector-only wording throughout, and not by accident:
+        # ``/ip dhcp-server alert`` writes a log line and nothing else --
+        # it blocks nothing. A rule named "Rogue DHCP protection" would
+        # describe a defence this platform has never had. Same sentence the
+        # readiness checklist item already shows for the same fact; see
+        # ``app.domains.monitoring.constants.ALERT_TARGET_ROGUE_DHCP_GUARD``.
+        "name": "Rogue DHCP detection off",
+        "description": (
+            "Fires when a router stops watching for another DHCP server "
+            "on an interface that hands out addresses. Detection only -- "
+            "it logs, it does not block."
+        ),
+        "trigger_type": AlertTriggerType.HEALTH_STATUS_CHANGE,
+        "target_component": ALERT_TARGET_ROGUE_DHCP_GUARD,
+        "condition_config": {"expected_status": ROGUE_DHCP_STATE_UNGUARDED},
+        "severity": "warning",
+    },
+)
+
+
+async def _create_default_alert_rules(
+    alert_service: AlertService, organization_id: uuid.UUID
+) -> None:
+    """Create every rule in ``_DEFAULT_ALERT_RULES`` for a brand-new
+    organization.
+
+    Non-fatal, and non-fatal *per rule*: a customer's organization
+    successfully existing matters more than any default rule existing, so a
+    failure is logged and never raised -- and one rule failing must not
+    skip the rest, which is why the try/except is inside the loop rather
+    than around it.
+
+    Only new organizations get these. Organizations that already existed
+    when a rule was added to this tuple do not, exactly as the first entry's
+    own history records -- an operator creates it through the existing
+    ``POST /alert-rules`` surface, which accepts every target here. That is
+    this codebase's established answer and it is left unchanged; a
+    data-seeding Alembic migration would be a new mechanism (there is not
+    one anywhere in ``alembic/versions``) and a backfill task would be
+    another.
+    """
+    for rule in _DEFAULT_ALERT_RULES:
+        try:
+            await alert_service.create_alert_rule(
+                organization_id=organization_id, **rule
+            )
+        except Exception:
+            get_logger(__name__).exception(
+                "default_alert_rule_creation_failed",
+                extra={
+                    "organization_id": str(organization_id),
+                    "target_component": rule["target_component"],
+                },
+            )
+
+
 # ============================================================================
 # Organizations
 # ============================================================================
@@ -178,37 +269,7 @@ async def create_organization(
         settings=payload.settings,
         subscription_tier=payload.subscription_tier,
     )
-    # Every new organization gets a real, working "hardware down" alert rule
-    # from day one -- previously this had to be created by hand per org
-    # (confirmed live: neither of the two organizations that existed before
-    # this had one until created manually), so a real customer's access
-    # points/printers/cameras going down produced no notification at all
-    # unless someone remembered this separate step. Deliberately kept out
-    # of OrganizationService itself (a foundational domain with no business
-    # knowing about alerting) -- composed here at the router/orchestration
-    # layer instead, the same layer that already composes billing's
-    # RequireFeature for this exact endpoint. Non-fatal: a customer's
-    # organization successfully existing matters more than this default
-    # rule existing, so a failure here is logged, never raised -- the org
-    # creation response is unaffected either way.
-    try:
-        await alert_service.create_alert_rule(
-            name="Network hardware down",
-            description=(
-                "Fires when a registered access point, printer, camera, or "
-                "other monitored device goes from up to down."
-            ),
-            organization_id=organization.id,
-            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
-            target_component=ALERT_TARGET_MONITORED_HARDWARE,
-            condition_config={"expected_status": "down"},
-            severity="warning",
-        )
-    except Exception:
-        get_logger(__name__).exception(
-            "default_hardware_down_alert_rule_creation_failed",
-            extra={"organization_id": str(organization.id)},
-        )
+    await _create_default_alert_rules(alert_service, organization.id)
     return build_response(
         success=True,
         message="Organization created",

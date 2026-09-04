@@ -32,7 +32,8 @@ per leaf task, the actual scale risk that pattern exists to close),
 ``evaluate_alert_rules`` never performs any per-device I/O of its own -- it
 only reads already-persisted state (``ServiceHealth``, ``Router
 .health_status``, ``RouterHealthSnapshot``, ``IspLink.health_status``,
-``PlatformEvent``) and writes ``Alert`` rows, dispatching outbound
+``PlatformEvent``, ``RouterRogueDhcpStatus``) and writes ``Alert`` rows,
+dispatching outbound
 notifications through ``NotificationService`` (a handful of webhook/email/
 SMS calls per newly-triggered/resolved alert, not one per rule or per
 router). This is the same risk profile ``app.domains.isp.tasks
@@ -40,6 +41,18 @@ router). This is the same risk profile ``app.domains.isp.tasks
 yet fanned-out) sweep -- a single Beat-scheduled task, run to completion
 well within this task's own 15-minute cadence, is the right shape here, not
 fan-out infrastructure this task's own workload does not need.
+
+``RouterRogueDhcpStatus`` is the newest entry on that list and the one that
+most looks like it should break the promise -- it is a real device fact,
+read off a real RouterOS API. It does not, because
+``app.domains.dhcp.tasks``'s own detector already paid that cost hours
+earlier, off this path and off the request path, and persisted the answer.
+That split is exactly why the row exists. ``ALERT_TARGET_ROGUE_DHCP_GUARD``
+needs no new composition in this task either, unlike
+``ALERT_TARGET_MONITORED_HARDWARE`` below: its state is a plain table
+``MonitoringRepository`` reads directly (two bulk queries per rule,
+whatever the fleet size -- see ``list_rogue_dhcp_statuses_with_routers``),
+not a status derived at read time by another domain's service.
 
 ## Fresh Redis client and HTTP client per invocation
 

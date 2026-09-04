@@ -107,6 +107,7 @@ from .constants import (
     ALERT_EVENT_LOOKBACK_MINUTES,
     ALERT_TARGET_ISP_LINK,
     ALERT_TARGET_MONITORED_HARDWARE,
+    ALERT_TARGET_ROGUE_DHCP_GUARD,
     ALERT_TARGET_ROUTER,
     AUDIT_LOG_SOURCE_DOMAIN,
     DEFAULT_EVENT_TIMELINE_LIMIT,
@@ -122,6 +123,8 @@ from .constants import (
     HTTP_NOTIFICATION_TIMEOUT_SECONDS,
     MAX_EVENT_TIMELINE_LIMIT,
     MONITORING_LIVE_CHANNEL,
+    ROGUE_DHCP_STATE_GUARDED,
+    ROGUE_DHCP_STATE_UNGUARDED,
     ROUTER_EVENT_SOURCE_DOMAIN,
     SOURCE_DOMAIN,
     AlertStatus,
@@ -1212,6 +1215,16 @@ class AlertService:
     same-router ``ALERT_TARGET_ROUTER`` rule's own open alert -- ``rule_id``
     is always part of the key too). See
     ``repository.MonitoringRepository.find_active_alert``.
+
+    Note what the key does **not** contain: anything below a router. An
+    ``ALERT_TARGET_ROGUE_DHCP_GUARD`` rule watches state the detector
+    persists per ``(router, interface)``, so its branch groups those rows
+    per router before evaluating them -- evaluating per interface would
+    address two different findings to one key and silently lose the second.
+    ``_evaluate_rogue_dhcp_guard_rule`` also answers the key from one bulk
+    ``list_open_alerts_for_rule`` read rather than a ``find_active_alert``
+    per target, because it is the one branch here that always evaluates a
+    whole fleet; the answer is identical, see that repository method.
     ``EVENT_OCCURRED`` rules use a different key -- see
     ``_evaluate_event_occurred_rule``'s own docstring -- since each match is
     a discrete past occurrence, not an ongoing condition.
@@ -1643,6 +1656,9 @@ class AlertService:
                     )
             return triggered, resolved
 
+        if rule.target_component == ALERT_TARGET_ROGUE_DHCP_GUARD:
+            return await self._evaluate_rogue_dhcp_guard_rule(rule, expected_status)
+
         if rule.target_component == ALERT_TARGET_ROUTER:
             routers = await self.repository.list_routers(
                 organization_id=rule.organization_id
@@ -1704,6 +1720,154 @@ class AlertService:
                     ),
                 )
             )
+        return triggered, resolved
+
+    async def _evaluate_rogue_dhcp_guard_rule(
+        self, rule: AlertRule, expected_status: object
+    ) -> tuple[list[Alert], list[Alert]]:
+        """Is each router still *watching* for a DHCP server on the guest
+        network that isn't ours?
+
+        Reads only the ``app.domains.dhcp.models.RouterRogueDhcpStatus``
+        rows cloud-guest#139's scheduled detector persisted -- **no device
+        I/O**, which is the promise ``app.domains.monitoring.tasks``'s
+        module docstring makes for this whole engine and the reason that
+        change split detector-writes from surface-reads in the first place.
+        See ``constants.ALERT_TARGET_ROGUE_DHCP_GUARD``.
+
+        ## Why this is not just the readiness checklist
+
+        #139 shipped the ``ROGUE_DHCP_GUARD`` checklist item over these same
+        rows. That surface is pull-only: an unguarded router appears if, and
+        only if, somebody opens that router's checklist. Nobody goes
+        looking. This is the push half.
+
+        ## One router at a time, not one interface
+
+        The detector writes one row per ``(router_id, interface)``, but this
+        engine's de-duplication key (see this class's own docstring) is
+        ``(rule_id, organization_id, location_id, router_id)`` and has no
+        interface dimension. Evaluating per interface would therefore try to
+        open a second alert on a key that already has one -- two unguarded
+        interfaces on one router would produce one alert plus one silently
+        swallowed duplicate on the first pass, and the interface named in
+        the message would be whichever the query happened to return first.
+        So the rows are grouped per router, and the affected interface
+        names go in the message.
+
+        ## Three states in, three outcomes out
+
+        Mirrors ``app.domains.readiness.service.ReadinessService
+        ._check_rogue_dhcp_detection``'s own ordering exactly, because it is
+        the same question asked of the same rows:
+
+        * any interface ``unguarded`` -> **trigger**. The device answered,
+          and answered that a segment handing out addresses has nothing
+          watching it. A known-unguarded interface outranks an unknown one
+          beside it: the finding was established by a device that answered,
+          and the unknown does not soften it.
+        * else any interface ``unknown`` -> **do nothing at all**. Not a
+          trigger, and -- the half that is easy to get wrong -- not a
+          resolution either. The detector could not reach this router. That
+          is not evidence it is unwatched, and it is not evidence somebody
+          fixed it. Auto-resolving here would clear a real open alert on
+          the strength of a timeout, and the operator would read "resolved"
+          as "the guard is back". ``unknown`` is an unanswered question at
+          every step of this feature; this is the last step, and it is not
+          collapsed here either.
+        * else -> **resolve**. Every row answered and every one is watched.
+
+        ## Cost
+
+        One query for the whole rule (``list_rogue_dhcp_statuses_with_routers``)
+        plus one for its open alerts (``list_open_alerts_for_rule``),
+        regardless of fleet size -- not one per router. See both
+        repository methods' own docstrings.
+        """
+        triggered: list[Alert] = []
+        resolved: list[Alert] = []
+        # Belt and braces with validators.validate_alert_rule_condition_config,
+        # which rejects any other expected_status at write time. A rule
+        # predating that check (or written straight into the table) must
+        # still never alert on "guarded"/"unknown".
+        if expected_status != ROGUE_DHCP_STATE_UNGUARDED:
+            return triggered, resolved
+
+        rows = await self.repository.list_rogue_dhcp_statuses_with_routers(
+            organization_id=rule.organization_id
+        )
+        # Indexed by the de-duplication key itself, from one query, rather
+        # than a find_active_alert round trip per router.
+        open_alerts: dict[
+            tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None], Alert
+        ] = {}
+        for alert in await self.repository.list_open_alerts_for_rule(rule_id=rule.id):
+            open_alerts.setdefault(
+                (alert.organization_id, alert.location_id, alert.router_id), alert
+            )
+
+        # Grouped per router, never per interface -- see this method's
+        # docstring.
+        routers_by_id: dict[uuid.UUID, object] = {}
+        unguarded_by_router: dict[uuid.UUID, list[str]] = {}
+        row_counts: dict[uuid.UUID, int] = {}
+        guarded_counts: dict[uuid.UUID, int] = {}
+        for router, status in rows:
+            routers_by_id[router.id] = router
+            row_counts[router.id] = row_counts.get(router.id, 0) + 1
+            if status.alert_state == ROGUE_DHCP_STATE_UNGUARDED:
+                unguarded_by_router.setdefault(router.id, []).append(status.interface)
+            elif status.alert_state == ROGUE_DHCP_STATE_GUARDED:
+                guarded_counts[router.id] = guarded_counts.get(router.id, 0) + 1
+
+        for router_id, router in routers_by_id.items():
+            unguarded_interfaces = sorted(unguarded_by_router.get(router_id, []))
+            # Resolution needs *positive* evidence, so it is spelled as
+            # "every row this router has answered guarded" rather than
+            # "nothing was unguarded". The difference is every state that is
+            # neither: today that is ``unknown``, tomorrow it could be a
+            # value some future detector writes that this evaluator has
+            # never heard of. Written the other way round, both would clear
+            # a real open alert on the strength of an answer nobody gave.
+            fully_guarded = guarded_counts.get(router_id, 0) == row_counts[router_id]
+            existing = open_alerts.get(
+                (router.organization_id, router.location_id, router.id)
+            )
+            if unguarded_interfaces:
+                if existing is None:
+                    triggered.append(
+                        await self._create_alert(
+                            rule,
+                            organization_id=router.organization_id,
+                            location_id=router.location_id,
+                            router_id=router.id,
+                            message=_rogue_dhcp_guard_message(
+                                router.name, unguarded_interfaces
+                            ),
+                        )
+                    )
+                continue
+            if not fully_guarded:
+                # See this method's docstring: no answer is not an answer.
+                # Never a trigger, and never a resolution either.
+                logger.info(
+                    "rogue_dhcp_guard_rule_router_state_unknown",
+                    extra={
+                        "rule_id": str(rule.id),
+                        "router_id": str(router.id),
+                        "open_alert_left_open": existing is not None,
+                    },
+                )
+                continue
+            if existing is not None:
+                resolved.append(
+                    await self._auto_resolve(
+                        existing,
+                        resolved_message=_rogue_dhcp_guard_resolved_message(
+                            router.name
+                        ),
+                    )
+                )
         return triggered, resolved
 
     async def _evaluate_threshold_rule(
@@ -1910,6 +2074,50 @@ def _health_status_message(name: str, health_status: str | None) -> str:
     if health_status == "healthy":
         return f"{name} is up"
     return f"{name} health status is {health_status}"
+
+
+def _rogue_dhcp_guard_message(router_name: str, interfaces: list[str]) -> str:
+    """The trigger copy for ``ALERT_TARGET_ROGUE_DHCP_GUARD``.
+
+    Every word here is about *detection*, never protection.
+    ``/ip dhcp-server alert`` writes a log line and does nothing else -- it
+    drops nothing, blocks nothing, rate-limits nothing -- so an alert
+    saying a router is "unprotected" or that its guard "is down" would
+    describe a defence this platform has never had, and would leave an
+    operator believing the fix restores one. The readiness item this alert
+    is the push half of already shows the same sentence
+    (``app.domains.readiness.constants``'s ``ROGUE_DHCP_GUARD`` entry, and
+    ``app.domains.dhcp.constants.RogueDhcpAlertState``'s own note), and the
+    two deliberately read alike so an operator meeting the fact on a
+    checklist and in an email meets the same claim.
+
+    Named interfaces, not a count: "ether2, vlan10" is something an
+    operator can act on; "2 interfaces" sends them looking.
+    """
+    names = ", ".join(interfaces)
+    return (
+        f"{router_name}: rogue DHCP detection is off on {names}. These "
+        "interfaces hand out addresses, so another DHCP server on the "
+        "segment would go unnoticed. Detection only -- it logs, it does "
+        "not block."
+    )
+
+
+def _rogue_dhcp_guard_resolved_message(router_name: str) -> str:
+    """The resolution copy, replacing the trigger text at resolve time for
+    the reason ``_auto_resolve``'s own docstring gives: ``_format_alert_message``
+    prefixes "[RESOLVED]" to whatever the alert says, and "[RESOLVED]
+    ... detection is off" is a contradiction a real operator did read as a
+    contradiction once already.
+
+    Says the detection is watching again -- not that anything is protected,
+    for the same reason as above.
+    """
+    return (
+        f"{router_name}: rogue DHCP detection is active again on every "
+        "interface serving DHCP. Detection only -- it logs, it does not "
+        "block."
+    )
 
 
 def _format_alert_message(alert: Alert) -> str:

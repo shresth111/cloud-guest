@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
+from app.domains.dhcp.models import RouterRogueDhcpStatus
 from app.domains.guest.models import GuestSession, RadiusNasClient
 from app.domains.isp.models import IspLink
 from app.domains.location.models import Location
@@ -216,6 +217,12 @@ class MonitoringRepositoryProtocol(Protocol):
     async def list_isp_links(
         self, *, organization_id: uuid.UUID | None
     ) -> list[IspLink]: ...
+
+    async def list_rogue_dhcp_statuses_with_routers(
+        self, *, organization_id: uuid.UUID | None
+    ) -> list[tuple[Router, RouterRogueDhcpStatus]]: ...
+
+    async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]: ...
 
     async def get_latest_router_health_snapshot(
         self, router_id: uuid.UUID
@@ -800,6 +807,84 @@ class MonitoringRepository:
         statement = select(IspLink).where(IspLink.is_deleted.is_(False))
         if organization_id is not None:
             statement = statement.where(IspLink.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_rogue_dhcp_statuses_with_routers(
+        self, *, organization_id: uuid.UUID | None = None
+    ) -> list[tuple[Router, RouterRogueDhcpStatus]]:
+        """Every rogue-DHCP detection row in scope, joined to the router it
+        belongs to -- the read behind
+        ``service.AlertService._evaluate_rogue_dhcp_guard_rule``.
+
+        Same "query another domain's model directly, read-only" precedent
+        ``list_routers``/``list_isp_links`` above already establish, and for
+        the same reason: ``DhcpService`` has no "every detection row across
+        an optional organization scope" method, only a per-router
+        ``get_rogue_dhcp_statuses`` the readiness checklist calls one router
+        at a time.
+
+        ## One query, not one per router
+
+        The join is the whole point. Looping the routers and calling a
+        per-router lookup would put a query per router inside every
+        evaluation pass, on a rule that exists to watch an entire fleet --
+        and ``evaluate_alert_rules`` already runs every active rule on a
+        Beat cadence. The router row comes back in the same trip because
+        the caller needs ``organization_id``/``location_id``/``name`` for
+        the alert's de-duplication key and message anyway.
+
+        An inner join, deliberately: a router with no detection rows at all
+        is a router the detector has not reached yet, which is an
+        unanswered question and must produce no finding. Absence stays
+        absence rather than becoming a row the evaluator has to remember to
+        skip. Soft-deleted rows on either side are excluded, matching every
+        other read here.
+        """
+        statement = (
+            select(Router, RouterRogueDhcpStatus)
+            .join(RouterRogueDhcpStatus, RouterRogueDhcpStatus.router_id == Router.id)
+            .where(
+                Router.is_deleted.is_(False),
+                RouterRogueDhcpStatus.is_deleted.is_(False),
+            )
+            .order_by(Router.id, RouterRogueDhcpStatus.interface)
+        )
+        if organization_id is not None:
+            statement = statement.where(Router.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return [(row[0], row[1]) for row in result.all()]
+
+    async def list_open_alerts_for_rule(self, *, rule_id: uuid.UUID) -> list[Alert]:
+        """Every open (not ``RESOLVED``) ``Alert`` for one rule, newest
+        first -- the bulk form of ``find_active_alert`` above.
+
+        ``find_active_alert`` answers the de-duplication question for one
+        target with one query, which is right for a rule watching a single
+        platform component and merely tolerable for one watching a fleet.
+        ``ALERT_TARGET_ROGUE_DHCP_GUARD`` evaluates every router with
+        detection rows on every pass, so asking it that way would be a
+        query per router per pass. This returns the same rows in one trip
+        and the caller indexes them by the de-duplication key itself --
+        identical predicate (not deleted, not resolved, this rule),
+        identical newest-first ordering, so the two cannot disagree about
+        which alert is "the" open one for a target.
+
+        The sibling ``ALERT_TARGET_ROUTER``/``ALERT_TARGET_ISP_LINK``
+        branches still call ``find_active_alert`` per target. Switching
+        them over is a strictly mechanical follow-up and is deliberately
+        not done here: it would put a behaviour change to three shipped
+        evaluation paths inside a change that adds a fourth.
+        """
+        statement = (
+            select(Alert)
+            .where(
+                Alert.is_deleted.is_(False),
+                Alert.rule_id == rule_id,
+                Alert.status != AlertStatus.RESOLVED.value,
+            )
+            .order_by(Alert.triggered_at.desc())
+        )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
 

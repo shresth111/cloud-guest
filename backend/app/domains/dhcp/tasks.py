@@ -54,23 +54,32 @@ that has nothing to do with health. A separate task on a much slower
 cadence keeps the existing poll exactly as fast and exactly as reliable as
 it is today.
 
-## Deliberately out of scope: an alert-engine target
+## The alert-engine target that reads these rows
 
-The obvious next step is an ``ALERT_TARGET_ROGUE_DHCP_GUARD`` alongside
-``app.domains.monitoring.constants``'s existing ``ALERT_TARGET_ROUTER``/
-``ALERT_TARGET_ISP_LINK``/``ALERT_TARGET_MONITORED_HARDWARE``, so an
-unguarded interface could page someone instead of only appearing on a
-checklist. It composes cleanly with what this change builds -- the alert
-engine reads already-persisted state, and ``RouterRogueDhcpStatus`` is
-exactly that -- and it is the natural follow-up.
+The rows this task writes are also read by
+``app.domains.monitoring.constants``'s ``ALERT_TARGET_ROGUE_DHCP_GUARD``,
+alongside its existing ``ALERT_TARGET_ROUTER``/``ALERT_TARGET_ISP_LINK``/
+``ALERT_TARGET_MONITORED_HARDWARE``, so an unguarded interface pages
+somebody instead of only appearing on a checklist nobody opens. It composes
+with what this task builds rather than duplicating it: the alert engine
+reads already-persisted state and performs no device I/O of its own, and
+``RouterRogueDhcpStatus`` is exactly that state.
 
-It is not built here. ``Alert.rule_id`` is a non-nullable FK to
-``alert_rules``, so no ``Alert`` can exist until an ``AlertRule`` for this
-target does; that means a rule type, its seeding, its evaluation branch and
-the customer-facing surface to configure it. That is materially more
-product than a detector, and bolting it on would have made this change a
-notification feature wearing a detector's name. The persisted rows are the
-seam it will need when someone picks it up.
+It was deliberately left out of this change and built separately, because
+``Alert.rule_id`` is a non-nullable FK to ``alert_rules`` -- no ``Alert``
+can exist until an ``AlertRule`` for the target does, which meant a rule
+type, somewhere for the rule to come from, an evaluation branch and a
+customer-facing surface to configure it. That is materially more product
+than a detector, and bolting it on would have made this change a
+notification feature wearing a detector's name. The FK was answered the way
+this codebase already answers it for ``ALERT_TARGET_MONITORED_HARDWARE``:
+``app.domains.organization.router``'s ``_DEFAULT_ALERT_RULES``, created with
+the organization.
+
+``RogueDhcpAlertState.UNKNOWN`` survives that whole path intact. It is not
+a finding here, it is NOT_CHECKED rather than FAIL on the readiness
+checklist, and in the alert engine it neither raises an alert nor resolves
+one -- see ``AlertService._evaluate_rogue_dhcp_guard_rule``.
 
 ## Per-router failure isolation
 
