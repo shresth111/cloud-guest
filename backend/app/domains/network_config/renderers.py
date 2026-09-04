@@ -712,6 +712,42 @@ HOTSPOT_DNS_NAME = "wifi.wyfyguest.com"
 # path last touched the router.
 HOTSPOT_HTML_DIRECTORY = "cloudguest-hotspot"
 
+# ---------------------------------------------------------------------------
+# Markers and ports the paired device writers in
+# ``wyfy_device_gateway.mikrotik_adapter`` already stamp on the rows they
+# converge. These are duplicated here deliberately and must stay byte-equal:
+# ``app.*`` cannot import the vendored gateway package, and a marker that
+# disagrees is worse than no marker at all -- each path would then be unable
+# to find the other's row, and would add a second one beside a working one.
+# That is precisely the duplicate ``_ensure_radius_client_row`` exists to
+# stop, reintroduced from the other side.
+# ---------------------------------------------------------------------------
+
+# Mirrors ``mikrotik_adapter._RADIUS_CLIENT_COMMENT``.
+RADIUS_CLIENT_COMMENT = "WyfyGuest RADIUS NAS client"
+
+# Mirrors ``mikrotik_adapter._ROGUE_DHCP_ALERT_COMMENT``.
+ROGUE_DHCP_ALERT_COMMENT = "cloudguest-rogue-dhcp-watch"
+
+# Mirrors ``mikrotik_adapter._CONTENT_FILTER_ENFORCEMENT_COMMENT``. Was an
+# inline literal in ``render_content_filter_enforcement`` until that function
+# had to *find* its own row again to reposition it.
+CONTENT_FILTER_ENFORCEMENT_COMMENT = (
+    "Wyfy Guest content filtering: block listed addresses"
+)
+
+# ``contract.RadiusClientConfig``'s own defaults. RouterOS defaults both onto
+# a ``service=hotspot`` entry anyway (confirmed live on 7.21.5 -- see this
+# module's RADIUS docstring section), but the writer sets them explicitly and
+# a hand-made row this renderer now ADOPTS rather than duplicates may carry
+# something else entirely.
+RADIUS_AUTH_PORT = 1812
+RADIUS_ACCT_PORT = 1813
+
+# NOT RouterOS's own default (1700): the RFC 5176 assigned port. Finding 3799
+# on a device is evidence this platform wrote it.
+RADIUS_COA_PORT = 3799
+
 
 def _sanitize_identifier(name: str) -> str:
     """Lowercases and replaces every character that is not alphanumeric/
@@ -827,7 +863,70 @@ def render_dhcp_pool(pool: DhcpPool) -> list[str]:
             "DNS-based content filtering will not apply to them"
         )
     lines.append(" ".join(network_parts))
+    lines.extend(_render_rogue_dhcp_alert(pool.interface))
     return lines
+
+
+def _render_rogue_dhcp_alert(interface: str) -> list[str]:
+    """The ``/ip dhcp-server alert`` row that goes beside every pool this
+    platform pushes -- the device's own watch for somebody else answering
+    DHCP on the same segment.
+
+    ## What it is for
+
+    A guest plugs a home router into a venue port and it starts handing out
+    leases. Guests land on its subnet, with a gateway that is not this
+    router, and never reach the portal at all. The alert **logs**; it drops
+    nothing and blocks nothing. That is the whole point -- it makes an event
+    that is otherwise invisible show up somewhere an operator can find it.
+
+    ``mikrotik_adapter.configure_rogue_dhcp_alerts`` writes this on the
+    device-writer path. Nothing rendered it, so a router configured from a
+    generated script served DHCP with nothing watching it, while a
+    fleet-pushed router beside it was guarded.
+
+    ## The trusted server is READ OFF THE DEVICE, never baked in
+
+    ``valid-server`` is a MAC address, and the only correct value is this
+    router's own MAC on this interface -- which is a fact about the
+    hardware, not about any row in this platform's database, so a rendered
+    literal is not available to us the way an address or a lease time is.
+    ``app.domains.dhcp.device_adapters`` solves this by reading the
+    interface's MAC from the device before it writes, and **refuses rather
+    than defaults** when it cannot find one (``return None``): a guessed
+    trusted server turns every legitimate lease into an alert, which is
+    exactly how a genuine rogue then gets ignored.
+
+    A script cannot do the read up front, so it does it at run time --
+    ``[/interface get [find name=...] mac-address]``. If the interface does
+    not resolve, that expression errors, :func:`_idempotent_lines`'
+    ``on-error={}`` swallows it, and no alert row is written. Same refusal,
+    same reason, reached differently: never a fabricated ``valid-server``.
+
+    ## ``disabled=no`` is not decoration
+
+    RouterOS creates an alert row **disabled by default**, so an ``add``
+    that omits this leaves a row that reads as configured in an export and
+    watches nothing. The writer's docstring calls this out and so does
+    this line; it is also re-asserted on the ``set`` branch, because an
+    operator (or an older build) may have left an existing row switched
+    off.
+
+    One row per interface -- that is RouterOS's own constraint, and it is
+    why this is keyed on ``interface`` rather than on the platform comment
+    the way most rows here are: a second ``add`` for the same interface
+    would silently overwrite the first rather than sit beside it."""
+    found = f'[/ip dhcp-server alert find where interface="{interface}"]'
+    fields = (
+        f'interface="{interface}" valid-server=$dhMac '
+        f'comment="{ROGUE_DHCP_ALERT_COMMENT}" disabled=no'
+    )
+    return [
+        f':local dhMac [/interface get [find name="{interface}"] mac-address]; '
+        f":if ([:len {found}] = 0) "
+        f"do={{ /ip dhcp-server alert add {fields} }} "
+        f"else={{ /ip dhcp-server alert set {found} {fields} }}"
+    ]
 
 
 def _vlan_address_line(vlan: Vlan, bind_interface: str) -> str | None:
@@ -887,6 +986,77 @@ def _render_vlan_hotspot(vlan: Vlan, bind_interface: str) -> list[str]:
     ]
 
 
+def _access_port_consent_guard(vlan: Vlan, physical: str, body: list[str]) -> list[str]:
+    """Gate an access-mode VLAN's whole rendering on the port not already
+    being a bridge member, for a VLAN whose operator never consented to
+    taking it.
+
+    ## The incident this mirrors
+
+    An access VLAN on ``ether2`` pulled the port carrying a venue's access
+    point out of the bridge the guest portal is bound to, and guest Wi-Fi
+    across the site stopped serving. ``Vlan.previous_bridge`` made that
+    reversible and the dashboard warned about it, but nothing *refused* --
+    and a warning an operator can click past is not a decision they made.
+
+    ``vlan.service.VlanService._check_takes_bridge_port`` closed that on the
+    device-writer path: an access-mode push is refused outright unless
+    ``Vlan.confirm_takes_port`` says the operator asked for exactly this.
+    This renderer kept issuing an unconditional
+    ``/interface bridge port remove``, and ``network_config.service
+    ._gather_enabled_rows`` reads VLAN rows straight out of the lookup --
+    the service's gate is not on this path at all. So the script reproduced
+    the original incident on any router it was pushed to.
+
+    ## Why a runtime guard rather than a render-time refusal
+
+    The writer's rule is a fact about the *device*: it refuses only when the
+    port is currently in a bridge, and returns early when the port's bridge
+    is ``None`` (a real answer meaning it is in none, and there is nothing
+    to take it out of). A renderer holds no device state, so the same
+    condition is evaluated on the router instead -- which lands on the same
+    rule rather than a stricter approximation of it.
+
+    Each line is guarded individually because :func:`_idempotent_lines`
+    wraps every command in its own ``:do {...} on-error={}`` block, so one
+    ``:if`` cannot bracket the lines that follow it. Guarding only the
+    ``bridge port remove`` would be worse than useless: the address and the
+    hotspot would still land on a port that is still a bridge member, which
+    is a half-configured VLAN rather than a refused one.
+
+    ``:error`` is deliberately NOT used to abort. ``on-error={}`` would
+    swallow it, so the refusal is a ``:log warning`` plus a ``:put`` an
+    operator watching the paste can actually see.
+
+    ## What this still cannot do
+
+    ``previous_bridge`` is recorded by the writer at push time from the
+    snapshot the refusal was based on, and is what lets a later delete put
+    the port back. A rendered script has nowhere to write that fact back
+    to, so a *confirmed* access VLAN taken by script is still not reversible
+    the way one taken through ``VlanService`` is. Taking the port is gated
+    now; giving it back remains device-writer-only, and that asymmetry is
+    real rather than papered over here."""
+    tag = f"vlan{vlan.vlan_id}"
+    member = f"[:len [/interface bridge port find where interface={physical}]]"
+    refusal = (
+        f"{tag} (access): {physical} is a bridge member and this VLAN does "
+        "not carry confirm_takes_port -- refusing to take the port"
+    )
+    return [
+        f"# {tag} (access): confirm_takes_port is not set, so every line "
+        f"below is gated on {physical} not already being a bridge member",
+        f":if ({member} > 0) do={{ "
+        f':log warning "cloudguest: {refusal}"; :put "{refusal}" }}',
+        *[
+            line
+            if line.lstrip().startswith("#")
+            else f":if ({member} = 0) do={{ {line} }}"
+            for line in body
+        ],
+    ]
+
+
 def render_vlan(vlan: Vlan) -> list[str]:
     """Renders one enabled ``Vlan`` row. Branches on ``port_mode``:
 
@@ -914,13 +1084,15 @@ def render_vlan(vlan: Vlan) -> list[str]:
                 "skipping, cannot dedicate an access port without one"
             ]
         physical = vlan.interface
-        lines = [f"/interface bridge port remove [find interface={physical}]"]
+        body = [f"/interface bridge port remove [find interface={physical}]"]
         address_line = _vlan_address_line(vlan, physical)
         if address_line:
-            lines.append(address_line)
+            body.append(address_line)
         if vlan.enable_hotspot:
-            lines.extend(_render_vlan_hotspot(vlan, physical))
-        return lines
+            body.extend(_render_vlan_hotspot(vlan, physical))
+        if vlan.confirm_takes_port:
+            return body
+        return _access_port_consent_guard(vlan, physical, body)
 
     if vlan.interface is None:
         return [
@@ -1099,11 +1271,70 @@ def render_content_filter_enforcement() -> list[str]:
     every ``IP_CIDR``-type :class:`ContentFilterRule`'s address-list
     membership (rendered by :func:`render_content_filter_rule`) actually
     block traffic -- see module docstring's "Content Filtering" section
-    for why this is rendered exactly once per push, not once per rule."""
-    return [
-        "/ip firewall filter add chain=forward "
+    for why this is rendered exactly once per push, not once per rule.
+
+    ## Position is managed here too, not left to where RouterOS appends
+
+    This used to be a bare ``add``, so the DROP landed at the *bottom* of
+    ``forward`` -- below ``accept cloudguest-fw-fwd-established`` -- and a
+    blocked destination was then only dropped on a *new* connection. A flow
+    already established when the block was added kept flowing: the operator
+    pressed Block, the dashboard said applied, and the guest's session
+    carried on until it closed by itself.
+
+    ``mikrotik_adapter._ensure_content_filter_enforcement_rule`` fixed
+    exactly this on the device-writer path -- placing the rule immediately
+    before the first ``accept`` in ``forward``, re-checked on every push --
+    and left this half behind. This is that same convergence expressed as
+    RouterOS script, so a router configured from a generated script blocks
+    the same traffic as one an operator re-applied.
+
+    See that method's docstring for the two device tests that make the
+    placement buildable rather than guessed (**T1**: ``place-before`` takes
+    a ``.id``, not an ordinal; **T2**: a static rule *can* sit above
+    hotspot's own dynamic ``forward`` rules), and for why sitting above the
+    accepts -- the dangerous direction in general -- is safe for *this* rule
+    specifically: it matches ``dst-address-list=`` and nothing else, so it
+    can only ever affect a destination the customer explicitly blocked,
+    never the portal, the tunnel, or 8728.
+
+    ## Why one line, and why add-then-remove rather than a position check
+
+    :func:`_idempotent_lines` wraps every rendered command in its own
+    ``:do {...} on-error={}``, and a RouterOS ``:local`` does not survive
+    across two of those blocks -- so this must be ONE self-contained line,
+    the same single-line discipline :func:`render_hotspot_walled_garden`
+    and :func:`render_guest_data_path` already follow. Comparing positions
+    inside a single line is possible and unreadable; re-adding at the right
+    position and dropping the previous rows is neither, and converges to
+    the identical end state.
+
+    The ordering *inside* the line is the load-bearing part, and it matches
+    the adapter's: the old rows are captured **before** the new one is
+    added, and the ``add`` happens **before** any ``remove``, so the window
+    holds two identical DROPs rather than none. A duplicated drop is
+    harmless; a gap is a site briefly unblocked, and this is a control that
+    must fail closed.
+
+    That rewrite also fixes a second defect the bare ``add`` carried:
+    ``/ip firewall filter`` has no unique key, so ``on-error={}`` caught
+    nothing and **every push appended another DROP** at the bottom of the
+    chain. This line leaves exactly one, however many times it is run."""
+    rule = (
+        "chain=forward "
         f"dst-address-list={CONTENT_FILTER_ADDRESS_LIST_NAME} action=drop "
-        'comment="Wyfy Guest content filtering: block listed addresses"'
+        f'comment="{CONTENT_FILTER_ENFORCEMENT_COMMENT}"'
+    )
+    return [
+        ":local cfOld [/ip firewall filter find where "
+        f'comment="{CONTENT_FILTER_ENFORCEMENT_COMMENT}"]; '
+        ":local cfAnchor [/ip firewall filter find where chain=forward "
+        "action=accept]; "
+        ":if ([:len $cfAnchor] > 0) "
+        f"do={{ /ip firewall filter add {rule} "
+        f"place-before=[:pick $cfAnchor 0] }} "
+        f"else={{ /ip firewall filter add {rule} }}; "
+        ":foreach cfR in=$cfOld do={ /ip firewall filter remove $cfR }"
     ]
 
 
@@ -1269,7 +1500,7 @@ def render_guest_data_path() -> list[str]:
                 f'add list="WAN" interface=${p}If '
                 f'comment="{DISCOVERED_WAN_LIST_COMMENT}" }}',
                 # The masquerade itself.
-                f':local {p}Nat [/ip firewall nat find where '
+                f":local {p}Nat [/ip firewall nat find where "
                 f'comment="{DISCOVERED_NAT_COMMENT}"]',
                 f":if ({if_resolved} && [:len ${p}Nat] = 0) do={{ /ip firewall nat add "
                 f"chain=srcnat out-interface=${p}If action=masquerade "
@@ -1279,7 +1510,7 @@ def render_guest_data_path() -> list[str]:
                 f"action=masquerade }} on-error={{ :log warning "
                 f'("cloudguest: could not re-point the Wyfy-managed masquerade at " '
                 f'. ${p}If . " -- guests may not get NAT over the live uplink") }} }}',
-                f":if (!({if_resolved})) do={{ :log warning \"cloudguest: no uplink "
+                f':if (!({if_resolved})) do={{ :log warning "cloudguest: no uplink '
                 "interface resolved, so the Wyfy-managed WAN list membership and "
                 'masquerade were left exactly as they are -- nothing was guessed" }',
             ]
@@ -1444,12 +1675,50 @@ def render_radius_client(
     function's single most important parameter, why ``service=hotspot``
     needs no separate accounting line, and why ``/radius incoming`` is
     rendered unconditionally here (it is a router-global setting, not
-    per-client)."""
+    per-client).
+
+    ## This converges; it used to append
+
+    This emitted a bare ``/radius add`` with no read first, and
+    :func:`_idempotent_lines`' ``on-error={}`` could not save it:
+    ``/radius`` has no unique key, so the ``add`` never errored and every
+    push left **another** NAS registration for the same server. After a
+    secret rotation one of them is stale, and RouterOS consults them in
+    order -- a router that authenticates guests intermittently, with a
+    correct-looking configuration at both ends.
+
+    ``mikrotik_adapter._ensure_radius_client_row`` fixed exactly this on
+    the writer path, and its own docstring named this function as still
+    carrying the defect. This is that same convergence: the ``add`` is
+    guarded by a ``find where address=``, an existing row is adopted with
+    a ``set`` rather than duplicated, and the row is stamped with
+    :data:`RADIUS_CLIENT_COMMENT`.
+
+    ``authentication-port``/``accounting-port`` are written explicitly even
+    though ``service=hotspot`` already defaults both (module docstring,
+    confirmed live on 7.21.5). The reason is the ``set`` branch rather than
+    the ``add`` branch: a row this now *adopts* may be one a human created
+    with different ports, and silently inheriting those is how a
+    registration that reads as correct authenticates against nothing.
+
+    Keyed on ``address`` alone rather than the writer's
+    ``service`` + ``address`` pair: RouterOS stores ``service`` as a list,
+    which does not survive a script-level ``=`` comparison the way it
+    survives the adapter's Python one. One RADIUS server per router makes
+    the address sufficient here."""
     secret = decrypt_secret(nas_client.shared_secret_encrypted)
+    fields = (
+        f"service=hotspot address={radius_server_host} "
+        f'secret="{secret}" src-address={tunnel_ip} '
+        f"authentication-port={RADIUS_AUTH_PORT} "
+        f"accounting-port={RADIUS_ACCT_PORT} "
+        f'comment="{RADIUS_CLIENT_COMMENT}" disabled=no'
+    )
+    found = f'[/radius find where address="{radius_server_host}"]'
     return [
-        f"/radius add service=hotspot address={radius_server_host} "
-        f'secret="{secret}" src-address={tunnel_ip}',
-        "/radius incoming set accept=yes port=3799",
+        f":if ([:len {found}] = 0) do={{ /radius add {fields} }} "
+        f"else={{ /radius set {found} {fields} }}",
+        f"/radius incoming set accept=yes port={RADIUS_COA_PORT}",
     ]
 
 

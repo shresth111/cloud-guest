@@ -29,6 +29,8 @@ from app.domains.firewall.constants import (
     FirewallProtocol,
 )
 from app.domains.firewall.models import FirewallRule
+from app.domains.guest.constants import NasStatus
+from app.domains.guest.models import RadiusNasClient
 from app.domains.hotspot.models import HotspotProfile
 from app.domains.isp.constants import IspConnectionMode
 from app.domains.isp.models import IspLink
@@ -56,6 +58,8 @@ from app.domains.network_config.exceptions import (
 from app.domains.network_config.renderers import (
     HOTSPOT_DNS_NAME,
     MANAGED_WALLED_GARDEN_COMMENT,
+    RADIUS_CLIENT_COMMENT,
+    ROGUE_DHCP_ALERT_COMMENT,
     render_agent_heartbeat_scheduler,
     render_bootstrap_script,
     render_content_filter_enforcement,
@@ -72,6 +76,7 @@ from app.domains.network_config.renderers import (
     render_network_config,
     render_port_forwarding_rule,
     render_qos_traffic_rule,
+    render_radius_client,
     render_vlan,
     render_wireguard_peer,
 )
@@ -726,9 +731,7 @@ class TestRenderBootstrapScript:
             in script
         )
         assert "http-method=post" in script
-        assert (
-            "https://api.cloudguest.example/api/v1/agent/wireguard-config" in script
-        )
+        assert "https://api.cloudguest.example/api/v1/agent/wireguard-config" in script
         assert '"X-Agent-Credential: " . ($enroll->"agent_credential")' in script
         # The interface is created from the platform-delivered key, tagged
         # like everything else this script creates.
@@ -774,9 +777,7 @@ class TestRenderBootstrapScript:
         deserialize = lines.index(
             ':local enroll [:deserialize from=json value=($resp->"data")]'
         )
-        wg_fetch = next(
-            i for i, line in enumerate(lines) if "wireguard-config" in line
-        )
+        wg_fetch = next(i for i, line in enumerate(lines) if "wireguard-config" in line)
         for field_name in self.CHECK_IN_FIELDS:
             check = next(
                 i
@@ -883,12 +884,10 @@ class TestRenderBootstrapScript:
         # uplink instead of being told one. Still allow-listed by exact
         # value, so a real hub address would still fail this.
         allowed_literals = {"216.239.35.0", "162.159.200.1", "0.0.0.0"}
-        found = set(
-            re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script)
-        )
-        assert not (found - allowed_literals), (
-            f"unexpected IP literal(s): {found - allowed_literals}"
-        )
+        found = set(re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script))
+        assert not (
+            found - allowed_literals
+        ), f"unexpected IP literal(s): {found - allowed_literals}"
         for needle in ("tunnel_ip_address", "wireguard_server_public_key"):
             for line in lines:
                 if needle in line and "missing" not in line:
@@ -940,14 +939,10 @@ class TestRenderRemoteBootstrapScript:
         )
 
     def _cut_line(self) -> str:
-        return next(
-            line for line in self._render() if line.startswith(":local cut ")
-        )
+        return next(line for line in self._render() if line.startswith(":local cut "))
 
     def _rvt_line(self) -> str:
-        return next(
-            line for line in self._render() if line.startswith(":local rvt ")
-        )
+        return next(line for line in self._render() if line.startswith(":local rvt "))
 
     def test_rejects_non_https_base_url(self) -> None:
         with pytest.raises(ValueError, match="https://"):
@@ -1004,9 +999,7 @@ class TestRenderRemoteBootstrapScript:
                 i for i, line in enumerate(lines) if line.startswith(":local body")
             )
             end = next(
-                i
-                for i, line in enumerate(lines)
-                if "empty peer_private_key" in line
+                i for i, line in enumerate(lines) if "empty peer_private_key" in line
             )
             return lines[start : end + 1]
 
@@ -1038,9 +1031,7 @@ class TestRenderRemoteBootstrapScript:
             ":local oldallowed ",
             ":local oldka ",
         ):
-            index = next(
-                i for i, line in enumerate(remote) if line.startswith(capture)
-            )
+            index = next(i for i, line in enumerate(remote) if line.startswith(capture))
             assert index < check_in
 
     def test_no_removal_before_successful_validation(self) -> None:
@@ -1057,9 +1048,7 @@ class TestRenderRemoteBootstrapScript:
         # The staged-script builders and every scheduler mutation come
         # strictly after validation.
         for prefix in (":local cut ", ":local rvt ", "/system scheduler"):
-            index = next(
-                i for i, line in enumerate(remote) if line.startswith(prefix)
-            )
+            index = next(i for i, line in enumerate(remote) if line.startswith(prefix))
             assert index > last_validation
 
     def test_revert_is_armed_before_cutover_is_staged(self) -> None:
@@ -1078,14 +1067,12 @@ class TestRenderRemoteBootstrapScript:
         )
         assert revert_add < cutover_add
         assert (
-            f"interval={REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES}m"
-            in remote[revert_add]
+            f"interval={REMOTE_BOOTSTRAP_REVERT_WINDOW_MINUTES}m" in remote[revert_add]
         )
         assert 'comment="CGBOOT-revert"' in remote[revert_add]
         assert "on-event=$rvt" in remote[revert_add]
         assert (
-            f"interval={REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS}s"
-            in remote[cutover_add]
+            f"interval={REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS}s" in remote[cutover_add]
         )
         assert 'comment="CGBOOT-cutover"' in remote[cutover_add]
         assert "on-event=$cut" in remote[cutover_add]
@@ -1106,7 +1093,7 @@ class TestRenderRemoteBootstrapScript:
             '/system scheduler remove [find where comment=\\"CGBOOT-cutover\\"]'
         )
         revert_guard = cut.index("revert window closed")
-        first_teardown = cut.index('/ip address remove')
+        first_teardown = cut.index("/ip address remove")
         assert self_remove < revert_guard < first_teardown
         # Teardown is a superset of on-site\'s: by CGBOOT comment (orphaned
         # rows) AND by interface (live rows predating the tag).
@@ -1114,7 +1101,7 @@ class TestRenderRemoteBootstrapScript:
             '/ip address remove [find where comment=\\"CGBOOT\\"]',
             '/ip address remove [find where interface=\\"wg-cloudguard\\"]',
             '/interface wireguard peers remove [find where comment=\\"CGBOOT\\"]',
-            '/interface wireguard peers remove '
+            "/interface wireguard peers remove "
             '[find where interface=\\"wg-cloudguard\\"]',
             '/interface wireguard remove [find where name=\\"wg-cloudguard\\"]',
         ):
@@ -1142,24 +1129,21 @@ class TestRenderRemoteBootstrapScript:
         # Confirmation is a real round-trip to the hub over the new
         # tunnel, polled within the revert window -- local existence never
         # disarms the revert.
-        assert (
-            f"\\$tries < {REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS}" in cut
-        )
+        assert f"\\$tries < {REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS}" in cut
         assert f":delay {REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS}s" in cut
         assert (
             ':set ok [/ping \\"" . ($enroll->"wireguard_hub_tunnel_address") . "\\"'
             " count=2]" in cut
         )
         success = cut.index(
-            ':if (\\$ok > 0) do={ /system scheduler remove '
+            ":if (\\$ok > 0) do={ /system scheduler remove "
             '[find where comment=\\"CGBOOT-revert\\"]'
         )
         assert success > cut.index(":set ok [/ping")
         assert "automatic revert stays armed" in cut
         # Poll budget stays well inside the revert window.
         poll_seconds = (
-            REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS
-            * REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS
+            REMOTE_BOOTSTRAP_CONFIRM_ATTEMPTS * REMOTE_BOOTSTRAP_CONFIRM_DELAY_SECONDS
         )
         assert (
             REMOTE_BOOTSTRAP_CUTOVER_DELAY_SECONDS + poll_seconds
@@ -1218,12 +1202,10 @@ class TestRenderRemoteBootstrapScript:
         # uplink instead of being told one. Still allow-listed by exact
         # value, so a real hub address would still fail this.
         allowed_literals = {"216.239.35.0", "162.159.200.1", "0.0.0.0"}
-        found = set(
-            re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script)
-        )
-        assert not (found - allowed_literals), (
-            f"unexpected IP literal(s): {found - allowed_literals}"
-        )
+        found = set(re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", script))
+        assert not (
+            found - allowed_literals
+        ), f"unexpected IP literal(s): {found - allowed_literals}"
         assert not any(line.lstrip().startswith("#") for line in remote)
         assert not any("\n" in line for line in remote)
         assert "one-time-token-abc" in script
@@ -1443,10 +1425,19 @@ class TestRenderNetworkConfig:
                 ),
             ],
         )
-        assert rendered.count("wyfyguest-content-filter-blocked") == 3
-        assert rendered.count("dst-address-list=wyfyguest-content-filter-blocked") == 1
-        assert rendered.count("action=drop") == 1
-        assert rendered.count("/ip firewall filter add chain=forward") == 1
+        # One enforcement LINE, still once per push and not once per rule --
+        # asserted as a line count rather than a substring count, because
+        # that single line now names the rule twice: once in the
+        # `place-before` branch and once in the plain-append fallback. See
+        # `render_content_filter_enforcement`.
+        enforcement = [line for line in rendered.splitlines() if "action=drop" in line]
+        assert len(enforcement) == 1
+        assert (
+            enforcement[0].count("dst-address-list=wyfyguest-content-filter-blocked")
+            == 2
+        )
+        # 2 address-list membership lines + the 2 in that one enforcement line
+        assert rendered.count("wyfyguest-content-filter-blocked") == 4
 
     def test_omits_content_filter_section_without_any_rules(self) -> None:
         rendered = render_network_config(
@@ -2278,8 +2269,7 @@ class TestRenderGuestDataPath:
             if "/ip firewall nat" not in statement:
                 continue
             assert (
-                "cloudguest-nat-live" in statement
-                or "$cgDataPathNat" in statement
+                "cloudguest-nat-live" in statement or "$cgDataPathNat" in statement
             ), statement
         assert "/ip firewall nat remove" not in script
 
@@ -2299,7 +2289,7 @@ class TestRenderGuestDataPath:
         degraded outcome is 'nothing was guessed', not a plausible-looking
         wrong interface."""
         script = self._script()
-        assert 'no uplink interface resolved' in script
+        assert "no uplink interface resolved" in script
         for statement in script.split("; "):
             if "/ip firewall nat add" in statement or "/interface list member add" in (
                 statement
@@ -2326,9 +2316,7 @@ class TestRenderHotspotWalledGarden:
     API_URL = "https://app.wyfyguest.com/agent/check-in"
 
     def _script(self, api_url: str | None = None) -> str:
-        return "\n".join(
-            render_hotspot_walled_garden(api_url=api_url or self.API_URL)
-        )
+        return "\n".join(render_hotspot_walled_garden(api_url=api_url or self.API_URL))
 
     def test_allows_the_portal_and_the_api_and_nothing_else(self) -> None:
         """A hotspot intercepts everything until the guest authenticates,
@@ -2493,3 +2481,243 @@ class TestGuestDataPathOnThePushPath:
             render_network_config(dhcp_pools=[], vlans=[], port_forwarding_rules=[])
             == ""
         )
+
+
+# ============================================================================
+# Generator / device-writer parity
+#
+# Four objects are written by BOTH the rendered-script path and the direct
+# device writers in ``wyfy_device_gateway.mikrotik_adapter``. Each drifted
+# because a writer was fixed and nothing compared the two halves afterwards.
+#
+# Every test below states the WRITER's behaviour as the expectation and names
+# the method it is holding the renderer level with, so a future change to one
+# side that is not mirrored on the other fails here rather than on a router.
+# ============================================================================
+
+
+def _make_nas_client(**overrides: object) -> RadiusNasClient:
+    fields = {
+        "router_id": uuid.uuid4(),
+        "organization_id": uuid.uuid4(),
+        "location_id": uuid.uuid4(),
+        "nas_identifier": "nas-1",
+        "shared_secret_encrypted": encrypt_secret("s3cret"),
+        "status": NasStatus.ACTIVE.value,
+        "is_active": True,
+    }
+    fields.update(overrides)
+    return RadiusNasClient(**_base_fields(**fields))
+
+
+class TestRadiusClientParity:
+    """``render_radius_client`` vs ``_ensure_radius_client_row`` /
+    ``_ensure_radius_incoming``."""
+
+    @staticmethod
+    def _render() -> list[str]:
+        return render_radius_client(_make_nas_client(), "10.100.0.5", "10.100.0.1")
+
+    def test_registration_is_guarded_so_a_second_push_adds_no_second_row(self) -> None:
+        # `/radius add` has no unique key, so `_idempotent_lines`'
+        # `on-error={}` could never make a bare `add` idempotent. Two pushes
+        # meant two NAS registrations for the same server, and after a secret
+        # rotation one of them is stale -- a router that authenticates guests
+        # intermittently depending on which row RouterOS consults.
+        add_line, _incoming = self._render()
+        assert ':if ([:len [/radius find where address="10.100.0.1"]] = 0)' in add_line
+        assert "do={ /radius add " in add_line
+        assert (
+            'else={ /radius set [/radius find where address="10.100.0.1"]' in add_line
+        )
+
+    def test_row_carries_the_marker_the_writer_keys_on_and_stamps(self) -> None:
+        # Must stay byte-equal to `mikrotik_adapter._RADIUS_CLIENT_COMMENT`:
+        # a row this renderer writes has to be findable by the writer, and
+        # vice versa, or each adds a second row beside the other's working one.
+        assert RADIUS_CLIENT_COMMENT == "WyfyGuest RADIUS NAS client"
+        add_line, _ = self._render()
+        assert add_line.count(f'comment="{RADIUS_CLIENT_COMMENT}"') == 2
+
+    def test_ports_and_enabled_state_are_written_explicitly(self) -> None:
+        add_line, _ = self._render()
+        assert add_line.count("authentication-port=1812") == 2
+        assert add_line.count("accounting-port=1813") == 2
+        assert add_line.count("disabled=no") == 2
+
+    def test_src_address_is_the_routers_own_tunnel_ip(self) -> None:
+        # The one field the whole feature lives or dies on: FreeRADIUS
+        # matches a client stanza BY SOURCE IP.
+        add_line, _ = self._render()
+        assert add_line.count("src-address=10.100.0.5") == 2
+
+    def test_coa_listener_uses_the_rfc_port_not_the_routeros_default(self) -> None:
+        _add, incoming = self._render()
+        assert incoming == "/radius incoming set accept=yes port=3799"
+
+
+class TestRogueDhcpAlertParity:
+    """``render_dhcp_pool`` vs ``configure_rogue_dhcp_alerts``."""
+
+    @staticmethod
+    def _alert(**overrides: object) -> str:
+        lines = render_dhcp_pool(_make_pool(**{"interface": "ether2", **overrides}))
+        (alert,) = [line for line in lines if "/ip dhcp-server alert" in line]
+        return alert
+
+    def test_an_alert_is_rendered_beside_the_pool(self) -> None:
+        # Without one, a guest's home router handing out leases on the venue
+        # segment is invisible: guests get an address from it, never reach
+        # the portal, and nothing anywhere records why.
+        assert 'interface="ether2"' in self._alert()
+
+    def test_the_alert_row_is_explicitly_enabled(self) -> None:
+        # RouterOS creates an alert row DISABLED by default, so an `add` that
+        # omits this leaves a row reading as configured in an export while
+        # watching nothing. Re-asserted on the `set` branch too, for a row an
+        # operator or an older build switched off.
+        assert self._alert().count("disabled=no") == 2
+
+    def test_valid_server_is_read_off_the_device_never_fabricated(self) -> None:
+        # A guessed trusted server turns every legitimate lease into an
+        # alert, which is exactly how a real rogue then gets ignored. The
+        # writer reads the MAC before writing and refuses when it cannot;
+        # a script has to do the same read at run time.
+        alert = self._alert()
+        assert ':local dhMac [/interface get [find name="ether2"] mac-address]' in alert
+        assert alert.count("valid-server=$dhMac") == 2
+
+    def test_the_row_is_keyed_on_interface_because_routeros_holds_one_each(
+        self,
+    ) -> None:
+        alert = self._alert()
+        assert alert.count('[/ip dhcp-server alert find where interface="ether2"]') == 2
+        assert f'comment="{ROGUE_DHCP_ALERT_COMMENT}"' in alert
+
+    def test_no_alert_when_there_is_no_interface_to_watch(self) -> None:
+        lines = render_dhcp_pool(_make_pool(interface=None))
+        assert not any("/ip dhcp-server alert" in line for line in lines)
+
+
+class TestContentFilterEnforcementPlacement:
+    """``render_content_filter_enforcement`` vs
+    ``_ensure_content_filter_enforcement_rule``."""
+
+    def test_the_drop_is_placed_above_the_first_accept_in_forward(self) -> None:
+        # Below the accept, a blocked destination is only dropped on a NEW
+        # connection -- a flow already established when the operator pressed
+        # Block keeps running. `place-before` takes a `.id`, not an ordinal
+        # (device test T1).
+        (line,) = render_content_filter_enforcement()
+        assert (
+            ":local cfAnchor [/ip firewall filter find where chain=forward "
+            "action=accept]" in line
+        )
+        assert "place-before=[:pick $cfAnchor 0]" in line
+
+    def test_it_appends_when_forward_has_no_accept_to_sit_above(self) -> None:
+        (line,) = render_content_filter_enforcement()
+        assert "else={ /ip firewall filter add chain=forward" in line
+
+    def test_old_rows_are_captured_before_the_add_and_removed_after_it(self) -> None:
+        # Add-before-remove, deliberately: the window holds two identical
+        # DROPs rather than none. A duplicate drop is harmless; a gap is a
+        # site briefly unblocked, and this control must fail closed.
+        (line,) = render_content_filter_enforcement()
+        assert (
+            line.index(":local cfOld")
+            < line.index("/ip firewall filter add")
+            < line.index(":foreach cfR in=$cfOld")
+        )
+
+    def test_it_is_one_line_because_local_does_not_survive_a_do_block(self) -> None:
+        # `_idempotent_lines` wraps each command in its own
+        # `:do {...} on-error={}`, and a `:local` set in one does not exist
+        # in the next.
+        assert len(render_content_filter_enforcement()) == 1
+
+
+class TestAccessVlanBridgePortConsent:
+    """``render_vlan``'s access branch vs
+    ``VlanService._check_takes_bridge_port``."""
+
+    @staticmethod
+    def _commands(lines: list[str]) -> list[str]:
+        return [line for line in lines if not line.lstrip().startswith("#")]
+
+    def test_an_unconfirmed_access_vlan_refuses_to_take_a_bridge_port(self) -> None:
+        # The incident: an access VLAN on ether2 took the port carrying a
+        # venue's AP out of the bridge the portal was bound to, and guest
+        # Wi-Fi stopped serving site-wide.
+        lines = render_vlan(
+            _make_vlan(port_mode="access", interface="ether3", confirm_takes_port=False)
+        )
+        warning, *guarded = self._commands(lines)
+        assert "refusing to take the port" in warning
+        assert ":log warning" in warning
+        # Every remaining command is gated -- guarding only the bridge-port
+        # remove would leave the address and the hotspot landing on a port
+        # that is still a bridge member, which is a half-configured VLAN
+        # rather than a refused one.
+        assert guarded
+        assert all(
+            "[:len [/interface bridge port find where interface=ether3]] = 0" in line
+            for line in guarded
+        )
+
+    def test_a_confirmed_access_vlan_takes_the_port_unconditionally(self) -> None:
+        lines = render_vlan(
+            _make_vlan(port_mode="access", interface="ether3", confirm_takes_port=True)
+        )
+        assert lines[0] == "/interface bridge port remove [find interface=ether3]"
+        assert not any("refusing to take the port" in line for line in lines)
+
+    def test_trunk_mode_is_never_gated_and_moves_no_port(self) -> None:
+        # A trunk VLAN hangs a tagged sub-interface off its parent and
+        # changes no bridge membership, so the same port being a bridge
+        # member is the normal case there, not a hazard.
+        lines = render_vlan(_make_vlan(port_mode="trunk", interface="ether1"))
+        assert not any("refusing to take the port" in line for line in lines)
+        assert not any("/interface bridge port remove" in line for line in lines)
+
+
+class TestRenderedBlocksAreStructurallyBalanced:
+    """Every line these renderers emit is a RouterOS ``do={...}`` block, and
+    an unbalanced brace is a syntax error the device reports at paste time
+    -- by which point a technician is standing in a venue.
+
+    This exists because it caught a real one: ``}}`` was left in a plain
+    (non-f-string) segment of :func:`render_content_filter_enforcement`,
+    where it stays a literal double brace instead of collapsing to one. The
+    substring assertions in the classes above all still passed -- they check
+    that the right commands are present, not that the block closes -- so
+    nothing but rendering the line and looking at it would have found it.
+    """
+
+    @staticmethod
+    def _lines() -> list[str]:
+        vlan_access = _make_vlan(
+            port_mode="access", interface="ether3", confirm_takes_port=False
+        )
+        return [
+            *render_content_filter_enforcement(),
+            *render_dhcp_pool(_make_pool(interface="ether2")),
+            *render_vlan(vlan_access),
+            *render_radius_client(_make_nas_client(), "10.100.0.5", "10.100.0.1"),
+        ]
+
+    def test_every_rendered_line_closes_every_brace_it_opens(self) -> None:
+        for line in self._lines():
+            assert line.count("{") == line.count("}"), line
+
+    def test_no_line_leaves_a_quote_open(self) -> None:
+        for line in self._lines():
+            assert line.count('"') % 2 == 0, line
+
+    def test_brace_nesting_never_goes_negative(self) -> None:
+        # A `}` before its `{` balances by count but is still malformed.
+        for line in self._lines():
+            depth = 0
+            for char in line:
+                depth += (char == "{") - (char == "}")
+                assert depth >= 0, line
