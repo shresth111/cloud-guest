@@ -353,7 +353,6 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
     import inspect
 
     from app.domains.rbac.location_scope import (
-        CallerLocationScope,
         OptionalCallerLocationScope,
     )
 
@@ -420,7 +419,6 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
 def test_no_route_relies_on_confinement_without_authentication() -> None:
     from app.domains.rbac.dependencies import CurrentUser
     from app.domains.rbac.location_scope import (
-        CallerLocationScope,
         OptionalCallerLocationScope,
     )
     from app.main import create_app
