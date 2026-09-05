@@ -26,10 +26,23 @@ Three buckets, and a domain must be in exactly one:
     something.
 
 ``PENDING``
-    Known to need the work, with the reason it has not had it yet. This list is
-    expected to shrink; nothing enforces that it does, because a ratchet on a
-    count fails for the wrong reasons. What is enforced is that a domain cannot
-    leave the list by being forgotten -- only by moving to another bucket.
+    Known to need the work. Each entry records **what was analysed and what
+    is not yet settled**, not merely that the domain is on a list -- because
+    a list of nine a future reader cannot distinguish from nine that were
+    considered and dismissed is how this quietly becomes permanent. An entry
+    saying "not yet analysed" is a fine entry; an entry saying nothing is not.
+
+    This list is expected to shrink; nothing enforces that it does, because a
+    ratchet on a count fails for the wrong reasons and gets deleted. What is
+    enforced is that a domain cannot leave the list by being forgotten -- only
+    by moving to another bucket.
+
+    The bar for leaving is: name the entity the routes actually address by id,
+    and say why that getter and not another. `voucher` is why. A mechanical
+    pass matched its `get_series` and would have confined voucher *series*
+    while leaving *batches* -- the entity every route addresses -- wide open,
+    with the whole suite green and this contract marking the domain done. A
+    hole behind a green tick is worse than an unconverted domain.
 
 ``EXEMPT``
     Genuinely does not need it, with the argument written down. An exemption
@@ -109,29 +122,55 @@ LOCATION_SCOPED: dict[str, str] = {
 
 PENDING: dict[str, str] = {
     "captive_portal": (
-        "Portal configs are per-location. Needs care: the guest-facing "
-        "resolve path must stay unconfined, since a guest has no grants."
+        "NOT YET ANALYSED. `CaptivePortalConfig` is per-location, but the "
+        "guest-facing resolve path must stay unconfined and the config is "
+        "resolved by org+location rather than by its own id, so the getter "
+        "choice is not obvious."
     ),
     "campaigns": (
-        "Campaigns are per-location. The guest-facing serve/respond routes "
-        "must stay unconfined."
+        "PARTLY ANALYSED. `get_campaign` is the getter the admin routes "
+        "address. Unsettled: the three `/portal/campaigns/*` guest routes "
+        "reach the same service and must stay unconfined, so this needs "
+        "`OptionalCallerLocationScope` plus a decision on serve/respond."
     ),
     "voucher": (
-        "Batches are per-location. The unauthenticated redeem/validate routes "
-        "must stay unconfined."
+        "ANALYSED, NOT CONVERTED -- and the reason this bar exists. A "
+        "mechanical pass matched `get_series` and would have confined voucher "
+        "*series* while leaving *batches* open; `get_batch` is what the routes "
+        "address. Also has unauthenticated redeem/validate. Convert against "
+        "`get_batch`, and decide `get_series`/`get_plan` explicitly."
     ),
-    "guest_access": "Access rules are per-location.",
-    "guest_teams": "Teams are per-location; the guest join route stays open.",
+    "guest_access": (
+        "NOT YET ANALYSED. Two entities -- `GuestAccessRule` and "
+        "`DeviceAccessRule` -- so which getters the routes address needs "
+        "checking before conversion, per the voucher lesson."
+    ),
+    "guest_teams": (
+        "NOT YET ANALYSED. `GuestTeam` is per-location, and the guest "
+        "`/guest-teams/join` route must stay unconfined."
+    ),
     "guest": (
-        "Guest, GuestSession and login history are per-location, and the admin "
-        "reads over them are the PII surface. Larger than the others and worth "
-        "doing deliberately rather than in a sweep."
+        "DELIBERATELY LAST, not unanalysed. `Guest`, `GuestSession` and "
+        "`GuestLoginHistory` are all per-location and the admin reads over "
+        "them are the PII surface. Some methods must stay unconfined even for "
+        "an authenticated caller, so this is the one domain that should not "
+        "be batched with anything."
     ),
-    "otp": "OtpRequest carries a location; the admin read is `GET /otp/requests`.",
-    "support_tickets": "Tickets carry a location.",
+    "otp": (
+        "NOT YET ANALYSED, and the domain where the suite carries the least "
+        "information: production runs `LoggingSmsProvider`, so an SMS OTP "
+        "request already produces a row and no message. A confinement mistake "
+        "here would not fail, it would join an existing silence. Read the "
+        "routes rather than trusting the tests."
+    ),
+    "support_tickets": (
+        "NOT YET ANALYSED. `SupportTicket` carries a location; the WebSocket "
+        "authorises in-handler rather than by dependency, so it needs "
+        "checking separately."
+    ),
     "monitoring": (
-        "Alert and PlatformEvent carry a location. Alert reads already scope by "
-        "organization; the location half is missing."
+        "NOT YET ANALYSED. `Alert` and `PlatformEvent` both carry a location "
+        "and two WebSockets reach the service unauthenticated by dependency."
     ),
 }
 
