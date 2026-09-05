@@ -249,3 +249,52 @@ def test_a_converted_domain_resolves_the_confinement_on_every_route(
         f"service cannot confine them and they fail open:\n"
         + "\n".join(f"  {m}" for m in missing)
     )
+
+
+@pytest.mark.parametrize("domain", sorted(LOCATION_SCOPED))
+def test_a_converted_domain_is_signature_consistent(domain: str) -> None:
+    """Every service method the router hands ``caller_location_scope`` must
+    actually accept it.
+
+    This is not hypothetical. The first attempt at replicating the firewall
+    shape added the dependency to the routes and the enforcement to the getter,
+    but not the parameter to `create`/`update`/`delete`/`list` -- so those five
+    endpoints would have raised ``TypeError`` on every call. The domain's own
+    unit tests passed throughout, because they exercise the service directly
+    and never go through the router. Nothing else in the suite looks at the
+    seam between the two.
+    """
+    import importlib
+    import inspect
+    import re
+
+    router_module = importlib.import_module(f"app.domains.{domain}.router")
+    service_module = importlib.import_module(f"app.domains.{domain}.service")
+
+    source = inspect.getsource(router_module)
+    called = set(re.findall(r"await (?:service|\w+_service)\.(\w+)\(", source))
+    assert called, f"no service calls found in {domain}'s router -- pattern is wrong"
+
+    service_classes = [
+        obj
+        for _name, obj in vars(service_module).items()
+        if inspect.isclass(obj) and obj.__module__ == service_module.__name__
+    ]
+
+    missing = []
+    for method_name in sorted(called):
+        for cls in service_classes:
+            fn = getattr(cls, method_name, None)
+            if fn is None or not inspect.isfunction(fn):
+                continue
+            params = inspect.signature(fn).parameters
+            if "caller_location_scope" not in params and not any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            ):
+                missing.append(f"{cls.__name__}.{method_name}")
+
+    assert not missing, (
+        f"{domain}: the router passes `caller_location_scope` to these, but they "
+        f"do not accept it -- every call raises TypeError:\n"
+        + "\n".join(f"  {m}" for m in missing)
+    )
