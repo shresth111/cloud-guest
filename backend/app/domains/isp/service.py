@@ -59,6 +59,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router.models import Router
 
@@ -98,6 +102,7 @@ from .events import (
     IspLinkUpdated,
 )
 from .exceptions import (
+    CrossLocationIspLinkAccessError,
     CrossOrganizationIspLinkAccessError,
     IspAmbiguousDefaultRouteError,
     IspDeviceConnectionError,
@@ -297,11 +302,21 @@ class IspService:
         audit_writer: AuditLogWriter | None = None,
         device_adapter_resolver=get_isp_health_adapter,
         redis: _RedisProtocol | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
         self._get_device_adapter = device_adapter_resolver
+        # Constructor-injected while `requesting_organization_id` stays
+        # per-method: an organization id is an *argument* (which tenant
+        # this call is about, and a Celery task legitimately varies it
+        # per call), whereas a location confinement is a *property of
+        # the caller*, fixed for the request, and a security control.
+        # Threading a security control through every method means every
+        # method can forget it, silently. See
+        # `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
         # Optional: backs run_speed_test's real per-link cooldown/in-flight
         # marker (see that method's own docstring) and
         # record_health_check_result's self-congestion suppression. `None`
@@ -539,6 +554,14 @@ class IspService:
             and link.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationIspLinkAccessError()
+        # Not enough on its own: this row is reached by its own id, so the
+        # permission check had nothing to pin to and a LOCATION grant on
+        # the caller's own site satisfied it.
+        enforce_entity_location(
+            entity_location_id=getattr(link, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationIspLinkAccessError(),
+        )
         return link
 
     async def list_links(

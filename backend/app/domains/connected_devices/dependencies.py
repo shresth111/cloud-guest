@@ -22,6 +22,10 @@ from app.domains.guest.repository import GuestRepositoryProtocol
 from app.domains.guest_access.dependencies import get_guest_access_service
 from app.domains.guest_access.service import GuestAccessService
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    CallerLocationScope,
+    LocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
@@ -44,6 +48,7 @@ def get_connected_device_service(
     guest_access_service: GuestAccessService = Depends(get_guest_access_service),
     guest_repository: GuestRepositoryProtocol = Depends(get_guest_repository),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
 ) -> ConnectedDeviceService:
     return ConnectedDeviceService(
         repository,
@@ -51,6 +56,7 @@ def get_connected_device_service(
         guest_access_service,
         guest_repository,
         audit_writer=audit_repository,
+        caller_location_scope=caller_location_scope,
     )
 
 

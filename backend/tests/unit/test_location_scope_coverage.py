@@ -47,6 +47,39 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "connected_devices": (
+        "Connected-device rows are the live view of who is on another site's network."
+    ),
+    "device_sync": (
+        "Sync runs read another site's router."
+    ),
+    "dhcp": (
+        "DHCP pools are per-router and per-site; a confined account could repoint another site's address range."
+    ),
+    "dns": (
+        "DNS records are per-router; a confined account could redirect another site's name resolution."
+    ),
+    "hotspot": (
+        "Hotspot profiles carry the walled garden a guest sees before login."
+    ),
+    "isp": (
+        "ISP links carry failover configuration for a site's uplinks."
+    ),
+    "isp_routing": (
+        "Routing rules decide which uplink a site's traffic takes."
+    ),
+    "mac_authorization": (
+        "Whitelisted MACs skip the portal entirely at whichever site they name."
+    ),
+    "network_device": (
+        "The device inventory for a site."
+    ),
+    "port_forwarding": (
+        "Port-forward rules expose internal hosts; a confined account could open a port at another site."
+    ),
+    "qos": (
+        "QoS rules shape another site's traffic, including voice priority."
+    ),
     "content_filtering": (
         "Same getter shape as firewall. A site-A account could block or "
         "unblock domains for every other site in the organization."
@@ -59,19 +92,8 @@ LOCATION_SCOPED: dict[str, str] = {
 }
 
 PENDING: dict[str, str] = {
-    "dhcp": "Same shape as firewall.",
-    "dns": "Same shape as firewall.",
-    "port_forwarding": "Same shape as firewall.",
-    "qos": "Same shape as firewall.",
     "vlan": "Same shape as firewall.",
-    "hotspot": "Same shape as firewall.",
-    "isp": "Same shape as firewall.",
-    "isp_routing": "Same shape as firewall.",
-    "mac_authorization": "Same shape as firewall.",
-    "connected_devices": "Same shape as firewall.",
-    "device_sync": "Same shape as firewall.",
     "monitored_hardware": "Same shape as firewall.",
-    "network_device": "Same shape as firewall.",
     "queue_management": "Same shape as firewall.",
     "captive_portal": (
         "Portal configs are per-location. Needs care: the guest-facing "

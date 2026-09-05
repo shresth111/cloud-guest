@@ -21,6 +21,10 @@ from app.domains.provisioning_engine.service import ProvisioningEngineService
 from app.domains.queue_management.dependencies import get_queue_management_service
 from app.domains.queue_management.service import QueueManagementService
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    CallerLocationScope,
+    LocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
@@ -48,6 +52,7 @@ def get_device_sync_service(
         get_provisioning_engine_service
     ),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
 ) -> DeviceSyncService:
     return DeviceSyncService(
         repository,
@@ -56,6 +61,7 @@ def get_device_sync_service(
         queue_management_service,
         provisioning_engine_service,
         audit_writer=audit_repository,
+        caller_location_scope=caller_location_scope,
     )
 
 

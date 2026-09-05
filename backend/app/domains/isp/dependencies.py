@@ -21,6 +21,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    CallerLocationScope,
+    LocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
@@ -47,12 +51,14 @@ def get_isp_service(
     # Redis-backed rate limiter in this codebase (OtpRateLimiter, this
     # app's own RateLimitMiddleware) already reuses, not a new client.
     redis: Redis = Depends(get_redis_client),
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
 ) -> IspService:
     return IspService(
         repository,
         router_service,
         audit_writer=audit_repository,
         redis=redis,
+        caller_location_scope=caller_location_scope,
     )
 
 
