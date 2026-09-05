@@ -80,6 +80,19 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "guest": (
+        "The PII surface, done last and alone. THREE getters across TWO "
+        "service classes: `_require_guest` (the chokepoint all nine "
+        "guest-by-id operations funnel through -- block, unblock, reconnect, "
+        "read), `get_session` (six `{session_id}` routes including terminate "
+        "and disconnect), both on `GuestService`; and `get_nas_client` on "
+        "`RadiusService`, a separate class with its own provider, which would "
+        "have been a partial conversion if left out since `RadiusNasClient` "
+        "carries a location too. Login is untouched: it goes through "
+        "`get_or_create_guest`, never `_require_guest`. Anonymous-tolerant, "
+        "necessarily -- this service backs every guest login route and is "
+        "composed into eleven other domains."
+    ),
     "monitoring": (
         "Seven service classes; only one owns a location-bearing row reached "
         "by id. `Alert` via `AlertService.get_alert` -- whose docstring "
@@ -209,13 +222,6 @@ LOCATION_SCOPED: dict[str, str] = {
 }
 
 PENDING: dict[str, str] = {
-    "guest": (
-        "DELIBERATELY LAST, not unanalysed. `Guest`, `GuestSession` and "
-        "`GuestLoginHistory` are all per-location and the admin reads over "
-        "them are the PII surface. Some methods must stay unconfined even for "
-        "an authenticated caller, so this is the one domain that should not "
-        "be batched with anything."
-    ),
 }
 
 EXEMPT: dict[str, str] = {
