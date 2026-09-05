@@ -17,6 +17,10 @@ from app.database.session import get_db_session
 from app.domains.location.dependencies import get_location_service
 from app.domains.location.service import LocationService
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    CallerLocationScope,
+    LocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .repository import TicketRepository, TicketRepositoryProtocol
@@ -34,12 +38,14 @@ def get_ticket_service(
     location_service: LocationService = Depends(get_location_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     redis_client: Redis = Depends(get_redis_client),
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
 ) -> TicketService:
     return TicketService(
         repository,
         location_lookup=location_service,
         audit_writer=audit_repository,
         redis_client=redis_client,
+        caller_location_scope=caller_location_scope,
     )
 
 

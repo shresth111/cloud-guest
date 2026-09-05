@@ -28,6 +28,10 @@ from redis.asyncio import Redis
 from app.database.utils.pagination import PaginationMeta
 from app.domains.location.exceptions import LocationNotFoundError
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 
 from .constants import (
     RESOLVED_STATUSES,
@@ -35,6 +39,7 @@ from .constants import (
     TicketRealtimeMessageType,
 )
 from .exceptions import (
+    CrossLocationTicketAccessError,
     CrossOrganizationTicketAccessError,
     InvalidTicketLocationError,
     OrganizationContextRequiredError,
@@ -160,10 +165,13 @@ class TicketService:
         location_lookup: LocationLookupProtocol,
         audit_writer: AuditLogWriter | None = None,
         redis_client: Redis | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.location_lookup = location_lookup
         self.audit_writer = audit_writer
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
         # None is the default (not a required constructor arg) so every
         # existing unit test that builds a TicketService directly keeps
         # working unchanged -- mirrors
@@ -244,6 +252,14 @@ class TicketService:
             raise TicketNotFoundError(ticket_id)
         self._enforce_tenant_scope(
             record.ticket.organization_id, requesting_organization_id
+        )
+        # A ticket is reached by its own id, so the permission check had
+        # nothing to pin to and a LOCATION grant on the caller's own site
+        # satisfied it. The location lives on the ticket, not the wrapper.
+        enforce_entity_location(
+            entity_location_id=getattr(record.ticket, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationTicketAccessError(),
         )
         return record
 

@@ -60,6 +60,14 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "support_tickets": (
+        "One entity, `SupportTicket`, addressed by `{ticket_id}` on the four "
+        "detail/reply routes; `get_ticket` is the only entity getter "
+        "(`get_location` is the location lookup protocol). The location lives "
+        "on `record.ticket`, not on the `TicketRecord` wrapper. Strict "
+        "`CallerLocationScope` is safe here: the `/ws` route authorises "
+        "in-handler and never resolves the ticket service."
+    ),
     "monitored_hardware": (
         "The hardware inventory and up/down view for a site. Raises its own"
         "NotFound rather than a 403, preserving this domain's existing choice"
@@ -162,11 +170,6 @@ PENDING: dict[str, str] = {
         "request already produces a row and no message. A confinement mistake "
         "here would not fail, it would join an existing silence. Read the "
         "routes rather than trusting the tests."
-    ),
-    "support_tickets": (
-        "NOT YET ANALYSED. `SupportTicket` carries a location; the WebSocket "
-        "authorises in-handler rather than by dependency, so it needs "
-        "checking separately."
     ),
     "monitoring": (
         "NOT YET ANALYSED. `Alert` and `PlatformEvent` both carry a location "

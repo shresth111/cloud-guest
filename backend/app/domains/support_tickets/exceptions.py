@@ -55,6 +55,24 @@ class InvalidTicketLocationError(SupportTicketError):
         )
 
 
+class CrossLocationTicketAccessError(SupportTicketError):
+    """A caller confined to particular sites reached a ticket raised at
+    another site.
+
+    Distinct from ``CrossOrganizationTicketAccessError``: both sites belong
+    to the *same* organization, so the organization comparison sees nothing
+    wrong. A ticket is reached by its own id, so ``RequirePermission`` had
+    nothing to pin the check to -- see ``app.domains.rbac.location_scope``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a support ticket raised at a location outside "
+            "your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class CrossOrganizationTicketAccessError(SupportTicketError):
     """A caller acting within organization A attempted to read/mutate a
     ticket belonging to organization B -- mirrors
