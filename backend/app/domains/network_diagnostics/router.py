@@ -12,6 +12,16 @@ through to ``NetworkDiagnosticsService`` as
 ``requesting_organization_id`` -- the same tenant-scoping posture every
 other domain's router already enforces.
 
+**Every route also resolves ``CurrentLocation``**, passed through as
+``scope_location_id``. It is not decorative: an organization-level guard
+structurally cannot see a caller scoped to site A acting on site B's
+router, and until this was added nothing else could either -- see
+``service.py``'s own "the organization guard was never enough" section.
+``scope_location_id`` is the location the permission check actually ran
+against, which is exactly what ``app.domains.location.scoping
+.enforce_target_location`` needs, and the same wiring the guest and
+live-session handlers already carry.
+
 **Route ordering matters.** ``GET /network-diagnostics/runs`` (list) is
 registered before ``GET /network-diagnostics/runs/{run_id}`` so
 Starlette's first-match-wins routing resolves the literal path first,
@@ -29,6 +39,7 @@ from app.common.responses import ApiResponse, build_response
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import AuthUser
 from app.domains.rbac.dependencies import (
+    CurrentLocation,
     CurrentOrganization,
     CurrentUser,
     RequirePermission,
@@ -92,6 +103,7 @@ async def ping_router(
     payload: PingRequest,
     actor: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: NetworkDiagnosticsService = Depends(get_network_diagnostics_service),
 ):
     run = await service.run_ping(
@@ -101,6 +113,7 @@ async def ping_router(
         timeout_seconds=payload.timeout_seconds,
         actor_user_id=uuid.UUID(actor.id),
         requesting_organization_id=requesting_organization_id,
+        scope_location_id=scope_location_id,
     )
     return build_response(
         success=True,
@@ -122,6 +135,7 @@ async def traceroute_router(
     payload: TracerouteRequest,
     actor: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: NetworkDiagnosticsService = Depends(get_network_diagnostics_service),
 ):
     run = await service.run_traceroute(
@@ -131,6 +145,7 @@ async def traceroute_router(
         timeout_seconds=payload.timeout_seconds,
         actor_user_id=uuid.UUID(actor.id),
         requesting_organization_id=requesting_organization_id,
+        scope_location_id=scope_location_id,
     )
     return build_response(
         success=True,
@@ -152,6 +167,7 @@ async def list_diagnostic_runs(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: NetworkDiagnosticsService = Depends(get_network_diagnostics_service),
 ):
     runs, meta = await service.list_runs(
@@ -159,6 +175,7 @@ async def list_diagnostic_runs(
         router_id=router_id,
         page=page,
         page_size=page_size,
+        scope_location_id=scope_location_id,
     )
     payload = DiagnosticRunListResponse(
         items=[_run_response(run) for run in runs], **_pagination_fields(meta)
@@ -181,10 +198,13 @@ async def get_diagnostic_run(
     request: Request,
     run_id: uuid.UUID,
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: NetworkDiagnosticsService = Depends(get_network_diagnostics_service),
 ):
     run = await service.get_run(
-        run_id, requesting_organization_id=requesting_organization_id
+        run_id,
+        requesting_organization_id=requesting_organization_id,
+        scope_location_id=scope_location_id,
     )
     return build_response(
         success=True,

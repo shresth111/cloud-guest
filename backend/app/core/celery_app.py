@@ -151,6 +151,10 @@ from app.domains.monitoring.constants import (
     TASK_RUN_ALERT_RULE_EVALUATION_SWEEP,
     TASK_RUN_HEALTH_CHECK_SWEEP,
 )
+from app.domains.network_diagnostics.constants import (
+    DIAGNOSTIC_RUN_RETENTION_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
+)
 from app.domains.notification.constants import TASK_RUN_NOTIFICATION_DISPATCH_SWEEP
 from app.domains.provisioning_engine.constants import (
     PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
@@ -218,6 +222,7 @@ celery_app = Celery(
         "app.domains.hub_reconciliation.tasks",
         "app.domains.isp.tasks",
         "app.domains.monitoring.tasks",
+        "app.domains.network_diagnostics.tasks",
         "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
@@ -623,6 +628,22 @@ celery_app.conf.update(
         "monitoring-alert-rule-evaluation-sweep": {
             "task": TASK_RUN_ALERT_RULE_EVALUATION_SWEEP,
             "schedule": ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS,
+        },
+        # Network Diagnostics: the diagnostic_runs retention sweep. That
+        # table is append-only and, until this entry, had no TTL and no
+        # purge job of any kind -- an authenticated customer could grow it
+        # without bound, one JSONB blob per row, and nothing on the
+        # platform would ever remove any of it.
+        #
+        # Daily, and deliberately NOT on DEVICE_IO_QUEUE_NAME: this sweep
+        # touches only this platform's own database and never opens a
+        # RouterOS connection, so it belongs with the pure-DB sweeps. See
+        # app.domains.network_diagnostics.constants
+        # .DIAGNOSTIC_RUN_RETENTION_DAYS for why ninety days, and that
+        # module's own tasks.py for why the deletion is batched.
+        "network-diagnostics-run-retention-sweep": {
+            "task": TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
+            "schedule": DIAGNOSTIC_RUN_RETENTION_SWEEP_INTERVAL_SECONDS,
         },
     },
 )
