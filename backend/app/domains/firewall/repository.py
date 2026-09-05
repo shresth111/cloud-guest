@@ -37,6 +37,7 @@ class FirewallRepositoryProtocol(Protocol):
         self,
         *,
         requesting_organization_id: uuid.UUID | None,
+        location_ids: frozenset[uuid.UUID] | None = None,
         router_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
@@ -75,6 +76,7 @@ class FirewallRepository:
         self,
         *,
         requesting_organization_id: uuid.UUID | None,
+        location_ids: frozenset[uuid.UUID] | None = None,
         router_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
@@ -84,6 +86,12 @@ class FirewallRepository:
             filters["organization_id"] = requesting_organization_id
         if router_id is not None:
             filters["router_id"] = router_id
+        # `None` means unconstrained; a set becomes an IN clause
+        # (`app.database.utils.filters.apply_filters`). An *empty* set is
+        # meaningful and must not be dropped -- it means "confined to no
+        # locations", which matches nothing.
+        if location_ids is not None:
+            filters["location_id"] = set(location_ids) or {None}
         return await self.rules.paginate(
             page=page,
             page_size=page_size,

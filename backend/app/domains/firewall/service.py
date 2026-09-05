@@ -27,11 +27,13 @@ import uuid
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import LocationScope, enforce_entity_location
 from app.domains.router.models import Router
 
 from .constants import DEFAULT_PRIORITY, FirewallAction, FirewallChain, FirewallProtocol
 from .events import FirewallRuleCreated, FirewallRuleDeleted, FirewallRuleUpdated
 from .exceptions import (
+    CrossLocationFirewallRuleAccessError,
     CrossOrganizationFirewallRuleAccessError,
     FirewallRuleNotFoundError,
 )
@@ -84,6 +86,7 @@ class FirewallService:
         *,
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
+        caller_location_scope: LocationScope = None,
         router_id: uuid.UUID,
         name: str,
         chain: FirewallChain = FirewallChain.FORWARD,
@@ -100,6 +103,13 @@ class FirewallService:
     ) -> FirewallRule:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
+        )
+        # Creating a rule on a router at a site the caller has no grant on is
+        # the same defect as editing one there.
+        enforce_entity_location(
+            entity_location_id=router.location_id,
+            caller_location_scope=caller_location_scope,
+            error=CrossLocationFirewallRuleAccessError(),
         )
         validate_address("source_address", source_address)
         validate_address("destination_address", destination_address)
@@ -140,6 +150,7 @@ class FirewallService:
         rule_id: uuid.UUID,
         *,
         requesting_organization_id: uuid.UUID | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> FirewallRule:
         rule = await self.repository.get_rule_by_id(rule_id)
         if rule is None:
@@ -149,18 +160,33 @@ class FirewallService:
             and rule.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationFirewallRuleAccessError()
+        # The organization comparison above is not enough on its own. A rule is
+        # reached by its own id, so `RequirePermission` had nothing to pin the
+        # check to and a LOCATION-scoped grant on the caller's *own* site
+        # satisfied it; without this, that account could read, edit and delete
+        # the firewall rules of every other site in the same organization.
+        enforce_entity_location(
+            entity_location_id=rule.location_id,
+            caller_location_scope=caller_location_scope,
+            error=CrossLocationFirewallRuleAccessError(),
+        )
         return rule
 
     async def list_rules(
         self,
         *,
         requesting_organization_id: uuid.UUID | None,
+        caller_location_scope: LocationScope = None,
         router_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[FirewallRule], object]:
+        # A confined caller sees only their own sites' rules. Filtering rather
+        # than refusing: a list is a legitimate request whose *answer* is
+        # narrower, unlike fetching one specific foreign rule.
         return await self.repository.list_rules(
             requesting_organization_id=requesting_organization_id,
+            location_ids=caller_location_scope,
             router_id=router_id,
             page=page,
             page_size=page_size,
@@ -171,12 +197,18 @@ class FirewallService:
         router_id: uuid.UUID,
         *,
         requesting_organization_id: uuid.UUID | None,
+        caller_location_scope: LocationScope = None,
     ) -> list[FirewallRule]:
         """Every non-deleted rule for this router, in priority order,
         unpaginated -- the real read source ``app.domains.network_config``
         composes to render a router's full firewall config."""
-        await self.router_lookup.get_router(
+        router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
+        )
+        enforce_entity_location(
+            entity_location_id=router.location_id,
+            caller_location_scope=caller_location_scope,
+            error=CrossLocationFirewallRuleAccessError(),
         )
         return await self.repository.list_rules_for_router(router_id)
 
@@ -186,10 +218,13 @@ class FirewallService:
         *,
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
+        caller_location_scope: LocationScope = None,
         **fields: object,
     ) -> FirewallRule:
         rule = await self.get_rule(
-            rule_id, requesting_organization_id=requesting_organization_id
+            rule_id,
+            requesting_organization_id=requesting_organization_id,
+            caller_location_scope=caller_location_scope,
         )
         if "source_address" in fields:
             validate_address("source_address", fields["source_address"])
@@ -227,9 +262,12 @@ class FirewallService:
         *,
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
+        caller_location_scope: LocationScope = None,
     ) -> FirewallRule:
         rule = await self.get_rule(
-            rule_id, requesting_organization_id=requesting_organization_id
+            rule_id,
+            requesting_organization_id=requesting_organization_id,
+            caller_location_scope=caller_location_scope,
         )
         deleted = await self.repository.soft_delete_rule(rule)
         event = FirewallRuleDeleted(id=deleted.id, router_id=deleted.router_id)
