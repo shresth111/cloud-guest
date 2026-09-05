@@ -37,12 +37,32 @@ Three buckets, and a domain must be in exactly one:
     enforced is that a domain cannot leave the list by being forgotten -- only
     by moving to another bucket.
 
-    The bar for leaving is: name the entity the routes actually address by id,
-    and say why that getter and not another. `voucher` is why. A mechanical
-    pass matched its `get_series` and would have confined voucher *series*
-    while leaving *batches* -- the entity every route addresses -- wide open,
-    with the whole suite green and this contract marking the domain done. A
-    hole behind a green tick is worse than an unconverted domain.
+    Two things must be established before a domain leaves this bucket.
+
+    **1. Which entity the routes actually address by id, and why that getter
+    and not another.** `voucher` is why. A mechanical pass matched its
+    `get_series` and would have confined voucher *series* while leaving
+    *batches* -- the entity every route addresses -- wide open, with the whole
+    suite green and this contract marking the domain done. A hole behind a
+    green tick is worse than an unconverted domain. Where a domain has several
+    entities, enforce all of them or say which are deliberately left alone:
+    `guest_access` has two and enforces both.
+
+    **2. What composes this service -- not only what routes it serves.** The
+    hazard travels through composition. `queue_management` and
+    `mac_authorization` have no guest-facing routes of their own; both are
+    reached as hooks from `get_guest_service`. Converting them with the strict
+    `CallerLocationScope` -- which depends on `CurrentUser` -- made FastAPI
+    resolve `CurrentUser` before every route that reaches the guest service,
+    and fifteen routes silently began requiring authentication: every guest
+    login method, both router-agent endpoints, and `POST /radius/authorize`,
+    which authenticates by NAS shared secret and is the path every guest's
+    traffic authorises through. It would have 401'd, at every venue at once.
+    Nothing in a per-domain reading of either service would have shown it.
+
+    So: `grep` for the service class and its `get_*_service` provider across
+    `app/domains/*/dependencies.py` before converting. If anything composes it
+    into a guest-serving domain, it needs `OptionalCallerLocationScope`.
 
 ``EXEMPT``
     Genuinely does not need it, with the argument written down. An exemption
