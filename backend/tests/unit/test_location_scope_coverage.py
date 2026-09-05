@@ -177,9 +177,7 @@ LOCATION_SCOPED: dict[str, str] = {
     "connected_devices": (
         "Connected-device rows are the live view of who is on another site's network."
     ),
-    "device_sync": (
-        "Sync runs read another site's router."
-    ),
+    "device_sync": ("Sync runs read another site's router."),
     "dhcp": (
         "DHCP pools are per-router and per-site; a confined account could"
         "repoint another site's address range."
@@ -188,28 +186,18 @@ LOCATION_SCOPED: dict[str, str] = {
         "DNS records are per-router; a confined account could redirect another"
         "site's name resolution."
     ),
-    "hotspot": (
-        "Hotspot profiles carry the walled garden a guest sees before login."
-    ),
-    "isp": (
-        "ISP links carry failover configuration for a site's uplinks."
-    ),
-    "isp_routing": (
-        "Routing rules decide which uplink a site's traffic takes."
-    ),
+    "hotspot": ("Hotspot profiles carry the walled garden a guest sees before login."),
+    "isp": ("ISP links carry failover configuration for a site's uplinks."),
+    "isp_routing": ("Routing rules decide which uplink a site's traffic takes."),
     "mac_authorization": (
         "Whitelisted MACs skip the portal entirely at whichever site they name."
     ),
-    "network_device": (
-        "The device inventory for a site."
-    ),
+    "network_device": ("The device inventory for a site."),
     "port_forwarding": (
         "Port-forward rules expose internal hosts; a confined account could"
         "open a port at another site."
     ),
-    "qos": (
-        "QoS rules shape another site's traffic, including voice priority."
-    ),
+    "qos": ("QoS rules shape another site's traffic, including voice priority."),
     "content_filtering": (
         "Same getter shape as firewall. A site-A account could block or "
         "unblock domains for every other site in the organization."
@@ -221,8 +209,7 @@ LOCATION_SCOPED: dict[str, str] = {
     ),
 }
 
-PENDING: dict[str, str] = {
-}
+PENDING: dict[str, str] = {}
 
 EXEMPT: dict[str, str] = {
     "otp": (
@@ -351,9 +338,9 @@ def test_every_bucket_entry_names_a_real_domain() -> None:
     domain name to be reused."""
     live = _domains_with_a_location_column()
     stale = (set(LOCATION_SCOPED) | set(PENDING) | set(EXEMPT)) - live
-    assert not stale, (
-        f"classified domains that own no location-bearing model: {sorted(stale)}"
-    )
+    assert (
+        not stale
+    ), f"classified domains that own no location-bearing model: {sorted(stale)}"
 
 
 def test_every_entry_carries_a_reason() -> None:
@@ -363,9 +350,9 @@ def test_every_entry_carries_a_reason() -> None:
         ("EXEMPT", EXEMPT),
     ):
         for domain, reason in bucket.items():
-            assert len(reason.strip()) > 20, (
-                f"{bucket_name}[{domain!r}] needs a real reason, not {reason!r}"
-            )
+            assert (
+                len(reason.strip()) > 20
+            ), f"{bucket_name}[{domain!r}] needs a real reason, not {reason!r}"
 
 
 @pytest.mark.parametrize("domain", sorted(LOCATION_SCOPED))
@@ -434,9 +421,7 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
     supplying = []
     for fn in providers:
         param = inspect.signature(fn).parameters.get("caller_location_scope")
-        if param is not None and getattr(
-            param.default, "dependency", None
-        ) in accepted:
+        if param is not None and getattr(param.default, "dependency", None) in accepted:
             supplying.append(fn.__name__)
 
     assert supplying, (
@@ -466,67 +451,131 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
 # staff member reading a tenant's records.
 _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/captive-portal/resolve"): (
-        "The guest portal render and the RFC 8908 endpoint the device's own OS reads. Both are pre-login by definition; the caller holds no roles, and `resolve_portal_config` resolves by organization+location rather than through the confined `get_config`."
+        "The guest portal render and the RFC 8908 endpoint the device's own OS reads. "
+        "Both are pre-login by definition; the caller holds no roles, and "
+        "`resolve_portal_config` resolves by organization+location rather than through "
+        "the confined `get_config`."
     ),
     ("GET", "/api/v1/captive-portal/rfc8908"): (
-        "The guest portal render and the RFC 8908 endpoint the device's own OS reads. Both are pre-login by definition; the caller holds no roles, and `resolve_portal_config` resolves by organization+location rather than through the confined `get_config`."
+        "The guest portal render and the RFC 8908 endpoint the device's own OS reads. "
+        "Both are pre-login by definition; the caller holds no roles, and "
+        "`resolve_portal_config` resolves by organization+location rather than through "
+        "the confined `get_config`."
     ),
     ("POST", "/api/v1/vouchers/redeem"): (
-        "A guest redeeming or checking a code handed to them at a front desk -- the whole point is that they have no account. They hold no roles, so there is no confinement to derive, and redemption resolves the voucher by its own code rather than through the confined `get_batch`."
+        "A guest redeeming or checking a code handed to them at a front desk -- the "
+        "whole point is that they have no account. They hold no roles, so there is no "
+        "confinement to derive, and redemption resolves the voucher by its own code "
+        "rather than through the confined `get_batch`."
     ),
     ("POST", "/api/v1/vouchers/validate"): (
-        "A guest redeeming or checking a code handed to them at a front desk -- the whole point is that they have no account. They hold no roles, so there is no confinement to derive, and redemption resolves the voucher by its own code rather than through the confined `get_batch`."
+        "A guest redeeming or checking a code handed to them at a front desk -- the "
+        "whole point is that they have no account. They hold no roles, so there is no "
+        "confinement to derive, and redemption resolves the voucher by its own code "
+        "rather than through the confined `get_batch`."
     ),
     ("GET", "/api/v1/portal/campaigns/next"): (
-        "A guest at the portal being shown a campaign, recording that it was shown, or answering its survey. They hold no roles, so there is no confinement to derive. The campaign they are served is already chosen by their own session's location (`get_next_campaign_for_session`), so being unconfined here does not widen what they can see."
+        "A guest at the portal being shown a campaign, recording that it was shown, or "
+        "answering its survey. They hold no roles, so there is no confinement to "
+        "derive. The campaign they are served is already chosen by their own session's "
+        "location (`get_next_campaign_for_session`), so being unconfined here does not "
+        "widen what they can see."
     ),
     ("POST", "/api/v1/portal/campaigns/{campaign_id}/impression"): (
-        "A guest at the portal being shown a campaign, recording that it was shown, or answering its survey. They hold no roles, so there is no confinement to derive. The campaign they are served is already chosen by their own session's location (`get_next_campaign_for_session`), so being unconfined here does not widen what they can see."
+        "A guest at the portal being shown a campaign, recording that it was shown, or "
+        "answering its survey. They hold no roles, so there is no confinement to "
+        "derive. The campaign they are served is already chosen by their own session's "
+        "location (`get_next_campaign_for_session`), so being unconfined here does not "
+        "widen what they can see."
     ),
     ("POST", "/api/v1/portal/campaigns/{campaign_id}/respond"): (
-        "A guest at the portal being shown a campaign, recording that it was shown, or answering its survey. They hold no roles, so there is no confinement to derive. The campaign they are served is already chosen by their own session's location (`get_next_campaign_for_session`), so being unconfined here does not widen what they can see."
+        "A guest at the portal being shown a campaign, recording that it was shown, or "
+        "answering its survey. They hold no roles, so there is no confinement to "
+        "derive. The campaign they are served is already chosen by their own session's "
+        "location (`get_next_campaign_for_session`), so being unconfined here does not "
+        "widen what they can see."
     ),
     ("POST", "/api/v1/guest/login/otp"): (
-        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+        "A guest acting on their own session, before or during login. They hold no "
+        "roles, so there is no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined rather than 401ing them out of the "
+        "portal."
     ),
     ("POST", "/api/v1/guest/login/voucher"): (
-        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+        "A guest acting on their own session, before or during login. They hold no "
+        "roles, so there is no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined rather than 401ing them out of the "
+        "portal."
     ),
     ("POST", "/api/v1/guest/login/password"): (
-        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+        "A guest acting on their own session, before or during login. They hold no "
+        "roles, so there is no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined rather than 401ing them out of the "
+        "portal."
     ),
     ("POST", "/api/v1/guest/login/pin"): (
-        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+        "A guest acting on their own session, before or during login. They hold no "
+        "roles, so there is no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined rather than 401ing them out of the "
+        "portal."
     ),
     ("POST", "/api/v1/guest/consent"): (
-        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+        "A guest acting on their own session, before or during login. They hold no "
+        "roles, so there is no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined rather than 401ing them out of the "
+        "portal."
     ),
     ("POST", "/api/v1/guest/profile"): (
-        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+        "A guest acting on their own session, before or during login. They hold no "
+        "roles, so there is no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined rather than 401ing them out of the "
+        "portal."
     ),
     ("POST", "/api/v1/guest/set-password"): (
-        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+        "A guest acting on their own session, before or during login. They hold no "
+        "roles, so there is no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined rather than 401ing them out of the "
+        "portal."
     ),
     ("POST", "/api/v1/guest/set-pin"): (
-        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+        "A guest acting on their own session, before or during login. They hold no "
+        "roles, so there is no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined rather than 401ing them out of the "
+        "portal."
     ),
     ("GET", "/api/v1/guest/session/active"): (
-        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+        "A guest acting on their own session, before or during login. They hold no "
+        "roles, so there is no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined rather than 401ing them out of the "
+        "portal."
     ),
     ("POST", "/api/v1/guest/session/disconnect"): (
-        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+        "A guest acting on their own session, before or during login. They hold no "
+        "roles, so there is no confinement to derive; the anonymous-tolerant "
+        "dependency resolves them to unconfined rather than 401ing them out of the "
+        "portal."
     ),
     ("POST", "/api/v1/radius/authorize"): (
-        "Authenticated by the NAS shared secret (`CurrentNas`), not by a user session -- the router itself is the caller. It has no RBAC grants and therefore no location confinement, and it must never 401: this is the path every guest's traffic authorises through."
+        "Authenticated by the NAS shared secret (`CurrentNas`), not by a user session "
+        "-- the router itself is the caller. It has no RBAC grants and therefore no "
+        "location confinement, and it must never 401: this is the path every guest's "
+        "traffic authorises through."
     ),
     ("POST", "/api/v1/radius/accounting"): (
-        "Authenticated by the NAS shared secret (`CurrentNas`), not by a user session -- the router itself is the caller. It has no RBAC grants and therefore no location confinement, and it must never 401: this is the path every guest's traffic authorises through."
+        "Authenticated by the NAS shared secret (`CurrentNas`), not by a user session "
+        "-- the router itself is the caller. It has no RBAC grants and therefore no "
+        "location confinement, and it must never 401: this is the path every guest's "
+        "traffic authorises through."
     ),
     ("GET", "/api/v1/agent/authorized-macs"): (
-        "Authenticated by the router agent's own credential (`CurrentAgent`), not by a user session. Same reasoning as the RADIUS routes: a device is the caller, holds no grants, and must not be confined."
+        "Authenticated by the router agent's own credential (`CurrentAgent`), not by a "
+        "user session. Same reasoning as the RADIUS routes: a device is the caller, "
+        "holds no grants, and must not be confined."
     ),
     ("POST", "/api/v1/agent/netwatch-event"): (
-        "Authenticated by the router agent's own credential (`CurrentAgent`), not by a user session. Same reasoning as the RADIUS routes: a device is the caller, holds no grants, and must not be confined."
+        "Authenticated by the router agent's own credential (`CurrentAgent`), not by a "
+        "user session. Same reasoning as the RADIUS routes: a device is the caller, "
+        "holds no grants, and must not be confined."
     ),
     ("POST", "/api/v1/guest-teams/join"): (
         "A guest joining a team with a code they were given. They hold no "
