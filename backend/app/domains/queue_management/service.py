@@ -551,6 +551,13 @@ class QueueManagementService:
         # *organization* that way so as not to confirm the row exists,
         # and a location refusal that 403s would leak exactly what the
         # organization refusal is careful not to.
+        #
+        # DO NOT "harmonise" this to the CrossLocation*AccessError 403 the
+        # other domains raise. "No such row" and "that row is not yours"
+        # are different answers, and this domain has deliberately chosen
+        # the first. No test asserts that a refusal must be uninformative,
+        # so that change would pass CI and quietly turn an
+        # existence-hiding refusal into an existence-confirming one.
         enforce_entity_location(
             entity_location_id=getattr(assignment, "location_id", None),
             caller_location_scope=self.caller_location_scope,

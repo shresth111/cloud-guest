@@ -328,3 +328,68 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
         f"{domain}: no service provider resolves CallerLocationScope, so every "
         f"caller is unconfined: {[f.__name__ for f in providers]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Anonymous-therefore-unconfined must never be the whole of a route's defence
+# ---------------------------------------------------------------------------
+#
+# `OptionalCallerLocationScope` resolves to `None` -- unconfined -- when no
+# credential is presented, because the services it feeds also back guest
+# routes (`/otp/request`, `/vouchers/redeem`, `/captive-portal/resolve`).
+#
+# That is safe only in combination with authentication. On a route carrying
+# `RequirePermission`, omitting the `Authorization` header dead-ends at 401
+# long before any service is consulted. On a route relying on service-level
+# confinement *alone*, an attacker would shed their confinement simply by not
+# authenticating. The safety is a property of the pair, so it is asserted
+# here rather than assumed.
+
+# Guest-facing routes that legitimately reach a confinement-dependent service
+# without authenticating. Each must be a route where being unconfined is
+# correct because the caller is a guest acting on their own session, not a
+# staff member reading a tenant's records.
+_GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {}
+
+
+def test_no_route_relies_on_confinement_without_authentication() -> None:
+    from app.domains.rbac.dependencies import CurrentUser
+    from app.domains.rbac.location_scope import (
+        CallerLocationScope,
+        OptionalCallerLocationScope,
+    )
+    from app.main import create_app
+
+    confinement_deps = {CallerLocationScope, OptionalCallerLocationScope}
+    offenders = []
+    for route in create_app().routes:
+        dependant = getattr(route, "dependant", None)
+        if dependant is None:
+            continue
+        resolved = _dependency_calls(dependant)
+        if not (resolved & confinement_deps):
+            continue
+
+        names = {getattr(f, "__qualname__", "") for f in resolved}
+        authenticated = CurrentUser in resolved or any(
+            n.startswith("RequirePermission") for n in names
+        )
+        if authenticated:
+            continue
+
+        path = getattr(route, "path", "")
+        methods = list(getattr(route, "methods", []) or [])
+        keys = [(m, path) for m in methods] or [("", path)]
+        if any(k in _GUEST_FACING_UNCONFINED for k in keys):
+            continue
+        offenders.append(f"{sorted(methods)} {path}")
+
+    assert not offenders, (
+        "These routes reach a location-confined service without requiring "
+        "authentication, so omitting the Authorization header makes the "
+        "caller unconfined:\n"
+        + "\n".join(f"  {o}" for o in sorted(offenders))
+        + "\n\nEither require authentication, or -- if the caller is genuinely "
+        "a guest acting on their own session -- add it to "
+        "_GUEST_FACING_UNCONFINED with the reason."
+    )

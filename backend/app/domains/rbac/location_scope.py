@@ -57,16 +57,31 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import Depends
+from fastapi import Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials
 
+from app.domains.api_keys.service import ApiKeyService
+from app.domains.auth.dependencies import (
+    _API_KEY_HEADER,
+    bearer_scheme,
+    get_api_key_service,
+    get_auth_repository,
+    get_current_user,
+)
 from app.domains.auth.models import AuthUser
+from app.domains.auth.repository import AuthRepositoryProtocol
 
 from .authorization import RoleResolver
 from .dependencies import CurrentUser, get_rbac_repository
 from .enums import ScopeType
 from .repository import RBACRepositoryProtocol
 
-__all__ = ["CallerLocationScope", "LocationScope", "enforce_entity_location"]
+__all__ = [
+    "CallerLocationScope",
+    "LocationScope",
+    "OptionalCallerLocationScope",
+    "enforce_entity_location",
+]
 
 # ``None`` -- the caller is not confined to particular locations.
 # A frozenset -- the caller may only act on these locations.
@@ -126,3 +141,63 @@ def enforce_entity_location(
     if entity_location_id in caller_location_scope:
         return
     raise error
+
+
+# ---------------------------------------------------------------------------
+# The anonymous-tolerant variant
+# ---------------------------------------------------------------------------
+
+
+async def OptionalCallerLocationScope(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    auth_repository: AuthRepositoryProtocol = Depends(get_auth_repository),
+    api_key_service: ApiKeyService = Depends(get_api_key_service),
+    rbac_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+) -> LocationScope:
+    """``CallerLocationScope`` for services that also serve guests.
+
+    ``CallerLocationScope`` depends on ``CurrentUser``, and FastAPI resolves
+    every declared dependency before the endpoint runs. So wiring it into the
+    provider for a service that *also* backs an unauthenticated route --
+    ``/captive-portal/resolve``, ``/otp/request``, ``/vouchers/redeem``,
+    ``/portal/campaigns/next`` -- would force authentication on the guest
+    portal and break guest login outright. Twelve such routes exist across six
+    domains.
+
+    The line this holds, and it is the whole of the design:
+
+    * **No credential presented at all** -> ``None``, unconfined. That is a
+      guest: they hold no roles, so there is no confinement to derive, and the
+      guest-facing methods are the ones that must never be confined anyway.
+    * **A credential presented but malformed, expired or invalid** -> the
+      failure propagates. Never silently unconfined. Swallowing it would mean
+      a caller could shed their confinement by corrupting their own token,
+      which is the opposite of what this exists for.
+
+    ## Why anonymous-therefore-unconfined is safe, and where it would not be
+
+    "Unconfined" here is only reachable by presenting no credential. On a route
+    that also carries ``RequirePermission`` that path dead-ends at 401 long
+    before any service is consulted. But that safety is a property of the
+    *combination*, not of this dependency: a route relying on service-level
+    confinement **alone** would let an attacker shed confinement simply by
+    omitting the ``Authorization`` header.
+
+    ``test_location_scope_coverage`` enforces the combination rather than
+    trusting it -- every route reaching a confinement-dependent service must
+    require authentication, or be explicitly allowlisted as guest-facing.
+    """
+    anonymous = (
+        request.headers.get(_API_KEY_HEADER) is None and credentials is None
+    )
+    if anonymous:
+        return None
+
+    user = await get_current_user(
+        request,
+        credentials=credentials,
+        repository=auth_repository,
+        api_key_service=api_key_service,
+    )
+    return await CallerLocationScope(user=user, repository=rbac_repository)

@@ -329,3 +329,80 @@ async def test_two_requests_never_share_a_service_instance() -> None:
         "injection would leak one caller's location confinement into another's "
         "request"
     )
+
+
+# ---------------------------------------------------------------------------
+# The anonymous-tolerant primitive
+# ---------------------------------------------------------------------------
+
+
+def _request(*, headers: dict[str, str] | None = None):
+    from starlette.requests import Request
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [
+                (k.lower().encode(), v.encode()) for k, v in (headers or {}).items()
+            ],
+            "query_string": b"",
+        }
+    )
+
+
+class TestOptionalCallerLocationScope:
+    """The line: no credential means unconfined; a *bad* credential never does."""
+
+    async def test_a_request_with_no_credential_is_unconfined(self) -> None:
+        """The guest case. `/vouchers/redeem` and `/otp/request` must keep
+        working for someone who has not logged in and cannot."""
+        from app.domains.rbac.location_scope import OptionalCallerLocationScope
+
+        scope = await OptionalCallerLocationScope(
+            _request(),
+            credentials=None,
+            auth_repository=None,
+            api_key_service=None,
+            rbac_repository=None,
+        )
+
+        assert scope is None
+
+    async def test_a_bad_bearer_token_propagates_rather_than_unconfining(self) -> None:
+        """The whole of the design. If an invalid token quietly resolved to
+        `None`, a confined caller could shed their confinement by corrupting
+        their own token -- the exact inverse of the control."""
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        from app.domains.rbac.location_scope import OptionalCallerLocationScope
+
+        with pytest.raises(Exception) as caught:
+            await OptionalCallerLocationScope(
+                _request(headers={"Authorization": "Bearer nonsense"}),
+                credentials=HTTPAuthorizationCredentials(
+                    scheme="Bearer", credentials="nonsense"
+                ),
+                auth_repository=None,
+                api_key_service=None,
+                rbac_repository=None,
+            )
+
+        assert not isinstance(caught.value, TypeError), (
+            "a malformed token must fail authentication, not crash the resolver"
+        )
+
+    async def test_an_api_key_header_is_not_treated_as_anonymous(self) -> None:
+        """An API-key caller presents a credential, so they must be resolved and
+        confined -- not waved through as a guest."""
+        from app.domains.rbac.location_scope import OptionalCallerLocationScope
+
+        with pytest.raises(Exception):
+            await OptionalCallerLocationScope(
+                _request(headers={"X-API-Key": "some-key"}),
+                credentials=None,
+                auth_repository=None,
+                api_key_service=None,
+                rbac_repository=None,
+            )
