@@ -80,6 +80,16 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "captive_portal": (
+        "`CaptivePortalConfig` via `get_config`, the chokepoint every "
+        "`{config_id}` route funnels through (`_enforce_tenant_scope` is the "
+        "organization half of the same check). The guest-facing "
+        "`resolve_portal_config` deliberately does NOT come through here -- "
+        "it resolves by organization+location, so the portal render a guest "
+        "sees is untouched. Anonymous-tolerant anyway: `/captive-portal/"
+        "resolve` and `/rfc8908` are unauthenticated and the service is "
+        "composed into `get_guest_service`."
+    ),
     "voucher": (
         "THREE entities addressed by id, and the answer the mechanical pass "
         "got wrong. `VoucherBatch` via `get_batch` (nine routes -- approve, "
@@ -189,12 +199,6 @@ LOCATION_SCOPED: dict[str, str] = {
 }
 
 PENDING: dict[str, str] = {
-    "captive_portal": (
-        "NOT YET ANALYSED. `CaptivePortalConfig` is per-location, but the "
-        "guest-facing resolve path must stay unconfined and the config is "
-        "resolved by org+location rather than by its own id, so the getter "
-        "choice is not obvious."
-    ),
     "guest": (
         "DELIBERATELY LAST, not unanalysed. `Guest`, `GuestSession` and "
         "`GuestLoginHistory` are all per-location and the admin reads over "
@@ -440,6 +444,12 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
 # correct because the caller is a guest acting on their own session, not a
 # staff member reading a tenant's records.
 _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
+    ("GET", "/api/v1/captive-portal/resolve"): (
+        "The guest portal render and the RFC 8908 endpoint the device's own OS reads. Both are pre-login by definition; the caller holds no roles, and `resolve_portal_config` resolves by organization+location rather than through the confined `get_config`."
+    ),
+    ("GET", "/api/v1/captive-portal/rfc8908"): (
+        "The guest portal render and the RFC 8908 endpoint the device's own OS reads. Both are pre-login by definition; the caller holds no roles, and `resolve_portal_config` resolves by organization+location rather than through the confined `get_config`."
+    ),
     ("POST", "/api/v1/vouchers/redeem"): (
         "A guest redeeming or checking a code handed to them at a front desk -- the whole point is that they have no account. They hold no roles, so there is no confinement to derive, and redemption resolves the voucher by its own code rather than through the confined `get_batch`."
     ),

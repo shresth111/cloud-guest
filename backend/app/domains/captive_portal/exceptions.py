@@ -61,6 +61,23 @@ class CaptivePortalConfigNotFoundError(CaptivePortalError):
         )
 
 
+class CrossLocationCaptivePortalConfigAccessError(CaptivePortalError):
+    """A caller confined to particular sites reached a portal config for
+    another site.
+
+    Distinct from ``CrossOrganizationCaptivePortalConfigAccessError``:
+    both sites belong to the *same* organization. A config is reached by its
+    own id -- see ``app.domains.rbac.location_scope``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a captive portal config for a location outside "
+            "your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class CrossOrganizationCaptivePortalConfigAccessError(CaptivePortalError):
     """A caller acting within organization A attempted to read/mutate a
     captive portal config belonging to organization B -- mirrors

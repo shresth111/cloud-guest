@@ -24,6 +24,10 @@ from app.domains.location.service import LocationService
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    OptionalCallerLocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .cache import CaptivePortalResolveCache
@@ -54,6 +58,7 @@ def get_captive_portal_service(
         get_captive_portal_resolve_cache
     ),
     branding_repository: BrandingRepositoryProtocol = Depends(get_branding_repository),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> CaptivePortalService:
     return CaptivePortalService(
         repository,
@@ -67,6 +72,7 @@ def get_captive_portal_service(
         # already-wired dependency function, never a second construction
         # path.
         branding_lookup=branding_repository,
+        caller_location_scope=caller_location_scope,
     )
 
 

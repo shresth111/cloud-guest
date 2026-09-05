@@ -73,6 +73,10 @@ from app.domains.billing.constants import PlanFeatureKey
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 
 from .constants import (
     DEFAULT_PORTAL_CONTENT_MODE,
@@ -90,6 +94,7 @@ from .events import (
 from .exceptions import (
     CaptivePortalConfigNotConfiguredError,
     CaptivePortalConfigNotFoundError,
+    CrossLocationCaptivePortalConfigAccessError,
     CrossOrganizationCaptivePortalConfigAccessError,
     MissingPortalResolutionParamsError,
     PoweredByAttributionNotEntitledError,
@@ -621,6 +626,7 @@ class CaptivePortalService:
         resolve_cache: CaptivePortalResolveCacheProtocol | None = None,
         entitlement_checker: EntitlementCheckerProtocol | None = None,
         branding_lookup: BrandingLookupProtocol | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.organization_lookup = organization_lookup
@@ -629,6 +635,8 @@ class CaptivePortalService:
         self.resolve_cache = resolve_cache
         self.entitlement_checker = entitlement_checker
         self.branding_lookup = branding_lookup
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     # ========================================================================
     # Create / read / update / delete
@@ -814,6 +822,14 @@ class CaptivePortalService:
         if config is None:
             raise CaptivePortalConfigNotFoundError(config_id)
         self._enforce_tenant_scope(config, requesting_organization_id)
+        # A config is reached by its own id. `resolve_portal_config` -- the
+        # guest-facing path -- resolves by organization+location instead and
+        # never comes through here, so the portal render is untouched.
+        enforce_entity_location(
+            entity_location_id=getattr(config, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationCaptivePortalConfigAccessError(),
+        )
         return config
 
     async def list_configs(
