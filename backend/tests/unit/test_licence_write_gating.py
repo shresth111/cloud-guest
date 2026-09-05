@@ -67,7 +67,9 @@ class TestMissingLicenceIsCleanlyRefused:
         org = uuid.uuid4()
 
         with pytest.raises(LicenseNotActiveError) as caught:
-            await _require_active_license(org, _Checker(raises=LicenseNotFoundError(org)))
+            await _require_active_license(
+                org, _Checker(raises=LicenseNotFoundError(org))
+            )
 
         assert "no license has been assigned" in str(caught.value)
 

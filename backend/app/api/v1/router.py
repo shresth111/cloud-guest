@@ -1,7 +1,5 @@
 from fastapi import APIRouter, Depends
 
-from app.domains.billing.dependencies import RequireActiveLicenseForWrites
-
 from app.api.v1.health.routes import router as health_router
 from app.domains.admin_logs.router import router as admin_logs_router
 from app.domains.agent_permissions.router import router as agent_permissions_router
@@ -10,6 +8,7 @@ from app.domains.api_keys.router import router as api_keys_router
 from app.domains.assistant.router import router as assistant_router
 from app.domains.audit.router import router as audit_router
 from app.domains.auth.router import router as auth_router
+from app.domains.billing.dependencies import RequireActiveLicenseForWrites
 from app.domains.billing.router import router as billing_router
 from app.domains.branding.router import router as branding_router
 from app.domains.campaigns.router import guest_router as campaigns_guest_router
@@ -75,7 +74,6 @@ from app.domains.voucher.router import router as voucher_router
 from app.domains.wireguard.router import router as wireguard_router
 from app.domains.workspace.router import router as workspace_router
 
-
 # ---------------------------------------------------------------------------
 # Licence gating
 # ---------------------------------------------------------------------------
@@ -119,7 +117,7 @@ from app.domains.workspace.router import router as workspace_router
 #   `device_sync`, `monitoring`, `readiness`, `system*`, `admin_logs`,
 #   `controller_logs`, `audit` -- platform-operator and device-fleet surfaces,
 #   several of which run as the platform with no organization context at all.
-_LICENCE_GATED_WRITES = [Depends(RequireActiveLicenseForWrites())]
+_PAID_WRITES = [Depends(RequireActiveLicenseForWrites())]
 
 api_v1_router = APIRouter()
 api_v1_router.include_router(health_router, prefix="/health", tags=["Health"])
@@ -135,7 +133,7 @@ api_v1_router.include_router(wireguard_router)
 api_v1_router.include_router(hub_reconciliation_router)
 api_v1_router.include_router(otp_router)
 api_v1_router.include_router(voucher_router)
-api_v1_router.include_router(captive_portal_router, dependencies=_LICENCE_GATED_WRITES)
+api_v1_router.include_router(captive_portal_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(guest_router)
 api_v1_router.include_router(guest_admin_router)
 api_v1_router.include_router(guest_radius_router)
@@ -143,38 +141,38 @@ api_v1_router.include_router(guest_nas_router)
 api_v1_router.include_router(guest_nas_xref_router)
 api_v1_router.include_router(guest_nas_platform_router)
 api_v1_router.include_router(guest_analytics_router)
-api_v1_router.include_router(guest_access_router, dependencies=_LICENCE_GATED_WRITES)
+api_v1_router.include_router(guest_access_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(guest_teams_guest_router)
-api_v1_router.include_router(guest_teams_admin_router, dependencies=_LICENCE_GATED_WRITES)
+api_v1_router.include_router(guest_teams_admin_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(monitoring_router)
 api_v1_router.include_router(analytics_router)
 api_v1_router.include_router(billing_router)
-api_v1_router.include_router(policy_router, dependencies=_LICENCE_GATED_WRITES)
+api_v1_router.include_router(policy_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(provisioning_engine_router)
-api_v1_router.include_router(queue_management_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(isp_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(isp_routing_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(vlan_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(dhcp_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(dns_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(firewall_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(port_forwarding_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(mac_authorization_router, dependencies=_LICENCE_GATED_WRITES)
+api_v1_router.include_router(queue_management_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(isp_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(isp_routing_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(vlan_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(dhcp_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(dns_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(firewall_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(port_forwarding_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(mac_authorization_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(connected_devices_router)
 api_v1_router.include_router(device_sync_router)
 api_v1_router.include_router(controller_logs_router)
 api_v1_router.include_router(admin_logs_router)
-api_v1_router.include_router(network_config_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(hotspot_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(qos_router, dependencies=_LICENCE_GATED_WRITES)
+api_v1_router.include_router(network_config_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(hotspot_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(qos_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(network_diagnostics_router)
-api_v1_router.include_router(network_device_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(monitored_hardware_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(content_filtering_router, dependencies=_LICENCE_GATED_WRITES)
+api_v1_router.include_router(network_device_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(campaigns_guest_router)
-api_v1_router.include_router(campaigns_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(notification_router, dependencies=_LICENCE_GATED_WRITES)
-api_v1_router.include_router(api_keys_router, dependencies=_LICENCE_GATED_WRITES)
+api_v1_router.include_router(campaigns_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(notification_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(api_keys_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(audit_router)
 api_v1_router.include_router(dashboard_router)
 api_v1_router.include_router(workspace_router)
@@ -184,7 +182,7 @@ api_v1_router.include_router(live_sessions_router)
 api_v1_router.include_router(customer_provisioning_router)
 api_v1_router.include_router(system_router)
 api_v1_router.include_router(system_settings_router)
-api_v1_router.include_router(branding_router, dependencies=_LICENCE_GATED_WRITES)
+api_v1_router.include_router(branding_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(support_tickets_router)
 api_v1_router.include_router(demo_request_router)
 api_v1_router.include_router(demo_booking_router)

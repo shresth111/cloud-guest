@@ -341,6 +341,7 @@ from .exceptions import (
     GuestProfileUpdateNotAuthorizedError,
     GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
+    GuestTeamSharedQuotaExceededError,
     InvalidSessionStatusTransitionError,
     MacAddressNotAuthorizedError,
     NoReconnectableSessionError,
@@ -352,7 +353,6 @@ from .exceptions import (
     RadiusNasNotSyncedError,
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
-    GuestTeamSharedQuotaExceededError,
     TooManyDeviceIdsError,
     VenueClosedError,
 )

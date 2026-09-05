@@ -28,6 +28,8 @@ from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.guest_access.dependencies import get_guest_access_service
 from app.domains.guest_access.service import GuestAccessService
+from app.domains.guest_teams.quota import SharedQuotaResolver
+from app.domains.guest_teams.repository import GuestTeamRepository
 from app.domains.location.dependencies import get_location_service
 from app.domains.location.service import LocationService
 from app.domains.mac_authorization.dependencies import get_mac_authorization_service
@@ -40,8 +42,6 @@ from app.domains.policy.dependencies import get_policy_service
 from app.domains.policy.service import PolicyService
 from app.domains.queue_management.dependencies import get_queue_management_service
 from app.domains.queue_management.service import QueueManagementService
-from app.domains.guest_teams.quota import SharedQuotaResolver
-from app.domains.guest_teams.repository import GuestTeamRepository
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
