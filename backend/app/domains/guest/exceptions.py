@@ -30,6 +30,8 @@ __all__ = [
     "GuestBlockedError",
     "GuestSessionNotFoundError",
     "GuestAuthMethodNotEnabledError",
+    "VenueClosedError",
+    "GuestTeamSharedQuotaExceededError",
     "RouterNotEligibleForGuestSessionError",
     "InvalidSessionStatusTransitionError",
     "SessionTerminationCooldownError",
@@ -118,6 +120,51 @@ class GuestAuthMethodNotEnabledError(GuestError):
         super().__init__(
             f"Auth method '{auth_method}' is not enabled for this location's "
             "captive portal",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class VenueClosedError(GuestError):
+    """The venue's Open Hours schedule says it is closed right now.
+
+    ``captive_portal.validators.is_open_now`` shipped, was validated, and was
+    evaluated on exactly one line in the whole backend --
+    ``captive_portal/router.py``'s config-resolve response, as an advisory
+    boolean for the portal UI. No login path consulted it, so a guest (or a
+    script) hitting the login endpoint directly outside opening hours was
+    authenticated normally. /how-it-works sells the opposite: "Outside those
+    hours, guests see a 'we're closed' message instead of a working login
+    screen. Nobody has to remember to switch anything off at close."
+
+    Carries the venue's own ``business_hours_closed_message`` when one is set,
+    so the guest sees the words the operator wrote rather than a generic
+    refusal.
+    """
+
+    def __init__(self, closed_message: str | None = None) -> None:
+        super().__init__(
+            closed_message or "This WiFi network is closed right now.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class GuestTeamSharedQuotaExceededError(GuestError):
+    """The guest belongs to a team that has used up its shared data limit.
+
+    Distinct from ``FairUsagePolicyExceededError``, which is a cap on one
+    guest: this is the *pooled* cap across a whole team, the thing
+    /features calls "one shared data limit" and /how-it-works shows as a
+    usage bar on each group.
+
+    ``GuestTeamService.check_shared_quota`` computed this correctly from the
+    day it shipped and had no caller anywhere in the application, so a team
+    with a 5 GB limit could use 50 GB unimpeded. See
+    ``guest_teams.quota.SharedQuotaResolver`` for the gate.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Your group has used up its shared data allowance",
             status_code=status.HTTP_403_FORBIDDEN,
         )
 

@@ -180,7 +180,16 @@ class QuestionResultBreakdownResponse(BaseModel):
     total_answers: int
     option_counts: dict[str, int] | None
     average_rating: float | None
-    rating_distribution: dict[int, int] | None
+    # `dict[str, int]`, not `dict[int, int]`, because JSON object keys are
+    # always strings: this field has always crossed the wire as
+    # `{"1": .., "5": ..}` no matter what the annotation claimed, so the
+    # declared type -- and the OpenAPI schema generated from it -- described
+    # something the transport cannot carry. A client trusting the schema and
+    # indexing by number read `undefined` for every star and rendered an
+    # all-zero distribution, which is indistinguishable from "nobody rated
+    # us". A wrong-looking chart with no error is exactly the failure mode
+    # this codebase keeps finding, so the annotation now matches the wire.
+    rating_distribution: dict[str, int] | None
     free_text_answers: list[str] | None
 
 

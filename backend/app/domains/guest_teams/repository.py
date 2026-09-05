@@ -68,6 +68,10 @@ class GuestTeamRepositoryProtocol(Protocol):
         self, team_id: uuid.UUID
     ) -> list[GuestTeamMember]: ...
 
+    async def list_active_memberships_for_guest(
+        self, guest_id: uuid.UUID
+    ) -> list[GuestTeamMember]: ...
+
 
 class GuestTeamRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -150,6 +154,17 @@ class GuestTeamRepository:
             filters={"team_id": team_id, "is_active": True},
             sort_by="joined_at",
             sort_order=SortOrder.ASC,
+        )
+
+    async def list_active_memberships_for_guest(
+        self, guest_id: uuid.UUID
+    ) -> list[GuestTeamMember]:
+        """The reverse of ``list_active_members``: which teams is this guest
+        currently in? Needed to enforce a team's shared data limit at the
+        moment one of its members logs in, which is the only place the guest
+        domain knows a guest id but not a team id."""
+        return await self.members.get_all(
+            filters={"guest_id": guest_id, "is_active": True},
         )
 
 

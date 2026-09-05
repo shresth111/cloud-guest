@@ -201,10 +201,46 @@ async def CurrentOrganization(
     organization except the one an operator had happened to add a
     membership row for by hand. The membership check below still applies in
     full to every non-GLOBAL caller -- this narrows, not removes, the
-    original guard."""
+    original guard.
+
+    ## Why an absent header is not simply ``None``
+
+    Returning ``None`` for a missing header made ``None`` mean two different
+    things: "a platform-level caller with no tenant" *and* "this client did
+    not send the header". Every tenant guard in the codebase reads it as only
+    the first -- ``LocationService._enforce_organization_scope``,
+    ``RouterService._enforce_organization_scope`` and every list service
+    (``if requesting_organization_id is not None: filters[...] = ...``) treat
+    ``None`` as "platform caller, apply no organization filter".
+
+    That gap was reachable by any authenticated user. ``ScopeResolver.satisfies``
+    compares *only* ``location_id`` for a LOCATION grant (see its own
+    docstring: "it relies entirely on the caller ... supplying
+    ``organization_id`` alongside ``location_id``"), so a caller holding a
+    LOCATION-scoped grant on their own site A could send ``X-Location-Id: A``
+    and **omit** ``X-Organization-Id``: ``_infer_scope_type`` resolved
+    LOCATION, the grant satisfied the check, and the handler then ran with
+    ``requesting_organization_id=None`` -- i.e. unfiltered, across every
+    tenant on the platform. Seven seeded roles are LOCATION-scoped
+    (``reception-staff``, ``helpdesk``, ``guest-operator``, ...), so this was
+    reachable from an ordinary front-desk account.
+
+    So the header is now *required* of anyone who is not a genuine
+    platform-level caller. ``None`` is returned only for a caller who holds an
+    active GLOBAL-scoped role -- exactly the population the bypass above was
+    written for -- which makes the assumption every service already documents
+    true in fact.
+    """
     organization_id = _parse_uuid_header(request, _ORG_HEADER)
     if organization_id is None:
-        return None
+        resolver = RoleResolver(repository)
+        active_assignments = await resolver.get_active_assignments(uuid.UUID(user.id))
+        if any(
+            assignment.role.scope_type == ScopeType.GLOBAL.value
+            for assignment in active_assignments
+        ):
+            return None
+        raise MissingScopeContextError("organization")
 
     organization_repo = GenericRepository(Organization, db)
     organization = await organization_repo.get_by_id(organization_id)

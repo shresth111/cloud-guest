@@ -1195,7 +1195,13 @@ class TestResultsAggregation:
         by_id = {b.question_id: b for b in results.question_breakdowns}
         assert by_id[q1.id].option_counts == {"yes": 1, "no": 1}
         assert by_id[q2.id].average_rating == 4.0
-        assert by_id[q2.id].rating_distribution == {5: 1, 3: 1}
+        # String keys, matching what JSON actually carries. This asserted
+        # `{5: 1, 3: 1}` while the API served `{"5": 1, "3": 1}`, so the test
+        # passed on a shape no client ever received -- which is how a
+        # consumer indexing by number came to read `undefined` for every star
+        # and render an all-zero chart that looked like real "nobody rated
+        # us" data.
+        assert by_id[q2.id].rating_distribution == {"5": 1, "3": 1}
 
 
 # ============================================================================

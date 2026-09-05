@@ -25,6 +25,7 @@ from typing import Protocol
 from pydantic import BaseModel as PydanticModel
 
 from app.common.masking import MaskedIdentifier, MaskedName
+from app.common.spreadsheet_safety import sanitize_spreadsheet_row
 from app.database.utils.pagination import PaginationMeta
 from app.domains.guest.constants import GuestSessionStatus
 from app.domains.location.models import Location
@@ -157,7 +158,7 @@ class QuestionResultBreakdown:
     total_answers: int
     option_counts: dict[str, int] | None
     average_rating: float | None
-    rating_distribution: dict[int, int] | None
+    rating_distribution: dict[str, int] | None
     free_text_answers: list[str] | None
 
 
@@ -935,6 +936,9 @@ class CampaignsService:
         buffer = io.StringIO()
         writer = csv.writer(buffer)
         writer.writerow(["guest_identifier", "guest_name", "submitted_at", "answers"])
+        # Survey answers are guest free text and the identifier is
+        # guest-chosen -- the two most directly attacker-controlled strings
+        # in the product, landing in a file a venue owner opens in Excel.
         for response in responses:
             guest = await self.guest_session_lookup.get_guest_by_id(response.guest_id)
             identifier = getattr(guest, "identifier", None)
@@ -944,12 +948,14 @@ class CampaignsService:
             )
             dumped = row.model_dump()
             writer.writerow(
-                [
-                    dumped["guest_identifier"] or "",
-                    dumped["guest_name"] or "",
-                    response.submitted_at.isoformat(),
-                    response.answers,
-                ]
+                sanitize_spreadsheet_row(
+                    [
+                        dumped["guest_identifier"] or "",
+                        dumped["guest_name"] or "",
+                        response.submitted_at.isoformat(),
+                        response.answers,
+                    ]
+                )
             )
         return buffer.getvalue()
 
@@ -984,7 +990,7 @@ def _build_question_breakdown(
     answer_type = AnswerType(question.answer_type)
     option_counts: dict[str, int] | None = None
     average_rating: float | None = None
-    rating_distribution: dict[int, int] | None = None
+    rating_distribution: dict[str, int] | None = None
     free_text_answers: list[str] | None = None
 
     if answer_type == AnswerType.SINGLE_CHOICE:
@@ -997,7 +1003,12 @@ def _build_question_breakdown(
         option_counts = dict(counter)
     elif answer_type == AnswerType.RATING_5:
         ratings = [int(a) for a in raw_answers if isinstance(a, int | float)]
-        rating_distribution = dict(Counter(ratings))
+        # Keyed by `str` deliberately -- see
+        # `QuestionResultBreakdownResponse.rating_distribution`. Building it
+        # as `str` here rather than letting Pydantic coerce on serialization
+        # means the in-process value and the JSON a client receives are the
+        # same shape, so a test asserting on one is asserting on the other.
+        rating_distribution = {str(k): v for k, v in Counter(ratings).items()}
         average_rating = sum(ratings) / len(ratings) if ratings else None
     else:
         free_text_answers = [str(a) for a in raw_answers if a]

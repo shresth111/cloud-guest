@@ -31,6 +31,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 
 from app.common.responses import ApiResponse, build_response
+from app.common.spreadsheet_safety import sanitize_spreadsheet_row
 from app.database.utils.pagination import PaginationMeta
 from app.domains.auth.models import LoginAttempt
 from app.domains.guest.models import GuestLoginHistory
@@ -82,8 +83,8 @@ def _csv_response(
 ) -> Response:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(header)
-    writer.writerows(rows)
+    writer.writerow(sanitize_spreadsheet_row(list(header)))
+    writer.writerows(sanitize_spreadsheet_row(list(r)) for r in rows)
     return Response(
         content=buffer.getvalue(),
         media_type="text/csv",

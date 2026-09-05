@@ -28,6 +28,8 @@ from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.guest_access.dependencies import get_guest_access_service
 from app.domains.guest_access.service import GuestAccessService
+from app.domains.guest_teams.quota import SharedQuotaResolver
+from app.domains.guest_teams.repository import GuestTeamRepository
 from app.domains.location.dependencies import get_location_service
 from app.domains.location.service import LocationService
 from app.domains.mac_authorization.dependencies import get_mac_authorization_service
@@ -65,6 +67,23 @@ def get_guest_repository(
     return GuestRepository(db)
 
 
+def get_shared_quota_resolver(
+    db: AsyncSession = Depends(get_db_session),
+    guest_repository: GuestRepositoryProtocol = Depends(get_guest_repository),
+) -> SharedQuotaResolver:
+    """Wires the guest-team shared data limit into the login path.
+
+    Deliberately builds ``GuestTeamRepository`` here rather than depending on
+    ``guest_teams.dependencies.get_guest_team_service``: that service composes
+    the concrete ``GuestService``, so depending on it from *this* provider
+    would make FastAPI's dependency graph recurse
+    (``get_guest_service -> get_guest_team_service -> get_guest_service``).
+    The resolver needs two repositories and no service, so there is no cycle
+    to break in the first place.
+    """
+    return SharedQuotaResolver(GuestTeamRepository(db), guest_repository)
+
+
 def get_guest_service(
     repository: GuestRepositoryProtocol = Depends(get_guest_repository),
     otp_service: OtpService = Depends(get_otp_service),
@@ -81,6 +100,7 @@ def get_guest_service(
     mac_authorization_service: MacAuthorizationService = Depends(
         get_mac_authorization_service
     ),
+    team_quota_resolver: SharedQuotaResolver = Depends(get_shared_quota_resolver),
     redis: Redis = Depends(get_redis_client),
 ) -> GuestService:
     """BE-011 Part 3 addition: wires ``MonitoringService`` in as
@@ -154,6 +174,7 @@ def get_guest_service(
         queue_assignment_dispatcher=enqueue_guest_queue_assignment,
         policy_lookup=policy_service,
         mac_authorization_hook=mac_authorization_service,
+        team_quota_hook=team_quota_resolver,
         redis=redis,
     )
 

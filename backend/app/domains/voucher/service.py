@@ -125,6 +125,7 @@ from typing import Protocol
 
 from redis.asyncio import Redis
 
+from app.common.spreadsheet_safety import sanitize_spreadsheet_row
 from app.core.email_layout import esc, heading, paragraph, render_email
 from app.core.storage import ObjectStorageProtocol
 from app.database.constants import MAX_BULK_CREATE_SIZE
@@ -1035,8 +1036,11 @@ class VoucherService:
         writer = csv.writer(buffer)
         writer.writerow(CSV_EXPORT_HEADERS)
         for voucher in vouchers:
+            # `redeemed_identifier` is whatever the guest typed at the portal;
+            # `normalize_redeemed_identifier` strips whitespace and nothing
+            # else, by design.
             writer.writerow(
-                [
+                sanitize_spreadsheet_row([
                     voucher.code,
                     voucher.status,
                     voucher.use_count,
@@ -1045,7 +1049,7 @@ class VoucherService:
                     voucher.last_used_at.isoformat() if voucher.last_used_at else "",
                     voucher.expires_at.isoformat() if voucher.expires_at else "",
                     voucher.redeemed_identifier or "",
-                ]
+                ])
             )
         return buffer.getvalue()
 

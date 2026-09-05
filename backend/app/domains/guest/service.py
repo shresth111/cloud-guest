@@ -254,6 +254,7 @@ from app.domains.auth.password import (
     PasswordVerificationError,
 )
 from app.domains.captive_portal.service import ResolvedPortalConfig
+from app.domains.captive_portal.validators import is_open_now
 from app.domains.guest_access.exceptions import GuestAccessDeniedError
 from app.domains.guest_access.service import AccessDecision
 from app.domains.location.models import Location
@@ -340,6 +341,7 @@ from .exceptions import (
     GuestProfileUpdateNotAuthorizedError,
     GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
+    GuestTeamSharedQuotaExceededError,
     InvalidSessionStatusTransitionError,
     MacAddressNotAuthorizedError,
     NoReconnectableSessionError,
@@ -352,6 +354,7 @@ from .exceptions import (
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
     TooManyDeviceIdsError,
+    VenueClosedError,
 )
 from .models import (
     Guest,
@@ -857,6 +860,21 @@ class MacAuthorizationLookupProtocol(Protocol):
     ) -> bool: ...
 
 
+class TeamQuotaLookupProtocol(Protocol):
+    """The single method ``GuestService``'s optional ``team_quota_hook``
+    needs from ``app.domains.guest_teams.quota.SharedQuotaResolver``.
+
+    A resolver rather than the full ``GuestTeamService`` because that service
+    composes the concrete ``GuestService``, so depending on it here would
+    close a DI cycle (``get_guest_service -> get_guest_team_service ->
+    get_guest_service``). ``None``-by-default, exactly like every other hook
+    on this class: a deployment with no guest-teams integration wired simply
+    never checks a pooled quota, and no venue that does not use teams pays
+    anything for this."""
+
+    async def is_over_shared_quota(self, guest_id: uuid.UUID) -> bool: ...
+
+
 class QueueAssignmentProtocol(Protocol):
     """The methods ``GuestService``'s optional ``queue_assignment_hook``
     needs from the real ``app.domains.queue_management.service
@@ -1350,6 +1368,7 @@ class GuestService:
         queue_assignment_dispatcher: QueueAssignmentDispatcherProtocol | None = None,
         policy_lookup: PolicyLookupProtocol | None = None,
         mac_authorization_hook: MacAuthorizationLookupProtocol | None = None,
+        team_quota_hook: TeamQuotaLookupProtocol | None = None,
         redis: Redis | None = None,
     ) -> None:
         self.repository = repository
@@ -1364,6 +1383,7 @@ class GuestService:
         self.queue_assignment_dispatcher = queue_assignment_dispatcher
         self.policy_lookup = policy_lookup
         self.mac_authorization_hook = mac_authorization_hook
+        self.team_quota_hook = team_quota_hook
         self.redis = redis
 
     async def _broadcast_guest_session_started(
@@ -1642,6 +1662,11 @@ class GuestService:
             device_name=device_name,
             known_device=known_device,
         )
+        resolved_session_timeout = await self._resolve_session_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -1653,7 +1678,7 @@ class GuestService:
             user_agent=user_agent,
             accept_language=accept_language,
             data_limit_mb=None,
-            session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
+            session_timeout_minutes=resolved_session_timeout,
         )
         if created:
             # BE-011 Part 3: additive, best-effort real-time broadcast --
@@ -1939,6 +1964,11 @@ class GuestService:
             device_name=device_name,
             known_device=known_device,
         )
+        resolved_session_timeout = await self._resolve_session_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -1950,7 +1980,7 @@ class GuestService:
             user_agent=user_agent,
             accept_language=accept_language,
             data_limit_mb=None,
-            session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
+            session_timeout_minutes=resolved_session_timeout,
         )
         if created:
             await self._broadcast_guest_session_started(
@@ -2218,6 +2248,11 @@ class GuestService:
         if device_name is not None:
             device_update["device_name"] = device_name
         device = await self.repository.update_device(device, device_update)
+        resolved_session_timeout = await self._resolve_session_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -2229,7 +2264,7 @@ class GuestService:
             user_agent=user_agent,
             accept_language=accept_language,
             data_limit_mb=None,
-            session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
+            session_timeout_minutes=resolved_session_timeout,
         )
         if created:
             await self._broadcast_guest_session_started(
@@ -2375,6 +2410,11 @@ class GuestService:
             device_name="Whitelisted device",
             known_device=known_device,
         )
+        resolved_session_timeout = await self._resolve_session_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -2386,7 +2426,7 @@ class GuestService:
             user_agent=user_agent,
             accept_language=accept_language,
             data_limit_mb=None,
-            session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
+            session_timeout_minutes=resolved_session_timeout,
         )
         if created:
             await self._broadcast_guest_session_started(
@@ -3476,6 +3516,27 @@ class GuestService:
         }
         if not enabled_map[auth_method]:
             raise GuestAuthMethodNotEnabledError(auth_method.value)
+
+        # Open Hours, enforced rather than merely reported.
+        #
+        # This is the one chokepoint every authenticated login method already
+        # passes through, and it has the resolved portal config in hand, so
+        # gating here covers OTP (SMS/email/WhatsApp), voucher, password and
+        # PIN in one place instead of four -- and a login method added later
+        # is covered by construction rather than by remembering.
+        #
+        # `is_open_now` is deliberately forgiving: business hours disabled
+        # means always open, and a malformed stored timezone degrades to
+        # "open" rather than raising (see its own docstring). So the failure
+        # direction here is always "let the guest online", never "lock a venue
+        # out of its own WiFi because a row is bad".
+        if not is_open_now(
+            enabled=config.business_hours_enabled,
+            timezone=config.business_hours_timezone,
+            schedule=config.business_hours_schedule,
+        ):
+            raise VenueClosedError(config.business_hours_closed_message)
+
         return resolved
 
     async def _get_eligible_router(self, router_id: uuid.UUID) -> Router:
@@ -3576,6 +3637,64 @@ class GuestService:
             "max_devices_per_guest", DEFAULT_MAX_DEVICES_PER_GUEST
         )
 
+    async def _resolve_session_timeout_minutes(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
+    ) -> int:
+        """Resolves how long this location's sessions last, via
+        ``PolicyType.SESSION``.
+
+        Mirrors ``_resolve_device_limit`` exactly, including its
+        ``policy_lookup is None`` and missing-field fallbacks.
+
+        Until now every non-voucher login -- OTP, password, PIN and
+        MAC-whitelist -- passed the platform-wide
+        ``constants.DEFAULT_SESSION_TIMEOUT_MINUTES`` (240) regardless of
+        location, even though ``PolicyType.SESSION``, a typed
+        ``SessionPolicyRules`` carrying ``session_timeout_minutes``, and
+        LOCATION-scoped ``PolicyAssignment`` had all shipped. The type was
+        simply never passed to ``resolve_effective_policy`` anywhere in the
+        application, so a cafe and a hotel got the identical four hours. The
+        homepage FAQ sells exactly that distinction ("a cafe usually wants a
+        session that ends about when the coffee does. A hotel doesn't").
+
+        240 remains the fallback, so a venue with no SESSION policy assigned
+        -- which is every venue today -- behaves exactly as before.
+
+        A failing policy lookup falls back rather than propagating, matching
+        the contract ``record_usage``'s own FUP tracking already keeps (see
+        ``test_never_raises_when_the_policy_lookup_itself_fails``): the policy
+        service being unreachable must never be the reason a guest cannot get
+        online. This resolver sits on the login path, so the failure mode has
+        to be "the default session length" and not "no WiFi".
+        """
+        if self.policy_lookup is None:
+            return DEFAULT_SESSION_TIMEOUT_MINUTES
+        try:
+            resolved = await self.policy_lookup.resolve_effective_policy(
+                policy_type=PolicyType.SESSION,
+                organization_id=organization_id,
+                location_id=location_id,
+                guest_id=guest_id,
+            )
+        except Exception:
+            logger.warning(
+                "session_policy_lookup_failed_using_default",
+                extra={
+                    "organization_id": str(organization_id),
+                    "location_id": str(location_id),
+                    "default_minutes": DEFAULT_SESSION_TIMEOUT_MINUTES,
+                },
+                exc_info=True,
+            )
+            return DEFAULT_SESSION_TIMEOUT_MINUTES
+        return resolved.rules.get(
+            "session_timeout_minutes", DEFAULT_SESSION_TIMEOUT_MINUTES
+        )
+
     async def _enforce_device_limit(
         self,
         *,
@@ -3635,7 +3754,19 @@ class GuestService:
         ``app.domains.policy`` seeds no default here. Called from
         ``login_via_otp``/``login_via_voucher`` alongside
         ``_enforce_device_limit``, the identical "reject before touching
-        OTP/voucher verification" placement."""
+        OTP/voucher verification" placement.
+
+        Also enforces the *team* shared data limit, which is a different cap
+        with the same shape: FUP bounds one guest, a guest team bounds a whole
+        group against one pooled allowance. It is checked here rather than in
+        its own call site so that every login path picks it up from the one
+        place they all already go through, and so it is checked before OTP or
+        voucher verification like every other rejection on this path.
+        """
+        if self.team_quota_hook is not None and await (
+            self.team_quota_hook.is_over_shared_quota(guest_id)
+        ):
+            raise GuestTeamSharedQuotaExceededError()
         if self.policy_lookup is None:
             return
         resolved = await self.policy_lookup.resolve_effective_policy(
