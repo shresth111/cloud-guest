@@ -27,6 +27,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 from app.domains.firewall.exceptions import (
     CrossLocationFirewallRuleAccessError,
@@ -378,7 +379,7 @@ class TestOptionalCallerLocationScope:
 
         from app.domains.rbac.location_scope import OptionalCallerLocationScope
 
-        with pytest.raises(Exception) as caught:
+        with pytest.raises((HTTPException, AttributeError)) as caught:
             await OptionalCallerLocationScope(
                 _request(headers={"Authorization": "Bearer nonsense"}),
                 credentials=HTTPAuthorizationCredentials(
@@ -398,7 +399,7 @@ class TestOptionalCallerLocationScope:
         confined -- not waved through as a guest."""
         from app.domains.rbac.location_scope import OptionalCallerLocationScope
 
-        with pytest.raises(Exception):
+        with pytest.raises((HTTPException, AttributeError)):
             await OptionalCallerLocationScope(
                 _request(headers={"X-API-Key": "some-key"}),
                 credentials=None,
