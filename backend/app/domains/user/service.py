@@ -166,6 +166,7 @@ class OrganizationLookupProtocol(Protocol):
         actor_user_id: uuid.UUID,
         organization_id: uuid.UUID,
         user_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
         is_primary_contact: bool = False,
     ) -> OrganizationMember: ...
 
@@ -488,6 +489,11 @@ class UserService:
                 actor_user_id=actor_user_id,
                 organization_id=organization_id,
                 user_id=user.id,
+                # Same value this method already checked at the top via
+                # _assert_organization_in_scope, so invite_member's own
+                # tenant guard reaches the same verdict rather than a
+                # second, differently-derived one.
+                requesting_organization_id=requesting_organization_id,
             )
             await self.organization_lookup.accept_invite(
                 user_id=user.id,
