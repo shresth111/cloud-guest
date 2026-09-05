@@ -80,6 +80,18 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "voucher": (
+        "THREE entities addressed by id, and the answer the mechanical pass "
+        "got wrong. `VoucherBatch` via `get_batch` (nine routes -- approve, "
+        "revoke, export, email, stats, vouchers) and `VoucherSeries` via "
+        "`get_series` both carry a location and are both enforced. "
+        "`VoucherPlan` has no `location_id` column at all, so there is "
+        "nothing to compare and `get_plan` is deliberately left alone. The "
+        "transformer had matched `get_series` only, which would have left "
+        "every batch route open. Anonymous-tolerant: `/vouchers/redeem` and "
+        "`/validate` are unauthenticated, and the service is composed into "
+        "`get_guest_service`."
+    ),
     "campaigns": (
         "One getter covers the whole surface. `get_campaign` handles "
         "`{campaign_id}` directly, and the sub-entity routes -- "
@@ -182,13 +194,6 @@ PENDING: dict[str, str] = {
         "guest-facing resolve path must stay unconfined and the config is "
         "resolved by org+location rather than by its own id, so the getter "
         "choice is not obvious."
-    ),
-    "voucher": (
-        "ANALYSED, NOT CONVERTED -- and the reason this bar exists. A "
-        "mechanical pass matched `get_series` and would have confined voucher "
-        "*series* while leaving *batches* open; `get_batch` is what the routes "
-        "address. Also has unauthenticated redeem/validate. Convert against "
-        "`get_batch`, and decide `get_series`/`get_plan` explicitly."
     ),
     "guest": (
         "DELIBERATELY LAST, not unanalysed. `Guest`, `GuestSession` and "
@@ -435,6 +440,12 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
 # correct because the caller is a guest acting on their own session, not a
 # staff member reading a tenant's records.
 _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
+    ("POST", "/api/v1/vouchers/redeem"): (
+        "A guest redeeming or checking a code handed to them at a front desk -- the whole point is that they have no account. They hold no roles, so there is no confinement to derive, and redemption resolves the voucher by its own code rather than through the confined `get_batch`."
+    ),
+    ("POST", "/api/v1/vouchers/validate"): (
+        "A guest redeeming or checking a code handed to them at a front desk -- the whole point is that they have no account. They hold no roles, so there is no confinement to derive, and redemption resolves the voucher by its own code rather than through the confined `get_batch`."
+    ),
     ("GET", "/api/v1/portal/campaigns/next"): (
         "A guest at the portal being shown a campaign, recording that it was shown, or answering its survey. They hold no roles, so there is no confinement to derive. The campaign they are served is already chosen by their own session's location (`get_next_campaign_for_session`), so being unconfined here does not widen what they can see."
     ),

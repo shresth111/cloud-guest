@@ -136,6 +136,10 @@ from app.domains.notification.constants import (
 )
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 
 from .constants import (
     CODE_GENERATION_MAX_ROUNDS,
@@ -158,6 +162,8 @@ from .events import (
     VoucherRedemptionFailed,
 )
 from .exceptions import (
+    CrossLocationVoucherBatchAccessError,
+    CrossLocationVoucherSeriesAccessError,
     CrossOrganizationVoucherBatchAccessError,
     CrossOrganizationVoucherPlanAccessError,
     CrossOrganizationVoucherSeriesAccessError,
@@ -327,6 +333,7 @@ class VoucherService:
             DEFAULT_REDEMPTION_MAX_ATTEMPTS_PER_WINDOW
         ),
         redemption_window_minutes: int = DEFAULT_REDEMPTION_WINDOW_MINUTES,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.redis = redis
@@ -337,6 +344,8 @@ class VoucherService:
         self.notification_service = notification_service
         self.redemption_max_attempts_per_window = redemption_max_attempts_per_window
         self.redemption_window_minutes = redemption_window_minutes
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     # ========================================================================
     # Batch lifecycle
@@ -564,6 +573,11 @@ class VoucherService:
             and batch.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationVoucherBatchAccessError()
+        enforce_entity_location(
+            entity_location_id=getattr(batch, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationVoucherBatchAccessError(),
+        )
         return await self._refresh_batch_expiry(batch)
 
     async def list_batches(
@@ -766,6 +780,11 @@ class VoucherService:
             and series.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationVoucherSeriesAccessError()
+        enforce_entity_location(
+            entity_location_id=getattr(series, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationVoucherSeriesAccessError(),
+        )
         return series
 
     async def list_series(

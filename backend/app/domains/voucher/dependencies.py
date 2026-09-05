@@ -49,6 +49,10 @@ from app.domains.rbac.dependencies import (
     get_rbac_repository,
 )
 from app.domains.rbac.enums import ScopeType
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    OptionalCallerLocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .repository import VoucherRepository, VoucherRepositoryProtocol
@@ -69,6 +73,7 @@ def get_voucher_service(
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     object_storage: ObjectStorageProtocol = Depends(get_object_storage),
     notification_service: NotificationService = Depends(get_notification_service),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> VoucherService:
     return VoucherService(
         repository,
@@ -78,6 +83,7 @@ def get_voucher_service(
         audit_writer=audit_repository,
         object_storage=object_storage,
         notification_service=notification_service,
+        caller_location_scope=caller_location_scope,
     )
 
 
