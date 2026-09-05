@@ -6,7 +6,7 @@ Unlike most other domains built in this batch, there is no user-facing
 "create a connected device" input to validate -- rows only ever come into
 existence via a real device sync (see ``device_adapters.py``). These
 helpers are therefore lenient parsers of *real device output*
-(RouterOS's own DHCP-lease/ARP/wireless-registration-table replies),
+(RouterOS's own DHCP-lease/ARP replies),
 never raising on malformed input -- a router returning one odd row must
 never abort an entire sync tick (mirrors
 ``app.domains.isp.device_adapters._parse_ping_rows``'s own "never crash

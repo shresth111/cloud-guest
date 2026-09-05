@@ -1,6 +1,6 @@
 """Connected Device Management domain: a per-router inventory of every
 device currently (or recently) seen on the network -- DHCP leases, ARP
-entries, and wireless registration-table clients merged by MAC address --
+entries merged by MAC address --
 with real device sync, a manual disconnect action, and admin actions
 (comment, block/unblock/whitelist).
 

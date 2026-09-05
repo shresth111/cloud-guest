@@ -9,7 +9,7 @@ per-router sync mechanism this codebase has, records one immutable
   this codebase.
 * ``app.domains.connected_devices`` -- ``ConnectedDeviceSyncProtocol``
   (satisfied structurally by the real ``ConnectedDeviceService``) drives
-  the real DHCP-lease/ARP/wireless sync.
+  the real DHCP-lease/ARP sync.
 * ``app.domains.queue_management`` -- ``QueueSyncProtocol`` (satisfied
   structurally by the real ``QueueManagementService``) drives the real
   per-assignment device re-push via ``reapply_assignments_for_router``

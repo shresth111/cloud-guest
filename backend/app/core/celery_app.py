@@ -531,9 +531,11 @@ celery_app.conf.update(
             "task": TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
             "schedule": ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
         },
-        # Connected Device Management: real DHCP-lease/ARP/wireless
-        # registration-table sync sweep -- every 5 minutes, an
-        # operationally-visible (not safety-critical) cadence, see
+        # Connected Device Management: real DHCP-lease/ARP sync sweep --
+        # an operationally-visible (not safety-critical) cadence. The
+        # interval is whatever CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS
+        # says (900s today; this comment used to hardcode "every 5
+        # minutes" and had been wrong since that constant was raised), see
         # app.domains.connected_devices.constants
         # .CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS's own docstring
         # for the full reasoning. Per-router failure isolation mirrors

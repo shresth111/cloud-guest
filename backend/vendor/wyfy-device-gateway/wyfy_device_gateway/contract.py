@@ -151,11 +151,45 @@ class WanHealth:
 
 @dataclass(frozen=True, slots=True)
 class ConnectedDevice:
+    """One device the router can currently see, merged by MAC across the
+    menus that vendor's adapter consults.
+
+    ``is_wireless`` is deliberately three-state, and the third state is
+    the common one on this fleet:
+
+    * ``True``  -- the device is associated to a radio this router owns.
+    * ``False`` -- this router can report wireless association, and this
+      device is not wireless.
+    * ``None``  -- **this router cannot report wireless association at
+      all**, so the question is unanswerable rather than answered "no".
+
+    ``None`` is not "we haven't looked yet". It means the capability does
+    not exist on the device, and no future poll will change that. Every
+    MikroTik router this platform currently deploys is a hEX lite /
+    RB750r2 (RouterOS 7.23.3, mipsbe): a five-port wired router with no
+    radio, no ``wireless`` package, and therefore no
+    ``/interface/wireless/registration-table`` menu at all. Guest Wi-Fi at
+    the venue comes from separate third-party access points (TP-Link /
+    Omada in the field today) that this platform does not talk to.
+
+    Collapsing that into ``False`` is what this three-state exists to
+    prevent: it turns "we cannot know" into the positive claim "this
+    guest's phone is on a cable", which is wrong for every Wi-Fi guest on
+    the fleet. A caller that needs a two-state answer must decide what to
+    do with ``None`` explicitly rather than inheriting a default.
+
+    ``signal_strength_dbm`` follows the same rule and has the same cause:
+    it is ``None`` whenever ``is_wireless`` is ``None``, permanently and
+    by construction, because the value lives in the access point and not
+    in this router. Do not render it as a pending measurement, and do not
+    substitute a placeholder for it downstream.
+    """
+
     mac_address: str
     ip_address: str | None
     hostname: str | None
     interface: str | None
-    is_wireless: bool
+    is_wireless: bool | None
     signal_strength_dbm: int | None
 
 
