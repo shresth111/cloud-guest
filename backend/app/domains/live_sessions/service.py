@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import UTC, datetime
 
 from app.domains.guest.constants import GuestSessionStatus
 from app.domains.guest.service import GuestService
@@ -17,6 +18,28 @@ from app.domains.rbac.service import RBACService
 from .schemas import LiveSession, LiveSessionListResponse, SessionActionResponse
 
 logger = logging.getLogger(__name__)
+
+
+def _elapsed_seconds(session, *, now: datetime) -> int:
+    """How long this session has actually been running.
+
+    ``GuestSession`` has no ``session_duration_seconds`` column -- the
+    previous ``getattr(s, "session_duration_seconds", 0)`` therefore returned
+    ``0`` for every session ever listed, which is why the "how long" column on
+    the connected-guest screen was uniformly zero. It is derived, not stored:
+    from ``started_at`` to ``ended_at`` for a finished session, or to now for a
+    live one. Returns ``0`` rather than a negative number if the clock or the
+    stored timestamp disagree.
+    """
+    started_at = session.started_at
+    if started_at is None:
+        return 0
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=UTC)
+    end = session.ended_at or now
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=UTC)
+    return max(0, int((end - started_at).total_seconds()))
 
 
 class LiveSessionService:
@@ -48,45 +71,63 @@ class LiveSessionService:
                 session_status = GuestSessionStatus(status)
             except ValueError:
                 session_status = None
-        try:
-            result = await self.guest_service.list_sessions(
+        # No try/except around the listing.
+        #
+        # This used to catch every exception, log a warning, and fall through
+        # to `LiveSessionListResponse(items=[], total=0)` -- so a broken query,
+        # a database blip or a scoping error all rendered as the sentence "no
+        # guests are online right now" on the one screen an operator opens to
+        # answer exactly that question. A venue with a full lobby and a failing
+        # query looks identical to an empty venue. `GuestService` raises typed
+        # `CloudGuestError`s that the app-wide handler turns into real non-2xx
+        # responses; anything else is a genuine 500 and should be seen as one.
+        rows, meta = await self.guest_service.list_sessions(
+            requesting_organization_id=organization_id,
+            location_id=location_id,
+            status=session_status,
+            page=page,
+            page_size=page_size,
+        )
+
+        # One bulk lookup rather than a per-session device query -- the same
+        # N+1 reasoning `GuestService.list_devices_by_ids` was built for.
+        device_ids = [s.device_id for s in rows if s.device_id is not None]
+        macs_by_device_id: dict[uuid.UUID, str] = {}
+        if device_ids:
+            devices = await self.guest_service.list_devices_by_ids(
+                device_ids=list(dict.fromkeys(device_ids)),
                 requesting_organization_id=organization_id,
-                location_id=location_id,
-                status=session_status,
-                page=page,
-                page_size=page_size,
             )
-            # Adapt guest sessions to live session format
-            for s in result[0] if isinstance(result, tuple) else result:
-                sessions.append(
-                    LiveSession(
-                        id=str(getattr(s, "id", "")),
-                        username=getattr(
-                            s, "guest_username", str(getattr(s, "id", ""))
-                        ),
-                        mac=getattr(s, "mac_address", ""),
-                        ip=getattr(s, "ip_address", ""),
-                        ssid=getattr(s, "ssid", ""),
-                        nas=getattr(s, "nas_identifier", ""),
-                        router=getattr(s, "router_name", ""),
-                        device=getattr(s, "user_agent", ""),
-                        signal=getattr(s, "signal_strength", 0) or 0,
-                        session_time_seconds=getattr(s, "session_duration_seconds", 0)
-                        or 0,
-                        download_bytes=getattr(s, "bytes_downloaded", 0) or 0,
-                        upload_bytes=getattr(s, "bytes_uploaded", 0) or 0,
-                        status=getattr(s, "status", "active"),
-                        location_id=str(getattr(s, "location_id", "")),
-                        organization_id=str(getattr(s, "organization_id", "")),
-                        started_at=getattr(s, "started_at", None),
-                    )
+            macs_by_device_id = {d.id: d.mac_address for d in devices}
+
+        now = datetime.now(UTC)
+        for s in rows:
+            sessions.append(
+                LiveSession(
+                    id=str(s.id),
+                    guest_id=str(s.guest_id) if s.guest_id else None,
+                    mac=macs_by_device_id.get(s.device_id),
+                    ip=s.ip_address,
+                    device=s.user_agent,
+                    session_time_seconds=_elapsed_seconds(s, now=now),
+                    download_bytes=s.bytes_downloaded or 0,
+                    upload_bytes=s.bytes_uploaded or 0,
+                    status=s.status,
+                    router_id=str(s.router_id) if s.router_id else None,
+                    location_id=str(s.location_id) if s.location_id else None,
+                    organization_id=(
+                        str(s.organization_id) if s.organization_id else None
+                    ),
+                    started_at=s.started_at,
                 )
-        except Exception as exc:
-            logger.warning("Could not fetch live sessions: %s", exc)
+            )
 
         return LiveSessionListResponse(
             items=sessions,
-            total=len(sessions),
+            # The real matching-row count, not `len(sessions)`. Paging off the
+            # page's own length told the client there was exactly one page of
+            # results no matter how many sessions actually matched.
+            total=meta.total_items,
             page=page,
             page_size=page_size,
         )

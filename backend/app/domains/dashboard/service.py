@@ -209,31 +209,34 @@ class DashboardService:
     async def _get_overview(
         self, user_id: uuid.UUID, organization_id: uuid.UUID | None = None
     ) -> DashboardOverview:
-        try:
-            orgs = await self.organization_service.list_organizations(
-                requesting_user_id=user_id, page=1, page_size=1
-            )
-            total_orgs = orgs[1].total_items if len(orgs) > 1 else 0
-        except Exception:
-            total_orgs = 0
+        """Composes the three headline counts from the services that already
+        own them.
 
-        try:
-            # Try to get unified dashboard data
-            dash = await self.analytics_dashboard.get_super_admin_dashboard(user_id)
-            total_locs = dash.total_locations if hasattr(dash, "total_locations") else 0
-            total_routers = (
-                dash.total_routers_online + dash.total_routers_offline
-                if hasattr(dash, "total_routers_online")
-                else 0
-            )
-        except Exception:
-            total_locs = 0
-            total_routers = 0
+        Both reads below used to be wrapped in a bare ``except Exception: -> 0``.
+        That is the wrong failure mode for a counter: an operator cannot tell
+        "you genuinely have no routers" from "the query broke", and the second
+        reading is the one that matters. Failures now propagate and surface as
+        a 5xx, the same posture ``live_sessions`` was moved to.
+
+        ``total_routers`` additionally read ``dash.total_routers_online`` and
+        ``dash.total_routers_offline`` behind a ``hasattr`` guard. Neither
+        attribute has ever existed on ``SuperAdminDashboardResponse`` -- the
+        real fields are ``total_routers``/``routers_online``/``routers_offline``
+        (``analytics.dashboard_schemas``) -- so the guard was permanently
+        False and this endpoint reported **0 routers** for every account since
+        it shipped, with the correct value one attribute away.
+        """
+        orgs = await self.organization_service.list_organizations(
+            requesting_user_id=user_id, page=1, page_size=1
+        )
+        total_orgs = orgs[1].total_items if len(orgs) > 1 else 0
+
+        dash = await self.analytics_dashboard.get_super_admin_dashboard(user_id)
 
         return DashboardOverview(
             total_organizations=total_orgs,
-            total_locations=total_locs,
-            total_routers=total_routers,
+            total_locations=dash.total_locations,
+            total_routers=dash.total_routers,
         )
 
     async def _get_widgets(

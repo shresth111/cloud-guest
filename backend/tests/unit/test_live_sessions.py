@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -31,18 +31,41 @@ from app.domains.live_sessions.service import LiveSessionService
 
 @dataclass
 class _FakeGuestSession:
-    """Minimal stand-in exposing only the attributes the live-session adapter
-    reads off a real ``GuestSession`` row."""
+    """Stand-in for a real ``GuestSession`` row.
+
+    Deliberately mirrors the real model's **actual** column set. The previous
+    version of this fake defined only the five attributes the adapter happened
+    to read successfully, which is precisely why the adapter's other seven
+    reads -- ``guest_username``, ``mac_address``, ``ssid``, ``nas_identifier``,
+    ``router_name``, ``signal_strength``, ``session_duration_seconds``, none of
+    which exist on ``GuestSession`` -- could return their ``getattr`` defaults
+    forever without a single test noticing. A fake that is missing the same
+    fields as the code under test cannot catch a field that does not exist.
+
+    So: every attribute here corresponds to a real column, and any attribute
+    the adapter invents will now raise ``AttributeError`` in these tests
+    rather than silently becoming ``""``/``0`` in production.
+    """
 
     id: uuid.UUID
     organization_id: uuid.UUID
     location_id: uuid.UUID
+    guest_id: uuid.UUID = field(default_factory=uuid.uuid4)
+    device_id: uuid.UUID | None = None
+    router_id: uuid.UUID | None = None
     status: str = GuestSessionStatus.ACTIVE.value
     ip_address: str = "10.0.0.5"
     user_agent: str = "Mozilla/5.0"
     bytes_downloaded: int = 4096
     bytes_uploaded: int = 1024
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    ended_at: datetime | None = None
+
+
+@dataclass
+class _FakeGuestDevice:
+    id: uuid.UUID
+    mac_address: str
 
 
 @dataclass
@@ -59,9 +82,25 @@ class _FakeGuestService:
     exactly as it does in production.
     """
 
-    def __init__(self, rows: list[_FakeGuestSession]) -> None:
+    def __init__(
+        self,
+        rows: list[_FakeGuestSession],
+        devices: list[_FakeGuestDevice] | None = None,
+    ) -> None:
         self._rows = rows
+        self._devices = devices or []
         self.calls: list[dict[str, object]] = []
+        # When set, stands in for a total larger than this page, so a test can
+        # tell `meta.total_items` apart from `len(page)`.
+        self.total_override: int | None = None
+
+    async def list_devices_by_ids(
+        self,
+        *,
+        device_ids: list[uuid.UUID],
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[_FakeGuestDevice]:
+        return [d for d in self._devices if d.id in set(device_ids)]
 
     async def list_sessions(
         self,
@@ -86,7 +125,11 @@ class _FakeGuestService:
         rows = [
             r for r in self._rows if r.organization_id == requesting_organization_id
         ]
-        return rows, _FakeMeta(total_items=len(rows))
+        return rows, _FakeMeta(
+            total_items=self.total_override
+            if self.total_override is not None
+            else len(rows)
+        )
 
 
 async def test_live_sessions_returns_active_rows_and_forwards_correct_keyword():
@@ -265,3 +308,144 @@ def test_every_session_action_route_resolves_the_caller():
         resolved = calls(route.dependant)
         assert CurrentUser in resolved, f"{action} does not resolve the actor"
         assert CurrentOrganization in resolved, f"{action} is unscoped"
+
+
+# ---------------------------------------------------------------------------
+# The connected-guest row must carry real data, or say it has none
+# ---------------------------------------------------------------------------
+#
+# Every field below was previously read with `getattr(session, "<name>",
+# <default>)` for a name that does not exist on `GuestSession`. The defaults
+# rendered a complete-looking row: session length always 0, MAC/SSID/NAS/
+# router always "", username the session's own UUID. `/how-it-works` sells
+# this screen as "who's on, which device, for how long, and how much data
+# used", so each of these is a shipped claim.
+
+
+async def test_session_time_is_derived_from_started_at_not_a_zero_default():
+    """The "for how long" column. `session_duration_seconds` is not a column
+    on `GuestSession`, so this was 0 for every session ever listed."""
+    org_id = uuid.uuid4()
+    started = datetime.now(UTC) - timedelta(minutes=42)
+    row = _FakeGuestSession(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        started_at=started,
+    )
+    service = LiveSessionService(
+        guest_service=_FakeGuestService([row]), rbac_service=None
+    )
+
+    result = await service.list_live_sessions(organization_id=org_id)
+
+    assert result.items[0].session_time_seconds == pytest.approx(42 * 60, abs=5)
+
+
+async def test_a_finished_session_measures_to_its_end_not_to_now():
+    org_id = uuid.uuid4()
+    started = datetime.now(UTC) - timedelta(hours=3)
+    row = _FakeGuestSession(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        started_at=started,
+        ended_at=started + timedelta(minutes=10),
+    )
+    service = LiveSessionService(
+        guest_service=_FakeGuestService([row]), rbac_service=None
+    )
+
+    result = await service.list_live_sessions(organization_id=org_id)
+
+    assert result.items[0].session_time_seconds == 600
+
+
+async def test_mac_comes_from_the_guest_device_row():
+    """"which device". MAC lives on `GuestDevice`, reachable through the
+    session's `device_id` -- never on `GuestSession` itself."""
+    org_id = uuid.uuid4()
+    device_id = uuid.uuid4()
+    row = _FakeGuestSession(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        device_id=device_id,
+    )
+    guest_service = _FakeGuestService(
+        [row], devices=[_FakeGuestDevice(id=device_id, mac_address="AA:BB:CC:DD:EE:FF")]
+    )
+    service = LiveSessionService(guest_service=guest_service, rbac_service=None)
+
+    result = await service.list_live_sessions(organization_id=org_id)
+
+    assert result.items[0].mac == "AA:BB:CC:DD:EE:FF"
+
+
+async def test_a_session_with_no_device_reports_no_mac_rather_than_empty_string():
+    org_id = uuid.uuid4()
+    row = _FakeGuestSession(
+        id=uuid.uuid4(), organization_id=org_id, location_id=uuid.uuid4()
+    )
+    service = LiveSessionService(
+        guest_service=_FakeGuestService([row]), rbac_service=None
+    )
+
+    result = await service.list_live_sessions(organization_id=org_id)
+
+    assert result.items[0].mac is None
+
+
+async def test_username_is_never_the_session_uuid():
+    """It used to fall back to `str(session.id)`, so the UI showed a UUID as a
+    guest's name. The real identifier is PII and only ever leaves through a
+    `MaskedIdentifier`-annotated field."""
+    org_id = uuid.uuid4()
+    row = _FakeGuestSession(
+        id=uuid.uuid4(), organization_id=org_id, location_id=uuid.uuid4()
+    )
+    service = LiveSessionService(
+        guest_service=_FakeGuestService([row]), rbac_service=None
+    )
+
+    result = await service.list_live_sessions(organization_id=org_id)
+
+    assert result.items[0].username != str(row.id)
+    assert result.items[0].username is None
+    assert result.items[0].guest_id == str(row.guest_id)
+
+
+async def test_a_failing_query_raises_instead_of_reporting_an_empty_venue():
+    """The most dangerous line in the old adapter: a bare `except Exception`
+    turned any failure into `items=[], total=0` -- "nobody is online" -- on
+    the one screen an operator opens to find out who is online."""
+
+    class _ExplodingGuestService:
+        async def list_sessions(self, **_kwargs):
+            raise RuntimeError("database is unreachable")
+
+    service = LiveSessionService(
+        guest_service=_ExplodingGuestService(), rbac_service=None
+    )
+
+    with pytest.raises(RuntimeError):
+        await service.list_live_sessions(organization_id=uuid.uuid4())
+
+
+async def test_total_is_the_matching_row_count_not_the_page_length():
+    """`total=len(sessions)` told the client every result fit on one page."""
+    org_id = uuid.uuid4()
+    rows = [
+        _FakeGuestSession(
+            id=uuid.uuid4(), organization_id=org_id, location_id=uuid.uuid4()
+        )
+        for _ in range(3)
+    ]
+    guest_service = _FakeGuestService(rows)
+    guest_service.total_override = 57
+    service = LiveSessionService(guest_service=guest_service, rbac_service=None)
+
+    result = await service.list_live_sessions(organization_id=org_id, page_size=3)
+
+    assert result.total == 57
+    assert len(result.items) == 3

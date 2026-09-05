@@ -13,7 +13,9 @@ from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
+from app.domains.location.scoping import enforce_target_location
 from app.domains.rbac.dependencies import (
+    CurrentLocation,
     CurrentOrganization,
     CurrentUser,
     RequirePermission,
@@ -44,8 +46,14 @@ async def list_live_sessions(
     search: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: LiveSessionService = Depends(get_live_session_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=organization_id,
+    )
     payload = await service.list_live_sessions(
         organization_id=organization_id,
         location_id=location_id,

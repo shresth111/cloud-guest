@@ -18,8 +18,12 @@ from app.domains.billing.constants import (
     PlanFeatureKey,
     SupportTier,
 )
-from app.domains.billing.service import SuperAdminBillingDashboardService
+from app.domains.billing.service import (
+    EntitlementChecker,
+    SuperAdminBillingDashboardService,
+)
 
+from .exceptions import PerCustomerFeatureOverrideNotSupportedError
 from .schemas import (
     CustomerFeaturesResponse,
     CustomerFeaturesUpdateResponse,
@@ -99,8 +103,12 @@ class FeatureEntitlementService:
     def __init__(
         self,
         billing_dashboard: SuperAdminBillingDashboardService,
+        entitlement_checker: EntitlementChecker,
     ) -> None:
         self.billing_dashboard = billing_dashboard
+        # The same object ``RequireFeature`` gates live requests against, so
+        # this domain reports exactly what the platform enforces.
+        self.entitlement_checker = entitlement_checker
 
     async def list_features(self) -> FeatureListResponse:
         features = []
@@ -138,20 +146,47 @@ class FeatureEntitlementService:
     async def get_customer_features(
         self, customer_id: uuid.UUID
     ) -> CustomerFeaturesResponse:
-        # Features are driven by the customer's active license/plan features
+        """This customer's real entitlements, read off their license and plan.
+
+        Previously this ignored ``customer_id`` entirely and returned the same
+        constant list for every customer -- every ``PlanFeatureKey`` enabled
+        except ``AI_FEATURES``/``WHITE_LABEL``, with ``limits={}`` -- under a
+        comment that said "In a real implementation, this would check the
+        customer's plan features from the billing domain. For now, return all
+        available features with reasonable defaults."
+
+        The billing domain has done exactly that all along:
+        ``EntitlementChecker.get_snapshot`` is the same cache-or-fetch read
+        model ``RequireFeature`` gates live requests against, assembled from
+        real ``License`` and ``PlanFeature`` rows. This is now a thin adapter
+        over it, so what this endpoint reports and what the platform actually
+        enforces can no longer disagree.
+        """
+        snapshot = await self.entitlement_checker.get_snapshot(customer_id)
+
         feature_values = []
         for key in PlanFeatureKey:
-            # In a real implementation, this would check the customer's plan
-            # features from the billing domain. For now, return all available
-            # features with reasonable defaults.
-            feature_values.append(CustomerFeatureValue(
-                feature_key=key.value,
-                enabled=key in BOOLEAN_FEATURE_KEYS and key not in (
-                    PlanFeatureKey.AI_FEATURES,
-                    PlanFeatureKey.WHITE_LABEL,
-                ),
-                limits={},
-            ))
+            limits: dict[str, object] = {}
+            # LIMIT-typed keys carry a number (max_locations, sms_quota, ...)
+            # and TIER-typed keys carry a tier string (support_level). Both are
+            # reported under `limits` rather than being flattened into the
+            # boolean, which is what made the old response unable to express a
+            # plan's actual ceilings at all.
+            if key.value in snapshot.limits:
+                limits["value"] = snapshot.limits[key.value]
+            if key.value in snapshot.tiers:
+                limits["tier_value"] = snapshot.tiers[key.value]
+
+            feature_values.append(
+                CustomerFeatureValue(
+                    feature_key=key.value,
+                    enabled=snapshot.has_feature(key)
+                    or key.value in snapshot.limits
+                    or key.value in snapshot.tiers,
+                    limits=limits,
+                )
+            )
+
         return CustomerFeaturesResponse(
             customer_id=str(customer_id),
             features=feature_values,
@@ -160,8 +195,13 @@ class FeatureEntitlementService:
     async def update_customer_features(
         self, customer_id: uuid.UUID, features: list[CustomerFeatureValue]
     ) -> CustomerFeaturesUpdateResponse:
-        return CustomerFeaturesUpdateResponse(
-            customer_id=str(customer_id),
-            features=features,
-            message="Customer features updated",
-        )
+        """Always refuses -- see
+        :class:`~.exceptions.PerCustomerFeatureOverrideNotSupportedError`.
+
+        There is no per-customer override model in the billing domain to write
+        to: entitlements are a property of the plan. This method used to echo
+        the caller's own payload back with ``"Customer features updated"`` and
+        persist nothing, so the failure was invisible to the operator who
+        thought they had just granted a customer a feature.
+        """
+        raise PerCustomerFeatureOverrideNotSupportedError()
