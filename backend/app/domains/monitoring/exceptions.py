@@ -110,6 +110,23 @@ class InvalidAlertRuleConfigError(MonitoringError):
         )
 
 
+class CrossLocationAlertAccessError(MonitoringError):
+    """A caller confined to particular sites reached an alert raised at
+    another site.
+
+    Distinct from the cross-*organization* guard `get_alert` already applies:
+    both sites belong to the same organization, so that comparison sees
+    nothing wrong. An alert is reached by its own id, so ``RequirePermission``
+    had nothing to pin the check to -- see ``app.domains.rbac.location_scope``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access an alert raised at a location outside your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class AlertNotFoundError(MonitoringError):
     def __init__(self, alert_id: uuid.UUID) -> None:
         super().__init__(

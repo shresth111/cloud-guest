@@ -25,6 +25,10 @@ from app.domains.otp.service import (
     get_configured_email_provider,
     get_configured_sms_provider,
 )
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    OptionalCallerLocationScope,
+)
 from app.domains.wireguard.dependencies import get_wireguard_service
 from app.domains.wireguard.service import WireGuardService
 
@@ -94,12 +98,14 @@ def get_alert_service(
     monitored_hardware_service: MonitoredHardwareService = Depends(
         get_monitored_hardware_service
     ),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> AlertService:
     return AlertService(
         repository,
         notification_service=notification_service,
         redis_client=redis_client,
         monitored_hardware_service=monitored_hardware_service,
+        caller_location_scope=caller_location_scope,
     )
 
 

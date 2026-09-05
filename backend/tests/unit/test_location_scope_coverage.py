@@ -80,6 +80,16 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "monitoring": (
+        "Seven service classes; only one owns a location-bearing row reached "
+        "by id. `Alert` via `AlertService.get_alert` -- whose docstring "
+        "already argues the organization half of exactly this case -- so the "
+        "location check sits beside it. `Incident` has no `location_id` "
+        "column, so `IncidentService.get_incident` is deliberately left "
+        "alone; `PlatformEvent` carries one but is not reached by id. "
+        "Anonymous-tolerant: `MonitoringService` is composed into "
+        "`get_guest_service` and the domain serves two WebSockets."
+    ),
     "captive_portal": (
         "`CaptivePortalConfig` via `get_config`, the chokepoint every "
         "`{config_id}` route funnels through (`_enforce_tenant_scope` is the "
@@ -206,20 +216,25 @@ PENDING: dict[str, str] = {
         "an authenticated caller, so this is the one domain that should not "
         "be batched with anything."
     ),
-    "otp": (
-        "NOT YET ANALYSED, and the domain where the suite carries the least "
-        "information: production runs `LoggingSmsProvider`, so an SMS OTP "
-        "request already produces a row and no message. A confinement mistake "
-        "here would not fail, it would join an existing silence. Read the "
-        "routes rather than trusting the tests."
-    ),
-    "monitoring": (
-        "NOT YET ANALYSED. `Alert` and `PlatformEvent` both carry a location "
-        "and two WebSockets reach the service unauthenticated by dependency."
-    ),
 }
 
 EXEMPT: dict[str, str] = {
+    "otp": (
+        "Exempt from *this* class, not from scrutiny. `OtpRequest` carries a "
+        "location, but the domain has **no by-id route at all** -- only "
+        "`/request`, `/verify` and the admin list `/requests`. There is no "
+        "'row reached by its own id' surface for a service-layer getter to "
+        "confine. Its one location-bearing surface is "
+        "`GET /otp/requests?location_id=`, a query *filter*, which belongs to "
+        "the other class: a route naming a scope id whose permission check "
+        "must be pinned to it. That is what `fix/scope-guard-sweep` closes by "
+        "making `_current_scope_context` read query parameters. "
+        "CAVEAT: until that branch lands, this filter IS reachable across "
+        "sites -- exempt here means 'wrong tool', not 'no problem'. Read "
+        "carefully rather than trusting the suite: production runs "
+        "`LoggingSmsProvider`, so an SMS OTP request already produces a row "
+        "and no message, and a break here would join an existing silence."
+    ),
     "rbac": (
         "These rows *are* the scope machinery -- UserRole, PermissionOverride, "
         "LocationRole, AuditLogEntry. Confining them by a confinement derived "

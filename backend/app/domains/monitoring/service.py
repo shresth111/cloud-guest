@@ -98,6 +98,10 @@ from app.domains.otp.service import (
     LoggingSmsProvider,
     SmsProviderProtocol,
 )
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router_provisioning.constants import EnrollmentStatus
@@ -156,6 +160,7 @@ from .events import (
 from .exceptions import (
     AlertNotFoundError,
     AlertRuleNotFoundError,
+    CrossLocationAlertAccessError,
     IncidentNotFoundError,
     InsufficientSlaDataError,
     NotificationChannelNotFoundError,
@@ -1290,9 +1295,12 @@ class AlertService:
         notification_service: NotificationService | None = None,
         redis_client: Redis | None = None,
         monitored_hardware_service: MonitoredHardwareService | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.notification_service = notification_service
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
         # Real-Time (BE-011 Part 3): optional, additive -- see
         # _publish_live_message's own docstring. ``None`` (the default) is
         # exactly how every existing caller/test that constructs
@@ -1447,6 +1455,15 @@ class AlertService:
         if alert is None:
             raise AlertNotFoundError(alert_id)
         _assert_owned_by(alert, requesting_organization_id)
+        # The location half of the same argument the docstring above makes
+        # for organizations: an alert is reached by its own id, so a
+        # LOCATION-scoped grant on the caller's own site satisfied the check
+        # while the read named another site in the same organization.
+        enforce_entity_location(
+            entity_location_id=getattr(alert, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationAlertAccessError(),
+        )
         return alert
 
     async def list_alerts(
