@@ -25,6 +25,10 @@ from app.domains.location.service import LocationService
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    OptionalCallerLocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 
 from .repository import GuestTeamRepository, GuestTeamRepositoryProtocol
@@ -43,6 +47,7 @@ def get_guest_team_service(
     location_service: LocationService = Depends(get_location_service),
     guest_service: GuestService = Depends(get_guest_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> GuestTeamService:
     return GuestTeamService(
         repository,
@@ -50,6 +55,7 @@ def get_guest_team_service(
         location_service,
         guest_service,
         audit_writer=audit_repository,
+        caller_location_scope=caller_location_scope,
     )
 
 

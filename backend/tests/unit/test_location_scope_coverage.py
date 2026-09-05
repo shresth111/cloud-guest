@@ -60,6 +60,15 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "guest_teams": (
+        "One entity, `GuestTeam`, addressed by `{team_id}` on the detail, "
+        "revoke and remove-member routes; `get_team` is the entity getter and "
+        "`get_team_summary` composes it. Uses the anonymous-tolerant "
+        "dependency because `POST /guest-teams/join` is guest-facing and "
+        "shares the provider -- but `join_team` resolves by team *code* off "
+        "the repository and never calls `get_team`, so the guest path does "
+        "not touch the confined code at all."
+    ),
     "support_tickets": (
         "One entity, `SupportTicket`, addressed by `{ticket_id}` on the four "
         "detail/reply routes; `get_ticket` is the only entity getter "
@@ -152,10 +161,6 @@ PENDING: dict[str, str] = {
         "NOT YET ANALYSED. Two entities -- `GuestAccessRule` and "
         "`DeviceAccessRule` -- so which getters the routes address needs "
         "checking before conversion, per the voucher lesson."
-    ),
-    "guest_teams": (
-        "NOT YET ANALYSED. `GuestTeam` is per-location, and the guest "
-        "`/guest-teams/join` route must stay unconfined."
     ),
     "guest": (
         "DELIBERATELY LAST, not unanalysed. `Guest`, `GuestSession` and "
@@ -347,6 +352,17 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
     import importlib
     import inspect
 
+    from app.domains.rbac.location_scope import (
+        CallerLocationScope,
+        OptionalCallerLocationScope,
+    )
+
+    # Either is acceptable. A domain whose service also backs an
+    # unauthenticated route must use the anonymous-tolerant variant, or
+    # FastAPI would resolve `CurrentUser` before the handler runs and force
+    # authentication on the guest portal. What is *not* acceptable is
+    # neither, which leaves every caller silently unconfined.
+    accepted = {CallerLocationScope, OptionalCallerLocationScope}
 
     deps = importlib.import_module(f"app.domains.{domain}.dependencies")
     providers = [
@@ -363,12 +379,12 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
         param = inspect.signature(fn).parameters.get("caller_location_scope")
         if param is not None and getattr(
             param.default, "dependency", None
-        ) is CallerLocationScope:
+        ) in accepted:
             supplying.append(fn.__name__)
 
     assert supplying, (
-        f"{domain}: no service provider resolves CallerLocationScope, so every "
-        f"caller is unconfined: {[f.__name__ for f in providers]}"
+        f"{domain}: no service provider resolves a location-scope dependency, "
+        f"so every caller is unconfined: {[f.__name__ for f in providers]}"
     )
 
 
@@ -391,7 +407,14 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
 # without authenticating. Each must be a route where being unconfined is
 # correct because the caller is a guest acting on their own session, not a
 # staff member reading a tenant's records.
-_GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {}
+_GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
+    ("POST", "/api/v1/guest-teams/join"): (
+        "A guest joining a team with a code they were given. They hold no "
+        "roles, so there is no confinement to derive, and `join_team` "
+        "resolves by team code off the repository rather than through the "
+        "confined `get_team` -- so being unconfined here grants nothing."
+    ),
+}
 
 
 def test_no_route_relies_on_confinement_without_authentication() -> None:
