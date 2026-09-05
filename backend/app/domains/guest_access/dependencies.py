@@ -44,6 +44,10 @@ from app.database.session import get_db_session
 from app.domains.guest.constants import GuestSessionStatus
 from app.domains.guest.repository import GuestRepository
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    OptionalCallerLocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
@@ -92,11 +96,13 @@ def get_guest_access_service(
     repository: GuestAccessRepositoryProtocol = Depends(get_guest_access_repository),
     block_enforcer: BlockEnforcerProtocol = Depends(get_block_enforcer),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> GuestAccessService:
     return GuestAccessService(
         repository,
         block_enforcer=block_enforcer,
         audit_writer=audit_repository,
+        caller_location_scope=caller_location_scope,
     )
 
 

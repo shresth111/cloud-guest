@@ -73,6 +73,10 @@ from typing import Protocol
 
 from app.database.utils.pagination import PaginationMeta
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 
 from .constants import (
     ACCESS_RULE_TYPE_PRECEDENCE,
@@ -86,7 +90,11 @@ from .events import (
     AccessRuleDeleted,
     GuestAccessDenied,
 )
-from .exceptions import AccessRuleNotFoundError, CrossOrganizationAccessRuleError
+from .exceptions import (
+    AccessRuleNotFoundError,
+    CrossLocationAccessRuleError,
+    CrossOrganizationAccessRuleError,
+)
 from .models import DeviceAccessRule, GuestAccessRule
 from .repository import GuestAccessRepositoryProtocol
 from .validators import (
@@ -234,8 +242,11 @@ class GuestAccessService:
         *,
         block_enforcer: BlockEnforcerProtocol | None,
         audit_writer: AuditLogWriter | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
         # Keyword-only and **without a default**, deliberately. A default
         # of ``None`` is how the original defect would come back: a
         # mis-wired construction would silently create blocks that end no
@@ -440,6 +451,14 @@ class GuestAccessService:
         if rule is None:
             raise AccessRuleNotFoundError(rule_id)
         self._enforce_tenant_scope(rule.organization_id, requesting_organization_id)
+        # Two entities in this domain, both reached by their own id, so
+        # both getters enforce -- confining one and not the other would
+        # be the `voucher` mistake.
+        enforce_entity_location(
+            entity_location_id=getattr(rule, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationAccessRuleError(),
+        )
         return rule
 
     async def list_guest_rules(
@@ -564,6 +583,14 @@ class GuestAccessService:
         if rule is None:
             raise AccessRuleNotFoundError(rule_id)
         self._enforce_tenant_scope(rule.organization_id, requesting_organization_id)
+        # Two entities in this domain, both reached by their own id, so
+        # both getters enforce -- confining one and not the other would
+        # be the `voucher` mistake.
+        enforce_entity_location(
+            entity_location_id=getattr(rule, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationAccessRuleError(),
+        )
         return rule
 
     async def list_device_rules(

@@ -60,6 +60,16 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "guest_access": (
+        "TWO entities, both addressed by id and both enforced: "
+        "`GuestAccessRule` via `get_guest_rule` (`/rules/{rule_id}`) and "
+        "`DeviceAccessRule` via `get_device_rule` "
+        "(`/device-rules/{rule_id}`). Confining one and not the other would "
+        "have been the `voucher` mistake. Uses the anonymous-tolerant "
+        "dependency because this service is composed into `get_guest_service` "
+        "as `access_control_hook`, so the strict one would have 401'd guest "
+        "login -- the composition hazard, not a route in this domain."
+    ),
     "guest_teams": (
         "One entity, `GuestTeam`, addressed by `{team_id}` on the detail, "
         "revoke and remove-member routes; `get_team` is the entity getter and "
@@ -156,11 +166,6 @@ PENDING: dict[str, str] = {
         "*series* while leaving *batches* open; `get_batch` is what the routes "
         "address. Also has unauthenticated redeem/validate. Convert against "
         "`get_batch`, and decide `get_series`/`get_plan` explicitly."
-    ),
-    "guest_access": (
-        "NOT YET ANALYSED. Two entities -- `GuestAccessRule` and "
-        "`DeviceAccessRule` -- so which getters the routes address needs "
-        "checking before conversion, per the voucher lesson."
     ),
     "guest": (
         "DELIBERATELY LAST, not unanalysed. `Guest`, `GuestSession` and "
