@@ -70,6 +70,24 @@ class CrossOrganizationLocationAccessError(LocationError):
         super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
 
 
+class CrossLocationScopeAccessError(LocationError):
+    """A caller whose permission was checked at LOCATION scope for location A
+    attempted to act on location B.
+
+    Distinct from :class:`CrossOrganizationLocationAccessError`, which catches
+    the *cross-tenant* case (a location in someone else's organization). This
+    one catches the *within-tenant* case that an organization-level check
+    cannot see: a front-desk account scoped to one site reaching a sibling
+    site under the same organization. See ``location.scoping`` for why an
+    organization-level guard alone is not sufficient."""
+
+    def __init__(
+        self,
+        message: str = "Cannot access a location outside your own location scope",
+    ) -> None:
+        super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
+
+
 class NewOrganizationRequiredError(LocationError):
     """Smart Location Provisioning: the caller supplied neither an
     ``existing_organization_id`` (provision a new location for an existing

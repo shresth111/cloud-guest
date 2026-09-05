@@ -45,7 +45,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
 from app.domains.auth.models import AuthUser
+from app.domains.location.scoping import enforce_target_location
 from app.domains.rbac.dependencies import (
+    CurrentLocation,
     CurrentOrganization,
     CurrentUser,
     RequireOrganization,
@@ -728,8 +730,14 @@ async def list_guests(
     is_blocked: bool | None = Query(default=None),
     search: str | None = Query(default=None, max_length=255),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestService = Depends(get_guest_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     guests, meta = await service.list_guests(
         requesting_organization_id=requesting_organization_id,
         location_id=location_id,
@@ -869,8 +877,14 @@ async def list_guest_sessions(
     ),
     end_date: datetime | None = Query(default=None),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestService = Depends(get_guest_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     has_real_range = start_date is not None and end_date is not None
     if has_real_range and requesting_organization_id is not None:
         sessions, meta = await service.list_sessions_in_range(
@@ -973,8 +987,14 @@ async def list_guest_login_history(
     ),
     end_date: datetime | None = Query(default=None),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestService = Depends(get_guest_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     has_real_range = start_date is not None and end_date is not None
     if has_real_range and requesting_organization_id is not None:
         entries, meta = await service.list_login_history_in_range(
@@ -1435,8 +1455,14 @@ async def list_radius_nas(
     router_id: uuid.UUID | None = Query(default=None),
     status_filter: NasStatus | None = Query(default=None, alias="status"),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: RadiusService = Depends(get_radius_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     nas_clients, meta = await service.list_nas_clients(
         requesting_organization_id=requesting_organization_id,
         location_id=location_id,
@@ -1864,8 +1890,14 @@ async def list_radius_nas_for_location(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: RadiusService = Depends(get_radius_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=requesting_organization_id,
+    )
     nas_clients, meta = await service.list_nas_clients(
         requesting_organization_id=requesting_organization_id,
         location_id=location_id,
@@ -2071,8 +2103,14 @@ async def get_guest_analytics_summary(
     end_date: datetime = Query(...),
     location_id: uuid.UUID | None = Query(default=None),
     organization_id: uuid.UUID = Depends(RequireOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestAnalyticsService = Depends(get_guest_analytics_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=organization_id,
+    )
     summary = await service.get_summary(
         organization_id=organization_id,
         location_id=location_id,
@@ -2176,8 +2214,14 @@ async def get_otp_success_rate(
     end_date: datetime = Query(...),
     location_id: uuid.UUID | None = Query(default=None),
     organization_id: uuid.UUID = Depends(RequireOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestAnalyticsService = Depends(get_guest_analytics_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=organization_id,
+    )
     result = await service.get_otp_success_rate(
         organization_id=organization_id,
         location_id=location_id,
@@ -2208,8 +2252,14 @@ async def get_voucher_usage(
     end_date: datetime = Query(...),
     location_id: uuid.UUID | None = Query(default=None),
     organization_id: uuid.UUID = Depends(RequireOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     service: GuestAnalyticsService = Depends(get_guest_analytics_service),
 ):
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=organization_id,
+    )
     result = await service.get_voucher_usage(
         organization_id=organization_id,
         location_id=location_id,
