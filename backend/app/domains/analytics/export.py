@@ -85,6 +85,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from app.common.spreadsheet_safety import sanitize_spreadsheet_row
+
 from .constants import ExportFormat
 from .exceptions import UnsupportedExportFormatError
 from .report_types import ReportPayload, extract_tabular_blocks, flatten_scalar_fields
@@ -180,15 +182,17 @@ def _render_csv(payload: ReportPayload) -> bytes:
     writer.writerow(["section", "field", "value"])
     for section in payload.sections:
         for field_path, value in flatten_scalar_fields(section.data):
-            writer.writerow([section.key, field_path, value])
+            writer.writerow(
+                sanitize_spreadsheet_row([section.key, field_path, value])
+            )
 
     for section in payload.sections:
         for block in extract_tabular_blocks(section.data):
             writer.writerow([])
             writer.writerow([f"## {section.key}.{block.name}"])
-            writer.writerow(block.columns)
+            writer.writerow(sanitize_spreadsheet_row(list(block.columns)))
             for row in block.rows:
-                writer.writerow(row)
+                writer.writerow(sanitize_spreadsheet_row(list(row)))
 
     return buffer.getvalue().encode("utf-8")
 
@@ -223,7 +227,9 @@ def _render_excel(payload: ReportPayload) -> bytes:
     summary_sheet.append(["Section", "Field", "Value"])
     for section in payload.sections:
         for field_path, value in flatten_scalar_fields(section.data):
-            summary_sheet.append([section.key, field_path, str(value)])
+            summary_sheet.append(
+                sanitize_spreadsheet_row([section.key, field_path, str(value)])
+            )
 
     for section in payload.sections:
         for block in extract_tabular_blocks(section.data):
@@ -231,9 +237,9 @@ def _render_excel(payload: ReportPayload) -> bytes:
                 f"{section.key}_{block.name}", taken=taken_sheet_names
             )
             sheet = workbook.create_sheet(title=sheet_name)
-            sheet.append(block.columns)
+            sheet.append(sanitize_spreadsheet_row(list(block.columns)))
             for row in block.rows:
-                sheet.append([str(cell) for cell in row])
+                sheet.append(sanitize_spreadsheet_row([str(cell) for cell in row]))
 
     buffer = io.BytesIO()
     workbook.save(buffer)
