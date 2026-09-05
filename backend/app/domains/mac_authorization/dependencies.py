@@ -15,8 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.session import get_db_session
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.location_scope import (
-    CallerLocationScope,
     LocationScope,
+    OptionalCallerLocationScope,
 )
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
@@ -38,7 +38,7 @@ def get_mac_authorization_service(
     ),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     router_service: RouterService = Depends(get_router_service),
-    caller_location_scope: LocationScope = Depends(CallerLocationScope),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> MacAuthorizationService:
     return MacAuthorizationService(
         repository,

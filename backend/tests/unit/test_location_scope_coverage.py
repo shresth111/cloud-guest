@@ -407,6 +407,48 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
 # correct because the caller is a guest acting on their own session, not a
 # staff member reading a tenant's records.
 _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
+    ("POST", "/api/v1/guest/login/otp"): (
+        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("POST", "/api/v1/guest/login/voucher"): (
+        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("POST", "/api/v1/guest/login/password"): (
+        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("POST", "/api/v1/guest/login/pin"): (
+        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("POST", "/api/v1/guest/consent"): (
+        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("POST", "/api/v1/guest/profile"): (
+        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("POST", "/api/v1/guest/set-password"): (
+        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("POST", "/api/v1/guest/set-pin"): (
+        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("GET", "/api/v1/guest/session/active"): (
+        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("POST", "/api/v1/guest/session/disconnect"): (
+        "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
+    ),
+    ("POST", "/api/v1/radius/authorize"): (
+        "Authenticated by the NAS shared secret (`CurrentNas`), not by a user session -- the router itself is the caller. It has no RBAC grants and therefore no location confinement, and it must never 401: this is the path every guest's traffic authorises through."
+    ),
+    ("POST", "/api/v1/radius/accounting"): (
+        "Authenticated by the NAS shared secret (`CurrentNas`), not by a user session -- the router itself is the caller. It has no RBAC grants and therefore no location confinement, and it must never 401: this is the path every guest's traffic authorises through."
+    ),
+    ("GET", "/api/v1/agent/authorized-macs"): (
+        "Authenticated by the router agent's own credential (`CurrentAgent`), not by a user session. Same reasoning as the RADIUS routes: a device is the caller, holds no grants, and must not be confined."
+    ),
+    ("POST", "/api/v1/agent/netwatch-event"): (
+        "Authenticated by the router agent's own credential (`CurrentAgent`), not by a user session. Same reasoning as the RADIUS routes: a device is the caller, holds no grants, and must not be confined."
+    ),
     ("POST", "/api/v1/guest-teams/join"): (
         "A guest joining a team with a code they were given. They hold no "
         "roles, so there is no confinement to derive, and `join_team` "
@@ -417,27 +459,55 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
 
 
 def test_no_route_relies_on_confinement_without_authentication() -> None:
+    """Also catches the inverse: a confinement dependency *adding* auth.
+
+    The first version of this test asked "is `CurrentUser` anywhere in the
+    route's dependency graph?" and answered yes for every route -- because
+    `CallerLocationScope` depends on `CurrentUser` and had just been added to
+    the graph. It reported zero offenders while fifteen routes were broken,
+    including every guest login method and `POST /radius/authorize`.
+
+    So the graph is walked twice: once for everything, and once **excluding
+    the confinement dependencies' own subtrees**, which is the authentication
+    a route has on its own account. A route with no independent authentication
+    that reaches a confined service is either a guest route needing the
+    anonymous-tolerant dependency, or a route that just had authentication
+    silently added to it.
+    """
     from app.domains.rbac.dependencies import CurrentUser
     from app.domains.rbac.location_scope import (
+        CallerLocationScope,
         OptionalCallerLocationScope,
     )
     from app.main import create_app
 
-    confinement_deps = {CallerLocationScope, OptionalCallerLocationScope}
+    confinement = {CallerLocationScope, OptionalCallerLocationScope}
+
+    def all_calls(dependant) -> set:
+        found = {d.call for d in dependant.dependencies}
+        for d in dependant.dependencies:
+            found |= all_calls(d)
+        return found
+
+    def independent_calls(dependant) -> set:
+        """Everything reachable *except* through a confinement dependency."""
+        found = set()
+        for d in dependant.dependencies:
+            if d.call in confinement:
+                continue
+            found.add(d.call)
+            found |= independent_calls(d)
+        return found
+
     offenders = []
     for route in create_app().routes:
         dependant = getattr(route, "dependant", None)
-        if dependant is None:
-            continue
-        resolved = _dependency_calls(dependant)
-        if not (resolved & confinement_deps):
+        if dependant is None or not (all_calls(dependant) & confinement):
             continue
 
-        names = {getattr(f, "__qualname__", "") for f in resolved}
-        authenticated = CurrentUser in resolved or any(
-            n.startswith("RequirePermission") for n in names
-        )
-        if authenticated:
+        own = independent_calls(dependant)
+        names = {getattr(f, "__qualname__", "") for f in own}
+        if CurrentUser in own or any(n.startswith("RequirePermission") for n in names):
             continue
 
         path = getattr(route, "path", "")
@@ -448,11 +518,11 @@ def test_no_route_relies_on_confinement_without_authentication() -> None:
         offenders.append(f"{sorted(methods)} {path}")
 
     assert not offenders, (
-        "These routes reach a location-confined service without requiring "
-        "authentication, so omitting the Authorization header makes the "
-        "caller unconfined:\n"
+        "These routes have no authentication of their own but reach a "
+        "location-confined service:\n"
         + "\n".join(f"  {o}" for o in sorted(offenders))
-        + "\n\nEither require authentication, or -- if the caller is genuinely "
-        "a guest acting on their own session -- add it to "
+        + "\n\nEither the domain needs OptionalCallerLocationScope (the strict "
+        "one drags CurrentUser in and turns a guest route into a 401), or -- if "
+        "being unconfined there is correct -- add it to "
         "_GUEST_FACING_UNCONFINED with the reason."
     )

@@ -23,8 +23,8 @@ from app.domains.policy.dependencies import get_policy_service
 from app.domains.policy.service import PolicyService
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.location_scope import (
-    CallerLocationScope,
     LocationScope,
+    OptionalCallerLocationScope,
 )
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
@@ -47,7 +47,7 @@ def get_queue_management_service(
     router_service: RouterService = Depends(get_router_service),
     policy_service: PolicyService = Depends(get_policy_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
-    caller_location_scope: LocationScope = Depends(CallerLocationScope),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> QueueManagementService:
     return QueueManagementService(
         repository,
