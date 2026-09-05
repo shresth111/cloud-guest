@@ -22,6 +22,9 @@ __all__ = [
     "DiagnosticsDeviceConnectionError",
     "DiagnosticsDeviceOperationError",
     "UnsupportedDiagnosticsVendorError",
+    "InvalidDiagnosticTargetError",
+    "DiagnosticCooldownError",
+    "DiagnosticRateLimitExceededError",
 ]
 
 
@@ -107,4 +110,64 @@ class UnsupportedDiagnosticsVendorError(NetworkDiagnosticsError):
         super().__init__(
             f"No diagnostics adapter registered for vendor '{vendor}'",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidDiagnosticTargetError(NetworkDiagnosticsError):
+    """The caller asked to run a diagnostic against something that is not a
+    real, probeable destination -- see ``validators.normalize_target`` for
+    exactly what is and is not enforceable here (and why a public target
+    cannot honestly be checked against "is this the customer's own to
+    probe").
+
+    A 422, not a diagnostic outcome: nothing was attempted, so -- like
+    :class:`MissingDiagnosticsCredentialsError` -- no ``DiagnosticRun`` row
+    is recorded."""
+
+    def __init__(self, target: str, reason: str) -> None:
+        super().__init__(
+            f"Invalid diagnostic target '{target}': {reason}",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
+class DiagnosticCooldownError(NetworkDiagnosticsError):
+    """A diagnostic against this router ran too recently -- mirrors
+    ``app.domains.isp.exceptions.IspSpeedTestCooldownError`` exactly,
+    including reporting the real, live remaining TTL rather than a fixed
+    guess, and refusing rather than silently queueing.
+
+    See ``constants.py``'s abuse-controls section for why a per-router
+    cooldown and a per-organization window are two different controls
+    doing two different jobs."""
+
+    def __init__(self, router_id: uuid.UUID, retry_after_seconds: int) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(
+            f"A diagnostic was run against router '{router_id}' too recently; "
+            f"retry in {retry_after_seconds}s",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            data={"retry_after_seconds": retry_after_seconds},
+        )
+
+
+class DiagnosticRateLimitExceededError(NetworkDiagnosticsError):
+    """This organization has run its allowance of diagnostics for the
+    current window (``constants.DIAGNOSTIC_ORG_MAX_RUNS_PER_WINDOW``).
+
+    Keyed on the organization rather than the router or the caller's IP:
+    the router is caller-chosen and therefore rotatable, and an office
+    behind one NAT would share an IP bucket between every admin in it.
+    ``CurrentOrganization`` validates membership, so the organization is
+    the one component of this request the caller cannot vary to mint a
+    fresh bucket -- the same reasoning ``app.middleware.rate_limit``
+    documents for its own venue/IP pair."""
+
+    def __init__(self, retry_after_seconds: int) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(
+            "This organization has run too many diagnostics recently; "
+            f"retry in {retry_after_seconds}s",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            data={"retry_after_seconds": retry_after_seconds},
         )

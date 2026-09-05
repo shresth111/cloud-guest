@@ -1493,10 +1493,13 @@ class MikroTikAdapter:
         the identical real RouterOS command
         (``api("/tool/ping", address=target, count=str(count))``) and parse
         the reply identically. ``timeout_seconds`` is accepted for Protocol
-        parity with both originals but, exactly like both originals, is not
-        itself used inside the ping command -- only ``creds.timeout_seconds``
-        (used when opening the connection) matters, an existing, if slightly
-        odd, real behavior preserved verbatim rather than "fixed" here."""
+        parity with both originals and is still not used inside the ping
+        command itself -- RouterOS's ``/tool/ping`` has no matching
+        parameter. What bounds one call is ``creds.timeout_seconds`` (the
+        socket timeout, below) and, for callers that impose one, their own
+        deadline: ``app.domains.network_diagnostics.service`` now wraps
+        this call in ``asyncio.wait_for`` so the parameter its API accepts
+        is a real bound rather than a discarded one."""
         return await asyncio.to_thread(self._ping_sync, creds, target, count)
 
     def _ping_sync(self, creds: DeviceCredentials, target: str, count: int) -> PingResult:
@@ -1504,8 +1507,25 @@ class MikroTikAdapter:
         try:
             try:
                 rows = list(api("/tool/ping", address=target, count=str(count)))
-            except LibRouterosError as exc:
-                raise MikroTikDeviceError(creds.host, f"ping failed: {exc}") from exc
+            except (LibRouterosError, OSError) as exc:
+                # OSError matters as much as LibRouterosError here, and it
+                # used to be missing. librouteros passes creds.timeout_seconds
+                # to socket.create_connection, which makes it the timeout on
+                # every subsequent recv as well as on the connect; its own
+                # SocketTransport.read calls sock.recv with NO exception
+                # translation. So a router that accepts the connection and
+                # then goes quiet -- a flaky tunnel, a saturated uplink --
+                # raises a bare socket TimeoutError, which is an OSError and
+                # is NOT a LibRouterosError. It therefore missed this clause,
+                # missed the domain adapter's own except clauses, missed the
+                # service's, and surfaced as an HTTP 500 with no DiagnosticRun
+                # row recorded at all: the single failure the diagnostics page
+                # most needs to report honestly was the one failure that left
+                # no trace. _describe_exception because a bare TimeoutError's
+                # str() is empty.
+                raise MikroTikDeviceError(
+                    creds.host, f"ping failed: {_describe_exception(exc)}"
+                ) from exc
         finally:
             api.close()
         sent, received, packet_loss, avg_rtt_ms = _parse_ping_rows(
@@ -1551,8 +1571,15 @@ class MikroTikAdapter:
                         **{"max-hops": str(max_hops)},
                     )
                 )
-            except LibRouterosError as exc:
-                raise MikroTikDeviceError(creds.host, f"traceroute failed: {exc}") from exc
+            except (LibRouterosError, OSError) as exc:
+                # See _ping_sync's own comment: a socket read timeout is an
+                # OSError, not a LibRouterosError, and without this it
+                # escaped every layer above as a bare 500. A traceroute is
+                # the more likely of the two to stall, since an unresponsive
+                # hop is a normal thing for it to encounter.
+                raise MikroTikDeviceError(
+                    creds.host, f"traceroute failed: {_describe_exception(exc)}"
+                ) from exc
         finally:
             api.close()
         return TracerouteResult(hops=_parse_traceroute_rows(rows))

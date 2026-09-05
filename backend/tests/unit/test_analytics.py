@@ -816,6 +816,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # -- the scheduled rogue-DHCP detector, and the first caller
     # ``wyfy_device_gateway.mikrotik_adapter.read_rogue_dhcp_alerts`` has
     # ever had. See app.domains.dhcp.tasks's own module docstring.
+    # Network Diagnostics adds a twenty-first Beat entry
+    # ("network-diagnostics-run-retention-sweep") -- the first and only
+    # thing that ever deletes a `diagnostic_runs` row. See
+    # app.domains.network_diagnostics.tasks's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -856,6 +860,12 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "notification-dispatch-sweep",
         "monitoring-alert-rule-evaluation-sweep",
         "provisioning-engine-router-snmp-metrics-poll-sweep",
+        # `diagnostic_runs` is append-only and had no TTL and no purge job
+        # of any kind, while the endpoint that writes it had no rate limit
+        # -- an authenticated customer could grow the table without bound,
+        # one JSONB blob per row. Its absence from this set is not a
+        # missing schedule entry, it is a table with no ceiling.
+        "network-diagnostics-run-retention-sweep",
         # Reads /ip dhcp-server alert per DHCP-serving router and persists
         # the answer for the readiness checklist to display. Its absence
         # from this set is not a missing schedule entry, it is a fleet in

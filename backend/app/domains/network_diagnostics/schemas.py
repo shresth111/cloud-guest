@@ -19,7 +19,12 @@ from app.domains.network_diagnostics.constants import (
     DEFAULT_PING_TIMEOUT_SECONDS,
     DEFAULT_TRACEROUTE_MAX_HOPS,
     DEFAULT_TRACEROUTE_TIMEOUT_SECONDS,
+    MAX_PING_COUNT,
+    MAX_PING_TIMEOUT_SECONDS,
+    MAX_TRACEROUTE_MAX_HOPS,
+    MAX_TRACEROUTE_TIMEOUT_SECONDS,
 )
+from app.domains.network_diagnostics.validators import MAX_TARGET_LENGTH
 
 __all__ = [
     "PingRequest",
@@ -30,16 +35,35 @@ __all__ = [
 
 
 class PingRequest(BaseModel):
-    target: str = Field(..., min_length=1, max_length=255)
-    count: int = Field(default=DEFAULT_PING_COUNT, ge=1, le=50)
-    timeout_seconds: int = Field(default=DEFAULT_PING_TIMEOUT_SECONDS, ge=1, le=60)
+    """``target`` is only length-checked here; its real validation (and
+    canonicalization) is ``validators.normalize_target``, called by the
+    service so that the value persisted in the history is the normalized
+    one and the rejection is this domain's own
+    ``InvalidDiagnosticTargetError`` rather than a raw pydantic error.
+
+    ``count`` and ``timeout_seconds`` are bounded well below their
+    previous ceilings -- see ``constants.py``'s own write-up on why 50
+    packets was a fifty-second request, and why ``timeout_seconds`` is now
+    a real deadline rather than an accepted-and-discarded parameter."""
+
+    target: str = Field(..., min_length=1, max_length=MAX_TARGET_LENGTH)
+    count: int = Field(default=DEFAULT_PING_COUNT, ge=1, le=MAX_PING_COUNT)
+    timeout_seconds: int = Field(
+        default=DEFAULT_PING_TIMEOUT_SECONDS, ge=1, le=MAX_PING_TIMEOUT_SECONDS
+    )
 
 
 class TracerouteRequest(BaseModel):
-    target: str = Field(..., min_length=1, max_length=255)
-    max_hops: int = Field(default=DEFAULT_TRACEROUTE_MAX_HOPS, ge=1, le=64)
+    """See :class:`PingRequest` for the target/bounds write-up."""
+
+    target: str = Field(..., min_length=1, max_length=MAX_TARGET_LENGTH)
+    max_hops: int = Field(
+        default=DEFAULT_TRACEROUTE_MAX_HOPS, ge=1, le=MAX_TRACEROUTE_MAX_HOPS
+    )
     timeout_seconds: int = Field(
-        default=DEFAULT_TRACEROUTE_TIMEOUT_SECONDS, ge=1, le=120
+        default=DEFAULT_TRACEROUTE_TIMEOUT_SECONDS,
+        ge=1,
+        le=MAX_TRACEROUTE_TIMEOUT_SECONDS,
     )
 
 
