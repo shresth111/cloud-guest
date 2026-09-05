@@ -159,6 +159,10 @@ from app.domains.network_config.renderers import (
     HOTSPOT_HTML_DIRECTORY,
 )
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.models import Router
 
 from .constants import DEVICE_CARRIED_FIELDS, VlanDevicePushStatus
@@ -171,6 +175,7 @@ from .device_adapters import (
 )
 from .events import VlanCreated, VlanDeleted, VlanPushed, VlanUpdated
 from .exceptions import (
+    CrossLocationVlanAccessError,
     CrossOrganizationVlanAccessError,
     VlanAccessPortNotFoundError,
     VlanDeviceConnectionError,
@@ -273,9 +278,19 @@ class VlanService:
         *,
         dhcp_pool_lookup: DhcpPoolLookupProtocol,
         audit_writer: AuditLogWriter | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
+        # Constructor-injected while `requesting_organization_id` stays
+        # per-method: an organization id is an *argument* (which tenant
+        # this call is about, and a Celery task legitimately varies it
+        # per call), whereas a location confinement is a *property of
+        # the caller*, fixed for the request, and a security control.
+        # Threading a security control through every method means every
+        # method can forget it, silently. See
+        # `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
         # Required, not optional-with-a-None-default. The captive-portal
         # DHCP conflict check is the one thing standing between a customer
         # and two DHCP servers on one interface, and a default of None
@@ -367,6 +382,14 @@ class VlanService:
             and vlan.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationVlanAccessError()
+        # Not enough on its own: this row is reached by its own id, so the
+        # permission check had nothing to pin to and a LOCATION grant on
+        # the caller's own site satisfied it.
+        enforce_entity_location(
+            entity_location_id=getattr(vlan, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationVlanAccessError(),
+        )
         return vlan
 
     async def list_vlans(

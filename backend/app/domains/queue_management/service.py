@@ -72,6 +72,10 @@ from typing import Any, Protocol
 from app.domains.policy.constants import PolicyType
 from app.domains.policy.schemas import BandwidthPolicyRules
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.models import Router
 
 from .constants import (
@@ -171,12 +175,15 @@ class QueueManagementService:
         *,
         audit_writer: AuditLogWriter | None = None,
         device_adapter_resolver=get_queue_adapter,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.policy_lookup = policy_lookup
         self.audit_writer = audit_writer
         self._get_device_adapter = device_adapter_resolver
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     # ========================================================================
     # Queue profiles
@@ -539,6 +546,16 @@ class QueueManagementService:
             and assignment.organization_id != requesting_organization_id
         ):
             raise QueueAssignmentNotFoundError(assignment_id)
+        # Same reasoning as firewall, but raising this domain's own
+        # NotFound rather than a 403: it already answers a foreign
+        # *organization* that way so as not to confirm the row exists,
+        # and a location refusal that 403s would leak exactly what the
+        # organization refusal is careful not to.
+        enforce_entity_location(
+            entity_location_id=getattr(assignment, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=QueueAssignmentNotFoundError(assignment_id),
+        )
         return assignment
 
     async def list_assignments(

@@ -47,6 +47,15 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "monitored_hardware": (
+        "The hardware inventory and up/down view for a site. Raises its own NotFound rather than a 403, preserving this domain's existing choice not to confirm a row exists."
+    ),
+    "queue_management": (
+        "Bandwidth queues shape a site's guest traffic. Same NotFound-not-403 convention as monitored_hardware."
+    ),
+    "vlan": (
+        "VLANs are the guest/office separation itself; a confined account could reshape another site's segmentation."
+    ),
     "connected_devices": (
         "Connected-device rows are the live view of who is on another site's network."
     ),
@@ -92,9 +101,6 @@ LOCATION_SCOPED: dict[str, str] = {
 }
 
 PENDING: dict[str, str] = {
-    "vlan": "Same shape as firewall.",
-    "monitored_hardware": "Same shape as firewall.",
-    "queue_management": "Same shape as firewall.",
     "captive_portal": (
         "Portal configs are per-location. Needs care: the guest-facing "
         "resolve path must stay unconfined, since a guest has no grants."
