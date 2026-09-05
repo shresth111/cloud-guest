@@ -119,6 +119,15 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ("PUT", "/api/v1/me"): "Self-service -- own profile.",
     ("GET", "/api/v1/me/organizations"): "Self-service -- own memberships.",
     ("GET", "/api/v1/me/permissions"): "Self-service -- own effective permissions.",
+    # Same category, and ungated for a specific reason: the dashboard reads
+    # entitlements to decide which features to lock, and must do that for
+    # every signed-in user. The only entitlement read was
+    # GET /customers/{id}/features, gated on `billing.read` -- which an
+    # Organization Owner holds and a front-desk staff member does not -- so
+    # the locked-feature UI worked for owners and silently failed open for
+    # staff. This one always answers for the caller's own organization,
+    # never one they name.
+    ("GET", "/api/v1/me/entitlements"): "Self-service -- own org's entitlements.",
     # -- Workspace: self-service among orgs the caller already belongs
     # to -- CurrentUser establishes identity, WorkspaceService itself
     # filters/validates membership; there is no meaningful org-scoped

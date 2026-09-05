@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -175,3 +176,106 @@ class TestCustomerFeatureWritesAreRefused:
             assert exc.status_code == 501
         else:  # pragma: no cover - the call above must raise
             raise AssertionError("update_customer_features silently succeeded")
+
+
+# ---------------------------------------------------------------------------
+# Self-service entitlements, and the tenant boundary on the admin routes
+# ---------------------------------------------------------------------------
+
+
+def _route(path: str, method: str):
+    from app.main import create_app
+
+    return next(
+        r
+        for r in create_app().routes
+        if getattr(r, "path", None) == path and method in getattr(r, "methods", set())
+    )
+
+
+def _dependency_calls(dependant) -> set:
+    calls = {d.call for d in dependant.dependencies}
+    for d in dependant.dependencies:
+        calls |= _dependency_calls(d)
+    return calls
+
+
+def test_me_entitlements_exists() -> None:
+    assert _route("/api/v1/me/entitlements", "GET") is not None
+
+
+def test_me_entitlements_is_not_permission_gated() -> None:
+    """The point of the endpoint.
+
+    The only entitlement read was gated on `billing.read`, which an
+    Organization Owner holds and a front-desk staff member does not. The
+    dashboard needs entitlements to decide what to lock for *every* signed-in
+    user, so gating it made the locked-feature UI work for owners and
+    silently fail open for staff -- a permission gate turning "you may not
+    ask" into "everything appears unlocked".
+    """
+    names = {
+        getattr(f, "__qualname__", "")
+        for f in _dependency_calls(_route("/api/v1/me/entitlements", "GET").dependant)
+    }
+    assert not any(n.startswith("RequirePermission") for n in names)
+
+
+def test_me_entitlements_still_requires_a_signed_in_user() -> None:
+    """Ungated is not unauthenticated -- it must resolve *whose* entitlements
+    to report, and never accept an organization named by the caller."""
+    from app.domains.rbac.dependencies import CurrentOrganization, CurrentUser
+
+    calls = _dependency_calls(_route("/api/v1/me/entitlements", "GET").dependant)
+    assert CurrentUser in calls
+    assert CurrentOrganization in calls
+
+
+def test_me_entitlements_takes_no_customer_id_parameter() -> None:
+    """If it accepted one it would be `/customers/{id}/features` with the
+    permission gate removed, which is the opposite of the intent."""
+    route = _route("/api/v1/me/entitlements", "GET")
+    names = {p.name for p in route.dependant.query_params + route.dependant.path_params}
+    assert "customer_id" not in names
+    assert "organization_id" not in names
+
+
+class TestAdminEntitlementRoutesAreTenantScoped:
+    """`customer_id` is an organization id read from the **path**, while
+    `RequirePermission` resolves its scope from the **header**. The usual
+    path-parameter fallback does not cover it, because that looks for a
+    parameter literally named `organization_id`. So any tenant holding
+    `billing.read` could read another tenant's plan and limits."""
+
+    def test_read_route_resolves_the_callers_own_organization(self) -> None:
+        from app.domains.rbac.dependencies import CurrentOrganization
+
+        calls = _dependency_calls(
+            _route("/api/v1/customers/{customer_id}/features", "GET").dependant
+        )
+        assert CurrentOrganization in calls
+
+    def test_write_route_resolves_the_callers_own_organization(self) -> None:
+        from app.domains.rbac.dependencies import CurrentOrganization
+
+        calls = _dependency_calls(
+            _route("/api/v1/customers/{customer_id}/features", "PUT").dependant
+        )
+        assert CurrentOrganization in calls
+
+    async def test_a_foreign_organization_is_refused(self) -> None:
+        from app.domains.organization.exceptions import CrossOrganizationAccessError
+        from app.domains.organization.scoping import enforce_target_organization
+
+        class _Orgs:
+            async def get_organization(self, organization_id):
+                return SimpleNamespace(
+                    id=organization_id, parent_organization_id=None
+                )
+
+        with pytest.raises(CrossOrganizationAccessError):
+            await enforce_target_organization(
+                target_organization_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+                organization_service=_Orgs(),
+            )
