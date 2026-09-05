@@ -48,13 +48,17 @@ from app.domains.rbac.location_scope import CallerLocationScope
 
 LOCATION_SCOPED: dict[str, str] = {
     "monitored_hardware": (
-        "The hardware inventory and up/down view for a site. Raises its own NotFound rather than a 403, preserving this domain's existing choice not to confirm a row exists."
+        "The hardware inventory and up/down view for a site. Raises its own"
+        "NotFound rather than a 403, preserving this domain's existing choice"
+        "not to confirm a row exists."
     ),
     "queue_management": (
-        "Bandwidth queues shape a site's guest traffic. Same NotFound-not-403 convention as monitored_hardware."
+        "Bandwidth queues shape a site's guest traffic. Same NotFound-not-403"
+        "convention as monitored_hardware."
     ),
     "vlan": (
-        "VLANs are the guest/office separation itself; a confined account could reshape another site's segmentation."
+        "VLANs are the guest/office separation itself; a confined account could"
+        "reshape another site's segmentation."
     ),
     "connected_devices": (
         "Connected-device rows are the live view of who is on another site's network."
@@ -63,10 +67,12 @@ LOCATION_SCOPED: dict[str, str] = {
         "Sync runs read another site's router."
     ),
     "dhcp": (
-        "DHCP pools are per-router and per-site; a confined account could repoint another site's address range."
+        "DHCP pools are per-router and per-site; a confined account could"
+        "repoint another site's address range."
     ),
     "dns": (
-        "DNS records are per-router; a confined account could redirect another site's name resolution."
+        "DNS records are per-router; a confined account could redirect another"
+        "site's name resolution."
     ),
     "hotspot": (
         "Hotspot profiles carry the walled garden a guest sees before login."
@@ -84,7 +90,8 @@ LOCATION_SCOPED: dict[str, str] = {
         "The device inventory for a site."
     ),
     "port_forwarding": (
-        "Port-forward rules expose internal hosts; a confined account could open a port at another site."
+        "Port-forward rules expose internal hosts; a confined account could"
+        "open a port at another site."
     ),
     "qos": (
         "QoS rules shape another site's traffic, including voice priority."
