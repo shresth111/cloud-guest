@@ -226,75 +226,67 @@ def test_every_entry_carries_a_reason() -> None:
 
 
 @pytest.mark.parametrize("domain", sorted(LOCATION_SCOPED))
-def test_a_converted_domain_resolves_the_confinement_on_every_route(
-    domain: str,
-) -> None:
-    """`caller_location_scope` defaults to `None` -- unconfined -- all the way
-    down, so a route that forgets to resolve it fails **open**. That default is
-    deliberate (it keeps system-internal composition working, where there is no
-    caller to confine), which makes this test the thing that stops it being a
-    hole.
+def test_a_converted_domains_service_takes_the_confinement(domain: str) -> None:
+    """The service must accept the confinement at construction.
+
+    Constructor injection rather than a per-method argument, because a method
+    that accepts a security control can forget to use it: a mutator that took
+    `caller_location_scope` and did not pass it into the getter produced no
+    error, no test failure and no enforcement. With it on the instance there is
+    nothing per-method to forget.
     """
-    routes = list(_routes_of_domain(domain))
-    assert routes, f"no routes found for {domain!r} -- the module filter is wrong"
+    import importlib
+    import inspect
 
-    missing = [
-        f"{sorted(getattr(r, 'methods', []))} {getattr(r, 'path', '')}"
-        for r in routes
-        if CallerLocationScope not in _dependency_calls(r.dependant)
+    module = importlib.import_module(f"app.domains.{domain}.service")
+    services = [
+        obj
+        for _n, obj in vars(module).items()
+        if inspect.isclass(obj)
+        and obj.__module__ == module.__name__
+        and _n.endswith("Service")
     ]
+    assert services, f"no service class found in {domain}"
 
-    assert not missing, (
-        f"{domain}: these routes do not resolve CallerLocationScope, so the "
-        f"service cannot confine them and they fail open:\n"
-        + "\n".join(f"  {m}" for m in missing)
+    accepting = [
+        cls
+        for cls in services
+        if "caller_location_scope" in inspect.signature(cls.__init__).parameters
+    ]
+    assert accepting, (
+        f"{domain}: no service takes `caller_location_scope` at construction, "
+        f"so nothing can confine it: {[c.__name__ for c in services]}"
     )
 
 
 @pytest.mark.parametrize("domain", sorted(LOCATION_SCOPED))
-def test_a_converted_domain_is_signature_consistent(domain: str) -> None:
-    """Every service method the router hands ``caller_location_scope`` must
-    actually accept it.
-
-    This is not hypothetical. The first attempt at replicating the firewall
-    shape added the dependency to the routes and the enforcement to the getter,
-    but not the parameter to `create`/`update`/`delete`/`list` -- so those five
-    endpoints would have raised ``TypeError`` on every call. The domain's own
-    unit tests passed throughout, because they exercise the service directly
-    and never go through the router. Nothing else in the suite looks at the
-    seam between the two.
-    """
+def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> None:
+    """A constructor parameter nothing supplies is unconfined by default -- it
+    fails **open**. The DI provider is the single place that must fill it, so
+    this is where forgetting becomes visible."""
     import importlib
     import inspect
-    import re
 
-    router_module = importlib.import_module(f"app.domains.{domain}.router")
-    service_module = importlib.import_module(f"app.domains.{domain}.service")
 
-    source = inspect.getsource(router_module)
-    called = set(re.findall(r"await (?:service|\w+_service)\.(\w+)\(", source))
-    assert called, f"no service calls found in {domain}'s router -- pattern is wrong"
-
-    service_classes = [
-        obj
-        for _name, obj in vars(service_module).items()
-        if inspect.isclass(obj) and obj.__module__ == service_module.__name__
+    deps = importlib.import_module(f"app.domains.{domain}.dependencies")
+    providers = [
+        fn
+        for name, fn in vars(deps).items()
+        if inspect.isfunction(fn)
+        and name.startswith("get_")
+        and name.endswith("_service")
     ]
+    assert providers, f"no `get_*_service` provider found in {domain}"
 
-    missing = []
-    for method_name in sorted(called):
-        for cls in service_classes:
-            fn = getattr(cls, method_name, None)
-            if fn is None or not inspect.isfunction(fn):
-                continue
-            params = inspect.signature(fn).parameters
-            if "caller_location_scope" not in params and not any(
-                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-            ):
-                missing.append(f"{cls.__name__}.{method_name}")
+    supplying = []
+    for fn in providers:
+        param = inspect.signature(fn).parameters.get("caller_location_scope")
+        if param is not None and getattr(
+            param.default, "dependency", None
+        ) is CallerLocationScope:
+            supplying.append(fn.__name__)
 
-    assert not missing, (
-        f"{domain}: the router passes `caller_location_scope` to these, but they "
-        f"do not accept it -- every call raises TypeError:\n"
-        + "\n".join(f"  {m}" for m in missing)
+    assert supplying, (
+        f"{domain}: no service provider resolves CallerLocationScope, so every "
+        f"caller is unconfined: {[f.__name__ for f in providers]}"
     )

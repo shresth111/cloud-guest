@@ -187,124 +187,145 @@ class _FirewallRepo:
         return [], SimpleNamespace(total_items=0)
 
 
-def _service(rule) -> tuple[FirewallService, _FirewallRepo]:
+def _service(rule, scope=None) -> tuple[FirewallService, _FirewallRepo]:
     repo = _FirewallRepo(rule)
-    return FirewallService(repo, router_lookup=None), repo
+    return (
+        FirewallService(repo, router_lookup=None, caller_location_scope=scope),
+        repo,
+    )
 
 
 class TestFirewallRuleAccess:
+    """The confinement arrives at construction, so no call below passes it."""
+
     async def test_a_site_a_account_cannot_read_a_site_b_rule(self) -> None:
         """The worked example. Both rules are in the caller's own organization,
         so the organization comparison sees nothing wrong."""
-        service, _ = _service(_rule(_SITE_B))
+        service, _ = _service(_rule(_SITE_B), scope=frozenset({_SITE_A}))
 
         with pytest.raises(CrossLocationFirewallRuleAccessError):
-            await service.get_rule(
-                uuid.uuid4(),
-                requesting_organization_id=_ORG,
-                caller_location_scope=frozenset({_SITE_A}),
-            )
+            await service.get_rule(uuid.uuid4(), requesting_organization_id=_ORG)
 
     async def test_a_site_a_account_cannot_delete_a_site_b_rule(self) -> None:
         """The write matters more than the read: this is network security
-        configuration on someone else's site."""
-        service, _ = _service(_rule(_SITE_B))
+        configuration on someone else's site.
+
+        It also demonstrates why the confinement moved to the constructor.
+        `delete_rule` passes nothing on -- it simply calls `get_rule`, which
+        reads `self`. Under the per-method shape this test only passed because
+        `delete_rule` remembered to forward the argument, and a mutator that
+        forgot produced no error and no enforcement.
+        """
+        service, _ = _service(_rule(_SITE_B), scope=frozenset({_SITE_A}))
 
         with pytest.raises(CrossLocationFirewallRuleAccessError):
             await service.delete_rule(
                 uuid.uuid4(),
                 actor_user_id=uuid.uuid4(),
                 requesting_organization_id=_ORG,
-                caller_location_scope=frozenset({_SITE_A}),
             )
 
     async def test_a_site_a_account_still_reaches_its_own_rule(self) -> None:
-        service, _ = _service(_rule(_SITE_A))
+        service, _ = _service(_rule(_SITE_A), scope=frozenset({_SITE_A}))
 
-        rule = await service.get_rule(
-            uuid.uuid4(),
-            requesting_organization_id=_ORG,
-            caller_location_scope=frozenset({_SITE_A}),
-        )
+        rule = await service.get_rule(uuid.uuid4(), requesting_organization_id=_ORG)
 
         assert rule.location_id == _SITE_A
 
     async def test_an_organization_admin_reaches_every_site(self) -> None:
         """`None` confinement -- the lockout guard."""
-        service, _ = _service(_rule(_SITE_B))
+        service, _ = _service(_rule(_SITE_B), scope=None)
 
-        rule = await service.get_rule(
-            uuid.uuid4(),
-            requesting_organization_id=_ORG,
-            caller_location_scope=None,
-        )
+        rule = await service.get_rule(uuid.uuid4(), requesting_organization_id=_ORG)
 
         assert rule.location_id == _SITE_B
 
     async def test_a_platform_operator_reaches_every_site_and_tenant(self) -> None:
-        service, _ = _service(_rule(_SITE_B, organization_id=uuid.uuid4()))
+        service, _ = _service(_rule(_SITE_B, organization_id=uuid.uuid4()), scope=None)
 
-        rule = await service.get_rule(
-            uuid.uuid4(), requesting_organization_id=None, caller_location_scope=None
-        )
+        rule = await service.get_rule(uuid.uuid4(), requesting_organization_id=None)
 
         assert rule is not None
 
     async def test_the_organization_boundary_still_takes_precedence(self) -> None:
         """A foreign *tenant's* rule is refused as cross-organization, not
         quietly reclassified as a location problem."""
-        service, _ = _service(_rule(_SITE_A, organization_id=uuid.uuid4()))
+        service, _ = _service(
+            _rule(_SITE_A, organization_id=uuid.uuid4()), scope=frozenset({_SITE_A})
+        )
 
         with pytest.raises(CrossOrganizationFirewallRuleAccessError):
-            await service.get_rule(
-                uuid.uuid4(),
-                requesting_organization_id=_ORG,
-                caller_location_scope=frozenset({_SITE_A}),
-            )
+            await service.get_rule(uuid.uuid4(), requesting_organization_id=_ORG)
 
 
 class TestFirewallRuleListing:
     async def test_a_confined_caller_only_lists_its_own_sites(self) -> None:
         """A list is filtered rather than refused: asking for a list is a
         legitimate request whose answer is simply narrower."""
-        service, repo = _service(None)
+        service, repo = _service(None, scope=frozenset({_SITE_A}))
 
-        await service.list_rules(
-            requesting_organization_id=_ORG,
-            caller_location_scope=frozenset({_SITE_A}),
-        )
+        await service.list_rules(requesting_organization_id=_ORG)
 
         assert repo.list_calls[0]["location_ids"] == frozenset({_SITE_A})
 
     async def test_an_unconfined_caller_lists_everything(self) -> None:
-        service, repo = _service(None)
+        service, repo = _service(None, scope=None)
 
-        await service.list_rules(
-            requesting_organization_id=_ORG, caller_location_scope=None
-        )
+        await service.list_rules(requesting_organization_id=_ORG)
 
         assert repo.list_calls[0]["location_ids"] is None
 
 
-def test_every_firewall_route_resolves_the_callers_confinement() -> None:
-    """Structural: the service cannot enforce what the route never passes it,
-    and the enforcement defaults to `None` (unconfined) so a route that forgets
-    fails open. This is what makes forgetting visible."""
-    from app.domains.rbac.location_scope import CallerLocationScope as _Dep
-    from app.main import create_app
+def test_the_di_provider_resolves_the_confinement() -> None:
+    """The service can only enforce what its constructor is given, and the
+    provider is now the single place that supplies it."""
+    import inspect
 
-    def calls(dependant):
-        found = {d.call for d in dependant.dependencies}
-        for d in dependant.dependencies:
-            found |= calls(d)
-        return found
+    from app.domains.firewall.dependencies import get_firewall_service
+    from app.domains.rbac.location_scope import CallerLocationScope
 
-    missing = []
-    for route in create_app().routes:
-        path = getattr(route, "path", "")
-        if not path.startswith("/api/v1/firewall-rules"):
-            continue
-        if _Dep not in calls(route.dependant):
-            missing.append(f"{sorted(getattr(route, 'methods', []))} {path}")
+    params = inspect.signature(get_firewall_service).parameters
+    assert "caller_location_scope" in params
+    assert params["caller_location_scope"].default.dependency is CallerLocationScope
 
-    assert not missing, f"firewall routes not resolving CallerLocationScope: {missing}"
+
+async def test_two_requests_never_share_a_service_instance() -> None:
+    """The precondition the whole design rests on.
+
+    Constructor injection puts request-scoped state on the service object. That
+    is safe only while an instance never outlives or is shared across a request
+    -- if one were reused, it would hand one caller's confinement to another
+    caller's request, which is worse than the bug being fixed. Asserted rather
+    than read for.
+    """
+    from fastapi import Depends, FastAPI
+    from starlette.testclient import TestClient
+
+    from app.domains.firewall.dependencies import (
+        get_firewall_repository,
+        get_firewall_service,
+    )
+    from app.domains.rbac.dependencies import get_rbac_repository
+    from app.domains.rbac.location_scope import CallerLocationScope
+    from app.domains.router.dependencies import get_router_service
+
+    app = FastAPI()
+
+    @app.get("/probe")
+    async def probe(service: FirewallService = Depends(get_firewall_service)):
+        return {"instance": id(service)}
+
+    app.dependency_overrides[get_firewall_repository] = lambda: object()
+    app.dependency_overrides[get_router_service] = lambda: object()
+    app.dependency_overrides[get_rbac_repository] = lambda: object()
+    app.dependency_overrides[CallerLocationScope] = lambda: None
+
+    with TestClient(app) as client:
+        first = client.get("/probe").json()["instance"]
+        second = client.get("/probe").json()["instance"]
+
+    assert first != second, (
+        "two requests shared one FirewallService instance -- constructor "
+        "injection would leak one caller's location confinement into another's "
+        "request"
+    )

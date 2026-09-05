@@ -30,7 +30,6 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
-from app.domains.rbac.location_scope import CallerLocationScope, LocationScope
 
 from .constants import FirewallAction, FirewallChain, FirewallProtocol
 from .dependencies import get_firewall_service
@@ -95,13 +94,11 @@ async def create_firewall_rule(
     payload: FirewallRuleCreateRequest,
     actor: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    caller_location_scope: LocationScope = Depends(CallerLocationScope),
     service: FirewallService = Depends(get_firewall_service),
 ):
     rule = await service.create_rule(
         actor_user_id=uuid.UUID(actor.id),
         requesting_organization_id=requesting_organization_id,
-        caller_location_scope=caller_location_scope,
         router_id=uuid.UUID(payload.router_id),
         name=payload.name,
         chain=payload.chain,
@@ -136,12 +133,10 @@ async def list_firewall_rules(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    caller_location_scope: LocationScope = Depends(CallerLocationScope),
     service: FirewallService = Depends(get_firewall_service),
 ):
     rules, meta = await service.list_rules(
         requesting_organization_id=requesting_organization_id,
-        caller_location_scope=caller_location_scope,
         router_id=router_id,
         page=page,
         page_size=page_size,
@@ -167,7 +162,6 @@ async def get_firewall_rule(
     request: Request,
     rule_id: uuid.UUID,
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    caller_location_scope: LocationScope = Depends(CallerLocationScope),
     service: FirewallService = Depends(get_firewall_service),
 ):
     rule = await service.get_rule(
@@ -193,7 +187,6 @@ async def update_firewall_rule(
     payload: FirewallRuleUpdateRequest,
     actor: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    caller_location_scope: LocationScope = Depends(CallerLocationScope),
     service: FirewallService = Depends(get_firewall_service),
 ):
     fields = {k: v for k, v in payload.model_dump().items() if v is not None}
@@ -207,7 +200,6 @@ async def update_firewall_rule(
         rule_id,
         actor_user_id=uuid.UUID(actor.id),
         requesting_organization_id=requesting_organization_id,
-        caller_location_scope=caller_location_scope,
         **fields,
     )
     return build_response(
@@ -229,14 +221,12 @@ async def delete_firewall_rule(
     rule_id: uuid.UUID,
     actor: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
-    caller_location_scope: LocationScope = Depends(CallerLocationScope),
     service: FirewallService = Depends(get_firewall_service),
 ):
     await service.delete_rule(
         rule_id,
         actor_user_id=uuid.UUID(actor.id),
         requesting_organization_id=requesting_organization_id,
-        caller_location_scope=caller_location_scope,
     )
     return build_response(
         success=True,

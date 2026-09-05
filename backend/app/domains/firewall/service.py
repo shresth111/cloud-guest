@@ -76,17 +76,37 @@ class FirewallService:
         router_lookup: RouterLookupProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
+        # Constructor-injected, deliberately, while `requesting_organization_id`
+        # stays a per-method argument. The two look similar and are not: an
+        # organization id is an *argument* -- which tenant's data this call is
+        # about, and a system-internal caller legitimately passes a different
+        # one per call. A location confinement is a *property of the caller*,
+        # fixed for the whole request, and it is a security control.
+        #
+        # Threading a security control through every method means every method
+        # can forget it. A mutator that accepts `caller_location_scope` and
+        # forgets to pass it into `get_rule` produces no error, no test
+        # failure, and no enforcement -- a guard that fails open silently.
+        # Here every path funnels through `get_rule`, so there is nothing
+        # per-method to forget.
+        #
+        # This is only safe because the service is built fresh per request (a
+        # plain FastAPI dependency, no caching, no module-level instance). If
+        # one were ever shared between requests it would hand one caller's
+        # confinement to another's. `test_location_scope_in_services` asserts
+        # the per-request property rather than trusting it.
+        self.caller_location_scope = caller_location_scope
 
     async def create_rule(
         self,
         *,
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
-        caller_location_scope: LocationScope = None,
         router_id: uuid.UUID,
         name: str,
         chain: FirewallChain = FirewallChain.FORWARD,
@@ -107,8 +127,8 @@ class FirewallService:
         # Creating a rule on a router at a site the caller has no grant on is
         # the same defect as editing one there.
         enforce_entity_location(
+            caller_location_scope=self.caller_location_scope,
             entity_location_id=router.location_id,
-            caller_location_scope=caller_location_scope,
             error=CrossLocationFirewallRuleAccessError(),
         )
         validate_address("source_address", source_address)
@@ -150,7 +170,6 @@ class FirewallService:
         rule_id: uuid.UUID,
         *,
         requesting_organization_id: uuid.UUID | None = None,
-        caller_location_scope: LocationScope = None,
     ) -> FirewallRule:
         rule = await self.repository.get_rule_by_id(rule_id)
         if rule is None:
@@ -166,8 +185,8 @@ class FirewallService:
         # satisfied it; without this, that account could read, edit and delete
         # the firewall rules of every other site in the same organization.
         enforce_entity_location(
+            caller_location_scope=self.caller_location_scope,
             entity_location_id=rule.location_id,
-            caller_location_scope=caller_location_scope,
             error=CrossLocationFirewallRuleAccessError(),
         )
         return rule
@@ -176,7 +195,6 @@ class FirewallService:
         self,
         *,
         requesting_organization_id: uuid.UUID | None,
-        caller_location_scope: LocationScope = None,
         router_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
@@ -186,7 +204,7 @@ class FirewallService:
         # narrower, unlike fetching one specific foreign rule.
         return await self.repository.list_rules(
             requesting_organization_id=requesting_organization_id,
-            location_ids=caller_location_scope,
+            location_ids=self.caller_location_scope,
             router_id=router_id,
             page=page,
             page_size=page_size,
@@ -197,7 +215,6 @@ class FirewallService:
         router_id: uuid.UUID,
         *,
         requesting_organization_id: uuid.UUID | None,
-        caller_location_scope: LocationScope = None,
     ) -> list[FirewallRule]:
         """Every non-deleted rule for this router, in priority order,
         unpaginated -- the real read source ``app.domains.network_config``
@@ -206,8 +223,8 @@ class FirewallService:
             router_id, requesting_organization_id=requesting_organization_id
         )
         enforce_entity_location(
+            caller_location_scope=self.caller_location_scope,
             entity_location_id=router.location_id,
-            caller_location_scope=caller_location_scope,
             error=CrossLocationFirewallRuleAccessError(),
         )
         return await self.repository.list_rules_for_router(router_id)
@@ -218,13 +235,11 @@ class FirewallService:
         *,
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
-        caller_location_scope: LocationScope = None,
         **fields: object,
     ) -> FirewallRule:
         rule = await self.get_rule(
             rule_id,
             requesting_organization_id=requesting_organization_id,
-            caller_location_scope=caller_location_scope,
         )
         if "source_address" in fields:
             validate_address("source_address", fields["source_address"])
@@ -262,12 +277,10 @@ class FirewallService:
         *,
         actor_user_id: uuid.UUID | None,
         requesting_organization_id: uuid.UUID | None,
-        caller_location_scope: LocationScope = None,
     ) -> FirewallRule:
         rule = await self.get_rule(
             rule_id,
             requesting_organization_id=requesting_organization_id,
-            caller_location_scope=caller_location_scope,
         )
         deleted = await self.repository.soft_delete_rule(rule)
         event = FirewallRuleDeleted(id=deleted.id, router_id=deleted.router_id)
