@@ -47,6 +47,10 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "content_filtering": (
+        "Same getter shape as firewall. A site-A account could block or "
+        "unblock domains for every other site in the organization."
+    ),
     "firewall": (
         "Worked example and the shape the rest follow. `DELETE "
         "/firewall-rules/{rule_id}` let a site-A account delete site B's "
@@ -55,7 +59,6 @@ LOCATION_SCOPED: dict[str, str] = {
 }
 
 PENDING: dict[str, str] = {
-    "content_filtering": "Same shape as firewall; next in the replication.",
     "dhcp": "Same shape as firewall.",
     "dns": "Same shape as firewall.",
     "port_forwarding": "Same shape as firewall.",

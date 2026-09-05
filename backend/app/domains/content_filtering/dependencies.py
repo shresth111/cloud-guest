@@ -12,6 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db_session
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    CallerLocationScope,
+    LocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
@@ -32,11 +36,13 @@ def get_content_filter_service(
     ),
     router_service: RouterService = Depends(get_router_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
 ) -> ContentFilterService:
     return ContentFilterService(
         repository,
         router_service,
         audit_writer=audit_repository,
+        caller_location_scope=caller_location_scope,
     )
 
 
