@@ -80,6 +80,15 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "campaigns": (
+        "One getter covers the whole surface. `get_campaign` handles "
+        "`{campaign_id}` directly, and the sub-entity routes -- "
+        "`/questions/{question_id}` and `/assets/{asset_id}` -- fetch their "
+        "row and then call `get_campaign` to authorise, so they inherit the "
+        "check without touching them. That inheritance is only automatic "
+        "because the confinement lives on the instance. Anonymous-tolerant: "
+        "the three `/portal/campaigns/*` routes are guest-facing."
+    ),
     "guest_access": (
         "TWO entities, both addressed by id and both enforced: "
         "`GuestAccessRule` via `get_guest_rule` (`/rules/{rule_id}`) and "
@@ -173,12 +182,6 @@ PENDING: dict[str, str] = {
         "guest-facing resolve path must stay unconfined and the config is "
         "resolved by org+location rather than by its own id, so the getter "
         "choice is not obvious."
-    ),
-    "campaigns": (
-        "PARTLY ANALYSED. `get_campaign` is the getter the admin routes "
-        "address. Unsettled: the three `/portal/campaigns/*` guest routes "
-        "reach the same service and must stay unconfined, so this needs "
-        "`OptionalCallerLocationScope` plus a decision on serve/respond."
     ),
     "voucher": (
         "ANALYSED, NOT CONVERTED -- and the reason this bar exists. A "
@@ -432,6 +435,15 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
 # correct because the caller is a guest acting on their own session, not a
 # staff member reading a tenant's records.
 _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
+    ("GET", "/api/v1/portal/campaigns/next"): (
+        "A guest at the portal being shown a campaign, recording that it was shown, or answering its survey. They hold no roles, so there is no confinement to derive. The campaign they are served is already chosen by their own session's location (`get_next_campaign_for_session`), so being unconfined here does not widen what they can see."
+    ),
+    ("POST", "/api/v1/portal/campaigns/{campaign_id}/impression"): (
+        "A guest at the portal being shown a campaign, recording that it was shown, or answering its survey. They hold no roles, so there is no confinement to derive. The campaign they are served is already chosen by their own session's location (`get_next_campaign_for_session`), so being unconfined here does not widen what they can see."
+    ),
+    ("POST", "/api/v1/portal/campaigns/{campaign_id}/respond"): (
+        "A guest at the portal being shown a campaign, recording that it was shown, or answering its survey. They hold no roles, so there is no confinement to derive. The campaign they are served is already chosen by their own session's location (`get_next_campaign_for_session`), so being unconfined here does not widen what they can see."
+    ),
     ("POST", "/api/v1/guest/login/otp"): (
         "A guest acting on their own session, before or during login. They hold no roles, so there is no confinement to derive; the anonymous-tolerant dependency resolves them to unconfined rather than 401ing them out of the portal."
     ),
