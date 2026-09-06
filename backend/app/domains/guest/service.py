@@ -4016,7 +4016,20 @@ class GuestService:
         return router
 
     def _reject_if_blocked(self, guest: Guest | None) -> None:
+        """The admin's ``blocked_reason`` is logged here and nowhere else on
+        this path -- it is not in the error's message or its ``data``, both of
+        which reach the guest's own screen. An operator asking "why was this
+        person turned away" reads it from here or from the guest row; the
+        person it is about does not read it at all."""
         if guest is not None and guest.is_blocked:
+            if guest.blocked_reason:
+                logger.info(
+                    "guest_blocked_login_refused",
+                    extra={
+                        "guest_id": str(guest.id),
+                        "reason": guest.blocked_reason,
+                    },
+                )
             raise GuestBlockedError(guest.blocked_reason)
 
     async def _enforce_access_control(
@@ -4208,6 +4221,21 @@ class GuestService:
         if decision.allowed:
             return
         if not decision.is_whitelist_only_denial:
+            # Same discipline as `_reject_if_blocked`: the matched rule's
+            # `reason` is an operator's private note, so it is logged rather
+            # than returned. The error carries neither it nor a `data` copy
+            # of it, because the app-wide handler serialises `data` into the
+            # response body the guest's browser reads.
+            if decision.reason:
+                logger.info(
+                    "guest_access_rule_login_refused",
+                    extra={
+                        "organization_id": str(organization_id),
+                        "location_id": str(location_id),
+                        "identifier": identifier,
+                        "reason": decision.reason,
+                    },
+                )
             raise GuestAccessDeniedError(decision.reason)
 
         # Whitelist-only, nothing matched. Before refusing, reconcile with

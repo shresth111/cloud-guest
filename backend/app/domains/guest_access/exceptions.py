@@ -223,16 +223,40 @@ class GuestAccessDeniedError(GuestAccessError):
     """Raised by ``AccessDecisionResolver``-driven enforcement (the
     optional hook composed into ``app.domains.guest.service.GuestService``
     -- see that module's own docstring for the composition) when the
-    resolved decision for a login attempt is ``BLOCKLIST``. Carries the
-    matched rule's ``reason`` (if any) so the caller can surface it exactly
-    as ``app.domains.guest.exceptions.GuestBlockedError`` already does for
-    the guest-level ``Guest.is_blocked`` flag."""
+    resolved decision for a login attempt is ``BLOCKLIST``.
+
+    **The matched rule's ``reason`` is deliberately not in the message, and
+    not in ``data`` either.** It used to be appended to the message, and the
+    portal renders a 403's message verbatim -- so an operator who wrote
+    "ex-employee, do not readmit" into a blocklist rule had that sentence
+    displayed to the person on the other side of the counter. The field is
+    an operator's private note about a guest; the guest is the one party who
+    must never read it.
+
+    ``data`` is the wrong hiding place for the same reason: the handler in
+    ``app.common.exceptions`` serialises ``exc.data`` straight into the
+    response body, so moving the reason there would have changed which JSON
+    key leaked it and nothing else.
+
+    It is kept as ``self.reason`` -- an attribute, never serialised -- so the
+    raise site can log it. An operator asking "why was this guest turned
+    away" is answered from the log and from the rule row itself, both of
+    which require an account.
+
+    ``data`` carries a stable ``code`` instead. The portal has to tell this
+    apart from a whitelist-only refusal ("an operator wrote a rule about
+    *you*" versus "an operator wrote a rule about everyone else") and was
+    otherwise reduced to matching on message text, because every 403 from
+    this application collapses to the same client-side error shape.
+    """
 
     def __init__(self, reason: str | None = None) -> None:
-        message = "Access denied by an active guest access control rule"
-        if reason:
-            message += f": {reason}"
-        super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
+        self.reason = reason
+        super().__init__(
+            "Access denied by an active guest access control rule",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "guest_access_denied"},
+        )
 
 
 #: The wording a guest sees when a whitelist-only property refuses them and
@@ -281,7 +305,21 @@ class WhitelistOnlyAccessDeniedError(GuestAccessError):
         message = (denied_message or "").strip() or (
             DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE
         )
-        super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
+        # A stable code, so the portal can route this to its own screen
+        # rather than discriminating on the message text. Both refusals are
+        # 403s and the client collapses every 403 to one error shape, so
+        # without this the only thing separating "you are barred" from "this
+        # venue admits only listed guests" is a string comparison against
+        # copy an operator can edit.
+        #
+        # Unlike ``GuestAccessDeniedError``'s, this message is meant for the
+        # guest: it is the venue's own ``whitelist_only_denied_message``, or
+        # the platform default when they have set none.
+        super().__init__(
+            message,
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "whitelist_only_access_denied"},
+        )
 
 
 # ---------------------------------------------------------------------------
