@@ -42,6 +42,25 @@ class AccessRuleDeleted:
 
 
 @dataclass(frozen=True, slots=True)
+class AccessRulesImported:
+    """One bulk import of guest (identifier-keyed) rules finished.
+
+    Carries counts rather than a rule id because a bulk import has no
+    single subject -- and because the three counts are the only thing an
+    operator actually asks about afterwards ("did my 200-row list land?").
+    ``rejected_count`` is logged even when zero: a run that rejected
+    nothing is a meaningfully different fact from one nobody recorded.
+    """
+
+    organization_id: uuid.UUID
+    location_id: uuid.UUID | None
+    imported_count: int
+    updated_count: int
+    rejected_count: int
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
 class GuestAccessDenied:
     """A resolved ``BLOCKLIST`` decision actually blocked a login attempt
     -- distinct from ``AccessRuleCreated``/etc. (rule CRUD), this is a
@@ -56,6 +75,7 @@ class GuestAccessDenied:
 
 __all__ = [
     "AccessRuleCreated",
+    "AccessRulesImported",
     "AccessRuleDeactivated",
     "AccessRuleDeleted",
     "GuestAccessDenied",

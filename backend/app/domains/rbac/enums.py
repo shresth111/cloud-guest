@@ -478,6 +478,14 @@ class AuditAction(StrEnum):
     # flag flip doesn't need a dedicated one" judgment call.
     GUEST_ACCESS_RULE_CREATED = "guest_access_rule_created"
     GUEST_ACCESS_RULE_DELETED = "guest_access_rule_deleted"
+    # One row per bulk import, not per imported rule -- see
+    # ``GuestAccessService.import_guest_rules``. A 200-room hotel
+    # re-uploads its Always Allowed list nightly; auditing each row would
+    # write 200 entries a night per property to answer a question nobody
+    # asks at that granularity ("who uploaded the list, where, and when"
+    # is the question), and would drown the genuinely per-guest
+    # create/delete entries above.
+    GUEST_ACCESS_RULES_IMPORTED = "guest_access_rules_imported"
 
     # Billing domain events (Module 013 Part 1: Plan + License + Usage Core)
     # -- written through this same table by

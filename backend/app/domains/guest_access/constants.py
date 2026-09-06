@@ -94,8 +94,85 @@ ACCESS_RULE_TYPE_PRECEDENCE: tuple[AccessRuleType, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Bulk import (``POST /guest-access/rules/import``)
+# ---------------------------------------------------------------------------
+
+# One request, one bounded batch, never an unbounded body -- the identical
+# bound ``app.domains.mac_authorization.constants.MAX_IMPORT_BATCH_SIZE``
+# and ``app.domains.voucher.schemas.VoucherImportRequest`` already carry,
+# matched deliberately rather than picked afresh so an operator who has
+# learned "a thousand rows per upload" for one list does not have to learn
+# a second number for another. Enforced by pydantic
+# (``schemas.GuestAccessRuleImportRequest.rules``'s ``max_length``), so a
+# 1001-row body is refused with a 422 before the handler runs and before a
+# single row is written -- never a partial import of the first 1000.
+MAX_IMPORT_BATCH_SIZE = 1000
+
+# Which rule types this importer may write.
+#
+# BLOCKLIST is deliberately absent, and its absence is the point.
+# ``GuestAccessService.create_guest_rule`` runs a BLOCKLIST rule through
+# ``enforcement.BlocklistEnforcer`` -- a commit plus a live RouterOS API
+# session per rule, to end the sessions the guest is already in. A
+# thousand of those in one request would hold the connection open for the
+# length of a thousand device round-trips and half-succeed in a way nobody
+# could reconstruct afterwards, and the per-rule enforcement outcome
+# (``enforcement_status``/``sessions_ended``) that a blocking operator has
+# to see would be buried in a bulk summary. Blocking someone is a
+# deliberate, one-at-a-time act with a device outcome; ``POST
+# /guest-access/rules`` remains the only way to do it.
+#
+# What is left is the three allow-shaped types, which write a row and stop.
+IMPORTABLE_RULE_TYPES: frozenset[AccessRuleType] = frozenset(
+    {AccessRuleType.WHITELIST, AccessRuleType.TEMPORARY, AccessRuleType.VIP}
+)
+
+
+class GuestRuleImportRejectionCode(StrEnum):
+    """Why one row of a bulk import was refused, as a stable string the
+    dashboard can branch on.
+
+    A human-readable ``reason`` travels alongside this (see
+    ``schemas.RejectedGuestRuleImportRowResponse``) and is what an operator
+    reads, but a 200-room hotel uploading a list exported from its PMS
+    routinely gets forty rejections that are all the *same* problem. A code
+    lets the upload screen collapse those into one instruction ("these
+    forty numbers have no country code") instead of forty lines the
+    operator scrolls past. Free-text reasons cannot be grouped without
+    string-matching a message that is allowed to change.
+    """
+
+    #: Neither phone-shaped nor email-shaped at all (letters, empty, a
+    #: spreadsheet's stray header row).
+    MALFORMED_IDENTIFIER = "malformed_identifier"
+    #: Phone-shaped and plausible, but written without a country code --
+    #: the single most common rejection a hotel's PMS export produces, and
+    #: the one with a fix the operator can apply in a spreadsheet. See
+    #: ``exceptions.CountryCodeRequiredError``.
+    COUNTRY_CODE_REQUIRED = "country_code_required"
+    #: ``rule_type`` is not one of ``IMPORTABLE_RULE_TYPES``.
+    RULE_TYPE_NOT_IMPORTABLE = "rule_type_not_importable"
+    #: ``rule_type`` is not an ``AccessRuleType`` at all.
+    UNKNOWN_RULE_TYPE = "unknown_rule_type"
+    #: A TEMPORARY row with no expiry, or any row whose expiry is already
+    #: in the past -- see ``validators.validate_rule_expiry``.
+    INVALID_EXPIRY = "invalid_expiry"
+    #: ``location_id`` is not a UUID.
+    INVALID_LOCATION_ID = "invalid_location_id"
+    #: The row named a location the caller is not confined to.
+    LOCATION_OUT_OF_SCOPE = "location_out_of_scope"
+    #: The optional contact ``email`` column is not email-shaped. Rejected
+    #: rather than dropped: half-storing a row someone typed is how the
+    #: dashboard's Whitelist form used to lose the email it collected.
+    INVALID_CONTACT_EMAIL = "invalid_contact_email"
+
+
 __all__ = [
     "AccessRuleType",
     "BlockEnforcementStatus",
     "ACCESS_RULE_TYPE_PRECEDENCE",
+    "MAX_IMPORT_BATCH_SIZE",
+    "IMPORTABLE_RULE_TYPES",
+    "GuestRuleImportRejectionCode",
 ]
