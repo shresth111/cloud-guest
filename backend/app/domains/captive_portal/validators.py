@@ -7,6 +7,7 @@ service layer calls before touching the database.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from datetime import datetime, time
@@ -26,8 +27,11 @@ from .constants import (
     HEX_COLOR_PATTERN,
     MAX_BACKGROUND_FOCAL,
     MAX_BACKGROUND_OVERLAY_STRENGTH,
+    MAX_FEEDBACK_DWELL_MINUTES,
     MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
+    MIN_FEEDBACK_DWELL_MINUTES,
+    REVIEW_URL_ALLOWED_HOST_SUFFIXES,
     SPLASH_HEADLINE_MAX_LENGTH,
     SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
     GuestFontChoice,
@@ -38,10 +42,12 @@ from .exceptions import (
     InvalidBackgroundOverlayStrengthError,
     InvalidBusinessHoursScheduleError,
     InvalidDefaultConfigScopeError,
+    InvalidFeedbackDwellMinutesError,
     InvalidGuestFontChoiceError,
     InvalidHexColorError,
     InvalidPortalContentModeError,
     InvalidPortalContentSourceError,
+    InvalidReviewUrlError,
     InvalidUserPortalUrlError,
     SplashTextTooLongError,
     WhitelistOnlyRequiresLocationError,
@@ -57,6 +63,23 @@ _WEEKDAYS = (
     "sunday",
 )
 _HHMM_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+#: Characters that URL parsers famously disagree about, rejected before
+#: ``urlsplit`` ever sees the string. A backslash is the important one:
+#: WHATWG-conformant browsers (and the URL parsers inside operating-system
+#: captive-portal clients) treat ``\`` as a path separator, Python's
+#: ``urlsplit`` does not, and that single disagreement is enough to make
+#: ``http://wifi.wyfyguest.com\@evil.example/`` validate here and resolve to
+#: ``evil.example`` there.
+#:
+#: Shared by ``validate_review_url`` and ``validate_user_portal_url``, which
+#: is why it sits up here with the other module constants rather than beside
+#: either one of them. Two URL fields on this domain now face the same
+#: parser differential from opposite directions -- one an operator-supplied
+#: link a guest taps, the other a caller-supplied URL an operating system
+#: opens by itself -- and a second literal is how the two would come to
+#: disagree about what is dangerous.
+_URL_PARSER_HAZARDS = ("\\",)
 
 
 def validate_hex_color(value: str, *, field_name: str) -> None:
@@ -88,6 +111,230 @@ def validate_single_content_source(
     has_url = bool(url_value and url_value.strip())
     if has_text and has_url:
         raise InvalidPortalContentSourceError(field_label)
+
+
+# How many hex characters of the digest go into a stored terms version.
+#
+# 16 hex characters is 64 bits. The thing being distinguished is "the
+# terms text a venue had on a given day" -- a set with, at most, a few
+# hundred distinct members per venue over the product's life. A collision
+# there is not a security event; it would mean two different texts stamped
+# the same version, which is a bookkeeping error, not an exploit, and 64
+# bits makes it not happen. The reason not to store all 64 characters is
+# that `guest_consents.terms_version` is a `String(50)` and widening a
+# live column to gain digits nobody reads is not worth a migration.
+_TERMS_VERSION_DIGEST_CHARS = 16
+
+
+def compute_terms_version(
+    *,
+    terms_and_conditions_text: str | None,
+    terms_and_conditions_url: str | None,
+    privacy_policy_text: str | None,
+    privacy_policy_url: str | None,
+) -> str | None:
+    """A stable identifier for the exact terms and privacy notice a portal
+    was showing -- the value ``guest_consents.terms_version`` was always
+    meant to carry and, until now, never did.
+
+    ## Why this exists
+
+    ``GuestConsent`` records that a guest accepted a portal's terms. The
+    column for *which* terms has been on the model since the table was
+    created and is NULL in every production row, because the only caller
+    posts ``{guest_id, captive_portal_config_id}`` and nothing else. So the
+    platform can prove *that* a guest consented and cannot say *to what*.
+
+    Under India's DPDP Act the burden of proof sits with the Data
+    Fiduciary -- the venue -- and a consent record with a null version
+    discharges none of it. It is also useless in the ordinary case it was
+    presumably added for: a venue edits its terms, and nobody can tell
+    which guests agreed to the old text.
+
+    ## Why a content hash and not a number
+
+    A version *number* has to be incremented by whoever edits the text, and
+    nothing in this product asks them to or would notice if they forgot. A
+    number that is not reliably bumped is worse than no number, because it
+    asserts sameness that was never checked. A digest of the text cannot
+    drift from the text: two rows carry the same version if and only if
+    they were shown the same words.
+
+    It is not reversible -- this does not let anyone reconstruct the terms
+    from the version. That is a real limitation and the fix for it is a
+    stored history of the text, which is a bigger change than this one and
+    belongs in its own spec. What this gives is the ability to say "these
+    4,102 guests agreed to the same thing, and it is not the thing on the
+    screen today", which is the question that actually gets asked.
+
+    ## The shape
+
+    All four content fields go in, not just the terms pair: a privacy
+    notice is as much a part of what was consented to as the terms, and
+    the URL variants matter because a config may point at a hosted
+    document instead of holding one inline (see
+    ``validate_single_content_source``). Each field is length-prefixed
+    before hashing, so a value ending where the next begins cannot produce
+    the same digest as a different split of the same characters.
+
+    Returns ``None`` when the config has none of the four -- and that is
+    deliberate. With nothing configured, whatever the guest saw came from
+    the frontend's own hardcoded copy, which this layer cannot see. A NULL
+    that means "we genuinely do not know" is honest; a digest of four
+    empty strings would be a version number for a document that does not
+    exist, and would be indistinguishable from a real one.
+    """
+    parts = (
+        terms_and_conditions_text,
+        terms_and_conditions_url,
+        privacy_policy_text,
+        privacy_policy_url,
+    )
+    if not any(part and part.strip() for part in parts):
+        return None
+    digest = hashlib.sha256()
+    for part in parts:
+        value = (part or "").encode("utf-8")
+        digest.update(str(len(value)).encode("ascii"))
+        digest.update(b":")
+        digest.update(value)
+    return f"sha256:{digest.hexdigest()[:_TERMS_VERSION_DIGEST_CHARS]}"
+
+
+def validate_feedback_dwell_minutes(value: object) -> None:
+    """Raises ``InvalidFeedbackDwellMinutesError`` unless ``value`` is a
+    real ``int`` (``bool`` excluded for the reason
+    ``validate_background_overlay_strength`` excludes it -- Python's
+    ``bool`` subclasses ``int``, and ``True`` is never a legal number of
+    minutes) within ``[0, 1440]``.
+
+    Enforced here as well as by the schema's ``ge``/``le`` because
+    ``create_config`` is also reached from the smart-location provisioning
+    flow, which builds its arguments in Python and never passes through a
+    request model. A bound that only exists on the wire is not a bound.
+
+    The bounds are the guest portal's own clamp, mirrored -- see
+    ``constants.MIN_FEEDBACK_DWELL_MINUTES``. Rejecting here what the
+    client would silently have raised is the point: a venue that sets 2
+    and sees the card at 5 has no way to find out why.
+    """
+    in_range = (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and MIN_FEEDBACK_DWELL_MINUTES <= value <= MAX_FEEDBACK_DWELL_MINUTES
+    )
+    if not in_range:
+        raise InvalidFeedbackDwellMinutesError(value)
+
+
+def validate_review_url(value: str | None) -> None:
+    """Raises ``InvalidReviewUrlError`` unless ``value`` is an ``https``
+    URL whose host is (or is a subdomain of) one of
+    ``constants.REVIEW_URL_ALLOWED_HOST_SUFFIXES``.
+
+    ``None`` and blank pass: no review link is the normal state, and it is
+    what the guest-side card treats as "render nothing". Clearing the field
+    must always be legal.
+
+    **What this deliberately does not do.**
+
+    It does not check the *path*. ``g.page/r/<id>/review`` and
+    ``search.google.com/local/writereview?placeid=`` are the two shapes in
+    circulation today and neither is a documented stable contract -- a
+    validator that encoded them would start rejecting real, working links
+    the next time Google changes one. Scheme and host are the parts that
+    have held.
+
+    It does not fetch the URL. The PM spec asks for validation by a
+    server-side HEAD/GET, and that is a better check than this one -- it
+    catches a 404 and a link to the wrong branch, which no amount of
+    parsing will. It is not done here because a network call on the write
+    path of a dashboard save turns a config PUT into something that can
+    hang on Google's latency and fail on an egress rule, and because a
+    fetch that must not block the save is a job queue, a stored result and
+    a piece of UI that reports it -- a real feature, not a line in a
+    validator. Left as the next step, with the honest consequence stated:
+    a syntactically valid link to a live page that is not *this venue's*
+    review page will be accepted here.
+    """
+    if value is None or not value.strip():
+        return
+    candidate = value.strip()
+    # Same pre-parse rejection ``validate_user_portal_url`` performs, from
+    # the same constant, for the same reason -- and it is load-bearing here
+    # too, not borrowed decoration.
+    #
+    # WHATWG treats ``\`` as ``/`` inside the authority of a special
+    # scheme, so a browser reads ``https://evil.com\@google.com/`` as host
+    # ``evil.com``. ``urlsplit`` ends the netloc only at ``/?#``, reads the
+    # trailing ``@google.com`` as a host preceded by userinfo, and returns
+    # ``hostname == "google.com"`` -- which the suffix check below then
+    # approves. The host this validator accepted is not the host the guest
+    # lands on.
+    #
+    # ``validate_user_portal_url`` answers the same hazard by rebuilding
+    # the URL from the hostname it checked. That is the stronger answer and
+    # it is not available here: this value is a venue's own review link,
+    # whose path and query are the part that matters and must survive
+    # verbatim (see ``constants.REVIEW_URL_MAX_LENGTH``). Rejecting the
+    # character is what is left, and it costs nothing -- no Google review
+    # link has ever contained a backslash.
+    if any(hazard in candidate for hazard in _URL_PARSER_HAZARDS):
+        raise InvalidReviewUrlError("it contains a backslash")
+    try:
+        parsed = urlsplit(candidate)
+        # ``.username``/``.port``/``.hostname`` parse the netloc lazily and
+        # raise on a malformed one, so they belong inside the same guard as
+        # ``urlsplit`` -- the discipline ``validate_user_portal_url``
+        # records.
+        has_userinfo = bool(parsed.username or parsed.password)
+        port = parsed.port
+        host = (parsed.hostname or "").lower()
+    except ValueError as exc:
+        # An unclosed IPv6 literal (``https://[::1/x``), a non-numeric
+        # port, or a netloc that NFKC-normalises into a delimiter. All are
+        # things an operator can paste into a dashboard field, and an
+        # uncaught ValueError here is a 500 on a config save.
+        raise InvalidReviewUrlError("it is not a valid web address") from exc
+    if parsed.scheme != "https":
+        # http:// specifically, rather than "any non-https scheme", because
+        # a downgraded paste is the common case and a guest tapping an
+        # http link from a portal page is the one this product should not
+        # be sending anywhere.
+        raise InvalidReviewUrlError("it must start with https://")
+    if not host:
+        raise InvalidReviewUrlError("it has no domain name")
+    if has_userinfo:
+        # ``https://google.com@evil.com/`` reads as a Google link to the
+        # venue pasting it and to anyone auditing the stored value later.
+        # The host check below catches it anyway; this exists so the
+        # rejection names the actual problem instead of blaming
+        # ``evil.com``.
+        raise InvalidReviewUrlError("it has a username before the domain")
+    if port not in (None, 443):
+        # Google does not serve review links off a non-default port. This
+        # is not a bypass on its own -- the host is still checked -- but it
+        # is a reliable sign the pasted string is not what the venue
+        # thinks it is.
+        raise InvalidReviewUrlError("it has a port number in it")
+    # Anchored on a dot, so ``maps.google.co.in`` passes via
+    # ``google.co.in`` and ``notgoogle.com`` does not pass via
+    # ``google.com``. ``host`` comes from ``.hostname``, which has already
+    # dropped any userinfo and port, so this compares the name the guest's
+    # device will resolve and not the bytes around it.
+    #
+    # A trailing-dot FQDN (``google.com.``) resolves identically and is
+    # *not* accepted here -- unlike ``validate_user_portal_url``, which
+    # normalises it away because it rebuilds the URL afterwards. This one
+    # stores what was pasted, so normalising the host would make the stored
+    # string disagree with the string that was checked. It fails closed,
+    # which is the right direction for a paste nobody produces on purpose.
+    allowed = any(
+        host == suffix or host.endswith(f".{suffix}")
+        for suffix in REVIEW_URL_ALLOWED_HOST_SUFFIXES
+    )
+    if not allowed:
+        raise InvalidReviewUrlError(f"'{host}' is not a Google domain")
 
 
 _GUEST_FONT_CHOICE_VALUES = frozenset(choice.value for choice in GuestFontChoice)
@@ -351,6 +598,9 @@ def is_open_now(
 __all__ = [
     "validate_hex_color",
     "validate_single_content_source",
+    "validate_review_url",
+    "validate_feedback_dwell_minutes",
+    "compute_terms_version",
     "validate_splash_text_length",
     "default_splash_headline",
     "SPLASH_TEXT_MAX_LENGTHS",
@@ -373,16 +623,6 @@ __all__ = [
 #: platform can produce, so accepting it would only widen the allowlist past
 #: anything it has to cover.
 _HOTSPOT_SUBDOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-
-#: Characters that URL parsers famously disagree about, rejected before
-#: ``urlsplit`` ever sees the string. A backslash is the important one:
-#: WHATWG-conformant browsers (and the URL parsers inside operating-system
-#: captive-portal clients) treat ``\`` as a path separator, Python's
-#: ``urlsplit`` does not, and that single disagreement is enough to make
-#: ``http://wifi.wyfyguest.com\@evil.example/`` validate here and resolve to
-#: ``evil.example`` there.
-_URL_PARSER_HAZARDS = ("\\",)
-
 
 def validate_user_portal_url(portal_url: str) -> str:
     """Validate the RFC 8908 endpoint's ``portal_url`` parameter and return

@@ -17,8 +17,10 @@ from app.common.exceptions import CloudGuestError
 from .constants import (
     MAX_BACKGROUND_FOCAL,
     MAX_BACKGROUND_OVERLAY_STRENGTH,
+    MAX_FEEDBACK_DWELL_MINUTES,
     MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
+    MIN_FEEDBACK_DWELL_MINUTES,
     GuestFontChoice,
     PortalContentMode,
 )
@@ -43,6 +45,8 @@ __all__ = [
     "PoweredByAttributionNotEntitledError",
     "InvalidUserPortalUrlError",
     "WhitelistOnlyRequiresLocationError",
+    "InvalidReviewUrlError",
+    "InvalidFeedbackDwellMinutesError",
 ]
 
 
@@ -112,6 +116,52 @@ class InvalidPortalContentSourceError(CaptivePortalError):
         super().__init__(
             f"Provide at most one of {field_label} text or {field_label} URL, "
             "not both",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidReviewUrlError(CaptivePortalError):
+    """``review_url`` was not an ``https`` URL on a Google host -- see
+    ``validators.validate_review_url``.
+
+    Rejected at write time rather than at render time, because the failure
+    this prevents is silent: a venue pastes something that is not their
+    review link, the card renders, guests tap it, and nobody finds out
+    until someone asks why the review count never moved. A 400 in the
+    dashboard, in front of the person who did the pasting, is the only
+    moment the mistake is cheap.
+
+    Deliberately *not* a shape check on the path. This platform does not
+    know what a valid Google review path looks like from one quarter to the
+    next (see ``constants.REVIEW_URL_MAX_LENGTH``'s own comment), and a
+    validator that guessed would reject working links. Scheme and host are
+    the two things that have stayed true."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"That doesn't look like a Google review link: {reason}. Copy it "
+            "from your Google Business Profile -> Read reviews -> Get more "
+            "reviews.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidFeedbackDwellMinutesError(CaptivePortalError):
+    """``feedback_dwell_minutes`` was outside
+    ``[MIN_FEEDBACK_DWELL_MINUTES, MAX_FEEDBACK_DWELL_MINUTES]`` or was not
+    a whole number of minutes.
+
+    The message names the unit, because the field's whole failure mode is
+    a venue -- or a second client -- reading it as seconds. 1500 seconds
+    is a plausible dwell; 1500 minutes is a card no guest will ever be
+    connected long enough to see, and it fails silently rather than
+    loudly."""
+
+    def __init__(self, value: object) -> None:
+        super().__init__(
+            f"Feedback dwell must be a whole number of *minutes* between "
+            f"{MIN_FEEDBACK_DWELL_MINUTES} and {MAX_FEEDBACK_DWELL_MINUTES} "
+            f"-- got {value!r}.",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 

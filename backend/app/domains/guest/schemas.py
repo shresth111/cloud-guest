@@ -41,6 +41,8 @@ __all__ = [
     "GuestSetPinRequest",
     "GuestSetPinResponse",
     "GuestUpdateProfileRequest",
+    "GuestReviewLinkOpenedRequest",
+    "GuestReviewLinkOpenedResponse",
     "GuestUpdateProfileResponse",
     "GuestConsentRequest",
     "GuestBlockRequest",
@@ -224,12 +226,53 @@ class GuestUpdateProfileRequest(BaseModel):
     session_id: uuid.UUID
     display_name: str | None = Field(default=None, min_length=1, max_length=200)
     email: EmailStr | None = Field(default=None)
+    declined: bool = Field(
+        default=False,
+        description=(
+            "The guest said no -- 'Not now', the close control, or Save "
+            "on an empty form, which is a decline and not an error. "
+            "Records the refusal server-side so the card is not shown "
+            "again, which is the whole reason this endpoint exists rather "
+            "than a `localStorage` flag: Web Storage throws inside "
+            "Apple's Captive Network Assistant, so a device-local record "
+            "of the decline is no record at all. Sending `declined` "
+            "together with a field is legal and the field still wins -- "
+            "either way the guest has answered and `has_profile` becomes "
+            "true."
+        ),
+    )
 
 
 class GuestUpdateProfileResponse(BaseModel):
     guest_id: str
     display_name: str | None
     email: str | None
+    # Echoed back so the caller never has to re-derive the rule that
+    # decides whether the card is done with -- the same bit
+    # `GuestLoginResponse.has_profile` carries, from the same helper.
+    has_profile: bool
+
+
+class GuestReviewLinkOpenedRequest(BaseModel):
+    """The guest tapped the review card and is being sent to Google.
+
+    Two ids and nothing else -- deliberately no URL. The link the guest
+    was sent to is ``captive_portal_configs.review_url``, which the server
+    already holds; accepting one from the request would let an
+    unauthenticated caller name a destination this platform then appears
+    to have recorded as its own.
+    """
+
+    guest_id: uuid.UUID
+    session_id: uuid.UUID
+
+
+class GuestReviewLinkOpenedResponse(BaseModel):
+    guest_id: str
+    # Echoed for the same reason `GuestUpdateProfileResponse` echoes
+    # `has_profile`: the caller should never have to re-derive the rule
+    # that decides whether the card is finished with.
+    has_opened_review_link: bool
 
 
 class GuestDisconnectRequest(BaseModel):
@@ -406,6 +449,29 @@ class GuestLoginResponse(BaseModel):
     # a guest that already has one *and* is on an already-recognized
     # device.
     has_pin: bool
+    # The third bit in the same family, and the one that lets the portal
+    # stop reading ``localStorage`` on the captive-portal surface
+    # entirely: whether this guest has already answered the post-connect
+    # "add your name / add your email" card, by filling it in or by
+    # declining it. See ``validators.guest_has_profile`` for the
+    # derivation and for why ``is_new_guest`` was the wrong key for the
+    # same job.
+    #
+    # A guest who has answered sees no card, no "welcome back {name}", and
+    # no gap -- the connected screen is byte-identical to one at a venue
+    # that never turned the ask on.
+    has_profile: bool
+    # The review card's own "already answered" bit, carried on the same
+    # response and for the same reason: the portal has nowhere else to
+    # keep it. ``localStorage`` throws inside Apple's Captive Network
+    # Assistant, so a device-local record of "they already went and
+    # reviewed us" is no record at all, and the card comes back on every
+    # visit -- hardest on the guest who actually did what was asked.
+    #
+    # True means the link was *opened*, never that a review was written.
+    # See ``models.Guest.review_link_opened_at`` for why the difference
+    # matters and why this can never be counted as reviews.
+    has_opened_review_link: bool
     session: GuestSessionResponse
     device: GuestDeviceResponse | None
 

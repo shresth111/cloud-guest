@@ -29,6 +29,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.database.utils.pagination import PageParams, PaginationMeta
+from app.domains.captive_portal.constants import (
+    DEFAULT_FEEDBACK_DWELL_MINUTES,
+)
+from app.domains.captive_portal.exceptions import CaptivePortalConfigNotFoundError
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.guest.constants import (
@@ -295,6 +299,12 @@ class FakeCaptivePortalService:
         voucher_enabled: bool = True,
         username_password_enabled: bool = False,
         pin_login_enabled: bool = False,
+        # The post-connect profile-capture flags. Default **on** here, and
+        # off in production -- see `make_fixture` for the reasoning; the
+        # divergence is deliberate and is the reason it is spelled out
+        # rather than inherited from the column default.
+        collect_guest_name: bool = True,
+        collect_guest_email: bool = True,
     ) -> CaptivePortalConfig:
         config = CaptivePortalConfig(
             **_base_fields(
@@ -327,6 +337,12 @@ class FakeCaptivePortalService:
                 pin_login_enabled=pin_login_enabled,
                 social_login_enabled=False,
                 social_login_providers=[],
+                collect_guest_name=collect_guest_name,
+                collect_guest_email=collect_guest_email,
+                review_card_enabled=False,
+                review_url=None,
+                guest_feedback_enabled=False,
+                feedback_dwell_minutes=DEFAULT_FEEDBACK_DWELL_MINUTES,
             )
         )
         self.configs_by_org[organization_id] = config
@@ -348,6 +364,17 @@ class FakeCaptivePortalService:
             config=self.configs_by_org[resolved_org],
             resolved_via_location_override=False,
         )
+
+    async def get_config(
+        self,
+        config_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> CaptivePortalConfig:
+        for config in self.configs_by_org.values():
+            if config.id == config_id:
+                return config
+        raise CaptivePortalConfigNotFoundError(config_id)
 
 
 @dataclass
@@ -1314,6 +1341,16 @@ def make_fixture(
     queue_assignment_hook: object | None = None,
     mac_authorization_hook: object | None = None,
     redis: FakeRedis | None = None,
+    # **On by default here, off by default in production.** The real
+    # column defaults false so that no venue starts collecting a guest's
+    # name or email because a migration decided for them -- the venue is
+    # the Data Fiduciary, not this platform. A test fixture is not a
+    # venue, and defaulting these off here would mean every test about the
+    # *authorisation* of a profile write would first have to opt in to the
+    # feature, burying the thing each test is actually about. Tests that
+    # care about the flags set them explicitly.
+    collect_guest_name: bool = True,
+    collect_guest_email: bool = True,
 ) -> Fixture:
     repository = FakeGuestRepository()
     otp_service = FakeOtpService()
@@ -1334,6 +1371,8 @@ def make_fixture(
         voucher_enabled=voucher_enabled,
         username_password_enabled=username_password_enabled,
         pin_login_enabled=pin_login_enabled,
+        collect_guest_name=collect_guest_name,
+        collect_guest_email=collect_guest_email,
     )
     captive_portal_service.add_location(location_id, organization_id)
     router = router_service.add(organization_id=organization_id, status=router_status)

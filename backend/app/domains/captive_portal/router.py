@@ -142,6 +142,16 @@ def _config_response(config: CaptivePortalConfig) -> CaptivePortalConfigResponse
         content_body=config.content_body,
         content_image_url=config.content_image_url,
         content_survey=config.content_survey,
+        # The post-connect ask flags travel with every other field, through
+        # this one function, so the unauthenticated guest-facing
+        # /captive-portal/resolve and the admin CRUD can never disagree
+        # about what a venue turned on.
+        collect_guest_name=config.collect_guest_name,
+        collect_guest_email=config.collect_guest_email,
+        review_card_enabled=config.review_card_enabled,
+        review_url=config.review_url,
+        guest_feedback_enabled=config.guest_feedback_enabled,
+        feedback_dwell_minutes=config.feedback_dwell_minutes,
         otp_sms_enabled=config.otp_sms_enabled,
         otp_email_enabled=config.otp_email_enabled,
         otp_whatsapp_enabled=config.otp_whatsapp_enabled,
@@ -217,6 +227,12 @@ async def create_captive_portal_config(
         content_body=payload.content_body,
         content_image_url=payload.content_image_url,
         content_survey=payload.content_survey,
+        collect_guest_name=payload.collect_guest_name,
+        collect_guest_email=payload.collect_guest_email,
+        review_card_enabled=payload.review_card_enabled,
+        review_url=payload.review_url,
+        guest_feedback_enabled=payload.guest_feedback_enabled,
+        feedback_dwell_minutes=payload.feedback_dwell_minutes,
         otp_sms_enabled=payload.otp_sms_enabled,
         otp_email_enabled=payload.otp_email_enabled,
         otp_whatsapp_enabled=payload.otp_whatsapp_enabled,

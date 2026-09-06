@@ -59,6 +59,8 @@ __all__ = [
     "GuestPinSetupNotAuthorizedError",
     "GuestPinTooWeakError",
     "GuestPinLockedError",
+    "GuestProfileFieldNotCollectedError",
+    "GuestReviewLinkOpenedNotAuthorizedError",
 ]
 
 
@@ -589,6 +591,58 @@ class GuestPasswordSetupNotAuthorizedError(GuestError):
         super().__init__(
             "This session isn't eligible to set a password -- please sign "
             "in again with a one-time code and try again right after.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class GuestProfileFieldNotCollectedError(GuestError):
+    """A guest tried to write a profile field this venue has switched off
+    -- ``captive_portal_configs.collect_guest_name`` /
+    ``collect_guest_email``.
+
+    A 400 rather than a 403: nothing is wrong with the caller's proof of
+    session, the field simply is not collected here. The distinction
+    matters to whoever reads the log, because the two have completely
+    different causes -- an expired session versus a venue setting.
+
+    Enforced server-side deliberately. The frontend does not render a
+    field whose flag is off, so in normal operation this never fires; it
+    fires for a stale portal bundle, a replayed request, or anyone
+    posting directly. "Off" has to mean off at the write path or the
+    toggle is decoration, and the venue -- not this platform -- is the
+    Data Fiduciary who would be holding the data."""
+
+    def __init__(self, field_label: str) -> None:
+        super().__init__(
+            f"This venue doesn't collect a guest {field_label}.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class GuestReviewLinkOpenedNotAuthorizedError(GuestError):
+    """``POST /guest/review-link-opened`` was called without a live
+    session belonging to the named guest.
+
+    **Deliberately a weaker check than
+    ``GuestProfileUpdateNotAuthorizedError``.** That one additionally
+    requires an OTP auth method and a session started within the last
+    ``SET_PASSWORD_SESSION_WINDOW_MINUTES``, because it guards a write of
+    personal data. This one guards a timestamp that stores nothing about
+    the guest, grants no capability, and can be set by no one but a
+    device already holding a live session id.
+
+    The cost of being stricter falls in the wrong place. The portal calls
+    this fire-and-forget as it navigates the guest away to Google; a
+    refusal is never seen by anybody, and its only effect is that the
+    card comes back next visit -- to the one guest who did what was
+    asked. A narrow window would also break a voucher or password guest,
+    and a guest who taps the card late in a long session, neither of whom
+    is doing anything wrong.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "A live session for this guest is required",
             status_code=status.HTTP_403_FORBIDDEN,
         )
 

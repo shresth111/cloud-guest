@@ -531,6 +531,16 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "dependency resolves them to unconfined rather than 401ing them out of the "
         "portal."
     ),
+    ("POST", "/api/v1/guest/review-link-opened"): (
+        "A guest tapping the review card on their own connected session -- the same "
+        "shape as `/guest/profile` above, and unauthenticated for the same reason: "
+        "they hold no roles, so there is no confinement to derive, and the strict "
+        "dependency would drag `CurrentUser` in and 401 them out of the portal. It "
+        "records one bit against the session the caller already holds and reads "
+        "nothing, so being unconfined here widens nothing: the worst a caller can do "
+        "with a session id they do not own is mark someone else's review card as "
+        "already tapped, which suppresses a nudge and grants no access."
+    ),
     ("POST", "/api/v1/guest/set-password"): (
         "A guest acting on their own session, before or during login. They hold no "
         "roles, so there is no confinement to derive; the anonymous-tolerant "

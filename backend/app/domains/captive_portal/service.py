@@ -79,6 +79,7 @@ from app.domains.rbac.location_scope import (
 )
 
 from .constants import (
+    DEFAULT_FEEDBACK_DWELL_MINUTES,
     DEFAULT_PORTAL_CONTENT_MODE,
     PRIVACY_POLICY_LABEL,
     TERMS_AND_CONDITIONS_LABEL,
@@ -110,8 +111,10 @@ from .validators import (
     validate_business_hours_timezone,
     validate_content_mode,
     validate_default_scope,
+    validate_feedback_dwell_minutes,
     validate_guest_font_choice,
     validate_hex_color,
+    validate_review_url,
     validate_single_content_source,
     validate_splash_text_length,
     validate_whitelist_only_scope,
@@ -445,6 +448,12 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "content_body",
     "content_image_url",
     "content_survey",
+    "collect_guest_name",
+    "collect_guest_email",
+    "review_card_enabled",
+    "review_url",
+    "guest_feedback_enabled",
+    "feedback_dwell_minutes",
     "otp_sms_enabled",
     "otp_email_enabled",
     "otp_whatsapp_enabled",
@@ -507,6 +516,12 @@ class _CachedCaptivePortalConfig:
     content_body: str | None
     content_image_url: str | None
     content_survey: dict[str, Any] | None
+    collect_guest_name: bool
+    collect_guest_email: bool
+    review_card_enabled: bool
+    review_url: str | None
+    guest_feedback_enabled: bool
+    feedback_dwell_minutes: int
     otp_sms_enabled: bool
     otp_email_enabled: bool
     otp_whatsapp_enabled: bool
@@ -723,6 +738,20 @@ class CaptivePortalService:
         # brand-new config behaving exactly as every config does today.
         whitelist_only_enabled: bool = False,
         whitelist_only_denied_message: str | None = None,
+        # The post-connect ask flags. All default to the off/empty value
+        # for the same reason pin_login_enabled/content_* default above --
+        # the smart-location provisioning flow and this domain's tests
+        # never pass them -- and here "off" is additionally the only
+        # defensible default in its own right: the venue is the Data
+        # Fiduciary for a guest's name and email, and the penalty for a
+        # badly-configured review ask lands on the venue's own Google
+        # Business Profile. See the columns' own comments in models.py.
+        collect_guest_name: bool = False,
+        collect_guest_email: bool = False,
+        review_card_enabled: bool = False,
+        review_url: str | None = None,
+        guest_feedback_enabled: bool = False,
+        feedback_dwell_minutes: int = DEFAULT_FEEDBACK_DWELL_MINUTES,
     ) -> CaptivePortalConfig:
         validate_hex_color(primary_color, field_name="primary_color")
         validate_hex_color(secondary_color, field_name="secondary_color")
@@ -745,6 +774,8 @@ class CaptivePortalService:
         validate_splash_text_length("splash_headline", splash_headline)
         validate_splash_text_length("splash_welcome_message", splash_welcome_message)
         validate_content_mode(content_mode)
+        validate_review_url(review_url)
+        validate_feedback_dwell_minutes(feedback_dwell_minutes)
         # Sanitize here, not at the schema layer and not on read. The value
         # bound to `post_login_html` from this point on is the *stored*
         # value, which is what makes the response the caller gets back the
@@ -803,6 +834,12 @@ class CaptivePortalService:
             content_body=content_body,
             content_image_url=content_image_url,
             content_survey=content_survey,
+            collect_guest_name=collect_guest_name,
+            collect_guest_email=collect_guest_email,
+            review_card_enabled=review_card_enabled,
+            review_url=review_url,
+            guest_feedback_enabled=guest_feedback_enabled,
+            feedback_dwell_minutes=feedback_dwell_minutes,
             otp_sms_enabled=otp_sms_enabled,
             otp_email_enabled=otp_email_enabled,
             otp_whatsapp_enabled=otp_whatsapp_enabled,
@@ -961,6 +998,19 @@ class CaptivePortalService:
             validate_guest_font_choice(str(update_data["guest_font_choice"]))
         if "content_mode" in update_data:
             validate_content_mode(str(update_data["content_mode"]))
+        # Validated only when the key is present, like content_mode above:
+        # a PUT that never mentions the review link must not be able to
+        # reject a save because of a value somebody stored earlier. Unlike
+        # the splash ceilings there is no grandfathering clause -- no row
+        # can predate this column, so there is no legacy value to protect.
+        if "review_url" in update_data:
+            submitted = update_data["review_url"]
+            validate_review_url(None if submitted is None else str(submitted))
+        # Same present-key-only rule, for the same reason: a PUT that never
+        # mentions the dwell must not reject a save over a value somebody
+        # stored earlier.
+        if "feedback_dwell_minutes" in update_data:
+            validate_feedback_dwell_minutes(update_data["feedback_dwell_minutes"])
         if "background_overlay_strength" in update_data:
             validate_background_overlay_strength(
                 update_data["background_overlay_strength"]

@@ -20,13 +20,17 @@ from pydantic import BaseModel, ConfigDict, Field
 from .constants import (
     CONTENT_BODY_MAX_LENGTH,
     CONTENT_HEADING_MAX_LENGTH,
+    DEFAULT_FEEDBACK_DWELL_MINUTES,
     DEFAULT_LANGUAGE,
     DEFAULT_PORTAL_CONTENT_MODE,
     DEFAULT_PRIMARY_COLOR,
     DEFAULT_SECONDARY_COLOR,
     DEFAULT_SUPPORTED_LANGUAGES,
     DEFAULT_THEME,
+    MAX_FEEDBACK_DWELL_MINUTES,
+    MIN_FEEDBACK_DWELL_MINUTES,
     POST_LOGIN_HTML_MAX_BYTES,
+    REVIEW_URL_MAX_LENGTH,
     SPLASH_HEADLINE_MAX_LENGTH,
     SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
 )
@@ -158,6 +162,76 @@ class CaptivePortalConfigCreateRequest(BaseModel):
             "content_mode == 'survey': the survey definition "
             "({'questions': [...], 'submitLabel': '...'}). Stored verbatim; "
             "the frontend (PortalSurvey) owns the schema."
+        ),
+    )
+    collect_guest_name: bool = Field(
+        default=False,
+        description=(
+            "Ask a guest for their name on the connected screen, after "
+            "they are already online. Never on the sign-in card, never "
+            "before the connection, never required -- see "
+            "`models.CaptivePortalConfig`'s own comment. Defaults off: "
+            "the venue is the Data Fiduciary for this data, so nothing "
+            "collects it until they say so."
+        ),
+    )
+    collect_guest_email: bool = Field(
+        default=False,
+        description=(
+            "The email half of the same post-connect card. Independent of "
+            "`otp_email_enabled`, which is a *sign-in method* -- a venue "
+            "that conflates the two will believe it is collecting emails "
+            "when it is not. Defaults off, for the same reason "
+            "`collect_guest_name` does. An email captured here is a "
+            "contact attribute, not a marketing list: there is no "
+            "marketing-consent artifact in this codebase yet, so nothing "
+            "collected here may be mailed offers."
+        ),
+    )
+    review_card_enabled: bool = Field(
+        default=False,
+        description=(
+            "Show the post-connect 'review us on Google' card. Does "
+            "nothing without `review_url`. Frequency, copy, position and "
+            "separation from any feedback prompt are product constants, "
+            "not settings."
+        ),
+    )
+    review_url: str | None = Field(
+        default=None,
+        max_length=REVIEW_URL_MAX_LENGTH,
+        description=(
+            "The venue's Google review link, copied from Business Profile "
+            "-> Read reviews -> Get more reviews. Stored **verbatim** -- "
+            "never synthesised from a place id, never normalised, never "
+            "rewritten. Validated on write to be `https` on a Google "
+            "host; the path is deliberately not checked, and the link is "
+            "not fetched. Null renders no card at all -- not a disabled "
+            "one. (The QR code Google offers alongside this link can only "
+            "be generated on desktop; venues ask.)"
+        ),
+    )
+    guest_feedback_enabled: bool = Field(
+        default=False,
+        description=(
+            "Show the post-connect private star-feedback card. Separate "
+            "from `review_card_enabled` on purpose and not a fallback for "
+            "it: sequencing one on the other's outcome -- private form "
+            "for unhappy guests, public review for happy ones -- is "
+            "review gating, which Google's Rating Manipulation policy "
+            "prohibits outright. Two flags, neither aware of the other."
+        ),
+    )
+    feedback_dwell_minutes: int = Field(
+        default=DEFAULT_FEEDBACK_DWELL_MINUTES,
+        ge=MIN_FEEDBACK_DWELL_MINUTES,
+        le=MAX_FEEDBACK_DWELL_MINUTES,
+        description=(
+            "Minutes a guest must have been connected before the feedback "
+            "card may appear. 0 means no gate. Inert while "
+            "`guest_feedback_enabled` is false. Note the gate is measured "
+            "on a screen iOS guests never reach -- see the model's own "
+            "comment."
         ),
     )
     otp_sms_enabled: bool = Field(default=True)
@@ -329,6 +403,25 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     content_body: str | None = Field(default=None, max_length=CONTENT_BODY_MAX_LENGTH)
     content_image_url: str | None = Field(default=None, max_length=500)
     content_survey: dict | None = Field(default=None)
+    collect_guest_name: bool | None = Field(default=None)
+    collect_guest_email: bool | None = Field(default=None)
+    review_card_enabled: bool | None = Field(default=None)
+    review_url: str | None = Field(
+        default=None,
+        max_length=REVIEW_URL_MAX_LENGTH,
+        description=(
+            "See the create schema for the full contract. Omit the key to "
+            "leave the stored link untouched; send null or an empty "
+            "string to clear it, which turns the card off in practice "
+            "whatever `review_card_enabled` says."
+        ),
+    )
+    guest_feedback_enabled: bool | None = Field(default=None)
+    feedback_dwell_minutes: int | None = Field(
+        default=None,
+        ge=MIN_FEEDBACK_DWELL_MINUTES,
+        le=MAX_FEEDBACK_DWELL_MINUTES,
+    )
     otp_sms_enabled: bool | None = Field(default=None)
     otp_email_enabled: bool | None = Field(default=None)
     otp_whatsapp_enabled: bool | None = Field(default=None)
@@ -431,6 +524,12 @@ class CaptivePortalConfigResponse(BaseModel):
     content_body: str | None
     content_image_url: str | None
     content_survey: dict | None
+    collect_guest_name: bool
+    collect_guest_email: bool
+    review_card_enabled: bool
+    review_url: str | None
+    guest_feedback_enabled: bool
+    feedback_dwell_minutes: int
     otp_sms_enabled: bool
     otp_email_enabled: bool
     otp_whatsapp_enabled: bool

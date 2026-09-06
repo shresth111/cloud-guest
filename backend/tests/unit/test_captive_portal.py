@@ -32,6 +32,7 @@ from app.domains.captive_portal.constants import (
     DEFAULT_BACKGROUND_FOCAL_X,
     DEFAULT_BACKGROUND_FOCAL_Y,
     DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
+    DEFAULT_FEEDBACK_DWELL_MINUTES,
     DEFAULT_GUEST_FONT_CHOICE,
     POST_LOGIN_HTML_MAX_BYTES,
     SPLASH_HEADLINE_MAX_LENGTH,
@@ -483,6 +484,12 @@ async def _create_config(
     post_login_html: str | None = None,
     whitelist_only_enabled: bool = False,
     whitelist_only_denied_message: str | None = None,
+    collect_guest_name: bool = False,
+    collect_guest_email: bool = False,
+    review_card_enabled: bool = False,
+    review_url: str | None = None,
+    guest_feedback_enabled: bool = False,
+    feedback_dwell_minutes: int = DEFAULT_FEEDBACK_DWELL_MINUTES,
     requesting_organization_id: uuid.UUID | None = None,
     organization_id: uuid.UUID | None = None,
 ) -> CaptivePortalConfig:
@@ -527,6 +534,12 @@ async def _create_config(
         post_login_html=post_login_html,
         whitelist_only_enabled=whitelist_only_enabled,
         whitelist_only_denied_message=whitelist_only_denied_message,
+        collect_guest_name=collect_guest_name,
+        collect_guest_email=collect_guest_email,
+        review_card_enabled=review_card_enabled,
+        review_url=review_url,
+        guest_feedback_enabled=guest_feedback_enabled,
+        feedback_dwell_minutes=feedback_dwell_minutes,
     )
 
 
@@ -2315,7 +2328,7 @@ class TestResolveSingleFlight:
 
 
 class TestResolveCacheKeyVersion:
-    def test_cache_key_is_v6(self) -> None:
+    def test_cache_key_is_v7(self) -> None:
         """Spec §0.3: the version must be bumped in the same change that
         changes the cached field set. Skipping it makes every payload
         written by the previous build raise KeyError out of the
@@ -2328,16 +2341,30 @@ class TestResolveCacheKeyVersion:
         ``whitelist_only_denied_message``) joining the same tuple -- the
         bump is required even though that feature ships dark, because the
         KeyError comes from deserializing a pre-deploy payload, not from
-        anything reading the new fields."""
+        anything reading the new fields. v8 is the post-connect ask
+        columns -- ``collect_guest_name``, ``collect_guest_email``,
+        ``review_card_enabled``, ``review_url``, ``guest_feedback_enabled``
+        and ``feedback_dwell_minutes`` -- joining it again.
+
+        Two changes claimed v7 independently, in parallel worktrees. Had
+        both landed spelling it v7, the second would have served a new
+        field set under a key the first had already warmed. See
+        ``cache.py``'s own comment: the number versions the SHAPE of that
+        tuple, against main, not against the branch it was cut from."""
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
 
         key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
-        assert key == "captive_portal:resolve:v7:org:loc"
+        assert key == "captive_portal:resolve:v8:org:loc"
 
     def test_org_index_key_is_versioned_in_lockstep_with_the_payload_key(self) -> None:
         """The index names payload keys. Left at an older version it
         would fan a delete out to keys nothing reads anymore, silently
-        doing nothing -- so its version must move with the payload's."""
+        doing nothing -- so its version must move with the payload's.
+
+        Asserts the two are EQUAL rather than pinning a literal. The
+        literal belongs in the one test that is about a specific bump;
+        here it only meant that every bump failed two tests, one of them
+        for a reason that had nothing to do with what the test protects."""
         from app.domains.captive_portal.cache import (
             _CACHE_KEY_TEMPLATE,
             _ORG_INDEX_KEY_TEMPLATE,
@@ -2345,7 +2372,7 @@ class TestResolveCacheKeyVersion:
 
         payload_version = _CACHE_KEY_TEMPLATE.split(":")[2]
         index_version = _ORG_INDEX_KEY_TEMPLATE.split(":")[2]
-        assert payload_version == index_version == "v7"
+        assert payload_version == index_version
 
     def test_a_payload_from_the_previous_key_version_would_raise(self) -> None:
         """The mechanism §0.3 is actually about, asserted rather than

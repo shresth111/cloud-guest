@@ -98,6 +98,8 @@ from .schemas import (
     GuestPasswordLoginRequest,
     GuestPinLoginRequest,
     GuestResponse,
+    GuestReviewLinkOpenedRequest,
+    GuestReviewLinkOpenedResponse,
     GuestSessionListResponse,
     GuestSessionResponse,
     GuestSetPasswordRequest,
@@ -135,6 +137,7 @@ from .service import (
     GuestService,
     RadiusService,
 )
+from .validators import guest_has_opened_review_link, guest_has_profile
 
 guest_router = APIRouter(prefix="/guest", tags=["Guest"])
 admin_router = APIRouter(tags=["Guest Admin"])
@@ -401,6 +404,8 @@ def _login_response(result: GuestLoginResult) -> GuestLoginResponse:
         is_new_guest=result.is_new_guest,
         has_password=bool(result.guest.hashed_password),
         has_pin=bool(result.guest.hashed_pin),
+        has_profile=guest_has_profile(result.guest),
+        has_opened_review_link=guest_has_opened_review_link(result.guest),
         session=_session_response(result.session),
         device=_device_response(result.device) if result.device else None,
     )
@@ -640,6 +645,7 @@ async def guest_update_profile(
         session_id=payload.session_id,
         display_name=payload.display_name,
         email=payload.email,
+        declined=payload.declined,
     )
     return build_response(
         success=True,
@@ -648,6 +654,47 @@ async def guest_update_profile(
             guest_id=str(guest.id),
             display_name=guest.display_name,
             email=guest.email,
+            has_profile=guest_has_profile(guest),
+        ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.post(
+    "/review-link-opened",
+    response_model=ApiResponse[GuestReviewLinkOpenedResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_review_link_opened(
+    request: Request,
+    payload: GuestReviewLinkOpenedRequest,
+    service: GuestService = Depends(get_guest_service),
+):
+    """Guest-facing, unauthenticated (same posture as ``/profile`` and
+    ``/login/*``): the guest tapped the venue's Google review card and is
+    being sent to Google.
+
+    Called fire-and-forget by the portal as it navigates away, so this
+    must stay cheap and must not be something the caller has to await.
+    Its only job is to stop the card being shown to this guest again --
+    see ``GuestService.record_review_link_opened`` for why that record
+    cannot live in the browser, and for why "opened" is the most this can
+    ever honestly claim.
+
+    Post-connect only. Nothing here can change whether, how fast, or how
+    long the guest is connected, and under Google's Rating Manipulation
+    policy nothing may.
+    """
+    guest = await service.record_review_link_opened(
+        guest_id=payload.guest_id,
+        session_id=payload.session_id,
+    )
+    return build_response(
+        success=True,
+        message="Review link opened",
+        data=GuestReviewLinkOpenedResponse(
+            guest_id=str(guest.id),
+            has_opened_review_link=guest_has_opened_review_link(guest),
         ).model_dump(),
         request_id=_request_id(request),
     )

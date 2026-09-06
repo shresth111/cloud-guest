@@ -294,6 +294,92 @@ SPLASH_WELCOME_MESSAGE_MAX_LENGTH = 78
 # would reject a payload that passed validation.
 POST_LOGIN_HTML_MAX_BYTES = 64 * 1024
 
+# ``captive_portal_configs.review_url`` -- the venue's own Google review
+# link, pasted from Business Profile -> Read reviews -> Get more reviews.
+#
+# **Merchant-pasted, never synthesised.** The ``g.page/r/...`` and
+# ``search.google.com/local/writereview?placeid=`` shapes are not documented
+# stable contracts and have changed before, so this platform does not build
+# one from a place id and does not rewrite what was pasted. Stored verbatim:
+# no normalising, no parameter stripping, no appending. A helpful rewrite
+# becomes a broken link the first time Google changes the shape, and a
+# silently-wrong link is worse than an empty field because the venue
+# believes the feature is working.
+REVIEW_URL_MAX_LENGTH = 500
+
+# The hosts a pasted review link may live on.
+#
+# This is a *host* allowlist, not a URL-shape allowlist, and the difference
+# is the whole point: the shapes change, the hosts have not. Checking the
+# host catches the realistic paste errors -- a Maps listing, a competitor's
+# link, a typo, an ``http://`` downgrade -- without pretending to know what
+# a valid review path looks like this quarter.
+#
+# Matched against the host exactly, or as a suffix after a dot, so
+# ``maps.google.co.in`` passes via ``google.co.in`` and
+# ``notgoogle.com`` does not pass via ``google.com``.
+REVIEW_URL_ALLOWED_HOST_SUFFIXES = (
+    "google.com",
+    "g.page",
+    "goo.gl",
+    "maps.app.goo.gl",
+    # Google runs a country-code domain per market and an Indian venue is
+    # as likely to copy a ``.co.in`` link as a ``.com`` one. Listing the
+    # markets this product actually sells into rather than every ccTLD
+    # Google owns: an unlisted one is a 400 the venue can report, not a
+    # silent acceptance of a host nobody checked.
+    "google.co.in",
+    "google.co.uk",
+    # ⚠ ``goo.gl`` and ``g.page`` are *redirectors*. Allowlisting them
+    # checks who operates the first hop, not where the guest ends up --
+    # a legacy ``goo.gl/maps/...`` short link is required (Google's own
+    # Maps "Share" produced them for years and they still resolve), and
+    # the price of accepting it is that this validator cannot promise the
+    # destination. It promises the venue pasted a Google-operated link,
+    # which is what catches the realistic mistake: a competitor's URL, a
+    # Maps listing for the wrong branch, an ``http://`` downgrade. The
+    # thing that would promise a destination is a server-side fetch, and
+    # ``validators.validate_review_url`` says why that is a feature rather
+    # than a line in a validator.
+)
+
+# Bounds on ``captive_portal_configs.feedback_dwell_minutes`` -- how long a
+# guest must have been connected before the private star-feedback card is
+# allowed to appear.
+#
+# The card asks "how is it going?", and the honest answer requires having
+# been there a while. Asked at second three it measures the WiFi; asked at
+# minute twenty it measures the visit, which is the thing the venue wants
+# to know. The dwell gate is the whole difference between the two.
+#
+# **These three numbers are the portal's, not this module's.** The guest
+# frontend clamps the value it renders against
+# (``clampFeedbackDwellMinutes`` in ``lib/portal-post-connect.ts``):
+# absent or non-numeric becomes 25, anything below 5 is raised to 5.
+# They are duplicated here so the server rejects what the client would
+# have silently overridden -- a backend that accepts 2 and a frontend
+# that shows the card at 5 is a venue setting a number that does nothing,
+# with no error to explain it. If either side moves, both move.
+#
+# A floor of 5 rather than 0 does mean "no dwell gate at all" cannot be
+# expressed. That is the frontend's existing behaviour rather than a
+# decision taken here, and it is a real product question -- a two-minute
+# QSR counter has a genuine case for showing the card immediately. Left
+# for the PM; see the PR description.
+#
+# The ceiling is a day, and it is not a judgement about what is useful --
+# anything past an hour almost certainly is not. It guards against a
+# value that silently means "never": a session that ends before the gate
+# opens shows nothing, with no error and nothing on screen to explain it.
+# A venue that types 10000 has made a mistake this platform can catch.
+MIN_FEEDBACK_DWELL_MINUTES = 5
+MAX_FEEDBACK_DWELL_MINUTES = 1440
+
+# 25 minutes, matching the frontend's own ``DEFAULT_FEEDBACK_DWELL_MINUTES``
+# -- long enough that the card is asking about a visit rather than about
+# the WiFi. A judgement, not a measurement.
+DEFAULT_FEEDBACK_DWELL_MINUTES = 25
+
 # Field-label constants for the "at most one of text/url" validation --
 # see validators.validate_single_content_source's docstring for why this is
 # "at most one", not "exactly one".
@@ -324,6 +410,11 @@ __all__ = [
     "SPLASH_HEADLINE_MAX_LENGTH",
     "SPLASH_WELCOME_MESSAGE_MAX_LENGTH",
     "POST_LOGIN_HTML_MAX_BYTES",
+    "REVIEW_URL_MAX_LENGTH",
+    "REVIEW_URL_ALLOWED_HOST_SUFFIXES",
+    "MIN_FEEDBACK_DWELL_MINUTES",
+    "MAX_FEEDBACK_DWELL_MINUTES",
+    "DEFAULT_FEEDBACK_DWELL_MINUTES",
     "TERMS_AND_CONDITIONS_LABEL",
     "PRIVACY_POLICY_LABEL",
 ]
