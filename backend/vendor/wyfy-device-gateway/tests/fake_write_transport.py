@@ -77,6 +77,13 @@ class FakePath:
     def update(self, **fields: Any) -> None:
         self._recorder.update_calls.append((self._segments, fields))
         self._recorder.ops.append(("update", self._segments, fields))
+        if self._segments in self._recorder.silently_ignore_updates:
+            # A `set` that returns cleanly and changes nothing. Not
+            # hypothetical: this is the exact shape of the 2026-08-18
+            # hotspot-profile rebind failure, and any code that treats "no
+            # exception" as success passes every other test in this suite
+            # while leaving the device untouched.
+            return
         target_id = fields.get(".id")
         for row in self._rows:
             if target_id is None or row.get(".id") == target_id:
@@ -105,11 +112,19 @@ class FakeRouterOSApi:
         command_replies: dict[str, list[dict[str, Any]]] | None = None,
         missing_menus: set[tuple[str, ...]] | None = None,
         raise_on_command: dict[str, Exception] | None = None,
+        command_handlers: dict[str, Any] | None = None,
     ) -> None:
         self._menus = {k: list(v) for k, v in (menus or {}).items()}
         self._command_replies = command_replies or {}
         self._missing_menus = missing_menus or set()
         self._raise_on_command = raise_on_command or {}
+        # A one-shot command that *changes the device* -- /certificate
+        # import is the real example: it creates certificate objects, and a
+        # fake that only replayed a canned reply would let a push whose
+        # whole point is those objects pass without ever creating them.
+        # A handler is called as handler(api, kwargs) and returns the reply
+        # rows, having mutated ``api`` however the real command would.
+        self._command_handlers = command_handlers or {}
         self.closed = False
         self.add_calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
         self.update_calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
@@ -120,6 +135,16 @@ class FakeRouterOSApi:
         # never leaving the chain without its DROP -- that ordering is the
         # thing worth asserting.
         self.ops: list[tuple[str, tuple[str, ...], Any]] = []
+        # One-shot commands (``api("/tool/fetch", ...)``) land in ``ops``
+        # too, as ``("command", (cmd,), kwargs)``. A certificate push is
+        # only correct if the fetches happen before the certificate store
+        # is swept and the rebind happens before the old leaf is removed,
+        # and neither of those orderings is assertable if the commands and
+        # the menu writes are recorded in two separate lists.
+        self.command_calls: list[tuple[str, dict[str, Any]]] = []
+        # Menus (as path tuples) whose ``update`` records the call and then
+        # does nothing -- see FakePath.update.
+        self.silently_ignore_updates: set[tuple[str, ...]] = set()
 
     def path(self, *segments: str) -> FakePath:
         from librouteros.exceptions import LibRouterosError
@@ -130,8 +155,13 @@ class FakeRouterOSApi:
         return FakePath(rows, self, segments)
 
     def __call__(self, cmd: str, **kwargs: Any):
+        self.command_calls.append((cmd, dict(kwargs)))
+        self.ops.append(("command", (cmd,), dict(kwargs)))
         if cmd in self._raise_on_command:
             raise self._raise_on_command[cmd]
+        handler = self._command_handlers.get(cmd)
+        if handler is not None:
+            return iter(handler(self, dict(kwargs)))
         return iter(self._command_replies.get(cmd, []))
 
     def close(self) -> None:

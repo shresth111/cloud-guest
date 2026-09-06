@@ -801,6 +801,97 @@ class SpeedTestResult:
 
 
 @dataclass(frozen=True, slots=True)
+class HotspotCertificatePush:
+    """One router's worth of "replace the TLS certificate the captive
+    portal serves", expressed as things the *device* can reach and names
+    the device already uses.
+
+    The two URLs are the whole point of this shape. The mechanism this
+    replaces pushed the PEMs with ``scp`` and drove the re-import over
+    ``ssh``; measured against the live fleet on 2026-09-06, ports
+    21/22/23/80/443/8291 all time out on the only reachable router --
+    filtered, a firewall drop, not "refused" -- and only 8728/8729 answer.
+    So nothing can be pushed *to* a router at all. Inverting the direction
+    (the router pulls, via ``/tool fetch``, which is an ordinary API
+    command on 8728) is the only transport that survives that firewall.
+
+    Because the direction is inverted, ``privkey_url`` is briefly a
+    credential living outside the API's own authentication: anyone who can
+    reach that URL gets the fleet private key. Minting it is therefore the
+    caller's responsibility and carries real obligations -- single use,
+    a short TTL, bound to the requesting router's own address, and served
+    only on an interface the public internet cannot route to. See
+    ``app.domains.router.ephemeral_pem_server`` in cloud-guest-repo for
+    the implementation those obligations are actually enforced by; this
+    package deliberately holds no opinion about *how* a URL is minted,
+    exactly as ``run_speed_test`` holds none about which host serves its
+    test file.
+
+    ``login_by`` is not a policy decision made here. It is ported verbatim
+    from ``ops/letsencrypt-hotspot/renew-hotspot-certs.sh``, which sets it
+    in the *same* ``set`` call as ``ssl-certificate`` because splitting the
+    two across separate calls silently no-op'd during the 2026-08-18
+    incident. It travels with the rebind so the rebind stays atomic, not so
+    that callers can retune the portal's authentication.
+
+    ``expected_dns_names`` is the certificate's own SAN list, when the
+    caller knows it. Given, the adapter refuses to rebind a profile whose
+    ``dns-name`` those SANs do not cover -- pushing a certificate that
+    does not match the address in the guest's URL bar produces exactly the
+    full-screen browser warning this whole effort exists to remove, while
+    looking like a success in every log.
+    """
+
+    cert_name: str
+    hotspot_profile: str
+    fullchain_url: str
+    privkey_url: str
+    login_by: str = "https,http-pap"
+    expected_dns_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotCertificatePushResult:
+    """What the device says is true *after* a certificate push -- read back
+    off the router, never inferred from the fact that the commands did not
+    raise.
+
+    Every field here exists because an import that silently no-ops is worse
+    than one that errors, and whether RouterOS's ``/certificate import``
+    reports its own result over the API has never been confirmed against
+    this fleet's firmware. ``certificates_imported``/
+    ``private_keys_imported`` carry that reply's counters when it sends
+    them and ``None`` when it sends nothing -- so a caller can tell "the
+    router said it imported 2 certificates" apart from "the router said
+    nothing and we checked ourselves". The read-back fields below are what
+    the adapter actually gates success on, precisely because the counters
+    may not be there.
+
+    ``chain_issuer_present`` is the 2026-08-18 incident, encoded as a
+    boolean. An earlier version of the shell push deleted the Let's Encrypt
+    intermediate immediately after importing it, and the router then served
+    the leaf alone: genuinely LE-issued, verifiable offline, incomplete on
+    the wire -- which strict/embedded TLS clients reject outright and
+    desktop browsers paper over, so it looked fine to whoever checked. The
+    tell on the device was an orphaned ``akid``: the leaf named an issuer
+    that no certificate object in the store claimed by ``skid``. That is
+    the check, not "did we import three objects".
+    """
+
+    cert_name: str
+    hotspot_profile: str
+    profile_dns_name: str | None
+    certificates_imported: int | None
+    private_keys_imported: int | None
+    bound_ssl_certificate: str | None
+    bound_login_by: str | None
+    leaf_has_private_key: bool
+    leaf_invalid_after: str | None
+    chain_issuer_present: bool
+    chain_cert_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class DefaultRoute:
     """One ``0.0.0.0/0`` route in the router's own ``main`` routing table,
     as RouterOS reports it right now.
@@ -1295,6 +1386,35 @@ class DeviceGatewayAdapter(Protocol):
         docstring for real, measured timings against real hardware."""
         ...
 
+    # -- hotspot TLS certificate ------------------------------------------
+    async def push_hotspot_certificate(
+        self, creds: DeviceCredentials, *, push: HotspotCertificatePush
+    ) -> HotspotCertificatePushResult:
+        """Replace the certificate the captive portal serves, over the API
+        alone -- no SSH, no SFTP, no port but the one the fleet's firewall
+        actually leaves open.
+
+        The device pulls both PEMs itself from the caller-minted URLs in
+        ``push`` (``/tool fetch``), imports them, and the profile is
+        rebound to the new leaf. See :class:`HotspotCertificatePush` for
+        why the direction is inverted and what minting those URLs obliges
+        the caller to.
+
+        Fails closed in the direction that matters: everything destructive
+        (removing the old leaf, rebinding the profile) happens only after
+        the new leaf has been read back off the device by name, so an
+        import that silently does nothing leaves the router on its current,
+        working certificate rather than on none. Success is likewise a
+        read-back, never an absence of errors -- see
+        :class:`HotspotCertificatePushResult`.
+
+        Not idempotent in the "re-push writes nothing" sense the config
+        methods are: a certificate push is a replacement, and re-running it
+        genuinely re-imports and re-binds. It is safe to re-run, which is
+        the property that actually matters after a partial failure.
+        """
+        ...
+
     # -- queue management (QoS/bandwidth shaping) --------------------------
     async def create_simple_queue(
         self,
@@ -1485,6 +1605,8 @@ __all__ = [
     "HotspotActiveSession",
     "HotspotSessionControl",
     "HotspotDisconnectResult",
+    "HotspotCertificatePush",
+    "HotspotCertificatePushResult",
     "ProvisionResult",
     "SpeedTestResult",
     "PingResult",
