@@ -162,10 +162,31 @@
 #
 #  /ip hotspot walled-garden ip print
 #
-#  Isme comment="cloudguest-portal-https" aur dst-address=20.219.51.94
-#  wali row honi chahiye. KHAALI HUI TO GUEST PORTAL TAK PAHUNCH
-#  HI NAHI PAYEGA -- ye is poore setup ka sabse zaroori ek check hai.
-#  Khaali ho to Walled Garden chunk dobara paste karo.
+#  Isme comment="cloudguest-portal-https" wali row honi chahiye.
+#  KHAALI HUI TO GUEST PORTAL TAK PAHUNCH HI NAHI PAYEGA -- ye is
+#  poore setup ka sabse zaroori ek check hai. Khaali ho to Walled
+#  Garden chunk dobara paste karo.
+#
+#  US ROW MEIN KAUNSA ADDRESS HONA CHAHIYE, YE YAHAN LIKHA HUA NAHI HAI
+#  -- JAANBUJH KAR. Device se khud poochho:
+#
+#  :put [:resolve auth.wyfyguest.com]
+#
+#  Jo nikle, wahi dst-address row mein hona chahiye. Alag ho to Walled
+#  Garden chunk dobara paste karo (wo bhi :resolve hi karta hai).
+#
+#  Yahan pehle `dst-address=20.219.51.94` likha tha, "expected value" ki
+#  tarah. Wo Azure ka address tha. Platform 2026-08-27 ko AWS ap-south-1
+#  pe chala gaya aur ab ye naam 13.203.112.174 pe resolve hota hai. Yaani
+#  ye runbook ek theek chalte router ko dekh kar operator se kehti ki
+#  "galat hai", aur operator use ek mare hue address pe set kar deta --
+#  guest portal ko theek karne ke naam par tod deta. Wahi shakal jo
+#  `login-by=https,http-pap` wali line ki thi.
+#
+#  Isliye ab yahan koi IP likhi hi nahi hai. Ek address jo file mein
+#  hardcode hai, wo agli migration pe phir se galat ho jayega aur koi
+#  ye file dobara khol kar nahi dekhega. `:resolve` kabhi purana nahi
+#  hota.
 #
 #  Agar "WAN CONNECTIVITY CHECK" me ping PASS aaye par DNS FAIL,
 #  to wo script ka bug hai, tumhare network ka nahi -- wo check
@@ -252,7 +273,17 @@
 #    2  3 / 3 replies
 #    3  1 ya zyada  <-- 0 hua to guest portal tak pahunchega hi nahi
 #    4  1
-#    5  http-pap zaroor ho (https bhi ho to theek hai)
+#    5  SIRF http-pap. `https` dikhe to wo galti hai, theek karo.
+#       (Yahan pehle "https bhi ho to theek hai" likha tha. Wo neeche
+#       troubleshooting ke ">>> https KABHI MAT DAALO <<<" se seedha
+#       ulta tha, aur operator checklist hi padhta hai. Exception sirf
+#       ek hai: agar is router pe wyfy-hotspot-fleet cert BANDHA hua ho
+#       to `https,http-pap` sahi hai -- par 2026-09-06 tak fleet mein
+#       aisa ek hi router hai, aur uspe bhi cert haath se chadhaya gaya
+#       tha. Cert bandha hai ya nahi, ye dekho:
+#       /ip hotspot profile print detail where name=hsprof1
+#       -- usme ssl-certificate khaali ho aur login-by me https ho, to
+#       wahi teen shikayaton wali haalat hai jo neeche likhi hai.)
 #    6  00:05:00
 #    7  5
 #    8  1
