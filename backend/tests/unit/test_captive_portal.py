@@ -49,6 +49,7 @@ from app.domains.captive_portal.exceptions import (
     InvalidGuestFontChoiceError,
     InvalidHexColorError,
     InvalidPortalContentSourceError,
+    InvalidUserPortalUrlError,
     MissingPortalResolutionParamsError,
     PostLoginHtmlTooLargeError,
     PoweredByAttributionNotEntitledError,
@@ -59,6 +60,7 @@ from app.domains.captive_portal.html_sanitizer import (
     sanitize_stylesheet,
 )
 from app.domains.captive_portal.models import CaptivePortalConfig
+from app.domains.captive_portal.router import captive_portal_api
 from app.domains.captive_portal.service import (
     CaptivePortalService,
     PoweredByAttributionResetService,
@@ -72,12 +74,14 @@ from app.domains.captive_portal.validators import (
     validate_hex_color,
     validate_single_content_source,
     validate_splash_text_length,
+    validate_user_portal_url,
 )
 from app.domains.location.exceptions import (
     CrossOrganizationLocationAccessError,
     LocationNotFoundError,
 )
 from app.domains.location.models import Location
+from app.domains.network_config.renderers import HOTSPOT_DNS_NAME
 from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
@@ -3496,3 +3500,134 @@ class TestPostLoginHtmlServiceWiring:
             organization_id=fx.organization.id, location_id=None
         )
         assert second.config.post_login_html == "<p>Welcome online</p>"
+
+
+class TestRfc8908UserPortalUrl:
+    """``portal_url`` is reflected into a document a conforming OS opens by
+    itself off a DHCP lease, so the allowlist here is a security boundary
+    rather than input hygiene -- see ``validate_user_portal_url``.
+
+    The accept cases pin the *rebuilt* value, not merely a 200: the whole
+    design is that the caller's bytes never reach the response, and a test
+    that only asserted "no exception" would pass just as happily against a
+    check-then-reflect implementation.
+    """
+
+    def test_accepts_the_bare_hotspot_name_and_canonicalises_it(self) -> None:
+        assert (
+            validate_user_portal_url(f"http://{HOTSPOT_DNS_NAME}/")
+            == f"http://{HOTSPOT_DNS_NAME}/"
+        )
+
+    def test_accepts_the_per_vlan_name_render_vlan_hotspot_emits(self) -> None:
+        """``_render_vlan_hotspot`` renders ``vlan{id}.`` + the bare name --
+        the one subdomain shape this platform actually produces."""
+        assert (
+            validate_user_portal_url(f"http://vlan100.{HOTSPOT_DNS_NAME}/")
+            == f"http://vlan100.{HOTSPOT_DNS_NAME}/"
+        )
+
+    @pytest.mark.parametrize(
+        "supplied",
+        [
+            f"http://{HOTSPOT_DNS_NAME}",
+            f"http://{HOTSPOT_DNS_NAME}/login",
+            f"http://{HOTSPOT_DNS_NAME}/?next=%2Fevil",
+            f"http://{HOTSPOT_DNS_NAME}/#frag",
+            f"http://{HOTSPOT_DNS_NAME}.",
+            f"http://{HOTSPOT_DNS_NAME.upper()}/",
+            f"http://{HOTSPOT_DNS_NAME}:80/",
+        ],
+    )
+    def test_rebuilds_rather_than_reflecting(self, supplied: str) -> None:
+        """Everything that is not the hostname is discarded, not sanitised.
+        A path or query on our own hotspot is harmless in itself; dropping
+        it is what removes the whole class of parser-disagreement attacks
+        rather than playing whack-a-mole with encodings."""
+        assert validate_user_portal_url(supplied) == f"http://{HOTSPOT_DNS_NAME}/"
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "http://evil.example/",
+            # Userinfo: the classic "the real host is after the @".
+            f"http://{HOTSPOT_DNS_NAME}@evil.example/",
+            f"http://user:pass@{HOTSPOT_DNS_NAME}/",
+            # Suffix confusion -- endswith() on the bare name without the
+            # dot separator would accept this.
+            f"http://evil{HOTSPOT_DNS_NAME}/",
+            f"http://{HOTSPOT_DNS_NAME}.evil.example/",
+            # Backslash: WHATWG parsers treat it as a path separator and
+            # resolve the host as evil.example; Python's urlsplit does not.
+            f"http://{HOTSPOT_DNS_NAME}\\@evil.example/",
+            f"http://{HOTSPOT_DNS_NAME}\\.evil.example/",
+            # Scheme: https is not merely unsafe here, it is wrong -- the
+            # hotspot has no certificate a guest device trusts.
+            f"https://{HOTSPOT_DNS_NAME}/",
+            f"javascript:alert(1)//{HOTSPOT_DNS_NAME}",
+            f"data:text/html,<h1>{HOTSPOT_DNS_NAME}",
+            f"//{HOTSPOT_DNS_NAME}/",
+            # Non-default port: nothing this platform emits.
+            f"http://{HOTSPOT_DNS_NAME}:8080/",
+            f"http://{HOTSPOT_DNS_NAME}:notaport/",
+            # Whitespace and controls: stripped by some parsers, kept by
+            # others, emitted by none of ours.
+            f"http://{HOTSPOT_DNS_NAME}/ evil",
+            f"http://{HOTSPOT_DNS_NAME}\t/",
+            f"http://\n{HOTSPOT_DNS_NAME}/",
+            # Deeper than one label -- not a name this platform can render.
+            f"http://a.b.{HOTSPOT_DNS_NAME}/",
+            "",
+            "http://",
+        ],
+    )
+    def test_refuses_everything_else(self, hostile: str) -> None:
+        with pytest.raises(InvalidUserPortalUrlError):
+            validate_user_portal_url(hostile)
+
+    def test_the_error_does_not_echo_the_offending_value(self) -> None:
+        """The endpoint is unauthenticated, so its error message is the one
+        string an attacker can reliably make the platform emit. Echoing
+        their input into it would be a smaller copy of the reflection this
+        validator exists to close."""
+        marker = "canary-do-not-echo.example"
+        with pytest.raises(InvalidUserPortalUrlError) as excinfo:
+            validate_user_portal_url(f"http://{marker}/")
+        assert marker not in str(excinfo.value)
+
+    def test_allowlist_tracks_the_renderer_rather_than_a_second_literal(
+        self,
+    ) -> None:
+        """The name a guest may be *sent* to and the name
+        ``render_hotspot_walled_garden`` lets them *reach* have to be one
+        set. This asserts the validator reads the renderer's constant, so
+        changing ``HOTSPOT_DNS_NAME`` cannot leave the two disagreeing."""
+        assert validate_user_portal_url(f"http://{HOTSPOT_DNS_NAME}/").endswith(
+            f"{HOTSPOT_DNS_NAME}/"
+        )
+
+
+class TestRfc8908Response:
+    """The document itself: media type, cache directive, and the fact that
+    ``user-portal-url`` carries the rebuilt value."""
+
+    async def test_serves_a_conformant_captive_json_document(self) -> None:
+        response = await captive_portal_api(portal_url=f"http://{HOTSPOT_DNS_NAME}/")
+        assert response.media_type == "application/captive+json"
+        body = json.loads(response.body)
+        assert body["captive"] is True
+        assert body["user-portal-url"] == f"http://{HOTSPOT_DNS_NAME}/"
+
+    async def test_is_not_cacheable_at_all(self) -> None:
+        """``private`` only forbids a *shared* cache, and this document's
+        entire job is to be re-fetched -- an RFC 8908 client polls it to
+        learn whether it is STILL captive, which is the one question a
+        cached copy always answers wrongly."""
+        response = await captive_portal_api(portal_url=f"http://{HOTSPOT_DNS_NAME}/")
+        assert response.headers["Cache-Control"] == "no-store"
+
+    async def test_a_hostile_portal_url_never_reaches_the_document(self) -> None:
+        """The reason this endpoint is worth hardening: a conforming OS
+        opens ``user-portal-url`` by itself, with no click to withhold."""
+        with pytest.raises(InvalidUserPortalUrlError):
+            await captive_portal_api(portal_url="http://evil.example/")
