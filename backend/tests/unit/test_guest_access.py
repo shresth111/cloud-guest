@@ -22,18 +22,23 @@ import pytest
 from app.domains.guest_access.constants import AccessRuleType
 from app.domains.guest_access.exceptions import (
     AccessRuleNotFoundError,
+    CountryCodeRequiredError,
     CrossOrganizationAccessRuleError,
     InvalidGuestIdentifierError,
     InvalidRuleExpiryError,
     TemporaryRuleRequiresExpiryError,
 )
 from app.domains.guest_access.models import DeviceAccessRule, GuestAccessRule
+from app.domains.guest_access.repository import GuestAccessRepository
 from app.domains.guest_access.service import (
     AccessDecision,
     AccessDecisionResolver,
     GuestAccessService,
 )
 from app.domains.guest_access.validators import (
+    canonicalize_rule_identifier,
+    identifier_match_terms,
+    identifiers_match,
     is_rule_expired,
     validate_identifier_shape,
     validate_rule_expiry,
@@ -130,11 +135,16 @@ class FakeGuestAccessRepository:
         identifier: str,
         now: datetime,
     ) -> list[GuestAccessRule]:
+        # ``identifiers_match``, not ``==``: the real repository resolves
+        # a guest against every stored spelling of the same number (see
+        # ``validators.identifier_match_terms``), and a fake that still
+        # compared exactly would keep passing for the exact defect this
+        # domain was fixed for.
         return [
             rule
             for rule in self.guest_rules.values()
             if rule.organization_id == organization_id
-            and rule.identifier == identifier
+            and identifiers_match(rule.identifier, identifier)
             and rule.is_active
             and not rule.is_deleted
             and (rule.location_id is None or rule.location_id == location_id)
@@ -288,14 +298,26 @@ class TestValidators:
             "guest@example.com",
             "a@b.co",
             "+919876543210",
-            "919876543210",
-            "14155552671",
+            "+14155552671",
         ],
     )
     def test_validate_identifier_shape_accepts_phone_or_email(
         self, identifier: str
     ) -> None:
         validate_identifier_shape(identifier)  # does not raise
+
+    @pytest.mark.parametrize("identifier", ["919876543210", "14155552671"])
+    def test_validate_identifier_shape_rejects_missing_country_code(
+        self, identifier: str
+    ) -> None:
+        # These two used to pass -- the old ``_PHONE_RE`` made the "+"
+        # optional, which is what let the customer dashboard write rules
+        # that could never match a guest (2026-09). A number without a
+        # country code is now refused at the door, and with its own
+        # exception: it is under-specified, not malformed, and the admin
+        # needs different words in front of them.
+        with pytest.raises(CountryCodeRequiredError):
+            validate_identifier_shape(identifier)
 
     @pytest.mark.parametrize(
         "identifier",
@@ -731,3 +753,263 @@ class TestCheckAccess:
                 identifier="guest@example.com",
                 mac_address=None,
             )
+
+
+# ============================================================================
+# Identifier normalization: the 2026-09 "Always Allowed matches nobody" fix
+# ============================================================================
+
+
+def _legacy_rule(
+    fx: Fixture,
+    *,
+    identifier: str,
+    rule_type: AccessRuleType = AccessRuleType.WHITELIST,
+    reason: str | None = None,
+) -> GuestAccessRule:
+    """Writes a rule straight into the repository, bypassing the service.
+
+    Not laziness -- necessity. ``create_guest_rule`` now refuses the very
+    shape these tests are about, and this is exactly how those rows got
+    into production: the customer dashboard's Always Allowed / Block User
+    forms POSTed bare national digits, the API stored them verbatim, and
+    nothing downstream could ever match them again.
+    """
+    rule = GuestAccessRule(
+        **_base_fields(
+            organization_id=fx.organization_id,
+            location_id=None,
+            identifier=identifier,
+            rule_type=rule_type.value,
+            reason=reason,
+            email=None,
+            expires_at=None,
+            is_active=True,
+        )
+    )
+    fx.repository.guest_rules[rule.id] = rule
+    return rule
+
+
+class TestIdentifierCanonicalization:
+    def test_bare_national_number_is_refused_not_guessed(self) -> None:
+        # Nothing server-side knows which country "9876543210" belongs to.
+        # Prefixing one would put the same class of unmatchable row in the
+        # table for a new reason, so the write is refused instead.
+        with pytest.raises(CountryCodeRequiredError):
+            validate_identifier_shape("9876543210")
+
+    def test_rejection_message_tells_the_admin_what_to_do(self) -> None:
+        with pytest.raises(CountryCodeRequiredError) as excinfo:
+            validate_identifier_shape("9876543210")
+        message = str(excinfo.value)
+        assert "country code" in message
+        assert "+919876543210" in message
+
+    @pytest.mark.parametrize(
+        ("submitted", "stored"),
+        [
+            ("  +919876543210  ", "+919876543210"),
+            ("+91 98765 43210", "+919876543210"),
+            ("+91-98765-43210", "+919876543210"),
+            ("+1 (415) 555-2671", "+14155552671"),
+        ],
+    )
+    def test_human_formatting_is_stripped_not_rejected(
+        self, submitted: str, stored: str
+    ) -> None:
+        # An admin bounced for punctuation retypes the number without the
+        # "+" next, which is the one shape this domain must keep out of
+        # the table -- so punctuation is absorbed, not punished.
+        canonical = canonicalize_rule_identifier(submitted)
+        assert canonical == stored
+        validate_identifier_shape(canonical)  # does not raise
+
+    def test_email_identifiers_are_left_alone(self) -> None:
+        # Case-folding emails would be an unrelated behaviour change to a
+        # column ``Guest.identifier`` compares case-sensitively.
+        assert canonicalize_rule_identifier("  Guest@Example.com ") == (
+            "Guest@Example.com"
+        )
+
+    async def test_create_guest_rule_stores_e164(self) -> None:
+        fx = make_fixture()
+        rule = await fx.service.create_guest_rule(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+91 98765 43210",
+            rule_type=AccessRuleType.WHITELIST,
+            reason="owner's family",
+            expires_at=None,
+            actor_user_id=fx.actor_user_id,
+        )
+        assert rule.identifier == "+919876543210"
+
+    async def test_create_guest_rule_refuses_bare_national_number(self) -> None:
+        fx = make_fixture()
+        with pytest.raises(CountryCodeRequiredError):
+            await fx.service.create_guest_rule(
+                organization_id=fx.organization_id,
+                requesting_organization_id=fx.organization_id,
+                location_id=fx.location_id,
+                identifier="9876543210",
+                rule_type=AccessRuleType.WHITELIST,
+                reason=None,
+                expires_at=None,
+                actor_user_id=fx.actor_user_id,
+            )
+        assert fx.repository.guest_rules == {}
+
+
+class TestLegacyIdentifierMatching:
+    async def test_bare_digit_rule_matches_e164_guest(self) -> None:
+        # The failure that was live: every row the Always Allowed form
+        # ever wrote is bare national digits, every guest signs in as
+        # E.164, and rules were resolved by string equality -- so no rule
+        # that screen wrote could match anybody. Under the per-property
+        # whitelist-only mode this same unchanged data refuses every
+        # guest at the property, staff included.
+        fx = make_fixture()
+        _legacy_rule(fx, identifier="9876543210", reason="owner's family")
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+919876543210",
+            mac_address=None,
+        )
+        assert decision.rule_type == AccessRuleType.WHITELIST.value
+        assert decision.allowed is True
+
+    async def test_bare_digit_blocklist_rule_still_denies(self) -> None:
+        # The same row shape on the deny side: a block written by that
+        # form let the blocked guest straight back on.
+        fx = make_fixture()
+        _legacy_rule(
+            fx,
+            identifier="9876543210",
+            rule_type=AccessRuleType.BLOCKLIST,
+            reason="repeated abuse",
+        )
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+919876543210",
+            mac_address=None,
+        )
+        assert decision.allowed is False
+        assert decision.reason == "repeated abuse"
+
+    async def test_e164_rule_matches_bare_digit_guest(self) -> None:
+        # The reverse direction. A canonically-written rule must not go
+        # inert the moment a portal (or a NAS forwarding whatever the
+        # browser POSTed) sends the number without its country code.
+        fx = make_fixture()
+        await fx.service.create_guest_rule(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=None,
+            identifier="+919876543210",
+            rule_type=AccessRuleType.VIP,
+            reason="regular",
+            expires_at=None,
+            actor_user_id=fx.actor_user_id,
+        )
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="9876543210",
+            mac_address=None,
+        )
+        assert decision.rule_type == AccessRuleType.VIP.value
+
+    async def test_country_code_without_plus_also_matches(self) -> None:
+        # The third spelling the old, "+"-optional regex accepted and the
+        # table therefore holds.
+        fx = make_fixture()
+        _legacy_rule(fx, identifier="919876543210")
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+919876543210",
+            mac_address=None,
+        )
+        assert decision.rule_type == AccessRuleType.WHITELIST.value
+
+    async def test_a_different_number_still_does_not_match(self) -> None:
+        # The widening is bounded at one country code, not "ends with".
+        fx = make_fixture()
+        _legacy_rule(fx, identifier="9876543210", rule_type=AccessRuleType.BLOCKLIST)
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=fx.location_id,
+            identifier="+919876500000",
+            mac_address=None,
+        )
+        assert decision.allowed is True
+        assert decision.rule_type is None
+
+    @pytest.mark.parametrize(
+        ("stored", "incoming"),
+        [
+            ("guest@example.com", "other@example.com"),
+            ("guest@example.com", "+919876543210"),
+            ("+919876543210", "guest@example.com"),
+            # Never widen what cannot be proved to be a phone number.
+            ("123456", "+91123456"),
+        ],
+    )
+    def test_non_phone_identifiers_are_never_widened(
+        self, stored: str, incoming: str
+    ) -> None:
+        assert identifiers_match(stored, incoming) is False
+
+    def test_identical_email_still_matches(self) -> None:
+        assert identifiers_match("guest@example.com", " guest@example.com ") is True
+
+
+class TestMatchTermsAndSqlAgree:
+    """The Python mirror (``identifiers_match``, used by this module's fake
+    repository) and the real SQL clause must not drift -- one of them is
+    what the tests above exercise and the other is what production runs,
+    and there is no live Postgres here to run both against."""
+
+    async def test_repository_statement_carries_every_match_term(self) -> None:
+        captured: list[object] = []
+
+        class _Result:
+            def scalars(self) -> _Result:
+                return self
+
+            def all(self) -> list[GuestAccessRule]:
+                return []
+
+        class _Session:
+            async def execute(self, statement: object) -> _Result:
+                captured.append(statement)
+                return _Result()
+
+        repository = GuestAccessRepository(_Session())  # type: ignore[arg-type]
+        await repository.list_matching_guest_rules(
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+            identifier="+919876543210",
+            now=_now(),
+        )
+        compiled = str(
+            captured[0].compile(  # type: ignore[attr-defined]
+                compile_kwargs={"literal_binds": True}
+            )
+        )
+        terms = identifier_match_terms("+919876543210")
+        assert "9876543210" in terms.exact  # the legacy shape, spelled out
+        for term in terms.exact:
+            assert f"'{term}'" in compiled
+        for pattern in terms.prefix_patterns:
+            assert f"'{pattern}'" in compiled
+        assert "LIKE" in compiled.upper()

@@ -28,6 +28,7 @@ from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
 
 from .models import DeviceAccessRule, GuestAccessRule
+from .validators import identifier_match_terms
 
 
 class GuestAccessRepositoryProtocol(Protocol):
@@ -169,13 +170,42 @@ class GuestAccessRepository:
         ``AccessDecisionResolver.resolve``. Deliberately not expressible
         via ``GenericRepository``'s equality-filter support: this needs an
         OR across ``location_id IS NULL`` vs. a specific ``location_id``,
-        plus an ``expires_at IS NULL OR expires_at > now`` bound."""
+        plus an ``expires_at IS NULL OR expires_at > now`` bound.
+
+        ``identifier`` is matched against every spelling of the same phone
+        number this table may hold, not by ``==``. Exact equality is what
+        made every rule the customer dashboard ever wrote unmatchable in
+        2026-09 -- those rows hold bare national digits ("9876543210")
+        and guests sign in as E.164 ("+919876543210") -- and no migration
+        can reconcile them without inventing a country code nobody
+        recorded. ``validators.identifier_match_terms`` documents the
+        equivalence, its bounds, and the false-match risk it accepts;
+        ``validators.identifiers_match`` is the Python mirror of the
+        clause built here.
+        """
         scope_clause = GuestAccessRule.location_id.is_(None)
         if location_id is not None:
             scope_clause = or_(scope_clause, GuestAccessRule.location_id == location_id)
+        terms = identifier_match_terms(identifier)
+        identifier_clause = GuestAccessRule.identifier.in_(terms.exact)
+        if terms.prefix_patterns:
+            # The stored-value-is-longer direction (a rule written in
+            # E.164, a guest signing in without the country code). No IN
+            # list can enumerate it, so it is a bounded LIKE: "+" or
+            # nothing, then 1-3 single-character wildcards, then the
+            # digits themselves. No leading "%" -- the organization_id
+            # equality above already confines the scan to one tenant's
+            # rules, which is a handful of rows per venue.
+            identifier_clause = or_(
+                identifier_clause,
+                *(
+                    GuestAccessRule.identifier.like(pattern)
+                    for pattern in terms.prefix_patterns
+                ),
+            )
         statement = select(GuestAccessRule).where(
             GuestAccessRule.organization_id == organization_id,
-            GuestAccessRule.identifier == identifier,
+            identifier_clause,
             GuestAccessRule.is_active.is_(True),
             GuestAccessRule.is_deleted.is_(False),
             scope_clause,

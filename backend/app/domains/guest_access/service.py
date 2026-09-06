@@ -98,6 +98,7 @@ from .exceptions import (
 from .models import DeviceAccessRule, GuestAccessRule
 from .repository import GuestAccessRepositoryProtocol
 from .validators import (
+    canonicalize_rule_identifier,
     normalize_identifier,
     normalize_mac_address,
     validate_identifier_shape,
@@ -275,7 +276,12 @@ class GuestAccessService:
         actor_user_id: uuid.UUID | None,
     ) -> GuestAccessRule:
         self._enforce_tenant_scope(organization_id, requesting_organization_id)
-        identifier = normalize_identifier(identifier)
+        # Canonicalize before validating, and store what was validated --
+        # this is the write half of the 2026-09 "Always Allowed matches
+        # nobody" fix. A phone number lands in the table as E.164 or does
+        # not land at all; ``validators.canonicalize_rule_identifier`` and
+        # ``exceptions.CountryCodeRequiredError`` carry the reasoning.
+        identifier = canonicalize_rule_identifier(identifier)
         validate_identifier_shape(identifier)
         now = datetime.now(UTC)
         validate_rule_expiry(rule_type=rule_type, expires_at=expires_at, now=now)
@@ -477,6 +483,14 @@ class GuestAccessService:
         if location_id is not None:
             filters["location_id"] = location_id
         if identifier is not None:
+            # Strip-only, deliberately: this is a dashboard list filter,
+            # not an access decision. ``canonicalize_rule_identifier``
+            # would refuse a bare number outright (see
+            # ``CountryCodeRequiredError``), turning "search for
+            # 9876543210" into a 400 -- and a search for exactly the
+            # legacy rows an admin most needs to find and rewrite. The
+            # filter stays an exact ``==``; the widened matching in
+            # ``check_access`` is what has to be right.
             filters["identifier"] = normalize_identifier(identifier)
         if rule_type is not None:
             filters["rule_type"] = rule_type.value
@@ -681,7 +695,7 @@ class GuestAccessService:
             guest_rules = await self.repository.list_matching_guest_rules(
                 organization_id=organization_id,
                 location_id=location_id,
-                identifier=normalize_identifier(identifier),
+                identifier=canonicalize_rule_identifier(identifier),
                 now=now,
             )
         if mac_address is not None:
