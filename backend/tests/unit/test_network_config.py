@@ -427,6 +427,29 @@ class TestRenderVlanHotspot:
         assert f"vlan200.{HOTSPOT_DNS_NAME}" in joined_b
         assert f"vlan200.{HOTSPOT_DNS_NAME}" not in joined_a
 
+    def test_the_html_directory_is_one_that_exists_on_the_device(self) -> None:
+        """``html-directory`` is where RouterOS serves the hotspot's pages
+        from, so a profile pointed at a directory nothing ever created has
+        no login page to serve.
+
+        This asserts the *stock* name specifically, not merely that the two
+        Python paths agree with each other. They did agree, on
+        ``cloudguest-hotspot`` -- a directory this platform names and never
+        writes a file into, as ``render_hotspot_walled_garden``'s own "What
+        this does NOT fix" says. The third path is the one that puts files
+        on devices: the Master Console's generated setup script writes
+        ``html-directory=hotspot`` and then overwrites five pages inside it.
+        A render after a paste moved the profile off the populated
+        directory onto the empty one.
+
+        The stock directory is also what carries ``api.json``, RouterOS's
+        own RFC 8908 endpoint since 7.3 -- so pointing away from it takes
+        the router's truthful captive-portal answer with it.
+        """
+        joined = "\n".join(render_vlan(_make_vlan(vlan_id=100, enable_hotspot=True)))
+        assert "html-directory=hotspot " in joined
+        assert "cloudguest-hotspot" not in joined
+
     def test_skips_entirely_without_cidr_or_gateway(self) -> None:
         vlan = _make_vlan(enable_hotspot=True, cidr=None, gateway_ip_address=None)
         lines = render_vlan(vlan)
