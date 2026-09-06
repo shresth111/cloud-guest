@@ -710,7 +710,43 @@ HOTSPOT_DNS_NAME = "wifi.wyfyguest.com"
 # over the API: the script path and the direct-push path must name the same
 # directory or a VLAN's portal serves different pages depending on which
 # path last touched the router.
-HOTSPOT_HTML_DIRECTORY = "cloudguest-hotspot"
+#
+# ``hotspot``, RouterOS's own stock directory -- NOT ``cloudguest-hotspot``,
+# which is what this said until 2026-09-06 and which pointed the profile at
+# a directory that does not exist on any device.
+#
+# Nothing on this platform ever created it or put a file in it. That is not
+# an oversight discovered from outside; it is stated eleven hundred lines
+# below, in :func:`render_hotspot_walled_garden`'s own "What this does NOT
+# fix": serving a login page from that directory "needs a file on the
+# device, so it needs either a ``/tool fetch`` of a page the API serves or a
+# ``/file`` write -- neither of which is rendered here". Both halves were
+# true and they were never read together. The directory was named as though
+# it would be filled in later, and the profile was pointed at it in the
+# meantime.
+#
+# What that cost: RouterOS serves the hotspot's pages out of
+# ``html-directory``, so a profile aimed at an empty one has no login page
+# to serve. And the Master Console's generated setup script writes
+# ``html-directory=hotspot`` (``RouterDetailTabs.tsx:6349``) and then
+# overwrites five stock pages inside it with a basename-anchored
+# ``/file set``. So on a router set up by the generator and later touched by
+# this renderer -- a VLAN push, a config re-render -- the profile moved off
+# the populated stock directory onto the empty one, and the venue's portal
+# stopped being served. The two paths this constant exists to keep in
+# agreement were in agreement with each other and not with the third path,
+# which is the only one that ever put a file on a device.
+#
+# There is now a second thing in that directory worth not losing. Since
+# RouterOS 7.3 the stock page set ships ``api.json``, MikroTik's own
+# RFC 8908 captive-portal API, whose ``captive`` member is real because the
+# router knows which client is asking. Pointing a profile away from the
+# stock directory takes that with it, silently, and it is the endpoint this
+# platform's whole captive-portal-detection story is meant to end up on.
+#
+# The stock name is also the one that cannot rot: it is present on a
+# factory-reset device before anything of ours runs.
+HOTSPOT_HTML_DIRECTORY = "hotspot"
 
 # ---------------------------------------------------------------------------
 # Markers and ports the paired device writers in
@@ -1642,13 +1678,23 @@ def render_hotspot_walled_garden(*, api_url: str) -> list[str]:
     own hotspot login page, with its own ``<form>``, over plain HTTP --
     ``dns-name`` changed the host in that URL, not its scheme. Removing the
     warning additionally requires the hotspot's ``html-directory``
-    (``cloudguest-hotspot``, already set by ``_render_vlan_hotspot``) to
-    hold a login page that carries no form of its own and merely redirects
-    to the platform's real HTTPS portal. That needs a file on the device,
-    so it needs either a ``/tool fetch`` of a page the API serves or a
-    ``/file`` write -- neither of which is rendered here, and neither of
-    which has been confirmed against a real device, which this module's own
-    "confirmed live" standard requires before it ships. This section is the
+    (:data:`HOTSPOT_HTML_DIRECTORY`, already set by
+    ``_render_vlan_hotspot``) to hold a login page that carries no form of
+    its own and merely redirects to the platform's real HTTPS portal. That
+    needs a file on the device, so it needs either a ``/tool fetch`` of a
+    page the API serves or a ``/file`` write -- neither of which is
+    rendered here, and neither of which has been confirmed against a real
+    device, which this module's own "confirmed live" standard requires
+    before it ships.
+
+    This paragraph used to name that directory ``cloudguest-hotspot``, and
+    saying "needs a file on the device, neither of which is rendered here"
+    about a directory the profile was *already pointed at* was the whole
+    defect: it reads as future work and it was in fact a live description
+    of a profile aimed at nothing. The constant now names RouterOS's stock
+    directory, which is populated on a factory-reset device, so this
+    remains genuinely outstanding work rather than a description of a
+    broken portal. This section is the
     half that is safe to ship without a device: the HTTPS portal is
     unreachable pre-auth *without* it, so it is a prerequisite for that
     work rather than an alternative to it.
