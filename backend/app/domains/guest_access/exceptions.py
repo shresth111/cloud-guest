@@ -20,6 +20,7 @@ __all__ = [
     "TemporaryRuleRequiresExpiryError",
     "InvalidRuleExpiryError",
     "InvalidGuestIdentifierError",
+    "CountryCodeRequiredError",
     "GuestAccessDeniedError",
     "BlockEnforcementMissingCredentialsError",
     "UnsupportedGuestAccessVendorError",
@@ -104,6 +105,42 @@ class InvalidGuestIdentifierError(GuestAccessError):
     def __init__(self, identifier: str) -> None:
         super().__init__(
             f"'{identifier}' is not a valid phone number or email address",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class CountryCodeRequiredError(GuestAccessError):
+    """A guest-rule ``identifier`` is a plausible phone number written
+    without a country code ("9876543210" rather than "+919876543210").
+
+    Distinct from ``InvalidGuestIdentifierError`` on purpose: the input is
+    not malformed, it is *under-specified*, and the two need different
+    words in front of an admin. Every ``guest_access_rules`` row written
+    before 2026-09 is in exactly this shape -- the customer dashboard's
+    Always Allowed / Block User forms submitted bare national digits while
+    every guest signs in as E.164, and rules are matched by string
+    comparison, so those rules could never match a living guest (they
+    still returned 201, listed, and read back fine).
+
+    Rejecting rather than prefixing a country code server-side is
+    deliberate: nothing in this platform knows which country a bare
+    number belongs to. The captive portal keeps the ISO-alpha-2 ->
+    dialling-code mapping on the frontend by design (see
+    ``app.domains.captive_portal.schemas
+    .ResolvedCaptivePortalConfigResponse.location_country``), and the one
+    "always +91" normalizer here
+    (``app.domains.channel_partner.schemas.normalize_indian_phone``) is
+    scoped to India-only, GSTIN-carrying partner records. A guess would
+    recreate the same silently-inert rule one layer down.
+    """
+
+    def __init__(self, identifier: str) -> None:
+        super().__init__(
+            f"'{identifier}' is missing a country code. Enter the number in "
+            "international format, starting with '+' and the country "
+            "calling code (e.g. +919876543210) -- that is how guests "
+            "identify themselves when they sign in, and a rule stored any "
+            "other way can never match them.",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
