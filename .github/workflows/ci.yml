@@ -40,6 +40,50 @@ jobs:
       - name: Ruff
         run: ruff check .
 
+      # Fails in seconds, before the ~20-minute suite, and says exactly what
+      # to do. There is already a pytest assertion for this
+      # (`test_the_revision_graph_has_exactly_one_head`) and it is not
+      # redundant with this one: the suite is where you learn *eventually*,
+      # this is where you learn *immediately*, and on the day it matters the
+      # difference is whether a branch sits unmergeable for twenty minutes or
+      # for one.
+      #
+      # Why it is worth a step of its own at all: the api image's CMD runs
+      # `alembic upgrade head` before uvicorn, so shipping the api IS running
+      # a migration. A branched history makes that command refuse outright --
+      # the container crash-loops, the deploy's health wait times out, and it
+      # rolls back, after the pre-deploy dump has already run.
+      #
+      # It has happened twice. The second time (0114 vs 0117, 2026-09-06) it
+      # took five consecutive backend deploys down over five hours while the
+      # frontend deployed normally, and nobody noticed, because every one of
+      # those PRs was green. Two PRs adding a migration in the same window is
+      # all it takes and neither looks wrong on its own.
+      #
+      # `ScriptDirectory` reads the versions directory only -- no database, no
+      # env.py -- so this cannot fail for an unrelated connection reason and
+      # cannot be mistaken for one.
+      - name: Assert Alembic has exactly one head
+        run: |
+          python - <<'EOF'
+          import sys
+          from alembic.config import Config
+          from alembic.script import ScriptDirectory
+
+          heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
+          for h in heads:
+              print("head: " + h)
+          if len(heads) != 1:
+              print("::error::Alembic has %d heads; `alembic upgrade head` will "
+                    "refuse and any api deploy will crash-loop. Rebase the newer "
+                    "revision's down_revision onto the other head -- and check "
+                    "which revisions production has already applied before "
+                    "choosing the direction, or the unapplied ones are skipped "
+                    "silently." % len(heads))
+              sys.exit(1)
+          print("one head, as required")
+          EOF
+
       - name: Pytest
         run: pytest --cov=app --cov-report=term-missing --junitxml=junit.xml
 
