@@ -94,3 +94,38 @@ def test_the_discovery_actually_finds_domains() -> None:
     # is caught too.
     for domain in ("router", "vlan", "guest", "billing"):
         assert domain in on_disk, f"{domain}/models.py not discovered"
+
+
+def test_the_revision_graph_has_exactly_one_head() -> None:
+    """A second head makes `alembic upgrade head` refuse to run at all, and
+    the api image's CMD runs it before uvicorn -- so the container
+    boot-loops, the health gate times out, and the deploy rolls back.
+
+    This is not hypothetical. On 2026-09-06 `0114` and `0117` were written
+    in parallel worktrees and both took `0113` as their parent. Five
+    consecutive backend deploys failed at container boot while the frontend
+    deployed normally, leaving production on a five-hour-old backend with
+    nothing on any dashboard to say so.
+
+    Every one of those five PRs was green, because this file's other tests
+    do not look at the graph's shape. Each author had also been told which
+    revision numbers were claimed and had written the collision into their
+    PR body -- which is exactly the point. A note in a PR body records a
+    hazard; it does not prevent one. This assertion does.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(Config(str(BACKEND_ROOT / "alembic.ini")))
+    heads = script.get_heads()
+
+    assert len(heads) == 1, (
+        "The migration graph has more than one head, so `alembic upgrade "
+        "head` cannot run and every deploy will fail at container boot:\n  "
+        + "\n  ".join(sorted(heads))
+        + "\n\nRepoint the newer revision's `down_revision` at the other "
+        "head. Check which revisions production has actually applied "
+        "before choosing the direction -- reparenting an already-applied "
+        "revision onto an unapplied one makes alembic skip the unapplied "
+        "ones silently."
+    )
