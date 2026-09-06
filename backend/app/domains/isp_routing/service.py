@@ -37,11 +37,16 @@ from typing import Protocol
 
 from app.domains.isp.models import IspLink
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.models import Router
 
 from .constants import IspRoutingRuleType
 from .events import IspRoutingRuleCreated, IspRoutingRuleDeleted, IspRoutingRuleUpdated
 from .exceptions import (
+    CrossLocationIspRoutingRuleAccessError,
     CrossOrganizationIspRoutingRuleAccessError,
     IspRoutingLinkRouterMismatchError,
     IspRoutingRuleNotFoundError,
@@ -120,11 +125,21 @@ class IspRoutingService:
         isp_link_lookup: IspLinkLookupProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.isp_link_lookup = isp_link_lookup
         self.audit_writer = audit_writer
+        # Constructor-injected while `requesting_organization_id` stays
+        # per-method: an organization id is an *argument* (which tenant
+        # this call is about, and a Celery task legitimately varies it
+        # per call), whereas a location confinement is a *property of
+        # the caller*, fixed for the request, and a security control.
+        # Threading a security control through every method means every
+        # method can forget it, silently. See
+        # `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     async def create_rule(
         self,
@@ -208,6 +223,14 @@ class IspRoutingService:
             and rule.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationIspRoutingRuleAccessError()
+        # Not enough on its own: this row is reached by its own id, so the
+        # permission check had nothing to pin to and a LOCATION grant on
+        # the caller's own site satisfied it.
+        enforce_entity_location(
+            entity_location_id=getattr(rule, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationIspRoutingRuleAccessError(),
+        )
         return rule
 
     async def list_rules(

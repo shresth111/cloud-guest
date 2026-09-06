@@ -95,6 +95,10 @@ from typing import Protocol
 
 from app.common.device_push import demote_device_push_on_edit
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.models import Router
 
 from .constants import DEVICE_CARRIED_FIELDS, QosDevicePushStatus
@@ -110,6 +114,7 @@ from .events import (
     QosTrafficRuleUpdated,
 )
 from .exceptions import (
+    CrossLocationQosTrafficRuleAccessError,
     CrossOrganizationQosTrafficRuleAccessError,
     QosMissingCredentialsError,
     QosTrafficRuleNotEnabledError,
@@ -164,11 +169,21 @@ class QosService:
         device_adapter_resolver: Callable[[str], BaseQosPriorityQueueAdapter] = (
             get_qos_queue_adapter
         ),
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
         self._get_device_adapter = device_adapter_resolver
+        # Constructor-injected while `requesting_organization_id` stays
+        # per-method: an organization id is an *argument* (which tenant
+        # this call is about, and a Celery task legitimately varies it
+        # per call), whereas a location confinement is a *property of
+        # the caller*, fixed for the request, and a security control.
+        # Threading a security control through every method means every
+        # method can forget it, silently. See
+        # `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     async def create_rule(
         self,
@@ -232,6 +247,14 @@ class QosService:
             and rule.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationQosTrafficRuleAccessError()
+        # Not enough on its own: this row is reached by its own id, so the
+        # permission check had nothing to pin to and a LOCATION grant on
+        # the caller's own site satisfied it.
+        enforce_entity_location(
+            entity_location_id=getattr(rule, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationQosTrafficRuleAccessError(),
+        )
         return rule
 
     async def list_rules(

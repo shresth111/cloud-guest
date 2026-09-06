@@ -217,6 +217,10 @@ from app.domains.guest.service import GuestService
 from app.domains.location.models import Location
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 
 from .constants import (
     TEAM_CODE_ALPHABET,
@@ -231,6 +235,7 @@ from .events import (
     GuestTeamRevoked,
 )
 from .exceptions import (
+    CrossLocationGuestTeamAccessError,
     CrossOrganizationGuestTeamAccessError,
     GuestTeamCodeGenerationExhaustedError,
     GuestTeamMemberCapExceededError,
@@ -359,12 +364,15 @@ class GuestTeamService:
         guest_service: GuestService,
         *,
         audit_writer: AuditLogWriter | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.organization_lookup = organization_lookup
         self.location_lookup = location_lookup
         self.guest_service = guest_service
         self.audit_writer = audit_writer
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     # ========================================================================
     # Team lifecycle
@@ -435,6 +443,15 @@ class GuestTeamService:
         if team is None:
             raise GuestTeamNotFoundError(team_id)
         self._enforce_tenant_scope(team.organization_id, requesting_organization_id)
+        # A team is reached by its own id, so the permission check had nothing
+        # to pin to. `join_team` deliberately does NOT come through here -- it
+        # resolves by team *code* off the repository -- so the guest join path
+        # is untouched by this.
+        enforce_entity_location(
+            entity_location_id=getattr(team, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationGuestTeamAccessError(),
+        )
         return await self._refresh_team_expiry(team)
 
     async def list_teams(

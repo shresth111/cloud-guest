@@ -42,6 +42,26 @@ class MacAuthorizationEntryNotFoundError(MacAuthorizationError):
         )
 
 
+class CrossLocationMacAuthorizationAccessError(MacAuthorizationError):
+    """A caller confined to particular sites reached a MAC authorization entry
+    at another site.
+
+    Distinct from ``CrossOrganizationMacAuthorizationAccessError``:
+    both sites belong to the *same* organization, so the organization
+    comparison sees nothing wrong. The row is reached by its own id,
+    so ``RequirePermission`` had nothing to pin the check to -- see
+    ``app.domains.rbac.location_scope`` for why the confinement comes
+    from the caller's grants rather than from ``X-Location-Id``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a MAC authorization entry at a location outside "
+            "your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class CrossOrganizationMacAuthorizationAccessError(MacAuthorizationError):
     """A caller acting within organization A attempted to read/mutate a
     MAC authorization entry belonging to organization B -- mirrors

@@ -53,6 +53,22 @@ class GuestTeamNotFoundError(GuestTeamError):
         )
 
 
+class CrossLocationGuestTeamAccessError(GuestTeamError):
+    """A caller confined to particular sites reached a team at another site.
+
+    Distinct from ``CrossOrganizationGuestTeamAccessError``: both sites belong
+    to the *same* organization, so the organization comparison sees nothing
+    wrong. A team is reached by its own id, so ``RequirePermission`` had
+    nothing to pin the check to -- see ``app.domains.rbac.location_scope``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a guest team at a location outside your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class CrossOrganizationGuestTeamAccessError(GuestTeamError):
     """A caller acting within organization A attempted to read/mutate a
     guest team belonging to organization B -- mirrors

@@ -17,6 +17,10 @@ from app.database.session import get_db_session
 from app.domains.isp.dependencies import get_isp_service
 from app.domains.isp.service import IspService
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    CallerLocationScope,
+    LocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
@@ -36,12 +40,14 @@ def get_isp_routing_service(
     router_service: RouterService = Depends(get_router_service),
     isp_service: IspService = Depends(get_isp_service),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
 ) -> IspRoutingService:
     return IspRoutingService(
         repository,
         router_service,
         isp_service,
         audit_writer=audit_repository,
+        caller_location_scope=caller_location_scope,
     )
 
 

@@ -43,6 +43,10 @@ from app.domains.policy.service import PolicyService
 from app.domains.queue_management.dependencies import get_queue_management_service
 from app.domains.queue_management.service import QueueManagementService
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    OptionalCallerLocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
@@ -102,6 +106,7 @@ def get_guest_service(
     ),
     team_quota_resolver: SharedQuotaResolver = Depends(get_shared_quota_resolver),
     redis: Redis = Depends(get_redis_client),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> GuestService:
     """BE-011 Part 3 addition: wires ``MonitoringService`` in as
     ``GuestService``'s optional ``monitoring_hook`` (see that class's own
@@ -176,6 +181,7 @@ def get_guest_service(
         mac_authorization_hook=mac_authorization_service,
         team_quota_hook=team_quota_resolver,
         redis=redis,
+        caller_location_scope=caller_location_scope,
     )
 
 
@@ -197,6 +203,7 @@ def get_radius_service(
     queue_management_service: QueueManagementService = Depends(
         get_queue_management_service
     ),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> RadiusService:
     """Queue Management Engine addition: wires ``QueueManagementService`` in
     as ``RadiusService``'s optional ``queue_lookup`` hook -- the one
@@ -212,6 +219,7 @@ def get_radius_service(
         nas_code_counter_repository,
         audit_writer=audit_repository,
         queue_lookup=queue_management_service,
+        caller_location_scope=caller_location_scope,
     )
 
 

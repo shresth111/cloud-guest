@@ -53,11 +53,16 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.models import Router
 
 from .constants import UNPROVISIONED_COMPONENTS, SyncComponent, SyncComponentStatus
 from .events import DeviceSyncRunCompleted
 from .exceptions import (
+    CrossLocationDeviceSyncRunAccessError,
     CrossOrganizationDeviceSyncRunAccessError,
     DeviceSyncRunNotFoundError,
 )
@@ -156,6 +161,7 @@ class DeviceSyncService:
         provisioning_lookup: ProvisioningLookupProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
@@ -163,6 +169,15 @@ class DeviceSyncService:
         self.queue_sync = queue_sync
         self.provisioning_lookup = provisioning_lookup
         self.audit_writer = audit_writer
+        # Constructor-injected while `requesting_organization_id` stays
+        # per-method: an organization id is an *argument* (which tenant
+        # this call is about, and a Celery task legitimately varies it
+        # per call), whereas a location confinement is a *property of
+        # the caller*, fixed for the request, and a security control.
+        # Threading a security control through every method means every
+        # method can forget it, silently. See
+        # `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     async def sync_router(
         self,
@@ -287,6 +302,14 @@ class DeviceSyncService:
             and run.organization_id != requesting_organization_id
         ):
             raise CrossOrganizationDeviceSyncRunAccessError()
+        # Not enough on its own: this row is reached by its own id, so the
+        # permission check had nothing to pin to and a LOCATION grant on
+        # the caller's own site satisfied it.
+        enforce_entity_location(
+            entity_location_id=getattr(run, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationDeviceSyncRunAccessError(),
+        )
         return run
 
     async def list_runs(

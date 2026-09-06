@@ -27,6 +27,7 @@ __all__ = [
     "GuestError",
     "GuestNotFoundError",
     "CrossOrganizationGuestAccessError",
+    "CrossLocationGuestAccessError",
     "GuestBlockedError",
     "GuestSessionNotFoundError",
     "GuestAuthMethodNotEnabledError",
@@ -74,6 +75,27 @@ class GuestNotFoundError(GuestError):
     def __init__(self, identifier: object) -> None:
         super().__init__(
             f"Guest not found: {identifier}", status_code=status.HTTP_404_NOT_FOUND
+        )
+
+
+class CrossLocationGuestAccessError(GuestError):
+    """A caller confined to particular sites reached a guest, session or NAS
+    record belonging to another site.
+
+    Distinct from ``CrossOrganizationGuestAccessError``: both sites belong to
+    the *same* organization, so that comparison sees nothing wrong. These rows
+    are reached by their own id, so ``RequirePermission`` had nothing to pin
+    the check to -- see ``app.domains.rbac.location_scope``.
+
+    This is the PII surface: a guest row carries the phone number or email a
+    person handed over at a portal. A front-desk account at one site reading
+    another site's guest list is the case this exists to stop.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a guest record at a location outside your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
         )
 
 

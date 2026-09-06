@@ -268,6 +268,10 @@ from app.domains.otp.models import OtpRequest
 from app.domains.policy.constants import PolicyType
 from app.domains.queue_management.constants import QueueTargetType
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.crypto import (
     RouterCredentialDecryptionError,
     decrypt_secret,
@@ -324,6 +328,7 @@ from .events import (
 )
 from .exceptions import (
     ConcurrentSessionLimitExceededError,
+    CrossLocationGuestAccessError,
     CrossOrganizationGuestAccessError,
     CrossOrganizationNasAccessError,
     FairUsagePolicyExceededError,
@@ -1370,6 +1375,7 @@ class GuestService:
         mac_authorization_hook: MacAuthorizationLookupProtocol | None = None,
         team_quota_hook: TeamQuotaLookupProtocol | None = None,
         redis: Redis | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.otp_service = otp_service
@@ -1385,6 +1391,8 @@ class GuestService:
         self.mac_authorization_hook = mac_authorization_hook
         self.team_quota_hook = team_quota_hook
         self.redis = redis
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     async def _broadcast_guest_session_started(
         self,
@@ -2975,6 +2983,11 @@ class GuestService:
         if session is None:
             raise GuestSessionNotFoundError(session_id)
         self._enforce_tenant_scope(session.organization_id, requesting_organization_id)
+        enforce_entity_location(
+            entity_location_id=getattr(session, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationGuestAccessError(),
+        )
         return session
 
     async def list_sessions(
@@ -4203,6 +4216,14 @@ class GuestService:
         if guest is None:
             raise GuestNotFoundError(guest_id)
         self._enforce_tenant_scope(guest.organization_id, requesting_organization_id)
+        # The chokepoint for all nine guest-by-id operations. Login does not
+        # come through here -- it uses `get_or_create_guest` -- so a guest
+        # signing in is unaffected.
+        enforce_entity_location(
+            entity_location_id=getattr(guest, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationGuestAccessError(),
+        )
         return guest
 
     def _enforce_tenant_scope(
@@ -4326,6 +4347,7 @@ class RadiusService:
         *,
         audit_writer: AuditLogWriter | None = None,
         queue_lookup: QueueRateLimitLookupProtocol | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.guest_service = guest_service
@@ -4334,6 +4356,8 @@ class RadiusService:
         self.nas_code_counter_repository = nas_code_counter_repository
         self.audit_writer = audit_writer
         self.queue_lookup = queue_lookup
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     async def authenticate_nas(
         self, *, nas_identifier: str, shared_secret: str
@@ -4572,6 +4596,11 @@ class RadiusService:
             raise RadiusNasNotFoundError(nas_id)
         self._enforce_nas_tenant_scope(
             nas_client.organization_id, requesting_organization_id
+        )
+        enforce_entity_location(
+            entity_location_id=getattr(nas_client, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationGuestAccessError(),
         )
         return nas_client
 

@@ -19,6 +19,10 @@ from typing import Protocol
 
 from app.domains.location.models import Location
 from app.domains.rbac.enums import AuditAction
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    enforce_entity_location,
+)
 from app.domains.router.models import Router
 
 from .constants import HardwareStatus
@@ -94,11 +98,14 @@ class MonitoredHardwareService:
         router_lookup: RouterLookupProtocol,
         *,
         audit_writer: AuditLogWriter | None = None,
+        caller_location_scope: LocationScope = None,
     ) -> None:
         self.repository = repository
         self.location_lookup = location_lookup
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
+        # Constructor-injected -- see `app.domains.rbac.location_scope`.
+        self.caller_location_scope = caller_location_scope
 
     async def register_device(
         self,
@@ -164,6 +171,23 @@ class MonitoredHardwareService:
             and device.organization_id != requesting_organization_id
         ):
             raise MonitoredHardwareNotFoundError(device_id)
+        # Same reasoning as firewall, but raising this domain's own
+        # NotFound rather than a 403: it already answers a foreign
+        # *organization* that way so as not to confirm the row exists,
+        # and a location refusal that 403s would leak exactly what the
+        # organization refusal is careful not to.
+        #
+        # DO NOT "harmonise" this to the CrossLocation*AccessError 403 the
+        # other domains raise. "No such row" and "that row is not yours"
+        # are different answers, and this domain has deliberately chosen
+        # the first. No test asserts that a refusal must be uninformative,
+        # so that change would pass CI and quietly turn an
+        # existence-hiding refusal into an existence-confirming one.
+        enforce_entity_location(
+            entity_location_id=getattr(device, "location_id", None),
+            caller_location_scope=self.caller_location_scope,
+            error=MonitoredHardwareNotFoundError(device_id),
+        )
         return device
 
     async def with_status(self, device: MonitoredHardware) -> HardwareWithStatus:

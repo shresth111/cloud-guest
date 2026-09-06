@@ -81,6 +81,22 @@ class VoucherEmailDeliveryNotConfiguredError(VoucherError):
         )
 
 
+class CrossLocationVoucherBatchAccessError(VoucherError):
+    """A caller confined to particular sites reached a voucher batch belonging to
+    another site.
+
+    Distinct from ``CrossOrganizationVoucherBatchAccessError``:
+    both sites belong to the *same* organization. See
+    ``app.domains.rbac.location_scope``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a voucher batch at a location outside your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class CrossOrganizationVoucherBatchAccessError(VoucherError):
     """A caller acting within organization A attempted to read/mutate a
     voucher batch belonging to organization B -- mirrors
@@ -233,6 +249,22 @@ class VoucherSeriesNotFoundError(VoucherError):
         super().__init__(
             f"Voucher series not found: {series_id}",
             status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class CrossLocationVoucherSeriesAccessError(VoucherError):
+    """A caller confined to particular sites reached a voucher series belonging to
+    another site.
+
+    Distinct from ``CrossOrganizationVoucherSeriesAccessError``:
+    both sites belong to the *same* organization. See
+    ``app.domains.rbac.location_scope``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access a voucher series at a location outside your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
         )
 
 

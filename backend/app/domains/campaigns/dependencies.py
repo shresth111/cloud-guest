@@ -21,6 +21,10 @@ from app.domains.location.service import LocationService
 from app.domains.organization.dependencies import get_organization_service
 from app.domains.organization.service import OrganizationService
 from app.domains.rbac.dependencies import get_rbac_repository
+from app.domains.rbac.location_scope import (
+    LocationScope,
+    OptionalCallerLocationScope,
+)
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
@@ -42,6 +46,7 @@ def get_campaigns_service(
     router_service: RouterService = Depends(get_router_service),
     guest_repository: GuestRepositoryProtocol = Depends(get_guest_repository),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
+    caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
 ) -> CampaignsService:
     return CampaignsService(
         repository,
@@ -50,6 +55,7 @@ def get_campaigns_service(
         router_service,
         guest_repository,
         audit_writer=audit_repository,
+        caller_location_scope=caller_location_scope,
     )
 
 

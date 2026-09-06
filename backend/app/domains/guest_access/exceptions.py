@@ -46,6 +46,23 @@ class AccessRuleNotFoundError(GuestAccessError):
         )
 
 
+class CrossLocationAccessRuleError(GuestAccessError):
+    """A caller confined to particular sites reached an access rule at another
+    site.
+
+    Distinct from ``CrossOrganizationAccessRuleError``: both sites belong to
+    the *same* organization, so the organization comparison sees nothing
+    wrong. Rules are reached by their own id, so ``RequirePermission`` had
+    nothing to pin the check to -- see ``app.domains.rbac.location_scope``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Cannot access an access rule at a location outside your own scope",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
 class CrossOrganizationAccessRuleError(GuestAccessError):
     """A caller acting within organization A attempted to read/mutate an
     access rule belonging to organization B -- mirrors
