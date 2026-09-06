@@ -56,6 +56,9 @@ from app.domains.rbac.location_scope import (
 from app.domains.router.models import Router
 
 from .constants import (
+    CAPTIVE_PORTAL_DHCP_OPTION_CODE,
+    CAPTIVE_PORTAL_DHCP_OPTION_NAME,
+    CAPTIVE_PORTAL_DHCP_OPTION_SET_NAME,
     DEFAULT_LEASE_TIME_SECONDS,
     DEVICE_CARRIED_FIELDS,
     DhcpDevicePushStatus,
@@ -63,6 +66,8 @@ from .constants import (
 )
 from .device_adapters import (
     DhcpCredentials,
+    DhcpOptionSnapshotReading,
+    DhcpOptionSpec,
     RogueDhcpInterfaceReading,
     get_dhcp_adapter,
 )
@@ -77,6 +82,7 @@ from .exceptions import (
     CrossOrganizationDhcpPoolAccessError,
     DhcpError,
     DhcpMissingCredentialsError,
+    DhcpOptionValueRequiredError,
     DhcpPoolMissingGatewayError,
     DhcpPoolMissingInterfaceError,
     DhcpPoolNotEnabledError,
@@ -137,6 +143,27 @@ class RouterLookupProtocol(Protocol):
 
 class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CaptivePortalDhcpOptionConvergence:
+    """What one router's option-114 convergence actually did.
+
+    ``changed`` is the device's own answer, never the caller's intent. Both
+    directions are idempotent, so "no exception" is true of a router that
+    was already in the desired state and of one that was not, and a report
+    that could not tell those apart would make a fleet sweep unreadable:
+    the only rows worth a human's attention are the venues that still had
+    the option when the sweep reached them.
+    """
+
+    router_id: uuid.UUID
+    present: bool
+    changed: bool
+    option_removed: bool = False
+    option_sets_removed: tuple[str, ...] = ()
+    option_sets_rewritten: tuple[str, ...] = ()
+    bindings_detached: tuple[str, ...] = ()
 
 
 class DhcpService:
@@ -823,6 +850,155 @@ class DhcpService:
             unknown=len(interfaces),
         )
 
+    # ------------------------------------------------------------------
+    # The captive-portal DHCP option (RFC 8910, code 114)
+    # ------------------------------------------------------------------
+
+    async def read_captive_portal_dhcp_option(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> DhcpOptionSnapshotReading:
+        """What this router currently advertises. Reads only.
+
+        Separate from the converger so an audit -- "which venues still hand
+        out the option?" -- is not itself a fleet change. Errors propagate
+        rather than being flattened into a "clean" answer: a router we
+        could not reach is not a router without the option, and a sweep
+        that reported it as one would certify exactly the venues nobody has
+        checked.
+        """
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+        return await adapter.read_dhcp_options(credentials)
+
+    async def converge_captive_portal_dhcp_option_for_router(
+        self,
+        router_id: uuid.UUID,
+        *,
+        present: bool,
+        option_value: str | None = None,
+        network_addresses: tuple[str, ...] = (),
+        actor_user_id: uuid.UUID | None = None,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> CaptivePortalDhcpOptionConvergence:
+        """Bring one router's option-114 state to ``present`` or absent,
+        over the RouterOS API on 8728.
+
+        ## Why this exists
+
+        Before it, **the platform could not write a DHCP option at all.**
+        ``network_config/renderers.py`` renders ``/ip pool``, ``/ip
+        dhcp-server`` and ``/ip dhcp-server network``, and has never
+        rendered an ``option`` line. The only writer of option 114 in the
+        entire system was a human pasting the Master Console setup script,
+        which made the only remover a human too -- so remediating a live
+        venue meant somebody opening an API session against a production
+        router by hand, and meant doing it again on the next router, and
+        forgetting.
+
+        ## Why the removal direction is the one being used today
+
+        The option points clients at ``GET /captive-portal/rfc8908``, whose
+        ``captive`` member is hardcoded ``true``. An RFC 8908 client
+        re-polls that URI precisely to learn whether it is *still* captive
+        and is always told yes, so the portal sheet never closes after a
+        successful login. The endpoint cannot be made truthful: every guest
+        reaches the cloud from behind the venue's NAT as one source IP, so
+        it cannot tell one guest's session from another's. With no option
+        114 at all, the OS's own probe interception gets both directions
+        right. Retiring the endpoint is a separate decision; **not
+        advertising it is this one.**
+
+        ## Removal never needs a value; creation always does
+
+        ``present=False`` needs only the option's name, and what it is
+        attached to is discovered from the device rather than assumed --
+        which is what makes it safe against routers configured by a pasted
+        script this platform never saw, i.e. every router in the fleet.
+
+        ``present=True`` requires ``option_value``. There is deliberately
+        no default: this database has never stored a per-router option-114
+        value (the only writer was that script), so a fallback here would
+        be a fabricated URI handed to every guest device on the network.
+        """
+        option = DhcpOptionSpec(
+            name=CAPTIVE_PORTAL_DHCP_OPTION_NAME,
+            code=CAPTIVE_PORTAL_DHCP_OPTION_CODE,
+            value=option_value,
+            # Matches what the setup script writes, and what the fleet
+            # actually carries: with force, every client gets the option
+            # whether or not it asked for the code. That is why this
+            # defect went from intermittent to universal.
+            force=True,
+            option_set_name=CAPTIVE_PORTAL_DHCP_OPTION_SET_NAME,
+            network_addresses=network_addresses,
+        )
+        if present and not option_value:
+            raise DhcpOptionValueRequiredError(router_id)
+
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+
+        if present:
+            await adapter.configure_dhcp_option(credentials, option=option)
+            convergence = CaptivePortalDhcpOptionConvergence(
+                router_id=router_id, present=True, changed=True
+            )
+        else:
+            report = await adapter.remove_dhcp_option(credentials, option=option)
+            convergence = CaptivePortalDhcpOptionConvergence(
+                router_id=router_id,
+                present=False,
+                # The device's own answer, not the request's intent. A
+                # removal succeeds against an already-clean router too, so
+                # "it worked" says nothing; this is the only field that
+                # distinguishes "this venue still had it" from "this venue
+                # was cleaned last week".
+                changed=report.changed,
+                option_removed=report.option_removed,
+                option_sets_removed=report.option_sets_removed,
+                option_sets_rewritten=report.option_sets_rewritten,
+                bindings_detached=report.bindings_detached,
+            )
+
+        logger.info(
+            "dhcp_captive_portal_option_converged",
+            extra={
+                "router_id": str(router_id),
+                "option": CAPTIVE_PORTAL_DHCP_OPTION_NAME,
+                "present": present,
+                "changed": convergence.changed,
+            },
+        )
+        # Audited only when the device actually changed. A fleet sweep that
+        # wrote an audit row per router per run would bury the handful of
+        # entries that record a real change to a production network under
+        # thousands that record nothing happening.
+        if convergence.changed:
+            await self._audit(
+                actor_user_id,
+                AuditAction.DHCP_OPTION_WRITTEN
+                if present
+                else AuditAction.DHCP_OPTION_REMOVED,
+                entity_id=router_id,
+                organization_id=router.organization_id,
+                description=(
+                    f"DHCP option {CAPTIVE_PORTAL_DHCP_OPTION_NAME} "
+                    f"{'written to' if present else 'removed from'} "
+                    f"router {router_id}"
+                ),
+                entity_type="router",
+            )
+        return convergence
+
     def _resolve_device_credentials(self, router: Router) -> DhcpCredentials:
         """Raise rather than guess -- mirrors ``vlan``/``qos``."""
         host = router.management_ip_address or router.public_ip_address
@@ -841,13 +1017,19 @@ class DhcpService:
         entity_id: uuid.UUID,
         organization_id: uuid.UUID | None,
         description: str,
+        # Defaulted rather than always passed: every caller but the
+        # captive-portal option converger audits a pool. That one audits a
+        # *router* -- the option is a property of the device, not of any
+        # DhcpPool row, and stamping it "dhcp_pool" would make the trail
+        # point at an entity that does not exist.
+        entity_type: str = "dhcp_pool",
     ) -> None:
         if self.audit_writer is None:
             return
         await self.audit_writer.create_audit_log_entry(
             actor_user_id=actor_user_id,
             action=action.value,
-            entity_type="dhcp_pool",
+            entity_type=entity_type,
             entity_id=entity_id,
             description=description,
             organization_id=organization_id,
@@ -880,6 +1062,7 @@ def _rogue_dhcp_detail(reading: RogueDhcpInterfaceReading) -> str:
 __all__ = [
     "RouterLookupProtocol",
     "AuditLogWriter",
+    "CaptivePortalDhcpOptionConvergence",
     "DhcpService",
     "RogueDhcpDetectionSummary",
 ]

@@ -23,6 +23,9 @@ __all__ = [
     "DhcpPoolUpdateRequest",
     "DhcpPoolResponse",
     "DhcpPoolListResponse",
+    "CaptivePortalDhcpOptionRequest",
+    "CaptivePortalDhcpOptionStateResponse",
+    "CaptivePortalDhcpOptionConvergenceResponse",
 ]
 
 
@@ -82,3 +85,62 @@ class DhcpPoolListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class CaptivePortalDhcpOptionRequest(BaseModel):
+    """Body for *writing* the captive-portal DHCP option (code 114).
+
+    ``option_value`` is required and has no default. This platform has
+    never stored a per-router option-114 value -- the only writer was a
+    human pasting the Master Console setup script -- so a default here
+    would be a fabricated URI handed to every client on a guest network.
+    The removal endpoint takes no body at all, because a removal is
+    identified by the option's name and discovers its own attachments from
+    the device.
+
+    ``network_addresses`` are the ``/ip dhcp-server network`` subnets to
+    bind the option set to, in RouterOS's own CIDR form
+    (``"10.5.50.0/24"``). A subnet with no network row on the device is
+    skipped rather than created: this endpoint attaches an option, and
+    inventing a network row would invent a gateway and DNS for a subnet
+    nobody asked it about.
+    """
+
+    option_value: str = Field(min_length=1)
+    network_addresses: list[str] = Field(default_factory=list)
+
+
+class CaptivePortalDhcpOptionStateResponse(BaseModel):
+    """What the router says right now.
+
+    ``supported`` is ``False`` for a RouterOS with no ``/ip dhcp-server
+    option`` menu at all -- which is *not* the same fact as ``advertised:
+    false``, and is carried separately so an audit cannot read a router it
+    could not ask as a router that answered "clean"."""
+
+    router_id: str
+    supported: bool
+    advertised: bool
+    option_name: str
+    option_code: int
+    option_value: str | None
+    force: bool
+    option_set_names: list[str]
+    bindings: list[str]
+
+
+class CaptivePortalDhcpOptionConvergenceResponse(BaseModel):
+    """What the convergence actually did to the device.
+
+    ``changed`` is the field worth reading. Both directions are idempotent,
+    so a 200 is equally true of a router that was already in the desired
+    state; ``changed`` is the only thing that distinguishes "this venue
+    still had it" from "this venue was cleaned already"."""
+
+    router_id: str
+    present: bool
+    changed: bool
+    option_removed: bool
+    option_sets_removed: list[str]
+    option_sets_rewritten: list[str]
+    bindings_detached: list[str]

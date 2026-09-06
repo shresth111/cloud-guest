@@ -29,6 +29,7 @@ __all__ = [
     "UnsupportedDhcpVendorError",
     "DhcpDeviceConnectionError",
     "DhcpDeviceOperationError",
+    "DhcpOptionValueRequiredError",
 ]
 
 
@@ -257,4 +258,29 @@ class DhcpPoolHotspotConflictError(DhcpError):
             "per interface. Re-point this pool, or turn that VLAN's portal "
             "off",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class DhcpOptionValueRequiredError(DhcpError):
+    """A caller asked for the captive-portal DHCP option to be *present*
+    without saying what value it should carry.
+
+    Refused rather than defaulted, and the refusal is the point. This
+    database has never stored a per-router option-114 value -- the only
+    thing that ever wrote one was a human pasting the Master Console setup
+    script -- so any fallback this code invented would be a fabricated URI
+    handed to every client device on a guest network. An operator who has
+    to supply the value gets an error they can fix; an operator handed a
+    guessed one gets a venue whose captive portal points somewhere wrong
+    and no indication that it does.
+
+    The removal direction needs no value at all, which is why this can only
+    ever be raised by ``present=True``.
+    """
+
+    def __init__(self, router_id: uuid.UUID | str) -> None:
+        super().__init__(
+            "A DHCP option value is required to write the captive-portal "
+            f"option to router {router_id}",
+            status_code=status.HTTP_400_BAD_REQUEST,
         )

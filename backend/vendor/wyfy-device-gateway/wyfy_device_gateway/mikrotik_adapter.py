@@ -82,6 +82,12 @@ from .contract import (
     DeviceHealthResult,
     DeviceInterfaceCounters,
     DeviceVendor,
+    DhcpOptionBinding,
+    DhcpOptionConfig,
+    DhcpOptionInfo,
+    DhcpOptionRemoval,
+    DhcpOptionSetInfo,
+    DhcpOptionSnapshot,
     DhcpPoolConfig,
     HotspotActiveSession,
     HotspotCertificatePush,
@@ -113,6 +119,21 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_API_PORT = 8728
 _DEFAULT_SSH_PORT = 22
+
+# The RouterOS menus that make up a custom DHCP option. Written out as
+# module constants because the removal path has to walk all four in a
+# fixed order and getting one of them wrong is a silent no-op.
+_DHCP_OPTION_PATH = ("ip", "dhcp-server", "option")
+_DHCP_OPTION_SET_PATH = ("ip", "dhcp-server", "option", "sets")
+_DHCP_NETWORK_PATH = ("ip", "dhcp-server", "network")
+# Every menu whose rows can hand a DHCP option to clients, paired with the
+# field that identifies a row to a human. ``/ip dhcp-server`` itself is
+# deliberately absent: it carries no ``dhcp-option``/``dhcp-option-set``
+# field, and probing it would only add a round trip that can never match.
+_DHCP_OPTION_BINDING_PATHS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (_DHCP_NETWORK_PATH, "address"),
+    (("ip", "dhcp-server", "lease"), "address"),
+)
 # ported from provisioning_engine/device_adapters.py's own module-level
 # filename constants -- push_config/verify_config and backup/restore each
 # round-trip through the *same* filename, so they must stay in sync with
@@ -801,6 +822,21 @@ def _is_truthy(value: object) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "yes"}
+
+
+def _split_routeros_list(value: object) -> tuple[str, ...]:
+    """Split one of RouterOS's comma-separated list fields (``options`` on
+    an option set, ``dhcp-option`` on a network/lease row) into its
+    entries, dropping the empties an absent field and a trailing comma both
+    produce.
+
+    Kept apart from :func:`_split_valid_servers`, which canonicalises MAC
+    addresses on the way through. These entries are *names*, and
+    upper-casing them would stop them matching the option they refer to.
+    """
+    if value is None:
+        return ()
+    return tuple(part.strip() for part in str(value).split(",") if part.strip())
 
 
 def _split_valid_servers(value: object) -> tuple[str, ...]:
@@ -3408,6 +3444,428 @@ class MikroTikAdapter:
         for row in list(menu):
             if row.get("address") == address and row.get("comment") == owner:
                 menu.remove(row[".id"])
+
+    # ------------------------------------------------------------------
+    # custom DHCP options (/ip dhcp-server option [+ sets])
+    # ------------------------------------------------------------------
+    #
+    # Read the whole of this before changing anything below it. Three of
+    # the four facts here were established by trying them on a live venue
+    # router, and none of them are inferable from the RouterOS
+    # documentation.
+    #
+    # 1. **Removal order is forced.** RouterOS refuses to remove an option
+    #    that an option-set still lists, and refuses to remove an
+    #    option-set that a ``/ip dhcp-server network`` row still names. So
+    #    the only order that works is detach -> shrink/remove the set ->
+    #    remove the option. Any other order fails partway and leaves the
+    #    device in a state where the option is still being handed out.
+    #
+    # 2. **``set dhcp-option-set=""`` DOES NOT CLEAR THE FIELD.** It fails
+    #    with ``ambiguous value of dhcp-option-set, more than one possible
+    #    value matches input``: RouterOS treats the empty string as a value
+    #    to *match against option-set names*, not as an instruction to
+    #    clear. The command that actually clears it is RouterOS's own
+    #    ``unset`` -- ``/ip/dhcp-server/network/unset`` with ``.id`` and
+    #    ``value-name=dhcp-option-set`` -- which is what
+    #    :meth:`_unset_field` issues. This cost real time on hardware; do
+    #    not "simplify" it back into an ``update``.
+    #
+    # 3. **Match the option by its own name, never by ``code=114``.** A
+    #    code-scoped sweep can only ever hit a row somebody else added. A
+    #    venue running its own PXE/TFTP option on a code we also use is a
+    #    real configuration, and deleting it is a worse outage than the one
+    #    being fixed.
+    #
+    # 4. **``force=yes`` changes the blast radius.** With it, every client
+    #    receives the option whether or not it asked for that code. It is
+    #    set on the fleet today, which is why an option-114 defect went
+    #    from affecting the clients that ask to affecting all of them.
+
+    async def read_dhcp_options(self, creds: DeviceCredentials) -> DhcpOptionSnapshot:
+        """Reads ``/ip dhcp-server option``, ``/ip dhcp-server option
+        sets``, and every row that binds one of them to clients.
+
+        Read-only. This is the call that answers "does this venue still
+        advertise the captive-portal URI" without writing anything, and it
+        is deliberately separate from the removal so a fleet audit can run
+        against production without being a fleet change.
+        """
+        return await asyncio.to_thread(self._read_dhcp_options_sync, creds)
+
+    def _read_dhcp_options_sync(self, creds: DeviceCredentials) -> DhcpOptionSnapshot:
+        api = self._connect_api(creds)
+        try:
+            try:
+                # ``supported`` distinguishes "this RouterOS has no option
+                # menu" from "this router has no options" -- see
+                # DhcpOptionSnapshot. _safe_query flattens both to [], so
+                # the menu is probed once, on its own, first.
+                supported = True
+                try:
+                    option_rows = list(api.path(*_DHCP_OPTION_PATH))
+                except LibRouterosError as exc:
+                    logger.info(
+                        "mikrotik_dhcp_option_menu_unavailable",
+                        extra={"host": creds.host, "detail": str(exc)},
+                    )
+                    supported = False
+                    option_rows = []
+                # The sets menu is a separate probe: RouterOS 6 has the
+                # option menu without ``option sets``, so a missing sets
+                # menu must not be read as a router with no options at all.
+                set_rows = (
+                    self._safe_query(api, *_DHCP_OPTION_SET_PATH) if supported else []
+                )
+                bindings: list[DhcpOptionBinding] = []
+                if supported:
+                    for path, identity_field in _DHCP_OPTION_BINDING_PATHS:
+                        for row in self._safe_query(api, *path):
+                            option_names = _split_routeros_list(row.get("dhcp-option"))
+                            option_set = _safe_str(row.get("dhcp-option-set"))
+                            if not option_names and not option_set:
+                                continue
+                            bindings.append(
+                                DhcpOptionBinding(
+                                    menu="/".join(path),
+                                    identity=_safe_str(row.get(identity_field))
+                                    or _safe_str(row.get(".id"))
+                                    or "",
+                                    option_names=option_names,
+                                    option_set_name=option_set,
+                                )
+                            )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_dhcp_options: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return DhcpOptionSnapshot(
+            supported=supported,
+            options=tuple(
+                DhcpOptionInfo(
+                    name=_safe_str(row.get("name")) or "",
+                    code=_safe_int(row.get("code")),
+                    value=_safe_str(row.get("value")),
+                    force=_is_truthy(row.get("force")),
+                )
+                for row in option_rows
+                if row.get("name")
+            ),
+            option_sets=tuple(
+                DhcpOptionSetInfo(
+                    name=_safe_str(row.get("name")) or "",
+                    option_names=_split_routeros_list(row.get("options")),
+                )
+                for row in set_rows
+                if row.get("name")
+            ),
+            bindings=tuple(bindings),
+        )
+
+    async def configure_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> None:
+        """Writes the option, the set that carries it, and the bindings that
+        hand it to clients -- the state a human previously produced only by
+        pasting a setup script.
+
+        ``code`` and ``value`` are required here even though they are
+        optional on the config: a removal is identified by name alone, but
+        an option cannot be *created* without the two fields that give it
+        meaning, and inventing either would put a fabricated URI in front
+        of every guest device on the network.
+        """
+        if option.code is None or not option.value:
+            raise MikroTikDeviceError(
+                creds.host,
+                "configure_dhcp_option: code and value are both required to "
+                f"create option {option.name!r}",
+            )
+        await asyncio.to_thread(self._configure_dhcp_option_sync, creds, option)
+
+    def _configure_dhcp_option_sync(
+        self, creds: DeviceCredentials, option: DhcpOptionConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                desired = {
+                    "code": str(option.code),
+                    "value": option.value or "",
+                    "force": "yes" if option.force else "no",
+                }
+                self._ensure_named_row(api, _DHCP_OPTION_PATH, option.name, desired)
+                if option.option_set_name:
+                    self._ensure_option_set_contains(
+                        api, option.option_set_name, option.name
+                    )
+                for address in option.network_addresses:
+                    self._attach_option_to_network(api, address, option)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_dhcp_option: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _ensure_named_row(
+        self, api, path: tuple[str, ...], name: str, desired: dict[str, str]
+    ) -> None:  # noqa: ANN001
+        """Create the row of this name, or bring an existing one into line.
+
+        Updating rather than skipping is the point: an option whose
+        ``value`` drifted still reads as configured on the dashboard and
+        hands every client the old URI. Same reasoning as
+        :meth:`_ensure_ip_pool`.
+        """
+        menu = api.path(*path)
+        for row in menu:
+            if row.get("name") == name:
+                changed = {
+                    key: value
+                    for key, value in desired.items()
+                    # ``force`` comes back from RouterOS as a real bool,
+                    # so comparing it as a string reports a difference on
+                    # every push and writes forever. Same trap
+                    # _ensure_dhcp_server documents for ``disabled``.
+                    if not (
+                        key == "force"
+                        and _is_truthy(row.get(key)) == (value == "yes")
+                    )
+                    and str(row.get(key, "")) != value
+                }
+                if changed:
+                    menu.update(**{".id": row[".id"], **changed})
+                return
+        menu.add(name=name, **desired)
+
+    def _ensure_option_set_contains(
+        self, api, set_name: str, option_name: str
+    ) -> None:  # noqa: ANN001
+        """Make ``set_name`` list ``option_name``, keeping whatever else it
+        already lists.
+
+        Appending rather than overwriting: ``options`` is a list field, and
+        a push that replaced it would silently drop another feature's
+        option out of a shared set.
+        """
+        menu = api.path(*_DHCP_OPTION_SET_PATH)
+        for row in menu:
+            if row.get("name") == set_name:
+                current = _split_routeros_list(row.get("options"))
+                if option_name in current:
+                    return
+                menu.update(
+                    **{
+                        ".id": row[".id"],
+                        "options": ",".join((*current, option_name)),
+                    }
+                )
+                return
+        menu.add(name=set_name, options=option_name)
+
+    def _attach_option_to_network(
+        self, api, address: str, option: DhcpOptionConfig
+    ) -> None:  # noqa: ANN001
+        """Bind this option (via its set where there is one, directly
+        otherwise) to the ``/ip dhcp-server network`` row for ``address``.
+
+        A subnet with no network row is skipped rather than created. This
+        method's job is to attach an option, and fabricating a network row
+        here would invent a gateway and DNS for a subnet nobody asked this
+        code about -- exactly the silent cross-feature damage
+        :meth:`_remove_dhcp_network`'s marker exists to prevent.
+        """
+        menu = api.path(*_DHCP_NETWORK_PATH)
+        for row in menu:
+            if row.get("address") != address:
+                continue
+            if option.option_set_name:
+                if _safe_str(row.get("dhcp-option-set")) == option.option_set_name:
+                    return
+                menu.update(
+                    **{
+                        ".id": row[".id"],
+                        "dhcp-option-set": option.option_set_name,
+                    }
+                )
+                return
+            current = _split_routeros_list(row.get("dhcp-option"))
+            if option.name in current:
+                return
+            menu.update(
+                **{
+                    ".id": row[".id"],
+                    "dhcp-option": ",".join((*current, option.name)),
+                }
+            )
+            return
+        logger.info(
+            "mikrotik_dhcp_option_network_row_absent",
+            extra={"address": address, "option": option.name},
+        )
+
+    async def delete_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> DhcpOptionRemoval:
+        """Removes one named option and every reference to it, in the only
+        order RouterOS accepts.
+
+        Takes the same :class:`DhcpOptionConfig` as the writer, but reads
+        only ``name`` (and ``option_set_name`` as a hint): what the option
+        is attached to is discovered from the device, never assumed from
+        the caller's idea of it. That is what makes this safe to run
+        against a router configured by a pasted script this platform never
+        saw -- which is every router in the fleet today.
+
+        Idempotent in the strong sense: against a router that never had
+        the option, against one already cleaned, and against one cleaned
+        halfway by a previous run that failed mid-sequence.
+        """
+        return await asyncio.to_thread(self._delete_dhcp_option_sync, creds, option)
+
+    def _delete_dhcp_option_sync(
+        self, creds: DeviceCredentials, option: DhcpOptionConfig
+    ) -> DhcpOptionRemoval:
+        api = self._connect_api(creds)
+        try:
+            try:
+                # --- plan, from the device's own state -------------------
+                # Only sets that actually list our option are touched, and
+                # only ours is taken out of them. A set that carries
+                # somebody else's option too is shrunk, not deleted.
+                sets_to_remove: list[str] = []
+                sets_to_rewrite: dict[str, tuple[str, ...]] = {}
+                for row in self._safe_query(api, *_DHCP_OPTION_SET_PATH):
+                    listed = _split_routeros_list(row.get("options"))
+                    if option.name not in listed:
+                        continue
+                    name = _safe_str(row.get("name")) or ""
+                    remaining = tuple(n for n in listed if n != option.name)
+                    if remaining:
+                        sets_to_rewrite[name] = remaining
+                    else:
+                        sets_to_remove.append(name)
+
+                # --- step 1: detach ------------------------------------
+                # Must come first. RouterOS refuses to remove an
+                # option-set a network row still names, and refuses to
+                # remove an option a set still lists.
+                detached = self._detach_dhcp_option(
+                    api, option_name=option.name, set_names=frozenset(sets_to_remove)
+                )
+
+                # --- step 2: shrink or remove the sets -----------------
+                set_menu = api.path(*_DHCP_OPTION_SET_PATH)
+                rewritten: list[str] = []
+                removed_sets: list[str] = []
+                for row in list(self._safe_query(api, *_DHCP_OPTION_SET_PATH)):
+                    name = _safe_str(row.get("name")) or ""
+                    if name in sets_to_rewrite:
+                        set_menu.update(
+                            **{
+                                ".id": row[".id"],
+                                "options": ",".join(sets_to_rewrite[name]),
+                            }
+                        )
+                        rewritten.append(name)
+                    elif name in sets_to_remove:
+                        set_menu.remove(row[".id"])
+                        removed_sets.append(name)
+
+                # --- step 3: the option itself -------------------------
+                option_removed = False
+                option_menu = api.path(*_DHCP_OPTION_PATH)
+                for row in list(self._safe_query(api, *_DHCP_OPTION_PATH)):
+                    # By name. Never by code -- see the block comment at
+                    # the top of this section.
+                    if row.get("name") == option.name:
+                        option_menu.remove(row[".id"])
+                        option_removed = True
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_dhcp_option: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return DhcpOptionRemoval(
+            option_removed=option_removed,
+            option_sets_removed=tuple(removed_sets),
+            option_sets_rewritten=tuple(rewritten),
+            bindings_detached=tuple(detached),
+        )
+
+    def _detach_dhcp_option(
+        self, api, *, option_name: str, set_names: frozenset[str]
+    ) -> list[str]:  # noqa: ANN001
+        """Take the option, and the sets that exist only to carry it, off
+        every row that hands them to clients. Returns what it detached
+        from, for the caller's report.
+
+        Two fields, two different removals:
+
+        * ``dhcp-option-set`` is a single value, so clearing it needs
+          RouterOS's ``unset`` (see :meth:`_unset_field` -- ``set
+          dhcp-option-set=""`` does not work and is not a shortcut).
+        * ``dhcp-option`` is a *list*, so ours is edited out of it and the
+          rest written back. Only when nothing else is left is the whole
+          field unset. A blanket unset here would drop another feature's
+          option on the way past.
+        """
+        detached: list[str] = []
+        for path, identity_field in _DHCP_OPTION_BINDING_PATHS:
+            rows = self._safe_query(api, *path)
+            if not rows:
+                continue
+            menu = api.path(*path)
+            for row in list(rows):
+                row_id = row.get(".id")
+                if row_id is None:
+                    continue
+                identity = (
+                    _safe_str(row.get(identity_field)) or _safe_str(row_id) or ""
+                )
+                touched = False
+                if _safe_str(row.get("dhcp-option-set")) in set_names:
+                    self._unset_field(api, path, row_id, "dhcp-option-set")
+                    touched = True
+                listed = _split_routeros_list(row.get("dhcp-option"))
+                if option_name in listed:
+                    remaining = tuple(n for n in listed if n != option_name)
+                    if remaining:
+                        menu.update(
+                            **{".id": row_id, "dhcp-option": ",".join(remaining)}
+                        )
+                    else:
+                        self._unset_field(api, path, row_id, "dhcp-option")
+                    touched = True
+                if touched:
+                    detached.append(f"{'/'.join(path)}:{identity}")
+        return detached
+
+    def _unset_field(
+        self, api, path: tuple[str, ...], row_id: object, value_name: str
+    ) -> None:  # noqa: ANN001
+        """Clear one field on one row using RouterOS's own ``unset``.
+
+        **This is not an ``update`` in disguise, and must not be rewritten
+        as one.** ``update(**{".id": id, "dhcp-option-set": ""})`` -- which
+        is the obvious thing to write -- fails on real hardware with
+        ``ambiguous value of dhcp-option-set, more than one possible value
+        matches input``, because RouterOS reads the empty string as a value
+        to match against the names of existing option sets rather than as
+        an instruction to clear the field. Found by trying it on a live
+        router; there is nothing in the documentation that says so.
+
+        ``librouteros``' ``Path.__call__`` is a *generator*, so the
+        sentence is only written when it is consumed -- hence ``tuple(...)``
+        rather than a bare call. A bare call is silently a no-op.
+        """
+        tuple(
+            api.path(*path)("unset", **{".id": row_id, "value-name": value_name})
+        )
 
     # ------------------------------------------------------------------
     # rogue DHCP detection (/ip dhcp-server alert)

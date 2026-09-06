@@ -395,6 +395,163 @@ class RogueDhcpAlertStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class DhcpOptionConfig:
+    """One custom DHCP option this platform owns on a router, plus where it
+    is attached.
+
+    ## Why this type exists at all
+
+    Until it did, **nothing in this platform could write a DHCP option.**
+    ``network_config/renderers.py`` renders ``/ip pool``, ``/ip
+    dhcp-server`` and ``/ip dhcp-server network`` and has never rendered an
+    ``option`` line; a fleet-wide ``grep`` for ``dhcp-server option``
+    returned nothing. The only writer of one was a **human pasting the
+    Master Console setup script**, which means the only remover of one was
+    a human too -- and that is how a wrong option survives on a live venue
+    router until somebody notices the symptom.
+
+    The concrete option that forced this: code **114** (RFC 8910 captive
+    portal URI), pointing at a cloud ``rfc8908`` endpoint whose ``captive``
+    member is a hardcoded ``true``. An RFC 8908 client re-polls that URI to
+    learn whether it is *still* captive and is always told yes, so a guest
+    who has signed in successfully keeps the portal sheet open forever. OS
+    probe interception -- what happens with no option 114 at all -- gets
+    both halves right: intercepted before login (sheet opens), succeeds
+    after (sheet dismisses). The endpoint cannot be made truthful, because
+    every guest reaches the cloud from behind the venue's NAT as one source
+    IP, so it has no way to tell one guest's state from another's. The fix
+    is therefore to stop advertising the option, and that is a *removal*
+    the platform has to be able to perform on its own.
+
+    ## Identity is ``name``, never ``code``
+
+    ``name`` is the row's own identity and the only thing this contract
+    matches on. Matching on ``code`` instead would let a sweep delete an
+    option **somebody else added** -- a venue with its own PXE or TFTP
+    option on the same code is a real configuration, not a mistake, and it
+    is not ours to remove. ``code``/``value``/``force`` are the desired
+    contents of *our* row and are written, not matched.
+
+    ``force`` mirrors RouterOS's own flag: send the option to every client
+    rather than only to clients that ask for it by code. It is set on the
+    real fleet router today, which is exactly why the symptom went from
+    occasional to universal.
+
+    ``option_set_name`` is the ``/ip dhcp-server option sets`` row that
+    carries this option, and ``network_addresses`` are the ``/ip
+    dhcp-server network`` rows the set is bound to. Both are optional: a
+    removal only needs ``name``, because the sets and bindings that
+    reference it are discovered from the device rather than assumed.
+    """
+
+    name: str
+    code: int | None = None
+    value: str | None = None
+    force: bool = False
+    option_set_name: str | None = None
+    network_addresses: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionInfo:
+    """One row of the router's own ``/ip dhcp-server option`` table."""
+
+    name: str
+    code: int | None
+    value: str | None
+    force: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionSetInfo:
+    """One row of ``/ip dhcp-server option sets``.
+
+    ``option_names`` is RouterOS's comma-separated ``options`` field split
+    out. It is a *list*, which is the whole reason a teardown cannot just
+    delete the set: a set that also carries somebody else's option must
+    lose our entry and keep theirs.
+    """
+
+    name: str
+    option_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionBinding:
+    """One place an option or option-set is actually handed to clients.
+
+    ``menu`` is the RouterOS path as a slash-joined string (``ip/dhcp-server
+    /network`` or ``ip/dhcp-server/lease``) and ``identity`` is the row's
+    human-recognisable key -- the subnet for a network row, the address for
+    a lease -- so a caller can say *where* something was attached without
+    holding a RouterOS ``.id`` that is meaningless the moment the
+    connection closes.
+
+    Both binding fields are carried, never merged: ``option_names`` is the
+    row's ``dhcp-option`` list and ``option_set_name`` its
+    ``dhcp-option-set``. They are different fields with different removal
+    rules -- one is a list to be edited down, the other a single value to
+    be unset -- and a shape that flattened them would lose that.
+    """
+
+    menu: str
+    identity: str
+    option_names: tuple[str, ...]
+    option_set_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionSnapshot:
+    """Everything the device currently says about its custom DHCP options.
+
+    ``supported`` is ``False`` on a router whose RouterOS has no ``/ip
+    dhcp-server option`` menu at all. That is not the same fact as "has no
+    options", and collapsing the two would report a router we could not ask
+    as a router that answered "none" -- the same conflation
+    :class:`RogueDhcpAlertStatus` exists to prevent one menu over.
+    """
+
+    supported: bool
+    options: tuple[DhcpOptionInfo, ...]
+    option_sets: tuple[DhcpOptionSetInfo, ...]
+    bindings: tuple[DhcpOptionBinding, ...]
+
+    def option(self, name: str) -> DhcpOptionInfo | None:
+        return next((o for o in self.options if o.name == name), None)
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionRemoval:
+    """What a removal actually changed on the device, as opposed to what it
+    was asked to change.
+
+    A removal is idempotent, so "it succeeded" says nothing on its own --
+    running it against a router that was cleaned last week succeeds too.
+    These four fields are the difference between the two runs, which is the
+    only thing worth logging and the only thing an operator asking "did
+    this venue still have it?" is actually asking.
+
+    ``option_sets_rewritten`` is separate from ``option_sets_removed``
+    deliberately: a set we emptied and deleted and a set we edited our
+    entry out of are different outcomes, and the second one means somebody
+    else's configuration is still live in that set.
+    """
+
+    option_removed: bool = False
+    option_sets_removed: tuple[str, ...] = ()
+    option_sets_rewritten: tuple[str, ...] = ()
+    bindings_detached: tuple[str, ...] = ()
+
+    @property
+    def changed(self) -> bool:
+        return bool(
+            self.option_removed
+            or self.option_sets_removed
+            or self.option_sets_rewritten
+            or self.bindings_detached
+        )
+
+@dataclass(frozen=True, slots=True)
 class PortForwardConfig:
     """One inbound port-forwarding (DSTNAT) rule to realize on a device.
 
@@ -1022,6 +1179,46 @@ class DeviceGatewayAdapter(Protocol):
         ...
     async def configure_dhcp_pool(self, creds: DeviceCredentials, *, pool: DhcpPoolConfig) -> None: ...
 
+    # -- custom DHCP options ------------------------------------------------
+    # The three operations that let this platform own an ``/ip dhcp-server
+    # option`` row instead of leaving it to whoever last pasted the setup
+    # script. See :class:`DhcpOptionConfig` for why that mattered.
+
+    async def read_dhcp_options(self, creds: DeviceCredentials) -> DhcpOptionSnapshot:
+        """Read the device's custom DHCP options, option sets, and every
+        row those are bound to. Reads only; writes nothing.
+
+        A router whose RouterOS has no option menu answers
+        ``supported=False`` rather than an empty list -- see
+        :class:`DhcpOptionSnapshot`.
+        """
+        ...
+
+    async def configure_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> None:
+        """Realize one custom DHCP option, its option set, and the network
+        rows the set is bound to.
+
+        Idempotent, and *updating* rather than skipping when the value or
+        the ``force`` flag drifted -- an option whose value is a stale URL
+        is worse than an absent one, because it reads as configured.
+        """
+        ...
+
+    async def delete_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> DhcpOptionRemoval:
+        """Take one custom DHCP option, and only that option, back off the
+        device -- detaching it everywhere first, because RouterOS refuses
+        to remove anything still referenced.
+
+        Idempotent: safe against a router that never had the option and
+        against one already cleaned. The return value says which of those
+        it was.
+        """
+        ...
+
     # -- rogue DHCP detection ----------------------------------------------
     # A detector, deliberately never an enforcer: see
     # :class:`RogueDhcpAlertConfig` for what a DHCP alert does and, more
@@ -1597,6 +1794,12 @@ __all__ = [
     "DhcpPoolConfig",
     "RogueDhcpAlertConfig",
     "RogueDhcpAlertStatus",
+    "DhcpOptionConfig",
+    "DhcpOptionInfo",
+    "DhcpOptionSetInfo",
+    "DhcpOptionBinding",
+    "DhcpOptionSnapshot",
+    "DhcpOptionRemoval",
     "NatRuleConfig",
     "PortForwardConfig",
     "RadiusClientConfig",

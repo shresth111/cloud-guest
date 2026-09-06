@@ -11,11 +11,13 @@ from __future__ import annotations
 import uuid
 from typing import Protocol
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
+from app.domains.router.models import Router
 
 from .models import DhcpPool, RouterRogueDhcpStatus
 
@@ -54,6 +56,8 @@ class DhcpRepositoryProtocol(Protocol):
     # ------------------------------------------------------------------
 
     async def list_router_ids_serving_dhcp(self) -> list[uuid.UUID]: ...
+
+    async def list_all_router_ids(self) -> list[uuid.UUID]: ...
 
     async def list_rogue_dhcp_statuses(
         self, router_id: uuid.UUID
@@ -161,6 +165,29 @@ class DhcpRepository:
         for row in rows:
             seen.setdefault(row.router_id, None)
         return list(seen)
+
+    async def list_all_router_ids(self) -> list[uuid.UUID]:
+        """Every non-deleted router in the fleet -- the set the
+        captive-portal DHCP-option sweep fans out over.
+
+        Deliberately **not** ``list_router_ids_serving_dhcp``. That one is
+        scoped to routers this platform has its own ``DhcpPool`` row for,
+        and the option this sweep removes was never written by this
+        platform: it was pasted, by a human, from the Master Console setup
+        script, onto a router whose DHCP was configured by that same
+        script. Scoping the sweep to routers we have pool rows for would
+        skip exactly the routers that have the problem.
+
+        Reads ``Router`` through this session directly rather than through
+        a repository of its own. ``RouterRepository.list_routers`` is
+        paginated and requires a ``location_id``, so it cannot answer a
+        fleet-wide question, and adding a fleet-wide lister to the router
+        domain to serve one caller in this one would be the wider change.
+        """
+        result = await self.session.execute(
+            select(Router.id).where(Router.is_deleted.is_(False))
+        )
+        return list(result.scalars().all())
 
     async def list_rogue_dhcp_statuses(
         self, router_id: uuid.UUID
