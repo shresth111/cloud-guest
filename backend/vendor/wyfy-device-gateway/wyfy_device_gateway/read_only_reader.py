@@ -120,8 +120,102 @@ READ_ONLY_SECTION_PATHS: MappingProxyType[str, tuple[str, ...]] = MappingProxyTy
         "wireguard_interfaces": ("interface", "wireguard"),
         "wireguard_peers": ("interface", "wireguard", "peers"),
         "netwatch": ("tool", "netwatch"),
+        # G. venue diagnostics
+        #
+        # Four reads added for the Connection Tools redesign. Each is a
+        # plain `print`, each is confirmed working over port 8728 against
+        # the lab hEX lite (RouterOS 7.23.3) by a script in
+        # `backend/ops/probes/`, and each answers a venue question the
+        # platform currently has to guess at. Not yet exposed on any
+        # customer-facing route -- that is the product design. This is the
+        # safe substrate underneath it.
+        #
+        # `hotspot_hosts` is the difference between "the guest is stuck on
+        # the login page" and "the guest never reached the network".  A
+        # device in `/ip/hotspot/host` with `authorized=no` has an
+        # address and has been redirected to the portal and has not
+        # logged in; a device absent from it is not on the network at
+        # all. Today both look identical from the dashboard. Carries
+        # guest MACs -- see the PII note below.
+        # Confirmed by ops/probes/read_router_log.py.
+        "hotspot_hosts": ("ip", "hotspot", "host"),
+        # `bridge_hosts` is the closest this hardware gets to seeing
+        # Wi-Fi. The routers have no radio, but the bridge's learned-MAC
+        # table maps every MAC to the physical port it arrived on, so on a
+        # multi-AP venue it identifies *which access point* a guest is
+        # behind, and whether an AP is still present on its port at all.
+        # It needs neither an IP (unlike `/ip/arp`) nor LLDP (unlike
+        # `/ip/neighbor`) -- one frame is enough.
+        # Confirmed by ops/probes/read_bridge_hosts.py.
+        "bridge_hosts": ("interface", "bridge", "host"),
+        # `neighbors` names the hardware plugged into each port -- an
+        # LLDP/MNDP/CDP neighbour reports identity, platform and board.
+        # Expect it to be EMPTY more often than not: the venue APs in the
+        # field are TP-Link units in dumb-AP mode that advertise nothing,
+        # and this was confirmed on the lab router with discovery enabled
+        # on the port (ops/probes/hunt_ap_via_discovery.py). Treat a hit
+        # as a bonus, never as the topology.
+        # Confirmed by ops/probes/read_neighbours.py.
+        "neighbors": ("ip", "neighbor"),
+        # `dns_cache` distinguishes "DNS is broken" from "DNS is working
+        # and returning an answer the customer does not like" -- including
+        # this platform's own content-filter `/ip dns static` overrides,
+        # which resolve blocked domains to the portal address. It is the
+        # single most common cause of "one website will not open".
+        #
+        # COST WARNING, and it is the only one in this map: a busy venue
+        # router can hold thousands of cache entries, and `read_all()`
+        # pulls every row of every section. Callers that want this should
+        # use `read_section("dns_cache")` and filter, or accept a large
+        # reply. Do not add it to a high-frequency sweep unthinkingly.
+        "dns_cache": ("ip", "dns", "cache"),
     }
 )
+
+# WHAT IS DELIBERATELY ABSENT FROM THIS MAP, AND WHY
+#
+# This allowlist is the substrate a customer-facing diagnostics page will
+# be built on, so the omissions matter as much as the entries. Two
+# RouterOS tools get asked for by name and must not be added here:
+#
+# `/tool/bandwidth-test` -- NEVER. Not here, not on any customer path,
+# not behind a confirmation. It saturates the venue's uplink by design
+# (that is the measurement), and on this hardware the traffic goes
+# through a single 850MHz MIPS core rather than the switch chip, so it
+# degrades DNS, DHCP and the captive portal simultaneously and keeps
+# misbehaving after the test ends. Running it at a cafe at 8pm drops
+# every guest, and any POS terminal sharing that uplink. It also cannot
+# do the job: it requires a RouterOS BTest server on the far end and
+# cannot measure throughput to the general internet -- confirmed against
+# a real 7.16.2 hEX lite, which answered `{"detail":"no such command"}`.
+# `MikroTikAdapter.run_speed_test` (`/tool/fetch`) is the real
+# measurement and is already implemented and validated on hardware.
+#
+# `/tool/torch` -- not here, and not anywhere without a server-enforced
+# duration. Torch is the only way to get live per-host *rate*, but it
+# inspects every packet on the interface in software, which is a real
+# CPU cost on this hardware while guests are using it. Worse, WITHOUT AN
+# EXPLICIT `duration` IT STREAMS FOREVER: the librouteros generator
+# blocks indefinitely and pins an open API connection to a production
+# router, with no clean cancel in the calling style this package uses. A
+# duration must be clamped server-side and never taken from a client
+# field. It is also a privacy exposure -- it reveals identifiable
+# guests' destination addresses and ports to a venue owner -- so any
+# eventual use must aggregate to "device X used Y Mbps". Note that this
+# class could not host torch anyway: it only ever *iterates* a `Path`
+# (issuing `/.../print`), and torch is not a print.
+#
+# The safe answer to "who is using all the bandwidth" is
+# `/ip/hotspot/active`'s own per-session `bytes-in`/`bytes-out`
+# counters -- free, already read elsewhere in this package, and carrying
+# no such hazards.
+#
+# PII, which sanitization here does NOT cover: `SANITIZED_ROW_FIELDS`
+# below strips secret material (passwords, keys, RADIUS secrets). It does
+# not strip guest personal data, and `hotspot_hosts` rows carry guest MAC
+# addresses. That is a real and separate filtering problem which belongs
+# to whatever renders these rows, not to this transport. Do not read the
+# absence of a sanitizer as evidence the rows are safe to display.
 
 _ALLOWED_PATH_SEGMENTS: frozenset[tuple[str, ...]] = frozenset(
     READ_ONLY_SECTION_PATHS.values()

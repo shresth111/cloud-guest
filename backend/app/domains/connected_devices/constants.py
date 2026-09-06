@@ -30,10 +30,20 @@ from enum import StrEnum
 
 
 class ConnectionType(StrEnum):
-    """How a device was observed connecting -- ``WIRELESS`` iff it
-    appears in the router's own wireless registration table, ``WIRED``
-    iff seen only via DHCP lease/ARP, ``UNKNOWN`` if the sync couldn't
-    determine either (e.g. a stale entry with no fresh data this tick)."""
+    """How a device was observed connecting.
+
+    ``WIRELESS`` iff a vendor adapter reported the device associated to a
+    radio the router itself owns. ``WIRED`` iff the adapter could have
+    reported that and did not. ``UNKNOWN`` when the router cannot answer
+    the question at all.
+
+    **``UNKNOWN`` is the normal value on this fleet, not an error.** Every
+    deployed router is a wired hEX lite with no radio, so it can never
+    distinguish a guest's phone on the venue Wi-Fi from a laptop on a
+    cable -- both reach it through the same bridge port from a
+    third-party access point. Recording those as ``WIRED`` would be a
+    positive claim the hardware does not support; see
+    ``service._connection_type_for``."""
 
     WIRED = "wired"
     WIRELESS = "wireless"
@@ -61,8 +71,8 @@ TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP = (
 # (the Beat-scheduled coordinator) dispatches one of per router, instead of
 # syncing every router sequentially, in-process, itself -- see
 # ``tasks.sync_single_router_devices``'s own docstring for the full
-# scale-readiness write-up (a real DHCP-lease/ARP/wireless-registration-
-# table discovery call per router, potentially more expensive than
+# scale-readiness write-up (a real DHCP-lease/ARP discovery call per
+# router, potentially more expensive than
 # ``app.domains.provisioning_engine``'s simple health ping, made the
 # original sequential loop's own overrun risk even worse).
 TASK_SYNC_SINGLE_ROUTER_DEVICES = (
@@ -73,8 +83,8 @@ TASK_SYNC_SINGLE_ROUTER_DEVICES = (
 # fix (fan-out + the lock below is). Slightly more conservative than
 # app.domains.provisioning_engine.constants
 # .ROUTER_HEALTH_POLL_SWEEP_INTERVAL_SECONDS's own 600s, since this sweep's
-# real per-router RouterOS call (full DHCP-lease/ARP/wireless-registration
-# discovery) is potentially heavier than that domain's simple health ping,
+# real per-router RouterOS call (full DHCP-lease/ARP discovery) is
+# potentially heavier than that domain's simple health ping,
 # so real-world device-timeout variance deserves a bit more headroom here.
 CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS = 900.0
 

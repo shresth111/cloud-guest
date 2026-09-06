@@ -53,6 +53,26 @@ PRD.md
 README.md
 ```
 
+## Running the tests — from THIS directory, not from `backend/`
+
+```bash
+cd backend/vendor/wyfy-device-gateway
+../../.venv/bin/python -m pytest tests/ -q      # 196 passed
+```
+
+This package has its own `[tool.pytest.ini_options]` with `pythonpath = ["."]`, which is what
+makes `from tests.fake_write_transport import ...` resolve. Run the same files from `backend/`
+instead and roughly half of them fail collection with:
+
+```
+ModuleNotFoundError: No module named 'tests.fake_write_transport'
+```
+
+That is a wrong working directory, **not broken code** — and it does not look like one, which is
+why it is written down here. `backend/pyproject.toml` sets `testpaths = ["tests"]`, so the
+backend's own suite never collects this package at all; a change here that breaks these tests
+will pass a full `backend/` run untouched. Run both.
+
 ## ReadOnlyDeviceReader (Wave 1 discovery)
 
 Used exclusively for router fleet **discovery** — not for config push.
@@ -62,6 +82,13 @@ Used exclusively for router fleet **discovery** — not for config push.
 | Surface | Only `read_section`, `read_all`, `section_names` — no SSH, no `push_config`, no raw command API |
 | Allowlist | Every RouterOS path is a frozen `/.../print` entry validated before socket I/O |
 | Sanitization | PPPoE passwords, WG private keys, RADIUS secrets stripped → `has_*` booleans |
+
+> **Sanitization covers secrets, not guest personal data.** `SANITIZED_ROW_FIELDS` strips
+> credential material. It does **not** strip PII, and several allowlisted sections carry it:
+> `hotspot_hosts` and `ip/arp` return guest MAC addresses, `hotspot_active` returns the login
+> identifier (a phone number on this platform), and `log` returns both. Rows that come back from
+> this reader are safe from a *credential-leak* standpoint and are **not** automatically safe to
+> display. Filtering PII belongs to whatever renders the rows.
 
 Discovery service code in `cloud-guest-repo` is typed against this class so writes cannot be
 expressed at the call site. See `app/domains/provisioning_engine/planner/service.py` and

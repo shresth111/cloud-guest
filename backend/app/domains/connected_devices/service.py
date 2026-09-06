@@ -1,6 +1,6 @@
 """Connected Device Management business logic: real per-router device
-sync (DHCP lease/ARP/wireless registration table), manual disconnect,
-and admin actions (comment, block/unblock/whitelist).
+sync (DHCP lease/ARP), manual disconnect, and admin actions (comment,
+block/unblock/whitelist).
 
 ## Composition, not duplication, with three other domains
 
@@ -25,7 +25,7 @@ adapter at construction time" convention exactly.
 
 ## Sync semantics: a device that drops off is marked inactive, never deleted
 
-A device absent from the router's own DHCP-lease/ARP/wireless tables on
+A device absent from the router's own DHCP-lease/ARP tables on
 a given sync tick has its ``is_active`` flipped to ``False`` -- its row
 survives (so "guest association"/"comment"/history-adjacent context
 isn't lost the moment someone unplugs a laptop), never soft-deleted by
@@ -86,6 +86,35 @@ def _event_extra(event: object) -> dict[str, object]:
         else str(value)
         for f in dataclasses.fields(event)
     }
+
+
+def _connection_type_for(is_wireless: bool | None) -> ConnectionType:
+    """Maps an adapter's three-state wireless verdict onto the stored
+    ``connection_type``, including the state that used to be lost.
+
+    ``DiscoveredDevice.is_wireless`` is ``None`` when the router cannot
+    report wireless association at all -- which is every router this
+    platform deploys, because they are wired hEX lite boxes with no radio
+    and the venue's Wi-Fi comes from separate access points we do not
+    talk to.
+
+    This used to be a two-branch expression
+    (``WIRELESS if is_wireless else WIRED``), so ``None`` fell to
+    ``WIRED``. That recorded a *positive, wrong claim* -- "this device is
+    on a cable" -- for every Wi-Fi guest on the fleet, and it was
+    indistinguishable in the API response from a genuine wired device.
+    ``UNKNOWN`` already existed for precisely this case; it simply was
+    never reachable.
+
+    Existing rows repair themselves without a migration: the sync sweep
+    writes ``connection_type`` unconditionally on every tick, so an active
+    device's row is corrected within one sweep interval. Rows for devices
+    that are no longer present keep their historical value, which is the
+    correct behaviour for a historical record.
+    """
+    if is_wireless is None:
+        return ConnectionType.UNKNOWN
+    return ConnectionType.WIRELESS if is_wireless else ConnectionType.WIRED
 
 
 # ============================================================================
@@ -245,11 +274,7 @@ class ConnectedDeviceService:
         for discovered in discovered_devices:
             seen_macs.add(discovered.mac_address)
             vendor = vendor_from_mac(discovered.mac_address)
-            connection_type = (
-                ConnectionType.WIRELESS
-                if discovered.is_wireless
-                else ConnectionType.WIRED
-            )
+            connection_type = _connection_type_for(discovered.is_wireless)
             guest_id, guest_session_id = await self._resolve_guest_association(
                 discovered.mac_address, router.id
             )

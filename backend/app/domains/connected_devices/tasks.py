@@ -7,8 +7,8 @@ platform-wide device-sync sweep.
 acquires a Redis overlap-prevention lock, lists every router due a sync via
 ``ConnectedDeviceRepository.list_routers_for_sync``, and dispatches one real
 Celery task (``sync_single_router_devices``) per router -- never itself
-performing the real per-router RouterOS DHCP-lease/ARP/wireless-
-registration-table discovery call. Each dispatched leaf task then does the
+performing the real per-router RouterOS DHCP-lease/ARP discovery
+call. Each dispatched leaf task then does the
 identical fresh-``AsyncSession``-per-invocation bridge every other Celery
 task in this codebase uses (see ``app.domains.isp.tasks
 .run_isp_health_check_sweep`` for the original single-process precedent
@@ -218,7 +218,7 @@ def sync_single_router_devices(router_id: str) -> dict[str, int]:
     independent, real Celery tasks each worker slot picks up and runs
     concurrently (up to worker pool capacity), rather than one task
     blocking on N sequential, potentially-expensive real RouterOS
-    DHCP-lease/ARP/wireless-registration-table discovery calls. One
+    DHCP-lease/ARP discovery calls. One
     router's own connection failure/timeout only ever fails/delays this
     one task -- it can never block or slow down any other router's own
     sync."""

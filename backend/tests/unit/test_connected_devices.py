@@ -408,6 +408,94 @@ class TestSyncRouter:
         assert wireless_device.signal_strength_dbm == -55
         assert wireless_device.vendor is None
 
+    async def test_unknowable_wireless_state_is_recorded_as_unknown_not_wired(
+        self,
+    ) -> None:
+        """The MikroTik adapter reports ``is_wireless=None`` for every
+        device, because every router this platform deploys is a wired hEX
+        lite with no radio -- the venue's Wi-Fi comes from separate access
+        points we do not talk to, so the router genuinely cannot tell a
+        guest's phone from a laptop on a cable.
+
+        This used to fall through a two-branch expression to ``WIRED``,
+        which turned "we cannot know" into the positive, wrong claim "this
+        guest is on a cable" for every Wi-Fi guest on the fleet, and made
+        it indistinguishable in the API from a real wired device.
+        ``UNKNOWN`` already existed for exactly this and was unreachable.
+        """
+        adapter = FakeConnectedDeviceAdapter(
+            discovered=[
+                DiscoveredDevice(
+                    mac_address="AA:BB:CC:DD:EE:07",
+                    ip_address="10.5.50.20",
+                    hostname="pixel-7",
+                    interface="bridge",
+                    is_wireless=None,
+                    signal_strength_dbm=None,
+                ),
+            ]
+        )
+        h = make_harness(adapter=adapter)
+        router = h.router_lookup.add(_make_router())
+        await h.service.sync_router(router.id)
+
+        devices, _ = await h.service.list_devices(
+            requesting_organization_id=router.organization_id
+        )
+        device = next(d for d in devices if d.mac_address == "AA:BB:CC:DD:EE:07")
+        assert device.connection_type == ConnectionType.UNKNOWN.value
+        assert device.connection_type != ConnectionType.WIRED.value
+        # Permanently unobtainable on this hardware, never a placeholder.
+        assert device.signal_strength_dbm is None
+
+    async def test_unknown_connection_type_self_heals_on_the_next_sweep(
+        self,
+    ) -> None:
+        """No data migration is needed for rows already written as
+        ``wired``: the sweep writes ``connection_type`` unconditionally on
+        every tick, so an active device's row corrects itself within one
+        sweep interval. This asserts that update actually happens rather
+        than only being claimed in a comment."""
+        stale = FakeConnectedDeviceAdapter(
+            discovered=[
+                DiscoveredDevice(
+                    mac_address="AA:BB:CC:DD:EE:08",
+                    ip_address="10.5.50.21",
+                    hostname="phone",
+                    interface="bridge",
+                    is_wireless=False,  # what the old adapter reported
+                    signal_strength_dbm=None,
+                ),
+            ]
+        )
+        h = make_harness(adapter=stale)
+        router = h.router_lookup.add(_make_router())
+        await h.service.sync_router(router.id)
+
+        devices, _ = await h.service.list_devices(
+            requesting_organization_id=router.organization_id
+        )
+        assert devices[0].connection_type == ConnectionType.WIRED.value
+
+        # Same device, same MAC, now reported honestly by the fixed adapter.
+        stale.discovered = [
+            DiscoveredDevice(
+                mac_address="AA:BB:CC:DD:EE:08",
+                ip_address="10.5.50.21",
+                hostname="phone",
+                interface="bridge",
+                is_wireless=None,
+                signal_strength_dbm=None,
+            ),
+        ]
+        await h.service.sync_router(router.id)
+
+        devices, meta = await h.service.list_devices(
+            requesting_organization_id=router.organization_id
+        )
+        assert meta.total_items == 1, "still one device, not a second row"
+        assert devices[0].connection_type == ConnectionType.UNKNOWN.value
+
     async def test_second_sync_updates_existing_and_marks_dropped_device_inactive(
         self,
     ) -> None:

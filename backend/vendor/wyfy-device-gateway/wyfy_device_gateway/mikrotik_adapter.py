@@ -1179,18 +1179,60 @@ class MikroTikAdapter:
         )
 
     async def list_connected_devices(self, creds: DeviceCredentials) -> list[ConnectedDevice]:
-        """Ported from
-        ``connected_devices/device_adapters.py::_discover_sync`` /
-        ``_merge_discovered_devices`` -- merges DHCP-lease/ARP/wireless-
-        registration-table replies into one row per MAC. Each menu is
-        queried independently (``_safe_query``): a wired-only router with
-        no wireless package at all has no
-        ``interface wireless registration-table`` menu, and that alone
-        must never abort discovery of the wired devices the other two
-        menus already carry fine (see that module's own docstring)."""
+        """Merges the router's ``/ip/dhcp-server/lease`` and ``/ip/arp``
+        replies into one :class:`ConnectedDevice` per MAC address.
+
+        ## Why the wireless registration table is no longer queried
+
+        This method used to issue a third read,
+        ``/interface/wireless/registration-table``, and merge its rows in
+        for signal strength and a wireless/wired verdict. That read was
+        removed because it cannot succeed on any router this platform
+        owns, and never could.
+
+        Every deployed router is a hEX lite / RB750r2 (RouterOS 7.23.3,
+        mipsbe) -- a five-port wired router with **no radio and no
+        ``wireless`` package**, so the menu does not exist. The query did
+        not return an empty table; it raised ``no such command or
+        directory (wireless)``, which ``_safe_query`` swallowed into
+        ``[]``. The cost of keeping it was a wasted RouterOS API round
+        trip plus a ``mikrotik_connected_devices_menu_unavailable`` log
+        line **per router, every five minutes, fleet-wide** (the
+        ``connected_devices`` sync sweep), for a reply that was
+        structurally guaranteed to be empty.
+
+        Guest Wi-Fi at these venues is emitted by separate third-party
+        access points (TP-Link / Omada in the field) plugged into
+        ``ether2..ether5``. Signal strength, data rate and association
+        state live in those APs. No RouterOS command on this hardware can
+        reach them, so this is not a gap a different query would close --
+        it is an access-point integration, tracked separately.
+
+        ## What that means for the caller
+
+        ``is_wireless`` is therefore ``None`` on every row this adapter
+        returns, and ``signal_strength_dbm`` is ``None`` with it -- the
+        documented "this router cannot answer that question" state, not
+        "no" and not "not measured yet". See :class:`ConnectedDevice`.
+
+        Re-adding a wireless read for genuinely wireless MikroTik hardware
+        is a real future change, but it must **gate on the device's own
+        ``/system/resource`` architecture and ``/system/package`` list**
+        rather than on a model-name string, and it must pick the right
+        menu for the RouterOS version: ``/interface/wireless`` (legacy
+        package), ``/interface/wifiwave2`` (7.1-7.12) or
+        ``/interface/wifi`` (7.13+, qcom drivers). Assuming any one of
+        those unconditionally is what this removal is undoing.
+        """
         return await asyncio.to_thread(self._list_connected_devices_sync, creds)
 
     def _safe_query(self, api, *path: str) -> list[dict[str, object]]:  # noqa: ANN001
+        """Reads one menu, degrading a missing/unsupported menu to ``[]``
+        rather than failing the whole discovery.
+
+        Retained after the wireless-menu removal above because it still
+        earns its place: ``/ip/dhcp-server/lease`` is absent on a router
+        running no DHCP server, and that must not cost us the ARP half."""
         try:
             return list(api.path(*path))
         except LibRouterosError as exc:
@@ -1207,12 +1249,9 @@ class MikroTikAdapter:
         try:
             leases = self._safe_query(api, "ip", "dhcp-server", "lease")
             arp_entries = self._safe_query(api, "ip", "arp")
-            wireless_entries = self._safe_query(
-                api, "interface", "wireless", "registration-table"
-            )
         finally:
             api.close()
-        return _merge_connected_devices(leases, arp_entries, wireless_entries)
+        return _merge_connected_devices(leases, arp_entries)
 
     async def disconnect_device(
         self, creds: DeviceCredentials, *, mac_address: str, interface: str | None
@@ -5397,44 +5436,37 @@ def _row_mac(row: dict[str, object]) -> str | None:
     return normalize_mac_address(row.get("mac-address"))
 
 
-def _parse_signal_strength(value: object) -> int | None:
-    """Ported verbatim from
-    ``connected_devices/device_adapters.py::_parse_signal_strength`` --
-    RouterOS reports signal strength as e.g. ``"-55dBm@6Mbps"`` or plain
-    ``"-55"`` depending on version."""
-    if value is None:
-        return None
-    text = str(value)
-    digits = ""
-    for index, char in enumerate(text):
-        if (char in "+-" and index == 0) or char.isdigit():
-            digits += char
-        else:
-            break
-    try:
-        return int(digits)
-    except ValueError:
-        return None
+# `_parse_signal_strength` was removed alongside the wireless
+# registration-table read (see `MikroTikAdapter.list_connected_devices`).
+# It parsed the legacy `wireless` package's `"-55dBm@6Mbps"` /`"-55"`
+# signal field, and had no other caller. Restoring it is not enough to
+# restore the capability: the newer `/interface/wifi` stack reports a
+# plain numeric `signal` with `rx-rate`/`tx-rate` alongside it, so the
+# parser to write depends on which wireless stack the device actually
+# runs -- which is the version gate described in that method's docstring.
 
 
 def _merge_connected_devices(
     leases: list[dict[str, object]],
     arp_entries: list[dict[str, object]],
-    wireless_entries: list[dict[str, object]],
 ) -> list[ConnectedDevice]:
-    """Ported verbatim from
-    ``connected_devices/device_adapters.py::_merge_discovered_devices`` --
-    merges DHCP-lease/ARP/wireless-registration-table replies into one
-    :class:`ConnectedDevice` per MAC address. See that module's own
-    docstring for why each menu answers a different question about the
-    same device and why a device present in more than one source is never
-    duplicated."""
-    wireless_by_mac: dict[str, dict[str, object]] = {}
-    for row in wireless_entries:
-        mac = _row_mac(row)
-        if mac is not None:
-            wireless_by_mac[mac] = row
+    """Merges ``/ip/dhcp-server/lease`` and ``/ip/arp`` replies into one
+    :class:`ConnectedDevice` per MAC address.
 
+    The two menus answer different questions about the same device -- a
+    lease carries the client-reported hostname and the address the router
+    handed out; ARP carries an address and interface for a device that
+    took no lease -- so a device present in both is one row, never two.
+    ARP is applied first and the lease overwrites it field by field,
+    keeping the ARP value wherever the lease has none.
+
+    ``is_wireless`` is ``None`` on every row: neither of these two menus
+    can answer it, and the third menu that could
+    (``/interface/wireless/registration-table``) does not exist on this
+    fleet's hardware. See :meth:`MikroTikAdapter.list_connected_devices`
+    for the full reasoning and :class:`ConnectedDevice` for why ``None``
+    rather than ``False``.
+    """
     merged: dict[str, ConnectedDevice] = {}
 
     for row in arp_entries:
@@ -5446,7 +5478,7 @@ def _merge_connected_devices(
             ip_address=_safe_str(row.get("address")),
             hostname=None,
             interface=_safe_str(row.get("interface")),
-            is_wireless=mac in wireless_by_mac,
+            is_wireless=None,
             signal_strength_dbm=None,
         )
 
@@ -5462,20 +5494,8 @@ def _merge_connected_devices(
             hostname=_safe_str(row.get("host-name")),
             interface=_safe_str(row.get("interface"))
             or (existing.interface if existing else None),
-            is_wireless=mac in wireless_by_mac,
-            signal_strength_dbm=existing.signal_strength_dbm if existing else None,
-        )
-
-    for mac, row in wireless_by_mac.items():
-        existing = merged.get(mac)
-        merged[mac] = ConnectedDevice(
-            mac_address=mac,
-            ip_address=existing.ip_address if existing else None,
-            hostname=existing.hostname if existing else None,
-            interface=_safe_str(row.get("interface"))
-            or (existing.interface if existing else None),
-            is_wireless=True,
-            signal_strength_dbm=_parse_signal_strength(row.get("signal-strength")),
+            is_wireless=None,
+            signal_strength_dbm=None,
         )
 
     return list(merged.values())
