@@ -41,6 +41,7 @@ __all__ = [
     "SplashTextTooLongError",
     "PostLoginHtmlTooLargeError",
     "PoweredByAttributionNotEntitledError",
+    "InvalidUserPortalUrlError",
 ]
 
 
@@ -345,4 +346,38 @@ class PoweredByAttributionNotEntitledError(CaptivePortalError):
                 "field": "powered_by_enabled",
                 "required_feature": feature_key,
             },
+        )
+
+
+class InvalidUserPortalUrlError(CaptivePortalError):
+    """The ``portal_url`` query parameter of the RFC 8908 endpoint was not
+    a URL on this platform's own hotspot name.
+
+    **This is a security boundary, not input hygiene.** That parameter is
+    reflected into the ``user-portal-url`` member of an
+    ``application/captive+json`` document, and a conforming operating
+    system *opens that URL by itself* -- no link, no click, no user
+    decision anywhere in the chain. An ordinary open redirect needs a
+    victim to follow it; this one needs a victim to plug in a network
+    cable. So the check is an allowlist of names this platform owns, and
+    anything else is refused rather than sanitised.
+
+    400 rather than 422: FastAPI's own 422 means "the request did not
+    match the declared schema", and this one did -- ``portal_url`` is a
+    string and a string arrived. What failed is a domain rule about
+    *which* strings are acceptable, which is the same category as every
+    other 400 in this module.
+    """
+
+    def __init__(self, portal_url: str) -> None:
+        # The offending value is deliberately NOT interpolated into the
+        # message. This endpoint is unauthenticated and reachable by any
+        # guest device, so the message is the one thing an attacker can
+        # reliably get the platform to emit; echoing their string back
+        # into it would hand back a smaller version of the same
+        # reflection this class exists to close.
+        super().__init__(
+            "portal_url must be an http:// URL on this platform's own "
+            "hotspot name",
+            status_code=status.HTTP_400_BAD_REQUEST,
         )

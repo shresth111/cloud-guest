@@ -62,7 +62,7 @@ from .schemas import (
     ResolvedCaptivePortalConfigResponse,
 )
 from .service import CaptivePortalService
-from .validators import is_open_now
+from .validators import is_open_now, validate_user_portal_url
 
 router = APIRouter(tags=["Captive Portal"])
 
@@ -582,11 +582,37 @@ async def captive_portal_api(portal_url: str = Query(...)):
     RFC 8908 defines this exact response shape and the
     `application/captive+json` media type; wrapping it in a
     success/message/data envelope would make it a non-conformant response
-    the OS's own captive-portal-detection client can't parse."""
+    the OS's own captive-portal-detection client can't parse.
+
+    ## `portal_url` is validated and REBUILT, never reflected
+
+    The paragraph above describes the intended caller. Nothing enforced
+    that it was the actual one: the parameter went straight into
+    `user-portal-url`, and a conforming OS *opens that URL by itself* off
+    a DHCP lease -- no link, no click. `validate_user_portal_url` closes
+    that by allowlisting this platform's own hotspot name and returning a
+    URL it constructed, so the caller's bytes never reach the response.
+    See that function's docstring for why check-then-reflect is not
+    equivalent.
+
+    ## `no-store`, not `private`
+
+    `private` still permits a cache; it only forbids a *shared* one. This
+    document's whole job is to be re-fetched -- RFC 8908 clients poll the
+    API to find out whether they are STILL captive, and that is the one
+    question a cached copy always answers wrongly. `captive` is a literal
+    `True` here today (deliberately: making it real is blocked on whether
+    the router can serve this document itself), and when that changes, a
+    client holding a cached `True` would keep showing the portal and the
+    fix would look like it had not shipped. Shipping `no-store` ahead of
+    that is what makes the later change observable."""
     return JSONResponse(
-        content={"captive": True, "user-portal-url": portal_url},
+        content={
+            "captive": True,
+            "user-portal-url": validate_user_portal_url(portal_url),
+        },
         media_type="application/captive+json",
-        headers={"Cache-Control": "private"},
+        headers={"Cache-Control": "no-store"},
     )
 
 

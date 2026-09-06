@@ -10,7 +10,17 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime, time
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+# Imported, never copied. This is the name the hotspot's own ``dns-name``
+# and ``/ip dns static`` entry are rendered from (``_render_vlan_hotspot``),
+# and the name ``render_hotspot_walled_garden`` permits a guest to reach
+# before they log in. The set of names a guest may be *sent* to and the set
+# they are *allowed* to reach have to be the same set; a second literal
+# here is how they would come to differ, silently, on a day nobody was
+# looking at both files.
+from app.domains.network_config.renderers import HOTSPOT_DNS_NAME
 
 from .constants import (
     HEX_COLOR_PATTERN,
@@ -32,6 +42,7 @@ from .exceptions import (
     InvalidHexColorError,
     InvalidPortalContentModeError,
     InvalidPortalContentSourceError,
+    InvalidUserPortalUrlError,
     SplashTextTooLongError,
 )
 
@@ -329,3 +340,105 @@ __all__ = [
     "validate_background_focal_point",
     "is_open_now",
 ]
+
+
+#: One DNS label, as RouterOS's own per-VLAN hotspot names are built:
+#: ``_render_vlan_hotspot`` renders ``f"vlan{vlan.vlan_id}.{HOTSPOT_DNS_NAME}"``
+#: and nothing on this platform renders anything deeper. Deliberately not a
+#: general subdomain pattern -- ``a.b.wifi.wyfyguest.com`` is not a name this
+#: platform can produce, so accepting it would only widen the allowlist past
+#: anything it has to cover.
+_HOTSPOT_SUBDOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+#: Characters that URL parsers famously disagree about, rejected before
+#: ``urlsplit`` ever sees the string. A backslash is the important one:
+#: WHATWG-conformant browsers (and the URL parsers inside operating-system
+#: captive-portal clients) treat ``\`` as a path separator, Python's
+#: ``urlsplit`` does not, and that single disagreement is enough to make
+#: ``http://wifi.wyfyguest.com\@evil.example/`` validate here and resolve to
+#: ``evil.example`` there.
+_URL_PARSER_HAZARDS = ("\\",)
+
+
+def validate_user_portal_url(portal_url: str) -> str:
+    """Validate the RFC 8908 endpoint's ``portal_url`` parameter and return
+    a URL **this function built**, not the caller's string.
+
+    ## Why this is not an ordinary open-redirect check
+
+    The return value is reflected into the ``user-portal-url`` member of an
+    ``application/captive+json`` document. A conforming operating system --
+    Windows 11, macOS 13+, iOS 14+ -- fetches that document on its own,
+    from the URI its DHCP lease handed it in RFC 8910 option 114, and then
+    **opens ``user-portal-url`` by itself**, in a captive-portal browser
+    surface the user did not choose to open and cannot inspect the address
+    bar of. There is no link to hover over and no click to withhold. So the
+    threat model is not "a user might be tricked into following this"; it
+    is "an unauthenticated caller can nominate a page the OS will open".
+
+    ## Validate, then rebuild -- the reflection is the vulnerability
+
+    Every accepted URL is **reconstructed** from the one component that was
+    actually checked (the hostname), rather than the caller's bytes being
+    passed through. That is the whole point: a check-then-reflect design
+    stays only as strong as the agreement between Python's ``urlsplit`` and
+    whichever URL parser the guest's OS ships, and those two do not have to
+    agree -- see ``_URL_PARSER_HAZARDS``. Rebuilding removes the question.
+    Anything the caller sent that is not the hostname (path, query,
+    fragment, and any encoding trick inside them) is discarded rather than
+    sanitised.
+
+    ## What is allowed, and why each bound is where it is
+
+    - **``http`` only.** Not an oversight and not a downgrade. The hotspot
+      login page is served by RouterOS itself, which has no certificate any
+      guest device trusts; ``HOTSPOT_LOGIN_BY`` is pinned to ``http-pap``
+      for exactly that reason, and an ``https`` redirect there is a
+      confirmed live cause of "no sign-in popup on Windows or macOS at
+      all" (the probe dies in the TLS handshake, below the HTTP layer the
+      OS is inspecting). An ``https`` value here would be wrong even if it
+      were safe.
+    - **``HOTSPOT_DNS_NAME``, or one label under it.** The two shapes this
+      platform actually renders: the bare name on the default ``hsprof1``
+      hotspot, and ``vlan{id}.`` + the bare name per VLAN.
+    - **No userinfo, no port other than 80.** ``http://a@b/`` and
+      ``http://host:8080/`` are both parseable and neither is anything this
+      platform emits.
+
+    Returns the canonical ``http://<host>/`` form. Raises
+    :class:`InvalidUserPortalUrlError` (400) otherwise.
+    """
+    if any(hazard in portal_url for hazard in _URL_PARSER_HAZARDS):
+        raise InvalidUserPortalUrlError(portal_url)
+    # Whitespace and C0/C1 controls: stripped by some parsers, significant
+    # to others, emitted by none of ours.
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in portal_url):
+        raise InvalidUserPortalUrlError(portal_url)
+
+    try:
+        parts = urlsplit(portal_url)
+        # `.username`/`.password`/`.port` parse the netloc lazily and raise
+        # ValueError on a malformed one (a non-numeric or out-of-range
+        # port), so they belong inside the same guard as urlsplit itself.
+        has_userinfo = bool(parts.username or parts.password)
+        port = parts.port
+        hostname = parts.hostname
+    except ValueError:
+        raise InvalidUserPortalUrlError(portal_url) from None
+
+    if parts.scheme != "http" or has_userinfo or port not in (None, 80):
+        raise InvalidUserPortalUrlError(portal_url)
+
+    # A trailing dot is a legal, fully-qualified spelling of the same name
+    # and resolves identically; it is normalised away rather than refused
+    # so that the rebuilt URL has exactly one spelling.
+    host = (hostname or "").rstrip(".").lower()
+    if host != HOTSPOT_DNS_NAME:
+        suffix = f".{HOTSPOT_DNS_NAME}"
+        if not host.endswith(suffix):
+            raise InvalidUserPortalUrlError(portal_url)
+        label = host[: -len(suffix)]
+        if not _HOTSPOT_SUBDOMAIN_LABEL.match(label):
+            raise InvalidUserPortalUrlError(portal_url)
+
+    return f"http://{host}/"
