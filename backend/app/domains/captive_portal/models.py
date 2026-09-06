@@ -433,6 +433,41 @@ class CaptivePortalConfig(BaseModel):
         Text, nullable=True
     )
 
+    # -- whitelist-only mode -------------------------------------------------
+    # Per-property "only the Always Allowed list gets online" switch. When
+    # enabled, a guest with no matching `guest_access`/`device_access` rule
+    # is refused **at the portal**, on the same login chokepoint business
+    # hours already gate -- nobody bypasses the portal, no device-side
+    # configuration changes, and the venue's own Always Allowed list stays
+    # the single source of truth for who gets through.
+    #
+    # It lives here rather than on the policy domain for the same reason
+    # the business-hours pair above does: this row is already org-scoped
+    # with a nullable `location_id` resolved most-specific-wins, and it is
+    # already resolved on the login path *before* the access gate runs, so
+    # the flag costs no extra query and adds no new way to fail.
+    #
+    # Disabled (False) is the shipped behaviour of every existing row and
+    # is what makes this column a no-op on rollout: the access gate keeps
+    # its default-allow for a guest nothing matches. **Only meaningful on
+    # a location-specific config** -- see validators.validate_whitelist_
+    # only_scope for why an org default (`location_id IS NULL`) may never
+    # carry it.
+    whitelist_only_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    # Shown on the guest-facing refusal screen in place of the normal
+    # sign-in card, in the venue's own words ("Ask reception to add your
+    # number"). Null means the venue wrote nothing and the frontend
+    # supplies its own generic default copy -- exactly the contract
+    # `business_hours_closed_message` above already has, and the reason
+    # this column is nullable rather than defaulted server-side: a stored
+    # default would be indistinguishable from a venue that deliberately
+    # typed the same words.
+    whitelist_only_denied_message: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+
     __table_args__ = (
         Index("ix_captive_portal_configs_organization_id", "organization_id"),
         Index("ix_captive_portal_configs_location_id", "location_id"),

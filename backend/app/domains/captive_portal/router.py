@@ -154,6 +154,8 @@ def _config_response(config: CaptivePortalConfig) -> CaptivePortalConfigResponse
         business_hours_timezone=config.business_hours_timezone,
         business_hours_schedule=dict(config.business_hours_schedule),
         business_hours_closed_message=config.business_hours_closed_message,
+        whitelist_only_enabled=config.whitelist_only_enabled,
+        whitelist_only_denied_message=config.whitelist_only_denied_message,
         guest_font_choice=config.guest_font_choice,
         background_overlay_strength=config.background_overlay_strength,
         background_focal_x=config.background_focal_x,
@@ -223,6 +225,8 @@ async def create_captive_portal_config(
         pin_login_enabled=payload.pin_login_enabled,
         social_login_enabled=payload.social_login_enabled,
         social_login_providers=payload.social_login_providers,
+        whitelist_only_enabled=payload.whitelist_only_enabled,
+        whitelist_only_denied_message=payload.whitelist_only_denied_message,
     )
     return build_response(
         success=True,
@@ -421,6 +425,16 @@ async def resolve_captive_portal_config(
         organization_id=organization_id, location_id=location_id
     )
     config_payload = _config_response(resolved.config).model_dump()
+
+    # Whitelist-only mode is an operator setting, not something a guest is
+    # told before they are refused -- see
+    # `ResolvedCaptivePortalConfigResponse.whitelist_only_enabled` for the
+    # full reasoning and for why this pop and that field's own
+    # `exclude=True` are both here rather than either one alone.
+    # `whitelist_only_denied_message` deliberately stays in the payload:
+    # the portal runtime needs the venue's own refusal copy, the identical
+    # path `business_hours_closed_message` already takes.
+    config_payload.pop("whitelist_only_enabled", None)
 
     # `CaptivePortalConfig.name` is an internal admin label for telling
     # multiple configs apart (e.g. an org-level default vs. a

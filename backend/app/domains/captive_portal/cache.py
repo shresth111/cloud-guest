@@ -74,15 +74,21 @@ from app.core.config import get_settings
 # the post-login screen, so a stale payload here does not merely serve an
 # old colour -- it serves the previous version of a page the venue
 # believes they just published, for up to a full TTL, with nothing on
-# screen to suggest the save did not take.
-_CACHE_KEY_TEMPLATE = "captive_portal:resolve:v6:{organization_id}:{location_id}"
+# screen to suggest the save did not take. v7 is whitelist_only_enabled/
+# whitelist_only_denied_message, the per-property whitelist-only pair,
+# added to that same tuple -- the identical bump for the identical
+# reason. Note the bump is required even though this feature ships dark:
+# the KeyError is raised by ``_config_from_cache_payload`` deserializing
+# a pre-deploy payload, not by anything reading the new fields, so
+# "nothing consumes the flag yet" buys no protection at all.
+_CACHE_KEY_TEMPLATE = "captive_portal:resolve:v7:{organization_id}:{location_id}"
 
 # Redis SET of every resolve key currently written for one organization,
 # so an organization-scoped edit can fan out to *all* of them (see
 # ``invalidate_organization``). Deliberately versioned in lockstep with
 # ``_CACHE_KEY_TEMPLATE`` -- an index holding keys from a previous
 # payload version would fan a delete out to keys nothing reads anymore.
-_ORG_INDEX_KEY_TEMPLATE = "captive_portal:resolve:v6:org-index:{organization_id}"
+_ORG_INDEX_KEY_TEMPLATE = "captive_portal:resolve:v7:org-index:{organization_id}"
 
 # The index set must outlive the payloads it points at, or a payload
 # written at second 59 of the index's own TTL would be orphaned (indexed

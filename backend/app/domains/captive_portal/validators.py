@@ -44,6 +44,7 @@ from .exceptions import (
     InvalidPortalContentSourceError,
     InvalidUserPortalUrlError,
     SplashTextTooLongError,
+    WhitelistOnlyRequiresLocationError,
 )
 
 _WEEKDAYS = (
@@ -245,6 +246,28 @@ def validate_default_scope(*, is_default: bool, location_id: uuid.UUID | None) -
         raise InvalidDefaultConfigScopeError()
 
 
+def validate_whitelist_only_scope(
+    *, whitelist_only_enabled: bool, location_id: uuid.UUID | None
+) -> None:
+    """Raises ``WhitelistOnlyRequiresLocationError`` if
+    ``whitelist_only_enabled=True`` is requested on an organization's own
+    default config (``location_id IS NULL``).
+
+    An org default is inherited by every location without an override, so
+    the flag set there is one toggle that refuses every guest without an
+    Always Allowed entry at *every* property in the organization. The
+    feature is per property; there is no legitimate whole-org use. Setting
+    it to ``False`` on an org default stays legal -- that is the column's
+    own default and can never widen anything.
+
+    Deliberately shaped exactly like ``validate_default_scope`` above (the
+    other "this field only means something at one scope" check this domain
+    already ships), so the two read as one rule with two instances.
+    """
+    if whitelist_only_enabled and location_id is None:
+        raise WhitelistOnlyRequiresLocationError()
+
+
 def validate_business_hours_timezone(value: str) -> None:
     """Raises ``InvalidBusinessHoursScheduleError`` unless ``value`` is a
     real IANA zone name Python's own ``zoneinfo`` can load -- rejected at
@@ -332,6 +355,7 @@ __all__ = [
     "default_splash_headline",
     "SPLASH_TEXT_MAX_LENGTHS",
     "validate_default_scope",
+    "validate_whitelist_only_scope",
     "validate_business_hours_timezone",
     "validate_business_hours_schedule",
     "validate_guest_font_choice",

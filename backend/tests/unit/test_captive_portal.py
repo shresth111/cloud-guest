@@ -54,13 +54,14 @@ from app.domains.captive_portal.exceptions import (
     PostLoginHtmlTooLargeError,
     PoweredByAttributionNotEntitledError,
     SplashTextTooLongError,
+    WhitelistOnlyRequiresLocationError,
 )
 from app.domains.captive_portal.html_sanitizer import (
     sanitize_post_login_html,
     sanitize_stylesheet,
 )
 from app.domains.captive_portal.models import CaptivePortalConfig
-from app.domains.captive_portal.router import captive_portal_api
+from app.domains.captive_portal.router import _config_response, captive_portal_api
 from app.domains.captive_portal.service import (
     CaptivePortalService,
     PoweredByAttributionResetService,
@@ -75,6 +76,7 @@ from app.domains.captive_portal.validators import (
     validate_single_content_source,
     validate_splash_text_length,
     validate_user_portal_url,
+    validate_whitelist_only_scope,
 )
 from app.domains.location.exceptions import (
     CrossOrganizationLocationAccessError,
@@ -479,6 +481,8 @@ async def _create_config(
     username_password_enabled: bool = True,
     pin_login_enabled: bool = False,
     post_login_html: str | None = None,
+    whitelist_only_enabled: bool = False,
+    whitelist_only_denied_message: str | None = None,
     requesting_organization_id: uuid.UUID | None = None,
     organization_id: uuid.UUID | None = None,
 ) -> CaptivePortalConfig:
@@ -521,6 +525,8 @@ async def _create_config(
         social_login_enabled=social_login_enabled,
         social_login_providers=social_login_providers or [],
         post_login_html=post_login_html,
+        whitelist_only_enabled=whitelist_only_enabled,
+        whitelist_only_denied_message=whitelist_only_denied_message,
     )
 
 
@@ -718,6 +724,235 @@ class TestSingleDefaultEnforcement:
         # Legal combinations never raise.
         validate_default_scope(is_default=True, location_id=None)
         validate_default_scope(is_default=False, location_id=uuid.uuid4())
+
+
+# ============================================================================
+# Whitelist-only mode (schema + guardrails; the gate itself ships separately)
+# ============================================================================
+
+
+class TestWhitelistOnlyScope:
+    """``whitelist_only_enabled`` is a **per-property** switch, and the API
+    refuses to let it be anything else.
+
+    A config with ``location_id IS NULL`` is the organization's default,
+    inherited by every location that has no override of its own. The flag
+    set there would put every property in the organization into
+    whitelist-only mode from one toggle -- every guest without an Always
+    Allowed entry refused, everywhere, with nothing on the screen that
+    turned it on to say how far it reached. There is no legitimate use for
+    that, so it is refused at the write path rather than guarded in the
+    UI, because the UI is not the only caller.
+    """
+
+    async def test_defaults_off_and_unset(self) -> None:
+        """The default is what makes this feature a no-op for every config
+        that already exists -- worth an assertion rather than a comment."""
+        fx = make_service()
+        config = await _create_config(fx)
+        assert config.whitelist_only_enabled is False
+        assert config.whitelist_only_denied_message is None
+
+    async def test_enabled_on_a_location_config_is_allowed(self) -> None:
+        fx = make_service()
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        config = await _create_config(
+            fx,
+            location_id=location.id,
+            whitelist_only_enabled=True,
+            whitelist_only_denied_message="Ask reception to add your number.",
+        )
+        assert config.whitelist_only_enabled is True
+        assert config.whitelist_only_denied_message == (
+            "Ask reception to add your number."
+        )
+
+    async def test_enabled_on_the_org_default_rejected_on_create(self) -> None:
+        fx = make_service()
+        with pytest.raises(WhitelistOnlyRequiresLocationError):
+            await _create_config(fx, location_id=None, whitelist_only_enabled=True)
+
+    async def test_enabled_on_the_org_default_rejected_on_update(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, location_id=None, is_default=True)
+        with pytest.raises(WhitelistOnlyRequiresLocationError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"whitelist_only_enabled": True},
+            )
+
+    async def test_disabling_on_the_org_default_is_always_allowed(self) -> None:
+        """``False`` is the column's own default and the value every
+        existing row carries, so writing it can never widen anything. A
+        guard that rejected it would make the org default's own portal
+        form unsaveable, since the dashboard PUTs its whole form."""
+        fx = make_service()
+        config = await _create_config(fx, location_id=None, is_default=True)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"whitelist_only_enabled": False},
+        )
+        assert updated.whitelist_only_enabled is False
+
+    async def test_the_denied_message_alone_is_not_gated(self) -> None:
+        """Copy is not enforcement. A venue may write (or clear) its
+        refusal wording on any config; only the switch is scoped."""
+        fx = make_service()
+        config = await _create_config(fx, location_id=None, is_default=True)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"whitelist_only_denied_message": "Ask the front desk."},
+        )
+        assert updated.whitelist_only_denied_message == "Ask the front desk."
+
+    async def test_an_unrelated_update_to_an_enabled_location_config_still_saves(
+        self,
+    ) -> None:
+        """The merge is against the **stored** ``location_id``/flag, not
+        against the payload. A PUT that never mentions the flag must not
+        be able to trip the guard on a config that legitimately has it on
+        -- otherwise a whitelist-only property could not change its logo.
+        """
+        fx = make_service()
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        config = await _create_config(
+            fx, location_id=location.id, whitelist_only_enabled=True
+        )
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"primary_color": "#000000"},
+        )
+        assert updated.whitelist_only_enabled is True
+
+    async def test_an_explicit_null_is_treated_as_omitted(self) -> None:
+        """``whitelist_only_enabled`` is NOT NULL, and the update request
+        types it ``bool | None`` because ``None`` is how every field on
+        that schema spells "leave it alone". ``exclude_unset=True`` keeps
+        an explicit JSON ``null`` though, so without normalizing it the
+        write reaches the database and 500s on the constraint."""
+        fx = make_service()
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        config = await _create_config(
+            fx, location_id=location.id, whitelist_only_enabled=True
+        )
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"whitelist_only_enabled": None},
+        )
+        assert updated.whitelist_only_enabled is True
+
+    async def test_validate_whitelist_only_scope_directly(self) -> None:
+        with pytest.raises(WhitelistOnlyRequiresLocationError):
+            validate_whitelist_only_scope(
+                whitelist_only_enabled=True, location_id=None
+            )
+        # Legal combinations never raise.
+        validate_whitelist_only_scope(
+            whitelist_only_enabled=True, location_id=uuid.uuid4()
+        )
+        validate_whitelist_only_scope(whitelist_only_enabled=False, location_id=None)
+        validate_whitelist_only_scope(
+            whitelist_only_enabled=False, location_id=uuid.uuid4()
+        )
+
+
+class TestWhitelistOnlyIsNotAnnouncedToGuests:
+    """``GET /captive-portal/resolve`` is fetched by an unauthenticated
+    guest device before any login. It must not report that the venue is
+    running an allowlist.
+
+    A guest can do nothing with that fact except learn it -- and anyone
+    who curls the endpoint learns which properties are running closed. The
+    guest finds out if and when they are refused, in the venue's own
+    words. That message therefore **does** ride along, on the identical
+    path ``business_hours_closed_message`` already takes.
+    """
+
+    async def test_the_flag_is_absent_from_the_guest_payload(self) -> None:
+        fx = make_service()
+        await _create_config(fx, name="Org default", is_default=True)
+
+        data = await _call_resolve_route(fx, None)
+
+        assert "whitelist_only_enabled" not in data
+
+    async def test_the_denied_message_does_reach_the_portal_runtime(self) -> None:
+        fx = make_service()
+        await _create_config(
+            fx,
+            name="Org default",
+            is_default=True,
+            whitelist_only_denied_message="Ask reception to add your number.",
+        )
+
+        data = await _call_resolve_route(fx, None)
+
+        assert data["whitelist_only_denied_message"] == (
+            "Ask reception to add your number."
+        )
+        # The pair it was modelled on is right there beside it, unchanged.
+        assert "business_hours_closed_message" in data
+
+    async def test_the_flag_cannot_be_serialized_back_in_by_force(self) -> None:
+        """The second, independent guard: even a caller that constructs
+        the resolved response with the flag explicitly set to True gets a
+        payload without it.
+
+        The route also pops the key, but a pop is one line a refactor can
+        drop. This asserts the property at the schema, where it survives
+        the route being rewritten -- and it is the one that holds for the
+        real `response_model` serialization FastAPI performs, which
+        `_call_resolve_route` (a direct function call) does not exercise.
+        """
+        from app.domains.captive_portal.schemas import (
+            ResolvedCaptivePortalConfigResponse,
+        )
+
+        fx = make_service()
+        config = await _create_config(fx, name="Org default", is_default=True)
+        _apply_column_defaults(config)
+        payload = _config_response(config).model_dump()
+        payload.pop("whitelist_only_enabled", None)
+
+        resolved = ResolvedCaptivePortalConfigResponse(
+            **payload,
+            whitelist_only_enabled=True,
+            resolved_via_location_override=False,
+            is_open_now=True,
+        )
+
+        assert "whitelist_only_enabled" not in resolved.model_dump()
+        assert "whitelist_only_enabled" not in resolved.model_dump_json()
+
+    async def test_admin_crud_does_read_the_flag_back(self) -> None:
+        """The dashboard has to be able to build a toggle against this,
+        so the admin-facing response keeps both fields -- the exclusion is
+        specific to the guest-facing resolve payload, not a decision to
+        hide the column from its own operator."""
+        fx = make_service()
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        config = await _create_config(
+            fx,
+            location_id=location.id,
+            whitelist_only_enabled=True,
+            whitelist_only_denied_message="Ask reception.",
+        )
+        _apply_column_defaults(config)
+
+        payload = _config_response(config).model_dump()
+
+        assert payload["whitelist_only_enabled"] is True
+        assert payload["whitelist_only_denied_message"] == "Ask reception."
 
 
 # ============================================================================
@@ -2088,11 +2323,16 @@ class TestResolveCacheKeyVersion:
         joining WiFi until the TTL expires.
 
         v6 is ``post_login_html``, the venue's own post-sign-in page,
-        joining ``_CACHED_CONFIG_SCALAR_FIELDS``."""
+        joining ``_CACHED_CONFIG_SCALAR_FIELDS``. v7 is the per-property
+        whitelist-only pair (``whitelist_only_enabled`` /
+        ``whitelist_only_denied_message``) joining the same tuple -- the
+        bump is required even though that feature ships dark, because the
+        KeyError comes from deserializing a pre-deploy payload, not from
+        anything reading the new fields."""
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
 
         key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
-        assert key == "captive_portal:resolve:v6:org:loc"
+        assert key == "captive_portal:resolve:v7:org:loc"
 
     def test_org_index_key_is_versioned_in_lockstep_with_the_payload_key(self) -> None:
         """The index names payload keys. Left at an older version it
@@ -2105,7 +2345,7 @@ class TestResolveCacheKeyVersion:
 
         payload_version = _CACHE_KEY_TEMPLATE.split(":")[2]
         index_version = _ORG_INDEX_KEY_TEMPLATE.split(":")[2]
-        assert payload_version == index_version == "v6"
+        assert payload_version == index_version == "v7"
 
     def test_a_payload_from_the_previous_key_version_would_raise(self) -> None:
         """The mechanism §0.3 is actually about, asserted rather than

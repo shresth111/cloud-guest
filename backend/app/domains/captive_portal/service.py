@@ -114,6 +114,7 @@ from .validators import (
     validate_hex_color,
     validate_single_content_source,
     validate_splash_text_length,
+    validate_whitelist_only_scope,
 )
 
 logger = logging.getLogger(__name__)
@@ -456,6 +457,8 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "business_hours_timezone",
     "business_hours_schedule",
     "business_hours_closed_message",
+    "whitelist_only_enabled",
+    "whitelist_only_denied_message",
     "guest_font_choice",
     "background_overlay_strength",
     "background_focal_x",
@@ -516,6 +519,8 @@ class _CachedCaptivePortalConfig:
     business_hours_timezone: str
     business_hours_schedule: dict[str, Any]
     business_hours_closed_message: str | None
+    whitelist_only_enabled: bool
+    whitelist_only_denied_message: str | None
     guest_font_choice: str
     background_overlay_strength: int
     background_focal_x: int
@@ -709,6 +714,15 @@ class CaptivePortalService:
         # None is also the value that means "unchanged": a config created
         # without one behaves exactly as every config does today.
         post_login_html: str | None = None,
+        # Per-property whitelist-only mode. Defaults to the column's own
+        # default (off / no venue copy) for the same reason
+        # pin_login_enabled and the content_* parameters above do: the
+        # smart-location provisioning flow in
+        # app.domains.location.provisioning_service, and this domain's own
+        # tests, never pass them, and off is the only value that leaves a
+        # brand-new config behaving exactly as every config does today.
+        whitelist_only_enabled: bool = False,
+        whitelist_only_denied_message: str | None = None,
     ) -> CaptivePortalConfig:
         validate_hex_color(primary_color, field_name="primary_color")
         validate_hex_color(secondary_color, field_name="secondary_color")
@@ -721,6 +735,9 @@ class CaptivePortalService:
             privacy_policy_text, privacy_policy_url, field_label=PRIVACY_POLICY_LABEL
         )
         validate_default_scope(is_default=is_default, location_id=location_id)
+        validate_whitelist_only_scope(
+            whitelist_only_enabled=whitelist_only_enabled, location_id=location_id
+        )
         # v7 §Part 2 (W2). Unconditional on create -- there is no existing
         # value to grandfather, so a brand-new config never gets to start
         # life over the limit. See update_config for why the same check is
@@ -794,6 +811,8 @@ class CaptivePortalService:
             pin_login_enabled=pin_login_enabled,
             social_login_enabled=social_login_enabled,
             social_login_providers=list(social_login_providers),
+            whitelist_only_enabled=whitelist_only_enabled,
+            whitelist_only_denied_message=whitelist_only_denied_message,
             powered_by_enabled=powered_by_enabled,
             created_by=actor_user_id,
         )
@@ -896,6 +915,38 @@ class CaptivePortalService:
         merged_is_default = bool(update_data.get("is_default", config.is_default))
         validate_default_scope(
             is_default=merged_is_default, location_id=config.location_id
+        )
+
+        # `whitelist_only_enabled` is NOT NULL, and this schema types it
+        # `bool | None` because `None` is how "leave it alone" is spelled
+        # on every field of the update request. But `model_dump(
+        # exclude_unset=True)` keeps an *explicit* JSON `null`, which would
+        # travel all the way to the repository and fail the NOT NULL
+        # constraint as a 500. An explicit null and an omitted key mean the
+        # same thing on this schema, so the former is normalized to the
+        # latter here rather than left to the database.
+        #
+        # Flagged, not fixed wholesale: `business_hours_enabled` and the
+        # login-method toggles beside it have the identical shape and the
+        # identical latent 500. Sweeping every NOT NULL boolean on this
+        # request is a change with its own blast radius and does not belong
+        # in a dark schema PR.
+        if update_data.get("whitelist_only_enabled", False) is None:
+            update_data.pop("whitelist_only_enabled")
+
+        # Scoped against the config's **stored** location_id, not anything
+        # in the payload -- location_id is immutable after creation and was
+        # stripped from update_data above, so the stored value is the only
+        # truth there is. Merged the same way is_default is: a PUT that
+        # never mentions the field must not be able to change the answer,
+        # and a PUT that turns the flag off on an org default (the value
+        # every existing row already carries) must keep succeeding.
+        merged_whitelist_only = bool(
+            update_data.get("whitelist_only_enabled", config.whitelist_only_enabled)
+        )
+        validate_whitelist_only_scope(
+            whitelist_only_enabled=merged_whitelist_only,
+            location_id=config.location_id,
         )
 
         if "business_hours_timezone" in update_data:

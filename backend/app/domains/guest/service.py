@@ -3653,8 +3653,45 @@ class GuestService:
         and ``requesting_organization_id`` to ``check_access`` -- this is an
         internal, trusted call on behalf of the already-resolved captive
         portal's own organization, not a cross-tenant admin request, so
-        there is no separate "requesting" identity to distinguish."""
+        there is no separate "requesting" identity to distinguish.
+
+        **The unwired case is fail-open, and says so out loud.** Returning
+        on a missing hook lets every guest online with no access-control
+        decision made at all. That was defensible while the only rule
+        types were VIP/TEMPORARY/BLOCKLIST -- an unwired hook meant
+        blocklists silently did nothing, bad but visible to an operator
+        who tried one. It stops being defensible under per-property
+        whitelist-only mode, where the *entire* enforcement is "refuse
+        whoever does not match": an unwired hook there is a venue that
+        believes it is running closed and is in fact running wide open,
+        with nothing on any screen to say so.
+
+        The hook is wired by ``dependencies.get_guest_service`` for every
+        real request, so this branch means a mis-composed service graph,
+        not a configuration choice -- exactly the class of defect commit
+        ``a0f1522`` records (see
+        ``tests/unit/test_guest_login_composition.py``). It is logged at
+        WARNING rather than raised because ``GuestService`` is legitimately
+        constructed without the hook by Celery tasks and by this domain's
+        own test suite, and turning those into hard failures would be a
+        behaviour change this dark PR has no business making. The log line
+        is the loud part; the composition test is the part that fails
+        first."""
         if self.access_control_hook is None:
+            logger.warning(
+                "guest_access_control_hook_not_wired",
+                extra={
+                    "organization_id": str(organization_id),
+                    "location_id": str(location_id),
+                    "detail": (
+                        "GuestService was composed without an "
+                        "access_control_hook -- this login was allowed "
+                        "with no access-control decision made at all "
+                        "(fail-open). Every real request path wires it "
+                        "via dependencies.get_guest_service."
+                    ),
+                },
+            )
             return
         decision: AccessDecision = await self.access_control_hook.check_access(
             organization_id=organization_id,
