@@ -40,6 +40,39 @@ jobs:
       - name: Ruff
         run: ruff check .
 
+      # Two heads is not a lint nit here: the api image runs
+      # `alembic upgrade head` in its CMD, so shipping the api IS running a
+      # migration. A branched history makes that command refuse outright,
+      # which crash-loops the container, fails remote-deploy.sh's health
+      # wait and rolls back -- after the pre-deploy dump has already run.
+      #
+      # It has happened twice: an earlier `fix/alembic-two-heads` branch,
+      # and again when 0117 was merged without rebasing its down_revision
+      # off 0113 (this PR). Both times `main` carried it, because nothing
+      # checked. Two PRs adding a migration in the same window is all it
+      # takes, and neither PR looks wrong on its own.
+      #
+      # ScriptDirectory reads the versions directory only -- no database,
+      # no env.py, so this cannot fail for an unrelated connection reason
+      # and cannot be confused for one.
+      - name: Assert Alembic has exactly one head
+        run: |
+          python - <<'EOF'
+          import sys
+          from alembic.config import Config
+          from alembic.script import ScriptDirectory
+
+          heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
+          for h in heads:
+              print("head: " + h)
+          if len(heads) != 1:
+              print("::error::Alembic has %d heads; `alembic upgrade head` will "
+                    "refuse and any api deploy will crash-loop. Rebase the newer "
+                    "revision's down_revision onto the other head." % len(heads))
+              sys.exit(1)
+          print("one head, as required")
+          EOF
+
       - name: Pytest
         run: pytest --cov=app --cov-report=term-missing --junitxml=junit.xml
 
