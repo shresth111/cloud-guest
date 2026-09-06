@@ -254,7 +254,7 @@ from app.domains.auth.password import (
     PasswordVerificationError,
 )
 from app.domains.captive_portal.service import ResolvedPortalConfig
-from app.domains.captive_portal.validators import is_open_now
+from app.domains.captive_portal.validators import compute_terms_version, is_open_now
 from app.domains.guest_access.exceptions import GuestAccessDeniedError
 from app.domains.guest_access.service import AccessDecision
 from app.domains.location.models import Location
@@ -343,7 +343,9 @@ from .exceptions import (
     GuestPinLoginFailedError,
     GuestPinSetupNotAuthorizedError,
     GuestPinTooWeakError,
+    GuestProfileFieldNotCollectedError,
     GuestProfileUpdateNotAuthorizedError,
+    GuestReviewLinkOpenedNotAuthorizedError,
     GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
     GuestTeamSharedQuotaExceededError,
@@ -759,6 +761,24 @@ class CaptivePortalLookupProtocol(Protocol):
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
     ) -> ResolvedPortalConfig: ...
+
+    async def get_config(
+        self,
+        config_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> Any:
+        """The one config the caller names by id, rather than the one that
+        resolves for an organization and location.
+
+        Needed by ``record_consent`` alone, and only because a consent row
+        is written against a specific ``captive_portal_config_id`` the
+        portal already resolved -- stamping it with the version of a
+        *differently* resolved config would be a worse record than no
+        version at all. Satisfied structurally by the real
+        ``CaptivePortalService``.
+        """
+        ...
 
 
 class RouterLookupProtocol(Protocol):
@@ -2675,6 +2695,7 @@ class GuestService:
         session_id: uuid.UUID,
         display_name: str | None,
         email: str | None,
+        declined: bool = False,
     ) -> Guest:
         """Lets a guest fill in their name/email right after a real OTP
         verification -- the skippable "tell us about yourself" prompt shown
@@ -2694,7 +2715,32 @@ class GuestService:
         Both fields are optional and independently settable (a guest may
         fill in only one) -- this call is only ever reached by choice; a
         guest who skips the prompt entirely never calls it at all, and
-        network access is never gated on it."""
+        network access is never gated on it.
+
+        Two things this method gained after the first version shipped, both
+        of which exist to move state out of the guest's browser and into
+        the row:
+
+        * ``declined=True`` records that the guest said no. That is the
+          third way ``validators.guest_has_profile`` becomes true, and it
+          is what lets the portal stop keeping a device-local "don't ask
+          again" flag -- see ``Guest.profile_prompt_declined_at``'s own
+          comment for why a ``localStorage`` flag was never a record on
+          the surface that matters.
+        * The venue's ``collect_guest_name``/``collect_guest_email`` flags
+          are enforced here, not only in the UI.
+
+        **Deliberately still post-connect only, and deliberately still
+        hard to call early.** The eligibility check above requires an
+        already-``ACTIVE`` OTP session; inside the login funnel, before the
+        NAS gate opens, that session exists but the guest is not yet on the
+        network, and the window this POST needs is the window the hotspot
+        login POST is racing through. Moving the ask earlier would mean
+        weakening this check or ordering two writes against a session
+        mid-handoff. It was tried, in the funnel, and reverted on purpose:
+        a third screen between a verified guest and their internet is where
+        they close the sheet, and the venue loses the *connection*, which
+        is the thing they are paying for. Keep it here."""
         guest = await self._require_guest(guest_id)
         session = await self.repository.get_session_by_id(session_id)
         now = datetime.now(UTC)
@@ -2714,11 +2760,50 @@ class GuestService:
         if not eligible:
             raise GuestProfileUpdateNotAuthorizedError()
 
+        # Per-venue enforcement: a field whose flag is off is refused
+        # here, not merely hidden in the UI.
+        #
+        # This is the same shape `_require_method_enabled` gives the auth
+        # flags, and it exists for the same reason: a hidden field that
+        # still accepts a write is how a venue ends up holding personal
+        # data it never agreed to hold. The venue is the Data Fiduciary
+        # for a guest's name and email under DPDP; "off" has to mean off
+        # on the server, or the flag is decoration.
+        #
+        # Resolved against the *session's* location, not the guest's.
+        # `Guest.location_id` is a "home" location -- where the guest was
+        # first seen -- and is explicitly never constrained to match the
+        # session's (see that column's own comment). For a multi-location
+        # chain, reading the guest's location would enforce the wrong
+        # venue's settings.
+        #
+        # Only consulted when a field is actually being written. A pure
+        # decline needs no config at all, so a guest can always say no,
+        # even at a venue whose portal config has since been deleted --
+        # refusing to record a refusal would be the wrong failure
+        # direction.
+        if display_name is not None or email is not None:
+            resolved = await self.captive_portal_service.resolve_portal_config(
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+            )
+            config = resolved.config
+            if display_name is not None and not config.collect_guest_name:
+                raise GuestProfileFieldNotCollectedError("name")
+            if email is not None and not config.collect_guest_email:
+                raise GuestProfileFieldNotCollectedError("email")
+
         update_data: dict[str, object] = {}
         if display_name is not None:
             update_data["display_name"] = display_name
         if email is not None:
             update_data["email"] = email
+        # A decline is recorded only if the guest has not already answered
+        # -- `has_profile` is already true once a field is on file, and
+        # overwriting the timestamp on a later "not now" would mean the
+        # column stopped answering "when did they first refuse".
+        if declined and guest.profile_prompt_declined_at is None:
+            update_data["profile_prompt_declined_at"] = now
         if not update_data:
             return guest
 
@@ -2729,6 +2814,71 @@ class GuestService:
                 "event_guest_id": str(updated.id),
                 "event_fields": list(update_data.keys()),
             },
+        )
+        return updated
+
+    async def record_review_link_opened(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        session_id: uuid.UUID,
+    ) -> Guest:
+        """Records that a guest tapped through to the venue's Google review
+        link, so the card stops being shown to them.
+
+        Without this the review card has no memory. It renders on arrival,
+        every visit, forever -- including to the guest who already went and
+        left the review, which is the one guest it must never ask again.
+        That is the whole difference between a feature and a nag, and the
+        record has to live here rather than in the browser because the
+        browser cannot keep it: Web Storage throws inside Apple's Captive
+        Network Assistant, so the device-local flag reads false every time.
+
+        **Post-connect only, and it changes nothing about the connection.**
+        Like every other ask in this family, it is reachable only from
+        ``/portal/session``, which a guest sees after the RADIUS session is
+        authorised and the NAS gate is open. Nothing here can affect
+        whether, how fast, or how long anyone is connected -- and under
+        Google's Rating Manipulation policy nothing may, in either
+        direction: free WiFi is a "free good and/or service", so it can be
+        conditioned neither on leaving a review nor on declining to.
+
+        The write is idempotent in the only sense that matters -- a second
+        tap moves the timestamp, and ``has_opened_review_link`` was already
+        true -- so the portal can call it fire-and-forget without
+        sequencing it against the navigation.
+
+        ⚠ **This is not a review counter.** It records that a link was
+        opened. Google exposes nothing that would let this platform learn
+        whether a review was written, and it cannot see iOS at all: iPhone
+        and iPad guests are sent to ``captive.apple.com/hotspot-detect
+        .html`` after login rather than to ``/portal/session``, so they
+        never reach the card. Any aggregate over this column counts
+        Android and desktop guests who tapped a link. See
+        ``models.Guest.review_link_opened_at``.
+        """
+        guest = await self._require_guest(guest_id)
+        session = await self.repository.get_session_by_id(session_id)
+        # Proof of a live session for this guest, and nothing more. See
+        # ``GuestReviewLinkOpenedNotAuthorizedError`` for why this is
+        # deliberately weaker than the profile write's check: there is no
+        # auth-method filter and no recency window, because this stores
+        # nothing about the guest and a refusal is invisible to the caller
+        # while costing the guest another nag.
+        eligible = (
+            session is not None
+            and session.guest_id == guest.id
+            and session.status == GuestSessionStatus.ACTIVE.value
+        )
+        if not eligible:
+            raise GuestReviewLinkOpenedNotAuthorizedError()
+
+        updated = await self.repository.update_guest(
+            guest, {"review_link_opened_at": datetime.now(UTC)}
+        )
+        logger.info(
+            "guest_review_link_opened",
+            extra={"event_guest_id": str(updated.id)},
         )
         return updated
 
@@ -2786,7 +2936,21 @@ class GuestService:
         terms_version: str | None,
         ip_address: str | None,
     ) -> GuestConsent:
+        """Records a guest accepting a portal's terms.
+
+        ``terms_version`` is derived server-side when the caller does not
+        supply one -- see ``_resolve_terms_version``. Before that, every
+        consent row in production had ``terms_version = NULL``, because
+        the only caller (the portal's sign-in hook) posts a guest id and a
+        config id and nothing else. The column existed; nothing ever filled
+        it; the platform could prove *that* a guest consented and not *to
+        what*."""
         guest = await self._require_guest(guest_id)
+        if terms_version is None:
+            terms_version = await self._resolve_terms_version(
+                captive_portal_config_id=captive_portal_config_id,
+                guest_organization_id=guest.organization_id,
+            )
         consent = await self.repository.create_consent(
             guest_id=guest.id,
             captive_portal_config_id=captive_portal_config_id,
@@ -2801,6 +2965,72 @@ class GuestService:
         )
         logger.info("guest_consent_recorded", extra=_event_extra(event))
         return consent
+
+    async def _resolve_terms_version(
+        self,
+        *,
+        captive_portal_config_id: uuid.UUID | None,
+        guest_organization_id: uuid.UUID,
+    ) -> str | None:
+        """The version string for the terms this portal was showing, or
+        ``None`` when it genuinely cannot be established.
+
+        Derived here rather than trusted from the request. The caller is
+        an unauthenticated guest-facing endpoint; a version it supplied
+        would be a claim about the venue's own documents made by the
+        party the record exists to hold evidence *against*. The
+        request-supplied value is still honoured when present -- it is the
+        seam an admin backfill or a future consent-string registry would
+        use -- but the portal itself sends none, so in practice this is
+        the path every real consent takes.
+
+        Three ways it returns ``None``, all of them honest:
+
+        * **No config id.** Nothing to hash. A guest can consent without
+          the portal telling us which config it rendered, and that
+          possibility is not removed by pretending otherwise.
+        * **The config does not exist, or belongs to another
+          organization.** ``captive_portal_config_id`` arrives from an
+          unauthenticated request body and is stored as a plain FK with no
+          tenant check, so a caller can name any config in the platform.
+          Stamping this guest's consent with *another tenant's* terms
+          version would be a fabricated record -- strictly worse than a
+          NULL, because it looks like evidence. Rejecting the whole
+          consent instead would be the wrong failure direction: this runs
+          on the sign-in path, and refusing to record a consent because
+          the config id looked odd loses the record entirely.
+        * **The config has no terms or privacy content at all.** Then what
+          the guest saw came from the frontend's own hardcoded copy, which
+          this layer cannot see -- see ``compute_terms_version``.
+
+        A failure here never propagates. The consent row is the thing that
+        matters; a missing version degrades it, an exception would lose
+        it.
+        """
+        if captive_portal_config_id is None:
+            return None
+        try:
+            config = await self.captive_portal_service.get_config(
+                captive_portal_config_id
+            )
+        except Exception:  # noqa: BLE001 -- never lose a consent over this
+            logger.warning(
+                "guest_consent_terms_version_unresolved",
+                extra={"event_config_id": str(captive_portal_config_id)},
+            )
+            return None
+        if getattr(config, "organization_id", None) != guest_organization_id:
+            logger.warning(
+                "guest_consent_terms_version_cross_org",
+                extra={"event_config_id": str(captive_portal_config_id)},
+            )
+            return None
+        return compute_terms_version(
+            terms_and_conditions_text=config.terms_and_conditions_text,
+            terms_and_conditions_url=config.terms_and_conditions_url,
+            privacy_policy_text=config.privacy_policy_text,
+            privacy_policy_url=config.privacy_policy_url,
+        )
 
     # ========================================================================
     # Guest / device lookups

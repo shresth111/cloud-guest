@@ -24,7 +24,52 @@ from .exceptions import (
     InvalidNasStatusTransitionError,
     InvalidSessionStatusTransitionError,
 )
-from .models import GuestSession
+from .models import Guest, GuestSession
+
+
+def guest_has_profile(guest: Guest) -> bool:
+    """Whether the post-connect "add your name / add your email" card has
+    already been answered by this guest -- either by giving something, or
+    by explicitly declining.
+
+    This is the value behind ``schemas.GuestLoginResponse.has_profile``,
+    and it exists as one function rather than an inline expression in
+    ``router._login_response`` because two surfaces read it (``POST
+    /guest/login/*`` and ``GET /guest/session/active``) and a third-hand
+    copy of "or the guest declined" is exactly the kind of clause that
+    gets dropped.
+
+    **Why this and not ``is_new_guest``.** The shipped card gates on
+    ``is_new_guest``, and that is the wrong key -- a venue that switches
+    the ask on in October has, on day one, a guest base of thousands who
+    are all ``is_new_guest == False`` and all have no name on file, and
+    not one of them will ever be asked. Under ``has_profile`` they are
+    asked once, then never again. It is the same key the neighbouring
+    ``has_password``/``has_pin`` bits already use for the same purpose,
+    and it costs the same to compute.
+
+    Ask *once ever*, not *on first login*.
+    """
+    return bool(
+        guest.display_name or guest.email or guest.profile_prompt_declined_at
+    )
+
+
+def guest_has_opened_review_link(guest: Guest) -> bool:
+    """Whether this guest has already tapped through to the venue's Google
+    review link -- the value behind
+    ``schemas.GuestLoginResponse.has_opened_review_link``.
+
+    One function rather than an inline ``bool(...)`` for the same reason
+    ``guest_has_profile`` is one: the login response and
+    ``GET /guest/session/active`` both derive it, and the portal treats a
+    tap as final. A second copy of that rule is how one surface comes to
+    keep asking a guest who already went.
+
+    It answers "was the link opened", never "was a review written".
+    Google exposes nothing that would tell this platform the difference.
+    """
+    return guest.review_link_opened_at is not None
 
 
 def normalize_mac_address(mac_address: str) -> str:
@@ -205,6 +250,8 @@ def is_weak_pin(pin: str) -> bool:
 
 
 __all__ = [
+    "guest_has_profile",
+    "guest_has_opened_review_link",
     "normalize_mac_address",
     "normalize_identifier",
     "is_weak_pin",
