@@ -208,6 +208,28 @@ class CaptivePortalConfigCreateRequest(BaseModel):
             "against a real provider registry since none exists."
         ),
     )
+    whitelist_only_enabled: bool = Field(
+        default=False,
+        description=(
+            "Per-property whitelist-only mode: when true, only guests with "
+            "a matching Always Allowed rule get online, and everyone else "
+            "still reaches the captive portal and is refused there. "
+            "**Rejected with a 400 when `location_id` is null** -- an "
+            "organization default is inherited by every location without "
+            "an override, so enabling it there would switch on every "
+            "property at once. Defaults false, which is exactly today's "
+            "behaviour."
+        ),
+    )
+    whitelist_only_denied_message: str | None = Field(
+        default=None,
+        description=(
+            "The venue's own words on the whitelist-only refusal screen "
+            "(e.g. 'Ask reception to add your number'). Null leaves the "
+            "frontend's generic default copy in place -- the identical "
+            "contract `business_hours_closed_message` already has."
+        ),
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -319,6 +341,23 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     business_hours_timezone: str | None = Field(default=None, max_length=64)
     business_hours_schedule: dict | None = Field(default=None)
     business_hours_closed_message: str | None = Field(default=None)
+    whitelist_only_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Per-property whitelist-only mode -- see the create schema's "
+            "own description. Setting it true on an organization default "
+            "(`location_id` null) is rejected with a 400; setting it false "
+            "is always allowed."
+        ),
+    )
+    whitelist_only_denied_message: str | None = Field(
+        default=None,
+        description=(
+            "The venue's own words on the whitelist-only refusal screen. "
+            "Omit the key to leave the stored copy untouched; send null to "
+            "clear it and fall back to the frontend's generic default."
+        ),
+    )
     guest_font_choice: str | None = Field(
         default=None,
         max_length=20,
@@ -404,6 +443,8 @@ class CaptivePortalConfigResponse(BaseModel):
     business_hours_timezone: str
     business_hours_schedule: dict
     business_hours_closed_message: str | None
+    whitelist_only_enabled: bool
+    whitelist_only_denied_message: str | None
     guest_font_choice: str
     background_overlay_strength: int
     background_focal_x: int
@@ -436,6 +477,25 @@ class ResolvedCaptivePortalConfigResponse(CaptivePortalConfigResponse):
     # Computed live at resolve time (validators.is_open_now), never a
     # stored column -- see that function's own docstring.
     is_open_now: bool
+    # Inherited from CaptivePortalConfigResponse and deliberately taken
+    # back out of the guest-facing payload.
+    #
+    # This endpoint is the one response in this module served to an
+    # unauthenticated guest device, before any login. A guest has no need
+    # to be told the venue is running an allowlist -- they find out if and
+    # when they are refused, in the venue's own words
+    # (`whitelist_only_denied_message`, which DOES stay, exactly as
+    # `business_hours_closed_message` does). Announcing the mode up front
+    # tells anyone who curls this endpoint which properties are running
+    # closed and gives a guest nothing they can act on.
+    #
+    # Two independent guards, on purpose: `exclude=True` keeps it out of
+    # every serialization of this model no matter who builds one, and
+    # `router.resolve_captive_portal_config` additionally pops the key
+    # before construction (the `False` default here is what makes that pop
+    # safe). Either alone would hold; a future edit that removes one
+    # should not be able to leak the field.
+    whitelist_only_enabled: bool = Field(default=False, exclude=True)
     location_country: str | None = Field(
         default=None,
         description=(

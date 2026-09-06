@@ -42,6 +42,7 @@ __all__ = [
     "PostLoginHtmlTooLargeError",
     "PoweredByAttributionNotEntitledError",
     "InvalidUserPortalUrlError",
+    "WhitelistOnlyRequiresLocationError",
 ]
 
 
@@ -125,6 +126,32 @@ class InvalidDefaultConfigScopeError(CaptivePortalError):
         super().__init__(
             "is_default can only be set on an organization-level config "
             "(location_id must be null)",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class WhitelistOnlyRequiresLocationError(CaptivePortalError):
+    """``whitelist_only_enabled=True`` was requested on an organization's
+    default config (``location_id IS NULL``).
+
+    An org default is inherited by every location that has no override of
+    its own, so setting the flag there would silently put *every* property
+    in the organization into whitelist-only mode at once -- every guest
+    without an Always Allowed entry refused, everywhere, from one toggle.
+    There is no legitimate use for that: the feature was asked for, and is
+    only ever operated, per property. Refused here rather than guarded in
+    the UI, because the UI is not the only caller.
+
+    Turning it **off** on an org default is always allowed -- ``False`` is
+    the column's own default and the value every existing row already
+    carries, so writing it can never widen anything.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "whitelist_only_enabled can only be set on a location-specific "
+            "config (location_id must not be null) -- enabling it on the "
+            "organization default would switch on every property at once",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
