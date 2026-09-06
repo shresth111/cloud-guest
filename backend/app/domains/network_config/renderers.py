@@ -1132,23 +1132,81 @@ def render_port_forwarding_rule(rule: PortForwardingRule) -> list[str]:
 
 def render_hotspot_profile(profile: HotspotProfile) -> list[str]:
     """Renders one enabled ``HotspotProfile`` row -- see module docstring
-    for why only the user-profile/walled-garden slice is modeled."""
+    for why only the user-profile/walled-garden slice is modeled.
+
+    ## Why this is ``set``-or-``add``, and not just ``add``
+
+    This used to emit a bare ``/ip hotspot user profile add name=<identifier>
+    session-timeout=...``. ``_hotspot_identifier`` is stable across edits (it
+    is the profile's name plus the first eight characters of its immutable
+    id), and every push re-renders *every* enabled row, so the second push of
+    a profile always named one RouterOS already had. ``add`` cannot update an
+    existing row -- it fails with "already have such entry" -- and
+    :func:`_idempotent_lines` wraps every command in ``:do {...} on-error={}``,
+    which swallows exactly that error by design.
+
+    The result was that a venue could change its session timeout, watch the
+    row update, watch a push report success, and have the router keep the old
+    value forever, with nothing logged anywhere. The first push of a profile
+    won; every edit after it was silently discarded. That is a device-side
+    "the setting cannot be changed", independent of (and additional to) the
+    RADIUS ``Session-Timeout`` reply path, which reads a different source
+    entirely -- ``GuestSession.session_timeout_minutes``, resolved from
+    ``PolicyType.SESSION``.
+
+    The fix follows :func:`render_radius_client`'s own established shape in
+    this file: ``:if ([:len [... find ...]] = 0) do={ ... add ... } else={
+    ... set ... }``, one self-contained line, still safe to wrap in
+    ``_idempotent_lines``.
+
+    ## Why unset fields are emitted as explicit "unlimited", not omitted
+
+    ``set`` only changes the parameters it is given, so omitting a field
+    leaves whatever the device already had. Under the old ``add``-only shape
+    omission was harmless (the row was being created from nothing); under
+    ``set`` it would mean a venue can raise a limit but never clear one back
+    to unlimited. So each field is always emitted, using RouterOS's own
+    "no limit" values -- ``session-timeout=0`` (the convention
+    ``HotspotProfile.session_timeout_minutes``'s own column comment already
+    names for its ``NULL``), ``idle-timeout=none``, and an empty
+    ``rate-limit``.
+
+    The walled-garden rows are guarded by the same ``find``-length check
+    :func:`render_hotspot_walled_garden` already uses, for the same reason:
+    ``/ip hotspot walled-garden`` has no uniqueness constraint, so a bare
+    ``add`` re-run on every push accumulated a duplicate row per host per
+    push, unbounded. Note these rows are still only ever added -- dropping a
+    host from ``walled_garden_hosts`` does not withdraw it from the device.
+    """
     identifier = _hotspot_identifier(profile)
-    parts = [f"/ip hotspot user profile add name={identifier}"]
-    if profile.session_timeout_minutes is not None:
-        parts.append(f"session-timeout={profile.session_timeout_minutes}m")
-    if profile.idle_timeout_minutes is not None:
-        parts.append(f"idle-timeout={profile.idle_timeout_minutes}m")
+    fields = [
+        f"session-timeout={profile.session_timeout_minutes}m"
+        if profile.session_timeout_minutes is not None
+        else "session-timeout=0",
+        f"idle-timeout={profile.idle_timeout_minutes}m"
+        if profile.idle_timeout_minutes is not None
+        else "idle-timeout=none",
+    ]
     if profile.upload_limit_kbps is not None or profile.download_limit_kbps is not None:
-        parts.append(
+        fields.append(
             f"rate-limit={profile.upload_limit_kbps or 0}k/"
             f"{profile.download_limit_kbps or 0}k"
         )
-    lines = [" ".join(parts)]
+    else:
+        fields.append('rate-limit=""')
+    body = " ".join(fields)
+    found = f'[/ip hotspot user profile find where name="{identifier}"]'
+    lines = [
+        f":if ([:len {found}] = 0) "
+        f"do={{ /ip hotspot user profile add name={identifier} {body} }} "
+        f"else={{ /ip hotspot user profile set {found} {body} }}"
+    ]
     for host in profile.walled_garden_hosts:
         lines.append(
-            f"/ip hotspot walled-garden add dst-host={host} action=allow "
-            f'comment="{profile.name}"'
+            f":if ([:len [/ip hotspot walled-garden find where "
+            f'dst-host="{host}" && comment="{profile.name}"]] = 0) '
+            f"do={{ /ip hotspot walled-garden add dst-host={host} action=allow "
+            f'comment="{profile.name}" }}'
         )
     return lines
 

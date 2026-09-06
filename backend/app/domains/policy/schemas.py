@@ -64,10 +64,27 @@ __all__ = [
 
 
 class SessionPolicyRules(BaseModel):
-    session_timeout_minutes: int = Field(..., ge=1)
-    max_concurrent_sessions_per_guest: int = Field(..., ge=1)
-    termination_reconnect_cooldown_minutes: int = Field(..., ge=0)
-    reconnect_grace_minutes: int = Field(..., ge=0)
+    """Validated shape of a ``PolicyType.SESSION`` version's ``rules``.
+
+    Every field is optional, and an omitted one means "this policy does not
+    express an opinion about that setting" -- the reader falls back to its own
+    platform constant, exactly as it does when no SESSION policy is assigned
+    at all. Consumers therefore treat a missing field and an explicit ``null``
+    identically (``PolicyService`` persists ``model_dump()``, so an omitted
+    optional is stored as ``null`` rather than dropped).
+
+    All four used to be required, which made the type unusable for its actual
+    purpose: a venue that wants to change only its session length had to
+    supply a concurrent-session cap, a reconnect cooldown and a grace window
+    too, or get a 422. Three of those four have no reader that a venue would
+    ever want to set deliberately, so requiring them meant requiring an
+    operator to invent numbers for settings they were not editing -- and to
+    keep them in sync with platform constants they cannot see."""
+
+    session_timeout_minutes: int | None = Field(default=None, ge=1)
+    max_concurrent_sessions_per_guest: int | None = Field(default=None, ge=1)
+    termination_reconnect_cooldown_minutes: int | None = Field(default=None, ge=0)
+    reconnect_grace_minutes: int | None = Field(default=None, ge=0)
 
     model_config = ConfigDict(extra="forbid")
 
