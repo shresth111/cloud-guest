@@ -122,6 +122,15 @@ from app.domains.router.repository import RouterRepository
 from app.domains.router_provisioning.models import RouterHealthSnapshot  # noqa: F401
 from app.domains.router_provisioning.repository import RouterProvisioningRepository
 
+# GuestSession.voucher_id carries a FK to `vouchers`. SQLAlchemy resolves
+# that target by table name against its metadata, so the Voucher model has
+# to be imported for the mapper to configure at all -- without it, the
+# first create_session() call dies with "Foreign key associated with column
+# 'guest_sessions.voucher_id' could not find table 'vouchers'", which reads
+# like a missing migration and is not one. Same reason every other model
+# above is imported for its side effect.
+from app.domains.voucher.models import Voucher  # noqa: F401
+
 # Reused, not reimplemented -- the exact same default-system-template helper
 # scripts/seed.py already ships (see its module docstring for why a fresh
 # deployment's location/router provisioning breaks without it).
