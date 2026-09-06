@@ -97,7 +97,10 @@ async def _main() -> None:
         # this router was enrolled some other way, and the push has no way in
         # -- which is exactly the state the shared password used to hide.
         if not r.api_credentials_encrypted:
-            _skip(name, "no stored credential -- re-run the setup script for this router")
+            _skip(
+                name,
+                "no stored credential -- re-run the setup script for this router",
+            )
             continue
 
         try:
