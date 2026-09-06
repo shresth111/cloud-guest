@@ -861,7 +861,11 @@ class MacAuthorizationLookupProtocol(Protocol):
     ``policy_lookup``'s absent-hook fallback -- never a crash."""
 
     async def is_mac_authorized(
-        self, mac_address: str, *, organization_id: uuid.UUID
+        self,
+        mac_address: str,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
     ) -> bool: ...
 
 
@@ -1388,6 +1392,13 @@ class GuestService:
         self.queue_assignment_hook = queue_assignment_hook
         self.queue_assignment_dispatcher = queue_assignment_dispatcher
         self.policy_lookup = policy_lookup
+        # Request-scoped memo for _resolve_session_policy_rules -- see its
+        # own docstring. GuestService is constructed per request by
+        # dependencies.get_guest_service, so this never outlives one login.
+        self._session_policy_cache: dict[
+            tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None],
+            dict[str, Any],
+        ] = {}
         self.mac_authorization_hook = mac_authorization_hook
         self.team_quota_hook = team_quota_hook
         self.redis = redis
@@ -1622,7 +1633,11 @@ class GuestService:
             # before OTP verification below, not after, so a guest already
             # at the limit never spends a real (rate-limited, one-time) OTP
             # attempt on a login that was always going to be rejected.
-            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_concurrent_session_limit(
+                existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
             # Same "brand-new guest trivially holds zero devices" skip --
             # see _enforce_device_limit's own docstring. Its return value
             # is threaded into _maybe_get_or_create_device below as
@@ -1637,7 +1652,9 @@ class GuestService:
             )
             # Same skip -- see _enforce_fup_quota's own docstring.
             await self._enforce_fup_quota(
-                guest_id=existing_guest.id, organization_id=resolved_org_id
+                guest_id=existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -1768,7 +1785,11 @@ class GuestService:
             # below, not after, so a guest already at the limit never
             # spends a real (single-use) voucher on a login that was always
             # going to be rejected.
-            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_concurrent_session_limit(
+                existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
             known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=device_mac,
@@ -1776,7 +1797,9 @@ class GuestService:
                 location_id=location_id,
             )
             await self._enforce_fup_quota(
-                guest_id=existing_guest.id, organization_id=resolved_org_id
+                guest_id=existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -1939,7 +1962,11 @@ class GuestService:
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
-            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_concurrent_session_limit(
+                existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
             known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=device_mac,
@@ -1947,7 +1974,9 @@ class GuestService:
                 location_id=location_id,
             )
             await self._enforce_fup_quota(
-                guest_id=existing_guest.id, organization_id=resolved_org_id
+                guest_id=existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -2184,7 +2213,11 @@ class GuestService:
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
-            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_concurrent_session_limit(
+                existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
             known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=device_mac,
@@ -2192,7 +2225,9 @@ class GuestService:
                 location_id=location_id,
             )
             await self._enforce_fup_quota(
-                guest_id=existing_guest.id, organization_id=resolved_org_id
+                guest_id=existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -2371,11 +2406,18 @@ class GuestService:
             organization_id=organization_id, location_id=location_id
         )
         resolved_org_id = resolved.config.organization_id
+        # Open Hours applies to this path too, even though the enabled-method
+        # check above it deliberately does not -- see _require_venue_open.
+        self._require_venue_open(resolved.config)
 
         if self.mac_authorization_hook is None:
             raise MacAddressNotAuthorizedError(normalized_mac)
+        # location_id, not just the organization: a trust entry that names a
+        # location applies only there. See is_mac_authorized's own docstring.
         authorized = await self.mac_authorization_hook.is_mac_authorized(
-            normalized_mac, organization_id=resolved_org_id
+            normalized_mac,
+            organization_id=resolved_org_id,
+            location_id=location_id,
         )
         if not authorized:
             raise MacAddressNotAuthorizedError(normalized_mac)
@@ -2393,7 +2435,11 @@ class GuestService:
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
-            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_concurrent_session_limit(
+                existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
             known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=normalized_mac,
@@ -2401,7 +2447,9 @@ class GuestService:
                 location_id=location_id,
             )
             await self._enforce_fup_quota(
-                guest_id=existing_guest.id, organization_id=resolved_org_id
+                guest_id=existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -3530,27 +3578,43 @@ class GuestService:
         if not enabled_map[auth_method]:
             raise GuestAuthMethodNotEnabledError(auth_method.value)
 
-        # Open Hours, enforced rather than merely reported.
-        #
-        # This is the one chokepoint every authenticated login method already
-        # passes through, and it has the resolved portal config in hand, so
-        # gating here covers OTP (SMS/email/WhatsApp), voucher, password and
-        # PIN in one place instead of four -- and a login method added later
-        # is covered by construction rather than by remembering.
-        #
-        # `is_open_now` is deliberately forgiving: business hours disabled
-        # means always open, and a malformed stored timezone degrades to
-        # "open" rather than raising (see its own docstring). So the failure
-        # direction here is always "let the guest online", never "lock a venue
-        # out of its own WiFi because a row is bad".
+        self._require_venue_open(config)
+
+        return resolved
+
+    def _require_venue_open(self, config) -> None:
+        """Open Hours, enforced rather than merely reported. Raises
+        ``VenueClosedError`` when this location's own configured business
+        hours say it is closed right now.
+
+        Deliberately its own helper rather than inline in
+        ``_require_method_enabled``. Open Hours arrived bolted onto that
+        method because it was "the one chokepoint every authenticated login
+        method passes through" -- but it is not: ``login_via_mac_whitelist``
+        skips ``_require_method_enabled`` on purpose (a whitelist entry's mere
+        existence is its own per-device enable signal -- see that method's own
+        docstring), and so it silently inherited an exemption from Open Hours
+        that nobody chose. That path is live: ``RadiusService.authorize`` falls
+        through to ``login_via_mac_whitelist`` to originate a session at RADIUS
+        authorize time, so a whitelisted device connecting to a closed venue got
+        a real session and a real Access-Accept.
+
+        Splitting the two checks apart lets the MAC path keep the exemption it
+        actually wants (the enabled-method booleans, which do not describe it)
+        while losing the one it never asked for. "Whether this venue is open"
+        is a property of the venue, not of how a guest proves who they are.
+
+        ``is_open_now`` is deliberately forgiving: business hours disabled
+        means always open, and a malformed stored timezone degrades to "open"
+        rather than raising (see its own docstring). So the failure direction
+        here is always "let the guest online", never "lock a venue out of its
+        own WiFi because a row is bad"."""
         if not is_open_now(
             enabled=config.business_hours_enabled,
             timezone=config.business_hours_timezone,
             schedule=config.business_hours_schedule,
         ):
             raise VenueClosedError(config.business_hours_closed_message)
-
-        return resolved
 
     async def _get_eligible_router(self, router_id: uuid.UUID) -> Router:
         router = await self.router_lookup.get_router(router_id)
@@ -3602,27 +3666,57 @@ class GuestService:
         if not decision.allowed:
             raise GuestAccessDeniedError(decision.reason)
 
-    async def _enforce_concurrent_session_limit(self, guest_id: uuid.UUID) -> None:
+    async def _enforce_concurrent_session_limit(
+        self,
+        guest_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
+    ) -> None:
         """Guest Session Engine (Phase 1): raises
         ``ConcurrentSessionLimitExceededError`` if ``guest_id`` already holds
-        ``constants.DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` (or more)
-        ``ACTIVE`` sessions. Called from ``login_via_otp``/
-        ``login_via_voucher`` after the guest identity is resolved but
-        before a new ``GuestSession`` row is created -- mirrors
+        this location's resolved maximum (or more) ``ACTIVE`` sessions.
+        Called from every login method after the guest identity is resolved
+        but before a new ``GuestSession`` row is created -- mirrors
         ``_reject_if_blocked``'s placement (reject before any further
         side effect). Deliberately **not** called from ``reconnect``: that
         method is already idempotent against the guest's own existing
         ``ACTIVE`` session (see its docstring) and only ever derives a new
         row when the guest currently holds zero active sessions, so it can
-        never itself push a guest over the limit."""
+        never itself push a guest over the limit.
+
+        The limit comes from ``PolicyType.SESSION``'s own
+        ``max_concurrent_sessions_per_guest``, resolved for this exact
+        ``organization_id``/``location_id`` via
+        ``_resolve_session_policy_rules`` -- the same lookup, same policy
+        type, and same resolved ``rules`` dict
+        ``_resolve_session_timeout_minutes`` already reads
+        ``session_timeout_minutes`` out of. Until now only the timeout half
+        was wired: a venue could publish a SESSION policy raising the
+        concurrent-session allowance, see it resolve, and still have every
+        login counted against the platform-wide
+        ``constants.DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` (3),
+        because this method never asked. That constant remains the fallback,
+        so a venue with no SESSION policy assigned behaves exactly as before.
+
+        ``organization_id``/``location_id`` default to ``None`` so a caller
+        with neither (and any test constructed before this was resolvable)
+        still gets the platform default rather than a signature error."""
         active_count = await self.repository.count_active_sessions_for_guest(guest_id)
+        rules = await self._resolve_session_policy_rules(
+            organization_id=organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+        )
+        limit = rules.get(
+            "max_concurrent_sessions_per_guest",
+            DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+        )
         if is_concurrent_session_limit_reached(
             active_count=active_count,
-            limit=DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+            limit=limit,
         ):
-            raise ConcurrentSessionLimitExceededError(
-                guest_id=guest_id, limit=DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
-            )
+            raise ConcurrentSessionLimitExceededError(guest_id=guest_id, limit=limit)
 
     async def _resolve_device_limit(
         self,
@@ -3637,15 +3731,36 @@ class GuestService:
         otherwise (or if the resolved rules omit the field, e.g. a
         ``GenericPolicyRules``-shaped override). ``guest_id``, when given,
         additionally surfaces a Group Policies "Map users" override for
-        this exact guest ahead of the location/organization default."""
+        this exact guest ahead of the location/organization default.
+
+        A failing policy lookup falls back rather than propagating, for the
+        reason ``_resolve_session_timeout_minutes`` states at length: this
+        resolver sits on the login path (``_enforce_device_limit``, called
+        by every login method), so the failure mode has to be "the default
+        device limit" and not "no WiFi". ``resolve_effective_policy`` is a
+        real database round trip that also validates the location against
+        the resolving organization, so it has more than one way to raise;
+        before this, any of them turned into a 500 on a guest login."""
         if self.policy_lookup is None:
             return DEFAULT_MAX_DEVICES_PER_GUEST
-        resolved = await self.policy_lookup.resolve_effective_policy(
-            policy_type=PolicyType.DEVICE,
-            organization_id=organization_id,
-            location_id=location_id,
-            guest_id=guest_id,
-        )
+        try:
+            resolved = await self.policy_lookup.resolve_effective_policy(
+                policy_type=PolicyType.DEVICE,
+                organization_id=organization_id,
+                location_id=location_id,
+                guest_id=guest_id,
+            )
+        except Exception:
+            logger.warning(
+                "device_policy_lookup_failed_using_default",
+                extra={
+                    "organization_id": str(organization_id),
+                    "location_id": str(location_id),
+                    "default_limit": DEFAULT_MAX_DEVICES_PER_GUEST,
+                },
+                exc_info=True,
+            )
+            return DEFAULT_MAX_DEVICES_PER_GUEST
         return resolved.rules.get(
             "max_devices_per_guest", DEFAULT_MAX_DEVICES_PER_GUEST
         )
@@ -3684,8 +3799,52 @@ class GuestService:
         online. This resolver sits on the login path, so the failure mode has
         to be "the default session length" and not "no WiFi".
         """
+        rules = await self._resolve_session_policy_rules(
+            organization_id=organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+        )
+        return rules.get("session_timeout_minutes", DEFAULT_SESSION_TIMEOUT_MINUTES)
+
+    async def _resolve_session_policy_rules(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
+        """One ``PolicyType.SESSION`` lookup, shared by every field that
+        policy type carries, so each new field does not re-copy the
+        ``policy_lookup is None`` and never-raise fallbacks (and so a
+        future one cannot quietly omit them -- which is exactly how
+        ``max_concurrent_sessions_per_guest`` came to be read from a
+        platform constant while ``session_timeout_minutes``, its neighbour
+        in the same resolved ``rules`` dict, was read from the policy).
+
+        Returns ``{}`` -- never raises, never ``None`` -- when no policy
+        engine is wired or the lookup itself fails, leaving every caller
+        to apply its own platform-constant default. See
+        ``_resolve_session_timeout_minutes`` for why "the default" and
+        never "no WiFi" is the only acceptable failure mode on a path
+        every guest login runs through.
+
+        Memoized for the life of this ``GuestService`` instance, which
+        ``dependencies.get_guest_service`` builds per request. A single login
+        reads this policy at two different moments -- the concurrent-session
+        check before OTP verification, and the session length after it -- and
+        ``resolve_effective_policy`` is several queries (location validation,
+        candidate assignments, policy, version). Without the memo, wiring the
+        second reader doubled that cost on the hottest path in the product,
+        for a value that cannot meaningfully change mid-login. A failed lookup
+        is deliberately *not* cached: it returns ``{}`` without storing it, so
+        a transient policy-service blip degrades one call rather than pinning
+        the whole login to defaults."""
         if self.policy_lookup is None:
-            return DEFAULT_SESSION_TIMEOUT_MINUTES
+            return {}
+        cache_key = (organization_id, location_id, guest_id)
+        cached = self._session_policy_cache.get(cache_key)
+        if cached is not None:
+            return cached
         try:
             resolved = await self.policy_lookup.resolve_effective_policy(
                 policy_type=PolicyType.SESSION,
@@ -3699,14 +3858,21 @@ class GuestService:
                 extra={
                     "organization_id": str(organization_id),
                     "location_id": str(location_id),
-                    "default_minutes": DEFAULT_SESSION_TIMEOUT_MINUTES,
                 },
                 exc_info=True,
             )
-            return DEFAULT_SESSION_TIMEOUT_MINUTES
-        return resolved.rules.get(
-            "session_timeout_minutes", DEFAULT_SESSION_TIMEOUT_MINUTES
-        )
+            return {}
+        # Drop null-valued keys so a caller's own ``.get(key, DEFAULT)`` is
+        # correct for both an omitted field and an explicit ``null``.
+        # ``SessionPolicyRules``' fields are all optional, and
+        # ``PolicyService`` persists ``model_dump()`` -- so a policy that sets
+        # only a session timeout is stored with the other three keys *present
+        # and null*. Without this, ``.get`` would find those keys, return
+        # ``None`` instead of the platform constant, and hand ``None`` to
+        # arithmetic on the login path.
+        rules = {k: v for k, v in resolved.rules.items() if v is not None}
+        self._session_policy_cache[cache_key] = rules
+        return rules
 
     async def _enforce_device_limit(
         self,
@@ -3753,12 +3919,16 @@ class GuestService:
         return existing_device
 
     async def _enforce_fup_quota(
-        self, *, guest_id: uuid.UUID, organization_id: uuid.UUID
+        self,
+        *,
+        guest_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
     ) -> None:
         """Guest Session Engine (Phase 1): raises
         ``FairUsagePolicyExceededError`` if ``guest_id`` already meets or
         exceeds a ``PolicyType.FUP`` daily/weekly/monthly data or time cap
-        resolved for ``organization_id``. Unlike
+        resolved for ``organization_id``/``location_id``. Unlike
         ``_enforce_device_limit``/``_enforce_concurrent_session_limit``,
         there is no platform-wide fallback: a no-op entirely when no
         ``policy_lookup`` hook is wired, and (once resolved) a no-op for
@@ -3775,6 +3945,19 @@ class GuestService:
         its own call site so that every login path picks it up from the one
         place they all already go through, and so it is checked before OTP or
         voucher verification like every other rejection on this path.
+
+        ``location_id`` is passed straight into the resolution. It used to be
+        hardcoded ``None`` here, and ``repository.list_candidate_assignments``
+        only adds its LOCATION-scope predicate when a real ``location_id``
+        arrives -- so a ``PolicyAssignment`` with ``scope_type=location`` on an
+        FUP policy was never a resolution candidate. A venue could create one,
+        see it listed and active, and have it enforce nothing, with no error
+        anywhere. Every sibling resolver on this path (``_resolve_device_limit``,
+        ``_resolve_session_policy_rules``, and ``queue_management``'s own
+        BANDWIDTH resolution) already passed the real location; FUP was the
+        one that did not. Organization- and GLOBAL-scoped assignments resolved
+        correctly throughout and are unaffected -- a location-scoped one simply
+        now outranks them, which is the whole point of the scope.
         """
         if self.team_quota_hook is not None and await (
             self.team_quota_hook.is_over_shared_quota(guest_id)
@@ -3785,7 +3968,7 @@ class GuestService:
         resolved = await self.policy_lookup.resolve_effective_policy(
             policy_type=PolicyType.FUP,
             organization_id=organization_id,
-            location_id=None,
+            location_id=location_id,
             guest_id=guest_id,
         )
         rules = resolved.rules

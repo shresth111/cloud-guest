@@ -409,13 +409,33 @@ class MacAuthorizationService:
         ]
 
     async def is_mac_authorized(
-        self, mac_address: str, *, organization_id: uuid.UUID
+        self,
+        mac_address: str,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
     ) -> bool:
         """Whether ``mac_address`` currently has a valid (enabled,
-        non-expired) authorization entry for ``organization_id`` -- see
-        module docstring for this method's own "not yet wired into guest
-        login" scope note. A malformed ``mac_address`` is never
-        authorized (returns ``False``, never raises)."""
+        non-expired) authorization entry that applies at ``location_id``
+        within ``organization_id``. A malformed ``mac_address`` is never
+        authorized (returns ``False``, never raises).
+
+        ``location_id`` is the location the device is actually trying to
+        connect at -- in practice the connecting router's own
+        ``location_id``. An entry with a ``NULL`` ``location_id`` is
+        organization-wide and applies everywhere; an entry that names a
+        location applies only there. That is exactly the predicate
+        ``list_active_entries_for_router`` a few lines above has always
+        used to decide which entries a given router should be told about.
+
+        This method did not apply it, and the two therefore disagreed: the
+        column was stored, the dashboard sent it, the router-facing list
+        honoured it, and the login-time check ignored it. A hotel chain
+        that trusted a lobby TV at one property had silently trusted that
+        MAC at every property in the organization. Passing no
+        ``location_id`` keeps the old organization-wide behaviour, so a
+        caller that genuinely has no location in hand is unchanged.
+        """
         try:
             normalized_mac = normalize_mac_address(mac_address)
         except MacAuthorizationError:
@@ -424,6 +444,12 @@ class MacAuthorizationService:
             organization_id, normalized_mac
         )
         if entry is None:
+            return False
+        if (
+            location_id is not None
+            and entry.location_id is not None
+            and entry.location_id != location_id
+        ):
             return False
         return is_currently_valid(
             is_enabled=entry.is_enabled,

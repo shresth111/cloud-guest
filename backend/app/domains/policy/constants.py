@@ -182,7 +182,19 @@ PLATFORM_DEFAULT_RULES: dict[PolicyType, dict[str, Any]] = {
         # Mirrors app.domains.guest.constants
         # .DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST -- that constant's own
         # docstring explicitly names this module as its intended successor.
-        "max_concurrent_sessions_per_guest": 3,
+        #
+        # Was 3, and had silently drifted: the guest-side constant was raised
+        # to 20 after a real launch incident (the same guest identifier
+        # logging in repeatedly hit the cap after 3 attempts and then read as
+        # "the WiFi is broken" -- see that constant's own comment), and this
+        # hand-maintained mirror was not updated with it. Because
+        # ``resolve_effective_policy`` returns these platform defaults as a
+        # real ``rules`` dict whenever no policy is assigned -- which is every
+        # venue in production today -- any reader wired to this key would have
+        # read 3 rather than 20 and reintroduced that incident on the spot,
+        # without a single policy existing anywhere. ``tests/unit/test_policy
+        # .py`` now pins the two together so this cannot drift again quietly.
+        "max_concurrent_sessions_per_guest": 20,
         # Mirrors app.domains.guest.constants
         # .TERMINATION_RECONNECT_COOLDOWN_MINUTES.
         "termination_reconnect_cooldown_minutes": 60,

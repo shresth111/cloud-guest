@@ -640,10 +640,25 @@ class FakeMacAuthorizationHook:
     calls: list[dict[str, object]] = field(default_factory=list)
 
     async def is_mac_authorized(
-        self, mac_address: str, *, organization_id: uuid.UUID
+        self,
+        mac_address: str,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
     ) -> bool:
+        # `location_id` is recorded, not filtered on. This double answers
+        # "is this MAC in the set", and the location predicate it stands in
+        # for is the real service's own -- reimplementing it here would mean
+        # the tests pass against a rule this fake invented rather than the
+        # one `MacAuthorizationService.is_mac_authorized` applies. What the
+        # tests need from the fake is that the caller PASSED a location at
+        # all, which `calls` now carries.
         self.calls.append(
-            {"mac_address": mac_address, "organization_id": organization_id}
+            {
+                "mac_address": mac_address,
+                "organization_id": organization_id,
+                "location_id": location_id,
+            }
         )
         return mac_address in self.whitelisted
 

@@ -29,9 +29,15 @@ from types import SimpleNamespace
 import pytest
 
 from app.domains.captive_portal.validators import is_open_now
-from app.domains.guest.constants import DEFAULT_SESSION_TIMEOUT_MINUTES
+from app.domains.guest.constants import (
+    DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+    DEFAULT_MAX_DEVICES_PER_GUEST,
+    DEFAULT_SESSION_TIMEOUT_MINUTES,
+)
 from app.domains.guest.exceptions import (
+    ConcurrentSessionLimitExceededError,
     GuestTeamSharedQuotaExceededError,
+    MacAddressNotAuthorizedError,
     VenueClosedError,
 )
 from app.domains.guest.service import GuestService
@@ -75,6 +81,7 @@ def _portal_config(
     closed_message: str | None = None,
 ):
     return SimpleNamespace(
+        organization_id=uuid.uuid4(),
         otp_sms_enabled=True,
         otp_email_enabled=True,
         otp_whatsapp_enabled=True,
@@ -414,3 +421,435 @@ class TestSharedTeamQuotaIsEnforced:
         await service._enforce_fup_quota(
             guest_id=uuid.uuid4(), organization_id=uuid.uuid4()
         )
+
+
+# ---------------------------------------------------------------------------
+# The other half of the same SESSION policy: concurrent sessions per guest
+# ---------------------------------------------------------------------------
+
+
+class _FakeSessionCountRepo:
+    """Only the one method ``_enforce_concurrent_session_limit`` calls."""
+
+    def __init__(self, active_count: int) -> None:
+        self._active_count = active_count
+
+    async def count_active_sessions_for_guest(self, guest_id):
+        return self._active_count
+
+
+def _guest_service_with_sessions(active_count: int, **kwargs) -> GuestService:
+    return GuestService(
+        _FakeSessionCountRepo(active_count),
+        None,  # otp_service
+        None,  # voucher_service
+        _FakePortalService(_portal_config()),
+        None,  # router_lookup
+        **kwargs,
+    )
+
+
+class TestConcurrentSessionLimitIsResolvedPerLocation:
+    """``PolicyType.SESSION`` carries four fields. Wiring the type in
+    resolved ``session_timeout_minutes`` and left the other three reading
+    platform constants -- so a venue could publish a SESSION policy, watch
+    it resolve, and still have its concurrent-session allowance ignored."""
+
+    async def test_a_location_policy_raises_the_allowance(self) -> None:
+        """Three active sessions is the platform limit. A venue that
+        published a policy allowing five must get a fourth login."""
+        lookup = _FakePolicyLookup({"max_concurrent_sessions_per_guest": 5})
+        service = _guest_service_with_sessions(3, policy_lookup=lookup)
+
+        await service._enforce_concurrent_session_limit(
+            uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+        )
+
+    async def test_a_location_policy_lowers_the_allowance(self) -> None:
+        lookup = _FakePolicyLookup({"max_concurrent_sessions_per_guest": 2})
+        service = _guest_service_with_sessions(2, policy_lookup=lookup)
+
+        with pytest.raises(ConcurrentSessionLimitExceededError):
+            await service._enforce_concurrent_session_limit(
+                uuid.uuid4(),
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+            )
+
+    async def test_the_error_reports_the_resolved_limit(self) -> None:
+        """Not the platform constant -- the guest is told the number that
+        actually applied to them."""
+        lookup = _FakePolicyLookup({"max_concurrent_sessions_per_guest": 2})
+        service = _guest_service_with_sessions(2, policy_lookup=lookup)
+
+        with pytest.raises(ConcurrentSessionLimitExceededError) as excinfo:
+            await service._enforce_concurrent_session_limit(
+                uuid.uuid4(),
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+            )
+
+        assert "2" in str(excinfo.value)
+
+    async def test_it_asks_for_the_session_policy_type_and_location(self) -> None:
+        lookup = _FakePolicyLookup({"max_concurrent_sessions_per_guest": 5})
+        service = _guest_service_with_sessions(0, policy_lookup=lookup)
+        location_id = uuid.uuid4()
+
+        await service._enforce_concurrent_session_limit(
+            uuid.uuid4(), organization_id=uuid.uuid4(), location_id=location_id
+        )
+
+        assert lookup.calls[0]["policy_type"] == PolicyType.SESSION
+        assert lookup.calls[0]["location_id"] == location_id
+
+    async def test_no_policy_hook_falls_back_to_todays_behaviour(self) -> None:
+        service = _guest_service_with_sessions(
+            DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST, policy_lookup=None
+        )
+
+        with pytest.raises(ConcurrentSessionLimitExceededError):
+            await service._enforce_concurrent_session_limit(
+                uuid.uuid4(),
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+            )
+
+    async def test_a_policy_without_the_field_falls_back(self) -> None:
+        service = _guest_service_with_sessions(
+            DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+            policy_lookup=_FakePolicyLookup({"session_timeout_minutes": 60}),
+        )
+
+        with pytest.raises(ConcurrentSessionLimitExceededError):
+            await service._enforce_concurrent_session_limit(
+                uuid.uuid4(),
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+            )
+
+    async def test_an_unassigned_venue_keeps_the_real_platform_limit(self) -> None:
+        """The production case, and the one that nearly shipped a regression.
+
+        ``resolve_effective_policy`` does not return "nothing" when no policy
+        is assigned -- it returns ``PLATFORM_DEFAULT_RULES`` as a real rules
+        dict. So this resolver's ``.get(..., DEFAULT)`` fallback never fires
+        for an unassigned venue; the platform-default mirror is what it reads.
+        That mirror had drifted to 3 while the guest constant was raised to 20
+        after a launch incident, so wiring this key naively would have dropped
+        every venue's cap from 20 to 3 without a single policy existing."""
+        from app.domains.policy.constants import PLATFORM_DEFAULT_RULES
+
+        lookup = _FakePolicyLookup(
+            dict(PLATFORM_DEFAULT_RULES[PolicyType.SESSION])
+        )
+        service = _guest_service_with_sessions(
+            DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST - 1, policy_lookup=lookup
+        )
+
+        await service._enforce_concurrent_session_limit(
+            uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+        )
+
+    async def test_a_failing_policy_service_never_blocks_a_login(self) -> None:
+        """Same contract the session-length resolver keeps: the policy
+        service being unreachable means "the default allowance", never a
+        500 on a guest login."""
+        service = _guest_service_with_sessions(
+            0,
+            policy_lookup=_FakePolicyLookup({}, raises=RuntimeError("unreachable")),
+        )
+
+        await service._enforce_concurrent_session_limit(
+            uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+        )
+
+
+class TestDeviceLimitSurvivesAFailingPolicyService:
+    """``_resolve_device_limit`` sits on the same login path as
+    ``_resolve_session_timeout_minutes`` but had none of its never-raise
+    guard: any failure inside ``resolve_effective_policy`` -- including the
+    real cross-organization location check it performs -- became a 500 on a
+    guest login rather than the default device limit."""
+
+    async def test_a_failing_policy_service_falls_back(self) -> None:
+        service = _guest_service(
+            _portal_config(),
+            policy_lookup=_FakePolicyLookup({}, raises=RuntimeError("unreachable")),
+        )
+
+        resolved = await service._resolve_device_limit(
+            organization_id=uuid.uuid4(), location_id=uuid.uuid4()
+        )
+
+        assert resolved == DEFAULT_MAX_DEVICES_PER_GUEST
+
+    async def test_a_working_policy_service_still_wins(self) -> None:
+        service = _guest_service(
+            _portal_config(),
+            policy_lookup=_FakePolicyLookup({"max_devices_per_guest": 9}),
+        )
+
+        resolved = await service._resolve_device_limit(
+            organization_id=uuid.uuid4(), location_id=uuid.uuid4()
+        )
+
+        assert resolved == 9
+
+
+# ---------------------------------------------------------------------------
+# Open Hours: the fifth login method, and the one that skips the chokepoint
+# ---------------------------------------------------------------------------
+
+
+class TestOpenHoursCoversTheMacWhitelistPath:
+    """``login_via_mac_whitelist`` deliberately skips
+    ``_require_method_enabled`` -- a whitelist entry is its own per-device
+    enable signal. Open Hours was bolted onto that same helper, so this path
+    silently inherited an exemption nobody chose. It is live: RADIUS authorize
+    falls through to this method to originate a session."""
+
+    async def test_a_closed_venue_rejects_a_whitelisted_device(self) -> None:
+        service = _guest_service(
+            _portal_config(business_hours_enabled=True, schedule=_ALWAYS_CLOSED),
+            mac_authorization_hook=None,
+        )
+
+        with pytest.raises(VenueClosedError):
+            await service.login_via_mac_whitelist(
+                mac_address="AA:BB:CC:DD:EE:FF",
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+                router_id=uuid.uuid4(),
+            )
+
+    async def test_the_venue_check_precedes_the_whitelist_check(self) -> None:
+        """Closed must read as "closed", not as "your device is not
+        whitelisted" -- the two have very different operator responses."""
+        service = _guest_service(
+            _portal_config(business_hours_enabled=True, schedule=_ALWAYS_CLOSED),
+            mac_authorization_hook=None,
+        )
+
+        with pytest.raises(VenueClosedError):
+            await service.login_via_mac_whitelist(
+                mac_address="AA:BB:CC:DD:EE:FF",
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+                router_id=uuid.uuid4(),
+            )
+
+    async def test_an_open_venue_still_reaches_the_whitelist_check(self) -> None:
+        """The gate must not swallow the ordinary path: with the venue open,
+        an unwhitelisted MAC still fails for its own real reason."""
+        service = _guest_service(
+            _portal_config(business_hours_enabled=True, schedule=_ALWAYS_OPEN),
+            mac_authorization_hook=None,
+        )
+
+        with pytest.raises(MacAddressNotAuthorizedError):
+            await service.login_via_mac_whitelist(
+                mac_address="AA:BB:CC:DD:EE:FF",
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+                router_id=uuid.uuid4(),
+            )
+
+    async def test_business_hours_disabled_is_always_open(self) -> None:
+        service = _guest_service(
+            _portal_config(business_hours_enabled=False, schedule=_ALWAYS_CLOSED),
+            mac_authorization_hook=None,
+        )
+
+        with pytest.raises(MacAddressNotAuthorizedError):
+            await service.login_via_mac_whitelist(
+                mac_address="AA:BB:CC:DD:EE:FF",
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+                router_id=uuid.uuid4(),
+            )
+
+
+# ---------------------------------------------------------------------------
+# FUP quotas were resolved with location_id hardcoded to None
+# ---------------------------------------------------------------------------
+
+
+class TestFupQuotaResolvesAtLocationScope:
+    """``list_candidate_assignments`` only adds its LOCATION-scope predicate
+    when a real ``location_id`` arrives, so a location-scoped FUP assignment
+    was never a resolution candidate -- creatable, listed, active, inert."""
+
+    async def test_the_location_reaches_the_policy_lookup(self) -> None:
+        lookup = _FakePolicyLookup({})
+        service = _guest_service(_portal_config(), policy_lookup=lookup)
+        location_id = uuid.uuid4()
+
+        await service._enforce_fup_quota(
+            guest_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            location_id=location_id,
+        )
+
+        assert lookup.calls[0]["policy_type"] == PolicyType.FUP
+        assert lookup.calls[0]["location_id"] == location_id
+
+    async def test_no_location_still_resolves_organization_scope(self) -> None:
+        """Callers without a location (and every pre-existing test) keep
+        resolving exactly as before rather than erroring."""
+        lookup = _FakePolicyLookup({})
+        service = _guest_service(_portal_config(), policy_lookup=lookup)
+
+        await service._enforce_fup_quota(
+            guest_id=uuid.uuid4(), organization_id=uuid.uuid4()
+        )
+
+        assert lookup.calls[0]["location_id"] is None
+
+
+class TestAPartialSessionPolicyIsUsable:
+    """``SessionPolicyRules`` used to require all four fields, so a venue
+    could not change only its session length. Now that they are optional,
+    ``PolicyService`` persists the omitted ones as explicit ``null`` (it
+    stores ``model_dump()``), and every reader must treat a null exactly like
+    a missing key -- otherwise ``.get(key, DEFAULT)`` returns ``None`` and
+    hands it to arithmetic on the login path."""
+
+    async def test_a_null_field_falls_back_to_the_platform_constant(self) -> None:
+        lookup = _FakePolicyLookup(
+            {
+                "session_timeout_minutes": 60,
+                "max_concurrent_sessions_per_guest": None,
+                "termination_reconnect_cooldown_minutes": None,
+                "reconnect_grace_minutes": None,
+            }
+        )
+        service = _guest_service_with_sessions(
+            DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST - 1, policy_lookup=lookup
+        )
+
+        # The null concurrent-session field must not become the limit.
+        await service._enforce_concurrent_session_limit(
+            uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+        )
+
+    async def test_the_field_that_was_set_still_applies(self) -> None:
+        service = _guest_service(
+            _portal_config(),
+            policy_lookup=_FakePolicyLookup(
+                {
+                    "session_timeout_minutes": 60,
+                    "max_concurrent_sessions_per_guest": None,
+                    "termination_reconnect_cooldown_minutes": None,
+                    "reconnect_grace_minutes": None,
+                }
+            ),
+        )
+
+        resolved = await service._resolve_session_timeout_minutes(
+            organization_id=uuid.uuid4(), location_id=uuid.uuid4()
+        )
+
+        assert resolved == 60
+
+    async def test_an_all_null_policy_behaves_like_no_policy(self) -> None:
+        service = _guest_service(
+            _portal_config(),
+            policy_lookup=_FakePolicyLookup({"session_timeout_minutes": None}),
+        )
+
+        resolved = await service._resolve_session_timeout_minutes(
+            organization_id=uuid.uuid4(), location_id=uuid.uuid4()
+        )
+
+        assert resolved == DEFAULT_SESSION_TIMEOUT_MINUTES
+
+
+class TestSessionPolicyRulesAcceptsAPartialPayload:
+    def test_only_a_session_timeout_validates(self) -> None:
+        """The write a venue changing just its session length would make."""
+        from app.domains.policy.constants import PolicyType as _PT
+        from app.domains.policy.validators import validate_rules
+
+        stored = validate_rules(_PT.SESSION, {"session_timeout_minutes": 60})
+
+        assert stored["session_timeout_minutes"] == 60
+        assert stored["max_concurrent_sessions_per_guest"] is None
+
+
+class TestSessionPolicyIsResolvedOncePerRequest:
+    """A single login reads this policy twice -- the concurrent-session check
+    before OTP verification, and the session length after it. Without a memo,
+    wiring the second reader doubled a multi-query resolve on the hottest path
+    in the product."""
+
+    async def test_two_reads_make_one_lookup(self) -> None:
+        """Mirrors the real sequence: both reads in a login carry the same
+        guest id (the concurrent check only runs for an already-existing
+        guest, and the session-length read uses that same row)."""
+        lookup = _FakePolicyLookup({"session_timeout_minutes": 60})
+        service = _guest_service_with_sessions(0, policy_lookup=lookup)
+        org_id, location_id, guest_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+        await service._enforce_concurrent_session_limit(
+            guest_id, organization_id=org_id, location_id=location_id
+        )
+        await service._resolve_session_timeout_minutes(
+            organization_id=org_id, location_id=location_id, guest_id=guest_id
+        )
+
+        assert len(lookup.calls) == 1
+
+    async def test_a_different_guest_is_a_different_lookup(self) -> None:
+        """A GUEST-targeted assignment can override the location default, so
+        the guest id is part of the key, not incidental to it."""
+        lookup = _FakePolicyLookup({"session_timeout_minutes": 60})
+        service = _guest_service_with_sessions(0, policy_lookup=lookup)
+        org_id, location_id = uuid.uuid4(), uuid.uuid4()
+
+        await service._resolve_session_timeout_minutes(
+            organization_id=org_id, location_id=location_id, guest_id=uuid.uuid4()
+        )
+        await service._resolve_session_timeout_minutes(
+            organization_id=org_id, location_id=location_id, guest_id=uuid.uuid4()
+        )
+
+        assert len(lookup.calls) == 2
+
+    async def test_a_different_location_is_a_different_lookup(self) -> None:
+        lookup = _FakePolicyLookup({"session_timeout_minutes": 60})
+        service = _guest_service_with_sessions(0, policy_lookup=lookup)
+        org_id = uuid.uuid4()
+
+        await service._resolve_session_timeout_minutes(
+            organization_id=org_id, location_id=uuid.uuid4()
+        )
+        await service._resolve_session_timeout_minutes(
+            organization_id=org_id, location_id=uuid.uuid4()
+        )
+
+        assert len(lookup.calls) == 2
+
+    async def test_a_failed_lookup_is_not_cached(self) -> None:
+        """A transient blip must degrade one call, not pin the whole login to
+        defaults."""
+        lookup = _FakePolicyLookup({}, raises=RuntimeError("unreachable"))
+        service = _guest_service(_portal_config(), policy_lookup=lookup)
+        org_id, location_id = uuid.uuid4(), uuid.uuid4()
+
+        await service._resolve_session_timeout_minutes(
+            organization_id=org_id, location_id=location_id
+        )
+        await service._resolve_session_timeout_minutes(
+            organization_id=org_id, location_id=location_id
+        )
+
+        assert service._session_policy_cache == {}

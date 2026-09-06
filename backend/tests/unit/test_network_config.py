@@ -498,7 +498,19 @@ class TestRenderHotspotProfile:
         assert "/ip hotspot walled-garden add dst-host=example.com" in joined
         assert 'comment="Guest Hotspot"' in joined
 
-    def test_omits_unset_timeout_and_rate_limit_fields(self) -> None:
+    def test_rate_limit_is_cleared_when_only_one_half_is_unset(self) -> None:
+        """One half set still means a real rate-limit; both unset is the
+        only case that clears it."""
+        (line, *_rest) = render_hotspot_profile(
+            _make_hotspot_profile(upload_limit_kbps=None, download_limit_kbps=2048)
+        )
+        assert "rate-limit=0k/2048k" in line
+
+    def test_unset_fields_are_emitted_as_explicit_unlimited(self) -> None:
+        """``set`` only changes what it is given, so an omitted field would
+        leave whatever the device already had -- meaning a venue could raise
+        a limit but never clear one back to unlimited. Each field is always
+        emitted, using RouterOS's own "no limit" values."""
         (line,) = render_hotspot_profile(
             _make_hotspot_profile(
                 session_timeout_minutes=None,
@@ -508,9 +520,34 @@ class TestRenderHotspotProfile:
                 walled_garden_hosts=[],
             )
         )
-        assert "session-timeout=" not in line
-        assert "idle-timeout=" not in line
-        assert "rate-limit=" not in line
+        assert "session-timeout=0" in line
+        assert "idle-timeout=none" in line
+        assert 'rate-limit=""' in line
+
+    def test_an_existing_profile_is_updated_rather_than_re_added(self) -> None:
+        """A bare ``add`` cannot update an existing row, and
+        ``_idempotent_lines``' ``on-error={}`` swallows the "already have
+        such entry" failure -- so every edit after the first push was
+        silently discarded on the device."""
+        (line,) = render_hotspot_profile(
+            _make_hotspot_profile(walled_garden_hosts=[])
+        )
+        assert "/ip hotspot user profile set" in line
+        assert "/ip hotspot user profile add" in line
+        assert line.startswith(":if ([:len [/ip hotspot user profile find where ")
+        # The updated value rides in both branches, not just the add.
+        assert line.count("session-timeout=240m") == 2
+
+    def test_walled_garden_rows_are_guarded_against_duplicates(self) -> None:
+        """``/ip hotspot walled-garden`` has no uniqueness constraint, so a
+        bare ``add`` re-run on every push accumulated one duplicate row per
+        host per push, unbounded."""
+        lines = render_hotspot_profile(_make_hotspot_profile())
+        (garden_line,) = [ln for ln in lines if "walled-garden" in ln]
+        assert garden_line.startswith(
+            ":if ([:len [/ip hotspot walled-garden find where "
+        )
+        assert "dst-host=example.com action=allow" in garden_line
 
     def test_rate_limit_defaults_unset_half_to_zero(self) -> None:
         (line, *_rest) = render_hotspot_profile(

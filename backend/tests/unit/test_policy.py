@@ -595,7 +595,41 @@ class TestRulesValidation:
         assert version.rules["session_timeout_minutes"] == 60
         assert version.version_number == 1
 
-    async def test_missing_required_session_field_is_rejected(self) -> None:
+    async def test_a_partial_session_payload_is_accepted(self) -> None:
+        """Was ``test_missing_required_session_field_is_rejected``.
+
+        ``SessionPolicyRules``' four fields are now optional, so a venue can
+        change only its session length. Requiring all four made the type
+        unusable for its actual purpose: three of them have no reader an
+        operator would ever set deliberately, so the old contract forced them
+        to invent numbers for settings they were not editing. An omitted field
+        means "no opinion" and the reader falls back to its platform
+        constant."""
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.SESSION,
+            name="Session",
+            description=None,
+        )
+
+        version = await service.create_version(
+            policy_id=policy.id,
+            requesting_organization_id=org.id,
+            actor_user_id=None,
+            rules={"session_timeout_minutes": 60},
+        )
+
+        assert version.rules["session_timeout_minutes"] == 60
+        assert version.rules["max_concurrent_sessions_per_guest"] is None
+
+    async def test_an_unknown_session_field_is_still_rejected(self) -> None:
+        """Optional is not the same as permissive -- ``extra="forbid"`` still
+        holds, so a typo'd or invented key is still a 422 rather than a
+        silently ignored setting."""
         service, _, org_lookup, _ = _build_service()
         org = org_lookup.add()
         policy = await service.create_policy(
@@ -611,7 +645,26 @@ class TestRulesValidation:
                 policy_id=policy.id,
                 requesting_organization_id=org.id,
                 actor_user_id=None,
-                rules={"session_timeout_minutes": 60},
+                rules={"session_timeout_minutes": 60, "sesion_timeout": 30},
+            )
+
+    async def test_an_out_of_range_session_value_is_still_rejected(self) -> None:
+        service, _, org_lookup, _ = _build_service()
+        org = org_lookup.add()
+        policy = await service.create_policy(
+            actor_user_id=None,
+            requesting_organization_id=org.id,
+            organization_id=org.id,
+            policy_type=PolicyType.SESSION,
+            name="Session",
+            description=None,
+        )
+        with pytest.raises(PolicyRulesValidationError):
+            await service.create_version(
+                policy_id=policy.id,
+                requesting_organization_id=org.id,
+                actor_user_id=None,
+                rules={"session_timeout_minutes": 0},
             )
 
     async def test_negative_value_is_rejected(self) -> None:
@@ -2152,3 +2205,67 @@ class TestEveryRouteRequiresPermission:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+class TestPlatformDefaultsMirrorTheirSourceConstants:
+    """``app.domains.policy`` is a dependency-free leaf, so
+    ``PLATFORM_DEFAULT_RULES`` duplicates several ``app.domains.guest``
+    constants as literals rather than importing them -- a documented
+    trade-off that keeps the module acyclic (see ``constants.py``'s own
+    module docstring).
+
+    The cost of that trade-off is drift, and it had already happened:
+    ``DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` was raised 3 -> 20 after a
+    real launch incident and the mirror stayed at 3. That is not a dormant
+    inconsistency -- ``resolve_effective_policy`` hands these defaults back as
+    a real ``rules`` dict whenever no policy is assigned, which is every venue
+    in production, so the stale copy is what a reader actually gets.
+
+    A test may import both sides freely; only the application module is bound
+    by the leaf rule. So the mirror is pinned here instead."""
+
+    def test_session_timeout_mirrors_the_guest_constant(self) -> None:
+        from app.domains.guest.constants import DEFAULT_SESSION_TIMEOUT_MINUTES
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.SESSION]["session_timeout_minutes"]
+            == DEFAULT_SESSION_TIMEOUT_MINUTES
+        )
+
+    def test_concurrent_session_limit_mirrors_the_guest_constant(self) -> None:
+        from app.domains.guest.constants import (
+            DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+        )
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.SESSION][
+                "max_concurrent_sessions_per_guest"
+            ]
+            == DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
+        )
+
+    def test_reconnect_cooldown_mirrors_the_guest_constant(self) -> None:
+        from app.domains.guest.constants import TERMINATION_RECONNECT_COOLDOWN_MINUTES
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.SESSION][
+                "termination_reconnect_cooldown_minutes"
+            ]
+            == TERMINATION_RECONNECT_COOLDOWN_MINUTES
+        )
+
+    def test_reconnect_grace_mirrors_the_guest_constant(self) -> None:
+        from app.domains.guest.constants import RECONNECT_GRACE_MINUTES
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.SESSION]["reconnect_grace_minutes"]
+            == RECONNECT_GRACE_MINUTES
+        )
+
+    def test_device_limit_mirrors_the_guest_constant(self) -> None:
+        from app.domains.guest.constants import DEFAULT_MAX_DEVICES_PER_GUEST
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.DEVICE]["max_devices_per_guest"]
+            == DEFAULT_MAX_DEVICES_PER_GUEST
+        )

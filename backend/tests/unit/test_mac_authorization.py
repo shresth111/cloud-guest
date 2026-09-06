@@ -19,6 +19,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -425,3 +426,104 @@ class TestEveryRouteRequiresPermission:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+class TestIsMacAuthorizedRespectsLocation:
+    """A trust entry that names a location applies only there. The column was
+    stored, the dashboard sent it, and ``list_active_entries_for_router``
+    honoured it -- only the login-time check ignored it, so a device trusted
+    at one site was trusted at every site in the organization."""
+
+    @staticmethod
+    def _service(entry):
+        class _Repo:
+            async def get_entry_by_org_and_mac(self, organization_id, mac):
+                return entry
+
+        return MacAuthorizationService(_Repo())
+
+    async def test_an_entry_for_another_location_is_not_authorized(self) -> None:
+        service = self._service(
+            SimpleNamespace(
+                is_enabled=True,
+                expires_at=None,
+                location_id=uuid.uuid4(),
+            )
+        )
+
+        assert (
+            await service.is_mac_authorized(
+                "AA:BB:CC:DD:EE:FF",
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+            )
+            is False
+        )
+
+    async def test_an_entry_for_this_location_is_authorized(self) -> None:
+        location_id = uuid.uuid4()
+        service = self._service(
+            SimpleNamespace(
+                is_enabled=True, expires_at=None, location_id=location_id
+            )
+        )
+
+        assert (
+            await service.is_mac_authorized(
+                "AA:BB:CC:DD:EE:FF",
+                organization_id=uuid.uuid4(),
+                location_id=location_id,
+            )
+            is True
+        )
+
+    async def test_an_organization_wide_entry_applies_everywhere(self) -> None:
+        """``location_id IS NULL`` means organization-wide -- the same
+        reading ``list_active_entries_for_router`` gives it."""
+        service = self._service(
+            SimpleNamespace(is_enabled=True, expires_at=None, location_id=None)
+        )
+
+        assert (
+            await service.is_mac_authorized(
+                "AA:BB:CC:DD:EE:FF",
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+            )
+            is True
+        )
+
+    async def test_omitting_the_location_keeps_organization_wide_behaviour(
+        self,
+    ) -> None:
+        service = self._service(
+            SimpleNamespace(
+                is_enabled=True, expires_at=None, location_id=uuid.uuid4()
+            )
+        )
+
+        assert (
+            await service.is_mac_authorized(
+                "AA:BB:CC:DD:EE:FF", organization_id=uuid.uuid4()
+            )
+            is True
+        )
+
+    async def test_a_disabled_entry_at_the_right_location_is_still_refused(
+        self,
+    ) -> None:
+        location_id = uuid.uuid4()
+        service = self._service(
+            SimpleNamespace(
+                is_enabled=False, expires_at=None, location_id=location_id
+            )
+        )
+
+        assert (
+            await service.is_mac_authorized(
+                "AA:BB:CC:DD:EE:FF",
+                organization_id=uuid.uuid4(),
+                location_id=location_id,
+            )
+            is False
+        )
