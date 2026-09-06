@@ -65,6 +65,7 @@ import hashlib
 import ipaddress
 import logging
 import re
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 
@@ -83,6 +84,8 @@ from .contract import (
     DeviceVendor,
     DhcpPoolConfig,
     HotspotActiveSession,
+    HotspotCertificatePush,
+    HotspotCertificatePushResult,
     HotspotDisconnectResult,
     HotspotSessionControl,
     InterfaceInfo,
@@ -729,6 +732,61 @@ def _interface_counters_from_rows(
             )
         )
     return tuple(counters) or None
+
+
+# How long a hotspot-certificate push waits for the device to agree that a
+# write landed before treating it as not having landed. Six reads half a
+# second apart, i.e. up to ~2.5s -- generously more than the ``:delay 1s``
+# each of these replaces in ``renew-hotspot-certs.sh``, and still short
+# enough that a genuinely silent no-op is reported inside one push.
+_SETTLE_ATTEMPTS = 6
+_SETTLE_DELAY_SECONDS = 0.5
+
+
+def _dns_name_covered(dns_name: str | None, san_names: Sequence[str]) -> bool:
+    """Whether a certificate carrying ``san_names`` is actually valid for
+    the hostname a hotspot profile redirects guests to.
+
+    Wildcard-aware in the one way X.509 defines and no further:
+    ``*.portal.wyfyguest.com`` covers ``site42.portal.wyfyguest.com`` and
+    does **not** cover ``portal.wyfyguest.com`` or
+    ``a.b.portal.wyfyguest.com``. Getting this wrong in the permissive
+    direction would wave through a push whose only visible effect is a
+    full-screen certificate warning on every guest device -- so an empty or
+    unreadable ``dns-name`` is treated as not covered, never as "probably
+    fine".
+    """
+    if not dns_name:
+        return False
+    host = dns_name.strip().lower().rstrip(".")
+    if not host:
+        return False
+    for raw in san_names:
+        san = str(raw).strip().lower().rstrip(".")
+        if not san:
+            continue
+        if san == host:
+            return True
+        if san.startswith("*."):
+            suffix = san[1:]  # ".portal.wyfyguest.com"
+            if host.endswith(suffix) and "." not in host[: -len(suffix)]:
+                return True
+    return False
+
+
+def _login_by_tokens(value: str | None) -> frozenset[str]:
+    """A RouterOS ``login-by`` list as a set of methods.
+
+    Compared as a set, never as a string: the API accepts
+    ``"https,http-pap"`` on write and is free to answer the read in its own
+    order, so a string comparison would report every correctly-rebound
+    profile as a failed rebind.
+    """
+    if not value:
+        return frozenset()
+    return frozenset(
+        token.strip().lower() for token in str(value).split(",") if token.strip()
+    )
 
 
 def _is_truthy(value: object) -> bool:
@@ -1874,6 +1932,660 @@ class MikroTikAdapter:
             duration_seconds=duration_seconds,
             test_url=download_url,
         )
+
+    # ------------------------------------------------------------------
+    # hotspot TLS certificate
+    # ------------------------------------------------------------------
+
+    async def push_hotspot_certificate(
+        self, creds: DeviceCredentials, *, push: HotspotCertificatePush
+    ) -> HotspotCertificatePushResult:
+        """See :meth:`DeviceGatewayAdapter.push_hotspot_certificate`, and
+        :meth:`_push_hotspot_certificate_sync` for the ordering -- every
+        line of which is ported from
+        ``ops/letsencrypt-hotspot/renew-hotspot-certs.sh``'s
+        ``REMOTE_SCRIPT`` rather than re-derived.
+
+        ``creds.timeout_seconds`` covers two real HTTP downloads by the
+        device plus two imports; size it like a ``run_speed_test`` call,
+        not like a health-check read.
+        """
+        return await asyncio.to_thread(
+            self._push_hotspot_certificate_sync, creds, push
+        )
+
+    def _push_hotspot_certificate_sync(
+        self, creds: DeviceCredentials, push: HotspotCertificatePush
+    ) -> HotspotCertificatePushResult:
+        """The whole push, in one API session, in the order the 2026-08-18
+        incident settled.
+
+        ## Why this exists at all
+
+        The mechanism this replaces (``renew-hotspot-certs.sh``) moves the
+        PEMs with ``scp`` and drives the re-import over ``ssh``. Measured
+        against the live fleet on 2026-09-06: on the only reachable router,
+        ports 21/22/23/80/443/8291 all *time out* -- filtered by a firewall
+        drop, not refused -- and only 8728/8729 answer. The push could not
+        work on any router in the fleet, and the hotspot certificate
+        expires 2026-11-16. A bound-but-expired certificate is not a
+        cosmetic problem: with ``login-by=https,http-pap`` it is the
+        confirmed three-symptom failure (no login page on Windows/macOS,
+        the captive window never closing, an Android certificate warning)
+        that PR #153 exists to prevent.
+
+        ``/tool fetch`` inverts the direction -- the router pulls -- and is
+        an ordinary API command on 8728. ``_run_speed_test_sync`` in this
+        same module already drives it against real hardware today,
+        including ``dst-path`` writing to flash and a real ``/file remove``
+        cleanup; that is the proof the transport works, and this method is
+        modelled on it.
+
+        ## Ordering (ported, not re-derived)
+
+        1. **Read the profile first.** Nothing is written until the profile
+           named in ``push`` has been found and, if the caller supplied the
+           certificate's SANs, its ``dns-name`` confirmed covered. A
+           certificate that does not match the address in the guest's URL
+           bar produces the same full-screen warning the certificate effort
+           exists to remove, while looking like a success in every log.
+        2. **Fetch both PEMs before touching the certificate store.** The
+           shell script uploads first too, and the reason matters: step 3
+           removes the currently-serving intermediate, so every failure
+           mode that can be moved *before* that removal must be.
+        3. **Remove the ephemeral and stable chain artifacts of the last
+           round** (``<name>.fullchain.pem*`` and ``<name>-chain-*``).
+           RouterOS dedupes an import against an identical object already
+           in the store, so leaving last round's intermediate in place
+           makes this round's import produce no intermediate object to
+           rename -- which is why this sweep must run before the import and
+           not after it. It is also the *only* place that broad sweep runs;
+           see step 8.
+
+           Known cost, stated rather than hidden: between here and step 8
+           the router is serving its *current* leaf with no intermediate
+           beside it, i.e. the incomplete chain of the incident, for the
+           few seconds the import and rebind take. That is accepted
+           deliberately -- the alternative is a push that reliably ends
+           with no intermediate at all, which is the same failure
+           permanently -- but it does mean a push should not be run
+           against a venue mid-event for fun.
+        3b. **Wait for the device to agree, at each gate.** Steps 5 and 6b
+           poll rather than assume, replacing the two ``:delay 1s`` lines
+           in the shell script. See :meth:`_settle`.
+        4. **Import fullchain, then privkey**, and read the reply's
+           counters if RouterOS sends any. Whether it does over the API on
+           this firmware has never been confirmed against this fleet, so
+           the counters are recorded but never gated on -- step 5 is.
+        5. **Find the new leaf by name and stop here if it is absent.**
+           ``<name>.fullchain.pem_0`` is what an import of a file called
+           ``<name>.fullchain.pem`` produces for the first certificate in
+           it. If it is not there, the import silently did nothing, and the
+           router is still on its previous, working certificate: raise, and
+           leave it that way. This is the single reason nothing destructive
+           happens earlier.
+        6. **Rename + trust the new leaf under a temporary name**, so the
+           live certificate is never deleted while still referenced, then
+           **rebind the profile** -- ``ssl-certificate`` and ``login-by``
+           in ONE ``set``. Splitting them across two calls is what silently
+           no-op'd during the incident.
+        6b. **Read the profile back and stop if the rebind did not take.**
+           The shell script delays a second here and then deletes the old
+           leaf regardless. On the silent-no-op path that destroys the
+           certificate the router is still serving. Nothing is removed
+           until the device itself reports the new binding.
+        7. **Only now remove the old leaf** (nothing references it any
+           more), rename the new one onto the stable name, and re-issue the
+           bind against that stable name -- see the inline comment at step
+           7b for why the rename alone is not enough to rely on.
+        8. **Rename every remaining ``<name>.fullchain.pem*`` object onto a
+           stable ``<name>-chain-N`` name and mark it trusted.** These are
+           the intermediate(s) -- however many Let's Encrypt's current
+           chain has; do not assume exactly one. This step is the fix for
+           the incident: an earlier version deleted them via the SAME broad
+           sweep now used only in step 3, run a second time at the end,
+           which by then matched only the still-ephemerally-named
+           intermediates (the leaf had been renamed away in step 6) and
+           deleted them right after importing them. RouterOS's hotspot TLS
+           server builds the served chain from whatever trusted certificate
+           objects are present and issuer-linked (skid/akid) to the bound
+           leaf -- it needs no explicit ``ca=`` field, but it very much
+           needs the intermediate object to still exist. Losing it left the
+           router serving the leaf alone: genuinely LE-issued, verifiable
+           offline, incomplete on the wire -- which strict/embedded TLS
+           clients reject outright and desktop browsers paper over.
+        9. **Final sweep of the ephemeral pattern** -- by now everything
+           wanted has been renamed off it in steps 6 and 8, so this is a
+           true no-op safety net, not a deletion mechanism.
+        10. **``/file remove`` the two uploads**, always -- the private key
+            must not sit on the router's flash after the push. Same
+            unconditional cleanup ``_run_speed_test_sync`` does.
+        11. **Verify by reading the device back**, and raise if it does not
+            agree. See :meth:`_verify_hotspot_certificate`.
+        """
+        upload_fullchain = f"{push.cert_name}.fullchain.pem"
+        upload_privkey = f"{push.cert_name}.privkey.pem"
+        temp_leaf_name = f"{push.cert_name}-new"
+        ephemeral_prefix = f"{upload_fullchain}_"
+        chain_prefix = f"{push.cert_name}-chain-"
+        profile_dns_name: str | None = None
+        chain_names: tuple[str, ...] = ()
+        certificates_imported: int | None = None
+        private_keys_imported: int | None = None
+
+        api = self._connect_api(creds)
+        try:
+            try:
+                # 1. profile preflight -- read-only, before any write.
+                profile = self._find_hotspot_profile(api, push.hotspot_profile)
+                if profile is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: no /ip hotspot profile "
+                        f"named {push.hotspot_profile!r} on this device -- "
+                        "nothing to rebind",
+                    )
+                profile_dns_name = _safe_str(profile.get("dns-name"))
+                if push.expected_dns_names and not _dns_name_covered(
+                    profile_dns_name, push.expected_dns_names
+                ):
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: this router's portal "
+                        f"redirects to {profile_dns_name!r}, which the "
+                        "certificate being pushed does not cover "
+                        f"(SANs: {', '.join(push.expected_dns_names)}) -- "
+                        "installing it would show every guest the exact "
+                        "browser warning this push exists to remove",
+                    )
+
+                # 2. both PEMs onto flash, before anything is removed.
+                self._fetch_to_flash(
+                    api, creds, url=push.fullchain_url, dst_path=upload_fullchain
+                )
+                self._fetch_to_flash(
+                    api, creds, url=push.privkey_url, dst_path=upload_privkey
+                )
+
+                cert_menu = api.path("certificate")
+
+                # 3. last round's artifacts. See docstring for why before.
+                self._remove_certificates(
+                    cert_menu,
+                    lambda name: name.startswith(ephemeral_prefix)
+                    or name in (upload_fullchain, upload_privkey)
+                    or name.startswith(chain_prefix),
+                )
+
+                # 4. import both. Counters recorded, never gated on.
+                certificates_imported, _ = self._import_certificate(
+                    api, creds, file_name=upload_fullchain
+                )
+                _, private_keys_imported = self._import_certificate(
+                    api, creds, file_name=upload_privkey
+                )
+
+                # 5. the fail-closed gate.
+                leaf = self._settle(
+                    lambda: self._find_certificate(
+                        cert_menu, f"{upload_fullchain}_0"
+                    )
+                )
+                if leaf is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: /certificate import "
+                        f"produced no {upload_fullchain}_0 object within "
+                        f"{_SETTLE_ATTEMPTS * _SETTLE_DELAY_SECONDS:.0f}s -- "
+                        "the import did nothing, and this router is still on "
+                        "its previous certificate (which is the safe "
+                        "outcome; nothing was removed or rebound)",
+                    )
+
+                # 6. temp name + trust, then the atomic rebind.
+                cert_menu.update(
+                    **{".id": leaf[".id"], "name": temp_leaf_name, "trusted": "yes"}
+                )
+                self._rebind_hotspot_profile(
+                    api, profile[".id"], certificate=temp_leaf_name, push=push
+                )
+
+                # 6b. The SECOND fail-closed gate, and the reason step 7 is
+                # allowed to delete anything at all.
+                #
+                # The shell script this is ported from puts a `:delay 1s`
+                # here and then deletes the old leaf unconditionally. That is
+                # a gap, not a subtlety to preserve: a `set` on
+                # /ip hotspot profile that returns cleanly and changes
+                # nothing is the exact 2026-08-18 failure, and on that path
+                # the script destroys the certificate the router is at that
+                # moment still serving. Reading the profile back instead
+                # turns "old certificate gone, portal unbound, loud error"
+                # into "nothing touched, loud error".
+                if self._settle(
+                    lambda: self._profile_bound_to(
+                        api, push.hotspot_profile, temp_leaf_name
+                    )
+                ) is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: the rebind of "
+                        f"{push.hotspot_profile!r} onto {temp_leaf_name!r} "
+                        "returned cleanly and did not take -- the profile "
+                        "still reports a different ssl-certificate. This is "
+                        "the 2026-08-18 silent-no-op shape; nothing has been "
+                        "removed, so this router is still serving the "
+                        "certificate it was serving before",
+                    )
+
+                # 7. old leaf out, new leaf onto the stable name.
+                old_leaf = self._find_certificate(cert_menu, push.cert_name)
+                if old_leaf is not None:
+                    cert_menu.remove(old_leaf[".id"])
+                new_leaf = self._find_certificate(cert_menu, temp_leaf_name)
+                if new_leaf is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: the renamed leaf "
+                        f"{temp_leaf_name!r} vanished between the rebind and "
+                        "the rename -- the profile is bound to a name that "
+                        "no longer exists, needs a human",
+                    )
+                cert_menu.update(**{".id": new_leaf[".id"], "name": push.cert_name})
+
+                # 7b. Re-issue the bind against the STABLE name. The shell
+                # script this is ported from stops after the rename, which
+                # is correct only if RouterOS rewrites a profile's
+                # ssl-certificate reference when the certificate it names is
+                # renamed out from under it. It may well do exactly that --
+                # but nobody has confirmed it on this firmware, and the
+                # failure mode if it does not is a profile pointing at a
+                # name that no longer exists, i.e. a portal serving no
+                # certificate at all. Re-issuing the same atomic
+                # ssl-certificate+login-by set costs one API call and is
+                # correct under either behavior.
+                self._rebind_hotspot_profile(
+                    api, profile[".id"], certificate=push.cert_name, push=push
+                )
+
+                # 8. THE INCIDENT FIX: preserve the intermediate(s).
+                chain_names = self._preserve_chain_certificates(
+                    cert_menu,
+                    ephemeral_prefix=ephemeral_prefix,
+                    chain_prefix=chain_prefix,
+                )
+
+                # 9. no-op safety net, deliberately after step 8.
+                self._remove_certificates(
+                    cert_menu, lambda name: name.startswith(ephemeral_prefix)
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"push_hotspot_certificate: {exc}"
+                ) from exc
+            finally:
+                # 10. The private key must not be left on flash whatever
+                # happened above -- same unconditional cleanup
+                # _run_speed_test_sync does for its own temp file.
+                self._remove_files(api, creds, (upload_fullchain, upload_privkey))
+
+            # 11. Success is a read-back, not an absence of errors.
+            #
+            # Outside the try above on purpose: the cleanup in its `finally`
+            # must have run before anything reads the device back, so that a
+            # verification failure is never also a report of a private key
+            # still sitting on the router's flash.
+            try:
+                return self._verify_hotspot_certificate(
+                    api,
+                    creds,
+                    push=push,
+                    profile_dns_name=profile_dns_name,
+                    chain_cert_names=chain_names,
+                    certificates_imported=certificates_imported,
+                    private_keys_imported=private_keys_imported,
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "push_hotspot_certificate: the push ran but the device "
+                    f"could not be read back to confirm it: {exc}",
+                ) from exc
+        finally:
+            api.close()
+
+    # -- push_hotspot_certificate helpers -------------------------------
+
+    def _rebind_hotspot_profile(
+        self,
+        api,  # noqa: ANN001
+        profile_id: str,
+        *,
+        certificate: str,
+        push: HotspotCertificatePush,
+    ) -> None:
+        """One ``set`` carrying BOTH ``ssl-certificate`` and ``login-by``.
+
+        Never split these into two calls. Doing so is what silently no-op'd
+        during the 2026-08-18 incident: the commands returned cleanly, the
+        profile did not change, and the logs said the push had worked.
+        """
+        api.path("ip", "hotspot", "profile").update(
+            **{
+                ".id": profile_id,
+                "ssl-certificate": certificate,
+                "login-by": push.login_by,
+            }
+        )
+
+    def _find_hotspot_profile(self, api, name: str) -> dict | None:  # noqa: ANN001
+        for row in api.path("ip", "hotspot", "profile"):
+            if row.get("name") == name:
+                return dict(row)
+        return None
+
+    def _profile_bound_to(
+        self, api, profile_name: str, certificate: str  # noqa: ANN001
+    ) -> dict | None:
+        """The profile row, but only once it actually reports ``certificate``
+        as its ``ssl-certificate``. ``None`` while it does not."""
+        profile = self._find_hotspot_profile(api, profile_name)
+        if profile is None:
+            return None
+        if _safe_str(profile.get("ssl-certificate")) != certificate:
+            return None
+        return profile
+
+    def _settle(self, read):  # noqa: ANN001, ANN201
+        """Poll ``read`` until it returns something truthy, or give up.
+
+        This is the port of the two ``:delay 1s`` lines in
+        ``renew-hotspot-certs.sh``'s ``REMOTE_SCRIPT``. They are there because
+        neither ``/certificate import`` nor a profile ``set`` is guaranteed to
+        be visible to the very next command, and dropping them would have made
+        the first hardware run fail spuriously -- which, on a path whose whole
+        purpose is to find out whether ``/certificate import`` works over the
+        API at all, would have produced exactly the wrong answer to the one
+        question the run exists to settle.
+
+        A poll rather than a blind sleep: it returns the instant the device
+        agrees, so the fast path costs nothing, and it still fails closed
+        because a caller that gets ``None`` has read the device and found it
+        unchanged rather than merely not waited long enough.
+        """
+        for attempt in range(_SETTLE_ATTEMPTS):
+            found = read()
+            if found:
+                return found
+            if attempt + 1 < _SETTLE_ATTEMPTS:
+                time.sleep(_SETTLE_DELAY_SECONDS)
+        return None
+
+    def _find_certificate(self, cert_menu, name: str) -> dict | None:  # noqa: ANN001
+        for row in cert_menu:
+            if row.get("name") == name:
+                return dict(row)
+        return None
+
+    def _fetch_to_flash(
+        self, api, creds: DeviceCredentials, *, url: str, dst_path: str  # noqa: ANN001
+    ) -> None:
+        """Make the device pull ``url`` onto its own flash as ``dst_path``.
+
+        Same command, same reply-shape checks as
+        ``_run_speed_test_sync``'s ``/tool/fetch`` -- which is the one
+        ``/tool fetch`` call in this codebase already exercised against
+        real hardware, so its handling of ``status``/``downloaded`` is
+        copied rather than reinvented.
+
+        ``check-certificate`` is set to ``yes`` for an ``https`` URL and
+        omitted otherwise. The speed test passes ``no`` because it is
+        downloading a throwaway blob from a public host and only the byte
+        count matters; here the response *is* the fleet private key, so an
+        unverified peer is not an acceptable place to get it from. The
+        intended deployment does not need it: the URL is served on the
+        WireGuard tunnel, over plain HTTP, on an address the public
+        internet cannot route to -- the tunnel is the encryption and the
+        authentication. ``https`` remains available for a deployment that
+        can present a certificate the router will actually verify.
+        """
+        mode = "https" if url.lower().startswith("https") else "http"
+        params: dict[str, str] = {"dst-path": dst_path}
+        if mode == "https":
+            params["check-certificate"] = "yes"
+        rows = list(api("/tool/fetch", url=url, mode=mode, **params))
+        if not rows:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: no reply from /tool/fetch for "
+                f"{dst_path} -- the router could not be told to pull it",
+            )
+        status = str(rows[-1].get("status", ""))
+        if status != "finished":
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: the router could not fetch "
+                f"{dst_path} (status={status!r}). This is the step that has "
+                "never been exercised in this direction: every use of the "
+                "tunnel so far has been app-server-to-router, and this is "
+                "the router reaching back. Check that the URL's address is "
+                "one the router routes over the tunnel and that something "
+                "is listening on it.",
+            )
+
+    def _import_certificate(
+        self, api, creds: DeviceCredentials, *, file_name: str  # noqa: ANN001
+    ) -> tuple[int | None, int | None]:
+        """Run ``/certificate import`` for one uploaded file and return its
+        ``(certificates-imported, private-keys-imported)`` counters --
+        ``(None, None)`` if it reports nothing at all.
+
+        Two of RouterOS's reply counters are genuine hard failures and are
+        raised on: a ``decryption-failure`` means the PEM was encrypted and
+        the empty passphrase did not open it, and
+        ``keys-with-no-certificate`` means a private key landed with
+        nothing to pair it to. Both are silent otherwise -- the command
+        returns normally.
+
+        The *absence* of counters is deliberately NOT a failure. Whether
+        this firmware reports import results over the API (as opposed to on
+        the console) is one of the three things this work could not settle
+        without a device, so the counters are treated as a bonus and the
+        real gate is the read-back in
+        :meth:`_verify_hotspot_certificate`.
+        """
+        rows = list(
+            api("/certificate/import", **{"file-name": file_name, "passphrase": ""})
+        )
+        if not rows:
+            return None, None
+        last = rows[-1]
+        failures = _safe_int(last.get("decryption-failures"), default=0) or 0
+        if failures:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: /certificate import {file_name} "
+                f"reported {failures} decryption failure(s) -- the PEM is "
+                "encrypted and this push imports with an empty passphrase",
+            )
+        orphan_keys = _safe_int(last.get("keys-with-no-certificate"), default=0) or 0
+        if orphan_keys:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: /certificate import {file_name} "
+                f"reported {orphan_keys} key(s) with no matching certificate "
+                "-- the private key does not belong to the certificate that "
+                "was imported alongside it",
+            )
+        return (
+            _safe_int(last.get("certificates-imported"), default=None),
+            _safe_int(last.get("private-keys-imported"), default=None),
+        )
+
+    def _remove_certificates(self, cert_menu, matches) -> None:  # noqa: ANN001
+        """Remove every ``/certificate`` row whose ``name`` ``matches``.
+
+        The rows are collected before the first removal rather than removed
+        while iterating: a RouterOS menu iteration is a live ``print``, and
+        deleting out from under it is how a sweep silently skips half its
+        matches.
+        """
+        doomed = [
+            row[".id"]
+            for row in cert_menu
+            if row.get(".id") and matches(str(row.get("name") or ""))
+        ]
+        for cert_id in doomed:
+            cert_menu.remove(cert_id)
+
+    def _preserve_chain_certificates(
+        self, cert_menu, *, ephemeral_prefix: str, chain_prefix: str  # noqa: ANN001
+    ) -> tuple[str, ...]:
+        """Rename every surviving ``<name>.fullchain.pem_N`` object onto a
+        stable ``<name>-chain-N`` name and mark it trusted.
+
+        This is the 2026-08-18 fix. Read
+        :meth:`_push_hotspot_certificate_sync`'s docstring, step 8, before
+        changing anything here -- the ordering relative to the leaf rename
+        is the entire point, and it is not re-derivable from the code
+        alone.
+        """
+        survivors = [
+            dict(row)
+            for row in cert_menu
+            if str(row.get("name") or "").startswith(ephemeral_prefix)
+        ]
+        names: list[str] = []
+        for index, row in enumerate(survivors, start=1):
+            stable = f"{chain_prefix}{index}"
+            cert_menu.update(**{".id": row[".id"], "name": stable, "trusted": "yes"})
+            names.append(stable)
+        return tuple(names)
+
+    def _remove_files(
+        self, api, creds: DeviceCredentials, filenames: Sequence[str]  # noqa: ANN001
+    ) -> None:
+        wanted = set(filenames)
+        try:
+            file_menu = api.path("file")
+            doomed = [
+                row[".id"]
+                for row in file_menu
+                if row.get(".id") and row.get("name") in wanted
+            ]
+            for file_id in doomed:
+                file_menu.remove(file_id)
+        except LibRouterosError:
+            # Worth a loud warning rather than an exception: the push
+            # itself may well have succeeded, and failing it here would
+            # send an operator to re-run a rebind that already worked. But
+            # one of these files is the fleet private key sitting on a
+            # router's flash, so this must never pass silently.
+            logger.warning(
+                "mikrotik_hotspot_cert_upload_cleanup_failed",
+                extra={"host": creds.host, "filenames": sorted(wanted)},
+            )
+
+    def _verify_hotspot_certificate(
+        self,
+        api,  # noqa: ANN001
+        creds: DeviceCredentials,
+        *,
+        push: HotspotCertificatePush,
+        profile_dns_name: str | None,
+        chain_cert_names: tuple[str, ...],
+        certificates_imported: int | None,
+        private_keys_imported: int | None,
+    ) -> HotspotCertificatePushResult:
+        """Read the device back and refuse to call this a success unless it
+        agrees.
+
+        Three things are checked, and each of them is a failure this
+        codebase has actually seen:
+
+        * **the profile is bound to the stable name** -- the rebind
+          silently no-op'd once already, when ``ssl-certificate`` and
+          ``login-by`` were set in separate calls;
+        * **the leaf has its private key** -- a certificate imported
+          without one binds fine and then serves nothing, because RouterOS
+          cannot complete a handshake with it;
+        * **the leaf's issuer is present in the store** -- its ``akid``
+          matched by some other certificate's ``skid``. This is the
+          2026-08-18 incident stated as a check. It is deliberately *not*
+          "did we rename N chain objects": RouterOS dedupes an import
+          against an identical object already present, so counting objects
+          this push happened to create would fail on a router that already
+          had the intermediate under some other name, while the thing that
+          actually matters -- can the router build a complete chain -- is
+          true. An orphaned ``akid`` is what a real incomplete chain looks
+          like on the device.
+        """
+        profile = self._find_hotspot_profile(api, push.hotspot_profile)
+        bound = _safe_str((profile or {}).get("ssl-certificate"))
+        bound_login_by = _safe_str((profile or {}).get("login-by"))
+
+        certificates = [dict(row) for row in api.path("certificate")]
+        leaf = next(
+            (row for row in certificates if row.get("name") == push.cert_name), None
+        )
+        has_key = leaf is not None and _is_truthy(leaf.get("private-key"))
+        akid = _safe_str((leaf or {}).get("akid"))
+        issuer_present = bool(akid) and any(
+            _safe_str(row.get("skid")) == akid
+            for row in certificates
+            if row.get("name") != push.cert_name
+        )
+
+        result = HotspotCertificatePushResult(
+            cert_name=push.cert_name,
+            hotspot_profile=push.hotspot_profile,
+            profile_dns_name=profile_dns_name,
+            certificates_imported=certificates_imported,
+            private_keys_imported=private_keys_imported,
+            bound_ssl_certificate=bound,
+            bound_login_by=bound_login_by,
+            leaf_has_private_key=has_key,
+            leaf_invalid_after=_safe_str((leaf or {}).get("invalid-after")),
+            chain_issuer_present=issuer_present,
+            chain_cert_names=chain_cert_names,
+        )
+
+        problems: list[str] = []
+        if leaf is None:
+            problems.append(
+                f"no /certificate named {push.cert_name!r} exists after the push"
+            )
+        if bound != push.cert_name:
+            problems.append(
+                f"profile {push.hotspot_profile!r} is bound to "
+                f"{bound!r}, not {push.cert_name!r}"
+            )
+        if leaf is not None and not has_key:
+            problems.append(
+                f"{push.cert_name!r} has no private key -- it will bind and "
+                "then fail every TLS handshake"
+            )
+        if _login_by_tokens(bound_login_by) != _login_by_tokens(push.login_by):
+            problems.append(
+                f"profile {push.hotspot_profile!r} reports "
+                f"login-by={bound_login_by!r}, not {push.login_by!r} -- the "
+                "rebind did not take, and this half of it is what decides "
+                "whether the portal is served over TLS at all"
+            )
+        if leaf is not None and not issuer_present:
+            problems.append(
+                f"{push.cert_name!r} has an orphaned akid: no certificate in "
+                "the store claims to be its issuer, so the router will serve "
+                "the leaf alone. This is the 2026-08-18 incomplete-chain "
+                "failure -- strict TLS clients reject it and browsers hide it"
+            )
+        if problems:
+            raise MikroTikDeviceError(
+                creds.host,
+                "push_hotspot_certificate: the device does not agree the "
+                "push worked -- " + "; ".join(problems),
+            )
+        return result
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -4924,6 +5636,7 @@ class MikroTikAdapter:
             "get_pppoe_interface_status": True,
             "get_interface_traffic_counters": True,
             "run_speed_test": True,
+            "push_hotspot_certificate": True,
             "create_simple_queue": True,
             "update_simple_queue": True,
             "delete_simple_queue": True,
