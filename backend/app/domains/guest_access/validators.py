@@ -87,7 +87,15 @@ _DIGITS_RE = re.compile(r"^[0-9]+$")
 # it plainly is rather than bounced as malformed -- an admin who is
 # bounced for punctuation retypes it without the "+" next, which is the
 # shape this module exists to keep out of the table.
-_PHONE_NOISE_RE = re.compile(r"[\s()\-.]")
+#
+# The four non-ASCII dashes are here because of the bulk importer: a
+# hotel's list arrives as a spreadsheet, and Excel and Google Sheets both
+# autocorrect a typed hyphen into U+2010/2011/2012/2013 (and a double
+# hyphen into U+2014) without telling anyone. A row bounced for a
+# character the operator cannot see in the cell is a support ticket, and
+# at a thousand rows a request it is a hundred of them. Removing them is
+# lossless -- none of them distinguishes one number from another.
+_PHONE_NOISE_RE = re.compile(r"[\s()\-.‐‑‒–—]")
 
 # An E.164 country calling code is 1-3 digits (ITU-T E.164 §6.2.1), and a
 # national significant number worth matching on is at least 7. Together

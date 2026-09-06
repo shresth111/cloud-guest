@@ -21,6 +21,9 @@ __all__ = [
     "InvalidRuleExpiryError",
     "InvalidGuestIdentifierError",
     "CountryCodeRequiredError",
+    "RuleTypeNotImportableError",
+    "OrganizationRequiredError",
+    "InvalidImportCellError",
     "GuestAccessDeniedError",
     "BlockEnforcementMissingCredentialsError",
     "UnsupportedGuestAccessVendorError",
@@ -132,6 +135,12 @@ class CountryCodeRequiredError(GuestAccessError):
     (``app.domains.channel_partner.schemas.normalize_indian_phone``) is
     scoped to India-only, GSTIN-carrying partner records. A guess would
     recreate the same silently-inert rule one layer down.
+
+    A bulk import raises this per row rather than for the batch (see
+    ``GuestAccessService.import_guest_rules``): a hotel's PMS export is
+    exactly where a thousand bare national numbers arrive at once, and
+    "row 137 needs a country code" is the only report an operator holding
+    a spreadsheet can act on.
     """
 
     def __init__(self, identifier: str) -> None:
@@ -141,6 +150,69 @@ class CountryCodeRequiredError(GuestAccessError):
             "calling code (e.g. +919876543210) -- that is how guests "
             "identify themselves when they sign in, and a rule stored any "
             "other way can never match them.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class RuleTypeNotImportableError(GuestAccessError):
+    """A bulk-import row asked for a ``rule_type`` this endpoint does not
+    write -- in practice always ``BLOCKLIST``.
+
+    See ``constants.IMPORTABLE_RULE_TYPES`` for why: a blocklist rule ends
+    the sessions the guest is already in, one live device session per rule,
+    and that outcome has to be visible per guest rather than summarised in
+    a bulk count.
+    """
+
+    def __init__(self, rule_type: str) -> None:
+        super().__init__(
+            f"'{rule_type}' rules cannot be bulk-imported. A block ends the "
+            "sessions that guest is already in, and that has to be done -- "
+            "and its device outcome seen -- one guest at a time via "
+            "POST /guest-access/rules",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidImportCellError(GuestAccessError):
+    """One cell of one bulk-import row could not be parsed.
+
+    Carried per row rather than raised at the request boundary, because
+    pydantic rejecting the batch is the failure this endpoint exists to
+    avoid -- see ``schemas.GuestAccessRuleImportRow``'s docstring. The
+    message names the column and what was in it, since the operator is
+    holding a spreadsheet and needs to find the cell.
+    """
+
+    def __init__(self, column: str, value: object) -> None:
+        #: Which column failed -- the import's rejection-code lookup keys
+        #: off this rather than off the exception type, since one exception
+        #: covers several columns.
+        self.column = column
+        super().__init__(
+            f"'{value}' is not a valid {column}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class OrganizationRequiredError(GuestAccessError):
+    """A whole-organization read was attempted with no organization
+    resolved from the request.
+
+    Only the CSV export raises this. ``list_guest_rules`` tolerates a
+    missing organization because it is paginated and reached through a
+    permission check that pins the scope, but an export is a single file
+    containing every row it can see -- and "every row" with no tenant
+    filter is every tenant's guest list in one download. Refusing is the
+    only safe reading of a missing ``X-Organization-Id`` here. Mirrors
+    ``app.domains.mac_authorization.exceptions.OrganizationRequiredError``,
+    which guards that domain's own import/export for the same reason.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "An organization context (X-Organization-Id) is required to "
+            "export guest access rules",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
