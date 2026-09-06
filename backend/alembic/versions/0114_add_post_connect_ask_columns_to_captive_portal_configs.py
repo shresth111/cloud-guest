@@ -89,7 +89,26 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0114_add_post_connect_ask_columns_to_captive_portal_configs"
-down_revision = "0113_create_router_rogue_dhcp_statuses_table"
+# Reparented onto 0117, not the other way round, and the direction is the
+# whole point.
+#
+# 0114 and 0117 were written in parallel worktrees and both took
+# 0113 as their parent, so `alembic upgrade head` found two heads and every
+# backend deploy from 13:54 onward failed at container boot -- five in a row,
+# with the frontend deploying normally the whole time.
+#
+# The obvious repair is to hang 0117 off 0116 and keep the filename order.
+# That would have been wrong, and only reading production said so:
+# `alembic_version` is already at **0117**. It applied cleanly at 12:12,
+# when 0117 was the only new revision on main; 0114-0116 arrived at 13:54
+# and have never run. Pointing 0117 at 0116 would leave alembic believing
+# everything below its current revision was applied, and these three columns
+# would never be created -- a silent no-op instead of a loud failure.
+#
+# So the applied revision stays where it is and the unapplied ones queue
+# behind it. The filename numbers now read out of order against the graph;
+# the graph is what alembic follows, and correctness beat tidiness here.
+down_revision = "0117_add_whitelist_only_to_captive_portal_configs"
 branch_labels = None
 depends_on = None
 
