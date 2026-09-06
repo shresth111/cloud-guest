@@ -587,6 +587,17 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "user session. Same reasoning as the RADIUS routes: a device is the caller, "
         "holds no grants, and must not be confined."
     ),
+    ("POST", "/api/v1/otp/request"): (
+        "A guest at a captive portal asking for a sign-in code, before they have any "
+        "identity at all -- the very first call the portal makes. It reaches a "
+        "confined service because it now composes `GuestService.check_portal_admission`"
+        ", the per-property whitelist-only gate that must refuse a non-listed guest "
+        "*before* the venue pays for an SMS. Being unconfined grants nothing: the "
+        "admission check resolves the portal config by the organization/location the "
+        "request itself names and reads only that property's own access rules, exactly "
+        "as `POST /guest/login/otp` does one step later. Requiring a credential here "
+        "would 401 every guest out of the portal."
+    ),
     ("POST", "/api/v1/guest-teams/join"): (
         "A guest joining a team with a code they were given. They hold no "
         "roles, so there is no confinement to derive, and `join_team` "

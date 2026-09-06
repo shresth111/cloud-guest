@@ -25,6 +25,8 @@ __all__ = [
     "OrganizationRequiredError",
     "InvalidImportCellError",
     "GuestAccessDeniedError",
+    "WhitelistOnlyAccessDeniedError",
+    "DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE",
     "BlockEnforcementMissingCredentialsError",
     "UnsupportedGuestAccessVendorError",
     "GuestAccessDeviceConnectionError",
@@ -230,6 +232,55 @@ class GuestAccessDeniedError(GuestAccessError):
         message = "Access denied by an active guest access control rule"
         if reason:
             message += f": {reason}"
+        super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
+
+
+#: The wording a guest sees when a whitelist-only property refuses them and
+#: its operator has set no ``whitelist_only_denied_message`` of their own.
+#:
+#: Deliberately says what to *do*, not what went wrong. The guest is not at
+#: fault and has no way to fix anything themselves -- their number simply is
+#: not on a list somebody at the front desk keeps -- so the only useful
+#: sentence points at the person who can add them. It also, deliberately,
+#: does not confirm or deny whether this number is known to the venue: this
+#: endpoint is unauthenticated and anyone can type any number into it.
+DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE = (
+    "This WiFi is limited to guests the venue has added to its allowed list. "
+    "Please ask reception to add you."
+)
+
+
+class WhitelistOnlyAccessDeniedError(GuestAccessError):
+    """This property runs in whitelist-only mode and nothing on its Always
+    Allowed list matches this guest.
+
+    **A different fact from ``GuestAccessDeniedError``, and therefore a
+    different exception.** That one means "an operator wrote a rule about
+    *you*" -- a BLOCKLIST hit, a decision aimed at a person. This one means
+    "an operator wrote a rule about *everyone else*" -- the guest did
+    nothing, is not barred anywhere else, and would sign in normally at the
+    same chain's next property. Collapsing the two into one error would put
+    "you have been blocked" in front of a guest who has not been, and would
+    leave the portal with no way to tell them the one thing that helps
+    (go and ask reception).
+
+    Both are 403: the request was well-formed and the refusal is
+    authorization, not input. The status code is not the discriminator --
+    the exception type and ``AccessDecision.is_whitelist_only_denial`` are.
+
+    ``denied_message`` is the property's own
+    ``captive_portal_configs.whitelist_only_denied_message`` when the
+    operator has written one, so a hotel can say "ask reception" and a
+    corporate office can say "raise a ticket with IT"; falling back to
+    ``DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE`` rather than to silence,
+    because a refusal with no explanation is the state this whole feature
+    exists to replace.
+    """
+
+    def __init__(self, denied_message: str | None = None) -> None:
+        message = (denied_message or "").strip() or (
+            DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE
+        )
         super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
 
 

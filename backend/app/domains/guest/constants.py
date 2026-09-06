@@ -513,7 +513,31 @@ NAS_CODE_SEQUENCE_DIGITS = 4
 # FreeRADIUS's own config and never manually retyped afterward).
 NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES = 32
 
+# ---------------------------------------------------------------------------
+# Login-failure reasons
+# ---------------------------------------------------------------------------
+
+# What ``GuestLoginHistory.failure_reason`` carries when a whitelist-only
+# property turned a guest away.
+#
+# Every other value in that column is an exception class name
+# (``type(exc).__name__``, see ``GuestService._record_login_failure``'s
+# callers), and this one keeps that convention deliberately: it is exactly
+# ``WhitelistOnlyAccessDeniedError.__name__``, spelled out as a constant so
+# the reporting query that answers "who did we turn away?" does not have to
+# import an exception class out of another domain to build a filter -- and
+# so renaming that class cannot silently split one venue's refusal history
+# into two buckets.
+#
+# It is its own value rather than reusing ``GuestAccessDeniedError``: an
+# operator reviewing refusals needs "we admit only listed guests and this
+# person is not on the list" separated from "this person is barred". They
+# lead to opposite actions -- add them to the list, or do not.
+WHITELIST_ONLY_LOGIN_FAILURE_REASON = "WhitelistOnlyAccessDeniedError"
+
+
 __all__ = [
+    "WHITELIST_ONLY_LOGIN_FAILURE_REASON",
     "GuestAuthMethod",
     "GuestSessionStatus",
     "GUEST_SESSION_STATUS_TRANSITIONS",

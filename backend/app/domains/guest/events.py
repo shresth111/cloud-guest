@@ -156,9 +156,55 @@ class RadiusNasDeleted:
     occurred_at: datetime = field(default_factory=_now)
 
 
+@dataclass(frozen=True, slots=True)
+class WhitelistOnlyGateFailedOpen:
+    """The whitelist-only gate could not reach the rule store, and let the
+    guest through anyway.
+
+    Its own event, logged at WARNING, because it is the one moment where
+    this platform knowingly does the opposite of what a venue asked for.
+    An operator reading their refusal log needs to be able to see the
+    window in which the list was not being applied -- otherwise a
+    fail-open is indistinguishable from a list that was simply wide.
+
+    ``detail`` carries the repr of the failure, not the exception object:
+    these events are flattened into log ``extra`` fields and must stay
+    JSON-shaped.
+    """
+
+    organization_id: uuid.UUID | None
+    location_id: uuid.UUID | None
+    identifier: str
+    auth_method: str
+    detail: str
+    occurred_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True, slots=True)
+class WhitelistOnlyLoginRefused:
+    """A guest was turned away at a whitelist-only property.
+
+    ``trusted_device_consulted`` records whether the MAC reconciliation
+    ran at all before the refusal -- i.e. whether the guest even presented
+    a device MAC. Without it, "we checked the trusted-device list and they
+    were not on it" and "there was no MAC to check" look identical in the
+    log, and only one of those is an operator's problem to fix.
+    """
+
+    organization_id: uuid.UUID
+    location_id: uuid.UUID | None
+    identifier: str
+    auth_method: str
+    mac_address: str | None
+    trusted_device_consulted: bool
+    occurred_at: datetime = field(default_factory=_now)
+
+
 __all__ = [
     "GuestLoggedIn",
     "GuestLoginFailed",
+    "WhitelistOnlyGateFailedOpen",
+    "WhitelistOnlyLoginRefused",
     "GuestSessionCreated",
     "GuestSessionDisconnected",
     "GuestSessionTerminated",

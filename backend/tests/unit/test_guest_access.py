@@ -13,6 +13,7 @@ environment.
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -22,6 +23,7 @@ from pydantic import ValidationError
 
 from app.domains.guest_access.constants import (
     MAX_IMPORT_BATCH_SIZE,
+    WHITELIST_ONLY_DENIAL_REASON,
     AccessRuleType,
     GuestRuleImportRejectionCode,
 )
@@ -489,6 +491,199 @@ class TestAccessDecisionResolver:
         decision = resolver.resolve(guest_rules=[], device_rules=[device_blocklist])
         assert decision.allowed is False
         assert decision.rule_type == AccessRuleType.BLOCKLIST
+
+
+class TestWhitelistOnlyDefault:
+    """The single behavioural change per-property whitelist-only mode makes
+    to resolution: what "nothing matched" means."""
+
+    def test_no_rules_denies_when_whitelist_only_is_on(self) -> None:
+        resolver = AccessDecisionResolver()
+        decision = resolver.resolve(
+            guest_rules=[], device_rules=[], whitelist_only_enabled=True
+        )
+        assert decision.allowed is False
+        assert decision.matched_rule_id is None
+        assert decision.rule_type is None
+        assert decision.reason == WHITELIST_ONLY_DENIAL_REASON
+
+    def test_the_denial_is_distinguishable_from_a_blocklist_denial(self) -> None:
+        """The whole reason this is a separate decision shape: the portal
+        has to be able to say "you are barred" and "this venue admits only
+        listed guests" differently, and it can only do that if the two
+        refusals do not look identical coming out of the resolver."""
+        resolver = AccessDecisionResolver()
+        blocked = resolver.resolve(
+            guest_rules=[_guest_rule(AccessRuleType.BLOCKLIST, reason="abuse")],
+            device_rules=[],
+            whitelist_only_enabled=True,
+        )
+        unlisted = resolver.resolve(
+            guest_rules=[], device_rules=[], whitelist_only_enabled=True
+        )
+
+        assert blocked.allowed is False and unlisted.allowed is False
+        assert blocked.is_whitelist_only_denial is False
+        assert unlisted.is_whitelist_only_denial is True
+        assert blocked.reason != unlisted.reason
+        assert blocked.matched_rule_id is not None
+        assert unlisted.matched_rule_id is None
+
+    @pytest.mark.parametrize(
+        "rule_type", [AccessRuleType.WHITELIST, AccessRuleType.VIP]
+    )
+    def test_an_allow_rule_still_admits_under_whitelist_only(
+        self, rule_type: AccessRuleType
+    ) -> None:
+        """The list is what the mode is *for*. A guest on it gets in."""
+        rule = _guest_rule(rule_type)
+        resolver = AccessDecisionResolver()
+        decision = resolver.resolve(
+            guest_rules=[rule], device_rules=[], whitelist_only_enabled=True
+        )
+        assert decision.allowed is True
+        assert decision.matched_rule_id == rule.id
+
+    def test_a_device_rule_admits_under_whitelist_only_too(self) -> None:
+        rule = _device_rule(AccessRuleType.WHITELIST)
+        resolver = AccessDecisionResolver()
+        decision = resolver.resolve(
+            guest_rules=[], device_rules=[rule], whitelist_only_enabled=True
+        )
+        assert decision.allowed is True
+
+    def test_a_blocklist_still_refuses_an_otherwise_listed_guest(self) -> None:
+        """Precedence is untouched: whitelist-only mode changes the
+        default, not the walk. A BLOCKLIST still outranks a WHITELIST."""
+        resolver = AccessDecisionResolver()
+        decision = resolver.resolve(
+            guest_rules=[
+                _guest_rule(AccessRuleType.WHITELIST),
+                _guest_rule(AccessRuleType.BLOCKLIST, reason="abuse"),
+            ],
+            device_rules=[],
+            whitelist_only_enabled=True,
+        )
+        assert decision.allowed is False
+        assert decision.rule_type == AccessRuleType.BLOCKLIST
+        assert decision.is_whitelist_only_denial is False
+
+    def test_every_matched_decision_is_byte_for_byte_what_it_was(self) -> None:
+        """The flag must not leak into any decision that matched a rule.
+
+        Asserted as equality of whole decisions across both settings,
+        rather than field by field, so a future field added to
+        ``AccessDecision`` is covered without anyone remembering to.
+        """
+        resolver = AccessDecisionResolver()
+        for rules in (
+            [_guest_rule(AccessRuleType.WHITELIST)],
+            [_guest_rule(AccessRuleType.VIP)],
+            [_guest_rule(AccessRuleType.TEMPORARY)],
+            [_guest_rule(AccessRuleType.BLOCKLIST, reason="abuse")],
+            [
+                _guest_rule(AccessRuleType.BLOCKLIST),
+                _guest_rule(AccessRuleType.VIP),
+            ],
+        ):
+            assert resolver.resolve(
+                guest_rules=rules, device_rules=[], whitelist_only_enabled=False
+            ) == resolver.resolve(
+                guest_rules=rules, device_rules=[], whitelist_only_enabled=True
+            )
+
+    def test_the_default_is_off(self) -> None:
+        """Omitting the parameter must mean allow, not deny -- every
+        pre-existing caller (this domain's own ``POST .../check`` endpoint
+        included) relies on it."""
+        assert (
+            AccessDecisionResolver().resolve(guest_rules=[], device_rules=[]).allowed
+            is True
+        )
+
+    def test_the_deny_singleton_is_shared_and_frozen(self) -> None:
+        """``_DEFAULT_DENY`` sits beside ``_DEFAULT_ALLOW`` as a
+        module-level frozen singleton -- one object, not one per refusal."""
+        resolver = AccessDecisionResolver()
+        first = resolver.resolve(
+            guest_rules=[], device_rules=[], whitelist_only_enabled=True
+        )
+        second = resolver.resolve(
+            guest_rules=[], device_rules=[], whitelist_only_enabled=True
+        )
+        assert first is second
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            first.allowed = True  # type: ignore[misc]
+
+
+class TestCheckAccessThreadsTheFlag:
+    async def test_check_access_denies_an_unmatched_guest_when_asked_to(self) -> None:
+        fx = make_fixture()
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=None,
+            identifier="+919876543210",
+            mac_address=None,
+            whitelist_only_enabled=True,
+        )
+        assert decision.is_whitelist_only_denial is True
+
+    async def test_check_access_defaults_to_allow_without_the_flag(self) -> None:
+        """The parameter defaults to ``False``, so the admin-facing
+        ``POST /guest-access/check`` -- which knows nothing about a portal
+        config -- keeps answering exactly as it always has."""
+        fx = make_fixture()
+        decision = await fx.service.check_access(
+            organization_id=fx.organization_id,
+            requesting_organization_id=fx.organization_id,
+            location_id=None,
+            identifier="+919876543210",
+            mac_address=None,
+        )
+        assert decision.allowed is True
+
+    def test_this_domain_still_imports_nothing_from_captive_portal(self) -> None:
+        """The acyclic module graph this domain's docstring documents as a
+        design constraint, asserted rather than trusted.
+
+        ``whitelist_only_enabled`` lives on ``captive_portal_configs``, and
+        the shortest way to read it here would have been to import that
+        domain -- which is exactly the edge that must not exist. It is a
+        parameter instead, so this assertion must keep holding.
+
+        Parses the imports rather than grepping the text, so a docstring
+        that merely *mentions* the other domain (this file's own do)
+        cannot trip it and, more importantly, cannot mask a real import.
+        """
+        import ast
+        import pathlib
+
+        import app.domains.guest_access.service as svc
+
+        tree = ast.parse(pathlib.Path(svc.__file__).read_text())
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported |= {alias.name for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+
+        assert not [m for m in imported if "captive_portal" in m], imported
+        assert not [m for m in imported if m.startswith("app.domains.guest.")], imported
+
+    def test_the_resolver_is_a_pure_function_of_its_arguments(self) -> None:
+        """``AccessDecisionResolver`` holds no collaborators at all -- no
+        repository, no session, no config service. Constructing one takes
+        no arguments and resolving needs nothing but rows and the flag."""
+        resolver = AccessDecisionResolver()
+        assert vars(resolver) == {}
+        assert (
+            resolver.resolve(
+                guest_rules=[], device_rules=[], whitelist_only_enabled=True
+            ).allowed
+            is False
+        )
 
 
 # ============================================================================

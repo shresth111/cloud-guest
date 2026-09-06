@@ -50,17 +50,35 @@ and an operator can retry the device half alone -- ``enforce_guest_rule``,
 the same "retry the push without re-submitting the form" separation
 ``VlanService.push_vlan_to_device`` makes.
 
-## Default-allow, not deny-by-default
+## Default-allow, except where a property has opted out of it
 
-This module does **not** turn the platform into a whitelist-only ("deny
-unless explicitly allowed") system. A guest with zero matching rules is
-allowed, exactly as before this module existed. ``WHITELIST`` rules exist
-to *guarantee* precedence over some other rule (see
-``constants.AccessRuleType.WHITELIST``'s docstring), not to gate access by
-themselves. Introducing true deny-by-default would be a platform-wide
-behavioral change far outside a single Phase 1 module's scope -- see the
-Architecture Design Document §13 for why that kind of default belongs to
-the Phase 2 Policy Engine's ``AccessPolicy`` type, not here.
+The platform-wide default is unchanged and stays unchanged: a guest with
+zero matching rules is allowed, exactly as before this module existed.
+``WHITELIST`` rules exist to *guarantee* precedence over some other rule
+(see ``constants.AccessRuleType.WHITELIST``'s docstring), not to gate
+access by themselves.
+
+The one exception is **per-property**, opt-in, and off by default:
+``captive_portal_configs.whitelist_only_enabled`` (added in PR #159,
+refused outright on an organization's own default config -- see
+``app.domains.captive_portal.validators.validate_whitelist_only_scope``).
+When a single property turns it on, ``AccessDecisionResolver.resolve``
+returns ``_DEFAULT_DENY`` instead of ``_DEFAULT_ALLOW`` for a guest who
+matched nothing there. Nothing else moves: the precedence walk, every
+matched decision, and every other property on the platform are untouched.
+
+This is still not the platform-wide deny-by-default the Architecture
+Design Document §13 assigns to the Phase 2 Policy Engine's
+``AccessPolicy``. The flag arrives here as a **parameter** on
+``resolve``/``check_access``, read by the caller off a portal config it
+had already resolved -- this module still imports nothing from
+``app.domains.captive_portal``, and the module graph documented above
+stays acyclic.
+
+**Nobody skips the captive portal.** A guest at a whitelist-only property
+still reaches the login page, still types their number, and is refused
+*there*, with words the operator chose. That is why this feature needs no
+change on the router at all: the portal is where the refusal happens.
 """
 
 from __future__ import annotations
@@ -85,6 +103,7 @@ from app.domains.rbac.location_scope import (
 from .constants import (
     ACCESS_RULE_TYPE_PRECEDENCE,
     IMPORTABLE_RULE_TYPES,
+    WHITELIST_ONLY_DENIAL_REASON,
     AccessRuleType,
     BlockEnforcementStatus,
     GuestRuleImportRejectionCode,
@@ -96,6 +115,7 @@ from .events import (
     AccessRuleDeleted,
     AccessRulesImported,
     GuestAccessDenied,
+    WhitelistOnlyAccessDenied,
 )
 from .exceptions import (
     AccessRuleNotFoundError,
@@ -162,9 +182,42 @@ class AccessDecision:
     matched_rule_id: uuid.UUID | None
     reason: str | None
 
+    @property
+    def is_whitelist_only_denial(self) -> bool:
+        """Whether this refusal is "the venue admits only listed guests"
+        rather than "an operator barred this person".
+
+        The structural discriminator, deliberately derived rather than
+        stored as a fourth flag: a whitelist-only denial is the *only*
+        decision this resolver can produce that refuses without having
+        matched a rule, because every other refusal is a BLOCKLIST hit and
+        a BLOCKLIST hit always carries the row it came from. Deriving it
+        means the two can never drift apart -- there is no way to
+        construct a decision whose flag says one thing and whose
+        ``matched_rule_id`` says another.
+        """
+        return not self.allowed and self.rule_type is None
+
 
 _DEFAULT_ALLOW = AccessDecision(
     allowed=True, rule_type=None, matched_rule_id=None, reason=None
+)
+
+#: What "nothing matched" means at a property that has opted into
+#: whitelist-only mode -- the single behavioural change this whole feature
+#: makes. Every other decision the resolver can return is unchanged.
+#:
+#: A module-level frozen singleton beside ``_DEFAULT_ALLOW`` for the same
+#: reason that one is: the resolver is a pure function over rows it was
+#: handed, both outcomes are values rather than objects with identity, and
+#: allocating a fresh one per login would be a per-request cost for no
+#: gain. ``AccessDecision`` is ``frozen=True``, so sharing one instance
+#: across every refusal on the platform is safe.
+_DEFAULT_DENY = AccessDecision(
+    allowed=False,
+    rule_type=None,
+    matched_rule_id=None,
+    reason=WHITELIST_ONLY_DENIAL_REASON,
 )
 
 
@@ -174,7 +227,7 @@ class AccessDecisionResolver:
     queries the repository and hands the results here.
 
     Precedence, highest first (``constants.ACCESS_RULE_TYPE_PRECEDENCE``):
-    ``VIP`` > ``TEMPORARY`` > ``BLOCKLIST`` > ``WHITELIST`` > default-allow.
+    ``VIP`` > ``TEMPORARY`` > ``BLOCKLIST`` > ``WHITELIST`` > the default.
     A ``VIP`` rule for either the identifier or the device overrides even an
     active ``BLOCKLIST`` rule for the other -- e.g. a VIP guest's own
     blocklisted personal device still connects, and a non-VIP guest on a
@@ -182,6 +235,23 @@ class AccessDecisionResolver:
     device-level rules are resolved together as one combined candidate set;
     neither takes blanket priority over the other -- only ``rule_type``
     ordering matters.
+
+    **``whitelist_only_enabled`` changes exactly one thing: the default.**
+    The precedence walk above is untouched -- a VIP still wins, a
+    BLOCKLIST still refuses, a WHITELIST still allows, and every one of
+    those decisions is byte-for-byte what it was before this parameter
+    existed. The flag is consulted only after the walk has fallen all the
+    way through, i.e. only for a guest who matched *nothing*, where the
+    answer was ``_DEFAULT_ALLOW`` and now becomes ``_DEFAULT_DENY``.
+
+    It is a **parameter, not a lookup**. This class stays a pure function
+    over rows it was handed: it opens no session, reads no config, and
+    imports nothing from ``app.domains.captive_portal`` (this module's own
+    docstring documents that acyclic graph as a design constraint). The
+    caller has already resolved the property's portal config for its own
+    reasons and passes the boolean down -- see
+    ``GuestAccessService.check_access`` and, above it,
+    ``app.domains.guest.service.GuestService._enforce_access_control``.
     """
 
     def resolve(
@@ -189,6 +259,7 @@ class AccessDecisionResolver:
         *,
         guest_rules: list[GuestAccessRule],
         device_rules: list[DeviceAccessRule],
+        whitelist_only_enabled: bool = False,
     ) -> AccessDecision:
         candidates: list[tuple[AccessRuleType, uuid.UUID, str | None]] = [
             (AccessRuleType(rule.rule_type), rule.id, rule.reason)
@@ -205,7 +276,9 @@ class AccessDecisionResolver:
                     matched_rule_id=rule_id,
                     reason=reason,
                 )
-        return _DEFAULT_ALLOW
+        # Nothing matched. Default-allow unless this property opted out of
+        # it -- the one line this feature adds to the resolution itself.
+        return _DEFAULT_DENY if whitelist_only_enabled else _DEFAULT_ALLOW
 
 
 # ============================================================================
@@ -1232,12 +1305,35 @@ class GuestAccessService:
         location_id: uuid.UUID | None,
         identifier: str | None,
         mac_address: str | None,
+        whitelist_only_enabled: bool = False,
     ) -> AccessDecision:
         """The read path both this module's own ``POST .../check`` endpoint
         and ``GuestService``'s optional enforcement hook call. Fetches
         every matching, active, non-expired rule for whichever of
         ``identifier``/``mac_address`` were supplied, then hands them to
-        ``AccessDecisionResolver`` for pure precedence resolution."""
+        ``AccessDecisionResolver`` for pure precedence resolution.
+
+        ``whitelist_only_enabled`` is passed straight through to the
+        resolver and changes nothing here: the same two queries run, on the
+        same rows, in the same order. It defaults to ``False`` so every
+        existing caller -- this module's own ``POST .../check`` endpoint
+        included -- keeps the default-allow behaviour it has always had,
+        and only a caller that has *actually read* a property's
+        ``captive_portal_configs.whitelist_only_enabled`` can ever turn the
+        default over.
+
+        **There is no new lookup here that can fail.** The flag arrives as
+        a parameter from a config the caller had already resolved for its
+        own reasons (``GuestService._require_method_enabled`` calls
+        ``resolve_portal_config`` on every non-MAC login *before* the
+        access gate runs, and holds the result). That is the whole reason
+        this design was chosen over expressing whitelist-only mode as a
+        Phase 2 policy: a policy would mean a second query, on the login
+        path, that can time out or 500 -- a brand-new way for a venue's
+        WiFi to break, added by a feature whose entire job is to refuse
+        people. Riding on a config that is already in hand adds no such
+        failure mode.
+        """
         self._enforce_tenant_scope(organization_id, requesting_organization_id)
         now = datetime.now(UTC)
         guest_rules: list[GuestAccessRule] = []
@@ -1257,7 +1353,9 @@ class GuestAccessService:
                 now=now,
             )
         decision = self.resolver.resolve(
-            guest_rules=guest_rules, device_rules=device_rules
+            guest_rules=guest_rules,
+            device_rules=device_rules,
+            whitelist_only_enabled=whitelist_only_enabled,
         )
         if not decision.allowed and decision.matched_rule_id is not None:
             event = GuestAccessDenied(
@@ -1266,6 +1364,21 @@ class GuestAccessService:
                 matched_rule_id=decision.matched_rule_id,
             )
             logger.info("guest_access_denied", extra=_event_extra(event))
+        elif decision.is_whitelist_only_denial:
+            # Logged on its own line rather than folded into
+            # ``guest_access_denied``: that event's ``matched_rule_id`` is
+            # non-optional because a blocklist denial always has one, and
+            # this denial by definition has none. Two different facts, two
+            # different log lines -- the same reason
+            # ``BlockEnforcementStatus`` refuses to collapse
+            # ``NOT_APPLICABLE`` into ``UNENFORCED``.
+            event = WhitelistOnlyAccessDenied(
+                identifier=identifier,
+                mac_address=mac_address,
+                organization_id=organization_id,
+                location_id=location_id,
+            )
+            logger.info("whitelist_only_access_denied", extra=_event_extra(event))
         return decision
 
     # -- internal helpers ----------------------------------------------------
