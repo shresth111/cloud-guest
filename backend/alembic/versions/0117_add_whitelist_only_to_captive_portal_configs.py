@@ -26,24 +26,23 @@ IS NULL`` -- may not carry the flag, since that would switch on every
 property at once); nothing consumes ``whitelist_only_enabled`` on the
 login path yet.
 
-Numbering: ``0113`` is the latest revision on ``origin/main`` and is this
-revision's parent. ``0114``-``0116`` were already claimed at the time this
-was written by concurrent work that is **not on any branch yet** (an
-unrelated post-connect-ask / profile-prompt / consent-backfill set), so
-``ls alembic/versions`` on a fresh checkout does not show them and this
-takes ``0117`` rather than collide. The gap is a numbering artifact, not a
-branch: the chain here is straight-line off ``0113``.
+Numbering: this was written against ``0113``, the then-head on
+``origin/main``, while ``0114``-``0116`` (an unrelated post-connect-ask /
+profile-prompt / consent-backfill set) were in flight on no branch yet --
+so it took ``0117`` rather than collide, and its original
+``down_revision`` pointed at ``0113``.
 
-**Whoever merges second must check, not assume.** If that set lands first,
-rebase this ``down_revision`` onto whatever is then head, or Alembic gets
-two heads (this repo has been there -- see the ``fix/alembic-two-heads``
-branch). Note in particular that ``0114`` adds its own columns to this
-same ``captive_portal_configs`` table. The columns are disjoint, so there
-is no data conflict and either order applies cleanly -- it is purely the
-``down_revision`` pointer that has to be made to agree.
+That set landed first, and this revision was then merged without the
+rebase its own warning called for, which is exactly how ``main`` came to
+have two heads: ``0116`` and this one. ``down_revision`` is now
+``0116_backfill_guest_consent_terms_version``, restoring a single
+straight-line chain. Only the pointer moved -- ``0114`` adds its own
+columns to this same ``captive_portal_configs`` table, but the two sets
+are disjoint, so no upgrade() body changed and either order would have
+applied cleanly.
 
 Revision ID: 0117_add_whitelist_only_to_captive_portal_configs
-Revises: 0113_create_router_rogue_dhcp_statuses_table
+Revises: 0116_backfill_guest_consent_terms_version
 Create Date: 2026-09-06
 """
 
@@ -52,7 +51,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0117_add_whitelist_only_to_captive_portal_configs"
-down_revision = "0113_create_router_rogue_dhcp_statuses_table"
+down_revision = "0116_backfill_guest_consent_terms_version"
 branch_labels = None
 depends_on = None
 
