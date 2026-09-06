@@ -47,6 +47,9 @@ __all__ = [
     "NextCampaignResponse",
     "CampaignRespondRequest",
     "CampaignImpressionRequest",
+    "CampaignTemplateQuestionResponse",
+    "CampaignTemplateResponse",
+    "CampaignTemplateListResponse",
 ]
 
 
@@ -135,6 +138,44 @@ class CampaignQuestionResponse(BaseModel):
     answer_type: str
     options: list[str]
     is_required: bool
+
+
+class CampaignTemplateQuestionResponse(BaseModel):
+    answer_type: str
+    # Empty when the venue supplies it -- a dish name, in the one template
+    # that has any. The dashboard renders an empty field, not a
+    # placeholder to be accepted as-is.
+    question_text: str
+    options: list[str]
+    is_required: bool
+    # The dashboard should offer "add another" for rows of this kind. A
+    # dish survey is a repeating list of identical questions with
+    # different names; a satisfaction survey is not.
+    repeatable: bool
+
+
+class CampaignTemplateResponse(BaseModel):
+    """A starter shape, not a resource. Applying one is the ordinary
+    `POST /campaigns` plus one `POST /campaigns/{id}/questions` per
+    question -- there is no "create from template" endpoint and no stored
+    link back to the template afterwards. See `templates.py` for why the
+    shapes live in the backend at all."""
+
+    key: str
+    name: str
+    description: str
+    campaign_type: str
+    display_rule: str
+    display_interval_days: int | None
+    questions: list[CampaignTemplateQuestionResponse]
+    # The ceiling the venue is authoring against, sent alongside the
+    # template so the dashboard can show "7 of 10" while they add dishes
+    # rather than discovering the limit as a 400 on the eleventh.
+    max_questions: int
+
+
+class CampaignTemplateListResponse(BaseModel):
+    items: list[CampaignTemplateResponse]
 
 
 class CampaignAssetCreateRequest(BaseModel):
