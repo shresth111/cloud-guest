@@ -47,6 +47,7 @@ from app.domains.guest.constants import (
     RECONNECT_GRACE_MINUTES,
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
+    WHITELIST_ONLY_LOGIN_FAILURE_REASON,
     GuestAuthMethod,
     GuestSessionStatus,
     NasStatus,
@@ -119,7 +120,16 @@ from app.domains.guest.validators import (
     is_session_timed_out,
     validate_nas_status_transition,
 )
-from app.domains.guest_access.exceptions import GuestAccessDeniedError
+from app.domains.guest_access.constants import (
+    WHITELIST_ONLY_DENIAL_REASON,
+    AccessRuleType,
+)
+from app.domains.guest_access.exceptions import (
+    DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE,
+    GuestAccessDeniedError,
+    WhitelistOnlyAccessDeniedError,
+)
+from app.domains.guest_access.service import AccessDecision
 from app.domains.location.models import Location
 from app.domains.otp.constants import OtpPurpose
 from app.domains.otp.exceptions import OtpCodeMismatchError
@@ -305,6 +315,8 @@ class FakeCaptivePortalService:
         # rather than inherited from the column default.
         collect_guest_name: bool = True,
         collect_guest_email: bool = True,
+        whitelist_only_enabled: bool = False,
+        whitelist_only_denied_message: str | None = None,
     ) -> CaptivePortalConfig:
         config = CaptivePortalConfig(
             **_base_fields(
@@ -343,6 +355,14 @@ class FakeCaptivePortalService:
                 review_url=None,
                 guest_feedback_enabled=False,
                 feedback_dwell_minutes=DEFAULT_FEEDBACK_DWELL_MINUTES,
+                # Set explicitly, always. The column is NOT NULL with a
+                # server default of False, but a `CaptivePortalConfig`
+                # constructed in memory never sees the server default -- so
+                # leaving it out would make the attribute `None`, which is
+                # falsy and would let a broken gate "pass" for the wrong
+                # reason.
+                whitelist_only_enabled=whitelist_only_enabled,
+                whitelist_only_denied_message=whitelist_only_denied_message,
             )
         )
         self.configs_by_org[organization_id] = config
@@ -504,18 +524,41 @@ class FakeAccessControlHook:
     without constructing a real ``GuestAccessService``/repository. Denies
     any identifier/mac_address pair added via ``deny()``; allows everything
     else, mirroring the real ``AccessDecisionResolver``'s default-allow
-    posture."""
+    posture.
+
+    ``allow()`` registers a stand-in for an allow-shaped rule
+    (WHITELIST/VIP/TEMPORARY) -- only meaningful under
+    ``whitelist_only_enabled``, where "matched an allow rule" and "matched
+    nothing" stop being the same outcome.
+
+    Returns the **real** ``AccessDecision``, not a look-alike. The
+    whitelist-only refusal is discriminated by
+    ``AccessDecision.is_whitelist_only_denial``, which is derived from
+    ``rule_type``/``allowed``; a hand-rolled double would let this fake
+    invent a combination the real resolver cannot produce, which is exactly
+    how a gate test passes while the gate is broken.
+    """
 
     denied_identifiers: set[str] = field(default_factory=set)
     denied_macs: set[str] = field(default_factory=set)
+    allowed_identifiers: set[str] = field(default_factory=set)
+    allowed_macs: set[str] = field(default_factory=set)
     denial_reason: str | None = "blocked for testing"
     calls: list[dict[str, object]] = field(default_factory=list)
+    #: Set to raise from ``check_access`` -- the fail-open path.
+    raises: Exception | None = None
 
     def deny(self, *, identifier: str | None = None, mac_address: str | None = None):
         if identifier is not None:
             self.denied_identifiers.add(identifier)
         if mac_address is not None:
             self.denied_macs.add(mac_address.strip().upper())
+
+    def allow(self, *, identifier: str | None = None, mac_address: str | None = None):
+        if identifier is not None:
+            self.allowed_identifiers.add(identifier)
+        if mac_address is not None:
+            self.allowed_macs.add(mac_address.strip().upper())
 
     async def check_access(
         self,
@@ -525,6 +568,7 @@ class FakeAccessControlHook:
         location_id: uuid.UUID | None,
         identifier: str | None,
         mac_address: str | None,
+        whitelist_only_enabled: bool = False,
     ):
         self.calls.append(
             {
@@ -533,20 +577,41 @@ class FakeAccessControlHook:
                 "location_id": location_id,
                 "identifier": identifier,
                 "mac_address": mac_address,
+                "whitelist_only_enabled": whitelist_only_enabled,
             }
         )
+        if self.raises is not None:
+            raise self.raises
         normalized_mac = mac_address.strip().upper() if mac_address else None
         denied = (identifier in self.denied_identifiers) or (
             normalized_mac is not None and normalized_mac in self.denied_macs
         )
-
-        class _Decision:
-            def __init__(self, allowed: bool, reason: str | None) -> None:
-                self.allowed = allowed
-                self.reason = reason
-
-        return _Decision(
-            allowed=not denied, reason=self.denial_reason if denied else None
+        if denied:
+            return AccessDecision(
+                allowed=False,
+                rule_type=AccessRuleType.BLOCKLIST,
+                matched_rule_id=uuid.uuid4(),
+                reason=self.denial_reason,
+            )
+        allowed = (identifier in self.allowed_identifiers) or (
+            normalized_mac is not None and normalized_mac in self.allowed_macs
+        )
+        if allowed:
+            return AccessDecision(
+                allowed=True,
+                rule_type=AccessRuleType.WHITELIST,
+                matched_rule_id=uuid.uuid4(),
+                reason=None,
+            )
+        if whitelist_only_enabled:
+            return AccessDecision(
+                allowed=False,
+                rule_type=None,
+                matched_rule_id=None,
+                reason=WHITELIST_ONLY_DENIAL_REASON,
+            )
+        return AccessDecision(
+            allowed=True, rule_type=None, matched_rule_id=None, reason=None
         )
 
 
@@ -1351,6 +1416,8 @@ def make_fixture(
     # care about the flags set them explicitly.
     collect_guest_name: bool = True,
     collect_guest_email: bool = True,
+    whitelist_only_enabled: bool = False,
+    whitelist_only_denied_message: str | None = None,
 ) -> Fixture:
     repository = FakeGuestRepository()
     otp_service = FakeOtpService()
@@ -1373,6 +1440,8 @@ def make_fixture(
         pin_login_enabled=pin_login_enabled,
         collect_guest_name=collect_guest_name,
         collect_guest_email=collect_guest_email,
+        whitelist_only_enabled=whitelist_only_enabled,
+        whitelist_only_denied_message=whitelist_only_denied_message,
     )
     captive_portal_service.add_location(location_id, organization_id)
     router = router_service.add(organization_id=organization_id, status=router_status)
@@ -5227,6 +5296,557 @@ class TestAccessControlHookIntegration:
                 router_id=fx.router.id,
                 device_mac="aa:bb:cc:dd:ee:ff",
             )
+
+
+# ============================================================================
+# Per-property whitelist-only mode
+# ============================================================================
+
+
+class TestWhitelistOnlyLoginGate:
+    """The gate itself, at the service level: what happens to a guest who
+    matches nothing, at a property that admits only listed guests."""
+
+    async def test_off_by_default_an_unmatched_guest_still_gets_online(self) -> None:
+        """The state of every property on the platform. Stated first,
+        because it is the assertion that must never break."""
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559992001",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+        assert hook.calls[0]["whitelist_only_enabled"] is False
+
+    async def test_on_an_unmatched_guest_is_refused(self) -> None:
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992002",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert len(fx.repository.sessions) == 0
+        assert hook.calls[0]["whitelist_only_enabled"] is True
+
+    async def test_on_a_listed_guest_still_gets_online(self) -> None:
+        hook = FakeAccessControlHook()
+        hook.allow(identifier="+15559992003")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559992003",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_the_refusal_is_not_the_blocklist_error(self) -> None:
+        """"You are barred" and "this venue admits only listed guests" are
+        different facts and must not raise the same exception -- the portal
+        has to be able to say different things.
+
+        ``WhitelistOnlyAccessDeniedError`` deliberately does **not**
+        subclass ``GuestAccessDeniedError``, so this is a real
+        discrimination and not an inheritance accident.
+        """
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(WhitelistOnlyAccessDeniedError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992004",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert not isinstance(exc_info.value, GuestAccessDeniedError)
+        assert exc_info.value.status_code == 403
+
+    async def test_a_blocklisted_guest_still_gets_the_blocklist_error(self) -> None:
+        """Turning whitelist-only on must not relabel existing blocks."""
+        hook = FakeAccessControlHook()
+        hook.deny(identifier="+15559992005")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(GuestAccessDeniedError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992005",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert not isinstance(exc_info.value, WhitelistOnlyAccessDeniedError)
+
+    async def test_the_operators_own_words_reach_the_guest(self) -> None:
+        hook = FakeAccessControlHook()
+        fx = make_fixture(
+            access_control_hook=hook,
+            whitelist_only_enabled=True,
+            whitelist_only_denied_message="Raise a ticket with IT to get access.",
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992006",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert "Raise a ticket with IT" in str(exc_info.value)
+
+    async def test_a_property_with_no_message_still_says_something_useful(
+        self,
+    ) -> None:
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(WhitelistOnlyAccessDeniedError) as exc_info:
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992007",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert str(exc_info.value) == DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE
+
+    async def test_the_refusal_happens_before_the_otp_is_verified(self) -> None:
+        """A refused guest must not spend a real OTP attempt, exactly as a
+        blocklisted one does not."""
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559992008",
+                code="WRONG",  # would raise OtpCodeMismatchError if reached
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    @pytest.mark.parametrize(
+        "method",
+        ["voucher", "password", "pin"],
+    )
+    async def test_every_login_method_is_gated(self, method: str) -> None:
+        """Not just OTP. A venue that closed its WiFi has closed it."""
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        identifier = f"+1555999{method[:2]}90"
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            if method == "voucher":
+                fx.voucher_service.register(
+                    "VWL", data_limit_mb=None, validity_minutes=60
+                )
+                await fx.guest_service.login_via_voucher(
+                    code="VWL",
+                    identifier=identifier,
+                    organization_id=None,
+                    location_id=fx.location_id,
+                    router_id=fx.router.id,
+                )
+            elif method == "password":
+                await fx.guest_service.login_via_password(
+                    identifier=identifier,
+                    password="whatever",
+                    organization_id=None,
+                    location_id=fx.location_id,
+                    router_id=fx.router.id,
+                )
+            else:
+                await fx.guest_service.login_via_pin(
+                    identifier=identifier,
+                    pin="123456",
+                    device_mac="aa:bb:cc:dd:ee:90",
+                    organization_id=None,
+                    location_id=fx.location_id,
+                    router_id=fx.router.id,
+                )
+
+
+class TestWhitelistOnlyReconcilesTrustedDevices:
+    """A trusted device's authorisation lives in ``mac_authorization_entries``
+    -- a table ``check_access`` does not query. Switching a property to
+    whitelist-only must not refuse every device an operator already
+    trusted, and must not make them keep the same MAC in two lists."""
+
+    async def test_a_trusted_device_is_admitted_without_a_second_list_entry(
+        self,
+    ) -> None:
+        mac_hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:F1"})
+        access_hook = FakeAccessControlHook()  # no rule for this guest at all
+        fx = make_fixture(
+            access_control_hook=access_hook,
+            mac_authorization_hook=mac_hook,
+            whitelist_only_enabled=True,
+        )
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559993001",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="aa:bb:cc:dd:ee:f1",
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+        # Scoped by location, not just organization -- a trust entry that
+        # names a location applies only there.
+        assert mac_hook.calls[-1]["location_id"] == fx.location_id
+
+    async def test_an_untrusted_device_is_still_refused(self) -> None:
+        mac_hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:F1"})
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(),
+            mac_authorization_hook=mac_hook,
+            whitelist_only_enabled=True,
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559993002",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="aa:bb:cc:dd:ee:f2",
+            )
+
+    async def test_the_trusted_device_lookup_only_runs_on_the_denial_path(
+        self,
+    ) -> None:
+        """An ordinary property pays nothing for this reconciliation, and
+        neither does a listed guest at a whitelist-only one."""
+        mac_hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:F1"})
+        access_hook = FakeAccessControlHook()
+        access_hook.allow(identifier="+15559993003")
+        fx = make_fixture(
+            access_control_hook=access_hook,
+            mac_authorization_hook=mac_hook,
+            whitelist_only_enabled=True,
+        )
+        await fx.guest_service.login_via_otp(
+            identifier="+15559993003",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="aa:bb:cc:dd:ee:f1",
+        )
+        assert mac_hook.calls == []
+
+    async def test_mac_whitelist_login_is_not_refused_by_whitelist_only(self) -> None:
+        """``login_via_mac_whitelist`` is the path a trusted device takes at
+        RADIUS-authorize time. Before this reconciliation it would have been
+        refused by a gate that cannot see the table authorising it."""
+        mac_hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:FF"})
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(),
+            mac_authorization_hook=mac_hook,
+            whitelist_only_enabled=True,
+        )
+        result = await fx.guest_service.login_via_mac_whitelist(
+            mac_address="AA:BB:CC:DD:EE:FF",
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+        # One lookup, not two: that path already asked the same question
+        # for the same MAC before the gate ran.
+        assert len(mac_hook.calls) == 1
+
+    async def test_no_mac_hook_wired_still_refuses_rather_than_crashing(self) -> None:
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(),
+            mac_authorization_hook=None,
+            whitelist_only_enabled=True,
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559993004",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="aa:bb:cc:dd:ee:f3",
+            )
+
+
+class TestWhitelistOnlyRefusalsAreRecorded:
+    """Without a record, a venue has no way to discover their list is
+    wrong -- and every rule written before PR #160 was a bare national
+    number that could never match anyone."""
+
+    async def test_a_refusal_writes_a_login_history_row(self) -> None:
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(), whitelist_only_enabled=True
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559994001",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                ip_address="203.0.113.7",
+            )
+        assert len(fx.repository.login_history) == 1
+        row = fx.repository.login_history[0]
+        assert row.success is False
+        assert row.identifier == "+15559994001"
+        assert row.failure_reason == WHITELIST_ONLY_LOGIN_FAILURE_REASON
+        assert row.auth_method == GuestAuthMethod.OTP_SMS.value
+        assert row.location_id == fx.location_id
+        assert row.organization_id == fx.organization_id
+        assert row.ip_address == "203.0.113.7"
+
+    async def test_the_reason_distinguishes_it_from_every_other_failure(self) -> None:
+        """An operator's question is "who did we turn away for not being on
+        the list?", which they cannot answer if the refusal is spelled the
+        same as a wrong OTP or a block."""
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(), whitelist_only_enabled=True
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559994002",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        assert (
+            fx.repository.login_history[0].failure_reason
+            != "GuestAccessDeniedError"
+        )
+        assert (
+            fx.repository.login_history[0].failure_reason
+            == WhitelistOnlyAccessDeniedError.__name__
+        )
+
+    async def test_an_admitted_guest_writes_no_refusal(self) -> None:
+        access_hook = FakeAccessControlHook()
+        access_hook.allow(identifier="+15559994003")
+        fx = make_fixture(
+            access_control_hook=access_hook, whitelist_only_enabled=True
+        )
+        await fx.guest_service.login_via_otp(
+            identifier="+15559994003",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert [r for r in fx.repository.login_history if not r.success] == []
+
+
+class TestWhitelistOnlyFailsOpen:
+    """The uncomfortable half, asserted rather than assumed."""
+
+    async def test_a_raising_rule_lookup_lets_the_guest_online(self) -> None:
+        """Failing closed at a whitelist-only property means *nobody* gets
+        online -- including the listed guests, the owner, and whoever is
+        trying to diagnose it -- and from the venue's side that is
+        indistinguishable from the feature working."""
+        hook = FakeAccessControlHook()
+        hook.raises = RuntimeError("connection pool exhausted")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559995001",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_it_says_so_out_loud(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The one moment this platform knowingly does the opposite of what
+        a venue asked for. It must be visible in the log, or a fail-open is
+        indistinguishable from a list that was simply wide."""
+        import logging
+
+        hook = FakeAccessControlHook()
+        hook.raises = RuntimeError("connection pool exhausted")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with caplog.at_level(logging.WARNING, logger="app.domains.guest.service"):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559995002",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+        records = [
+            r for r in caplog.records if r.message == "whitelist_only_gate_failed_open"
+        ]
+        assert records, [r.message for r in caplog.records]
+        assert records[0].event_identifier == "+15559995002"
+
+    async def test_a_property_that_never_opted_in_keeps_raising(self) -> None:
+        """The swallow is scoped to the feature. A venue that never
+        switched whitelist-only on must not have its error behaviour
+        quietly changed by a feature it does not use."""
+        hook = FakeAccessControlHook()
+        hook.raises = RuntimeError("connection pool exhausted")
+        fx = make_fixture(access_control_hook=hook)  # whitelist-only off
+        with pytest.raises(RuntimeError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559995003",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+    async def test_a_real_refusal_travelling_as_an_exception_is_not_swallowed(
+        self,
+    ) -> None:
+        """Fail-open must not become "any 403 from the gate means allow"."""
+        hook = FakeAccessControlHook()
+        hook.raises = GuestAccessDeniedError("abuse")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        with pytest.raises(GuestAccessDeniedError):
+            await fx.guest_service.login_via_otp(
+                identifier="+15559995004",
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+            )
+
+
+class TestCheckPortalAdmission:
+    """The gate on ``POST /otp/request`` -- refusing before the venue pays
+    for an SMS, at the service level. The routed version lives in
+    ``test_guest_login_composition.py``."""
+
+    async def test_an_unlisted_guest_is_refused_before_a_code_is_sent(self) -> None:
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(), whitelist_only_enabled=True
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.check_portal_admission(
+                identifier="+15559996001",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+            )
+
+    async def test_a_listed_guest_passes(self) -> None:
+        hook = FakeAccessControlHook()
+        hook.allow(identifier="+15559996002")
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        await fx.guest_service.check_portal_admission(
+            identifier="+15559996002",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+        )
+
+    async def test_it_is_a_no_op_at_an_ordinary_property(self) -> None:
+        """Deliberately does **not** start enforcing blocklists at
+        OTP-request time: that is a behaviour change for every venue on the
+        platform and belongs to its own PR."""
+        hook = FakeAccessControlHook()
+        hook.deny(identifier="+15559996003")
+        fx = make_fixture(access_control_hook=hook)  # whitelist-only off
+        await fx.guest_service.check_portal_admission(
+            identifier="+15559996003",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+        )
+        assert hook.calls == []
+
+    async def test_it_is_a_no_op_when_no_property_was_named(self) -> None:
+        """An account-level code carries no venue at all, and there is no
+        flag to read."""
+        hook = FakeAccessControlHook()
+        fx = make_fixture(access_control_hook=hook, whitelist_only_enabled=True)
+        await fx.guest_service.check_portal_admission(
+            identifier="+15559996004",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=None,
+        )
+        assert hook.calls == []
+
+    async def test_the_refusal_is_recorded(self) -> None:
+        """With the gate here, a refused OTP guest never reaches
+        ``/guest/login/otp`` at all -- so if this path did not record, a
+        whitelist-only venue's refusal list would be empty for the method
+        nearly all of them use."""
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(), whitelist_only_enabled=True
+        )
+        with pytest.raises(WhitelistOnlyAccessDeniedError):
+            await fx.guest_service.check_portal_admission(
+                identifier="+15559996005",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                ip_address="203.0.113.9",
+            )
+        assert len(fx.repository.login_history) == 1
+        row = fx.repository.login_history[0]
+        assert row.failure_reason == WHITELIST_ONLY_LOGIN_FAILURE_REASON
+        assert row.ip_address == "203.0.113.9"
+
+    async def test_a_trusted_device_passes_here_too(self) -> None:
+        mac_hook = FakeMacAuthorizationHook(whitelisted={"AA:BB:CC:DD:EE:F1"})
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(),
+            mac_authorization_hook=mac_hook,
+            whitelist_only_enabled=True,
+        )
+        await fx.guest_service.check_portal_admission(
+            identifier="+15559996006",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            device_mac="AA:BB:CC:DD:EE:F1",
+        )
+
+    async def test_a_failing_config_lookup_lets_the_guest_through(self) -> None:
+        """This path *does* add a lookup ``POST /otp/request`` never made
+        before. It fails in the same direction as the rest of the gate --
+        and the refusal still stands at login, which was always there."""
+        fx = make_fixture(
+            access_control_hook=FakeAccessControlHook(), whitelist_only_enabled=True
+        )
+        await fx.guest_service.check_portal_admission(
+            identifier="+15559996007",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=uuid.uuid4(),  # no config registered for this org
+            location_id=None,
+        )
 
 
 # ============================================================================

@@ -17,12 +17,16 @@ class AccessRuleType(StrEnum):
     ``models.py``'s module docstring for why one column, not one table per
     type.
 
-    * ``WHITELIST`` -- an explicit, permanent allow. Since this module does
-      not flip the platform into deny-by-default mode (see
-      ``service.AccessDecisionResolver``'s own docstring), a ``WHITELIST``
-      rule mainly exists to *guarantee* access precedence over some other,
-      broader ``BLOCKLIST`` rule that might otherwise apply (e.g. an
-      org-wide blocklist entry with a location-scoped whitelist exception).
+    * ``WHITELIST`` -- an explicit, permanent allow. At an ordinary
+      property (the platform-wide default is still allow-unless-blocked --
+      see ``service.AccessDecisionResolver``'s own docstring), a
+      ``WHITELIST`` rule mainly exists to *guarantee* access precedence
+      over some other, broader ``BLOCKLIST`` rule that might otherwise
+      apply (e.g. an org-wide blocklist entry with a location-scoped
+      whitelist exception). At a property that has switched on
+      ``captive_portal_configs.whitelist_only_enabled``, the same rule
+      takes on its second job: it is the list, and a guest who matches no
+      allow-shaped rule there is refused at the portal.
     * ``BLOCKLIST`` -- an explicit, permanent deny.
     * ``TEMPORARY`` -- a bounded-window allow. Requires ``expires_at`` (see
       ``validators.validate_rule_expiry``) -- an "temporary" rule with no
@@ -92,6 +96,27 @@ ACCESS_RULE_TYPE_PRECEDENCE: tuple[AccessRuleType, ...] = (
     AccessRuleType.BLOCKLIST,
     AccessRuleType.WHITELIST,
 )
+
+
+# The ``reason`` carried by ``service._DEFAULT_DENY`` -- the decision
+# ``AccessDecisionResolver`` returns when **nothing matched** and the
+# property has ``captive_portal_configs.whitelist_only_enabled`` on.
+#
+# A stable, machine-readable token rather than a sentence, for the same
+# reason ``GuestRuleImportRejectionCode`` exists: it is branched on, not
+# read aloud. The words a refused guest actually sees come from that
+# property's own ``whitelist_only_denied_message`` (or the default in
+# ``exceptions.WhitelistOnlyAccessDeniedError``), never from here.
+#
+# It must never collide with a rule's own free-text ``reason``: every
+# other denial this resolver produces is a BLOCKLIST match and carries the
+# operator's typed note (or ``None``). "You are barred from this network"
+# and "this venue admits only listed guests" are different facts about
+# different people, and the portal has to be able to say different things
+# -- which is why this is a distinct decision shape and not a second way
+# to spell a blocklist hit. See ``AccessDecision.is_whitelist_only_denial``
+# for the structural discriminator callers should branch on.
+WHITELIST_ONLY_DENIAL_REASON = "whitelist_only"
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +197,7 @@ __all__ = [
     "AccessRuleType",
     "BlockEnforcementStatus",
     "ACCESS_RULE_TYPE_PRECEDENCE",
+    "WHITELIST_ONLY_DENIAL_REASON",
     "MAX_IMPORT_BATCH_SIZE",
     "IMPORTABLE_RULE_TYPES",
     "GuestRuleImportRejectionCode",

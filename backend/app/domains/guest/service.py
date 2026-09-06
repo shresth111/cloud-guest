@@ -255,7 +255,10 @@ from app.domains.auth.password import (
 )
 from app.domains.captive_portal.service import ResolvedPortalConfig
 from app.domains.captive_portal.validators import compute_terms_version, is_open_now
-from app.domains.guest_access.exceptions import GuestAccessDeniedError
+from app.domains.guest_access.exceptions import (
+    GuestAccessDeniedError,
+    WhitelistOnlyAccessDeniedError,
+)
 from app.domains.guest_access.service import AccessDecision
 from app.domains.location.models import Location
 from app.domains.mac_authorization.exceptions import MacAuthorizationError
@@ -295,6 +298,7 @@ from .constants import (
     RECONNECT_GRACE_MINUTES,
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
+    WHITELIST_ONLY_LOGIN_FAILURE_REASON,
     GuestAuthMethod,
     GuestSessionStatus,
     NasStatus,
@@ -325,6 +329,8 @@ from .events import (
     RadiusNasRegistered,
     RadiusNasSecretRegenerated,
     RadiusNasUpdated,
+    WhitelistOnlyGateFailedOpen,
+    WhitelistOnlyLoginRefused,
 )
 from .exceptions import (
     ConcurrentSessionLimitExceededError,
@@ -855,7 +861,15 @@ class AccessDecisionProtocol(Protocol):
     ``GuestSessionBroadcastProtocol``/``monitoring_hook`` above already
     establishes for the Real-Time Engine. See
     ``GuestService.__init__``'s docstring for why this hook is additive
-    (``None``-by-default) rather than a required dependency."""
+    (``None``-by-default) rather than a required dependency.
+
+    ``whitelist_only_enabled`` travels *down* this protocol rather than
+    being looked up behind it. ``app.domains.guest_access`` documents its
+    own acyclic module graph as a design constraint and must never import
+    ``app.domains.captive_portal``, where the flag lives -- and the caller
+    on this side has the resolved config in hand already (see
+    ``_enforce_access_control``). So the boolean is an argument, and the
+    resolver stays a pure function."""
 
     async def check_access(
         self,
@@ -865,6 +879,7 @@ class AccessDecisionProtocol(Protocol):
         location_id: uuid.UUID | None,
         identifier: str | None,
         mac_address: str | None,
+        whitelist_only_enabled: bool = False,
     ) -> AccessDecision: ...
 
 
@@ -1644,6 +1659,13 @@ class GuestService:
             location_id=location_id,
             identifier=identifier,
             device_mac=device_mac,
+            auth_method=auth_method,
+            guest=existing_guest,
+            ip_address=ip_address,
+            whitelist_only_enabled=bool(resolved.config.whitelist_only_enabled),
+            whitelist_only_denied_message=(
+                resolved.config.whitelist_only_denied_message
+            ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
@@ -1797,6 +1819,13 @@ class GuestService:
             location_id=location_id,
             identifier=identifier,
             device_mac=device_mac,
+            auth_method=GuestAuthMethod.VOUCHER,
+            guest=existing_guest,
+            ip_address=ip_address,
+            whitelist_only_enabled=bool(resolved.config.whitelist_only_enabled),
+            whitelist_only_denied_message=(
+                resolved.config.whitelist_only_denied_message
+            ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
@@ -1979,6 +2008,13 @@ class GuestService:
             location_id=location_id,
             identifier=identifier,
             device_mac=device_mac,
+            auth_method=GuestAuthMethod.USERNAME_PASSWORD,
+            guest=existing_guest,
+            ip_address=ip_address,
+            whitelist_only_enabled=bool(resolved.config.whitelist_only_enabled),
+            whitelist_only_denied_message=(
+                resolved.config.whitelist_only_denied_message
+            ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
@@ -2230,6 +2266,13 @@ class GuestService:
             location_id=location_id,
             identifier=identifier,
             device_mac=device_mac,
+            auth_method=GuestAuthMethod.PIN,
+            guest=existing_guest,
+            ip_address=ip_address,
+            whitelist_only_enabled=bool(resolved.config.whitelist_only_enabled),
+            whitelist_only_denied_message=(
+                resolved.config.whitelist_only_denied_message
+            ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
@@ -2452,6 +2495,19 @@ class GuestService:
             location_id=location_id,
             identifier=identifier,
             device_mac=normalized_mac,
+            auth_method=GuestAuthMethod.MAC_WHITELIST,
+            guest=existing_guest,
+            ip_address=ip_address,
+            whitelist_only_enabled=bool(resolved.config.whitelist_only_enabled),
+            whitelist_only_denied_message=(
+                resolved.config.whitelist_only_denied_message
+            ),
+            # `is_mac_authorized` returned True barely a dozen lines above,
+            # for this exact MAC, organization and location. Passing that
+            # answer down rather than letting the gate ask again is the
+            # difference between one lookup and two on every whitelisted
+            # device's login.
+            device_mac_already_authorized=True,
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
@@ -3782,6 +3838,112 @@ class GuestService:
         was pulled out to module scope."""
         return await enforce_session_timeouts(self.repository)
 
+    async def check_portal_admission(
+        self,
+        *,
+        identifier: str,
+        auth_method: GuestAuthMethod,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        device_mac: str | None = None,
+        ip_address: str | None = None,
+    ) -> None:
+        """"May this identifier begin a login at this property at all?" --
+        asked *before* anything is spent on them.
+
+        ## Why this exists
+
+        The captive portal does not start at ``POST /guest/login/otp``. It
+        starts at ``POST /otp/request``, which sends a real SMS, and only
+        afterwards calls the login endpoint where
+        ``_enforce_access_control`` runs. Gate only the second call and
+        whitelist-only mode means: anyone who walks past the venue and
+        types any phone number gets a real SMS at the owner's expense, and
+        is then refused. That is a live bill and an abuse vector -- a
+        stranger can drain a venue's SMS credit at will by typing numbers
+        into a page that is, by design, open to the street.
+
+        It is also simply the better guest experience. Someone who is not
+        on the list should be told so immediately, not left waiting for a
+        code that was never going to help them.
+
+        ## Scope: only where the property opted in
+
+        Returns immediately unless this property has
+        ``whitelist_only_enabled`` on. A property that never switched the
+        feature on sees no behaviour change here whatsoever -- in
+        particular, this is deliberately **not** an opportunity to start
+        enforcing blocklists at OTP-request time. That would be a real
+        behaviour change (a blocked guest currently does receive a code and
+        is refused at login) affecting every venue on the platform, and it
+        belongs to its own PR with its own argument.
+
+        Returns immediately, too, when the caller supplied neither an
+        organization nor a location: with no property resolved there is no
+        flag to read, and this is exactly the shape of the non-portal
+        callers of ``POST /otp/request`` (e.g. an account-level code, which
+        carries no venue at all).
+
+        Note that the gate is deliberately **not** conditioned on the OTP's
+        ``purpose``. ``purpose`` is client-supplied on an unauthenticated
+        endpoint, so conditioning on it would leave the SMS spend one JSON
+        field away from being unprotected -- and the check is about who is
+        asking and where, which no purpose changes.
+
+        ## The one new lookup, named honestly
+
+        Unlike the login path -- where the portal config is already
+        resolved by ``_require_method_enabled`` before the gate runs, and
+        the flag costs nothing -- this method *does* resolve the config
+        itself, because ``POST /otp/request`` had no reason to resolve one
+        before. If that resolution raises, the guest is let through and a
+        warning is logged, for the reason argued at length in
+        ``_enforce_access_control``: a venue whose config lookup hiccups
+        must not lose its WiFi entirely, and this path's fallback is
+        precisely the behaviour every property had before the feature
+        existed. The refusal still stands at login, which is the gate that
+        was always there.
+        """
+        if organization_id is None and location_id is None:
+            return
+        identifier = normalize_identifier(identifier)
+        try:
+            resolved = await self.captive_portal_service.resolve_portal_config(
+                organization_id=organization_id, location_id=location_id
+            )
+        except Exception as exc:
+            event = WhitelistOnlyGateFailedOpen(
+                organization_id=organization_id,
+                location_id=location_id,
+                identifier=identifier,
+                auth_method=auth_method.value,
+                detail=repr(exc),
+            )
+            logger.warning(
+                "whitelist_only_gate_failed_open", extra=_event_extra(event)
+            )
+            return
+        config = resolved.config
+        if not config.whitelist_only_enabled:
+            return
+        await self._enforce_access_control(
+            organization_id=config.organization_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=device_mac,
+            auth_method=auth_method,
+            # No `guest=`: resolving one would be a second query run on
+            # every OTP request at a whitelist-only property, including the
+            # overwhelming majority that are about to be allowed, purely to
+            # populate a nullable FK. `GuestLoginHistory.guest_id` is
+            # nullable for exactly this case (see that model's docstring --
+            # "failed attempts for an as-yet-unknown identifier"), and the
+            # column an operator reads a refusal list by is `identifier`.
+            ip_address=ip_address,
+            whitelist_only_enabled=True,
+            whitelist_only_denied_message=config.whitelist_only_denied_message,
+        )
+
     # ========================================================================
     # Internal helpers
     # ========================================================================
@@ -3861,9 +4023,15 @@ class GuestService:
         self,
         *,
         organization_id: uuid.UUID,
-        location_id: uuid.UUID,
+        location_id: uuid.UUID | None,
         identifier: str,
         device_mac: str | None,
+        auth_method: GuestAuthMethod,
+        guest: Guest | None = None,
+        ip_address: str | None = None,
+        whitelist_only_enabled: bool = False,
+        whitelist_only_denied_message: str | None = None,
+        device_mac_already_authorized: bool = False,
     ) -> None:
         """Guest Access Control (Phase 1): a no-op when no
         ``access_control_hook`` was wired (the default -- see
@@ -3871,6 +4039,86 @@ class GuestService:
         ``AccessDecisionResolver`` (via ``GuestAccessService.check_access``)
         and raises ``GuestAccessDeniedError`` on a resolved ``BLOCKLIST``
         decision.
+
+        ## Whitelist-only mode
+
+        ``whitelist_only_enabled`` is this property's own
+        ``captive_portal_configs.whitelist_only_enabled``, read by the
+        caller off the config ``_require_method_enabled`` already resolved
+        on its way here. **It is threaded, not looked up**: no new query
+        runs on the login path, so this feature adds no new way for a login
+        to fail. (That is also why it lives on the captive-portal config
+        rather than in the Phase 2 policy domain, which would have meant a
+        second resolution -- and a second timeout -- in the middle of a
+        guest signing in.)
+
+        With it on, a guest who matched no rule gets ``_DEFAULT_DENY``
+        instead of ``_DEFAULT_ALLOW`` and is refused with
+        ``WhitelistOnlyAccessDeniedError``, carrying the property's own
+        ``whitelist_only_denied_message``. Deliberately a different
+        exception from ``GuestAccessDeniedError``: see that exception's
+        docstring -- "an operator wrote a rule about you" and "an operator
+        wrote a rule about everyone else" are different facts, and the
+        portal has to be able to say different things.
+
+        ## Trusted devices are reconciled, not duplicated
+
+        A trusted device's authorisation lives in
+        ``mac_authorization_entries``, a table ``check_access`` does not
+        query at all -- it resolves ``guest_access_rules``/
+        ``device_access_rules``. So switching a property to whitelist-only
+        would otherwise refuse every device an operator had already
+        trusted, on a list they can see in the dashboard, and the fix would
+        be "type all of them into a second list as well". That is the
+        silent-divergence shape this area is full of, so on a whitelist-only
+        denial with a MAC present this consults
+        ``mac_authorization_hook.is_mac_authorized`` before refusing.
+
+        The consultation is scoped by ``organization_id`` **and**
+        ``location_id`` -- a trust entry that names a location applies only
+        there, exactly as ``login_via_mac_whitelist`` already passes it.
+        It runs only on the denial path, so an ordinary property pays
+        nothing for it. ``device_mac_already_authorized`` lets
+        ``login_via_mac_whitelist`` skip the second lookup: that method has
+        just performed the identical check and would otherwise ask the same
+        question twice in one request.
+
+        ## Failure direction: fail open, and say so
+
+        If the rule lookup itself raises -- the connection pool is
+        exhausted, the replica is briefly gone -- and this property is in
+        whitelist-only mode, the guest is **allowed** and a WARNING is
+        logged.
+
+        This is uncomfortable and it is deliberate. The tension is real:
+        the entire purpose of the feature is to refuse people, and here it
+        admits someone it was told to refuse. But consider what failing
+        closed actually does at a whitelist-only property: *nobody* gets
+        online, including the guests who are on the list, including the
+        owner, including whoever is trying to diagnose it -- a database
+        hiccup becomes a total WiFi outage that looks, from the venue's
+        side, exactly like the feature working. Failing open degrades to
+        the behaviour every property on this platform had last week, which
+        is a known, survivable state, and it leaves a log line saying
+        precisely when it happened.
+
+        The scope of that swallow is deliberately narrow: it applies
+        **only** when ``whitelist_only_enabled`` is on. At every property
+        that never opted in, a raising lookup propagates exactly as it
+        always has -- a feature nobody switched on must not change how
+        their errors behave.
+
+        ## Every refusal is recorded
+
+        A whitelist-only refusal writes a ``GuestLoginHistory`` row through
+        the existing ``_record_login_failure`` path, with its own
+        ``failure_reason``. Without it a venue has no way to discover their
+        list is wrong -- and given that every rule written before PR #160
+        was a bare national number with no country code, "who did we turn
+        away?" is the first thing anyone will ask after switching this on.
+        A BLOCKLIST denial is deliberately left as it was (no history row):
+        changing that is a behaviour change for properties that never
+        enabled this feature, and belongs to its own PR.
 
         Placement: called from ``login_via_otp``/``login_via_voucher``
         immediately after ``_reject_if_blocked`` and before
@@ -3923,15 +4171,95 @@ class GuestService:
                 },
             )
             return
-        decision: AccessDecision = await self.access_control_hook.check_access(
+        try:
+            decision: AccessDecision = await self.access_control_hook.check_access(
+                organization_id=organization_id,
+                requesting_organization_id=organization_id,
+                location_id=location_id,
+                identifier=identifier,
+                mac_address=device_mac,
+                whitelist_only_enabled=whitelist_only_enabled,
+            )
+        except Exception as exc:
+            # Fail open, loudly -- and only where this feature is on. See
+            # this method's docstring for the argument; the short form is
+            # that a whitelist-only property failing closed is a total WiFi
+            # outage for a venue that cannot tell it from the feature
+            # working, while failing open is last week's behaviour plus a
+            # log line. A property that never opted in keeps propagating
+            # exactly as it always has.
+            if not whitelist_only_enabled:
+                raise
+            if isinstance(exc, GuestAccessDeniedError | WhitelistOnlyAccessDeniedError):
+                # A real refusal that happened to travel as an exception --
+                # never something to swallow.
+                raise
+            event = WhitelistOnlyGateFailedOpen(
+                organization_id=organization_id,
+                location_id=location_id,
+                identifier=identifier,
+                auth_method=auth_method.value,
+                detail=repr(exc),
+            )
+            logger.warning(
+                "whitelist_only_gate_failed_open", extra=_event_extra(event)
+            )
+            return
+        if decision.allowed:
+            return
+        if not decision.is_whitelist_only_denial:
+            raise GuestAccessDeniedError(decision.reason)
+
+        # Whitelist-only, nothing matched. Before refusing, reconcile with
+        # Trusted Devices -- see this method's docstring for why operators
+        # must not have to keep the same device in two tables.
+        trusted_device_consulted = False
+        if device_mac is not None:
+            if device_mac_already_authorized:
+                return
+            if self.mac_authorization_hook is not None:
+                try:
+                    # Normalized here rather than handed over raw. A guest
+                    # arrives with whatever spelling their NAS reported
+                    # ("aa-bb-cc-..."), the Trusted Devices table stores one
+                    # canonical form, and a case-sensitive miss here would
+                    # refuse a device the operator can see on their own
+                    # trusted list. The real service normalizes internally
+                    # too; doing it explicitly means the two cannot quietly
+                    # disagree about which spellings match.
+                    normalized = normalize_whitelist_mac_address(device_mac)
+                except MacAuthorizationError:
+                    # Not MAC-shaped at all -- nothing to reconcile
+                    # against, and never a reason to admit someone.
+                    normalized = None
+                if normalized is not None:
+                    trusted_device_consulted = True
+                    if await self.mac_authorization_hook.is_mac_authorized(
+                        normalized,
+                        organization_id=organization_id,
+                        location_id=location_id,
+                    ):
+                        return
+
+        event = WhitelistOnlyLoginRefused(
             organization_id=organization_id,
-            requesting_organization_id=organization_id,
             location_id=location_id,
             identifier=identifier,
+            auth_method=auth_method.value,
             mac_address=device_mac,
+            trusted_device_consulted=trusted_device_consulted,
         )
-        if not decision.allowed:
-            raise GuestAccessDeniedError(decision.reason)
+        logger.info("whitelist_only_login_refused", extra=_event_extra(event))
+        await self._record_login_failure(
+            guest=guest,
+            identifier=identifier,
+            auth_method=auth_method,
+            organization_id=organization_id,
+            location_id=location_id,
+            reason=WHITELIST_ONLY_LOGIN_FAILURE_REASON,
+            ip_address=ip_address,
+        )
+        raise WhitelistOnlyAccessDeniedError(whitelist_only_denied_message)
 
     async def _enforce_concurrent_session_limit(
         self,
