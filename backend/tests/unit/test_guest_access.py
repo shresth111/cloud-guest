@@ -14,6 +14,7 @@ environment.
 from __future__ import annotations
 
 import dataclasses
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -1708,3 +1709,76 @@ class TestBulkRoutesRequirePermission:
                         route.dependencies != []
                     ), f"{key} has no permission dependency"
         assert seen == wanted
+
+
+class TestARefusalNeverCarriesTheOperatorsNote:
+    """`GuestAccessRule.reason` and `Guest.blocked_reason` are an operator's
+    private note *about* a guest. The guest is the one party who must never
+    read them.
+
+    They used to be appended to the error message, and the portal renders a
+    403's message verbatim -- so an operator who wrote "ex-employee, do not
+    readmit" had that sentence displayed to the person at the counter.
+
+    Both halves are asserted, because `data` is not a hiding place: the
+    app-wide handler in `app.common.exceptions` serialises `exc.data`
+    straight into the response body, so moving the note there would have
+    changed which JSON key leaked it and nothing else.
+    """
+
+    _NOTE = "ex-employee, do not readmit"
+
+    def test_a_blocklist_refusal_leaks_neither_in_message_nor_data(self) -> None:
+        from app.domains.guest_access.exceptions import GuestAccessDeniedError
+
+        err = GuestAccessDeniedError(self._NOTE)
+
+        assert self._NOTE not in err.message
+        assert self._NOTE not in json.dumps(err.data)
+        # Still reachable to the raise site, which logs it.
+        assert err.reason == self._NOTE
+
+    def test_a_blocked_guest_refusal_leaks_neither_in_message_nor_data(self) -> None:
+        from app.domains.guest.exceptions import GuestBlockedError
+
+        err = GuestBlockedError(self._NOTE)
+
+        assert self._NOTE not in err.message
+        assert self._NOTE not in json.dumps(err.data)
+        assert err.reason == self._NOTE
+
+    def test_the_two_refusals_are_distinguishable_without_reading_the_message(
+        self,
+    ) -> None:
+        """Every 403 from this application collapses to one client-side error
+        shape, so before these codes the portal could only tell a blocklist
+        denial from a whitelist-only refusal by comparing message text --
+        against copy an operator can edit. They are different facts and the
+        guest is told different things, so they need different codes."""
+        from app.domains.guest_access.exceptions import (
+            GuestAccessDeniedError,
+            WhitelistOnlyAccessDeniedError,
+        )
+
+        blocklist = GuestAccessDeniedError("some note").data["code"]
+        whitelist = WhitelistOnlyAccessDeniedError(None).data["code"]
+
+        assert blocklist != whitelist
+        assert blocklist and whitelist
+
+    def test_the_whitelist_refusal_still_says_the_venues_own_words(self) -> None:
+        """The opposite case, and the reason this is not a blanket "never put
+        text in a refusal" rule: `whitelist_only_denied_message` is authored
+        by the venue *for* the guest, so it belongs in the message."""
+        from app.domains.guest_access.exceptions import (
+            DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE,
+            WhitelistOnlyAccessDeniedError,
+        )
+
+        venue_words = "Please collect your WiFi access at the front desk."
+
+        assert WhitelistOnlyAccessDeniedError(venue_words).message == venue_words
+        assert (
+            WhitelistOnlyAccessDeniedError("   ").message
+            == DEFAULT_WHITELIST_ONLY_DENIED_MESSAGE
+        )

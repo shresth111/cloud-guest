@@ -117,13 +117,26 @@ class GuestBlockedError(GuestError):
     """The guest identified by this identifier has ``is_blocked=True`` --
     an admin-set ban. Raised before any OTP/voucher verification is even
     attempted, so a blocked guest never learns whether their code/voucher
-    would otherwise have been valid."""
+    would otherwise have been valid.
+
+    **The admin's ``reason`` is deliberately not in the message, and not in
+    ``data`` either** -- see ``app.domains.guest_access.exceptions
+    .GuestAccessDeniedError`` for the argument, which applies identically
+    here: the portal renders a 403's message verbatim, so this appended the
+    operator's private note about a guest onto that guest's own screen.
+    ``data`` is no better a hiding place, since the app-wide handler
+    serialises it into the same response body.
+
+    Kept as ``self.reason``, an attribute and never serialised, so the raise
+    site can log it."""
 
     def __init__(self, reason: str | None = None) -> None:
-        message = "This guest has been blocked from guest WiFi access"
-        if reason:
-            message += f": {reason}"
-        super().__init__(message, status_code=status.HTTP_403_FORBIDDEN)
+        self.reason = reason
+        super().__init__(
+            "This guest has been blocked from guest WiFi access",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "guest_blocked"},
+        )
 
 
 class GuestSessionNotFoundError(GuestError):
