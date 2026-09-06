@@ -1079,6 +1079,74 @@ class TestValidateVsRedeem:
         assert redeemed.expires_at is not None
         assert redeemed_batch.id == batch.id
 
+    @pytest.mark.parametrize(
+        "typed",
+        [
+            "lower",
+            "MiXeD",
+            "dashes",
+            "spaces",
+            "en-dash",
+            "leading and trailing space",
+        ],
+    )
+    async def test_redeem_accepts_the_code_as_a_guest_would_type_it(
+        self, typed: str
+    ) -> None:
+        """A voucher is handed to a guest on paper. They type it back with
+        the case and grouping the card invited, and the lookup is exact.
+
+        Before this, redemption normalised with `.strip()` while the bulk
+        import used `.strip().upper()`, so a lower-cased or dash-grouped
+        code came back "voucher not found" for a code sitting valid and
+        unredeemed in the row beside it. Every spelling below must reach
+        the same voucher."""
+        fx = make_service()
+        await _create_batch(fx, quantity=1, has_manage_permission=True)
+        voucher = next(iter(fx.repository.vouchers.values()))
+        code = voucher.code
+        spellings = {
+            "lower": code.lower(),
+            "MiXeD": code[:2].lower() + code[2:],
+            "dashes": "-".join([code[:4], code[4:8], code[8:]]).strip("-"),
+            "spaces": " ".join([code[:4], code[4:]]),
+            "en-dash": code[:4] + "–" + code[4:],
+            "leading and trailing space": f"  {code} ",
+        }
+        redeemed, _ = await fx.service.redeem_voucher(
+            code=spellings[typed], identifier="+15551234567", source="1.2.3.4"
+        )
+        assert redeemed.code == code
+        assert redeemed.use_count == 1
+
+    async def test_a_genuinely_wrong_code_is_still_refused(self) -> None:
+        """The normalisation deletes separators and upper-cases, and
+        nothing else. It must not fold the characters the alphabet
+        deliberately excludes -- `I`, `O`, `0` and `1` are absent from
+        every code by design, so a guest who types one has not mistyped a
+        near-neighbour for it and should be told so."""
+        fx = make_service()
+        await _create_batch(fx, quantity=1, has_manage_permission=True)
+        voucher = next(iter(fx.repository.vouchers.values()))
+        with pytest.raises(VoucherNotFoundError):
+            await fx.service.redeem_voucher(
+                code=voucher.code[:-1] + "0",
+                identifier="+15551234567",
+                source="1.2.3.4",
+            )
+
+    async def test_validate_accepts_the_same_spellings_redeem_does(self) -> None:
+        """The two paths shared the defect and must share the fix -- a
+        guest whose code validates and then fails to redeem, or the
+        reverse, is the worse version of this bug."""
+        fx = make_service()
+        await _create_batch(fx, quantity=1, has_manage_permission=True)
+        voucher = next(iter(fx.repository.vouchers.values()))
+        result = await fx.service.validate_voucher(
+            code=voucher.code.lower(), source="1.2.3.4"
+        )
+        assert result.is_first_use is True
+
     async def test_validate_unknown_code_raises_not_found(self) -> None:
         fx = make_service()
         with pytest.raises(VoucherNotFoundError):

@@ -184,9 +184,11 @@ from .models import Voucher, VoucherBatch, VoucherPlan, VoucherSeries
 from .repository import VoucherRepositoryProtocol
 from .validators import (
     normalize_redeemed_identifier,
+    normalize_voucher_code,
     validate_batch_status_transition,
     validate_code_length,
     validate_quantity,
+    voucher_code_lookup_candidates,
 )
 from .voucher_pdf import render_voucher_batch_pdf
 
@@ -842,7 +844,21 @@ class VoucherService:
     # ========================================================================
 
     async def _get_voucher_and_batch(self, code: str) -> tuple[Voucher, VoucherBatch]:
-        voucher = await self.repository.get_voucher_by_code(code)
+        """Resolves a guest-typed code, trying each spelling
+        ``voucher_code_lookup_candidates`` yields, in its order.
+
+        The as-typed (trimmed, upper-cased) spelling first, so a venue whose
+        pre-printed codes genuinely carry a hyphen matches exactly; the
+        separator-free spelling only on a miss, so a guest who typed a
+        generated code with the grouping a printed card invited still lands
+        on it. A second query only ever runs when the first found nothing,
+        so this costs a redemption that succeeds exactly what it cost
+        before."""
+        voucher = None
+        for candidate in voucher_code_lookup_candidates(code):
+            voucher = await self.repository.get_voucher_by_code(candidate)
+            if voucher is not None:
+                break
         if voucher is None:
             raise VoucherNotFoundError()
         batch = await self.repository.get_batch(voucher.batch_id)
@@ -923,7 +939,7 @@ class VoucherService:
         future captive portal to show "is this code still good" before
         committing to a redemption."""
         await self._enforce_redemption_rate_limit(source)
-        voucher, batch = await self._get_voucher_and_batch(code.strip())
+        voucher, batch = await self._get_voucher_and_batch(code)
         now = datetime.now(UTC)
         reason = self._redemption_failure_reason(voucher, batch, now=now)
         if reason is not None:
@@ -940,7 +956,7 @@ class VoucherService:
         self, *, code: str, identifier: str, source: str
     ) -> tuple[Voucher, VoucherBatch]:
         await self._enforce_redemption_rate_limit(source)
-        voucher, batch = await self._get_voucher_and_batch(code.strip())
+        voucher, batch = await self._get_voucher_and_batch(code)
         now = datetime.now(UTC)
         reason = self._redemption_failure_reason(voucher, batch, now=now)
         if reason is not None:
@@ -1178,7 +1194,7 @@ class VoucherService:
         seen_in_request: set[str] = set()
         candidates: list[str] = []
         for raw_code in codes:
-            code = raw_code.strip().upper()
+            code = normalize_voucher_code(raw_code)
             if not code:
                 rejected.append((raw_code, "empty code"))
                 continue
