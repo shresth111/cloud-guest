@@ -1018,8 +1018,14 @@ class TestTheCacheKeyMovedWithTheFieldSet:
         ``_CACHED_CONFIG_SCALAR_FIELDS`` with ``payload[field_name]``,
         unguarded and deliberately so, and
         ``GET /captive-portal/resolve`` is unauthenticated and is the
-        first call every guest device makes. Left at v6, the first resolve
-        after deploy reads a payload with none of these keys in it."""
+        first call every guest device makes. Left unbumped, the first resolve
+        after deploy reads a payload with none of these keys in it.
+
+        v8, not v7: the per-property whitelist-only pair took v7 on main
+        while this branch was in flight, and both changes had independently
+        reasoned their way to the same number. See ``cache.py`` -- the
+        version tracks the SHAPE of the cached field set, against main, not
+        against the branch it was cut from."""
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
         from app.domains.captive_portal.service import (
             _CACHED_CONFIG_SCALAR_FIELDS,
@@ -1034,4 +1040,4 @@ class TestTheCacheKeyMovedWithTheFieldSet:
             "feedback_dwell_minutes",
         ):
             assert field in _CACHED_CONFIG_SCALAR_FIELDS
-        assert _CACHE_KEY_TEMPLATE.split(":")[2] == "v7"
+        assert _CACHE_KEY_TEMPLATE.split(":")[2] == "v8"

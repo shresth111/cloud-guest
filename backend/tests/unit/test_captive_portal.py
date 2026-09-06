@@ -2354,12 +2354,17 @@ class TestResolveCacheKeyVersion:
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
 
         key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
-        assert key == "captive_portal:resolve:v7:org:loc"
+        assert key == "captive_portal:resolve:v8:org:loc"
 
     def test_org_index_key_is_versioned_in_lockstep_with_the_payload_key(self) -> None:
         """The index names payload keys. Left at an older version it
         would fan a delete out to keys nothing reads anymore, silently
-        doing nothing -- so its version must move with the payload's."""
+        doing nothing -- so its version must move with the payload's.
+
+        Asserts the two are EQUAL rather than pinning a literal. The
+        literal belongs in the one test that is about a specific bump;
+        here it only meant that every bump failed two tests, one of them
+        for a reason that had nothing to do with what the test protects."""
         from app.domains.captive_portal.cache import (
             _CACHE_KEY_TEMPLATE,
             _ORG_INDEX_KEY_TEMPLATE,
@@ -2367,7 +2372,7 @@ class TestResolveCacheKeyVersion:
 
         payload_version = _CACHE_KEY_TEMPLATE.split(":")[2]
         index_version = _ORG_INDEX_KEY_TEMPLATE.split(":")[2]
-        assert payload_version == index_version == "v7"
+        assert payload_version == index_version
 
     def test_a_payload_from_the_previous_key_version_would_raise(self) -> None:
         """The mechanism §0.3 is actually about, asserted rather than
