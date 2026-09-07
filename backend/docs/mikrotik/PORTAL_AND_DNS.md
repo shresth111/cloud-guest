@@ -246,11 +246,40 @@ platform constants and one is derived from the router's own LAN address.
 | P3 | `/ip hotspot profile hsprof1 dns-name=` | `wifi.wyfyguest.com` (`HOTSPOT_DNS_NAME`) | `RouterDetailTabs.tsx:1704`, `renderers.py:706` |
 | P4 | `/ip hotspot profile hsprof1 login-by=` | `http-pap`, or `https,http-pap` **iff** the profile is already bound to the fleet certificate | `HOTSPOT_LOGIN_BY`, `RouterDetailTabs.tsx:6381-6384` |
 
-Plus one optional discovery hint, RFC 8910/8908:
-`/ip dhcp-server option code=114` pointing at
-`GET /captive-portal/rfc8908?portal_url=http://wifi.wyfyguest.com/`
-(`RouterDetailTabs.tsx:6296`, served by
-`captive_portal/router.py:captive_portal_api`).
+**There is no longer a fifth object.** The generator used to add one
+optional discovery hint — `/ip dhcp-server option code=114` pointing at
+`GET /captive-portal/rfc8908?portal_url=http://wifi.wyfyguest.com/`, served
+by `captive_portal/router.py:captive_portal_api`. Both halves are gone: the
+generator now *removes* that option instead of writing it (frontend #236),
+the platform can remove it from a device over the API (#175), and the cloud
+endpoint has been retired outright.
+
+RFC 8910's option does not carry "the portal's address" — it carries the
+address of an RFC 8908 API that a capport-aware OS **re-polls to learn
+whether it is still captive**. The cloud endpoint answered a hardcoded
+`captive: true` and could never answer anything else: RFC 8908 §4 requires
+the API server to see the same client address the enforcement device sees,
+and every guest reaches the cloud from behind the venue's NAT as one source
+IP. So advertising it replaced a heuristic that is correct in both
+directions (probe interception) with an authority that is correct in one,
+and a guest who signed in successfully kept the portal sheet open for ever.
+
+Measured, not argued: 856 requests over 27 Aug – 6 Sep, from four public
+IPs, all of them captive-detection agents — 363 from Apple's
+`CaptiveNetworkSupport`, 493 from a headless `Chrome/60` detector. Neither
+UA ever requested any other path on this platform, so for those devices
+this document was the *only* thing they consulted, and it told all 856 of
+them they were still captive.
+
+**The replacement is RouterOS's own.** MikroTik serves an RFC 8908 document
+at `https://<dns-name-of-hotspot>/api` (the `api.json` file in `/file`),
+whose template answers `"captive": $(if logged-in == 'yes')false$(else)true`
+— per-client and correct in both directions, from the box that is the
+enforcement device. It is emitted automatically, but only on a router that
+has both a `dns-name` and a valid certificate, which is the condition §4
+tracks. Where those are absent the device falls back to probe interception,
+which RFC 8908 §5 prescribes for exactly this case ("proceed to interact
+with the captive network as if the API capabilities were not present").
 
 **P1 and P2 are one feature and must be pushed together.** This is the most
 expensive lesson in the whole repo and it is recorded twice, live:
@@ -463,9 +492,13 @@ was implemented, you will have to use 'Reset HTML' function, or manually
 add/edit the api.json file."* The `api.json` file is served at
 `https://<dns-name-of-hotspot>/api` **when DNS configuration and valid SSL
 certificates exist** — so on a router without the fleet certificate (i.e. all
-but one, §4), the RFC 7710 endpoint is not available and the DHCP option-114
-hint pointing at the platform's own `/captive-portal/rfc8908` is doing real
-work rather than duplicating RouterOS's.
+but one, §4), the RFC 7710 endpoint is not available. **That is now an
+argument for "Reset HTML" and a certificate, not for the platform serving
+the document itself:** the cloud endpoint that used to fill this gap has
+been retired (§2.2.2), because an API server behind the venue's NAT cannot
+identify the client (RFC 8908 §4) and could only ever answer `captive:
+true`. A router that cannot serve `/api` should fall back to probe
+interception, which RFC 8908 §5 prescribes.
 
 **(d) What a real upload path would cost, if it is ever wanted.**
 `renderers.py:1383-1394` already scopes it honestly and declines to ship it:
@@ -604,10 +637,20 @@ Two documented details do bear on the design regardless:
   therefore rests entirely on the plain-HTTP probe path and on the RFC 7710
   DHCP option — and that option is only emitted when the router has both a
   `dns-name` **and** a valid certificate, which all but one fleet router
-  lacks (§4). This is why the platform's own option-114 hint exists and is
-  doing real work rather than duplicating RouterOS. It is also the cleanest
-  explanation available for the two live walled-garden observations in
-  §2.2.2, and it is invisible to anyone reading only the prose docs.
+  lacks (§4). It is the cleanest explanation available for the two live
+  walled-garden observations in §2.2.2, and it is invisible to anyone
+  reading only the prose docs.
+
+  **This paragraph used to end "which is why the platform's own option-114
+  hint exists and is doing real work rather than duplicating RouterOS."
+  That conclusion has been reversed and the hint is gone** — see §2.2.2.
+  The premise was sound and the inference was not: a cloud-hosted RFC 8908
+  API cannot identify the client behind the venue's NAT (RFC 8908 §4), so
+  it could only ever answer `captive: true`, which is worse than answering
+  nothing. A router without the certificate should fall back to probe
+  interception (RFC 8908 §5), not be handed an authority that lies. Note
+  also that the router named in §4 as *having* the fleet certificate is the
+  one on which RouterOS's own `/api` document should already be live.
   **Never emit `https-redirect`** — a tool that does gets a hard error on
   7.5+.
 

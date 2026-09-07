@@ -34,7 +34,6 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, Query, Request, status
-from fastapi.responses import JSONResponse
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
@@ -62,7 +61,7 @@ from .schemas import (
     ResolvedCaptivePortalConfigResponse,
 )
 from .service import CaptivePortalService
-from .validators import is_open_now, validate_user_portal_url
+from .validators import is_open_now
 
 router = APIRouter(tags=["Captive Portal"])
 
@@ -579,70 +578,6 @@ async def resolve_captive_portal_config(
         message="Captive portal config resolved",
         data=response_payload.model_dump(),
         request_id=_request_id(request),
-    )
-
-
-@router.get(
-    "/captive-portal/rfc8908",
-    include_in_schema=False,
-)
-async def captive_portal_api(portal_url: str = Query(...)):
-    """RFC 8908 Captive Portal API -- the response a device's OS fetches
-    (via the RFC 8910 DHCP Option 114 URI the Setup Script's "DHCP Option
-    114" chunk configures) to discover *where* the captive portal is,
-    without relying on the older, unreliable heuristic of noticing an
-    HTTP connectivity-check probe got intercepted. No RequirePermission/
-    CurrentUser, same reasoning as resolve_captive_portal_config above --
-    this is fetched by an unauthenticated guest device, before it has any
-    platform identity at all.
-
-    `portal_url` is supplied by the caller (this platform's own Setup
-    Script, baking in this router's real hotspot address at script-
-    generation time) rather than looked up from a stored field -- no
-    domain object here persists a router's LAN/hotspot IP today, and
-    round-tripping it through the DHCP option's own URL avoids adding
-    one just for this. The device's OS itself then opens `user-portal-url`
-    (which is always the router's own local hotspot address -- reachable
-    without a route to the outside world), so it flows through the exact
-    same $(mac)/$(link-login-only)/$(link-orig) hotspot-side substitution
-    every other entry into this flow already goes through -- this
-    endpoint is a discovery hint, not a second, divergent portal path.
-
-    Uses a bare JSONResponse, not this codebase's ApiResponse envelope --
-    RFC 8908 defines this exact response shape and the
-    `application/captive+json` media type; wrapping it in a
-    success/message/data envelope would make it a non-conformant response
-    the OS's own captive-portal-detection client can't parse.
-
-    ## `portal_url` is validated and REBUILT, never reflected
-
-    The paragraph above describes the intended caller. Nothing enforced
-    that it was the actual one: the parameter went straight into
-    `user-portal-url`, and a conforming OS *opens that URL by itself* off
-    a DHCP lease -- no link, no click. `validate_user_portal_url` closes
-    that by allowlisting this platform's own hotspot name and returning a
-    URL it constructed, so the caller's bytes never reach the response.
-    See that function's docstring for why check-then-reflect is not
-    equivalent.
-
-    ## `no-store`, not `private`
-
-    `private` still permits a cache; it only forbids a *shared* one. This
-    document's whole job is to be re-fetched -- RFC 8908 clients poll the
-    API to find out whether they are STILL captive, and that is the one
-    question a cached copy always answers wrongly. `captive` is a literal
-    `True` here today (deliberately: making it real is blocked on whether
-    the router can serve this document itself), and when that changes, a
-    client holding a cached `True` would keep showing the portal and the
-    fix would look like it had not shipped. Shipping `no-store` ahead of
-    that is what makes the later change observable."""
-    return JSONResponse(
-        content={
-            "captive": True,
-            "user-portal-url": validate_user_portal_url(portal_url),
-        },
-        media_type="application/captive+json",
-        headers={"Cache-Control": "no-store"},
     )
 
 

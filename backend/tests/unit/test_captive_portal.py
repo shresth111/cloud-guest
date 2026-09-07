@@ -62,7 +62,7 @@ from app.domains.captive_portal.html_sanitizer import (
     sanitize_stylesheet,
 )
 from app.domains.captive_portal.models import CaptivePortalConfig
-from app.domains.captive_portal.router import _config_response, captive_portal_api
+from app.domains.captive_portal.router import _config_response
 from app.domains.captive_portal.service import (
     CaptivePortalService,
     PoweredByAttributionResetService,
@@ -3770,9 +3770,17 @@ class TestPostLoginHtmlServiceWiring:
 
 
 class TestRfc8908UserPortalUrl:
-    """``portal_url`` is reflected into a document a conforming OS opens by
+    """``portal_url`` was reflected into a document a conforming OS opens by
     itself off a DHCP lease, so the allowlist here is a security boundary
     rather than input hygiene -- see ``validate_user_portal_url``.
+
+    **The endpoint this guarded is gone** (the RFC 8908 route was retired
+    once the Master Console generator stopped advertising it), so
+    ``validate_user_portal_url`` currently has no production caller. Kept
+    with its tests rather than deleted in the same change: it is the vetted
+    allowlist for any future per-router ``user-portal-url``, and removing a
+    security boundary is a separate review from removing a dead route. If
+    nothing has claimed it by the time the fleet is swept, delete both.
 
     The accept cases pin the *rebuilt* value, not merely a 200: the whole
     design is that the caller's bytes never reach the response, and a test
@@ -3873,28 +3881,3 @@ class TestRfc8908UserPortalUrl:
             f"{HOTSPOT_DNS_NAME}/"
         )
 
-
-class TestRfc8908Response:
-    """The document itself: media type, cache directive, and the fact that
-    ``user-portal-url`` carries the rebuilt value."""
-
-    async def test_serves_a_conformant_captive_json_document(self) -> None:
-        response = await captive_portal_api(portal_url=f"http://{HOTSPOT_DNS_NAME}/")
-        assert response.media_type == "application/captive+json"
-        body = json.loads(response.body)
-        assert body["captive"] is True
-        assert body["user-portal-url"] == f"http://{HOTSPOT_DNS_NAME}/"
-
-    async def test_is_not_cacheable_at_all(self) -> None:
-        """``private`` only forbids a *shared* cache, and this document's
-        entire job is to be re-fetched -- an RFC 8908 client polls it to
-        learn whether it is STILL captive, which is the one question a
-        cached copy always answers wrongly."""
-        response = await captive_portal_api(portal_url=f"http://{HOTSPOT_DNS_NAME}/")
-        assert response.headers["Cache-Control"] == "no-store"
-
-    async def test_a_hostile_portal_url_never_reaches_the_document(self) -> None:
-        """The reason this endpoint is worth hardening: a conforming OS
-        opens ``user-portal-url`` by itself, with no click to withhold."""
-        with pytest.raises(InvalidUserPortalUrlError):
-            await captive_portal_api(portal_url="http://evil.example/")
