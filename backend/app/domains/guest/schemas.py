@@ -534,6 +534,14 @@ class GuestLastEndedSessionResponse(BaseModel):
 
     reason: GuestSessionEndedReason
     session_timeout_minutes: int | None = None
+    # Venue policy, on the identical footing as ``session_timeout_minutes``
+    # above and safe for the same reason: every guest at the location gets
+    # the same number, so it discloses nothing about this guest. It earns
+    # its place by turning "you were disconnected" into "this venue signs
+    # out devices after 15 minutes of inactivity", which is the difference
+    # between a guest thinking the WiFi is broken and a guest understanding
+    # what happened.
+    idle_timeout_minutes: int | None = None
 
 
 class GuestResponse(BaseModel):

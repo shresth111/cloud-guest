@@ -639,6 +639,7 @@ async def guest_last_ended_session(
             GuestLastEndedSessionResponse(
                 reason=result.reason,
                 session_timeout_minutes=result.session_timeout_minutes,
+                idle_timeout_minutes=result.idle_timeout_minutes,
             ).model_dump()
             if result
             else None
@@ -2115,6 +2116,25 @@ async def radius_authorize(
     if result.authorized:
         if result.session_timeout_seconds is not None:
             reply["Session-Timeout"] = result.session_timeout_seconds
+        # RFC 2865 s5.28, attribute 28. RouterOS reads this on a hotspot
+        # Access-Accept and applies it to that session in preference to the
+        # user profile's own ``idle-timeout`` -- which is the whole point of
+        # sending it, because until now the profile was the ONLY thing that
+        # decided, and the venue's own setting reached the device by no path
+        # at all. A router set up by Master console carries 30m there; one
+        # provisioned before that constant existed carries RouterOS's
+        # factory ``none``. Two venues with identical dashboard settings
+        # therefore behaved differently, and neither behaved as configured.
+        #
+        # Omitted, never sent as 0, when the session has no recorded idle
+        # timeout. RFC 2865 gives 0 no "unlimited" meaning for this
+        # attribute, so a 0 would be a guess about NAS behaviour -- and the
+        # plausible readings of it include "disconnect immediately", which
+        # would lock every guest out. Absence is the one encoding whose
+        # meaning is certain: the NAS falls back to its own profile, exactly
+        # as it did before this line existed.
+        if result.idle_timeout_seconds is not None:
+            reply["Idle-Timeout"] = result.idle_timeout_seconds
         if result.rate_limit is not None:
             reply["Mikrotik-Rate-Limit"] = result.rate_limit
         # Without this, RouterOS's hotspot profile (radius-interim-update

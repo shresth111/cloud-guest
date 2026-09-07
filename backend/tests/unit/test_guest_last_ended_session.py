@@ -37,6 +37,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.domains.guest.constants import (
+    DEFAULT_IDLE_TIMEOUT_MINUTES,
     LAST_ENDED_SESSION_WINDOW_MINUTES,
     GuestAuthMethod,
     GuestSessionEndedReason,
@@ -195,23 +196,27 @@ class TestWhichEndingsAGuestIsToldAbout:
             "fup_data_quota_exceeded_daily",
             "fup_data_quota_exceeded_weekly",
             "fup_data_quota_exceeded_monthly",
-            "fup_time_quota_exceeded_daily",
-            "fup_time_quota_exceeded_weekly",
-            "fup_time_quota_exceeded_monthly",
         ],
     )
-    async def test_quota_exhaustion_is_not_reported_as_a_timeout(
+    async def test_data_quota_exhaustion_is_not_reported_as_a_timeout(
         self, disconnect_reason: str
     ) -> None:
-        """``EXPIRED`` is written for four different things, and only one
-        of them is a timeout. A guest who has used up their data
+        """``EXPIRED`` is written for several different things, and only
+        some of them are about time. A guest who has used up their DATA
         allowance has not run out of *time*, and telling them to sign in
         again sends them round a loop that ends the same way. They get
         the ordinary sign-in page, where the quota is enforced and
         explained properly.
 
         This is why the mapping matches ``inactivity_timeout`` exactly
-        rather than keying off the status alone."""
+        rather than keying off the status alone.
+
+        The three ``fup_time_quota_exceeded_*`` reasons used to be in this
+        list and now have their own test below. They left because they
+        became tellable -- a daily time limit is now a real, enforced
+        setting with a true sentence to say about it. These four stayed
+        because a data limit still is not: the "Add a data limit" control
+        remains unenforced and still says so on its face."""
         fx = make_fixture()
         login = await _login(fx)
         await _end(
@@ -227,6 +232,55 @@ class TestWhichEndingsAGuestIsToldAbout:
             )
             is None
         )
+
+    @pytest.mark.parametrize(
+        "disconnect_reason",
+        [
+            "fup_time_quota_exceeded_daily",
+            "fup_time_quota_exceeded_weekly",
+            "fup_time_quota_exceeded_monthly",
+        ],
+    )
+    async def test_a_spent_time_allowance_is_told_apart_from_a_timeout(
+        self, disconnect_reason: str
+    ) -> None:
+        """A guest who has spent the venue's daily connected-time
+        allowance and a guest whose session timed out are both EXPIRED,
+        and they need opposite advice.
+
+        The timed-out guest can sign straight back in. This one cannot --
+        ``_enforce_fup_quota`` refuses the very next login until the
+        period rolls over -- so showing them "sign in again to carry on"
+        would walk them into a refusal with no explanation. They get their
+        own reason so the portal can say something true instead.
+
+        These three reasons used to return ``None`` (the guest was told
+        nothing) and were parametrized into
+        ``test_data_quota_exhaustion_is_not_reported_as_a_timeout``. They
+        moved here because they became tellable: a daily time limit is now
+        something the dashboard can set and this platform enforces
+        end-to-end, so there is a true sentence to say. The data-quota
+        reasons stayed behind, silent, because there still is not one.
+
+        Asserted as "not TIMED_OUT" as well as "is TIME_LIMIT_REACHED",
+        because collapsing the two back together is the regression this
+        guards."""
+        fx = make_fixture()
+        login = await _login(fx)
+        await _end(
+            fx,
+            login.session,
+            status=GuestSessionStatus.EXPIRED.value,
+            disconnect_reason=disconnect_reason,
+        )
+
+        result = await fx.guest_service.get_last_ended_session_for_device(
+            router_id=fx.router.id, device_mac=_MAC
+        )
+
+        assert result is not None
+        assert result.reason is GuestSessionEndedReason.TIME_LIMIT_REACHED
+        assert result.reason is not GuestSessionEndedReason.TIMED_OUT
 
     async def test_an_unknown_future_expired_reason_is_not_reported(self) -> None:
         """The mapping is an allowlist and fails closed. Whoever adds the
@@ -506,9 +560,17 @@ class TestItTellsAStrangerNothingAboutTheGuest:
         return GuestLastEndedSessionResponse(
             reason=result.reason,
             session_timeout_minutes=result.session_timeout_minutes,
+            idle_timeout_minutes=result.idle_timeout_minutes,
         ).model_dump(mode="json")
 
-    async def test_the_response_has_exactly_two_fields(self) -> None:
+    async def test_the_response_has_exactly_three_fields(self) -> None:
+        """Was two. ``idle_timeout_minutes`` is the third, and it had to
+        clear the same bar the other two did rather than being waved
+        through: it is venue policy, identical for every guest at the
+        location, so a stranger holding an observed MAC learns nothing
+        about the guest from it. The count is asserted exactly -- not
+        ``>= 3`` -- because the point of this test is that widening the
+        response is a decision somebody has to come here and make."""
         fx = make_fixture()
         login = await _login(fx)
         await _end(
@@ -518,7 +580,11 @@ class TestItTellsAStrangerNothingAboutTheGuest:
             disconnect_reason="inactivity_timeout",
         )
 
-        assert set(await self._payload(fx)) == {"reason", "session_timeout_minutes"}
+        assert set(await self._payload(fx)) == {
+            "reason",
+            "session_timeout_minutes",
+            "idle_timeout_minutes",
+        }
 
     async def test_it_never_carries_the_guests_identifier(self) -> None:
         """The identifier is the guest's real, unmasked phone number --
@@ -573,12 +639,22 @@ class TestItTellsAStrangerNothingAboutTheGuest:
         assert "ended_at" not in payload
         assert "started_at" not in payload
 
-    async def test_the_reason_is_one_of_two_closed_values(self) -> None:
+    async def test_the_reason_is_one_of_four_closed_values(self) -> None:
         """No caller-, operator- or NAS-authored string can travel
         through ``reason``, because the only values it can hold are the
-        two written in this repository's own source."""
+        four written in this repository's own source.
+
+        Was two. The vocabulary grew, and the guarantee this test exists
+        to defend did not change with it: ``reason`` is still *derived*
+        by comparing ``disconnect_reason`` against literals owned by this
+        repository, and the column's own free-text contents still never
+        reach a guest. Pinned as an exact set so that adding a member is
+        a deliberate edit here, with that argument re-made, rather than
+        something a mapping change can do on its own."""
         assert {r.value for r in GuestSessionEndedReason} == {
             "timed_out",
+            "idle_timed_out",
+            "time_limit_reached",
             "disconnected",
         }
 
@@ -828,11 +904,23 @@ class TestTheRouterDropReachesTheScreen:
         assert result is not None
         assert result.reason is GuestSessionEndedReason.TIMED_OUT
 
-    async def test_an_idle_timeout_stop_reads_as_disconnected(self) -> None:
-        """RouterOS's hotspot profile carries its own `idle-timeout`,
-        independent of anything this platform sends. "Your device went
-        quiet" is what the generic copy already describes well, and it is
-        not the venue's time limit."""
+    async def test_an_idle_timeout_stop_reads_as_its_own_reason(self) -> None:
+        """This test used to assert DISCONNECTED, on the reasoning that
+        "RouterOS's hotspot profile carries its own `idle-timeout`,
+        independent of anything this platform sends", so cause 4 reported
+        a number nobody had chosen and the generic copy described it well
+        enough.
+
+        That reasoning was sound and its premise is now false. This
+        platform sends ``Idle-Timeout`` on every Access-Accept, from the
+        venue's own SESSION policy, so cause 4 now reports the venue's own
+        setting firing. It is a distinct, explicable event, and rolling it
+        into "you were disconnected" would throw away the one fact that
+        explains why a guest who was sitting still got signed out.
+
+        It stays separate from TIMED_OUT for the reason that split exists
+        at all: one guest used all their time, the other used none of it.
+        """
         fx = make_fixture()
         login = await _login(fx)
         await _end(
@@ -847,7 +935,32 @@ class TestTheRouterDropReachesTheScreen:
         )
 
         assert result is not None
-        assert result.reason is GuestSessionEndedReason.DISCONNECTED
+        assert result.reason is GuestSessionEndedReason.IDLE_TIMED_OUT
+        assert result.reason is not GuestSessionEndedReason.TIMED_OUT
+        assert result.reason is not GuestSessionEndedReason.DISCONNECTED
+
+    async def test_an_idle_timeout_stop_reports_the_number_that_ended_it(
+        self,
+    ) -> None:
+        """The reason alone is not enough to write honest copy. "You were
+        signed out for being inactive" invites "after how long?", and the
+        only defensible answer is the value THIS session carried -- not
+        whatever is configured by the time the guest reads the screen."""
+        fx = make_fixture()
+        login = await _login(fx)
+        await _end(
+            fx,
+            login.session,
+            status=GuestSessionStatus.DISCONNECTED.value,
+            disconnect_reason="Idle-Timeout",
+        )
+
+        result = await fx.guest_service.get_last_ended_session_for_device(
+            router_id=fx.router.id, device_mac=_MAC
+        )
+
+        assert result is not None
+        assert result.idle_timeout_minutes == DEFAULT_IDLE_TIMEOUT_MINUTES
 
 
 class TestTheScreenWorksEvenIfTheRouterNeverTellsUs:

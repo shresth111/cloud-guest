@@ -195,6 +195,26 @@ PLATFORM_DEFAULT_RULES: dict[PolicyType, dict[str, Any]] = {
         # without a single policy existing anywhere. ``tests/unit/test_policy
         # .py`` now pins the two together so this cannot drift again quietly.
         "max_concurrent_sessions_per_guest": 20,
+        # Mirrors app.domains.guest.constants.DEFAULT_IDLE_TIMEOUT_MINUTES,
+        # which in turn deliberately matches the value Master console's own
+        # router setup script writes onto RouterOS's built-in ``default``
+        # hotspot user profile.
+        #
+        # Present here rather than left to the reader's own ``.get`` fallback
+        # for the reason the ``max_concurrent_sessions_per_guest`` comment
+        # above spells out: ``resolve_effective_policy`` hands these platform
+        # defaults back as a real ``rules`` dict for every venue with no
+        # SESSION policy assigned -- which is most of them -- so this mirror,
+        # not the guest-side constant, is what production actually reads.
+        # ``tests/unit/test_policy.py`` pins the two together.
+        #
+        # The consequence is deliberate: every Access-Accept now carries an
+        # ``Idle-Timeout``, for every venue, configured or not. A venue that
+        # has never opened the Guest WiFi Limits screen sees no behaviour
+        # change (the number equals what its router was already doing on its
+        # own), but the reply -- not the device's provisioning history --
+        # becomes the thing that decides.
+        "idle_timeout_minutes": 30,
         # Mirrors app.domains.guest.constants
         # .TERMINATION_RECONNECT_COOLDOWN_MINUTES.
         "termination_reconnect_cooldown_minutes": 60,
