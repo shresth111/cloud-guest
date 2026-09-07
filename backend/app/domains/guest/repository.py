@@ -189,6 +189,15 @@ class GuestRepositoryProtocol(Protocol):
 
     async def count_active_sessions_for_guest(self, guest_id: uuid.UUID) -> int: ...
 
+    async def get_latest_ended_session_for_device(
+        self,
+        *,
+        router_id: uuid.UUID,
+        device_id: uuid.UUID,
+        statuses: Sequence[str],
+        ended_after: datetime,
+    ) -> GuestSession | None: ...
+
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]: ...
 
     async def list_active_sessions_for_guest(
@@ -620,6 +629,58 @@ class GuestRepository:
                 "status": GuestSessionStatus.ACTIVE.value,
             }
         )
+
+    async def get_latest_ended_session_for_device(
+        self,
+        *,
+        router_id: uuid.UUID,
+        device_id: uuid.UUID,
+        statuses: Sequence[str],
+        ended_after: datetime,
+    ) -> GuestSession | None:
+        """The most recently ended session this device held on this
+        router, provided it ended after ``ended_after`` and in one of
+        ``statuses`` -- backs the captive portal's "you were
+        disconnected" screen via
+        ``service.GuestService.get_last_ended_session_for_device``.
+
+        Hand-written for the same reason ``list_sessions_in_range`` above
+        is: ``GenericRepository.paginate``'s ``apply_filters`` only emits
+        ``column == value`` / ``column.in_(...)`` and cannot express the
+        ``ended_at >= ended_after`` bound. That bound is not a
+        convenience -- it is the privacy boundary. Doing the window in
+        Python after fetching the newest row would mean the database
+        happily returning a months-old session to anyone holding the MAC,
+        and one refactor later somebody returns it. Here it cannot be
+        skipped by accident.
+
+        ``statuses`` is passed in rather than hardcoded so the caller --
+        which is the thing that has actually reasoned about which
+        lifecycle states a guest may be told about -- stays the single
+        place that decision lives.
+
+        Ordered by ``ended_at`` (never ``started_at``): sessions are
+        append-only history and a device that reconnected several times
+        can hold rows whose start and end orders differ. The question
+        here is only ever "what ended most recently".
+        """
+        if not statuses:
+            return None
+        statement = (
+            select(GuestSession)
+            .where(
+                GuestSession.router_id == router_id,
+                GuestSession.device_id == device_id,
+                GuestSession.status.in_(list(statuses)),
+                GuestSession.ended_at.isnot(None),
+                GuestSession.ended_at >= ended_after,
+                GuestSession.is_deleted.is_(False),
+            )
+            .order_by(GuestSession.ended_at.desc(), GuestSession.id)
+            .limit(1)
+        )
+        result = await self.session.execute(statement)
+        return result.scalars().first()
 
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]:
         """Active sessions whose ``last_activity_at`` plus their own

@@ -129,6 +129,51 @@ def is_session_timed_out(session: GuestSession, *, now: datetime) -> bool:
     return elapsed_minutes >= session.session_timeout_minutes
 
 
+def has_session_reached_time_limit(session: GuestSession, *, now: datetime) -> bool:
+    """Whether ``session`` has been open, in wall-clock terms, for at
+    least its own ``session_timeout_minutes`` -- measured from
+    ``started_at``, deliberately **not** from ``last_activity_at``.
+
+    This is the same number ``is_session_timed_out`` above reads, and the
+    two mean genuinely different things by it. That is not an accident to
+    be tidied away; it is a real split that this predicate exists to name:
+
+    * ``is_session_timed_out`` measures **idleness** and drives the
+      Celery sweep. Every RADIUS Interim-Update refreshes
+      ``last_activity_at`` (``GuestService.record_usage``), and the
+      Authorize reply asks for one every 300s, so a guest who is actually
+      using the WiFi has that timestamp refreshed indefinitely and the
+      sweep can never expire them. It only ever catches abandoned
+      sessions -- which is a useful thing to catch, and is all it should
+      be relied on for.
+    * ``Session-Timeout``, the RADIUS reply attribute built from the very
+      same column (``RadiusService.authorize``), is absolute elapsed time
+      from the NAS's own session start. RouterOS drops the guest at 30
+      minutes of *being connected*, whatever they were doing.
+
+    So a venue that picks "30 min" in Guest WiFi Limits gets two
+    mechanisms that disagree: the router cuts a busy guest off at 30
+    minutes and the platform's own records say the session is still
+    ACTIVE. This predicate takes the **router's** meaning, because that is
+    the one a guest actually experiences and the one the operator meant:
+    the dropdown says "Re-authenticate after this much time", not "after
+    this much silence".
+
+    It is used at the three places where the platform's answer must match
+    what the network already did -- the two guest-facing session reads and
+    the Authorize reply -- so that a guest whose router-side session has
+    run out is never told they are still connected, and is never handed a
+    fresh full timeout for a session that has already spent it.
+
+    ``False`` when no timeout was recorded (an unbounded session), exactly
+    like ``is_session_timed_out``.
+    """
+    if session.session_timeout_minutes is None:
+        return False
+    elapsed_minutes = (now - session.started_at).total_seconds() / 60
+    return elapsed_minutes >= session.session_timeout_minutes
+
+
 def is_quota_exceeded(session: GuestSession) -> bool:
     """Whether ``session``'s cumulative ``bytes_uploaded +
     bytes_downloaded`` has reached or exceeded its own ``data_limit_mb`` --

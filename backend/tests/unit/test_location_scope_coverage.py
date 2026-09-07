@@ -559,6 +559,22 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "dependency resolves them to unconfined rather than 401ing them out of the "
         "portal."
     ),
+    ("GET", "/api/v1/guest/session/last-ended"): (
+        "The read-only twin of `/guest/session/active` above, asked by the portal "
+        "only after that one answers 'no active session', and unauthenticated for "
+        "the identical reason: a guest whose session has just ended holds no roles, "
+        "so there is no confinement to derive, and the strict dependency would drag "
+        "`CurrentUser` in and 401 them out of the portal at exactly the moment the "
+        "screen exists to help them. Being unconfined widens nothing here, and this "
+        "route is deliberately narrower than its twin rather than as wide: it "
+        "returns a closed two-member enum plus the venue's own session-timeout "
+        "setting -- no identifier, no ids, no timestamp, no `disconnect_reason` -- "
+        "and returns null outright for any session an operator terminated, so it "
+        "cannot be used to ask whether a MAC is blocked at a venue. The most a "
+        "caller holding a MAC they do not own can learn is that some session on "
+        "that device ended within LAST_ENDED_SESSION_WINDOW_MINUTES, which is "
+        "strictly less than `/session/active` already discloses for a live one."
+    ),
     ("POST", "/api/v1/guest/session/disconnect"): (
         "A guest acting on their own session, before or during login. They hold no "
         "roles, so there is no confinement to derive; the anonymous-tolerant "
