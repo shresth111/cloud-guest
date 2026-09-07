@@ -3351,6 +3351,84 @@ class GuestService:
             update_data["device_name"] = device_name
         return await self.repository.update_device(device, update_data)
 
+    async def adopt_nas_asserted_device(
+        self, *, session: GuestSession, mac_address: str
+    ) -> GuestSession:
+        """Attach a ``GuestDevice`` to a session that was created without
+        one, using a MAC the **NAS itself asserted**.
+
+        ## The defect this exists to close
+
+        ``device_mac`` is optional on the OTP/voucher/password login
+        schemas -- deliberately, and in three places at once:
+        ``GuestPinLoginRequest`` documents that its own ``device_mac`` is
+        required "unlike every other login request schema's";
+        ``_find_reusable_active_session`` documents the MAC-less case
+        explicitly; and the captive portal's ``mac`` search param is
+        optional because a stale bookmark, a hand-typed URL or a cropped
+        QR code really does arrive without RouterOS's ``$(mac)``
+        substitution. So a session with ``device_id IS NULL`` is a
+        supported outcome, not corruption.
+
+        What was **not** supported is what happened to it afterwards.
+        Three separate consumers key on ``device_id`` and each one skips a
+        NULL silently:
+
+        1. ``get_active_session_for_device`` -- the captive portal's only
+           "are you already connected?" check. It resolves a MAC to a
+           device row and filters sessions on ``device_id``, so a session
+           with none can never be returned, at any point in its life. The
+           guest is online, the session is ``ACTIVE``, and the portal
+           shows them the sign-in form anyway.
+        2. ``_find_reusable_active_session`` -- returns ``None`` for a
+           NULL ``device_id``, so the next login inserts a second row
+           rather than reusing the first.
+        3. ``app.domains.router_agent``'s ``/agent/authorized-macs`` --
+           ``if session.device_id is None: continue``, so the session
+           contributes no MAC to the router's ip-binding bypass list.
+
+        Confirmed live: one guest, one iPhone, two OTP verifications 2m44s
+        apart, because the session created by the first was invisible to
+        the check that would have shown it to them.
+
+        ## Why healing here, and not refusing the login
+
+        Refusing a MAC-less login would turn "you occasionally sign in
+        twice" into "guests on a link without ``$(mac)`` can never sign in
+        at all" -- a documented, supported case, regressed into a hard
+        failure. Widening the lookup is not available either: a session
+        with no device stores no MAC anywhere, so there is no column to
+        match ``get_active_session_for_device``'s ``device_mac`` against
+        and no join path to one; and the portal, on a fresh load, knows
+        nothing else about the guest to key on (the identifier is what it
+        is about to ask for).
+
+        That leaves backfilling, and there is exactly one trustworthy
+        later source of the MAC: RFC 2865 Section 5.31
+        ``Calling-Station-Id``, asserted by an already
+        shared-secret-authenticated NAS at Authorize time. This module's
+        own ``RadiusService.authorize`` docstring makes the argument for
+        why that value -- and only that value -- can be trusted, in the
+        write-up of why ``POST /guest/login/mac`` was removed as an
+        authentication bypass. This method is that argument applied to a
+        session that already exists.
+
+        ## Bounds
+
+        Idempotent: a session that already has a ``device_id`` is returned
+        untouched, so the reauthentication a real NAS sends every few
+        minutes costs one comparison. ``get_or_create_device`` owns the
+        MAC-to-guest reassignment semantics, unchanged. The caller is
+        responsible for never letting a failure here turn a valid
+        authorize into a reject -- see ``RadiusService.authorize``.
+        """
+        if session.device_id is not None:
+            return session
+        device = await self.get_or_create_device(
+            guest_id=session.guest_id, mac_address=mac_address
+        )
+        return await self.repository.update_session(session, {"device_id": device.id})
+
     async def get_active_session_for_device(
         self,
         *,
@@ -6134,6 +6212,36 @@ class RadiusService:
                     session = None
                 else:
                     session = result.session
+
+        if session is not None and session.device_id is None and calling_station_id:
+            # A session created by a login that carried no ``device_mac``
+            # (a supported case -- see ``GuestService
+            # .adopt_nas_asserted_device``) is invisible to the captive
+            # portal's own "already connected?" check, to login dedup, and
+            # to /agent/authorized-macs, all three of which key on
+            # ``device_id``. This is the first and only moment the platform
+            # is told that session's real MAC by something entitled to
+            # assert it, so it is where the row gets healed.
+            #
+            # Never allowed to change the verdict, exactly like
+            # ``_resolve_rate_limit_reply`` below: this is a repair, and a
+            # repair that failed must still leave an authorized guest
+            # authorized. A broad catch is deliberate for the same reason
+            # that method gives -- the alternative is a guest with a
+            # verified OTP and no internet because a device write raced.
+            try:
+                session = await self.guest_service.adopt_nas_asserted_device(
+                    session=session, mac_address=calling_station_id
+                )
+            except Exception as exc:  # noqa: BLE001 -- see comment above
+                logger.warning(
+                    "radius_authorize_device_adoption_failed",
+                    extra={
+                        "event_session_id": str(session.id),
+                        "event_calling_station_id": calling_station_id,
+                        "error": str(exc),
+                    },
+                )
 
         # The Authorize decision is otherwise invisible server-side: this
         # endpoint answers HTTP 200 for both Accept and Reject (the verdict
