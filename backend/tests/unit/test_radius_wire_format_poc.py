@@ -113,7 +113,25 @@ class TestRadiusAuthorizeWireFormat:
 
         # rlm_rest's real attribute names MUST be present.
         assert body.get("control:Auth-Type") == "Accept"
-        assert body.get("Session-Timeout") == DEFAULT_SESSION_TIMEOUT_MINUTES * 60
+        # Not an exact equality. Since the Access-Accept began carrying the
+        # session's REMAINING allowance rather than the full one (#178 -- the
+        # change that made a venue's timeout actually expire, because the NAS
+        # re-authorizes periodically and the old full value reset the clock
+        # every time), this number is `full - elapsed`. Asserting equality
+        # made it a function of how long the test took to run: CI observed
+        # 14398 against an expected 14400 and failed a PR that had touched
+        # nothing near RADIUS.
+        #
+        # What this test is actually for is rlm_rest's ATTRIBUTE NAMES, not
+        # the arithmetic -- that belongs to
+        # test_guest_last_ended_session.py::test_the_reply_carries_remaining_time_not_the_full_allowance.
+        # So pin it tightly enough that a wrong attribute or a wrong unit
+        # (minutes-not-seconds, or some other timeout entirely) still fails,
+        # and loosely enough that the clock cannot.
+        full_seconds = DEFAULT_SESSION_TIMEOUT_MINUTES * 60
+        session_timeout = body.get("Session-Timeout")
+        assert isinstance(session_timeout, int)
+        assert full_seconds - 60 <= session_timeout <= full_seconds
         assert body.get("Acct-Interim-Interval") == 300
 
         # The OLD, silently-discarded-by-rlm_rest generic envelope must be
