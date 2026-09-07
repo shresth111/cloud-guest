@@ -54,6 +54,8 @@ __all__ = [
     "SessionReconnectRequest",
     "GuestDeviceResponse",
     "GuestDeviceListResponse",
+    "VoucherRedemptionResponse",
+    "VoucherRedemptionListResponse",
     "GuestLoginHistoryResponse",
     "GuestLoginHistoryListResponse",
     "GuestSessionResponse",
@@ -357,6 +359,65 @@ class GuestDeviceListResponse(BaseModel):
     items: list[GuestDeviceResponse]
 
 
+class VoucherRedemptionResponse(BaseModel):
+    """What a voucher's **observed** redemption actually looked like on
+    the network -- the device and address the session ran on, resolved
+    through ``GuestSession.voucher_id``.
+
+    This lives in the guest domain, not the voucher domain, on purpose.
+    ``app.domains.voucher.models.Voucher``'s own docstring is explicit
+    that ``redeemed_identifier`` is "not a foreign key" and that the
+    guest module "composes with this one purely through
+    ``VoucherService.redeem_voucher``'s return value, never a shared
+    table or FK". ``guest_sessions.voucher_id`` is the only link that
+    exists, and the guest domain owns that column -- so the resolution
+    is exposed from here and the Vouchers screen batches a call to it,
+    rather than ``voucher/service.py`` reaching into ``guest_sessions``
+    and inverting a dependency direction this codebase deliberately set.
+
+    ## ``redeemed_identifier`` is not in this schema, and that is the point
+
+    ``Voucher.redeemed_identifier`` is whatever the guest typed at the
+    portal -- self-reported, normalized only for whitespace (see
+    ``VoucherService.export_batch_csv``'s own note). ``device_mac`` and
+    ``ip_address`` here are observed by the platform. The two are not
+    equally trustworthy and must not be rendered as though they were, so
+    they are deliberately not merged into one shape: the Vouchers screen
+    already has the self-reported value on its own row and adds these
+    beside it, labelled as observed.
+
+    ``session_count`` exists because a voucher can be multi-use
+    (``VoucherBatch.max_uses_per_voucher``, ``Voucher.use_count``), so
+    one voucher may have many sessions on many devices. The fields here
+    describe the **most recent** session only -- ``session_count`` is
+    what tells the UI not to present that one device as "the" redeemer.
+    A count greater than one is the UI's cue to offer the full list via
+    ``GET /guest-sessions?voucher_id=...`` rather than imply a single
+    device."""
+
+    voucher_id: str
+    session_count: int
+    session_id: str | None
+    guest_id: str | None
+    device_mac: MaskedMac = None
+    ip_address: str | None = None
+    started_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class VoucherRedemptionListResponse(BaseModel):
+    """Bulk voucher-redemption resolution for ``GET
+    /voucher-redemptions``. Mirrors ``GuestDeviceListResponse``'s shape
+    exactly -- a bounded batch lookup keyed by the caller's own
+    ``voucher_ids``, so no pagination envelope, and a voucher with no
+    session at all (never redeemed, or redeemed outside the caller's
+    organization scope) is simply absent from ``items`` rather than an
+    error."""
+
+    items: list[VoucherRedemptionResponse]
+
+
 class GuestLoginHistoryResponse(BaseModel):
     """One ``GuestLoginHistory`` row -- the Login/Access Attempt Log
     report's per-row shape (see ``docs/ipdr-logs-syslog-spec.md``'s v1
@@ -390,9 +451,34 @@ class GuestLoginHistoryListResponse(BaseModel):
 
 
 class GuestSessionResponse(BaseModel):
+    """One ``GuestSession`` row -- the Guest Session Log / Reports
+    per-row shape.
+
+    ``device_mac`` is the human-readable resolution of ``device_id``,
+    denormalized onto this response by ``router._session_response`` from a
+    single bulk device lookup per page (never one query per row -- see
+    ``constants.MAX_BULK_DEVICE_LOOKUP_IDS``'s own docstring for the N+1
+    this codebase already refused to accept). ``device_id`` is kept
+    alongside it, not replaced: it is the stable key existing callers
+    (notably ``GET /guest-devices``) already join on, and removing it
+    would break the Network Activity Log.
+
+    ``None`` means genuinely no device: either the session carries no
+    ``device_id`` at all (a login that never presented a MAC), or the
+    referenced device row is outside the caller's organization scope. It
+    never means "this endpoint forgot to resolve it" -- that was the
+    defect this field exists to close, where the Reports screen had only
+    an opaque UUID to show and so showed nothing.
+
+    ``ip_address`` is the session's own DHCP lease at the time it ran, and
+    is meaningful only within this session -- unlike ``device_mac``, which
+    is a stable property of the device. See ``GuestResponse``'s docstring
+    for why that difference keeps IP off the per-guest Users row."""
+
     id: str
     guest_id: str
     device_id: str | None
+    device_mac: MaskedMac = None
     router_id: str
     location_id: str
     organization_id: str
@@ -547,13 +633,53 @@ class GuestLastEndedSessionResponse(BaseModel):
 class GuestResponse(BaseModel):
     """Admin-/dashboard-facing -- unlike ``GuestLoginResponse``, this is
     exactly the "reception staff sees the dashboard, not raw numbers"
-    view ``app.common.masking`` exists for."""
+    view ``app.common.masking`` exists for.
+
+    ## ``mac_addresses``: all of them, newest-seen first, not "the MAC"
+
+    The ``guests`` table has no MAC column -- a MAC belongs to a
+    ``GuestDevice``, and a guest may own several (``constants
+    .DEFAULT_MAX_DEVICES_PER_GUEST`` is 3, and that is a policy default,
+    not a hard cap, so historical rows can exceed it). There is therefore
+    no single true "the guest's MAC" to denormalize, and inventing one by
+    silently picking a winner would hide the rest at exactly the moment
+    someone is trying to trace a specific device to a person.
+
+    So this is the whole list, ordered ``last_seen_at`` descending by the
+    repository (in SQL, not in Python): ``mac_addresses[0]`` is the
+    guest's current device, which is what a table cell should show, and
+    ``device_count`` tells the UI whether there is a "+N" to offer. An
+    empty list means the guest genuinely has no device on file -- every
+    login that presented a MAC creates one.
+
+    Populated by ``router._guest_response`` from one bulk lookup per
+    page. Defaults are empty rather than required so the schema stays
+    constructible, but every admin-facing route that returns a
+    ``GuestResponse`` passes them; see that helper's own docstring.
+
+    ## Why there is no ``ip_address`` here
+
+    Deliberately absent, and the omission is the decision. A guest row
+    aggregates an identity across all time (``first_seen_at``,
+    ``total_visit_count``); an IP is a per-session DHCP lease off a
+    private range that the router reassigns constantly. The most recent
+    session's IP printed on a guest row would silently mean "whatever
+    they happened to hold last Tuesday" -- and by now very possibly
+    belongs to a different guest entirely. That is worse than an empty
+    column precisely in the case the field would exist for (tracing an
+    abuse report back to a device), because it reads as current fact.
+    A MAC does not have this problem: it is a stable property of the
+    hardware, which is why it *is* denormalized here. Session IPs live on
+    ``GuestSessionResponse``, scoped to the session that actually held
+    them."""
 
     id: str
     organization_id: str
     location_id: str | None
     identifier: MaskedIdentifier
     display_name: MaskedName
+    mac_addresses: list[MaskedMac] = Field(default_factory=list)
+    device_count: int = 0
     first_seen_at: datetime
     last_seen_at: datetime
     total_visit_count: int

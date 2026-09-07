@@ -293,6 +293,7 @@ from .constants import (
     DEFAULT_SESSION_TIMEOUT_MINUTES,
     LAST_ENDED_SESSION_WINDOW_MINUTES,
     MAX_BULK_DEVICE_LOOKUP_IDS,
+    MAX_BULK_VOUCHER_LOOKUP_IDS,
     NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
     PIN_LENGTH,
     PIN_LOCKOUT_MINUTES,
@@ -371,6 +372,7 @@ from .exceptions import (
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
     TooManyDeviceIdsError,
+    TooManyVoucherIdsError,
     VenueClosedError,
 )
 from .models import (
@@ -399,6 +401,7 @@ from .repository import (
     DeviceSessionCount,
     GuestRepositoryProtocol,
     LocationSessionCount,
+    VoucherRedemptionRow,
 )
 from .validators import (
     compute_period_start,
@@ -3487,6 +3490,82 @@ class GuestService:
             )
         return await self.repository.list_devices_by_ids(
             device_ids=device_ids, organization_id=requesting_organization_id
+        )
+
+    async def list_devices_for_session_ids(
+        self,
+        *,
+        device_ids: list[uuid.UUID],
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[GuestDevice]:
+        """Resolve device ids taken from an already-tenant-filtered session
+        list -- backs ``GuestSessionResponse.device_mac``. See
+        ``GuestRepository.list_devices_for_session_ids`` for why this asks
+        a different tenancy question than ``list_devices_by_ids`` above.
+
+        Bounded like its sibling, and for the same reason: the router
+        chunks at ``MAX_BULK_DEVICE_LOOKUP_IDS`` before calling, so this
+        raises only if a future caller forgets to."""
+        if len(device_ids) > MAX_BULK_DEVICE_LOOKUP_IDS:
+            raise TooManyDeviceIdsError(
+                requested=len(device_ids), limit=MAX_BULK_DEVICE_LOOKUP_IDS
+            )
+        return await self.repository.list_devices_for_session_ids(
+            device_ids=device_ids, organization_id=requesting_organization_id
+        )
+
+    async def list_devices_for_guest_ids(
+        self,
+        *,
+        guest_ids: list[uuid.UUID],
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> dict[uuid.UUID, list[GuestDevice]]:
+        """Resolve one page of guests to their devices, grouped by
+        ``guest_id`` and newest-seen first within each group -- backs the
+        ``mac_addresses``/``device_count`` fields on ``GuestResponse``.
+
+        Deliberately takes no ``MAX_BULK_*`` bound of its own, unlike
+        ``list_devices_by_ids`` above. That bound exists because ``GET
+        /guest-devices`` lets an external caller choose the id list.
+        Here the list is one page of ``GET /guests``, already capped at
+        ``page_size <= 100`` by the route signature, so a second bound
+        would be an unreachable branch pretending to be a safeguard.
+
+        Returns a mapping rather than a flat list so the caller does no
+        grouping of its own; the repository's SQL ordering is preserved
+        within each group, which is what lets ``mac_addresses[0]`` mean
+        "the guest's current device" without a Python-side sort."""
+        devices = await self.repository.list_devices_for_guest_ids(
+            guest_ids=guest_ids, organization_id=requesting_organization_id
+        )
+        grouped: dict[uuid.UUID, list[GuestDevice]] = {}
+        for device in devices:
+            grouped.setdefault(device.guest_id, []).append(device)
+        return grouped
+
+    async def list_voucher_redemptions(
+        self,
+        *,
+        voucher_ids: list[uuid.UUID],
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[VoucherRedemptionRow]:
+        """Resolve ``voucher_ids`` to the device/address each was actually
+        redeemed on -- backs ``GET /voucher-redemptions`` for the Vouchers
+        screen. See ``GuestRepository.list_voucher_redemptions`` for the
+        two-hop join, and ``constants.MAX_BULK_VOUCHER_LOOKUP_IDS`` for
+        why this resolution lives in the guest domain rather than the
+        voucher one.
+
+        Raises ``TooManyVoucherIdsError`` rather than truncating, for the
+        identical reason ``list_devices_by_ids`` raises rather than
+        truncating: a silently dropped id renders as an empty cell that
+        is indistinguishable from "never redeemed"."""
+        if len(voucher_ids) > MAX_BULK_VOUCHER_LOOKUP_IDS:
+            raise TooManyVoucherIdsError(
+                requested=len(voucher_ids), limit=MAX_BULK_VOUCHER_LOOKUP_IDS
+            )
+        return await self.repository.list_voucher_redemptions(
+            voucher_ids=voucher_ids, organization_id=requesting_organization_id
         )
 
     async def get_or_create_device(

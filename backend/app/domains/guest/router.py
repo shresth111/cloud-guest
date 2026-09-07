@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 
 import httpx
@@ -60,6 +61,7 @@ from app.domains.wireguard.validators import hub_reserved_ip
 
 from .constants import (
     MAX_BULK_DEVICE_LOOKUP_IDS,
+    MAX_BULK_VOUCHER_LOOKUP_IDS,
     RADIUS_ACCT_STATUS_ACCOUNTING_OFF,
     RADIUS_ACCT_STATUS_ACCOUNTING_ON,
     RADIUS_ACCT_STATUS_INTERIM_UPDATE,
@@ -130,6 +132,8 @@ from .schemas import (
     TopDevicesResponse,
     TopLocationItem,
     TopLocationsResponse,
+    VoucherRedemptionListResponse,
+    VoucherRedemptionResponse,
     VoucherUsageResponse,
 )
 from .service import (
@@ -309,11 +313,20 @@ def _device_response(device: GuestDevice) -> dict[str, object]:
     }
 
 
-def _session_response(session: GuestSession) -> GuestSessionResponse:
+def _session_response(
+    session: GuestSession, *, device_mac: str | None = None
+) -> GuestSessionResponse:
+    """``device_mac`` is passed in, never looked up here, because the only
+    correct way to resolve it for a *list* of sessions is one bulk query
+    for the whole page -- see ``_resolve_session_macs`` below. A helper
+    that fetched its own device would turn every list endpoint into an
+    N+1, which is the exact cost ``constants.MAX_BULK_DEVICE_LOOKUP_IDS``
+    was written to avoid."""
     return GuestSessionResponse(
         id=str(session.id),
         guest_id=str(session.guest_id),
         device_id=str(session.device_id) if session.device_id else None,
+        device_mac=device_mac,
         router_id=str(session.router_id),
         location_id=str(session.location_id),
         organization_id=str(session.organization_id),
@@ -358,13 +371,129 @@ def _nas_response(nas_client: RadiusNasClient) -> RadiusNasResponse:
     )
 
 
-def _guest_response(guest: Guest) -> GuestResponse:
+async def _resolve_session_macs(
+    sessions: Sequence[GuestSession],
+    *,
+    service: GuestService,
+    requesting_organization_id: uuid.UUID | None,
+) -> dict[str, str]:
+    """Resolve one page of sessions' ``device_id``s to MAC addresses in a
+    single query, returning ``{device_id: mac_address}``.
+
+    This is the whole anti-N+1 story for ``GuestSessionResponse
+    .device_mac``: one extra query per page, never one per row. It is
+    also strictly cheaper than the alternative the ``GET /guest-devices``
+    endpoint was built for, which costs a second HTTP round trip per page
+    on top of the same query -- and which, as it turns out, no caller
+    ever actually made, which is why the Reports screen has been showing
+    a blank Device MAC column.
+
+    ``GET /guest-devices`` is deliberately left in place: it is a
+    published endpoint with its own bound and tests, and removing it is a
+    separate decision from fixing the screens.
+
+    De-duplicates ids before querying, so a page where many sessions
+    share one device costs one row in the ``IN (...)``, not one per
+    session -- which is the common case, since a guest reconnecting all
+    day produces many sessions on one device.
+
+    Chunked at ``MAX_BULK_DEVICE_LOOKUP_IDS`` rather than passed straight
+    through, because not every caller is page-bounded: ``GET
+    /guests/{id}`` resolves a guest's *entire* session history
+    (``get_guest_sessions`` takes ``limit=None``). Handing that to the
+    service unchunked would raise ``TooManyDeviceIdsError`` and turn a
+    working detail endpoint into a 400 for the platform's heaviest-using
+    guests. The bound is there to
+    stop an external caller sending an unbounded ``IN (...)``; it is not
+    a reason to fail on an id list this module derived itself, so this
+    respects the bound by splitting rather than by refusing."""
+    device_ids = list(
+        {session.device_id for session in sessions if session.device_id is not None}
+    )
+    if not device_ids:
+        return {}
+    macs: dict[str, str] = {}
+    for start in range(0, len(device_ids), MAX_BULK_DEVICE_LOOKUP_IDS):
+        chunk = device_ids[start : start + MAX_BULK_DEVICE_LOOKUP_IDS]
+        # Scoped through the SESSION's organization, not the device's
+        # current owner -- see GuestRepository.list_devices_for_session_ids
+        # for why that difference matters for a guest who visits two
+        # venues on different organizations.
+        devices = await service.list_devices_for_session_ids(
+            device_ids=chunk,
+            requesting_organization_id=requesting_organization_id,
+        )
+        macs.update({str(device.id): device.mac_address for device in devices})
+    return macs
+
+
+def _session_responses(
+    sessions: Sequence[GuestSession], macs: dict[str, str]
+) -> list[GuestSessionResponse]:
+    """Zip a page of sessions with an already-resolved MAC map. A session
+    whose device is absent from ``macs`` (no ``device_id``, or a device
+    outside the caller's organization scope) gets ``None`` -- an honest
+    "no device on record", never a fabricated or borrowed address."""
+    return [
+        _session_response(
+            s, device_mac=macs.get(str(s.device_id)) if s.device_id else None
+        )
+        for s in sessions
+    ]
+
+
+async def _session_response_resolved(
+    session: GuestSession,
+    *,
+    service: GuestService,
+    requesting_organization_id: uuid.UUID | None,
+) -> GuestSessionResponse:
+    """Single-session variant of ``_session_responses`` for the admin
+    session-mutation endpoints (disconnect/terminate/pause/resume/
+    extend/reconnect) and ``GET /guest-sessions/{id}``.
+
+    One session means one device, so there is no N+1 to avoid here --
+    it is one bounded lookup. These are wired up not because an action
+    acknowledgement needs a MAC, but because the frontend reuses one
+    session type across list and detail responses: leaving ``device_mac``
+    absent on exactly these seven routes would put a field on the type
+    that is silently null depending on which endpoint filled it, which is
+    the same "looks empty, is actually unresolved" trap the whole change
+    is closing."""
+    macs = await _resolve_session_macs(
+        [session],
+        service=service,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return _session_response(
+        session,
+        device_mac=macs.get(str(session.device_id)) if session.device_id else None,
+    )
+
+
+def _guest_response(
+    guest: Guest, *, devices: Sequence[GuestDevice] | None = None
+) -> GuestResponse:
+    """``devices`` is this guest's own device rows, newest-seen first, as
+    grouped by ``GuestService.list_devices_for_guest_ids`` -- passed in
+    from one bulk query per page for the same anti-N+1 reason
+    ``_session_response`` takes its MAC as an argument.
+
+    Passing ``None`` yields an empty ``mac_addresses`` and a
+    ``device_count`` of 0. That is correct only where the caller has
+    genuinely not resolved devices; every admin-facing route that returns
+    a ``GuestResponse`` does resolve them, precisely so no screen renders
+    a blank MAC cell that looks like missing data but is really a missing
+    join."""
+    device_list = list(devices or [])
     return GuestResponse(
         id=str(guest.id),
         organization_id=str(guest.organization_id),
         location_id=str(guest.location_id) if guest.location_id else None,
         identifier=guest.identifier,
         display_name=guest.display_name,
+        mac_addresses=[d.mac_address for d in device_list],
+        device_count=len(device_list),
         first_seen_at=guest.first_seen_at,
         last_seen_at=guest.last_seen_at,
         total_visit_count=guest.total_visit_count,
@@ -784,6 +913,10 @@ async def guest_disconnect_own_session(
     return build_response(
         success=True,
         message="Disconnected",
+        # Guest-facing: no CurrentOrganization to scope a device lookup
+        # by, and this is the guest's own disconnect acknowledgement --
+        # not an admin display surface. device_mac stays None here by
+        # design, not by omission.
         data=_session_response(session).model_dump(),
         request_id=_request_id(request),
     )
@@ -859,8 +992,14 @@ async def list_guests(
         page=page,
         page_size=page_size,
     )
+    devices_by_guest = await service.list_devices_for_guest_ids(
+        guest_ids=[g.id for g in guests],
+        requesting_organization_id=requesting_organization_id,
+    )
     payload = GuestListResponse(
-        items=[_guest_response(g) for g in guests],
+        items=[
+            _guest_response(g, devices=devices_by_guest.get(g.id, [])) for g in guests
+        ],
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,
@@ -894,9 +1033,19 @@ async def get_guest(
     sessions = await service.get_guest_sessions(
         guest_id, requesting_organization_id=requesting_organization_id
     )
+    devices_by_guest = await service.list_devices_for_guest_ids(
+        guest_ids=[guest.id],
+        requesting_organization_id=requesting_organization_id,
+    )
+    macs = await _resolve_session_macs(
+        sessions,
+        service=service,
+        requesting_organization_id=requesting_organization_id,
+    )
+    guest_payload = _guest_response(guest, devices=devices_by_guest.get(guest.id, []))
     payload = GuestDetailResponse(
-        **_guest_response(guest).model_dump(),
-        sessions=[_session_response(s) for s in sessions],
+        **guest_payload.model_dump(),
+        sessions=_session_responses(sessions, macs),
     )
     return build_response(
         success=True,
@@ -926,10 +1075,16 @@ async def block_guest(
         requesting_organization_id=requesting_organization_id,
         reason=payload.reason,
     )
+    devices_by_guest = await service.list_devices_for_guest_ids(
+        guest_ids=[guest.id],
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message="Guest blocked",
-        data=_guest_response(guest).model_dump(),
+        data=_guest_response(
+            guest, devices=devices_by_guest.get(guest.id, [])
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -952,10 +1107,16 @@ async def unblock_guest(
         guest_id=guest_id,
         requesting_organization_id=requesting_organization_id,
     )
+    devices_by_guest = await service.list_devices_for_guest_ids(
+        guest_ids=[guest.id],
+        requesting_organization_id=requesting_organization_id,
+    )
     return build_response(
         success=True,
         message="Guest unblocked",
-        data=_guest_response(guest).model_dump(),
+        data=_guest_response(
+            guest, devices=devices_by_guest.get(guest.id, [])
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1018,8 +1179,13 @@ async def list_guest_sessions(
             page=page,
             page_size=page_size,
         )
+    macs = await _resolve_session_macs(
+        sessions,
+        service=service,
+        requesting_organization_id=requesting_organization_id,
+    )
     payload = GuestSessionListResponse(
-        items=[_session_response(s) for s in sessions],
+        items=_session_responses(sessions, macs),
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,
@@ -1069,6 +1235,73 @@ async def list_guest_devices(
     return build_response(
         success=True,
         message="Guest devices retrieved",
+        data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@admin_router.get(
+    "/voucher-redemptions",
+    response_model=ApiResponse[VoucherRedemptionListResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("guest_sessions.read"))],
+)
+async def list_voucher_redemptions(
+    request: Request,
+    voucher_ids: list[uuid.UUID] = Query(
+        ...,
+        description=(
+            "Bulk-resolve up to "
+            f"{MAX_BULK_VOUCHER_LOOKUP_IDS} voucher IDs (e.g. a page of the "
+            "Vouchers screen) to the device and address each was actually "
+            "redeemed on, in one call. A voucher with no session -- never "
+            "redeemed, or redeemed outside the caller's own organization -- "
+            "is simply absent from the response rather than an error."
+        ),
+    ),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: GuestService = Depends(get_guest_service),
+):
+    """Resolve vouchers to their **observed** redemption facts.
+
+    Gated on ``guest_sessions.read``, not a voucher permission, and that
+    is deliberate: everything this returns is guest-session data (the
+    device, the address, when the session ran). A caller who may list
+    vouchers but not read guest sessions must not get session details
+    through a voucher-shaped door.
+
+    Lives on the guest router rather than the voucher router for the
+    reason ``app.domains.voucher.models.Voucher`` documents: the voucher
+    domain deliberately holds no FK to a guest, device or session, and
+    ``guest_sessions.voucher_id`` -- the only link -- is this domain's
+    column. The Vouchers screen batches a call here rather than the
+    voucher service reaching across the boundary.
+
+    Note what is *not* here: ``Voucher.redeemed_identifier``. That value
+    is self-reported by the guest at the portal; these are observed by
+    the platform. Keeping them in separate responses is what stops a UI
+    presenting them as equally trustworthy facts on one row."""
+    rows = await service.list_voucher_redemptions(
+        voucher_ids=voucher_ids,
+        requesting_organization_id=requesting_organization_id,
+    )
+    payload = VoucherRedemptionListResponse(
+        items=[
+            VoucherRedemptionResponse(
+                voucher_id=str(row.voucher_id),
+                session_count=row.session_count,
+                session_id=str(row.session_id),
+                guest_id=str(row.guest_id),
+                device_mac=row.device_mac,
+                ip_address=row.ip_address,
+                started_at=row.started_at,
+            )
+            for row in rows
+        ]
+    )
+    return build_response(
+        success=True,
+        message="Voucher redemptions retrieved",
         data=payload.model_dump(),
         request_id=_request_id(request),
     )
@@ -1161,7 +1394,13 @@ async def get_guest_session(
     return build_response(
         success=True,
         message="Guest session retrieved",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1189,7 +1428,13 @@ async def disconnect_guest_session(
     return build_response(
         success=True,
         message="Guest session disconnected",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1217,7 +1462,13 @@ async def terminate_guest_session(
     return build_response(
         success=True,
         message="Guest session terminated",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1245,7 +1496,13 @@ async def pause_guest_session(
     return build_response(
         success=True,
         message="Guest session paused",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1271,7 +1528,13 @@ async def resume_guest_session(
     return build_response(
         success=True,
         message="Guest session resumed",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1299,7 +1562,13 @@ async def extend_guest_session(
     return build_response(
         success=True,
         message="Guest session extended",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -1328,7 +1597,13 @@ async def reconnect_guest_session(
     return build_response(
         success=True,
         message="Guest session reconnected",
-        data=_session_response(session).model_dump(),
+        data=(
+            await _session_response_resolved(
+                session,
+                service=service,
+                requesting_organization_id=requesting_organization_id,
+            )
+        ).model_dump(),
         request_id=_request_id(request),
     )
 

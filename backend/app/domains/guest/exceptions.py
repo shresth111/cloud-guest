@@ -46,6 +46,7 @@ __all__ = [
     "InvalidNasStatusTransitionError",
     "InvalidAnalyticsDateRangeError",
     "TooManyDeviceIdsError",
+    "TooManyVoucherIdsError",
     "ConcurrentSessionLimitExceededError",
     "GuestDeviceLimitExceededError",
     "FairUsagePolicyExceededError",
@@ -436,6 +437,26 @@ class TooManyDeviceIdsError(GuestError):
             f"of {limit} allowed per request",
             status_code=status.HTTP_400_BAD_REQUEST,
             data={"max_device_ids": limit},
+        )
+
+
+class TooManyVoucherIdsError(GuestError):
+    """Raised by ``GET /voucher-redemptions`` when a caller passes more
+    ``voucher_ids`` than the endpoint accepts in one request. The exact
+    sibling of ``TooManyDeviceIdsError`` above, and it exists for the
+    same reason: silently truncating to the first ``limit`` ids would
+    leave a Vouchers page's later rows showing no device at all, with
+    nothing to distinguish "this voucher was never redeemed" from "your
+    request was too big and we quietly dropped it" -- which is exactly
+    the class of silent blank this whole change set is fixing."""
+
+    def __init__(self, *, requested: int, limit: int) -> None:
+        self.limit = limit
+        super().__init__(
+            f"Requested {requested} voucher_ids, which exceeds the maximum "
+            f"of {limit} allowed per request",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={"max_voucher_ids": limit},
         )
 
 
