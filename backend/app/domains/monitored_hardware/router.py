@@ -70,6 +70,7 @@ def _device_response(item: HardwareWithStatus) -> MonitoredHardwareResponse:
         floor=device.floor,
         status=item.status.value,
         last_seen_at=item.last_seen_at,
+        connected_at=item.connected_at,
         created_at=device.created_at,
     )
 
