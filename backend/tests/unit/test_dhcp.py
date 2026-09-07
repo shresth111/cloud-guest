@@ -1917,3 +1917,92 @@ class TestCaptivePortalDhcpOptionSweepTargets:
         assert celery_app.conf.task_routes[
             TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER
         ] == {"queue": DEVICE_IO_QUEUE_NAME}
+
+
+class TestCaptivePortalDhcpOptionLeafReachability:
+    """``reachable`` in a leaf's result must mean "the router answered".
+
+    The 2026-09-06 removal run against the one real router reported::
+
+        {'changed': False, 'reachable': False,
+         'detail': 'Router rejected remove_dhcp_option: ...'}
+
+    The router was plainly reachable -- it was read over the same API
+    connection immediately before and after. "Router rejected" *is* the
+    router answering. Reporting that as unreachable sends whoever reads it
+    hunting a network fault instead of reading the rejection the device
+    actually gave, and it makes a fleet sweep's reachable-count a
+    fiction.
+    """
+
+    @staticmethod
+    def _run_leaf(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> dict:
+        import asyncio
+
+        from app.domains.dhcp import tasks
+
+        class _Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def commit(self):
+                return None
+
+            async def rollback(self):
+                return None
+
+        class _Service:
+            async def converge_captive_portal_dhcp_option_for_router(
+                self, router_id, *, present
+            ):
+                raise exc
+
+        monkeypatch.setattr(tasks, "SessionLocal", lambda: _Session())
+        monkeypatch.setattr(tasks, "_build_dhcp_service", lambda session: _Service())
+        return asyncio.run(
+            tasks._converge_captive_portal_dhcp_option_async(
+                uuid.uuid4(), present=False
+            )
+        )
+
+    def test_a_router_that_answered_and_refused_is_reachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result = self._run_leaf(
+            monkeypatch,
+            DhcpDeviceOperationError(
+                "remove_dhcp_option",
+                "delete_dhcp_option: input does not match any value of value-name",
+            ),
+        )
+
+        assert result["reachable"] is True
+        assert result["changed"] is False
+        assert "Router rejected" in result["detail"]
+
+    def test_a_router_that_could_not_be_dialled_is_unreachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of the distinction. If this ever stops being
+        False, the flag has become a constant and means nothing."""
+        result = self._run_leaf(
+            monkeypatch, DhcpDeviceConnectionError("10.20.0.19", "timed out")
+        )
+
+        assert result["reachable"] is False
+        assert result["changed"] is False
+
+    def test_changed_stays_false_either_way(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The one thing the shipped version got right: a failed removal
+        reports ``changed: False`` instead of claiming success. Fixing
+        ``reachable`` must not cost that."""
+        for exc in (
+            DhcpDeviceOperationError("remove_dhcp_option", "nope"),
+            DhcpDeviceConnectionError("10.20.0.19", "timed out"),
+        ):
+            assert self._run_leaf(monkeypatch, exc)["changed"] is False

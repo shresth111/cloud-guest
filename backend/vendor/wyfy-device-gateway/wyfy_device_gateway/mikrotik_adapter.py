@@ -76,7 +76,7 @@ import re
 import shlex
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import asyncssh
 import librouteros
@@ -3647,15 +3647,23 @@ class MikroTikAdapter:
     #    remove the option. Any other order fails partway and leaves the
     #    device in a state where the option is still being handed out.
     #
-    # 2. **``set dhcp-option-set=""`` DOES NOT CLEAR THE FIELD.** It fails
-    #    with ``ambiguous value of dhcp-option-set, more than one possible
-    #    value matches input``: RouterOS treats the empty string as a value
-    #    to *match against option-set names*, not as an instruction to
-    #    clear. The command that actually clears it is RouterOS's own
-    #    ``unset`` -- ``/ip/dhcp-server/network/unset`` with ``.id`` and
-    #    ``value-name=dhcp-option-set`` -- which is what
-    #    :meth:`_unset_field` issues. This cost real time on hardware; do
-    #    not "simplify" it back into an ``update``.
+    # 2. **``dhcp-option-set`` is a name-reference property, and clearing it
+    #    takes the ``!`` prefix.** Two other shapes were shipped first and
+    #    both failed on the venue router, with two different errors:
+    #    ``set dhcp-option-set=""`` gives ``ambiguous value of
+    #    dhcp-option-set, more than one possible value matches input``
+    #    (RouterOS prefix-matches name-typed values, and "" prefixes every
+    #    candidate), and ``unset value-name=dhcp-option-set`` gives ``input
+    #    does not match any value of value-name`` (``unset`` is
+    #    undocumented, per-menu optional, and does not list this field on
+    #    this menu). The *documented* clear, ``set !dhcp-option-set``, is
+    #    accepted by 7.23.3 and SILENTLY DOES NOTHING. What actually
+    #    clears the field is ``set dhcp-option-set=none``, confirming the
+    #    ``name | none`` typing. All three observations are from the venue
+    #    router. :meth:`_clear_field` tries them in that order and *proves*
+    #    the result by re-reading the row -- three shapes have now been
+    #    wrong on this one menu, so do not "simplify" it to a single
+    #    command, and do not drop the read-back.
     #
     # 3. **Match the option by its own name, never by ``code=114``.** A
     #    code-scoped sweep can only ever hit a row somebody else added. A
@@ -3940,7 +3948,10 @@ class MikroTikAdapter:
                 # option-set a network row still names, and refuses to
                 # remove an option a set still lists.
                 detached = self._detach_dhcp_option(
-                    api, option_name=option.name, set_names=frozenset(sets_to_remove)
+                    api,
+                    host=creds.host,
+                    option_name=option.name,
+                    set_names=frozenset(sets_to_remove),
                 )
 
                 # --- step 2: shrink or remove the sets -----------------
@@ -3984,7 +3995,7 @@ class MikroTikAdapter:
         )
 
     def _detach_dhcp_option(
-        self, api, *, option_name: str, set_names: frozenset[str]
+        self, api, *, host: str, option_name: str, set_names: frozenset[str]
     ) -> list[str]:  # noqa: ANN001
         """Take the option, and the sets that exist only to carry it, off
         every row that hands them to clients. Returns what it detached
@@ -3992,13 +4003,20 @@ class MikroTikAdapter:
 
         Two fields, two different removals:
 
-        * ``dhcp-option-set`` is a single value, so clearing it needs
-          RouterOS's ``unset`` (see :meth:`_unset_field` -- ``set
-          dhcp-option-set=""`` does not work and is not a shortcut).
+        * ``dhcp-option-set`` is a single name-reference value, so clearing
+          it goes through :meth:`_clear_field` -- ``set
+          dhcp-option-set=""`` does not work and is not a shortcut, and
+          neither does ``unset``. See that method for the two errors the
+          venue router gives and why the documented shape is ``!``.
         * ``dhcp-option`` is a *list*, so ours is edited out of it and the
           rest written back. Only when nothing else is left is the whole
-          field unset. A blanket unset here would drop another feature's
+          field cleared. A blanket clear here would drop another feature's
           option on the way past.
+
+        Raises :class:`MikroTikDeviceError` if a field will not clear,
+        leaving the device exactly as it was found. Detaching is the step
+        everything after it depends on, so a half-detach must not be
+        allowed to look like progress.
         """
         detached: list[str] = []
         for path, identity_field in _DHCP_OPTION_BINDING_PATHS:
@@ -4015,7 +4033,9 @@ class MikroTikAdapter:
                 )
                 touched = False
                 if _safe_str(row.get("dhcp-option-set")) in set_names:
-                    self._unset_field(api, path, row_id, "dhcp-option-set")
+                    self._clear_field_or_fail(
+                        api, host, path, row_id, "dhcp-option-set", identity
+                    )
                     touched = True
                 listed = _split_routeros_list(row.get("dhcp-option"))
                 if option_name in listed:
@@ -4025,33 +4045,184 @@ class MikroTikAdapter:
                             **{".id": row_id, "dhcp-option": ",".join(remaining)}
                         )
                     else:
-                        self._unset_field(api, path, row_id, "dhcp-option")
+                        self._clear_field_or_fail(
+                            api, host, path, row_id, "dhcp-option", identity
+                        )
                     touched = True
                 if touched:
                     detached.append(f"{'/'.join(path)}:{identity}")
         return detached
 
-    def _unset_field(
-        self, api, path: tuple[str, ...], row_id: object, value_name: str
-    ) -> None:  # noqa: ANN001
-        """Clear one field on one row using RouterOS's own ``unset``.
+    def _clear_field_or_fail(
+        self,
+        api,  # noqa: ANN001
+        host: str,
+        path: tuple[str, ...],
+        row_id: object,
+        field: str,
+        identity: str,
+    ) -> None:
+        """:meth:`_clear_field`, but refusing to continue when the device
+        will not let go of the field.
 
-        **This is not an ``update`` in disguise, and must not be rewritten
-        as one.** ``update(**{".id": id, "dhcp-option-set": ""})`` -- which
-        is the obvious thing to write -- fails on real hardware with
-        ``ambiguous value of dhcp-option-set, more than one possible value
-        matches input``, because RouterOS reads the empty string as a value
-        to match against the names of existing option sets rather than as
-        an instruction to clear the field. Found by trying it on a live
-        router; there is nothing in the documentation that says so.
-
-        ``librouteros``' ``Path.__call__`` is a *generator*, so the
-        sentence is only written when it is consumed -- hence ``tuple(...)``
-        rather than a bare call. A bare call is silently a no-op.
+        This is the fail-closed hinge of the whole removal. If the binding
+        is still attached, the option is still being handed to clients, and
+        removing the set and the option underneath it would either be
+        refused by RouterOS or leave a dangling reference. Raising here
+        stops the sequence with the device in its original, working state
+        and lets the caller report ``changed: False`` honestly -- which is
+        the one thing the shipped version got right.
         """
-        tuple(
-            api.path(*path)("unset", **{".id": row_id, "value-name": value_name})
+        if self._clear_field(api, path, row_id, field):
+            return
+        raise MikroTikDeviceError(
+            host,
+            f"could not clear {field} on /{'/'.join(path)} row {identity!r}: "
+            "the router refused every supported clear shape "
+            f"(set !{field}, set {field}=none, unset value-name={field}). "
+            "Nothing further was written; the option is still attached.",
         )
+
+    def _field_is_clear(
+        self, api, path: tuple[str, ...], row_id: object, field: str
+    ) -> bool:  # noqa: ANN001
+        """Re-reads one row and answers whether ``field`` is now empty.
+
+        ``none`` counts as empty: it is the literal RouterOS stores for a
+        ``name | none`` property that points at nothing, and a row that
+        reads back ``none`` is a row that hands out no option set.
+
+        A row that has vanished is *not* reported as clear -- that is a
+        different and much worse event than a cleared field, and the
+        caller must not mistake one for the other.
+        """
+        for row in self._safe_query(api, *path):
+            if row.get(".id") != row_id:
+                continue
+            return _safe_str(row.get(field)) in (None, "none")
+        return False
+
+    def _clear_field(
+        self, api, path: tuple[str, ...], row_id: object, field: str
+    ) -> bool:  # noqa: ANN001
+        """Clear one field on one row, and *prove* it was cleared.
+
+        Returns ``True`` only when a re-read of the row says the field is
+        empty. Never infers success from the absence of an exception: a
+        RouterOS ``set`` that returns cleanly and changes nothing is a real
+        failure mode on this fleet (2026-08-18, hotspot profile rebind).
+
+        ## Why this is a ladder and not one command
+
+        Two shapes were shipped before this one and *both* failed on the
+        venue router (RouterOS 7.23.3, hEX lite), with two different
+        errors, which is what makes this worth writing down:
+
+        * ``update(**{".id": id, "dhcp-option-set": ""})`` fails with
+          ``ambiguous value of dhcp-option-set, more than one possible
+          value matches input``. ``dhcp-option-set`` is a *name-reference*
+          property, and RouterOS resolves name-typed values by **prefix**.
+          The empty string is a prefix of every candidate name, so with
+          ``none`` plus at least one defined option set it matches more
+          than one. (Same error, same cause, reproduced by other people on
+          ``/ip firewall nat`` ``in-interface``.)
+        * ``("unset", value-name="dhcp-option-set")`` fails with ``input
+          does not match any value of value-name``. ``unset`` is
+          undocumented and per-menu optional -- it is absent from the
+          Console page's list of general commands -- and its ``value-name``
+          argument is an enum. A property that always has a value (default
+          ``none``) is not a member of that enum on this menu, so the
+          sentence is rejected before it does anything.
+
+        The shape that *is* documented is the ``!`` prefix on ``set``:
+        RouterOS Scripting docs, ``set`` -- "The parameter can be unset by
+        specifying '!' before the parameter." Over the binary API that is
+        the attribute word ``=!dhcp-option-set=``, and ``librouteros``
+        composes exactly that from a ``"!"``-prefixed key:
+
+            /ip/dhcp-server/network/set  =.id=*1  =!dhcp-option-set=
+
+        **...and on 7.23.3 the documented shape is a silent no-op.** Run
+        against the venue router on 2026-09-07, ``set !dhcp-option-set``
+        was accepted -- no ``!trap``, no error -- and the read-back showed
+        ``dhcp-option-set`` still set to ``cloudguest-opts``. The shape
+        that actually cleared it was ``set dhcp-option-set=none``, which
+        also confirms the ``name | none`` typing that explains the
+        "ambiguous" error above.
+
+        That is the whole argument for this method's design in one
+        observation: the *documented* command returned success and changed
+        nothing. Any version of this that trusted a clean return would have
+        reported a removal that did not happen. Only the read-back caught
+        it, and only the next rung fixed it.
+
+        Rung order is therefore hardware-first, not documentation-first:
+        the shape observed to work on this fleet's firmware leads, and the
+        documented one is kept behind it for the menus and firmwares where
+        it does work.
+        """
+        rungs: tuple[tuple[str, Callable[[], object]], ...] = (
+            # 1. The `name | none` clear literal -- OBSERVED to work on
+            #    7.23.3 (hEX lite) for dhcp-option-set. Unambiguous where
+            #    "" is not, because it matches exactly one candidate. Only
+            #    meaningful for a name-reference field: on an ordinary list
+            #    field like `dhcp-option` there is no option called "none",
+            #    so RouterOS rejects it and the next rung runs.
+            (
+                f"set {field}=none",
+                lambda: api.path(*path).update(**{".id": row_id, field: "none"}),
+            ),
+            # 2. The DOCUMENTED clear ("The parameter can be unset by
+            #    specifying '!' before the parameter"), wire word
+            #    `=!<field>=`. Kept, but demoted: on 7.23.3 this is
+            #    accepted and does nothing for dhcp-option-set. It is here
+            #    for the menus and firmwares where it does work, and it is
+            #    harmless where it does not -- the read-back is what
+            #    decides, never the clean return.
+            (
+                f"set !{field}",
+                lambda: api.path(*path).update(**{".id": row_id, f"!{field}": ""}),
+            ),
+            # 3. RouterOS's own `unset`, for the menus that do list this
+            #    field in the value-name enum. ``Path.__call__`` is a
+            #    *generator*, so the sentence is only written when it is
+            #    consumed -- hence ``tuple(...)``. A bare call sends nothing.
+            (
+                f"unset value-name={field}",
+                lambda: tuple(
+                    api.path(*path)(
+                        "unset", **{".id": row_id, "value-name": field}
+                    )
+                ),
+            ),
+        )
+        for label, attempt in rungs:
+            try:
+                attempt()
+            except LibRouterosError as exc:
+                logger.info(
+                    "mikrotik_clear_field_rung_rejected",
+                    extra={
+                        "menu": "/".join(path),
+                        "field": field,
+                        "shape": label,
+                        "detail": str(exc),
+                    },
+                )
+            # Read back even after a rejection: a RouterOS error does not
+            # always mean nothing changed, and the device's own answer is
+            # the only thing this method is willing to believe.
+            if self._field_is_clear(api, path, row_id, field):
+                logger.info(
+                    "mikrotik_clear_field_succeeded",
+                    extra={
+                        "menu": "/".join(path),
+                        "field": field,
+                        "shape": label,
+                    },
+                )
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # rogue DHCP detection (/ip dhcp-server alert)
