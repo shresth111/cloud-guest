@@ -121,7 +121,7 @@ from .constants import (
     TASK_RUN_CAPTIVE_PORTAL_DHCP_OPTION_SWEEP,
     TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
 )
-from .exceptions import DhcpError
+from .exceptions import DhcpDeviceConnectionError, DhcpError
 from .repository import DhcpRepository
 from .service import DhcpService, RogueDhcpDetectionSummary
 
@@ -378,10 +378,20 @@ async def _converge_captive_portal_dhcp_option_async(
             await session.commit()
         except DhcpError as exc:
             await session.rollback()
+            # ``reachable`` means "did the router answer", not "did the
+            # operation succeed". A router that read back its own DHCP
+            # options a moment earlier and then *refused* a command --
+            # ``DhcpDeviceOperationError``, "Router rejected ..." -- was
+            # plainly reachable, and reporting it as unreachable sends the
+            # reader looking for a network fault instead of at the
+            # rejection the router actually gave. Only
+            # ``DhcpDeviceConnectionError`` is an unreachable router;
+            # everything else here is a device that answered, or a
+            # precondition this service failed before dialling at all.
             return {
                 "router_id": str(router_id),
                 "changed": False,
-                "reachable": False,
+                "reachable": not isinstance(exc, DhcpDeviceConnectionError),
                 "detail": str(exc),
             }
         except Exception:

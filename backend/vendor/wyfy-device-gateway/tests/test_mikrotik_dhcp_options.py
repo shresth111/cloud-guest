@@ -17,10 +17,19 @@ to establish:
 
 1. removal happens in the order detach -> set -> option, because RouterOS
    refuses every other order;
-2. detaching uses RouterOS's ``unset``, never ``set field=""`` -- which
+2. detaching clears ``dhcp-option-set`` with ``set dhcp-option-set=none``,
+   the only one of three shapes that works on 7.23.3. ``set field=""``
    fails with "ambiguous value of dhcp-option-set, more than one possible
-   value matches input";
+   value matches input"; bare ``unset`` fails with "input does not match
+   any value of value-name"; and the *documented* ``!`` prefix is accepted
+   and silently changes nothing -- which is why every clear is proved by
+   re-reading the row rather than by a clean return;
 3. the option is matched by **name**, never by ``code=114``.
+
+The last block of this file runs against a fake configured with those two
+rejections, i.e. against the router as it really answers. Everything above
+that block runs against a permissive fake, which is precisely how a removal
+path that could not work on hardware passed a green suite.
 """
 
 from __future__ import annotations
@@ -173,24 +182,28 @@ async def test_the_network_row_itself_survives(patch_connect, mikrotik_creds):
 
 
 @pytest.mark.asyncio
-async def test_the_binding_is_cleared_with_unset_never_set_to_empty(
+async def test_the_binding_is_cleared_with_the_bang_prefix_never_set_to_empty(
     patch_connect, mikrotik_creds
 ):
     """The single most expensive fact in this file.
 
     ``set dhcp-option-set=""`` does not clear the field on real hardware:
-    RouterOS treats the empty string as a value to match against existing
-    option-set names and fails with "ambiguous value of dhcp-option-set,
-    more than one possible value matches input". The removal must issue
-    ``unset`` with ``value-name``. If someone "simplifies" this back into
-    an update, this test is what says no.
+    ``dhcp-option-set`` is a name-reference property, RouterOS resolves
+    name-typed values by prefix, and "" prefixes every candidate -- so it
+    fails with "ambiguous value of dhcp-option-set, more than one possible
+    value matches input".
+
+    The documented clear is the ``!`` prefix on ``set`` ("The parameter can
+    be unset by specifying '!' before the parameter"), which on the wire is
+    the attribute word ``=!dhcp-option-set=``. If someone "simplifies" this
+    back into a plain update, this test is what says no.
     """
     api = _venue_router()
     patch_connect(api)
 
     await MikroTikAdapter().delete_dhcp_option(mikrotik_creds, option=_spec())
 
-    assert api.unset_calls == [(_NETWORK_PATH, "*1", "dhcp-option-set")]
+    assert (_NETWORK_PATH, {".id": "*1", "!dhcp-option-set": ""}) in api.update_calls
     assert not any(
         fields.get("dhcp-option-set") == "" for _, fields in api.update_calls
     )
@@ -209,11 +222,14 @@ async def test_removal_order_is_detach_then_set_then_option(
     await MikroTikAdapter().delete_dhcp_option(mikrotik_creds, option=_spec())
 
     kinds = [(op, segments) for op, segments, _ in api.ops]
-    assert kinds == [
-        ("unset", _NETWORK_PATH),
-        ("remove", _SET_PATH),
-        ("remove", _OPTION_PATH),
-    ]
+    # The clear may take more than one sentence -- the ladder tries shapes
+    # until the device says the field is empty -- so what is asserted is the
+    # *order of the three phases*, not a fixed sentence count.
+    assert kinds[-2:] == [("remove", _SET_PATH), ("remove", _OPTION_PATH)]
+    assert kinds[:-2], "the binding must be detached before anything is removed"
+    assert all(
+        (op, segments) == ("update", _NETWORK_PATH) for op, segments in kinds[:-2]
+    )
 
 
 @pytest.mark.asyncio
@@ -354,7 +370,12 @@ async def test_a_direct_dhcp_option_list_is_edited_not_unset(
     rows = {r["address"]: r for r in api.path(*_NETWORK_PATH)}
     assert rows["10.5.50.0/24"]["dhcp-option"] == "venue-pxe"
     assert "dhcp-option" not in rows["10.6.0.0/24"]
-    assert api.unset_calls == [(_NETWORK_PATH, "*2", "dhcp-option")]
+    # The row that still has another option is *rewritten*; only the row
+    # whose remainder is empty is cleared outright.
+    assert (_NETWORK_PATH, {".id": "*1", "dhcp-option": "venue-pxe"}) in (
+        api.update_calls
+    )
+    assert (_NETWORK_PATH, {".id": "*2", "!dhcp-option": ""}) in api.update_calls
 
 
 @pytest.mark.asyncio
@@ -496,3 +517,241 @@ async def test_configure_then_remove_returns_the_device_to_where_it_started(
     assert list(api.path(*_OPTION_PATH)) == []
     assert list(api.path(*_SET_PATH)) == []
     assert list(api.path(*_NETWORK_PATH)) == [{".id": "*1", "address": "10.5.50.0/24"}]
+
+
+# ---------------------------------------------------------------------------
+# RouterOS 7.23.3, as it actually behaves
+# ---------------------------------------------------------------------------
+#
+# Everything above this line runs against a fake that accepts whatever the
+# adapter sends. The venue router does not. These fixtures switch on the two
+# rejections observed on HJP0ATMRJ6X (RouterOS 7.23.3, hEX lite) and are the
+# reason the shipped removal path converged in the suite and failed on
+# hardware.
+
+_ROS_723 = {_NETWORK_PATH: {"dhcp-option-set"}}
+
+
+def _venue_router_as_it_really_is() -> FakeRouterOSApi:
+    """The venue router *including* the two dynamic lease rows it really
+    has, and the name-reference semantics of 7.23.3.
+
+    The lease rows matter independently: ``_DHCP_OPTION_BINDING_PATHS``
+    walks the lease menu too, real lease rows carry ``dhcp-option`` but no
+    ``dhcp-option-set``, and no fixture above this line has any lease rows
+    at all -- so the whole lease half of the walk was untested against a
+    router that has leases.
+    """
+    api = FakeRouterOSApi(
+        menus={
+            _OPTION_PATH: [
+                {
+                    ".id": "*1",
+                    "name": _OPTION_NAME,
+                    "code": "114",
+                    "value": _VALUE,
+                    "force": True,
+                }
+            ],
+            _SET_PATH: [{".id": "*1", "name": _SET_NAME, "options": _OPTION_NAME}],
+            _NETWORK_PATH: [
+                {
+                    ".id": "*1",
+                    "address": "10.5.50.0/24",
+                    "gateway": "10.5.50.1",
+                    "dns-server": "10.5.50.1",
+                    "dhcp-option": "",
+                    "dhcp-option-set": _SET_NAME,
+                    "dynamic": False,
+                }
+            ],
+            ("ip", "dhcp-server", "lease"): [
+                {
+                    ".id": "*1",
+                    "address": "10.5.50.101",
+                    "mac-address": "AA:BB:CC:DD:EE:01",
+                    "dhcp-option": "",
+                    "dynamic": True,
+                },
+                {
+                    ".id": "*2",
+                    "address": "10.5.50.102",
+                    "mac-address": "AA:BB:CC:DD:EE:02",
+                    "dhcp-option": "",
+                    "dynamic": True,
+                },
+            ],
+        },
+        name_reference_fields=_ROS_723,
+    )
+    return api
+
+
+@pytest.mark.asyncio
+async def test_removal_converges_on_a_real_routeros_7_23_router(
+    patch_connect, mikrotik_creds
+):
+    """THE REGRESSION TEST.
+
+    Against the real device this failed with::
+
+        Router rejected remove_dhcp_option: delete_dhcp_option:
+        input does not match any value of value-name
+
+    ...because the removal issued ``unset value-name=dhcp-option-set`` and
+    7.23.3 does not list that field in that menu's ``unset`` enum. The
+    option stayed on the router and kept being handed to every client.
+    """
+    api = _venue_router_as_it_really_is()
+    patch_connect(api)
+
+    removal = await MikroTikAdapter().delete_dhcp_option(
+        mikrotik_creds, option=_spec()
+    )
+
+    assert removal.option_removed is True
+    assert removal.option_sets_removed == (_SET_NAME,)
+    assert removal.bindings_detached == ("ip/dhcp-server/network:10.5.50.0/24",)
+    # The device, read back: nothing left that hands out code 114.
+    assert list(api.path(*_OPTION_PATH)) == []
+    assert list(api.path(*_SET_PATH)) == []
+    network = list(api.path(*_NETWORK_PATH))[0]
+    assert network.get("dhcp-option-set", "") == ""
+    # ...and the row that serves guests is otherwise untouched.
+    assert network["address"] == "10.5.50.0/24"
+    assert network["gateway"] == "10.5.50.1"
+    assert network["dns-server"] == "10.5.50.1"
+
+
+@pytest.mark.asyncio
+async def test_the_shape_that_works_on_this_firmware_is_tried_first(
+    patch_connect, mikrotik_creds
+):
+    """Rung order is load-bearing, and it is ordered by what the hardware
+    does, not by what the documentation says.
+
+    ``set dhcp-option-set=none`` is the shape observed to clear the field
+    on 7.23.3. It must be the first thing on the wire, so the fleet's
+    common case costs one sentence and no rejected ones.
+    """
+    api = _venue_router_as_it_really_is()
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_dhcp_option(mikrotik_creds, option=_spec())
+
+    writes = [op for op in api.ops if op[0] in ("update", "unset", "remove")]
+    assert writes[0] == (
+        "update",
+        _NETWORK_PATH,
+        {".id": "*1", "dhcp-option-set": "none"},
+    )
+    # It worked, so the fallbacks were never issued at all.
+    assert api.unset_calls == []
+    assert not any(
+        field.startswith("!") for _, fields in api.update_calls for field in fields
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_documented_bang_shape_is_a_silent_no_op_and_is_not_believed(
+    patch_connect, mikrotik_creds
+):
+    """The observation that justifies this whole method.
+
+    Run against the venue router on 2026-09-07, ``set !dhcp-option-set``
+    -- the shape MikroTik *documents* for clearing a parameter -- was
+    accepted with no trap and no error, and the field was still set
+    afterwards::
+
+        [rung] A: set !dhcp-option-set
+               issued without error
+               read-back: dhcp-option-set='cloudguest-opts' -> still set
+
+    A clean return is not evidence of a change. If the ladder is ever
+    reordered to lead with the documented shape, or if the read-back is
+    ever dropped for being an "extra round trip", this test fails: the
+    removal would report success while option 114 stayed on the router.
+    """
+    api = _venue_router_as_it_really_is()
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_dhcp_option(mikrotik_creds, option=_spec())
+
+    # The bang shape is modelled as the no-op the device really performs,
+    # so a removal can only converge here by not trusting it.
+    assert list(api.path(*_OPTION_PATH)) == []
+    assert list(api.path(*_NETWORK_PATH))[0].get("dhcp-option-set", "") == ""
+
+
+@pytest.mark.asyncio
+async def test_lease_rows_are_walked_without_being_written_to(
+    patch_connect, mikrotik_creds
+):
+    """Real lease rows have ``dhcp-option`` (empty) and no
+    ``dhcp-option-set`` at all. Nothing about them matches, so nothing must
+    be written to them -- an ``unset`` aimed at the lease menu would be
+    rejected exactly the way the network one was, and a lease is not ours
+    to edit."""
+    api = _venue_router_as_it_really_is()
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_dhcp_option(mikrotik_creds, option=_spec())
+
+    lease_path = ("ip", "dhcp-server", "lease")
+    assert not any(path == lease_path for path, _ in api.update_calls)
+    assert not any(path == lease_path for path, _, _ in api.unset_calls)
+    assert not any(path == lease_path for path, _ in api.remove_calls)
+    assert len(list(api.path(*lease_path))) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_router_that_refuses_every_clear_shape_changes_nothing(
+    patch_connect, mikrotik_creds
+):
+    """Fail closed, and say so.
+
+    If no supported shape clears the binding, the option is still attached
+    and removing the set and option underneath it would be wrong. The
+    device must be left exactly as found, and the caller must hear about
+    it -- which is what makes the sweep report ``changed: False`` honestly
+    rather than claiming a removal that did not happen.
+    """
+    api = _venue_router_as_it_really_is()
+    # A router where even the documented shape does nothing: `set` returns
+    # cleanly and the field stays put. This is the silent-no-op failure
+    # mode, which no exception would ever reveal.
+    api.silently_ignore_updates.add(_NETWORK_PATH)
+    patch_connect(api)
+
+    with pytest.raises(MikroTikDeviceError) as excinfo:
+        await MikroTikAdapter().delete_dhcp_option(mikrotik_creds, option=_spec())
+
+    assert "could not clear dhcp-option-set" in str(excinfo.value)
+    # Nothing was removed on the way past.
+    assert [r["name"] for r in api.path(*_OPTION_PATH)] == [_OPTION_NAME]
+    assert [r["name"] for r in api.path(*_SET_PATH)] == [_SET_NAME]
+    assert list(api.path(*_NETWORK_PATH))[0]["dhcp-option-set"] == _SET_NAME
+
+
+@pytest.mark.asyncio
+async def test_removal_is_still_idempotent_on_a_7_23_router(
+    patch_connect, mikrotik_creds
+):
+    """The strong idempotency guarantee survives the ladder: a second run
+    against an already-clean router writes nothing at all."""
+    api = _venue_router_as_it_really_is()
+    patch_connect(api)
+
+    await MikroTikAdapter().delete_dhcp_option(mikrotik_creds, option=_spec())
+    api.ops.clear()
+    api.update_calls.clear()
+    api.unset_calls.clear()
+    api.remove_calls.clear()
+
+    second = await MikroTikAdapter().delete_dhcp_option(
+        mikrotik_creds, option=_spec()
+    )
+
+    assert second.option_removed is False
+    assert second.bindings_detached == ()
+    assert api.ops == []
