@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -77,6 +78,7 @@ from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 from app.domains.router_provisioning.exceptions import DuplicateConfigVariableError
 from app.domains.router_provisioning.models import ConfigTemplate, ConfigVersion
+from app.domains.wireguard.constants import HealthStatus
 
 # ============================================================================
 # Shared helpers
@@ -564,7 +566,11 @@ class Harness:
     device_adapter: FakeDeviceAdapter
 
 
-def make_harness(*, device_adapter: FakeDeviceAdapter | None = None) -> Harness:
+def make_harness(
+    *,
+    device_adapter: FakeDeviceAdapter | None = None,
+    wireguard_lookup: object | None = None,
+) -> Harness:
     repository = FakeProvisioningEngineRepository()
     router_lookup = FakeRouterLookup()
     router_provisioning = FakeRouterProvisioningLookup()
@@ -583,6 +589,7 @@ def make_harness(*, device_adapter: FakeDeviceAdapter | None = None) -> Harness:
         queue_dispatcher=queue_dispatcher,
         audit_writer=audit_writer,
         device_adapter_resolver=lambda vendor: adapter,
+        wireguard_lookup=wireguard_lookup,
     )
     return Harness(
         service=service,
@@ -1531,3 +1538,106 @@ class TestProvisioningEngineRepositoryConstruction:
         assert repository.steps is not None
         assert repository.logs is not None
         assert repository.templates is not None
+
+
+# ============================================================================
+# Connection-error enrichment (the WireGuard tunnel-state hint)
+#
+# This is the seam that produced, verbatim, in Master Console's Device
+# Console against a healthy router:
+#
+#     Could not connect to device at '10.20.0.19': connection attempt timed
+#     out -- Its WireGuard tunnel is healthy and recently handshaked, so this
+#     looks like a different problem -- not a tunnel issue. Check the
+#     device's own credentials, load, or service status instead.
+#
+# Nothing was wrong with the credentials, the load or the service status. The
+# hint named three subsystems it had not looked at, and `_enrich_connection_
+# error`'s own docstring already promised it would stay silent in exactly
+# this case. See app.domains.wireguard.connection_diagnostics for the fix and
+# tests/unit/test_wireguard_connection_diagnostics.py for the classifier.
+# ============================================================================
+
+
+class _StubWireGuardLookup:
+    """Duck-types WireGuardTunnelLookupProtocol against the router fixture's
+    own management IP, so the failed connection genuinely looks like one
+    attempted over the tunnel."""
+
+    handshake_stale_after = timedelta(minutes=5)
+
+    def __init__(self, *, handshake_age: timedelta | None) -> None:
+        self._handshake_age = handshake_age
+
+    async def get_peer(self, *, router_id, requesting_organization_id):  # noqa: ANN001
+        peer = SimpleNamespace(tunnel_ip_address="10.0.0.1")
+        peer.last_handshake_at = (
+            None
+            if self._handshake_age is None
+            else datetime.now(UTC) - self._handshake_age
+        )
+        return peer
+
+    def compute_health_status(self, peer, *, now=None):  # noqa: ANN001
+        if peer.last_handshake_at is None:
+            return HealthStatus.UNKNOWN
+        moment = now or datetime.now(UTC)
+        if moment - peer.last_handshake_at <= self.handshake_stale_after:
+            return HealthStatus.HEALTHY
+        return HealthStatus.STALE
+
+
+def _console_harness(*, handshake_age: timedelta | None) -> Harness:
+    return make_harness(
+        device_adapter=FakeDeviceAdapter(
+            raw_command_exception=ProvisionDeviceConnectionError(
+                "10.0.0.1", "connection attempt timed out"
+            )
+        ),
+        wireguard_lookup=_StubWireGuardLookup(handshake_age=handshake_age),
+    )
+
+
+class TestConsoleConnectionErrorEnrichment:
+    async def _run(self, h: Harness) -> str:
+        router = h.router_lookup.add(_make_router())
+        with pytest.raises(ProvisionDeviceConnectionError) as excinfo:
+            await h.service.execute_console_command(
+                router_id=router.id,
+                command="/interface print",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=router.organization_id,
+            )
+        return str(excinfo.value)
+
+    async def test_healthy_tunnel_leaves_the_error_exactly_as_the_adapter_made_it(
+        self,
+    ) -> None:
+        """The regression, at the layer the operator actually reads."""
+        message = await self._run(_console_harness(handshake_age=timedelta(minutes=1)))
+
+        assert "connection attempt timed out" in message
+        assert "WireGuard" not in message
+        assert "credentials, load, or service status" not in message
+
+    async def test_barely_stale_tunnel_does_not_send_the_operator_to_the_wan(
+        self,
+    ) -> None:
+        """The other half of the incident: the same router, five minutes
+        earlier, was told to go check its WAN and UDP."""
+        message = await self._run(
+            _console_harness(handshake_age=timedelta(minutes=5, seconds=30))
+        )
+
+        assert "unknown" in message
+        assert "UDP" not in message
+
+    async def test_a_genuinely_dead_tunnel_is_still_explained(self) -> None:
+        message = await self._run(_console_harness(handshake_age=timedelta(days=1)))
+
+        assert "UDP isn't blocked" in message
+
+    async def test_a_tunnel_that_never_handshaked_is_still_explained(self) -> None:
+        message = await self._run(_console_harness(handshake_age=None))
+
+        assert "never recorded" in message
