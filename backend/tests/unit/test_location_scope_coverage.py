@@ -110,7 +110,7 @@ LOCATION_SCOPED: dict[str, str] = {
         "`resolve_portal_config` deliberately does NOT come through here -- "
         "it resolves by organization+location, so the portal render a guest "
         "sees is untouched. Anonymous-tolerant anyway: `/captive-portal/"
-        "resolve` and `/rfc8908` are unauthenticated and the service is "
+        "resolve` is unauthenticated and the service is "
         "composed into `get_guest_service`."
     ),
     "voucher": (
@@ -451,16 +451,9 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
 # staff member reading a tenant's records.
 _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/captive-portal/resolve"): (
-        "The guest portal render and the RFC 8908 endpoint the device's own OS reads. "
-        "Both are pre-login by definition; the caller holds no roles, and "
-        "`resolve_portal_config` resolves by organization+location rather than through "
-        "the confined `get_config`."
-    ),
-    ("GET", "/api/v1/captive-portal/rfc8908"): (
-        "The guest portal render and the RFC 8908 endpoint the device's own OS reads. "
-        "Both are pre-login by definition; the caller holds no roles, and "
-        "`resolve_portal_config` resolves by organization+location rather than through "
-        "the confined `get_config`."
+        "The guest portal render. Pre-login by definition; the caller holds no "
+        "roles, and `resolve_portal_config` resolves by organization+location "
+        "rather than through the confined `get_config`."
     ),
     ("POST", "/api/v1/vouchers/redeem"): (
         "A guest redeeming or checking a code handed to them at a front desk -- the "

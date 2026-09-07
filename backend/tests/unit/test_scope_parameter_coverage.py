@@ -81,10 +81,6 @@ _UNAUTHENTICATED_BY_DESIGN: dict[tuple[str, str], str] = {
         "Guest portal render. The guest has not logged in yet -- this is the "
         "screen that lets them."
     ),
-    ("GET", "/api/v1/captive-portal/rfc8908"): (
-        "RFC 8908 Captive Portal API, read by the device's own OS before any "
-        "guest interaction."
-    ),
     ("GET", "/api/v1/branding/{organization_id}/logo/public"): (
         "Public branding asset, fetched by the portal page itself."
     ),

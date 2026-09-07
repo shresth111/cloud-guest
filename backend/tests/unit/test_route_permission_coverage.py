@@ -232,13 +232,6 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "of this router's own currently-ACTIVE guest sessions for the "
         "hotspot ip-binding sync; same class as the /agent/* entries above."
     ),
-    # -- Guest device OS, pre-identity ---------------------------------
-    ("GET", "/api/v1/captive-portal/rfc8908"): (
-        "RFC 8908 Captive Portal API discovery document, fetched by an "
-        "unauthenticated guest device's OS via the RFC 8910 DHCP Option "
-        "114 URI -- same pre-identity guest category as GET "
-        "/captive-portal/resolve, which is allowlisted by prefix above."
-    ),
     # -- Self-service data-masking step-up: CurrentUser establishes
     # identity and the OTP is always sent to the caller's *own* phone/
     # email (never a client-supplied identifier), so the authorization
