@@ -6280,6 +6280,208 @@ class TestPublicMacLoginEndpointRemoved:
 
 
 # ============================================================================
+# A login with no device_mac creates a session no consumer can see, until
+# the NAS asserts the MAC at Authorize time.
+# ============================================================================
+
+
+class TestMacLessSessionIsHealedByNasAssertion:
+    """``device_mac`` is optional on the OTP/voucher/password logins, so a
+    session with ``device_id IS NULL`` is a supported outcome. Three
+    consumers key on ``device_id`` and skip a NULL silently -- the captive
+    portal's own "already connected?" check among them -- so such a guest
+    is online, ACTIVE, and shown the sign-in form again.
+
+    Confirmed live: one iPhone, two OTP verifications 2m44s apart.
+
+    The contract these pin: such a session stays creatable (refusing it
+    would stop a guest on a link without RouterOS's ``$(mac)`` from
+    signing in at all), and becomes visible the moment a
+    shared-secret-authenticated NAS asserts its ``Calling-Station-Id``.
+    """
+
+    async def _register_and_authenticate_nas(
+        self, fx: Fixture, secret: str = "supersecret123"
+    ) -> RadiusNasClient:
+        await fx.radius_service.register_nas(
+            actor_user_id=uuid.uuid4(),
+            router_id=fx.router.id,
+            nas_identifier="nas-1",
+            shared_secret=secret,
+        )
+        return await fx.radius_service.authenticate_nas(
+            nas_identifier="nas-1", shared_secret=secret
+        )
+
+    async def _login_without_mac(self, fx: Fixture, identifier: str) -> GuestSession:
+        result = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        assert result.device is None
+        assert result.session.device_id is None
+        return result.session
+
+    async def test_a_macless_session_is_invisible_to_the_portals_own_check(
+        self,
+    ) -> None:
+        """The defect itself, pinned so it cannot be re-argued as
+        cosmetic: before any NAS speaks, the portal cannot find the
+        session it just created."""
+        fx = make_fixture()
+        await self._login_without_mac(fx, "+15551230001")
+
+        found = await fx.guest_service.get_active_session_for_device(
+            router_id=fx.router.id, device_mac="AA:BB:CC:DD:EE:01"
+        )
+
+        assert found is None
+
+    async def test_authorize_attaches_the_nas_asserted_device_to_the_session(
+        self,
+    ) -> None:
+        fx = make_fixture()
+        session = await self._login_without_mac(fx, "+15551230002")
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        authz = await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="+15551230002",
+            calling_station_id="AA:BB:CC:DD:EE:02",
+        )
+
+        assert authz.authorized is True
+        healed = await fx.repository.get_session_by_id(session.id)
+        assert healed is not None
+        assert healed.device_id is not None
+        device = await fx.repository.get_device_by_id(healed.device_id)
+        assert device is not None
+        assert device.mac_address == "AA:BB:CC:DD:EE:02"
+        assert device.guest_id == healed.guest_id
+
+    async def test_the_portal_can_find_the_session_once_the_nas_has_spoken(
+        self,
+    ) -> None:
+        """The guest-visible half: this is the lookup that returned
+        ``None`` and sent a real guest back through OTP a second time."""
+        fx = make_fixture()
+        await self._login_without_mac(fx, "+15551230003")
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="+15551230003",
+            calling_station_id="AA:BB:CC:DD:EE:03",
+        )
+
+        found = await fx.guest_service.get_active_session_for_device(
+            router_id=fx.router.id, device_mac="AA:BB:CC:DD:EE:03"
+        )
+
+        assert found is not None
+        assert found.session.status == GuestSessionStatus.ACTIVE.value
+        assert found.device is not None
+        assert found.device.mac_address == "AA:BB:CC:DD:EE:03"
+
+    async def test_a_second_login_reuses_the_healed_session(self) -> None:
+        """``_find_reusable_active_session`` is the second consumer that
+        keys on ``device_id``. Once healed, the duplicate row that the
+        production incident produced is no longer created."""
+        fx = make_fixture()
+        session = await self._login_without_mac(fx, "+15551230004")
+        nas_client = await self._register_and_authenticate_nas(fx)
+        await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="+15551230004",
+            calling_station_id="AA:BB:CC:DD:EE:04",
+        )
+
+        second = await fx.guest_service.login_via_otp(
+            identifier="+15551230004",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:04",
+        )
+
+        assert second.session.id == session.id
+
+    async def test_adoption_is_idempotent_across_reauthentication(self) -> None:
+        """A real NAS re-sends Authorize on every periodic reauth. The
+        second one must not reassign, duplicate, or churn the row."""
+        fx = make_fixture()
+        session = await self._login_without_mac(fx, "+15551230005")
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        for _ in range(3):
+            await fx.radius_service.authorize(
+                nas_client=nas_client,
+                username="+15551230005",
+                calling_station_id="AA:BB:CC:DD:EE:05",
+            )
+
+        healed = await fx.repository.get_session_by_id(session.id)
+        assert healed is not None
+        first_device_id = healed.device_id
+        assert first_device_id is not None
+        assert await fx.repository.count_devices_for_guest(healed.guest_id) == 1
+
+    async def test_a_session_that_already_has_a_device_is_left_alone(self) -> None:
+        """Adoption must never repoint a session that logged in with its
+        own MAC at a different one the NAS happens to assert."""
+        fx = make_fixture()
+        login = await fx.guest_service.login_via_otp(
+            identifier="+15551230006",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:06",
+        )
+        original_device_id = login.session.device_id
+        assert original_device_id is not None
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="+15551230006",
+            calling_station_id="99:99:99:99:99:99",
+        )
+
+        unchanged = await fx.repository.get_session_by_id(login.session.id)
+        assert unchanged is not None
+        assert unchanged.device_id == original_device_id
+
+    async def test_authorize_still_grants_when_adoption_fails(self) -> None:
+        """The repair must never change the verdict. A guest with a
+        verified OTP losing their internet because a device write failed
+        would be strictly worse than the defect being repaired."""
+        fx = make_fixture()
+        await self._login_without_mac(fx, "+15551230007")
+        nas_client = await self._register_and_authenticate_nas(fx)
+
+        async def _boom(**_kwargs: object) -> GuestSession:
+            raise RuntimeError("device write failed")
+
+        fx.guest_service.adopt_nas_asserted_device = _boom  # type: ignore[method-assign]
+
+        authz = await fx.radius_service.authorize(
+            nas_client=nas_client,
+            username="+15551230007",
+            calling_station_id="AA:BB:CC:DD:EE:07",
+        )
+
+        assert authz.authorized is True
+
+
+# ============================================================================
 # RADIUS Accounting-On/Accounting-Off (RFC 2866 §5.13): NAS reboot/shutdown
 # closes every ACTIVE GuestSession tied to that NAS's router.
 # ============================================================================
