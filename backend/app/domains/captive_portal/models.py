@@ -113,12 +113,44 @@ placeholder, written before the ``guest`` module existed to authenticate
 against -- it no longer is. ``app.domains.guest.service.GuestService
 .login_via_password``/``POST /guest/login/password`` is a real, working
 login path today, and this flag genuinely gates it (see
-``GuestService._resolve_and_validate_method``). It defaults to ``True``
--- the standard baseline every location gets (OTP once, then a saved
-password from then on) -- mirroring
-``app.domains.location.provisioning_service._resolve_login_methods``'s
-identical always-on default for a freshly provisioned location; an admin
-can still turn it off per location.
+``GuestService._require_method_enabled``).
+
+## Retiring password sign-in
+
+It used to default to ``True`` -- the standard baseline every location
+got: verify once by OTP, set a password right after, then sign in with
+phone/email + password from then on. **It now defaults to ``False``.**
+
+That baseline is being withdrawn at the founder's request, and the cost is
+real and worth stating plainly rather than rediscovering in a support
+ticket: **every returning guest goes back to doing an OTP on every
+visit.** OTP (all three channels), vouchers and Portal PIN are unaffected.
+
+This is a rollout, not a switch-off, and the shape below is deliberate:
+
+* **New locations get it off.**
+  ``app.domains.location.provisioning_service._resolve_login_methods``
+  carries its own identical default and was changed in the same commit --
+  the two must agree, or the disagreement presents as a race.
+* **Existing rows are NOT migrated.** A venue that has it on today keeps
+  working until someone turns it off. Flipping stored config under live
+  venues is not reversible by a redeploy.
+* **The endpoint stays.** ``POST /guest/login/password`` and
+  ``GuestService.login_via_password`` are untouched and still gated by
+  this flag, so a request arriving for a location that has it off fails
+  the way it always has -- ``GuestAuthMethodNotEnabledError``, a 403 with
+  a guest-safe message, never a 500 and never a stack trace.
+* **The portal no longer offers it** regardless of this flag, via
+  ``PASSWORD_SIGN_IN_OFFERED`` in cloudguest-foundation's
+  ``src/lib/portal-auth-methods.ts``. That one constant is the whole
+  reversal on the guest side; flipping it back restores the method for
+  every venue whose stored flag is still on. The set-password prompt goes
+  with it, so the population of guests holding a usable password can only
+  shrink from here.
+
+An admin can still turn it on per location, and the enum member
+``GuestAuthMethod.USERNAME_PASSWORD`` stays -- it is the ``auth_method``
+on live and historical ``guest_sessions`` rows.
 """
 
 from __future__ import annotations
@@ -499,9 +531,13 @@ class CaptivePortalConfig(BaseModel):
     )
     voucher_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # Real, working login-method gate -- see module docstring. Defaults
-    # on: the standard "OTP once, then a saved password" baseline.
+    # OFF as of 2026-09-07: password sign-in is being retired from the
+    # guest portal, so a newly provisioned location must not be handed it
+    # as a baseline. Existing rows are deliberately NOT migrated -- see
+    # the module docstring's "Retiring password sign-in" note for the
+    # rollout, and for why the endpoint stays in place behind this flag.
     username_password_enabled: Mapped[bool] = mapped_column(
-        Boolean, default=True, nullable=False
+        Boolean, default=False, nullable=False
     )
     # Real, working login-method gate for Portal PIN
     # (app.domains.guest.service.GuestService.login_via_pin /
