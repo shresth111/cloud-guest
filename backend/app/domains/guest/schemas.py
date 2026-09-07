@@ -28,6 +28,7 @@ from .constants import (
     RADIUS_ACCT_STATUS_START,
     RADIUS_ACCT_STATUS_STOP,
     GuestAuthMethod,
+    GuestSessionEndedReason,
     GuestSessionStatus,
 )
 
@@ -58,6 +59,7 @@ __all__ = [
     "GuestSessionResponse",
     "GuestSessionListResponse",
     "GuestLoginResponse",
+    "GuestLastEndedSessionResponse",
     "GuestResponse",
     "GuestDetailResponse",
     "GuestListResponse",
@@ -474,6 +476,64 @@ class GuestLoginResponse(BaseModel):
     has_opened_review_link: bool
     session: GuestSessionResponse
     device: GuestDeviceResponse | None
+
+
+class GuestLastEndedSessionResponse(BaseModel):
+    """The whole of what ``GET /guest/session/last-ended`` tells the
+    captive portal about the session that just ended on a device.
+
+    Two fields, and the shortness is the point. The caller of that
+    endpoint is anonymous and its only credential is a MAC address the
+    router asserted -- which, for a session that has *ended*, is no
+    longer backed by anything: the device is not authorised any more, so
+    "holds this MAC" no longer implies "is sitting in the venue holding
+    this device". Anyone who can observe a MAC can ask this question.
+    Every field therefore has to be safe in the hands of someone who is
+    not the guest.
+
+    Deliberately **not** ``GuestLoginResponse`` (what
+    ``/guest/session/active`` returns), even though reusing it would have
+    been a smaller change. That model carries ``identifier`` -- the
+    guest's real, unmasked phone number or email, by explicit design (see
+    its docstring: it exists to show a guest the identifier they just
+    typed). Returning it keyed on a MAC with no live session behind it
+    would hand anyone who ever observed that MAC the phone number of the
+    person who used the device. It also carries ``guest_id``,
+    ``has_password`` and ``has_pin``, which describe the guest's account
+    rather than the network event, and a nested ``GuestSessionResponse``,
+    which carries ``disconnect_reason`` -- free text that includes
+    operators' private notes about guests (``"Blocked: ex-employee, do
+    not readmit"``). Backend #169 spent a whole change removing that note
+    from what a refused guest is shown; reaching for the convenient
+    existing model here would have put it straight back on a different
+    endpoint.
+
+    What is left is safe on its own terms:
+
+    * ``reason`` is a closed two-member enum
+      (:class:`~.constants.GuestSessionEndedReason`) derived from
+      ``GuestSession.status``, never the ``disconnect_reason`` string. No
+      operator-, NAS- or guest-authored text can travel through it,
+      because the only values it can hold are the two written in this
+      repository's own source.
+    * ``session_timeout_minutes`` is venue policy, not guest data: every
+      guest at a location gets the same number, so it tells a stranger
+      nothing about the guest. It earns its place because it is what
+      turns the portal's copy from "something went wrong" into "this is
+      how long sessions last here".
+
+    What the response unavoidably admits is that *some* session on this
+    device ended on this router within the window -- bounded presence
+    information. That is the irreducible minimum for the feature to
+    exist at all, it is bounded by
+    ``LAST_ENDED_SESSION_WINDOW_MINUTES`` rather than open-ended, and it
+    is strictly less than ``/guest/session/active`` already discloses for
+    a live session. No timestamp is returned, so the disclosure has the
+    granularity of the window and not of the clock.
+    """
+
+    reason: GuestSessionEndedReason
+    session_timeout_minutes: int | None = None
 
 
 class GuestResponse(BaseModel):

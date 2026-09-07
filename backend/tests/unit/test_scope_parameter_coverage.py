@@ -94,6 +94,21 @@ _UNAUTHENTICATED_BY_DESIGN: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/guest/session/active"): (
         "Guest-facing: a connected guest reading their own session state."
     ),
+    ("GET", "/api/v1/guest/session/last-ended"): (
+        "Guest-facing, and the reason it names `router_id` is the same as "
+        "`/session/active` above: the captive portal has no platform "
+        "identity to authorize against, only the router's own $(mac). The "
+        "`router_id` here narrows the lookup rather than widening it -- it "
+        "is ANDed with the device, so a caller who guesses a different "
+        "router's id gets fewer rows, never another tenant's. What comes "
+        "back is a two-member enum and the venue's own session-timeout "
+        "policy: no guest identifier, no timestamp, no disconnect_reason, "
+        "and nothing at all for a session an operator ended (see the "
+        "service method's docstring). So there is no cross-tenant read to "
+        "protect here -- the widest answer any router_id can produce is "
+        "'a session on some device ended recently', bounded by "
+        "LAST_ENDED_SESSION_WINDOW_MINUTES."
+    ),
     # -- authorized in the handler rather than by a dependency ---------------
     #
     # These three are checked, just not somewhere this test can see. Listed

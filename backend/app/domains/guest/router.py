@@ -90,6 +90,7 @@ from .schemas import (
     GuestDeviceListResponse,
     GuestDeviceResponse,
     GuestDisconnectRequest,
+    GuestLastEndedSessionResponse,
     GuestListResponse,
     GuestLoginHistoryListResponse,
     GuestLoginHistoryResponse,
@@ -578,6 +579,70 @@ async def guest_active_session(
         success=True,
         message="Active session found" if result else "No active session",
         data=_login_response(result).model_dump() if result else None,
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.get(
+    "/session/last-ended",
+    response_model=ApiResponse[GuestLastEndedSessionResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def guest_last_ended_session(
+    request: Request,
+    router_id: uuid.UUID = Query(...),
+    device_mac: str = Query(...),
+    service: GuestService = Depends(get_guest_service),
+):
+    """Guest-facing, unauthenticated (same posture as ``/login/*`` and
+    ``/session/active`` directly above): the sibling question to that
+    endpoint's. ``/session/active`` asks "is this device connected right
+    now"; this asks "did it just stop being connected, and may the guest
+    be told so". The portal calls this only once the first has answered
+    no, so a connected guest never reaches it.
+
+    It exists because a guest whose session ends while the portal tab is
+    closed -- which is every real guest, since sessions run for hours --
+    lost their internet and then got a sign-in page identical to a
+    first-time visit, with nothing anywhere saying the two events were
+    related. Read as "the WiFi is broken again".
+
+    ``data`` is ``null`` (not an error) for every kind of no: no such
+    device, nothing ended within
+    ``LAST_ENDED_SESSION_WINDOW_MINUTES``, or an ending a guest must not
+    be told about -- notably an operator's block, which ends sessions as
+    ``TERMINATED`` and must send the guest to an ordinary sign-in page
+    to be refused there properly rather than be told their session
+    "expired". The caller cannot tell those cases apart, which is
+    deliberate: a single ``null`` is what stops this endpoint answering
+    "is this MAC blocked here?" for anyone who asks.
+
+    A separate route rather than an extra field on ``/session/active``,
+    even though that would have been the smaller diff, because that
+    endpoint's response model is ``GuestLoginResponse`` -- which carries
+    the guest's unmasked ``identifier`` and a nested session object
+    holding ``disconnect_reason``. Both are defensible for a device the
+    NAS is currently authorising and neither is defensible keyed on a
+    bare, no-longer-authorised MAC. Keeping the two questions on two
+    routes keeps them on two response models, so the wider one cannot be
+    reached by the weaker credential. See
+    ``schemas.GuestLastEndedSessionResponse`` for the field-by-field
+    argument.
+    """
+    result = await service.get_last_ended_session_for_device(
+        router_id=router_id, device_mac=device_mac
+    )
+    return build_response(
+        success=True,
+        message="Last ended session found" if result else "No recent ended session",
+        data=(
+            GuestLastEndedSessionResponse(
+                reason=result.reason,
+                session_timeout_minutes=result.session_timeout_minutes,
+            ).model_dump()
+            if result
+            else None
+        ),
         request_id=_request_id(request),
     )
 

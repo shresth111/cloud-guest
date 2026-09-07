@@ -237,6 +237,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 import secrets
 import uuid
 from collections.abc import Sequence
@@ -289,6 +290,7 @@ from .constants import (
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
+    LAST_ENDED_SESSION_WINDOW_MINUTES,
     MAX_BULK_DEVICE_LOOKUP_IDS,
     NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
     PIN_LENGTH,
@@ -300,6 +302,7 @@ from .constants import (
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
     WHITELIST_ONLY_LOGIN_FAILURE_REASON,
     GuestAuthMethod,
+    GuestSessionEndedReason,
     GuestSessionStatus,
     NasStatus,
     QuotaPeriodType,
@@ -398,6 +401,7 @@ from .repository import (
 )
 from .validators import (
     compute_period_start,
+    has_session_reached_time_limit,
     is_concurrent_session_limit_reached,
     is_device_limit_reached,
     is_fup_usage_exceeded,
@@ -1237,6 +1241,95 @@ class GuestLoginResult:
     session: GuestSession
     device: GuestDevice | None
     is_new_guest: bool
+
+
+#: The single ``disconnect_reason`` literal that means "this session ran
+#: out of time" -- written only by ``enforce_session_timeouts`` above.
+#: Matched exactly, never by prefix or substring: the other ``EXPIRED``
+#: reasons (``data_limit_exceeded``, ``fup_data_quota_exceeded_daily``,
+#: ...) are quota exhaustion, which is a different thing to tell a guest
+#: and is deliberately not told to them here at all.
+SESSION_TIMEOUT_DISCONNECT_REASON = "inactivity_timeout"
+
+#: RFC 2866 §5.10 ``Acct-Terminate-Cause`` value 5, forwarded verbatim by
+#: FreeRADIUS (``ops/freeradius/rest.conf``) into ``disconnect_reason``
+#: when a NAS stops accounting because its own ``Session-Timeout`` ran
+#: out. This is the founder's case as it actually arrives: RouterOS
+#: enforces the ``Session-Timeout`` this platform put in the Access-Accept
+#: and then reports the stop, so the session lands as ``DISCONNECTED``
+#: with this string -- **not** as ``EXPIRED``, which only the platform's
+#: own idle sweep ever writes.
+#:
+#: Matching a NAS-supplied string is safe in a way that matching an
+#: operator-supplied one would not be: it is compared, never returned,
+#: and it arrives from a NAS already authenticated by its shared secret,
+#: from a closed RFC enumeration rather than a free-text field.
+#:
+#: ``Idle-Timeout`` (cause 4) is deliberately NOT here. RouterOS's own
+#: hotspot profile carries ``idle-timeout: 30m`` independently of
+#: anything this platform sends, and "your device was idle" is what the
+#: generic disconnected copy already describes well.
+RADIUS_SESSION_TIMEOUT_TERMINATE_CAUSE = "Session-Timeout"
+
+
+def _ended_session_reason(session: GuestSession) -> GuestSessionEndedReason | None:
+    """Map an already-ended ``GuestSession`` to the coarse, guest-safe
+    vocabulary the captive portal is allowed to see, or ``None`` when a
+    guest should be told nothing at all about this ending.
+
+    Module scope, not a private method, so the whole decision table can
+    be tested against real ``GuestSession`` rows without standing up a
+    ``GuestService`` and its dependency chain -- the same reason
+    ``enforce_session_timeouts`` and ``is_session_timed_out`` live where
+    they do.
+
+    Fails closed by construction: the returns are an allowlist, and
+    anything not named -- a new status, a new ``EXPIRED`` reason -- falls
+    through to ``None`` and shows an ordinary sign-in page. The failure
+    mode of a missing case is a guest who is told nothing, which is
+    today's behaviour and is merely unhelpful. The failure mode of an
+    open default would be a guest told something false about why their
+    internet stopped.
+
+    See ``GuestService.get_last_ended_session_for_device`` for why each
+    branch is what it is.
+    """
+    if session.status == GuestSessionStatus.DISCONNECTED.value:
+        # The founder's case arrives here, not in the EXPIRED branch
+        # below: the router enforced the Session-Timeout and told us so
+        # via Accounting-Stop, which ends the session as DISCONNECTED and
+        # carries the NAS's own terminate cause. Reading it is what makes
+        # "your time is up" available instead of the vaguer "you were
+        # disconnected" -- the two are different messages to a guest, and
+        # only one of them explains a venue's 30-minute limit.
+        if session.disconnect_reason == RADIUS_SESSION_TIMEOUT_TERMINATE_CAUSE:
+            return GuestSessionEndedReason.TIMED_OUT
+        return GuestSessionEndedReason.DISCONNECTED
+    if (
+        session.status == GuestSessionStatus.EXPIRED.value
+        and session.disconnect_reason == SESSION_TIMEOUT_DISCONNECT_REASON
+    ):
+        return GuestSessionEndedReason.TIMED_OUT
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class GuestLastEndedSessionResult:
+    """What ``GuestService.get_last_ended_session_for_device`` hands back.
+
+    Carries no ``Guest`` and no ``GuestSession`` on purpose. Every other
+    read model in this module returns the ORM rows and lets the router
+    pick fields off them; this one cannot, because its consumer is an
+    unauthenticated endpoint and the rows carry an unmasked
+    ``identifier`` and a ``disconnect_reason`` holding operators' private
+    notes. Handing the router those rows would make leaking them a
+    one-line mistake in a file where that one line looks exactly like
+    every neighbouring line. The redaction is done here, once, by
+    construction -- what does not travel cannot be serialised.
+    """
+
+    reason: GuestSessionEndedReason
+    session_timeout_minutes: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3296,11 +3389,183 @@ class GuestService:
         if not sessions:
             return None
         session = sessions[0]
+        # An ACTIVE row is not proof the guest is on the network. If the
+        # venue set 30 minutes, the router dropped them at 30 minutes --
+        # and this row only becomes DISCONNECTED when the NAS's
+        # Accounting-Stop arrives, which is not guaranteed and is not
+        # instant. In the gap, answering "yes, you're connected" sends a
+        # guest with no internet to the "You're online" screen, which is
+        # the single most frustrating thing this portal can do. The
+        # session's own wall-clock limit is a fact we already hold, so
+        # there is no reason to wait to be told.
+        if has_session_reached_time_limit(session, now=datetime.now(UTC)):
+            return None
         guest = await self.repository.get_guest_by_id(session.guest_id)
         if guest is None:
             return None
         return GuestLoginResult(
             guest=guest, session=session, device=device, is_new_guest=False
+        )
+
+    async def _active_session_past_its_limit(
+        self,
+        *,
+        router_id: uuid.UUID,
+        device_id: uuid.UUID,
+        now: datetime,
+    ) -> GuestSession | None:
+        """The device's newest still-``ACTIVE`` session on this router, if
+        it has already outlived its own ``session_timeout_minutes``.
+
+        Bounded by the same freshness window as a genuinely-ended session,
+        deliberately: a row abandoned ACTIVE for a week is a bookkeeping
+        artefact, not something to greet a guest with. Without the bound
+        this would be the one path that could report an arbitrarily old
+        session, which is exactly the hole the SQL-level window on the
+        ended-session query exists to close.
+        """
+        sessions, _ = await self.repository.list_sessions(
+            page=1,
+            page_size=1,
+            filters={
+                "router_id": router_id,
+                "device_id": device_id,
+                "status": GuestSessionStatus.ACTIVE.value,
+            },
+            sort_by="started_at",
+            sort_order=SortOrder.DESC,
+        )
+        if not sessions:
+            return None
+        session = sessions[0]
+        if not has_session_reached_time_limit(session, now=now):
+            return None
+        ended_at = session.started_at + timedelta(
+            minutes=session.session_timeout_minutes or 0
+        )
+        if ended_at < now - timedelta(minutes=LAST_ENDED_SESSION_WINDOW_MINUTES):
+            return None
+        return session
+
+    async def get_last_ended_session_for_device(
+        self,
+        *,
+        router_id: uuid.UUID,
+        device_mac: str,
+        now: datetime | None = None,
+    ) -> GuestLastEndedSessionResult | None:
+        """"This device had a session on this router, and it has just
+        ended" -- the answer the captive portal needs to greet a
+        returning guest with "you were disconnected" instead of the same
+        blank sign-in form a first-time visitor gets.
+
+        Same trust model as ``get_active_session_for_device`` above:
+        ``device_mac`` is RouterOS's own ``$(mac)`` substitution, the one
+        identity available before the guest types anything. It is weaker
+        here than there, though, and the difference drives everything
+        below: for an *active* session the MAC is corroborated by the
+        device actually being authorised on the NAS right now, whereas a
+        MAC whose session has ended is backed by nothing at all. So this
+        method answers the narrowest question that still makes the screen
+        possible, and returns ``None`` -- never an error -- for every
+        other shape of "no".
+
+        **Which endings a guest may be told about.** Not a taste
+        judgement; it follows ``GuestSessionStatus``'s own contract:
+
+        * ``DISCONNECTED`` -- yes. The enum defines this as "a normal,
+          non-punitive end of use ... reconnecting immediately is
+          allowed", which is exactly the precondition for a screen whose
+          main button is "Sign in again". Covers the NAS's own
+          Accounting-Stop (including the ``Lost-Service`` seen in
+          production), a router reboot, an admin ending a session with
+          no disciplinary intent, and the guest's own Disconnect tap.
+        * ``EXPIRED`` **and** ``disconnect_reason == "inactivity_timeout"``
+          -- yes, and this is the founder's case. The status alone is not
+          enough: ``EXPIRED`` is also written for ``data_limit_exceeded``
+          and for ``fup_{data,time}_quota_exceeded_*``. A guest who has
+          exhausted their data allowance has not "timed out", and telling
+          them to sign in again would send them round a loop that ends
+          the same way. Matching the one literal this codebase writes for
+          a real timeout is an allowlist, and it fails closed: any future
+          ``EXPIRED`` reason is silently excluded until somebody decides
+          what a guest should be told about it.
+        * ``TERMINATED`` -- **never**, for two independent reasons,
+          either of which alone would settle it. It is an operator's
+          punitive kill, and it is how a blocklist rule ends a session
+          (``guest_access.enforcement.BlocklistEnforcer`` writes exactly
+          this status). A blocked guest must not be shown "your session
+          expired": it is false, and it invites them to retry a sign-in
+          that is guaranteed to be refused, replacing a clear refusal at
+          the sign-in step with a confusing detour. Independently, this
+          status carries ``TERMINATION_RECONNECT_COOLDOWN_MINUTES``, so
+          "Sign in again" is an offer the platform will not honour. The
+          right destination for these guests is the ordinary sign-in
+          page, where ``_enforce_access_control`` refuses them properly
+          -- and, since backend #169, without the operator's note.
+        * ``PAUSED`` -- never. It is the one non-terminal status, has no
+          ``ended_at`` at all, and an admin may resume it back to
+          ``ACTIVE``. Nothing has ended, so there is nothing to report.
+        * ``ACTIVE`` -- not this method's question;
+          ``get_active_session_for_device`` above answers it, and the
+          portal asks that one first.
+
+        ``disconnect_reason`` is read here and never returned. It is free
+        text from three mutually distrusting sources -- see
+        ``GuestSessionEndedReason``'s docstring -- so it may inform a
+        decision but may not itself become an answer.
+
+        The ``LAST_ENDED_SESSION_WINDOW_MINUTES`` bound is applied in
+        SQL (``repository.get_latest_ended_session_for_device``), not
+        here, so no future caller can obtain an unbounded history of a
+        device by skipping a Python-side check.
+        """
+        now = now or datetime.now(UTC)
+        device = await self.repository.get_device_by_mac(
+            normalize_mac_address(device_mac)
+        )
+        if device is None:
+            return None
+        # The exact mirror of the skip in `get_active_session_for_device`,
+        # and it has to be here or that skip would make things worse
+        # rather than better: a guest whose router-side session has run
+        # out would stop being told "you're connected" (good) and start
+        # getting a blank sign-in form with no explanation (which is the
+        # bug this whole change exists to fix).
+        #
+        # This is also the case the feature has to survive on. If the NAS
+        # never sends an Accounting-Stop -- a real possibility nobody has
+        # been able to disprove on the device -- the row stays ACTIVE
+        # indefinitely, because the idle sweep cannot expire it either
+        # (see `has_session_reached_time_limit`). Deriving the answer from
+        # the session's own elapsed life rather than from a disconnect
+        # event means the screen works whether or not the router ever
+        # tells us anything.
+        overrun = await self._active_session_past_its_limit(
+            router_id=router_id, device_id=device.id, now=now
+        )
+        if overrun is not None:
+            return GuestLastEndedSessionResult(
+                reason=GuestSessionEndedReason.TIMED_OUT,
+                session_timeout_minutes=overrun.session_timeout_minutes,
+            )
+        session = await self.repository.get_latest_ended_session_for_device(
+            router_id=router_id,
+            device_id=device.id,
+            statuses=(
+                GuestSessionStatus.DISCONNECTED.value,
+                GuestSessionStatus.EXPIRED.value,
+            ),
+            ended_after=now - timedelta(minutes=LAST_ENDED_SESSION_WINDOW_MINUTES),
+        )
+        if session is None:
+            return None
+        reason = _ended_session_reason(session)
+        if reason is None:
+            return None
+        return GuestLastEndedSessionResult(
+            reason=reason,
+            session_timeout_minutes=session.session_timeout_minutes,
         )
 
     # ========================================================================
@@ -4877,9 +5142,31 @@ class GuestService:
         with a short gap between them, not by this method."""
         if device_id is None:
             return None
+        now = datetime.now(UTC)
         active_sessions = await self.repository.list_active_sessions_for_guest(guest_id)
         for candidate in active_sessions:
             if candidate.router_id == router_id and candidate.device_id == device_id:
+                # An ACTIVE row that has already outlived its own
+                # `session_timeout_minutes` must not be reused, and this
+                # guard is what stops the rest of this change locking
+                # guests out. Reuse refreshes `last_activity_at` and
+                # `session_timeout_minutes` but never `started_at` -- by
+                # design, since backdating a closed accounting interval is
+                # the very thing this method's docstring refuses to do. So
+                # a guest signing in again after their 30 minutes ran out
+                # would land back on the same overrun row, be measured
+                # from the same old `started_at`, and be refused by
+                # Authorize again, for ever: the sign-in would appear to
+                # succeed and the internet would never come back.
+                #
+                # A fresh sign-in after the limit is a genuinely new
+                # connection interval and gets a genuinely new row, which
+                # is exactly what the append-only design already says
+                # should happen for a session that has ended -- this one
+                # has ended in every sense a guest can observe, whatever
+                # its status column still says.
+                if has_session_reached_time_limit(candidate, now=now):
+                    return None
                 return candidate
         return None
 
@@ -5862,6 +6149,28 @@ class RadiusService:
             "event_router_id": str(router.id),
             "event_calling_station_id": calling_station_id,
         }
+        # A session that has already spent its wall-clock allowance is not
+        # an authorization, however ACTIVE its row still says it is. This
+        # is the hop that makes a venue's "30 min" actually mean the guest
+        # signs in again: without it, a guest dropped by the router at 30
+        # minutes hits the portal, the portal re-POSTs to the hotspot, the
+        # NAS re-asks RADIUS, and this method -- looking only at status --
+        # said yes and issued a fresh full timeout. The guest was silently
+        # let back on without signing in, for ever, and the setting could
+        # never be observed to work.
+        #
+        # Treated exactly like every other Authorize rejection: a plain
+        # `authorized=False`, never an exception. RADIUS has no notion of
+        # "why", and the guest's next stop is the portal, where
+        # `/guest/session/last-ended` gives them the real explanation.
+        if session is not None and has_session_reached_time_limit(
+            session, now=datetime.now(UTC)
+        ):
+            logger.info(
+                "radius_authorize_session_past_time_limit",
+                extra={**decision_extra, "event_session_id": str(session.id)},
+            )
+            session = None
         if session is None:
             logger.info(
                 "radius_authorize_decision",
@@ -5884,14 +6193,47 @@ class RadiusService:
         )
         return RadiusAuthorizeResult(
             authorized=True,
-            session_timeout_seconds=(
-                session.session_timeout_minutes * 60
-                if session.session_timeout_minutes
-                else None
-            ),
+            # REMAINING time, not the full allowance again.
+            #
+            # This used to send `session_timeout_minutes * 60` on every
+            # Authorize. A NAS re-authorizes an already-connected device
+            # periodically, and the captive portal's own hotspot-login
+            # POST triggers one too -- so each of those handed the guest a
+            # brand-new full clock. A venue setting 30 minutes did not get
+            # a guest who must sign in again after 30 minutes; it got a
+            # guest whose 30 minutes restarted every time anything spoke
+            # to RADIUS. The limit was unreachable by construction, which
+            # is why "it just doesn't work" and not "it works late".
+            #
+            # A session at or past its limit is refused outright above, so
+            # this is always positive; `max(..., 1)` guards only the
+            # sub-second race between that check and this line, since a
+            # NAS given `Session-Timeout: 0` may treat it as unlimited --
+            # failing open on exactly the session we mean to end.
+            session_timeout_seconds=self._remaining_session_seconds(session),
             data_limit_mb=session.data_limit_mb,
             rate_limit=await self._resolve_rate_limit_reply(session.id),
         )
+
+    @staticmethod
+    def _remaining_session_seconds(session: GuestSession) -> int | None:
+        """Seconds left of ``session``'s own wall-clock allowance, or
+        ``None`` for an unbounded session (which stays unbounded -- absent
+        is how RADIUS says "no limit", and sending a number there would
+        impose one no venue asked for)."""
+        if not session.session_timeout_minutes:
+            return None
+        ends_at = session.started_at + timedelta(
+            minutes=session.session_timeout_minutes
+        )
+        remaining = (ends_at - datetime.now(UTC)).total_seconds()
+        # Rounded UP, not truncated: a session authorized microseconds
+        # after it was created has 14399.9997s left of a 240-minute
+        # allowance, and truncation would quietly shave a second off every
+        # venue's stated limit. Ceiling keeps a fresh session's reply
+        # exactly `session_timeout_minutes * 60`, which is both what the
+        # venue configured and what the existing wire-format tests pin.
+        return max(math.ceil(remaining), 1)
 
     async def _find_active_session_for_identifier(
         self, router: Router, identifier: str

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -969,6 +970,33 @@ class FakeGuestRepository:
             for s in self.sessions.values()
             if s.guest_id == guest_id and s.status == GuestSessionStatus.ACTIVE.value
         )
+
+    async def get_latest_ended_session_for_device(
+        self,
+        *,
+        router_id: uuid.UUID,
+        device_id: uuid.UUID,
+        statuses: Sequence[str],
+        ended_after: datetime,
+    ) -> GuestSession | None:
+        """Mirrors the real statement in ``GuestRepository`` -- including
+        the ``ended_at >= ended_after`` bound, which is the privacy
+        window and so must be enforced by the fake too, or the tests
+        that assert an old session is not disclosed would pass against a
+        fake that never had the bound at all."""
+        if not statuses:
+            return None
+        items = [
+            s
+            for s in self.sessions.values()
+            if s.router_id == router_id
+            and s.device_id == device_id
+            and s.status in set(statuses)
+            and s.ended_at is not None
+            and s.ended_at >= ended_after
+        ]
+        items.sort(key=lambda s: s.ended_at, reverse=True)  # type: ignore[arg-type,return-value]
+        return items[0] if items else None
 
     async def list_timed_out_sessions(self, *, now: datetime) -> list[GuestSession]:
         return [

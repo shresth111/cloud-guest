@@ -606,3 +606,82 @@ class RadiusNasDevicePushStatus(StrEnum):
     PENDING = "pending"
     ACTIVE = "active"
     FAILED = "failed"
+
+
+class GuestSessionEndedReason(StrEnum):
+    """What the captive portal is allowed to tell a returning guest about
+    the session that just ended on their device -- see
+    ``schemas.GuestLastEndedSessionResponse`` and
+    ``service.GuestService.get_last_ended_session_for_device``.
+
+    This is a **closed, derived** vocabulary, not
+    ``models.GuestSession.disconnect_reason``. That column is free text
+    written by three mutually distrusting sources and can never be handed
+    to a guest:
+
+    * an operator's own words, via
+      ``app.domains.guest_access.enforcement.BlockEnforcer._disconnect_reason``,
+      which stores ``f"Blocked: {reason}"`` -- returning that raw would
+      re-open precisely the operator-reason leak closed in backend #169;
+    * the NAS's ``Acct-Terminate-Cause`` verbatim (``Lost-Service``,
+      ``Idle-Timeout``, ...), which is vendor jargon, not guest copy;
+    * the portal's own prose (``"guest tapped disconnect"``).
+
+    So the mapping keys off ``GuestSessionStatus`` -- an enum this domain
+    owns -- and nothing else. Two members, deliberately:
+
+    * ``TIMED_OUT`` -- ``EXPIRED``: ``enforce_session_timeouts`` swept the
+      session because ``last_activity_at`` fell further behind than
+      ``session_timeout_minutes``. This is the founder's case.
+    * ``DISCONNECTED`` -- ``DISCONNECTED``: a normal, non-punitive end.
+      The NAS reported an Accounting-Stop, the router rebooted
+      (``close_sessions_for_nas_restart``), or the guest tapped
+      Disconnect. These are not split further because the only column
+      that could split them is the free text above, and guessing a
+      cause from it would be a confident lie rather than a message.
+
+    ``TERMINATED`` and ``PAUSED`` map to **no member at all** -- the
+    lookup returns ``None`` and the portal shows an ordinary sign-in
+    page. See the service method's docstring for why that is the only
+    safe answer for both.
+    """
+
+    TIMED_OUT = "timed_out"
+    DISCONNECTED = "disconnected"
+
+
+#: How long after a session ends the portal may still greet the returning
+#: device with "you were disconnected" instead of a plain sign-in page.
+#:
+#: The message has to be true *from the guest's side*: the only thing they
+#: actually observed is that the internet stopped, and this screen exists
+#: to connect that observation to a cause. That connection has a shelf
+#: life. Ten seconds later it is the obvious explanation; the next morning
+#: it is a non-sequitur about something they have long since stopped
+#: thinking about, and reads as a fresh fault rather than an explanation
+#: of an old one.
+#:
+#: 60 minutes, against the 240-minute ``DEFAULT_SESSION_TIMEOUT_MINUTES``:
+#:
+#: * Long enough for the real gap between a session dying and the guest
+#:   next opening a browser. The portal is only ever reached when the
+#:   device asks for a page, so a phone in a pocket through a meal or a
+#:   meeting routinely delays the visit by tens of minutes. A 5- or
+#:   10-minute window would silently miss most genuine cases while looking
+#:   like it worked in testing.
+#: * Short enough never to span two visits. A guest who leaves a venue and
+#:   comes back more than an hour later is a returning guest, and telling
+#:   them they "were disconnected" describes an event from their last
+#:   visit, not this one.
+#: * A quarter of the timeout it most often explains, so the explanation
+#:   can never outlive the session it is about by more than a fraction of
+#:   that session's own length. Tying it to the timeout directly
+#:   (``timeout // 4``) was rejected: the window is a fact about human
+#:   memory, not about venue policy, and it should not move when a venue
+#:   picks a different timeout.
+#:
+#: The 240-minute figure is itself only the platform default -- no venue
+#: has ever chosen it (there was no setting to choose it with). If venues
+#: gain a real timeout setting, revisit this number, but revisit it as a
+#: question about the guest, not as an arithmetic function of theirs.
+LAST_ENDED_SESSION_WINDOW_MINUTES = 60
