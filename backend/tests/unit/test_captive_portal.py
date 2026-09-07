@@ -475,11 +475,14 @@ async def _create_config(
     social_login_providers: list[str] | None = None,
     splash_headline: str | None = None,
     splash_welcome_message: str | None = None,
-    # True (the real, standard "OTP once, then a saved password" baseline
-    # -- see CaptivePortalConfig.username_password_enabled's own
-    # docstring) mirrors this helper's own otp_sms_enabled/voucher_enabled
-    # defaults being the actually-enabled-by-default methods.
-    username_password_enabled: bool = True,
+    # False as of 2026-09-07, mirroring the real column/schema default --
+    # password sign-in is being retired from the guest portal (see
+    # CaptivePortalConfig's module docstring, "Retiring password sign-in",
+    # and tests/unit/test_guest_password_login_retirement.py). This helper
+    # passes the value through explicitly, so it never exercised the real
+    # default either way; it is aligned here so a config built by these
+    # tests looks like one a real location would get.
+    username_password_enabled: bool = False,
     pin_login_enabled: bool = False,
     post_login_html: str | None = None,
     whitelist_only_enabled: bool = False,
@@ -1459,20 +1462,28 @@ class TestSocialLoginPlaceholder:
         assert config.social_login_enabled is False
         assert config.social_login_providers == []
 
-    async def test_username_password_enabled_by_default(self) -> None:
-        """The standard baseline every location gets: a guest verifies
-        once via OTP, sets a password right after, and signs in with
-        phone/email + password from then on -- real and on by default,
-        same as otp_sms_enabled/voucher_enabled (an admin can still turn
-        it off per location, e.g. an SMS-OTP-only kiosk)."""
+    async def test_username_password_disabled_by_default(self) -> None:
+        """Password sign-in used to be the standard baseline every
+        location got -- verify once via OTP, save a password, sign in with
+        phone/email + password from then on. It is being retired from the
+        guest portal, so a location created now does not get it, and a
+        returning guest at such a location does an OTP on every visit.
+
+        Existing rows are deliberately not migrated and the endpoint
+        deliberately stays in place behind this flag -- the whole rollout,
+        and the three separate defaults that have to agree for it to hold,
+        are in tests/unit/test_guest_password_login_retirement.py."""
         fx = make_service()
         config = await _create_config(fx)
-        assert config.username_password_enabled is True
-
-    async def test_username_password_can_be_disabled_per_location(self) -> None:
-        fx = make_service()
-        config = await _create_config(fx, username_password_enabled=False)
         assert config.username_password_enabled is False
+
+    async def test_username_password_can_still_be_enabled_per_location(self) -> None:
+        """The reversal is a single field an admin sets -- no migration,
+        no redeploy. A venue that wants the returning-guest shortcut back
+        can have it, and one that already has it keeps it."""
+        fx = make_service()
+        config = await _create_config(fx, username_password_enabled=True)
+        assert config.username_password_enabled is True
 
     async def test_no_provider_registry_validation_is_performed(self) -> None:
         """Any string is accepted as a provider slug -- there is no real

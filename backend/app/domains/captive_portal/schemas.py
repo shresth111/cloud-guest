@@ -249,14 +249,18 @@ class CaptivePortalConfigCreateRequest(BaseModel):
     voucher_enabled: bool = Field(default=True)
     # Real, functional login method (GuestService.login_via_password /
     # POST /guest/login/password) -- no longer the placeholder this field
-    # started as. Defaults to True (the standard baseline: every guest can
-    # verify once via OTP, set a password right after, and use phone/email
-    # + password from then on) -- mirrors
+    # started as. Defaults to FALSE as of 2026-09-07: password sign-in is
+    # being retired from the guest portal, so a config created now must not
+    # be handed it as a baseline. Mirrors
     # app.domains.location.provisioning_service._resolve_login_methods's
-    # identical "always-on baseline" default for a newly provisioned
-    # location. An admin can still explicitly turn it off per location
-    # (e.g. an SMS-OTP-only kiosk) via CaptivePortalConfigUpdateRequest.
-    username_password_enabled: bool = Field(default=True)
+    # identical default for a newly provisioned location -- the two must
+    # agree or the disagreement presents as a race. Existing rows are
+    # deliberately not migrated and the endpoint deliberately stays in
+    # place behind the flag; see CaptivePortalConfig's module docstring
+    # ("Retiring password sign-in") for the whole rollout, including the
+    # guest-facing cost. An admin can still explicitly turn it on per
+    # location via CaptivePortalConfigUpdateRequest.
+    username_password_enabled: bool = Field(default=False)
     pin_login_enabled: bool = Field(
         default=False,
         description=(

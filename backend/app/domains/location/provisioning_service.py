@@ -797,7 +797,16 @@ class _LoginMethods:
     otp_email_enabled: bool
     voucher_enabled: bool
     social_login_enabled: bool
-    username_password_enabled: bool = True
+    # Defaults OFF as of 2026-09-07 -- password sign-in is being retired
+    # from the guest portal. Must stay equal to
+    # app.domains.captive_portal.models.CaptivePortalConfig
+    # .username_password_enabled's own column default: this dataclass and
+    # that column are two independent defaults for the same
+    # setting, and if they disagree a location's offered methods depend on
+    # which path created its config, which presents as a race rather than
+    # as a wrong default. See that column's module docstring ("Retiring
+    # password sign-in") for the rollout and the guest-facing cost.
+    username_password_enabled: bool = False
     # Third real OTP channel -- see CaptivePortalConfig.otp_whatsapp_enabled's
     # own docstring. No PlanFeatureKey exists for it (same gap as
     # otp_email_enabled had before it defaulted on), but unlike email,
@@ -816,8 +825,13 @@ def _resolve_login_methods(feature_summary: dict[str, object]) -> _LoginMethods:
     ``CaptivePortalConfig`` field to map onto today -- a real, documented
     gap (not fabricated), left for a future Captive Portal addition.
     ``username_password_enabled`` has no corresponding ``PlanFeatureKey`` in
-    the spec's list either, so it defaults to always-on (the standard,
-    baseline login method).
+    the spec's list either. It used to default to always-on (the standard,
+    baseline login method); as of 2026-09-07 it defaults OFF, because
+    password sign-in is being retired from the guest portal -- see
+    ``_LoginMethods``'s own field comment and
+    ``app.domains.captive_portal.models``'s module docstring. The cost,
+    stated plainly: a returning guest at a newly provisioned location does
+    an OTP on every visit.
 
     ``otp_email_enabled`` previously reused ``mobile_otp_enabled`` as its
     source -- there is no dedicated ``PlanFeatureKey`` for email OTP either
@@ -829,9 +843,14 @@ def _resolve_login_methods(feature_summary: dict[str, object]) -> _LoginMethods:
     guest hitting the disabled otp_email path fell through to the
     password-login form, which always fails for a first-time guest with no
     saved password (``GuestPasswordLoginFailedError``). Email OTP has no
-    comparable per-send cost, so -- like ``username_password_enabled`` --
-    it now defaults to always-on rather than piggybacking on an unrelated
-    feature flag."""
+    comparable per-send cost, so it now defaults to always-on rather than
+    piggybacking on an unrelated feature flag. (This used to read "like
+    ``username_password_enabled``, it now defaults to always-on". That
+    comparison no longer holds -- password login defaults OFF as of
+    2026-09-07 -- and the incident above is a reason it should: falling
+    through to a password form that can never succeed for a first-time
+    guest is exactly what made a broken email path look like a working
+    one.)"""
     mobile_otp_enabled = bool(
         feature_summary.get(PlanFeatureKey.MOBILE_OTP.value, False)
     )
