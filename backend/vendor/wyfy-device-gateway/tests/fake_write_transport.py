@@ -39,12 +39,45 @@ class FakePath:
     def __iter__(self):
         return iter(self._rows)
 
-    def __call__(self, **kwargs: Any):
+    def __call__(self, cmd: str | None = None, **kwargs: Any):
         """RouterOS menu paths are themselves callable to invoke the bare
         command they represent (e.g. ``api.path("system", "reboot")()``),
         distinct from ``.add``/``.update``/``.remove`` -- confirmed by the
-        real ``_reboot_sync`` usage this fake mirrors."""
-        return iter(self._rows)
+        real ``_reboot_sync`` usage this fake mirrors.
+
+        ``cmd`` is modelled because ``unset`` has no ``librouteros`` helper
+        and is issued this way -- ``path("unset", **{".id": ..,
+        "value-name": ..})``. It is the *only* way to clear a RouterOS
+        field: ``set field=""`` fails with "ambiguous value ... more than
+        one possible value matches input" on real hardware. If this fake
+        did not model ``unset``, a removal that silently left
+        ``dhcp-option-set`` attached would pass every test in this suite.
+
+        The real ``librouteros`` ``Path.__call__`` is a generator, so a
+        caller that never consumes it sends nothing. Returning an iterator
+        here preserves that: a bare, unconsumed call mutates nothing in
+        this fake either, exactly as on a device.
+        """
+        if cmd != "unset":
+            return iter(self._rows)
+
+        def _apply():
+            target_id = kwargs.get(".id")
+            value_name = kwargs.get("value-name")
+            self._recorder.unset_calls.append(
+                (self._segments, target_id, value_name)
+            )
+            self._recorder.ops.append(
+                ("unset", self._segments, (target_id, value_name))
+            )
+            for row in self._rows:
+                if row.get(".id") == target_id:
+                    row.pop(value_name, None)
+                    break
+            return
+            yield  # pragma: no cover - generator marker
+
+        return _apply()
 
     def add(self, **fields: Any) -> str:
         new_id = f"*{len(self._rows) + 1}"
@@ -129,6 +162,11 @@ class FakeRouterOSApi:
         self.add_calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
         self.update_calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
         self.remove_calls: list[tuple[tuple[str, ...], tuple[Any, ...]]] = []
+        # RouterOS ``unset`` -- (path, .id, value-name). Its own list
+        # because it is neither an update nor a remove, and the removal
+        # path's correctness is exactly "did it unset, or did it try to
+        # set an empty string".
+        self.unset_calls: list[tuple[tuple[str, ...], Any, Any]] = []
         # One interleaved log of every write, in the order it was issued.
         # The three lists above cannot answer "did the add happen before the
         # remove", and for a security control that must fail closed --

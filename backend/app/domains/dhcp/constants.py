@@ -25,6 +25,13 @@ __all__ = [
     "ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS",
     "ROGUE_DHCP_DETECTION_SWEEP_LOCK_REDIS_KEY",
     "ROGUE_DHCP_DETECTION_SWEEP_LOCK_TTL_SECONDS",
+    "CAPTIVE_PORTAL_DHCP_OPTION_NAME",
+    "CAPTIVE_PORTAL_DHCP_OPTION_SET_NAME",
+    "CAPTIVE_PORTAL_DHCP_OPTION_CODE",
+    "TASK_RUN_CAPTIVE_PORTAL_DHCP_OPTION_SWEEP",
+    "TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER",
+    "CAPTIVE_PORTAL_DHCP_OPTION_SWEEP_LOCK_REDIS_KEY",
+    "CAPTIVE_PORTAL_DHCP_OPTION_SWEEP_LOCK_TTL_SECONDS",
 ]
 
 
@@ -182,3 +189,81 @@ ROGUE_DHCP_DETECTION_SWEEP_LOCK_REDIS_KEY = "dhcp:rogue_dhcp_detection_sweep:loc
 # query plus N in-memory ``.delay()`` calls, not for the leaf tasks' own
 # device I/O; gating release on those would defeat fan-out entirely.
 ROGUE_DHCP_DETECTION_SWEEP_LOCK_TTL_SECONDS = 300
+
+
+# ============================================================================
+# The captive-portal DHCP option (RFC 8910, code 114)
+# ============================================================================
+
+# The exact identity the Master Console setup script writes, read off the
+# live venue router over the API rather than copied from the generator:
+#
+#   /ip/dhcp-server/option
+#     name  cloudguest-captive-portal   code 114   force True
+#     value 'https://master.wyfyguest.com/api/v1/captive-portal/rfc8908?...'
+#   /ip/dhcp-server/option/sets
+#     name  cloudguest-opts   options cloudguest-captive-portal
+#   /ip/dhcp-server/network
+#     address 10.5.50.0/24   dhcp-option-set 'cloudguest-opts'
+#
+# ## Why the platform now needs to be able to take this off
+#
+# Option 114 hands every client an RFC 8908 "captive portal API" URI. A
+# client re-polls that URI to learn whether it is *still* captive. Ours
+# answers with a hardcoded ``captive: true`` (``app.domains.captive_portal
+# .router``), so a guest who has just signed in successfully is told they
+# are still captive, forever, and the portal sheet never closes.
+#
+# The endpoint cannot be made truthful. Every guest reaches the cloud from
+# behind the venue's NAT as a single source IP -- which is why its handler
+# takes no ``Request`` at all -- so it has no way to tell one guest's
+# session from another's. The only URI that could answer honestly is the
+# router's own ``api.json``, which is HTTPS-only and needs a fleet
+# certificate this platform does not yet have.
+#
+# With no option 114 at all, the OS's own probe interception gets both
+# halves right: intercepted before login (sheet opens), succeeds after
+# login (sheet dismisses). So the remediation is to stop advertising the
+# option -- and that has to be something the platform can do to a router,
+# not something a person does over an API session at 2am.
+#
+# ## Matched by name, never by code
+#
+# ``CAPTIVE_PORTAL_DHCP_OPTION_NAME`` is the identity. A sweep scoped to
+# ``code=114`` could only ever hit a row somebody else added: a venue
+# running its own PXE or vendor option on the same code is a real
+# configuration, and removing it would be a worse outage than the one being
+# fixed. ``CAPTIVE_PORTAL_DHCP_OPTION_CODE`` is recorded here for the
+# *write* path and for humans reading logs -- it is never a match key.
+CAPTIVE_PORTAL_DHCP_OPTION_NAME = "cloudguest-captive-portal"
+CAPTIVE_PORTAL_DHCP_OPTION_SET_NAME = "cloudguest-opts"
+CAPTIVE_PORTAL_DHCP_OPTION_CODE = 114
+
+# The Beat-schedulable coordinator and its per-router fan-out leaf, in the
+# same two-task shape as the rogue-DHCP sweep above and for the same
+# reason: the leaf is a real RouterOS round trip, so one unreachable router
+# must only ever delay its own task.
+#
+# **Neither is registered in ``app.core.celery_app``'s ``beat_schedule``,
+# deliberately.** A recurring job that removes this option would fight the
+# Master Console setup script on every freshly-provisioned router until
+# that generator stops emitting the chunk (a separate change, in a separate
+# repository, by a separate engineer), and a background job that quietly
+# undoes what an operator just pasted is worse than one that never runs.
+# Dispatch it explicitly -- per router through
+# ``DhcpService.converge_captive_portal_dhcp_option_for_router``, or
+# fleet-wide by calling the coordinator once -- until that lands.
+TASK_RUN_CAPTIVE_PORTAL_DHCP_OPTION_SWEEP = (
+    "app.domains.dhcp.tasks.run_captive_portal_dhcp_option_sweep"
+)
+TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER = (
+    "app.domains.dhcp.tasks.converge_captive_portal_dhcp_option_for_router"
+)
+
+# Same crash-safety-backstop contract as the rogue-DHCP sweep lock above:
+# it guards the coordinator's own listing+dispatch phase against two
+# invocations racing, never against a slow router.
+CAPTIVE_PORTAL_DHCP_OPTION_SWEEP_LOCK_REDIS_KEY = (
+    "dhcp:captive_portal_dhcp_option_sweep:lock"
+)
+CAPTIVE_PORTAL_DHCP_OPTION_SWEEP_LOCK_TTL_SECONDS = 300

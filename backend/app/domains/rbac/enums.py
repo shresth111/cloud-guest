@@ -796,6 +796,14 @@ class AuditAction(StrEnum):
     # nothing about any device -- and used to be the only DHCP audit entry
     # that ever existed, which is how "created" came to mean "a row exists".
     DHCP_POOL_PUSHED = "dhcp_pool_pushed"
+    # The captive-portal DHCP option (RFC 8910, code 114) written to, or
+    # removed from, a router. Its entity is a **router**, not a DhcpPool:
+    # the option is a property of the device and belongs to no pool row.
+    # Recorded only when the device actually changed -- a fleet sweep is
+    # idempotent, and a row per router per run would bury the handful of
+    # entries recording a real change to a production network.
+    DHCP_OPTION_WRITTEN = "dhcp_option_written"
+    DHCP_OPTION_REMOVED = "dhcp_option_removed"
 
     # Port Forwarding Management domain events -- written through this
     # same table by

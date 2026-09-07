@@ -126,6 +126,7 @@ from app.domains.connected_devices.constants import (
 )
 from app.domains.dhcp.constants import (
     ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,
+    TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER,
     TASK_DETECT_ROGUE_DHCP_FOR_ROUTER,
     TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
 )
@@ -294,6 +295,14 @@ celery_app.conf.update(
         # left off -- one DB query plus N .delay() calls, no device I/O of
         # its own.
         TASK_DETECT_ROGUE_DHCP_FOR_ROUTER: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The captive-portal DHCP-option converger -- one real RouterOS
+        # write per router, so it belongs here for the same reason. Routed
+        # but NOT Beat-scheduled: see the constant's own note on why a
+        # recurring remover must wait for the Master Console generator to
+        # stop emitting the option-114 chunk.
+        TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER: {
+            "queue": DEVICE_IO_QUEUE_NAME
+        },
     },
     beat_schedule={
         # Hub reconciliation -- every 5 minutes, the shortest cadence in
