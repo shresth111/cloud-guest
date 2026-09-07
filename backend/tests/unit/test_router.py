@@ -870,7 +870,15 @@ class TestRouterProvisioning:
         # be allowed too or the one hostname guests are actually sent to is
         # the one hostname walled off. Keeps the one line of slack this cap
         # has carried since the 30 -> 36 raise.
-        assert len(lines) <= 39
+        #
+        # Raised 39 -> 42 on 2026-09-07, again in lockstep, for the three
+        # lines that make the HTTPS portal reachable pre-auth at all: a
+        # fourth host-based row for `GUEST_PORTAL_HOST` (the host the guest
+        # is actually sent to, which this section had never allowed), one
+        # joined line of address-based `/ip hotspot walled-garden ip`
+        # writes, and one verification line. See test_network_config.py for
+        # why the address-based row is the only one that can pass TLS.
+        assert len(lines) <= 42
         assert '/system identity set name="HQ-001"' in script
         assert "provisioning/check-in" in script
         # Step 1 ends at a verified tunnel + success line; the full config

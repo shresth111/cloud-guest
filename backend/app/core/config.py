@@ -31,6 +31,17 @@ class Settings(BaseSettings):
             # is here so it stays working if that ever stops being true,
             # not because anything currently depends on it.
             "https://wifi.wyfyguest.com",
+            # The origin the guest portal SPA is ACTUALLY served from --
+            # `network_config.renderers.GUEST_PORTAL_HOST`, and the host in
+            # the `location.replace()` the router's own login.html performs.
+            # The entry above covers the hop the browser passes over on the
+            # way here; this covers where it lands and stays. Same "here so
+            # it keeps working if same-origin ever stops being true"
+            # reasoning, but with a sharper edge: production serves the SPA
+            # on auth.wyfyguest.com and the Master API on
+            # master.wyfyguest.com, which is cross-origin the moment nginx
+            # stops proxying /api/ from the portal's own server block.
+            "https://auth.wyfyguest.com",
         ]
     )
 
