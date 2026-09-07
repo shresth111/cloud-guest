@@ -123,8 +123,9 @@ class TestRadiusAuthorizeWireFormat:
         # nothing near RADIUS.
         #
         # What this test is actually for is rlm_rest's ATTRIBUTE NAMES, not
-        # the arithmetic -- that belongs to
-        # test_guest_last_ended_session.py::test_the_reply_carries_remaining_time_not_the_full_allowance.
+        # the arithmetic. That is owned by the test asserting the reply
+        # carries remaining time rather than the full allowance, over in
+        # tests/unit/test_guest_last_ended_session.py.
         # So pin it tightly enough that a wrong attribute or a wrong unit
         # (minutes-not-seconds, or some other timeout entirely) still fails,
         # and loosely enough that the clock cannot.
