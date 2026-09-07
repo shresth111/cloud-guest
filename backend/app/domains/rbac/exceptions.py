@@ -222,3 +222,59 @@ class MissingScopeContextError(RBACError):
             f"(supply the X-{scope_name.title()}-Id header)",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+
+class UnspecifiedOrganizationScopeError(RBACError):
+    """A GLOBAL-scoped caller named no organization and did not ask for all of them.
+
+    Distinct from :class:`MissingScopeContextError`, which is what a *tenant*
+    caller gets. This one is specifically the platform-admin case, and its
+    message has to name both remedies because both are legitimate: a platform
+    admin looking at one venue picks that venue, and a platform admin auditing
+    the estate asks for every venue on purpose.
+
+    Before this existed, that caller silently got every organization -- see
+    ``app.domains.rbac.organization_scope`` for the report this produced.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This request did not say which organization it is about. Select an "
+            "organization (send its id in the X-Organization-Id header), or ask "
+            "for every organization explicitly (send X-Organization-Scope: all). "
+            "Reading across organizations is never the default.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class CrossOrganizationScopeDeniedError(RBACError):
+    """A caller without a GLOBAL-scoped role asked to read across organizations.
+
+    403 rather than a silent narrowing to their own tenant: a caller who
+    believes they are looking at the whole estate and is actually looking at
+    one tenant makes worse decisions than one who is told no.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Reading across organizations requires a platform-level (global) "
+            "role. Scope this request to a single organization instead.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class SingleOrganizationRequiredError(RBACError):
+    """A cross-organization request hit a route that only answers per-tenant.
+
+    A usage summary, an invoice list or a per-venue report has no honest
+    all-organizations answer -- summing one across fourteen tenants produces a
+    number that is true of nobody. Refusing is better than inventing it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This operation is about one organization, so it cannot be run "
+            "across all of them. Select an organization (send its id in the "
+            "X-Organization-Id header).",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
