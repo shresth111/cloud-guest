@@ -31,14 +31,22 @@ device.
 
 ## Two ports, not one -- why ``creds.extra["ssh_port"]`` exists
 
-Every read/write operation below except ``provision_device`` uses
-MikroTik's structured RouterOS API (``librouteros``, default TCP port
-8728, taken from ``creds.port``). ``provision_device`` is the one
-operation ported from ``provisioning_engine.device_adapters`` that
-genuinely needs SSH + SFTP instead (RouterOS's API protocol has no
-file-transfer primitive; ``/import`` is a file-system-level operation --
-see that module's own docstring for the full "why both librouteros AND
-asyncssh" reasoning, mirrored here unchanged). Since
+Almost every operation below uses MikroTik's structured RouterOS API
+(``librouteros``, default TCP port 8728, taken from ``creds.port``). The
+exceptions are the ones that genuinely move *files*: ``provision_device``,
+``push_config``/``verify_config``, ``backup``/``restore`` and
+``upload_file`` need SSH + SFTP, because RouterOS's API protocol has no
+file-transfer primitive and ``/import`` is a file-system-level operation
+(see ``provisioning_engine.device_adapters``'s own docstring for the full
+"why both librouteros AND asyncssh" reasoning, mirrored here unchanged).
+
+``execute_raw_command`` used to be in that SSH list and is not any more:
+port 22 is filtered on this fleet, so the Master Console device console
+timed out on commands the API answers in milliseconds. It now runs over
+the API whenever the command can be translated faithfully, and falls back
+to SSH only for the shapes the API cannot express -- see that method's own
+docstring for the incident and :func:`_console_command_to_api_sentence`
+for what "faithfully" means. Since
 ``DeviceCredentials`` (the vendor-agnostic contract type) has only one
 ``port`` field, the SSH port is read from ``creds.extra["ssh_port"]``
 (defaulting to 22 if absent/unparsable) -- exactly the escape hatch the
@@ -65,6 +73,7 @@ import hashlib
 import ipaddress
 import logging
 import re
+import shlex
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -623,6 +632,183 @@ def _describe_exception(exc: BaseException) -> str:
     if isinstance(exc, TimeoutError):
         return "connection attempt timed out"
     return type(exc).__name__
+
+
+# ============================================================================
+# Raw-console command translation: RouterOS CLI text -> a RouterOS API
+# sentence. See ``MikroTikAdapter.execute_raw_command``'s own docstring for
+# why the console runs over the API (8728) rather than SSH (22).
+# ============================================================================
+
+# A bare (non ``key=value``) console token is only ever a menu segment or a
+# command word. Anything outside this shape -- ``[find ...]``, ``:put``,
+# ``$var``, a ``;``-chained second command, a redirect -- has no API-sentence
+# equivalent, and *guessing* one would run something other than what the
+# operator typed. Those commands are handed to the SSH fallback instead.
+_CONSOLE_BARE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_CONSOLE_ARG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# RouterOS CLI keywords that read as bare words but are *not* menu segments.
+# ``/interface print where running=yes`` naively concatenates to the
+# nonexistent path ``/interface/print/where``; the API expresses that filter
+# as a query word instead, which this translator deliberately does not try to
+# construct. Presence of any of these means "not translatable".
+_CONSOLE_CLI_ONLY_KEYWORDS = frozenset(
+    {
+        "where",
+        "from",
+        "do",
+        "as-value",
+        "follow",
+        "follow-only",
+        "without-paging",
+        "detail",
+        "brief",
+        "terse",
+        "count-only",
+        "file",
+        "append",
+        "value-list",
+    }
+)
+
+# RouterOS command words -- the verb that terminates a menu path. A
+# translatable command's LAST bare token must be one of these, and no
+# earlier token may be.
+#
+# This is what keeps *positional* CLI syntax out. ``/user set admin
+# password=x`` is a real command an operator might type, and naive
+# concatenation turns it into the nonexistent path ``/user/set/admin``
+# (the API expresses that target as a ``.id``/``numbers`` word, not a path
+# segment). Requiring the verb to come last rejects it, and the SSH
+# fallback then reports honestly instead of the platform issuing a sentence
+# nobody asked for.
+#
+# The list is deliberately conservative and incomplete. A command whose
+# verb is not here is not translated -- it is not mangled -- so growing
+# this set is a safe, additive change, while a wrong entry is not.
+_ROUTEROS_ACTION_WORDS = frozenset(
+    {
+        "add",
+        "backup",
+        "blink",
+        "cancel",
+        "check-for-updates",
+        "clear",
+        "comment",
+        "disable",
+        "discover",
+        "download",
+        "enable",
+        "export",
+        "find",
+        "flush",
+        "get",
+        "install",
+        "load",
+        "monitor",
+        "move",
+        "ping",
+        "print",
+        "reboot",
+        "refresh",
+        "register",
+        "release",
+        "remove",
+        "renew",
+        "reset",
+        "reset-configuration",
+        "reset-counters",
+        "resolve",
+        "restart",
+        "restore",
+        "run",
+        "save",
+        "scan",
+        "send",
+        "set",
+        "shutdown",
+        "sign",
+        "start",
+        "stop",
+        "unset",
+        "upgrade",
+    }
+)
+
+
+def _console_command_to_api_sentence(
+    command: str,
+) -> tuple[str, dict[str, str]] | None:
+    """Translates one RouterOS console line into ``(sentence, arguments)``
+    for ``librouteros``' raw calling form (``api("/interface/print")``), or
+    returns ``None`` when the line cannot be translated *faithfully*.
+
+    ``None`` is not a failure -- it means "this command's meaning is not
+    expressible as a single API sentence", and the caller falls back to the
+    SSH transport rather than running an approximation of what the operator
+    asked for. Translating conservatively and refusing loudly is the whole
+    point: a console that silently runs a *different* command than the one
+    typed is worse than one that cannot run it at all.
+    """
+    try:
+        tokens = shlex.split(command.strip())
+    except ValueError:  # unbalanced quotes -- let SSH's own parser judge it
+        return None
+    if not tokens or not tokens[0].startswith("/"):
+        return None
+
+    segments: list[str] = []
+    arguments: dict[str, str] = {}
+    seen_argument = False
+    for index, token in enumerate(tokens):
+        name, separator, value = token.partition("=")
+        if separator and not token.startswith("/"):
+            if not _CONSOLE_ARG_NAME_RE.match(name):
+                return None
+            arguments[name] = value
+            seen_argument = True
+            continue
+        # A bare word after arguments have started is a second command or a
+        # CLI construct, never a menu segment.
+        if seen_argument:
+            return None
+        bare = token.lstrip("/") if index == 0 else token
+        if index > 0 and bare in _CONSOLE_CLI_ONLY_KEYWORDS:
+            return None
+        if not _CONSOLE_BARE_TOKEN_RE.match(bare):
+            return None
+        segments.extend(part for part in bare.split("/") if part)
+
+    # A menu path alone (``/interface``) only opens a submenu on the CLI; it
+    # is not a command the API can execute. Needs at least menu + verb.
+    if len(segments) < 2:
+        return None
+    # The verb terminates the path, and appears exactly once. Anything else
+    # means a positional argument or a second command is in play -- see
+    # ``_ROUTEROS_ACTION_WORDS``.
+    if segments[-1] not in _ROUTEROS_ACTION_WORDS:
+        return None
+    if any(segment in _ROUTEROS_ACTION_WORDS for segment in segments[:-1]):
+        return None
+    return "/" + "/".join(segments), arguments
+
+
+def _format_console_rows(rows: Sequence[Mapping[str, object]]) -> str:
+    """Renders RouterOS API reply rows as console-style text.
+
+    The API answers with structured rows where the CLI answers with a text
+    table, so this is the one place the two transports genuinely differ in
+    what an operator sees. ``key=value`` per row (``.id`` first, since that
+    is what a follow-up command needs) is chosen over imitating the CLI's
+    column layout because it is unambiguous: no truncated columns, and no
+    value silently reformatted to fit a width."""
+    lines: list[str] = []
+    for index, row in enumerate(rows):
+        ordered = sorted(row.items(), key=lambda item: (item[0] != ".id", item[0]))
+        rendered = " ".join(f"{key}={value}" for key, value in ordered)
+        lines.append(f"{index:>3} {rendered}".rstrip())
+    return "\n".join(lines)
 
 
 def _domain_subdomain_regex(domain: str) -> str:
@@ -6046,18 +6232,94 @@ class MikroTikAdapter:
     async def execute_raw_command(
         self, creds: DeviceCredentials, *, command: str
     ) -> RawCommandResult:
-        """Ported from
-        ``provisioning_engine/device_adapters.py::execute_raw_command`` --
-        runs exactly ``command`` over the device's real SSH console
-        connection with no interpretation, whitelisting, or retry. Unlike
-        every other method here, a non-zero ``exit_status`` is not raised
-        as an exception (see :class:`~.contract.RawCommandResult`'s own
-        docstring)."""
+        """Runs exactly ``command`` on the device, with no whitelisting or
+        retry. Unlike every other method here, a non-zero ``exit_status`` is
+        not raised as an exception (see
+        :class:`~.contract.RawCommandResult`'s own docstring) -- a typo in
+        the console is a result, not a 500.
+
+        ## Why this runs over the API (8728), not SSH (22)
+
+        This method was ported from ``provisioning_engine/device_adapters
+        .py`` running over SSH, and SSH does not reach this fleet. Port 22
+        is filtered on real routers -- a port sweep from the platform
+        reached only 8728, and 22 timed out (recorded in
+        ``app.domains.qos.models`` and ``app.domains.content_filtering
+        .device_adapters``, both of which moved off this same dead
+        transport for the same reason). The failure that motivated *this*
+        change: Master Console's Device Console ran ``/interface print``
+        against a healthy router and reported "connection attempt timed
+        out" after asyncssh's own 10s ``connect_timeout``, while the same
+        credential over 8728 answered the same command in 57ms. Nothing
+        was wrong with the device, the credential, the host or the tunnel
+        -- the console was simply knocking on a port nothing answers.
+
+        So a command that can be expressed *faithfully* as a single API
+        sentence is executed over the API, the transport that actually
+        reaches the fleet. Anything else (``[find ...]``, ``:``-script
+        commands, ``where`` filters, ``;``-chained lines --
+        see :func:`_console_command_to_api_sentence`) still goes over SSH
+        rather than being approximated, and its connection error now names
+        the transport and port it failed on so the next operator is not
+        sent hunting the wrong subsystem.
+        """
+        sentence = _console_command_to_api_sentence(command)
+        if sentence is None:
+            return await self._execute_raw_command_over_ssh(creds, command=command)
+        return await asyncio.to_thread(
+            self._execute_raw_command_over_api_sync, creds, command, *sentence
+        )
+
+    def _execute_raw_command_over_api_sync(
+        self,
+        creds: DeviceCredentials,
+        command: str,
+        sentence: str,
+        arguments: Mapping[str, str],
+    ) -> RawCommandResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = [dict(row) for row in api(sentence, **arguments)]
+            except LibRouterosError as exc:
+                # A device-side rejection (unknown command, bad argument,
+                # permission denied) is this console's equivalent of a
+                # non-zero shell exit status, not a transport failure.
+                return RawCommandResult(
+                    command=command,
+                    stdout="",
+                    stderr=_describe_exception(exc),
+                    exit_status=1,
+                )
+        finally:
+            api.close()
+        return RawCommandResult(
+            command=command,
+            stdout=_format_console_rows(rows),
+            stderr="",
+            exit_status=0,
+        )
+
+    async def _execute_raw_command_over_ssh(
+        self, creds: DeviceCredentials, *, command: str
+    ) -> RawCommandResult:
+        """The original SSH path, kept for the commands the API cannot
+        express. See ``execute_raw_command``'s own docstring for why this is
+        no longer the default and why its connection error names the port:
+        an operator who sees a bare timeout has no way to tell "the device
+        is unreachable" from "this platform tried a port your fleet
+        filters"."""
         try:
             async with self._ssh_connect(creds) as conn:
                 result = await conn.run(command, check=False)
         except (OSError, asyncssh.Error) as exc:
-            raise MikroTikConnectionError(creds.host, _describe_exception(exc)) from exc
+            raise MikroTikConnectionError(
+                creds.host,
+                f"{_describe_exception(exc)} (over SSH, port "
+                f"{self._ssh_port(creds)}; this command has no RouterOS API "
+                f"equivalent, so it could not use port "
+                f"{creds.port or _DEFAULT_API_PORT})",
+            ) from exc
         return RawCommandResult(
             command=command,
             stdout=str(result.stdout or ""),
