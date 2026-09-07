@@ -331,6 +331,27 @@ TASK_RUN_SESSION_TIMEOUT_SWEEP = "app.domains.guest.tasks.run_session_timeout_sw
 
 MAX_BULK_DEVICE_LOOKUP_IDS = 100
 
+# ============================================================================
+# Bulk voucher-redemption lookup -- see
+# ``GuestRepository.list_voucher_redemptions``'s own docstring.
+#
+# The Vouchers screen has the opposite problem to the one above, for a
+# structural reason rather than an oversight: ``app.domains.voucher.models
+# .Voucher`` stores a *self-reported* ``redeemed_identifier`` string and
+# deliberately no FK to a guest, device or session, so a voucher row cannot
+# say which device actually redeemed it. ``guest_sessions.voucher_id`` is
+# the only link, and it belongs to this domain -- which is why the resolver
+# is exposed from here and the voucher domain is left untouched, rather
+# than ``voucher/service.py`` querying ``guest_sessions`` and inverting the
+# dependency direction ``voucher/models.py`` sets out explicitly.
+#
+# Same bound and same reasoning as the device lookup above: a page-sized
+# batch, matching every list endpoint's own ``page_size<=100`` cap, rather
+# than an unbounded ``IN (...)``.
+# ============================================================================
+
+MAX_BULK_VOUCHER_LOOKUP_IDS = 100
+
 # Every 5 minutes -- shorter than analytics' 15-minute rolling aggregation
 # cadence (``SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS``-adjacent), because an
 # expired-but-not-yet-flipped session is guest-facing/operationally visible
@@ -604,6 +625,7 @@ __all__ = [
     "NAS_CODE_SEQUENCE_DIGITS",
     "NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES",
     "MAX_BULK_DEVICE_LOOKUP_IDS",
+    "MAX_BULK_VOUCHER_LOOKUP_IDS",
 ]
 
 

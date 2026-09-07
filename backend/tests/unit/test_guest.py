@@ -928,6 +928,89 @@ class FakeGuestRepository:
             ]
         return items
 
+    async def list_devices_for_session_ids(
+        self,
+        *,
+        device_ids,
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]:
+        """Mirrors the real query's tenancy question: a device is visible
+        if some session IN THIS ORGANIZATION used it -- deliberately not
+        ``list_devices_by_ids``'s "who owns the device row now", which a
+        device reassigned to another org's guest would fail."""
+        wanted = set(device_ids)
+        items = [
+            d for d in self.devices.values() if d.id in wanted and not d.is_deleted
+        ]
+        if organization_id is not None:
+            visible = {
+                s.device_id
+                for s in self.sessions.values()
+                if not s.is_deleted and s.organization_id == organization_id
+            }
+            items = [d for d in items if d.id in visible]
+        return items
+
+    async def list_devices_for_guest_ids(
+        self,
+        *,
+        guest_ids,
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]:
+        """Mirrors the real repository's ``last_seen_at DESC, id DESC``
+        ordering in Python -- that ordering is the contract
+        ``GuestResponse.mac_addresses[0] is the current device`` rests
+        on, so a fake that returned insertion order would let a broken
+        implementation pass."""
+        wanted = set(guest_ids)
+        items = [d for d in self.devices.values() if d.guest_id in wanted]
+        if organization_id is not None:
+            items = [
+                d
+                for d in items
+                if d.guest_id in self.guests
+                and self.guests[d.guest_id].organization_id == organization_id
+            ]
+        return sorted(items, key=lambda d: (d.last_seen_at, d.id), reverse=True)
+
+    async def list_voucher_redemptions(
+        self,
+        *,
+        voucher_ids,
+        organization_id: uuid.UUID | None,
+    ):
+        """Python mirror of the real ``row_number()``/``count()`` window
+        query: group this voucher's sessions, count them, and return the
+        most recent one with its device's MAC left-joined."""
+        from app.domains.guest.repository import VoucherRedemptionRow
+
+        wanted = set(voucher_ids)
+        by_voucher: dict[uuid.UUID, list[GuestSession]] = {}
+        for session in self.sessions.values():
+            if session.voucher_id not in wanted:
+                continue
+            if organization_id is not None and (
+                session.organization_id != organization_id
+            ):
+                continue
+            by_voucher.setdefault(session.voucher_id, []).append(session)
+        rows = []
+        for voucher_id, group in by_voucher.items():
+            newest = sorted(group, key=lambda s: (s.started_at, s.id), reverse=True)[0]
+            device = self.devices.get(newest.device_id) if newest.device_id else None
+            rows.append(
+                VoucherRedemptionRow(
+                    voucher_id=voucher_id,
+                    session_count=len(group),
+                    session_id=newest.id,
+                    guest_id=newest.guest_id,
+                    device_mac=device.mac_address if device else None,
+                    ip_address=newest.ip_address,
+                    started_at=newest.started_at,
+                )
+            )
+        return rows
+
     async def update_device(
         self, device: GuestDevice, data: dict[str, object]
     ) -> GuestDevice:

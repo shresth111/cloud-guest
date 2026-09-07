@@ -50,6 +50,22 @@ from .models import (
 
 
 @dataclass(frozen=True, slots=True)
+class VoucherRedemptionRow:
+    """One voucher's observed redemption -- its most recent
+    ``GuestSession`` plus how many sessions that voucher has in total.
+    See ``GuestRepository.list_voucher_redemptions`` for why "most
+    recent, plus a count" rather than the whole list."""
+
+    voucher_id: uuid.UUID
+    session_count: int
+    session_id: uuid.UUID
+    guest_id: uuid.UUID
+    device_mac: str | None
+    ip_address: str | None
+    started_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class SessionAggregate:
     visitors: int
     unique_guests: int
@@ -157,6 +173,27 @@ class GuestRepositoryProtocol(Protocol):
         device_ids: Sequence[uuid.UUID],
         organization_id: uuid.UUID | None,
     ) -> list[GuestDevice]: ...
+
+    async def list_devices_for_guest_ids(
+        self,
+        *,
+        guest_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]: ...
+
+    async def list_devices_for_session_ids(
+        self,
+        *,
+        device_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]: ...
+
+    async def list_voucher_redemptions(
+        self,
+        *,
+        voucher_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[VoucherRedemptionRow]: ...
 
     # -- sessions ------------------------------------------------------------------
     async def create_session(self, **fields: object) -> GuestSession: ...
@@ -511,6 +548,210 @@ class GuestRepository:
             statement = select(GuestDevice).where(*conditions)
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    async def list_devices_for_guest_ids(
+        self,
+        *,
+        guest_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]:
+        """Bulk-resolve every :class:`~.models.GuestDevice` belonging to
+        ``guest_ids`` (e.g. one page of ``GET /guests``) in a single query,
+        newest-seen device first.
+
+        The sibling of ``list_devices_by_ids`` above, keyed the other way
+        round. ``GET /guests`` needs this one because ``Guest`` carries no
+        ``device_id`` to key a by-id lookup off at all -- a guest *has*
+        devices, it is not *on* one -- so the existing bulk-by-device-id
+        endpoint cannot serve the Users screen no matter how it is called.
+
+        Ordered ``last_seen_at DESC`` in SQL, not in Python, so the caller
+        can take "the guest's current device" off the front of each group
+        without re-sorting; ``id`` breaks the tie so the order is total and
+        stable across pages rather than arbitrary between two devices
+        sharing a timestamp.
+
+        Tenant scoping joins through ``Guest`` for exactly the reason
+        ``list_devices_by_ids`` documents: ``GuestDevice`` has no
+        ``organization_id`` column of its own. A platform-level caller
+        (``organization_id is None``) skips the join, the same convention
+        every other method here uses."""
+        if not guest_ids:
+            return []
+        conditions = [
+            GuestDevice.guest_id.in_(guest_ids),
+            GuestDevice.is_deleted.is_(False),
+        ]
+        if organization_id is not None:
+            statement = (
+                select(GuestDevice)
+                .join(Guest, Guest.id == GuestDevice.guest_id)
+                .where(*conditions, Guest.organization_id == organization_id)
+            )
+        else:
+            statement = select(GuestDevice).where(*conditions)
+        statement = statement.order_by(
+            GuestDevice.last_seen_at.desc(), GuestDevice.id.desc()
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_devices_for_session_ids(
+        self,
+        *,
+        device_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[GuestDevice]:
+        """Resolve device ids taken from sessions the caller can already
+        see -- backs ``GuestSessionResponse.device_mac``.
+
+        ## Why this is not ``list_devices_by_ids``
+
+        That method scopes by the device's **current owner**
+        (``Guest.organization_id``), which is the right question for ``GET
+        /guest-devices``, where the caller names devices directly. It is
+        the wrong question here, because a ``GuestDevice`` is reassignable:
+        ``mac_address`` is globally unique and ``get_or_create_device``
+        re-points ``guest_id`` with no organization check, by design (see
+        ``models.py``'s "MAC address uniqueness" write-up). So one physical
+        phone carried between two venues on different organizations ends up
+        with its single device row owned by whichever guest authenticated
+        most recently.
+
+        Scoping by current owner then makes org A's *own* session lose its
+        MAC the moment that guest visits org B -- the field goes blank on
+        exactly the screens this exists to fix, reproducing the "empty cell
+        that reads as missing data" symptom that was reported in the first
+        place.
+
+        This asks the question that actually authorises the value: was this
+        device used by a session **in the caller's organization**? If yes,
+        that organization observed the device on its own network and is
+        entitled to the address, regardless of who the device row currently
+        points at. The caller reached these ids through an
+        already-tenant-filtered session list, so this re-derives the same
+        authorisation from the session table rather than trusting the ids
+        blindly -- a bug upstream still cannot leak another org's MAC.
+
+        ``DISTINCT`` because a device has many sessions and the join would
+        otherwise return one row per session. ``GET /guest-devices``'s own
+        behaviour is deliberately left unchanged; retiring or re-scoping a
+        published endpoint is a separate decision."""
+        if not device_ids:
+            return []
+        conditions = [
+            GuestDevice.id.in_(device_ids),
+            GuestDevice.is_deleted.is_(False),
+        ]
+        if organization_id is not None:
+            statement = (
+                select(GuestDevice)
+                .join(GuestSession, GuestSession.device_id == GuestDevice.id)
+                .where(
+                    *conditions,
+                    GuestSession.is_deleted.is_(False),
+                    GuestSession.organization_id == organization_id,
+                )
+                .distinct()
+            )
+        else:
+            statement = select(GuestDevice).where(*conditions)
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_voucher_redemptions(
+        self,
+        *,
+        voucher_ids: Sequence[uuid.UUID],
+        organization_id: uuid.UUID | None,
+    ) -> list[VoucherRedemptionRow]:
+        """Resolve ``voucher_ids`` to the device and address each was
+        actually redeemed on, in one query -- backs ``GET
+        /voucher-redemptions`` for the Vouchers screen.
+
+        ``guest_sessions.voucher_id`` is the only link between a voucher
+        and a device that exists: ``app.domains.voucher.models.Voucher``
+        stores a self-reported ``redeemed_identifier`` string and
+        deliberately no FK (see that model's own docstring). The join is
+        therefore two hops -- session by ``voucher_id``, then device by
+        ``session.device_id`` -- and it lives here because the guest
+        domain owns both tables.
+
+        A voucher may be multi-use (``VoucherBatch.max_uses_per_voucher``),
+        so this returns the **most recent** session per voucher plus a
+        total ``session_count``, not every session. Returning every
+        session would make the result unbounded in the one dimension the
+        caller cannot predict, and the Vouchers screen needs a single
+        cell; a caller wanting the full history has ``GET
+        /guest-sessions?voucher_id=...`` already. ``session_count`` is
+        what stops the UI presenting one device as *the* redeemer when
+        there were several.
+
+        Both the pick and the count are window functions over a single
+        scan rather than a per-voucher subquery, so this stays one round
+        trip regardless of how many vouchers are asked for.
+
+        The device join is a LEFT join: a session that carried no
+        ``device_id`` (a login that presented no MAC) still yields a row,
+        with ``device_mac`` ``None`` and its IP intact -- dropping the
+        row entirely would make a real redemption look like it never
+        happened.
+
+        Tenant scoping filters ``GuestSession.organization_id``
+        directly -- unlike ``GuestDevice``, a session carries its own
+        organization column, so no join through ``Guest`` is needed. A
+        platform-level caller (``organization_id is None``) skips the
+        filter, the same convention used throughout this repository."""
+        if not voucher_ids:
+            return []
+        conditions = [
+            GuestSession.voucher_id.in_(voucher_ids),
+            GuestSession.is_deleted.is_(False),
+        ]
+        if organization_id is not None:
+            conditions.append(GuestSession.organization_id == organization_id)
+        ranked = (
+            select(
+                GuestSession.voucher_id.label("voucher_id"),
+                GuestSession.id.label("session_id"),
+                GuestSession.guest_id.label("guest_id"),
+                GuestSession.ip_address.label("ip_address"),
+                GuestSession.started_at.label("started_at"),
+                GuestDevice.mac_address.label("device_mac"),
+                func.row_number()
+                .over(
+                    partition_by=GuestSession.voucher_id,
+                    order_by=(GuestSession.started_at.desc(), GuestSession.id.desc()),
+                )
+                .label("rank"),
+                func.count()
+                .over(partition_by=GuestSession.voucher_id)
+                .label("session_count"),
+            )
+            .select_from(GuestSession)
+            .join(
+                GuestDevice,
+                (GuestDevice.id == GuestSession.device_id)
+                & (GuestDevice.is_deleted.is_(False)),
+                isouter=True,
+            )
+            .where(*conditions)
+            .subquery()
+        )
+        statement = select(ranked).where(ranked.c.rank == 1)
+        result = await self.session.execute(statement)
+        return [
+            VoucherRedemptionRow(
+                voucher_id=row.voucher_id,
+                session_count=row.session_count,
+                session_id=row.session_id,
+                guest_id=row.guest_id,
+                device_mac=row.device_mac,
+                ip_address=row.ip_address,
+                started_at=row.started_at,
+            )
+            for row in result
+        ]
 
     # -- sessions ------------------------------------------------------------------
 
