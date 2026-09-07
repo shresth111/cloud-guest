@@ -2244,6 +2244,26 @@ class TestPlatformDefaultsMirrorTheirSourceConstants:
             == DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
         )
 
+    def test_idle_timeout_mirrors_the_guest_constant(self) -> None:
+        """And, transitively, the value the router setup script writes onto
+        the device (``HOTSPOT_IDLE_TIMEOUT``, 30m).
+
+        This one has a second reason to be pinned that the others do not.
+        Every Access-Accept now carries an ``Idle-Timeout`` built from this
+        mirror, for every venue, configured or not. As long as the number
+        equals what the device was already doing on its own, a venue that
+        never opened the settings screen sees no behaviour change. Let the
+        two drift and the platform starts silently overriding the device's
+        idle timeout fleet-wide with a number nobody chose -- which is the
+        exact failure this whole change set out to remove, reintroduced from
+        the other side."""
+        from app.domains.guest.constants import DEFAULT_IDLE_TIMEOUT_MINUTES
+
+        assert (
+            PLATFORM_DEFAULT_RULES[PolicyType.SESSION]["idle_timeout_minutes"]
+            == DEFAULT_IDLE_TIMEOUT_MINUTES
+        )
+
     def test_reconnect_cooldown_mirrors_the_guest_constant(self) -> None:
         from app.domains.guest.constants import TERMINATION_RECONNECT_COOLDOWN_MINUTES
 

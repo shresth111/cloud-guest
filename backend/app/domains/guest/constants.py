@@ -155,6 +155,40 @@ GUEST_SESSION_STATUS_TRANSITIONS: dict[
 # short-lived (minutes) verification codes.
 DEFAULT_SESSION_TIMEOUT_MINUTES = 240
 
+# How long a guest's device may pass ZERO bytes in either direction before
+# the NAS closes their session -- the RFC 2865 s5.28 ``Idle-Timeout`` reply
+# attribute this platform now sends on every Access-Accept
+# (``RadiusService.authorize``).
+#
+# Thirty minutes, and the number is not arbitrary: it is the SAME value the
+# Master console's own router setup script already writes onto RouterOS's
+# built-in ``default`` hotspot user profile
+# (``RouterDetailTabs.tsx``'s ``HOTSPOT_IDLE_TIMEOUT``). Two things follow
+# from deliberately matching it rather than picking a fresh number:
+#
+# * A venue that has never opened the Guest WiFi Limits screen sees no
+#   behaviour change at all from this platform starting to send the
+#   attribute. The reply now merely states, per session, what the device
+#   was already doing.
+# * The reply becomes the single source of truth. The profile value is a
+#   device-side *backstop* that only applies to a session RADIUS never
+#   answered for; every real guest's idle timeout is decided here, so it no
+#   longer depends on whether a given router was provisioned before or
+#   after that constant existed.
+#
+# It is emphatically NOT RouterOS's own factory default. RouterOS ships
+# ``idle-timeout=none`` on that profile, and this fleet also sets
+# ``keepalive-timeout=none`` (a fix for a confirmed incident where phones
+# locking their screens were hard-logged-out at the factory two-minute
+# keepalive). With both off, NOTHING closed an abandoned session: slots
+# stayed held against ``shared-users``, device counts only ever rose, and
+# RADIUS never saw an Accounting-Stop. The 30m was introduced to fix
+# exactly that. Anything here that lengthens or removes it is re-opening a
+# closed incident, which is why "no idle timeout at all" is deliberately
+# not an option this platform offers -- see
+# ``app.domains.policy.constants.PLATFORM_DEFAULT_RULES``.
+DEFAULT_IDLE_TIMEOUT_MINUTES = 30
+
 # How long, after an admin-driven ``terminate_session`` (punitive, not a
 # normal disconnect), the same guest is blocked from reconnecting at all --
 # see ``exceptions.SessionTerminationCooldownError``.
@@ -628,17 +662,39 @@ class GuestSessionEndedReason(StrEnum):
     * the portal's own prose (``"guest tapped disconnect"``).
 
     So the mapping keys off ``GuestSessionStatus`` -- an enum this domain
-    owns -- and nothing else. Two members, deliberately:
+    owns -- and nothing else. Four members:
 
     * ``TIMED_OUT`` -- ``EXPIRED``: ``enforce_session_timeouts`` swept the
       session because ``last_activity_at`` fell further behind than
       ``session_timeout_minutes``. This is the founder's case.
+    * ``IDLE_TIMED_OUT`` -- ``DISCONNECTED`` carrying the NAS's own
+      ``Idle-Timeout`` terminate cause (RFC 2866 s5.10 value 4). The
+      venue's configured idle timeout fired on the device. See
+      ``service.RADIUS_IDLE_TIMEOUT_TERMINATE_CAUSE`` for why this became
+      a distinguishable event only once this platform started *sending*
+      ``Idle-Timeout``, and why it is not folded into ``DISCONNECTED``.
+    * ``TIME_LIMIT_REACHED`` -- ``EXPIRED`` carrying one of
+      ``service.FUP_TIME_QUOTA_DISCONNECT_REASONS``:
+      ``run_fup_time_accrual`` expired the session because the guest has
+      spent their venue-configured daily/weekly/monthly connected-time
+      allowance. Distinct from ``TIMED_OUT`` because the two need
+      opposite advice: one guest can sign straight back in, the other
+      cannot until the period rolls over.
     * ``DISCONNECTED`` -- ``DISCONNECTED``: a normal, non-punitive end.
       The NAS reported an Accounting-Stop, the router rebooted
       (``close_sessions_for_nas_restart``), or the guest tapped
       Disconnect. These are not split further because the only column
       that could split them is the free text above, and guessing a
       cause from it would be a confident lie rather than a message.
+
+    The two added members do not weaken the "no free text ever reaches a
+    guest" guarantee that the original two-member vocabulary was built
+    on. Both are still *derived*: the mapping compares
+    ``disconnect_reason`` against string literals written in this
+    repository (or, for ``IDLE_TIMED_OUT``, against a closed RFC
+    enumeration arriving from a shared-secret-authenticated NAS), and
+    returns one of these members. The column's own contents are still
+    never returned.
 
     ``TERMINATED`` and ``PAUSED`` map to **no member at all** -- the
     lookup returns ``None`` and the portal shows an ordinary sign-in
@@ -647,6 +703,8 @@ class GuestSessionEndedReason(StrEnum):
     """
 
     TIMED_OUT = "timed_out"
+    IDLE_TIMED_OUT = "idle_timed_out"
+    TIME_LIMIT_REACHED = "time_limit_reached"
     DISCONNECTED = "disconnected"
 
 

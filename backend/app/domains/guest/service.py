@@ -287,6 +287,7 @@ from app.domains.voucher.models import Voucher, VoucherBatch
 
 from .constants import (
     BYTES_PER_MB,
+    DEFAULT_IDLE_TIMEOUT_MINUTES,
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
@@ -1047,45 +1048,94 @@ async def run_fup_time_accrual(
     own test suite can exercise the exact same logic against fakes with no
     live Postgres/Celery broker needed at all.
 
-    For every distinct ``(guest_id, organization_id)`` pair with at least
-    one currently ``ACTIVE`` session, resolves that organization's own
-    ``PolicyType.FUP`` time limits; if none are configured at all, the
-    guest is skipped entirely (no accrual round trip is worth paying for a
-    guest whose organization never opted into time-based quotas -- unlike
-    byte usage, which is tracked unconditionally in
-    ``GuestService.record_usage`` because it rides for free on a call
-    that already happens regardless). Otherwise, for each configured
-    period, adds the wall-clock minutes elapsed since the row's own
-    ``last_accrued_at`` (or ``period_start``) into ``minutes_used`` --
+    For every distinct guest with at least one currently ``ACTIVE``
+    session, resolves that guest's own ``PolicyType.FUP`` time limits; if
+    none are configured at all, the guest is skipped entirely (no accrual
+    round trip is worth paying for a guest whose organization never opted
+    into time-based quotas -- unlike byte usage, which is tracked
+    unconditionally in ``GuestService.record_usage`` because it rides for
+    free on a call that already happens regardless). Otherwise, for each
+    configured period, adds the wall-clock minutes elapsed since the row's
+    own ``last_accrued_at`` (or ``period_start``) into ``minutes_used`` --
     guest-level connected time, not summed across concurrent sessions (see
     ``models.GuestQuotaUsage``'s own docstring for why). A guest whose
     accrued usage now meets or exceeds a configured limit has every one of
     their currently ``ACTIVE`` sessions expired. Returns a summary dict
-    (rows accrued into, sessions expired)."""
+    (rows accrued into, sessions expired).
+
+    ## Resolution passes the guest's real location, and used not to
+
+    This resolved with a hardcoded ``location_id=None``.
+    ``repository.list_candidate_assignments`` only adds its LOCATION-scope
+    predicate when a real ``location_id`` arrives, so a ``PolicyAssignment``
+    with ``scope_type=location`` on an FUP policy was never a candidate
+    here -- the identical defect ``GuestService._enforce_fup_quota``'s own
+    docstring describes, in the one place it mattered most.
+
+    It mattered most here because these two halves are not independent.
+    ``_enforce_fup_quota`` is a login-time *gate*: it reads
+    ``minutes_used`` and refuses a guest who has already spent their
+    allowance. This sweep is the only thing that ever *writes*
+    ``minutes_used``. So a venue that assigned its FUP policy to a location
+    -- which is exactly what the dashboard's Guest WiFi Limits screen does,
+    it has no other scope to offer -- got a sweep that resolved no limits,
+    skipped the guest, and never accrued a minute. ``minutes_used`` stayed
+    0 for ever, so the login gate (fixed earlier, and correct) had nothing
+    to gate on and also never fired. Fixing either half alone leaves a
+    daily time limit that still does nothing; this is the other half.
+
+    ## One accrual per guest, even across locations
+
+    ``list_active_guest_org_pairs`` now returns one row per distinct
+    ``(guest, organization, location)``, so a guest holding active sessions
+    at two of an organization's locations appears twice. Accruing per row
+    would double their elapsed minutes and expire them at half their real
+    allowance. The rows are therefore grouped back together by guest, and
+    each guest is accrued exactly once.
+
+    Their limits are merged across those locations by taking the strictest
+    (smallest) configured value for each period. A guest connected at two
+    sites is genuinely subject to both venues' rules, and of the available
+    readings this is the only one that cannot let a guest exceed a limit
+    somebody actually set. The case is rare; picking a defensible answer
+    for it is cheaper than leaving it to row ordering.
+    """
     pairs = await repository.list_active_guest_org_pairs()
     accrued_rows = 0
     expired_sessions = 0
+    locations_by_guest: dict[tuple[uuid.UUID, uuid.UUID], list[uuid.UUID | None]] = {}
     for pair in pairs:
-        tz_name = await repository.get_organization_timezone(pair.organization_id)
-        resolved = await policy_lookup.resolve_effective_policy(
-            policy_type=PolicyType.FUP,
-            organization_id=pair.organization_id,
-            location_id=None,
-            guest_id=pair.guest_id,
+        locations_by_guest.setdefault((pair.guest_id, pair.organization_id), []).append(
+            pair.location_id
         )
-        time_limits = {
-            QuotaPeriodType.DAILY: resolved.rules.get("daily_time_limit_minutes"),
-            QuotaPeriodType.WEEKLY: resolved.rules.get("weekly_time_limit_minutes"),
-            QuotaPeriodType.MONTHLY: resolved.rules.get("monthly_time_limit_minutes"),
-        }
+    for (guest_id, organization_id), location_ids in locations_by_guest.items():
+        tz_name = await repository.get_organization_timezone(organization_id)
+        time_limits: dict[QuotaPeriodType, int | None] = dict.fromkeys(
+            FUP_TIME_LIMIT_RULE_KEYS
+        )
+        for location_id in location_ids:
+            resolved = await policy_lookup.resolve_effective_policy(
+                policy_type=PolicyType.FUP,
+                organization_id=organization_id,
+                location_id=location_id,
+                guest_id=guest_id,
+            )
+            for period_type, rule_key in FUP_TIME_LIMIT_RULE_KEYS.items():
+                candidate = resolved.rules.get(rule_key)
+                if candidate is None:
+                    continue
+                current = time_limits[period_type]
+                time_limits[period_type] = (
+                    candidate if current is None else min(current, candidate)
+                )
         if not any(time_limits.values()):
             continue
         violated_period: str | None = None
         for period_type, limit_minutes in time_limits.items():
             usage = await get_or_reset_quota_usage(
                 repository,
-                guest_id=pair.guest_id,
-                organization_id=pair.organization_id,
+                guest_id=guest_id,
+                organization_id=organization_id,
                 period_type=period_type,
                 tz_name=tz_name,
                 now=now,
@@ -1108,9 +1158,7 @@ async def run_fup_time_accrual(
             ):
                 violated_period = period_type.value
         if violated_period is not None:
-            active_sessions = await repository.list_active_sessions_for_guest(
-                pair.guest_id
-            )
+            active_sessions = await repository.list_active_sessions_for_guest(guest_id)
             reason = f"fup_time_quota_exceeded_{violated_period}"
             for active_session in active_sessions:
                 updated_session = await repository.update_session(
@@ -1265,11 +1313,71 @@ SESSION_TIMEOUT_DISCONNECT_REASON = "inactivity_timeout"
 #: and it arrives from a NAS already authenticated by its shared secret,
 #: from a closed RFC enumeration rather than a free-text field.
 #:
-#: ``Idle-Timeout`` (cause 4) is deliberately NOT here. RouterOS's own
-#: hotspot profile carries ``idle-timeout: 30m`` independently of
-#: anything this platform sends, and "your device was idle" is what the
-#: generic disconnected copy already describes well.
+#: ``Idle-Timeout`` (cause 4) is not here, and has its own constant
+#: directly below. It used to be excluded outright, on the reasoning that
+#: "RouterOS's own hotspot profile carries ``idle-timeout: 30m``
+#: independently of anything this platform sends, and 'your device was
+#: idle' is what the generic disconnected copy already describes well."
+#: That reasoning was correct for as long as its premise held, and the
+#: premise has since stopped holding: this platform now *sends*
+#: ``Idle-Timeout`` on every Access-Accept, from the venue's own SESSION
+#: policy (``GuestService._resolve_idle_timeout_minutes``). Cause 4 no
+#: longer reports a number nobody chose -- it reports the venue's own
+#: setting firing, which is a different and tellable event.
+#:
+#: The two stay separate constants rather than becoming one set, because
+#: they must not collapse into one message. A guest whose Session-Timeout
+#: ran out has used their full allotted time and can sign straight back
+#: in; a guest whose Idle-Timeout fired was not using the connection at
+#: all and is usually surprised to find themselves signed out. Telling
+#: either of them the other's story is worse than telling them nothing.
 RADIUS_SESSION_TIMEOUT_TERMINATE_CAUSE = "Session-Timeout"
+
+#: RFC 2866 s5.10 ``Acct-Terminate-Cause`` value 4, arriving by the exact
+#: same route as ``RADIUS_SESSION_TIMEOUT_TERMINATE_CAUSE`` above (the NAS
+#: sets it, FreeRADIUS forwards it verbatim into ``disconnect_reason``, and
+#: the session lands ``DISCONNECTED``). It means the device passed no
+#: traffic for longer than the ``Idle-Timeout`` this platform put in the
+#: Access-Accept.
+#:
+#: Same safety argument as its sibling: compared, never returned, from a
+#: closed RFC enumeration, arriving from a NAS already authenticated by its
+#: shared secret.
+#:
+#: Honest limit, worth stating: a router provisioned before this platform
+#: sent the attribute -- or one whose hotspot profile still carries its own
+#: ``idle-timeout`` and whose firmware ignores the RADIUS value -- also
+#: reports cause 4. The guest is then shown "you were idle", which remains
+#: true; only the *number* on the screen (this session's recorded
+#: ``idle_timeout_minutes``) might not be the one the device applied. The
+#: copy is written to survive that: it names the venue's setting, and a
+#: session with no recorded value shows no number at all.
+RADIUS_IDLE_TIMEOUT_TERMINATE_CAUSE = "Idle-Timeout"
+
+#: The exact ``disconnect_reason`` literals ``run_fup_time_accrual`` writes
+#: when a guest has spent their venue-configured connected-time allowance
+#: for a period. Built from ``QuotaPeriodType`` rather than typed out, so a
+#: new period can never be added with an ending the portal silently fails
+#: to recognise.
+#:
+#: A frozenset of exact strings, matched by membership and never by prefix
+#: -- the same discipline ``SESSION_TIMEOUT_DISCONNECT_REASON`` keeps, and
+#: for the same reason: the neighbouring ``fup_data_quota_exceeded_*``
+#: reasons share this stem, and they are a different thing to tell a guest
+#: (data spent, not time spent).
+FUP_TIME_QUOTA_DISCONNECT_REASONS = frozenset(
+    f"fup_time_quota_exceeded_{period.value}" for period in QuotaPeriodType
+)
+
+#: Which ``FUPPolicyRules`` field carries each period's connected-time cap.
+#: Module scope so ``run_fup_time_accrual`` does not rebuild it once per
+#: guest, and so the mapping is stated once rather than spelled out at each
+#: of the two places that read these rules.
+FUP_TIME_LIMIT_RULE_KEYS: dict[QuotaPeriodType, str] = {
+    QuotaPeriodType.DAILY: "daily_time_limit_minutes",
+    QuotaPeriodType.WEEKLY: "weekly_time_limit_minutes",
+    QuotaPeriodType.MONTHLY: "monthly_time_limit_minutes",
+}
 
 
 def _ended_session_reason(session: GuestSession) -> GuestSessionEndedReason | None:
@@ -1304,12 +1412,24 @@ def _ended_session_reason(session: GuestSession) -> GuestSessionEndedReason | No
         # only one of them explains a venue's 30-minute limit.
         if session.disconnect_reason == RADIUS_SESSION_TIMEOUT_TERMINATE_CAUSE:
             return GuestSessionEndedReason.TIMED_OUT
+        # The venue's own idle timeout, enforced on the device and reported
+        # back as cause 4. Checked before the DISCONNECTED fall-through
+        # rather than folded into it: since this platform started sending
+        # Idle-Timeout, this is the venue's setting firing, not an
+        # unattributable drop. See RADIUS_IDLE_TIMEOUT_TERMINATE_CAUSE.
+        if session.disconnect_reason == RADIUS_IDLE_TIMEOUT_TERMINATE_CAUSE:
+            return GuestSessionEndedReason.IDLE_TIMED_OUT
         return GuestSessionEndedReason.DISCONNECTED
-    if (
-        session.status == GuestSessionStatus.EXPIRED.value
-        and session.disconnect_reason == SESSION_TIMEOUT_DISCONNECT_REASON
-    ):
-        return GuestSessionEndedReason.TIMED_OUT
+    if session.status == GuestSessionStatus.EXPIRED.value:
+        if session.disconnect_reason == SESSION_TIMEOUT_DISCONNECT_REASON:
+            return GuestSessionEndedReason.TIMED_OUT
+        # The venue's daily/weekly/monthly connected-time allowance, spent.
+        # Separated from TIMED_OUT because the advice differs: a timed-out
+        # guest signs back in and carries on, whereas this guest cannot get
+        # back on until the period rolls over, and telling them to "sign in
+        # again" would send them round a loop that refuses them.
+        if session.disconnect_reason in FUP_TIME_QUOTA_DISCONNECT_REASONS:
+            return GuestSessionEndedReason.TIME_LIMIT_REACHED
     return None
 
 
@@ -1330,6 +1450,16 @@ class GuestLastEndedSessionResult:
 
     reason: GuestSessionEndedReason
     session_timeout_minutes: int | None
+    # The idle timeout this session actually carried, so a guest idled out
+    # can be told the venue's real number rather than whatever happens to be
+    # configured by the time they read the screen. None for a session that
+    # recorded none (every row predating the column), in which case the
+    # portal shows the reason without a number rather than inventing one.
+    #
+    # Safe by the same test every other field on this model had to pass: it
+    # is venue policy, identical for every guest at the location, so it
+    # tells a stranger holding an observed MAC nothing about the guest.
+    idle_timeout_minutes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1337,6 +1467,20 @@ class RadiusAuthorizeResult:
     authorized: bool
     session_timeout_seconds: int | None
     data_limit_mb: int | None
+    # RFC 2865 s5.28 Idle-Timeout, in seconds -- how long the NAS lets this
+    # device pass zero bytes before closing the session. None means "send no
+    # attribute", which leaves whatever the device's own hotspot profile
+    # says standing; that is the behaviour every session had before this
+    # platform sent the attribute, and is what a session row predating
+    # GuestSession.idle_timeout_minutes still gets.
+    #
+    # Unlike session_timeout_seconds this is NOT a remaining allowance and
+    # must never be turned into one. An idle timeout is a rolling window the
+    # NAS resets on every packet, so the full configured value is the
+    # correct thing to send on every re-authorization; sending "what is
+    # left" would be a category error that shrank a guest's idle allowance
+    # each time anything spoke to RADIUS.
+    idle_timeout_seconds: int | None = None
     # A real Mikrotik-Rate-Limit RADIUS reply-attribute value (see
     # app.domains.queue_management.service.format_mikrotik_rate_limit),
     # or None when no queue_lookup hook is wired or the session has no
@@ -1827,6 +1971,11 @@ class GuestService:
             location_id=location_id,
             guest_id=guest.id,
         )
+        resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -1839,6 +1988,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=None,
             session_timeout_minutes=resolved_session_timeout,
+            idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:
             # BE-011 Part 3: additive, best-effort real-time broadcast --
@@ -1975,6 +2125,19 @@ class GuestService:
             device_name=device_name,
             known_device=known_device,
         )
+        # A voucher batch carries its own validity and data allowance, so
+        # those two come from the batch. It carries no idle timeout -- there
+        # is no such field on a batch and no reason there should be: how long
+        # a voucher is good for is a property of the voucher, whereas how long
+        # a silent device may hold a slot is a property of the venue's
+        # network. So this one resolves from the SESSION policy exactly as
+        # every other login path does, which also means a voucher guest and
+        # an OTP guest at the same location are treated identically.
+        resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         # Copied, not referenced -- see module docstring.
         session, created = await self._reuse_or_create_session(
             guest=guest,
@@ -1988,6 +2151,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=batch.data_limit_mb,
             session_timeout_minutes=batch.validity_minutes,
+            idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:
             # BE-011 Part 3: additive, best-effort real-time broadcast --
@@ -2155,6 +2319,11 @@ class GuestService:
             location_id=location_id,
             guest_id=guest.id,
         )
+        resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -2167,6 +2336,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=None,
             session_timeout_minutes=resolved_session_timeout,
+            idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:
             await self._broadcast_guest_session_started(
@@ -2452,6 +2622,11 @@ class GuestService:
             location_id=location_id,
             guest_id=guest.id,
         )
+        resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -2464,6 +2639,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=None,
             session_timeout_minutes=resolved_session_timeout,
+            idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:
             await self._broadcast_guest_session_started(
@@ -2640,6 +2816,11 @@ class GuestService:
             location_id=location_id,
             guest_id=guest.id,
         )
+        resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -2652,6 +2833,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=None,
             session_timeout_minutes=resolved_session_timeout,
+            idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:
             await self._broadcast_guest_session_started(
@@ -3532,7 +3714,7 @@ class GuestService:
         device_mac: str,
         now: datetime | None = None,
     ) -> GuestLastEndedSessionResult | None:
-        """"This device had a session on this router, and it has just
+        """ "This device had a session on this router, and it has just
         ended" -- the answer the captive portal needs to greet a
         returning guest with "you were disconnected" instead of the same
         blank sign-in form a first-time visitor gets.
@@ -3626,6 +3808,7 @@ class GuestService:
             return GuestLastEndedSessionResult(
                 reason=GuestSessionEndedReason.TIMED_OUT,
                 session_timeout_minutes=overrun.session_timeout_minutes,
+                idle_timeout_minutes=overrun.idle_timeout_minutes,
             )
         session = await self.repository.get_latest_ended_session_for_device(
             router_id=router_id,
@@ -3644,6 +3827,7 @@ class GuestService:
         return GuestLastEndedSessionResult(
             reason=reason,
             session_timeout_minutes=session.session_timeout_minutes,
+            idle_timeout_minutes=session.idle_timeout_minutes,
         )
 
     # ========================================================================
@@ -4092,6 +4276,14 @@ class GuestService:
             accept_language=prior.accept_language,
             data_limit_mb=prior.data_limit_mb,
             session_timeout_minutes=prior.session_timeout_minutes,
+            # Carried forward with the rest of the prior session's grant --
+            # a reconnect continues an existing entitlement rather than
+            # issuing a new one, so it must not quietly pick up a different
+            # idle allowance than the session it derives from. A prior
+            # session from before this column existed carries NULL, which
+            # reads as "send no Idle-Timeout", i.e. exactly the behaviour
+            # that prior session actually had.
+            idle_timeout_minutes=prior.idle_timeout_minutes,
         )
         await self._bump_guest_visit(guest)
         return session
@@ -4191,7 +4383,7 @@ class GuestService:
         device_mac: str | None = None,
         ip_address: str | None = None,
     ) -> None:
-        """"May this identifier begin a login at this property at all?" --
+        """ "May this identifier begin a login at this property at all?" --
         asked *before* anything is spent on them.
 
         ## Why this exists
@@ -4262,9 +4454,7 @@ class GuestService:
                 auth_method=auth_method.value,
                 detail=repr(exc),
             )
-            logger.warning(
-                "whitelist_only_gate_failed_open", extra=_event_extra(event)
-            )
+            logger.warning("whitelist_only_gate_failed_open", extra=_event_extra(event))
             return
         config = resolved.config
         if not config.whitelist_only_enabled:
@@ -4557,9 +4747,7 @@ class GuestService:
                 auth_method=auth_method.value,
                 detail=repr(exc),
             )
-            logger.warning(
-                "whitelist_only_gate_failed_open", extra=_event_extra(event)
-            )
+            logger.warning("whitelist_only_gate_failed_open", extra=_event_extra(event))
             return
         if decision.allowed:
             return
@@ -4772,6 +4960,53 @@ class GuestService:
         )
         return rules.get("session_timeout_minutes", DEFAULT_SESSION_TIMEOUT_MINUTES)
 
+    async def _resolve_idle_timeout_minutes(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
+    ) -> int:
+        """Resolves how long a guest's device at this location may pass zero
+        bytes before the NAS closes the session, via the same
+        ``PolicyType.SESSION`` policy ``_resolve_session_timeout_minutes``
+        above reads -- one policy lookup, memoized, serves both.
+
+        The two are genuinely different settings and this is not a
+        duplicate: ``session_timeout_minutes`` is absolute elapsed time from
+        the session's start and ends a guest who is actively browsing;
+        ``idle_timeout_minutes`` is time spent passing no traffic and never
+        ends a guest who is using the WiFi. A venue can, and typically does,
+        want both.
+
+        Unlike the session timeout, this value was never merely defaulted --
+        it was never sent at all. Every Access-Accept this platform has ever
+        issued carried no ``Idle-Timeout``, so what actually governed a
+        guest was whatever RouterOS's ``default`` hotspot user profile
+        happened to say, which on a router provisioned by Master console is
+        30 minutes and on one provisioned before that constant existed is
+        ``none`` (i.e. never). The venue's own setting reached the device by
+        no path whatsoever.
+
+        ``DEFAULT_IDLE_TIMEOUT_MINUTES`` (30) is the fallback and is the
+        same number the setup script writes onto the device, so a venue with
+        no SESSION policy assigned sees no behaviour change -- the reply now
+        merely states what its router was already doing. What changes is
+        that the statement is now made by this platform, per session, so it
+        no longer depends on the router's provisioning history.
+
+        Falls back rather than propagating on a lookup failure, for the
+        identical reason ``_resolve_session_timeout_minutes`` does: this sits
+        on the login path, and the failure mode has to be "the default idle
+        timeout", never "no WiFi".
+        """
+        rules = await self._resolve_session_policy_rules(
+            organization_id=organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+        )
+        return rules.get("idle_timeout_minutes", DEFAULT_IDLE_TIMEOUT_MINUTES)
+
     async def _resolve_session_policy_rules(
         self,
         *,
@@ -4925,8 +5160,9 @@ class GuestService:
         correctly throughout and are unaffected -- a location-scoped one simply
         now outranks them, which is the whole point of the scope.
         """
-        if self.team_quota_hook is not None and await (
-            self.team_quota_hook.is_over_shared_quota(guest_id)
+        if (
+            self.team_quota_hook is not None
+            and await self.team_quota_hook.is_over_shared_quota(guest_id)
         ):
             raise GuestTeamSharedQuotaExceededError()
         if self.policy_lookup is None:
@@ -4944,9 +5180,8 @@ class GuestService:
             QuotaPeriodType.MONTHLY: rules.get("monthly_data_limit_mb"),
         }
         time_limits = {
-            QuotaPeriodType.DAILY: rules.get("daily_time_limit_minutes"),
-            QuotaPeriodType.WEEKLY: rules.get("weekly_time_limit_minutes"),
-            QuotaPeriodType.MONTHLY: rules.get("monthly_time_limit_minutes"),
+            period_type: rules.get(rule_key)
+            for period_type, rule_key in FUP_TIME_LIMIT_RULE_KEYS.items()
         }
         if not any(data_limits.values()) and not any(time_limits.values()):
             return
@@ -5122,6 +5357,7 @@ class GuestService:
         ip_address: str | None,
         data_limit_mb: int | None,
         session_timeout_minutes: int | None,
+        idle_timeout_minutes: int | None = None,
         user_agent: str | None = None,
         accept_language: str | None = None,
     ) -> GuestSession:
@@ -5145,6 +5381,7 @@ class GuestService:
             bytes_downloaded=0,
             data_limit_mb=data_limit_mb,
             session_timeout_minutes=session_timeout_minutes,
+            idle_timeout_minutes=idle_timeout_minutes,
             disconnect_reason=None,
         )
         event = GuestSessionCreated(
@@ -5262,6 +5499,7 @@ class GuestService:
         accept_language: str | None,
         data_limit_mb: int | None,
         session_timeout_minutes: int | None,
+        idle_timeout_minutes: int | None = None,
     ) -> tuple[GuestSession, bool]:
         """Shared by every guest self-service login method: returns
         ``(session, created)``, where ``created`` is ``False`` when an
@@ -5295,6 +5533,13 @@ class GuestService:
                 "last_activity_at": datetime.now(UTC),
                 "data_limit_mb": data_limit_mb,
                 "session_timeout_minutes": session_timeout_minutes,
+                # Refreshed with the rest of this login's entitlement, for
+                # the same reason session_timeout_minutes is: the reused row
+                # represents the login that just happened, and the NAS is
+                # about to be told this session's idle allowance on the very
+                # next Access-Accept. Leaving a stale value here would send
+                # the previous login's number.
+                "idle_timeout_minutes": idle_timeout_minutes,
             }
             if reusable.auth_method != auth_method.value:
                 update_data["auth_method"] = auth_method.value
@@ -5316,6 +5561,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=data_limit_mb,
             session_timeout_minutes=session_timeout_minutes,
+            idle_timeout_minutes=idle_timeout_minutes,
         )
         return session, True
 
@@ -5462,7 +5708,7 @@ class RadiusNasSecretRegenerationResult:
 
 
 class NasSecretPushProtocol(Protocol):
-    """"Put this secret into the real FreeRADIUS server's ``client{}``
+    """ "Put this secret into the real FreeRADIUS server's ``client{}``
     stanza, or raise."
 
     A *required* collaborator of ``RadiusService.regenerate_secret`` -- the
@@ -6289,7 +6535,10 @@ class RadiusService:
                 },
             )
             return RadiusAuthorizeResult(
-                authorized=False, session_timeout_seconds=None, data_limit_mb=None
+                authorized=False,
+                session_timeout_seconds=None,
+                idle_timeout_seconds=None,
+                data_limit_mb=None,
             )
         logger.info(
             "radius_authorize_decision",
@@ -6319,6 +6568,14 @@ class RadiusService:
             # NAS given `Session-Timeout: 0` may treat it as unlimited --
             # failing open on exactly the session we mean to end.
             session_timeout_seconds=self._remaining_session_seconds(session),
+            # The FULL configured idle allowance, every time -- see the
+            # field's own comment for why this is deliberately not the
+            # "remaining" treatment its neighbour above gets.
+            idle_timeout_seconds=(
+                session.idle_timeout_minutes * 60
+                if session.idle_timeout_minutes
+                else None
+            ),
             data_limit_mb=session.data_limit_mb,
             rate_limit=await self._resolve_rate_limit_reply(session.id),
         )

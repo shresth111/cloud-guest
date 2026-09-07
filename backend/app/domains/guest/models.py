@@ -440,6 +440,23 @@ class GuestSession(BaseModel):
     # write-up (mirrors Voucher.expires_at's identical reasoning).
     data_limit_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
     session_timeout_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The venue's idle timeout as it stood when this session started --
+    # copied, not referenced, for the same reason ``session_timeout_minutes``
+    # directly above is (see service.py's module docstring). An operator who
+    # shortens the venue's idle timeout at 3pm must not retroactively
+    # shorten the allowance of a guest who connected at 2pm; the change
+    # applies to sessions started after it.
+    #
+    # This is also what lets ``/guest/session/last-ended`` tell a guest who
+    # was idled out *which* number ended their session, rather than the
+    # number that happens to be configured by the time they look.
+    #
+    # NULL means "no idle timeout was recorded for this session" -- true of
+    # every row written before this column existed, and of any future path
+    # that deliberately declines to impose one. Readers treat NULL as
+    # "send no ``Idle-Timeout`` attribute", which lets the NAS's own profile
+    # value stand, exactly as it did before this platform sent one at all.
+    idle_timeout_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     disconnect_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     __table_args__ = (

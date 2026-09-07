@@ -80,12 +80,27 @@ class AuthMethodOutcomeCounts:
 
 @dataclass(frozen=True, slots=True)
 class ActiveGuestOrgPair:
-    """One distinct ``(guest_id, organization_id)`` pair drawn from
-    currently ``ACTIVE`` ``GuestSession`` rows -- see
-    ``GuestRepository.list_active_guest_org_pairs``'s own docstring."""
+    """One distinct ``(guest_id, organization_id, location_id)`` triple
+    drawn from currently ``ACTIVE`` ``GuestSession`` rows -- see
+    ``GuestRepository.list_active_guest_org_pairs``'s own docstring.
+
+    ``location_id`` is the third member and the newest. Without it
+    ``run_fup_time_accrual`` had no location to resolve with and passed
+    ``location_id=None``, which meant a LOCATION-scoped FUP
+    ``PolicyAssignment`` was never a resolution candidate for the sweep --
+    see that function's own docstring for what that silently cost. The
+    class keeps its name because "pair" is what every caller and test
+    already says, and renaming it would churn more than it clarifies.
+    """
 
     guest_id: uuid.UUID
     organization_id: uuid.UUID
+    # Non-nullable on GuestSession, so always a real location -- but
+    # defaulted here so the fakes and call sites that predate it keep
+    # constructing, and so a caller that genuinely has no location (there
+    # are none today) degrades to organization-scope resolution rather
+    # than failing.
+    location_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -726,14 +741,29 @@ class GuestRepository:
         )
 
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]:
-        """Every distinct ``(guest_id, organization_id)`` pair with at
-        least one currently ``ACTIVE`` session -- backs
+        """Every distinct ``(guest_id, organization_id, location_id)``
+        triple with at least one currently ``ACTIVE`` session -- backs
         ``tasks.run_fup_time_accrual_sweep``'s per-guest sweep loop.
-        ``organization_id`` comes straight off ``GuestSession`` itself (see
-        that model's own denormalization docstring) -- no join through
-        ``guests`` needed at all."""
+        ``organization_id`` and ``location_id`` both come straight off
+        ``GuestSession`` itself (see that model's own denormalization
+        docstring) -- no join through ``guests`` needed at all.
+
+        ``location_id`` joined the projection so the sweep can resolve a
+        LOCATION-scoped FUP policy; before that it resolved with
+        ``location_id=None`` and could not see one. Adding it to the
+        ``DISTINCT`` can return more than one row for the same guest -- one
+        per location they hold an active session at, which is rare but
+        real (a guest on two sites of the same organization). That is
+        handled in ``run_fup_time_accrual``, which groups the rows back
+        together per guest so a guest's minutes are still accrued exactly
+        once; see its docstring for why time, unlike bytes, must never be
+        summed across concurrent sessions."""
         statement = (
-            select(GuestSession.guest_id, GuestSession.organization_id)
+            select(
+                GuestSession.guest_id,
+                GuestSession.organization_id,
+                GuestSession.location_id,
+            )
             .where(
                 GuestSession.status == GuestSessionStatus.ACTIVE.value,
                 GuestSession.is_deleted.is_(False),
@@ -742,7 +772,9 @@ class GuestRepository:
         )
         result = await self.session.execute(statement)
         return [
-            ActiveGuestOrgPair(guest_id=row[0], organization_id=row[1])
+            ActiveGuestOrgPair(
+                guest_id=row[0], organization_id=row[1], location_id=row[2]
+            )
             for row in result.all()
         ]
 

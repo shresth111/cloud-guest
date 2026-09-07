@@ -82,6 +82,22 @@ class SessionPolicyRules(BaseModel):
     keep them in sync with platform constants they cannot see."""
 
     session_timeout_minutes: int | None = Field(default=None, ge=1)
+    # The venue's idle timeout, in minutes -- how long a guest's device may
+    # pass zero bytes before the NAS closes the session. Read by
+    # ``app.domains.guest.service.GuestService._resolve_idle_timeout_minutes``
+    # and sent as the RFC 2865 s5.28 ``Idle-Timeout`` reply attribute on
+    # every Access-Accept.
+    #
+    # ``ge=1`` is load-bearing, and is the reason there is no "no idle
+    # timeout at all" value here. Zero would have to mean either "unlimited"
+    # (which RFC 2865 does not define for this attribute, and whose RouterOS
+    # behaviour is unverified on this fleet) or "disconnect immediately"
+    # (which would lock every guest out). Neither is a thing an operator
+    # should be able to select by typing a number into a policy. The wider
+    # product reason -- that removing the idle timeout re-opens a closed
+    # incident -- is written out on
+    # ``app.domains.guest.constants.DEFAULT_IDLE_TIMEOUT_MINUTES``.
+    idle_timeout_minutes: int | None = Field(default=None, ge=1)
     max_concurrent_sessions_per_guest: int | None = Field(default=None, ge=1)
     termination_reconnect_cooldown_minutes: int | None = Field(default=None, ge=0)
     reconnect_grace_minutes: int | None = Field(default=None, ge=0)

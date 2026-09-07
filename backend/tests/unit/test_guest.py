@@ -680,6 +680,47 @@ class FakeFupPolicyLookup:
 
 
 @dataclass
+class FakeLocationScopedFupPolicyLookup:
+    """A FUP policy assigned at LOCATION scope, which is the only scope the
+    dashboard's Guest WiFi Limits screen can produce.
+
+    Unlike ``FakeFupPolicyLookup`` above, this one actually looks at
+    ``location_id``, because that is the whole point: the real
+    ``PolicyRepository.list_candidate_assignments`` only adds its
+    LOCATION-scope predicate when a real ``location_id`` arrives, so a
+    caller that passes ``None`` resolves as if the assignment were not
+    there at all -- no error, no warning, just no limits. A fake that
+    ignored the argument would pass whether or not the caller supplied it,
+    and would have let the defect this models ship twice.
+
+    Records every ``location_id`` it is asked with so a test can assert on
+    what the caller actually passed, not merely on the outcome."""
+
+    fup_rules: dict[str, object] = field(default_factory=dict)
+    location_ids_seen: list[uuid.UUID | None] = field(default_factory=list)
+
+    async def resolve_effective_policy(
+        self,
+        *,
+        policy_type: object,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
+    ):
+        self.location_ids_seen.append(location_id)
+
+        class _Resolved:
+            def __init__(self, rules: dict[str, object]) -> None:
+                self.rules = rules
+
+        if location_id is None:
+            # An organization-scope resolution finds no location-scoped
+            # assignment. This is what the sweep used to get, every time.
+            return _Resolved({})
+        return _Resolved(dict(self.fup_rules))
+
+
+@dataclass
 class FakeQueueAssignmentHook:
     """Stand-in for ``QueueAssignmentProtocol`` -- lets speed-linked-voucher
     tests exercise ``GuestService._assign_voucher_queue``'s
@@ -1026,18 +1067,24 @@ class FakeGuestRepository:
         ]
 
     async def list_active_guest_org_pairs(self) -> list[ActiveGuestOrgPair]:
-        seen: set[tuple[uuid.UUID, uuid.UUID]] = set()
+        # DISTINCT over (guest, organization, LOCATION) -- mirrors the real
+        # repository's projection. The location is what lets the accrual
+        # sweep resolve a LOCATION-scoped FUP policy; leaving it out of the
+        # key here would hide exactly the defect the sweep tests exercise.
+        seen: set[tuple[uuid.UUID, uuid.UUID, uuid.UUID | None]] = set()
         pairs: list[ActiveGuestOrgPair] = []
         for s in self.sessions.values():
             if s.status != GuestSessionStatus.ACTIVE.value:
                 continue
-            key = (s.guest_id, s.organization_id)
+            key = (s.guest_id, s.organization_id, s.location_id)
             if key in seen:
                 continue
             seen.add(key)
             pairs.append(
                 ActiveGuestOrgPair(
-                    guest_id=s.guest_id, organization_id=s.organization_id
+                    guest_id=s.guest_id,
+                    organization_id=s.organization_id,
+                    location_id=s.location_id,
                 )
             )
         return pairs
@@ -5013,6 +5060,145 @@ class TestRecordUsageFupTracking:
 
 
 class TestRunFupTimeAccrual:
+    async def test_the_sweep_resolves_with_the_guests_real_location(self) -> None:
+        """The sweep used to resolve with a hardcoded ``location_id=None``,
+        which made a LOCATION-scoped FUP assignment invisible to it.
+
+        That is the only scope the dashboard's Guest WiFi Limits screen can
+        produce, so this was not an edge case -- it was every venue that
+        ever set a daily time limit. And it was silent in the worst way,
+        because the two halves of the feature depend on each other: this
+        sweep is the only thing that ever WRITES ``minutes_used``, and the
+        login-time gate only READS it. With the sweep resolving no limits,
+        it skipped the guest, ``minutes_used`` stayed 0 for ever, and the
+        gate -- which by then resolved the location correctly -- had
+        nothing to fire on. The limit was set, stored, displayed, and
+        enforced by nothing.
+
+        Asserts on the argument, not just the outcome: a future change that
+        resolved the right rules by luck (an organization-scoped policy
+        that happened to match) would still leave location-scoped venues
+        broken, and this test would still catch it."""
+        fx = make_fixture()
+        await fx.guest_service.login_via_otp(
+            identifier="+15559990048",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        policy_lookup = FakeLocationScopedFupPolicyLookup(
+            fup_rules={"daily_time_limit_minutes": 999_999}
+        )
+
+        await run_fup_time_accrual(fx.repository, policy_lookup, now=datetime.now(UTC))
+
+        assert policy_lookup.location_ids_seen == [fx.location_id]
+        assert None not in policy_lookup.location_ids_seen
+
+    async def test_a_location_scoped_daily_limit_actually_accrues_and_expires(
+        self,
+    ) -> None:
+        """End to end for the setting as a venue actually creates it: a
+        daily time limit on a policy assigned to one location.
+
+        Fails outright before the location fix -- not by expiring late, but
+        by never accruing a single minute and never expiring anything, for
+        ever."""
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990049",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        policy_lookup = FakeLocationScopedFupPolicyLookup(
+            fup_rules={"daily_time_limit_minutes": 60}
+        )
+        now = datetime.now(UTC)
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        await fx.repository.update_quota_usage(usage, {"last_accrued_at": now})
+
+        summary = await run_fup_time_accrual(
+            fx.repository, policy_lookup, now=now + timedelta(minutes=61)
+        )
+
+        assert summary["expired_sessions"] == 1
+        after = await fx.repository.get_quota_usage(
+            result.guest.id, QuotaPeriodType.DAILY.value
+        )
+        assert after.minutes_used == 61
+        ended = fx.repository.sessions[result.session.id]
+        assert ended.status == GuestSessionStatus.EXPIRED.value
+        assert ended.disconnect_reason == "fup_time_quota_exceeded_daily"
+
+    async def test_a_guest_at_two_locations_accrues_their_minutes_once(self) -> None:
+        """Adding ``location_id`` to the sweep's DISTINCT means a guest
+        holding active sessions at two of an organization's locations now
+        appears as two rows.
+
+        Accruing per row would double their elapsed minutes and cut them
+        off at half their real allowance -- a regression introduced by the
+        fix above rather than by the original defect, which is exactly the
+        kind that ships unnoticed. Time is per guest, never summed across
+        concurrent sessions (see ``GuestQuotaUsage``'s own docstring); this
+        pins that the location grouping did not quietly change it."""
+        fx = make_fixture()
+        result = await fx.guest_service.login_via_otp(
+            identifier="+15559990050",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+        )
+        # A second active session for the same guest at a DIFFERENT
+        # location of the same organization.
+        second_location_id = uuid.uuid4()
+        await fx.repository.create_session(
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            location_id=second_location_id,
+            router_id=fx.router.id,
+            status=GuestSessionStatus.ACTIVE.value,
+            started_at=datetime.now(UTC),
+            last_activity_at=datetime.now(UTC),
+        )
+        policy_lookup = FakeLocationScopedFupPolicyLookup(
+            fup_rules={"daily_time_limit_minutes": 999_999}
+        )
+        now = datetime.now(UTC)
+        usage = await get_or_reset_quota_usage(
+            fx.repository,
+            guest_id=result.guest.id,
+            organization_id=fx.organization_id,
+            period_type=QuotaPeriodType.DAILY,
+            tz_name="UTC",
+            now=now,
+        )
+        await fx.repository.update_quota_usage(usage, {"last_accrued_at": now})
+
+        await run_fup_time_accrual(
+            fx.repository, policy_lookup, now=now + timedelta(minutes=10)
+        )
+
+        after = await fx.repository.get_quota_usage(
+            result.guest.id, QuotaPeriodType.DAILY.value
+        )
+        # Ten minutes of connected time, not twenty.
+        assert after.minutes_used == 10
+        assert len(policy_lookup.location_ids_seen) == 2
+
     async def test_skips_guests_whose_org_has_no_time_limit_configured(self) -> None:
         fx = make_fixture()
         result = await fx.guest_service.login_via_otp(
