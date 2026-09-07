@@ -1,7 +1,9 @@
 """Unit tests for the Monitored Hardware domain: registration CRUD (tenant
 isolation, MAC format validation, duplicate-MAC rejection), the derived
-up/down/unknown status lookup this domain exists for, and a structural
-RBAC check that every route carries a permission dependency.
+up/down/unknown status lookup this domain exists for, real device uptime
+(a separate fact from ``last_seen_at``, see the "uptime" section below),
+and a structural RBAC check that every route carries a permission
+dependency.
 
 Follows this project's plain-``assert``/native-``async def`` style,
 mirroring ``tests/unit/test_network_device.py``'s own identical "fake the
@@ -27,7 +29,9 @@ from app.domains.monitored_hardware.exceptions import (
     MonitoredHardwareNotFoundError,
 )
 from app.domains.monitored_hardware.models import MonitoredHardware
+from app.domains.monitored_hardware.repository import UptimeReading
 from app.domains.monitored_hardware.router import router as monitored_hardware_router
+from app.domains.monitored_hardware.schemas import MonitoredHardwareResponse
 from app.domains.monitored_hardware.service import MonitoredHardwareService
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
@@ -146,6 +150,14 @@ def _make_connected_device(
 class FakeMonitoredHardwareRepository:
     devices: dict[uuid.UUID, MonitoredHardware] = field(default_factory=dict)
     connected_devices: list[ConnectedDevice] = field(default_factory=list)
+    # Routers this fake "platform" manages, and their latest health
+    # snapshot's uptime -- the two tables the real repository reads to
+    # answer "how long since this box rebooted".
+    routers: list[Router] = field(default_factory=list)
+    uptime_by_router: dict[uuid.UUID, UptimeReading] = field(default_factory=dict)
+    # Call counters, so a test can prove the list path stayed batched.
+    router_mac_lookups: int = 0
+    uptime_lookups: int = 0
 
     async def create_device(self, **fields: object) -> MonitoredHardware:
         device = MonitoredHardware(**_base_fields(**fields))
@@ -204,6 +216,29 @@ class FakeMonitoredHardwareRepository:
             if cd.location_id == location_id and cd.mac_address == mac_address:
                 return cd
         return None
+
+    async def get_router_ids_by_mac(
+        self, organization_id: uuid.UUID, mac_addresses, **_kw: object
+    ) -> dict[str, uuid.UUID]:
+        self.router_mac_lookups += 1
+        wanted = {m.upper() for m in mac_addresses}
+        return {
+            r.mac_address.upper(): r.id
+            for r in self.routers
+            if r.organization_id == organization_id
+            and not r.is_deleted
+            and r.mac_address.upper() in wanted
+        }
+
+    async def get_latest_uptime_by_router(
+        self, router_ids, **_kw: object
+    ) -> dict[uuid.UUID, UptimeReading]:
+        self.uptime_lookups += 1
+        return {
+            rid: self.uptime_by_router[rid]
+            for rid in router_ids
+            if rid in self.uptime_by_router
+        }
 
 
 @dataclass
@@ -535,6 +570,191 @@ class TestDerivedStatus:
         statuses = {item.device.id: item.status for item in items}
         assert statuses[up_device.id] == HardwareStatus.UP
         assert statuses[unknown_device.id] == HardwareStatus.UNKNOWN
+
+
+# ============================================================================
+# Real device uptime -- a DIFFERENT FACT from last_seen_at
+# ============================================================================
+#
+# The bug these lock down: the dashboard rendered the age of `last_seen_at`
+# and labelled it "up", so a router with 7h28m of real uptime and a
+# 2-minute-old heartbeat displayed as "4 mins up". The two are not the same
+# measurement and no amount of relabelling makes one into the other -- the
+# router that prompted this had rebooted three times in the preceding two
+# hours, and because it heartbeated normally between reboots, the
+# time-since-heartbeat reading stayed healthy through every one of them.
+#
+# So: uptime must be its own field, populated only from a real reading, and
+# NEVER derived from last_seen_at.
+
+
+class TestDeviceUptime:
+    async def test_uptime_is_none_when_hardware_is_not_a_managed_router(self) -> None:
+        """A third-party access point, printer or camera has no uptime
+        source anywhere in this platform -- there is no RouterOS API on a
+        TP-Link EAP225. `None` is the honest answer; a number would be
+        invented."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        device = await _register_device(h, location, mac_address="aa:bb:cc:dd:ee:20")
+        h.repository.connected_devices.append(
+            _make_connected_device(
+                organization_id=location.organization_id,
+                location_id=location.id,
+                mac_address=device.mac_address,
+                is_active=True,
+            )
+        )
+        items, _ = await h.service.list_devices(
+            requesting_organization_id=location.organization_id, page=1, page_size=25
+        )
+        assert items[0].status == HardwareStatus.UP
+        assert items[0].last_seen_at is not None
+        assert items[0].uptime_seconds is None
+        assert items[0].uptime_recorded_at is None
+
+    async def test_uptime_comes_from_the_routers_latest_health_snapshot(self) -> None:
+        """The number the device itself reports at /system/resource, already
+        collected every 600s by the RouterOS-API health sweep and stored in
+        router_health_snapshots. Read from that table, never polled here."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        managed = _make_router(
+            organization_id=location.organization_id, location_id=location.id
+        )
+        managed.mac_address = "AA:BB:CC:DD:EE:21"
+        h.repository.routers.append(managed)
+        recorded_at = _now() - timedelta(minutes=3)
+        h.repository.uptime_by_router[managed.id] = UptimeReading(
+            uptime_seconds=26931, recorded_at=recorded_at
+        )
+        device = await _register_device(h, location, mac_address="aa:bb:cc:dd:ee:21")
+        h.repository.connected_devices.append(
+            _make_connected_device(
+                organization_id=location.organization_id,
+                location_id=location.id,
+                mac_address=device.mac_address,
+                is_active=True,
+                last_seen_at=_now() - timedelta(minutes=2),
+            )
+        )
+        items, _ = await h.service.list_devices(
+            requesting_organization_id=location.organization_id, page=1, page_size=25
+        )
+        item = items[0]
+        # 7h28m51s -- the real reading, not the 2-minute heartbeat age.
+        assert item.uptime_seconds == 26931
+        assert item.uptime_recorded_at == recorded_at
+        # And the two facts stay separate: last_seen_at is still its own,
+        # much smaller number. Conflating them is the entire bug.
+        assert item.last_seen_at is not None
+        heartbeat_age = (_now() - item.last_seen_at).total_seconds()
+        assert heartbeat_age < 300
+        assert item.uptime_seconds > heartbeat_age * 10
+
+    async def test_uptime_is_none_when_the_latest_poll_failed(self) -> None:
+        """`record_failed_health_check` writes a snapshot with a NULL
+        uptime. Reaching back past it to the last row that had a number
+        would resurrect a pre-outage reading and present it as current --
+        and it would be wrong by exactly the amount that matters, since the
+        likeliest reason a router stopped answering and started again is
+        that it rebooted."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        managed = _make_router(
+            organization_id=location.organization_id, location_id=location.id
+        )
+        managed.mac_address = "AA:BB:CC:DD:EE:22"
+        h.repository.routers.append(managed)
+        h.repository.uptime_by_router[managed.id] = UptimeReading(
+            uptime_seconds=None, recorded_at=_now()
+        )
+        await _register_device(h, location, mac_address="aa:bb:cc:dd:ee:22")
+        items, _ = await h.service.list_devices(
+            requesting_organization_id=location.organization_id, page=1, page_size=25
+        )
+        assert items[0].uptime_seconds is None
+        # No timestamp either -- "we measured nothing, at this precise
+        # moment" is not a fact worth rendering.
+        assert items[0].uptime_recorded_at is None
+
+    async def test_uptime_never_reads_another_organizations_router(self) -> None:
+        """Router.mac_address is globally unique, so an unscoped MAC lookup
+        would match another tenant's router and hand this org that router's
+        uptime -- the same path-id/header-org cross-tenant shape this
+        codebase has been bitten by before."""
+        h = make_harness()
+        mine = h.location_lookup.add(_make_location())
+        theirs_org = uuid.uuid4()
+        foreign = _make_router(organization_id=theirs_org)
+        foreign.mac_address = "AA:BB:CC:DD:EE:23"
+        h.repository.routers.append(foreign)
+        h.repository.uptime_by_router[foreign.id] = UptimeReading(
+            uptime_seconds=99999, recorded_at=_now()
+        )
+        await _register_device(h, mine, mac_address="aa:bb:cc:dd:ee:23")
+        items, _ = await h.service.list_devices(
+            requesting_organization_id=mine.organization_id, page=1, page_size=25
+        )
+        assert items[0].uptime_seconds is None
+
+    async def test_list_render_stays_batched_and_never_goes_n_plus_1(self) -> None:
+        """Uptime for a whole page must cost two queries, not two per row.
+        This is the assertion that stops a later "just look it up in
+        with_status" refactor from turning a 200-device page into 400
+        extra queries."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        for i in range(12):
+            managed = _make_router(
+                organization_id=location.organization_id, location_id=location.id
+            )
+            managed.mac_address = f"AA:BB:CC:DD:EF:{i:02X}"
+            h.repository.routers.append(managed)
+            h.repository.uptime_by_router[managed.id] = UptimeReading(
+                uptime_seconds=1000 + i, recorded_at=_now()
+            )
+            await _register_device(h, location, mac_address=f"aa:bb:cc:dd:ef:{i:02x}")
+        items, _ = await h.service.list_devices(
+            requesting_organization_id=location.organization_id, page=1, page_size=25
+        )
+        assert len(items) == 12
+        assert all(item.uptime_seconds is not None for item in items)
+        assert h.repository.router_mac_lookups == 1
+        assert h.repository.uptime_lookups == 1
+
+    async def test_an_explicit_router_id_is_honoured_over_the_mac_match(self) -> None:
+        """router_id is always NULL in the real system today (nothing in the
+        product sends it), so the MAC is the link that does the work -- but
+        where a router_id IS set it is the stronger statement and wins."""
+        h = make_harness()
+        location = h.location_lookup.add(_make_location())
+        linked = _make_router(
+            organization_id=location.organization_id, location_id=location.id
+        )
+        linked.mac_address = "AA:BB:CC:DD:EE:24"
+        h.repository.routers.append(linked)
+        h.router_lookup.routers[linked.id] = linked
+        h.repository.uptime_by_router[linked.id] = UptimeReading(
+            uptime_seconds=4242, recorded_at=_now()
+        )
+        # Registered under a MAC that matches nothing, but linked explicitly.
+        await _register_device(
+            h, location, mac_address="aa:bb:cc:dd:ee:25", router_id=linked.id
+        )
+        items, _ = await h.service.list_devices(
+            requesting_organization_id=location.organization_id, page=1, page_size=25
+        )
+        assert items[0].uptime_seconds == 4242
+
+    def test_the_response_schema_carries_uptime_as_its_own_field(self) -> None:
+        """Structural: the wire shape must expose uptime separately from
+        last_seen_at. A client cannot label a duration honestly if the API
+        only ever sent it one number."""
+        fields = MonitoredHardwareResponse.model_fields
+        assert "uptime_seconds" in fields
+        assert "uptime_recorded_at" in fields
+        assert "last_seen_at" in fields
 
 
 # ============================================================================
