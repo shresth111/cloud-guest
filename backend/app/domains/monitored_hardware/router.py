@@ -70,6 +70,8 @@ def _device_response(item: HardwareWithStatus) -> MonitoredHardwareResponse:
         floor=device.floor,
         status=item.status.value,
         last_seen_at=item.last_seen_at,
+        uptime_seconds=item.uptime_seconds,
+        uptime_recorded_at=item.uptime_recorded_at,
         created_at=device.created_at,
     )
 

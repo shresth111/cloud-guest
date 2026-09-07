@@ -29,7 +29,7 @@ from .constants import HardwareStatus
 from .events import MonitoredHardwareDeleted, MonitoredHardwareRegistered
 from .exceptions import DuplicateMonitoredHardwareError, MonitoredHardwareNotFoundError
 from .models import MonitoredHardware
-from .repository import MonitoredHardwareRepositoryProtocol
+from .repository import MonitoredHardwareRepositoryProtocol, UptimeReading
 from .validators import validate_mac_address
 
 logger = logging.getLogger(__name__)
@@ -81,11 +81,26 @@ class HardwareWithStatus:
     """A ``MonitoredHardware`` row plus its derived status -- see module
     docstring. ``last_seen_at`` is only ever a real
     ``ConnectedDevice.last_seen_at`` value (or ``None`` when the device
-    has never been observed), never invented."""
+    has never been observed), never invented.
+
+    ``uptime_seconds`` is a DIFFERENT FACT from ``last_seen_at`` and the
+    two must never be presented as one. ``last_seen_at`` answers "when did
+    we last hear from it"; ``uptime_seconds`` answers "how long since it
+    last rebooted". A device that reboots three times in two hours
+    heartbeats normally between reboots, so ``last_seen_at`` stays healthy
+    across all three and hides them completely -- ``uptime_seconds`` is the
+    only one of the two that makes a reboot visible at all.
+
+    It is populated only where a real reading exists (see
+    ``_uptime_by_mac``) and is ``None`` everywhere else -- never a
+    fall-back to the ``last_seen_at`` age, which is the substitution this
+    field exists to end."""
 
     device: MonitoredHardware
     status: HardwareStatus
     last_seen_at: datetime | None
+    uptime_seconds: int | None = None
+    uptime_recorded_at: datetime | None = None
 
 
 class MonitoredHardwareService:
@@ -190,17 +205,107 @@ class MonitoredHardwareService:
         )
         return device
 
-    async def with_status(self, device: MonitoredHardware) -> HardwareWithStatus:
+    async def _uptime_by_mac(
+        self, devices: list[MonitoredHardware]
+    ) -> dict[str, UptimeReading]:
+        """Real device uptime for whichever of ``devices`` this platform can
+        actually measure it for, keyed by upper-cased MAC.
+
+        Two batched queries for the whole page, never one pair per row --
+        the per-row ``get_connected_device_by_mac`` in ``with_status`` is
+        already an N+1 and this must not add a second one.
+
+        A hardware row earns an uptime reading only by being a ``Router``
+        this platform polls: either it carries an explicit ``router_id``
+        (honoured, though nothing in the product sets one today), or its
+        MAC is a managed router's MAC. Everything else -- every third-party
+        access point, printer and camera -- gets nothing, because nothing
+        in this platform can read those devices' uptime. There is no
+        RouterOS API on a TP-Link EAP225 and no SNMP agent configured on
+        one, and inventing a number for them is exactly what this domain
+        exists not to do.
+
+        Nothing here reaches out to a device. Both queries read tables the
+        existing Celery health sweeps already fill (``run_router_health_
+        poll_sweep`` every 600s over the RouterOS API on port 8728,
+        ``run_router_snmp_metrics_poll_sweep`` every 300s), so this stays a
+        pure database read no matter how many rows the page holds."""
+        if not devices:
+            return {}
+        organization_id = devices[0].organization_id
+        # ``list_devices`` filters by organization, so a page is single-org in
+        # practice. The ``== organization_id`` guards below do not assume it:
+        # a row from any other organization is dropped from both lookups and
+        # simply gets no uptime. Silently reading another tenant's routers is
+        # the one outcome that must be impossible here, and skipping a row is
+        # a safe way to be wrong.
+        by_mac: dict[str, uuid.UUID] = await self.repository.get_router_ids_by_mac(
+            organization_id,
+            [d.mac_address for d in devices if d.organization_id == organization_id],
+        )
+        # ``router_id`` bypasses the MAC lookup's own organization filter, so
+        # it is trusted only because ``register_device`` already validated
+        # that the router belongs to the location's organization before
+        # persisting it -- it cannot point across a tenant boundary.
+        explicit = {
+            d.mac_address.upper(): d.router_id
+            for d in devices
+            if d.router_id is not None and d.organization_id == organization_id
+        }
+        # An explicit router_id wins over the MAC match: it is the stronger
+        # statement, and the two can only disagree if an admin typed a MAC
+        # that belongs to a different router than the one they linked.
+        by_mac = {**by_mac, **explicit}
+        if not by_mac:
+            return {}
+        readings = await self.repository.get_latest_uptime_by_router(
+            list(dict.fromkeys(by_mac.values()))
+        )
+        return {
+            mac: readings[router_id]
+            for mac, router_id in by_mac.items()
+            if router_id in readings
+        }
+
+    async def with_status(
+        self,
+        device: MonitoredHardware,
+        *,
+        uptime: UptimeReading | None = None,
+    ) -> HardwareWithStatus:
+        """``uptime`` is passed in rather than looked up here so that a list
+        render costs two queries for the whole page instead of two per row
+        (see ``_uptime_by_mac``). Omitting it means "no reading", which is
+        also the correct answer for every caller that has none -- it is
+        never silently substituted with anything derived from
+        ``last_seen_at``."""
         connected = await self.repository.get_connected_device_by_mac(
             device.location_id, device.mac_address
         )
+        uptime_seconds = uptime.uptime_seconds if uptime is not None else None
+        # recorded_at is only meaningful alongside a real reading -- a
+        # timestamp with no number attached would say "we measured nothing,
+        # at this precise moment".
+        uptime_recorded_at = (
+            uptime.recorded_at
+            if uptime is not None and uptime.uptime_seconds is not None
+            else None
+        )
         if connected is None:
             return HardwareWithStatus(
-                device=device, status=HardwareStatus.UNKNOWN, last_seen_at=None
+                device=device,
+                status=HardwareStatus.UNKNOWN,
+                last_seen_at=None,
+                uptime_seconds=uptime_seconds,
+                uptime_recorded_at=uptime_recorded_at,
             )
         status = HardwareStatus.UP if connected.is_active else HardwareStatus.DOWN
         return HardwareWithStatus(
-            device=device, status=status, last_seen_at=connected.last_seen_at
+            device=device,
+            status=status,
+            last_seen_at=connected.last_seen_at,
+            uptime_seconds=uptime_seconds,
+            uptime_recorded_at=uptime_recorded_at,
         )
 
     async def list_devices(
@@ -217,7 +322,11 @@ class MonitoredHardwareService:
             page=page,
             page_size=page_size,
         )
-        return [await self.with_status(d) for d in devices], meta
+        uptimes = await self._uptime_by_mac(devices)
+        return [
+            await self.with_status(d, uptime=uptimes.get(d.mac_address.upper()))
+            for d in devices
+        ], meta
 
     async def list_all_devices_with_status(
         self, *, organization_id: uuid.UUID
