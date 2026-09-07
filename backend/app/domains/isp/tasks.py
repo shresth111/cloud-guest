@@ -26,7 +26,7 @@ import logging
 
 from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
-from app.database.redis import redis_client
+from app.database.redis import create_redis_client
 from app.database.session import SessionLocal
 from app.domains.location.repository import (
     LocationCodeCounterRepository,
@@ -63,30 +63,58 @@ def _build_router_service(session) -> RouterService:  # noqa: ANN001
 
 
 async def _run_isp_health_check_sweep_async() -> HealthCheckSweepSummary:
-    async with SessionLocal() as session:
-        try:
-            repository = IspRepository(session)
-            router_service = _build_router_service(session)
-            audit_writer = RBACRepository(session)
-            summary = await run_health_check_sweep(
-                repository,
-                router_service,
-                audit_writer=audit_writer,
-                device_adapter_resolver=get_isp_health_adapter,
-                # Same real app.database.redis.redis_client singleton the
-                # FastAPI DI path (dependencies.get_isp_service) wires in --
-                # required so this sweep's own record_health_check_result
-                # calls can see run_speed_test's real in-flight marker (see
-                # that method's own docstring) and correctly suppress a
-                # self-induced-congestion reading rather than letting it
-                # advance toward a real failover.
-                redis=redis_client,
-            )
-            await session.commit()
-            return summary
-        except Exception:
-            await session.rollback()
-            raise
+    # A FRESH redis client per invocation, closed in the finally below --
+    # never the module-level ``app.database.redis.redis_client`` singleton
+    # this task used to pass.
+    #
+    # This was the odd one out. ``app.domains.monitoring.tasks``,
+    # ``app.domains.dhcp.tasks``, ``app.domains.provisioning_engine.tasks``,
+    # ``app.domains.connected_devices.tasks`` and
+    # ``app.domains.hub_reconciliation.tasks`` all call
+    # ``create_redis_client()`` per run, and several of them document why at
+    # length: a redis client's connection pool binds to whichever event loop
+    # first used it, every ``run_celery_task`` call is a brand new
+    # ``asyncio.run`` loop, and reusing a singleton across them has already
+    # produced real cross-loop ``RuntimeError``s elsewhere in this codebase.
+    # ``app.core.async_task_bridge`` even names this task specifically as
+    # one that hit that failure class -- but its fix disposes the SQLAlchemy
+    # engine, and nothing ever disposed the redis pool.
+    #
+    # That matters here beyond tidiness. ``record_health_check_result``
+    # touches redis on exactly one condition -- when a link classifies
+    # UNHEALTHY, to check the speed-test in-flight marker -- so a
+    # cross-loop error there would surface as *every unhealthy link*
+    # failing before ``checked += 1``, which is precisely the
+    # ``{"checked": 0, "errors": 7}`` shape production reports on every
+    # run. The DI path (``dependencies.get_isp_service``) legitimately uses
+    # the singleton because it lives inside the one long-lived FastAPI
+    # loop; a Celery task does not.
+    #
+    # The reason a real client is passed at all is unchanged: without one,
+    # this sweep's ``record_health_check_result`` calls cannot see
+    # ``run_speed_test``'s in-flight marker and would let a
+    # self-induced-congestion reading advance toward a real failover.
+    redis = create_redis_client()
+    try:
+        async with SessionLocal() as session:
+            try:
+                repository = IspRepository(session)
+                router_service = _build_router_service(session)
+                audit_writer = RBACRepository(session)
+                summary = await run_health_check_sweep(
+                    repository,
+                    router_service,
+                    audit_writer=audit_writer,
+                    device_adapter_resolver=get_isp_health_adapter,
+                    redis=redis,
+                )
+                await session.commit()
+                return summary
+            except Exception:
+                await session.rollback()
+                raise
+    finally:
+        await redis.aclose()
 
 
 @celery_app.task(name=TASK_RUN_ISP_HEALTH_CHECK_SWEEP)
@@ -98,6 +126,10 @@ def run_isp_health_check_sweep() -> dict[str, int]:
         "failbacks": summary.failbacks,
         "skipped": summary.skipped,
         "errors": summary.errors,
+        # Reported separately so "nothing is being checked" can be told
+        # apart from "something went wrong once" at a glance -- see
+        # HealthCheckSweepSummary.misconfigured.
+        "misconfigured": summary.misconfigured,
     }
     logger.info("isp_task_run_health_check_sweep_completed", extra=result)
     return result

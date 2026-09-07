@@ -172,8 +172,10 @@ from app.domains.queue_management.constants import (
 )
 from app.domains.router.constants import (
     PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS,
+    ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS,
     STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP,
+    TASK_RUN_ROUTER_REACHABILITY_SWEEP,
     TASK_RUN_STALE_HEARTBEAT_SWEEP,
 )
 
@@ -618,6 +620,35 @@ celery_app.conf.update(
         "router-stale-heartbeat-sweep": {
             "task": TASK_RUN_STALE_HEARTBEAT_SWEEP,
             "schedule": STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS,
+        },
+        # The FAST half of the same problem, and a genuinely different
+        # question from the sweep above -- not a faster copy of it.
+        #
+        # The sweep above owns `Router.status` at the 15-minute
+        # `ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES` that
+        # `compute_lifecycle_stage`, `compute_internet_availability` and the
+        # frontend's `location-liveness` module all share. That number must
+        # not move: its own docstring says a second, slightly different
+        # definition of "offline" is how two screens start disagreeing about
+        # one router.
+        #
+        # But 15 minutes cannot produce the two-minute outage email a real
+        # venue needs. So this sweep writes a separate, alert-only
+        # `Router.reachability_state` off a separate, five-times-faster
+        # signal -- `router_agent_credentials.last_used_at`, stamped by the
+        # 60-second `/agent/authorized-macs` poll rather than the 5-minute
+        # heartbeat -- debounced over two consecutive misses and confirmed
+        # against the hub's live `wg show` before anything is raised.
+        # Nothing that reads `status` changes behaviour because of it.
+        #
+        # 30s matches the alert evaluation sweep below, so the two compose
+        # into: site dies -> <=120s to UNREACHABLE -> <=30s to an Alert and
+        # its email. See RouterService.sweep_router_reachability for the
+        # awake-window, fleet-outage and tunnel-confirmation guards that
+        # keep a two-minute threshold from crying wolf on our own deploys.
+        "router-reachability-sweep": {
+            "task": TASK_RUN_ROUTER_REACHABILITY_SWEEP,
+            "schedule": ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS,
         },
         # Monitoring domain: the Alert Engine's evaluation sweep -- the real
         # background job behind an already-fully-built-but-previously-

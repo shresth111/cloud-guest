@@ -2908,6 +2908,13 @@ class TestHealthCheckSweep:
         assert isinstance(summary, HealthCheckSweepSummary)
         assert summary.checked == 1
         assert summary.errors == 1
+        # ...and it is specifically a CONFIGURATION failure, which will
+        # recur identically on every sweep until a human fixes the router.
+        # ``misconfigured`` is a breakdown of ``errors`` above, not a
+        # separate bucket -- production reported "checked 0, errors 7" every
+        # 30 seconds and the number alone could not say whether that was
+        # seven permanently broken links or one bad afternoon.
+        assert summary.misconfigured == 1
         assert summary.skipped == 1
         assert good_link.health_status == HealthStatus.HEALTHY.value
 

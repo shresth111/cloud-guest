@@ -820,6 +820,16 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # ("network-diagnostics-run-retention-sweep") -- the first and only
     # thing that ever deletes a `diagnostic_runs` row. See
     # app.domains.network_diagnostics.tasks's own module docstring.
+    # Router domain adds a twenty-second Beat entry
+    # ("router-reachability-sweep") -- the FAST outage path, and a
+    # different question from "router-stale-heartbeat-sweep" rather than a
+    # faster copy of it. That one owns `Router.status` at the 15-minute
+    # ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES every screen shares; this one
+    # owns a separate, alert-only `Router.reachability_state` sized to a
+    # two-minute outage email. See
+    # app.domains.router.service.RouterService.sweep_router_reachability's
+    # own docstring for the awake-window, fleet-outage and tunnel-
+    # confirmation guards.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -836,6 +846,11 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "campaigns-sweep-status-transitions",
         "provisioning-engine-router-health-poll-sweep",
         "router-provisioning-token-cleanup-sweep",
+        # Its absence from this set is not a missing schedule entry, it is
+        # a venue whose router went down and whose owner finds out when a
+        # guest complains -- which is exactly what happened on 2026-09-07,
+        # for twenty-two minutes, with nothing sent.
+        "router-reachability-sweep",
         # `GET /monitoring/health` only reads the stored `service_health`
         # table; it probes nothing. Without this entry the sole writer is
         # the Master console's own button, so the page's timestamps are as
