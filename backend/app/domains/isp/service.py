@@ -63,7 +63,12 @@ from app.domains.rbac.location_scope import (
     LocationScope,
     enforce_entity_location,
 )
-from app.domains.router.crypto import decrypt_secret, encrypt_secret
+from app.domains.router.crypto import (
+    RouterCredentialDecryptionError,
+    decrypt_secret,
+    encrypt_secret,
+)
+from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 
 from .constants import (
@@ -119,6 +124,7 @@ from .exceptions import (
     IspNoBackupLinkAvailableError,
     IspPrimaryLinkAlreadyExistsError,
     IspSpeedTestCooldownError,
+    UnsupportedIspVendorError,
 )
 from .models import IspHealthCheck, IspLink
 from .repository import IspRepositoryProtocol
@@ -222,6 +228,24 @@ class HealthCheckSweepSummary:
     failbacks: int
     skipped: int
     errors: int
+    # A BREAKDOWN of ``errors``, not a sibling of it -- every link counted
+    # here is counted in ``errors`` as well, so that field keeps meaning
+    # exactly what it always meant and no existing reader changes. This
+    # says WHICH KIND of nothing the sweep did.
+    #
+    # Production reported ``{"checked": 0, ..., "errors": 7}`` on every
+    # single run: every enabled link on the platform failing, none of them
+    # recording a health reading, and therefore ``IspLink.health_status``
+    # frozen forever -- which means an "ISP down" alert rule would have had
+    # nothing truthful to fire on even once the evaluator was fixed. But
+    # ``errors`` alone cannot distinguish a fleet-wide *configuration*
+    # problem (a router with no stored credentials, a credential the
+    # current ``router_encryption_key`` cannot decrypt, an unknown vendor
+    # -- all of which fail before a socket is opened and will fail
+    # identically forever until a human changes something) from a transient
+    # runtime one. Those need completely different responses, and telling
+    # them apart took a code read rather than a glance at the number.
+    misconfigured: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -2031,6 +2055,19 @@ class IspService:
         )
 
 
+# The failures that mean "somebody has to change a setting", as opposed to
+# "something went wrong this time". Every one of these is raised before any
+# socket is opened, and every one will recur identically on every sweep
+# until a human intervenes -- which is exactly why they are counted apart
+# from transient errors. See ``run_health_check_sweep``'s except clauses.
+_ISP_LINK_CONFIGURATION_ERRORS = (
+    IspMissingCredentialsError,
+    UnsupportedIspVendorError,
+    RouterCredentialDecryptionError,
+    RouterNotFoundError,
+)
+
+
 async def run_health_check_sweep(
     repository: IspRepositoryProtocol,
     router_lookup: RouterLookupProtocol,
@@ -2064,6 +2101,7 @@ async def run_health_check_sweep(
     failbacks = 0
     skipped = 0
     errors = 0
+    misconfigured = 0
     for link in links:
         # Only a STATIC-mode link with no manually-entered gateway has
         # nothing to check at all -- skipped before even trying, exactly
@@ -2132,23 +2170,73 @@ async def run_health_check_sweep(
                 and updated.is_active_uplink
             ):
                 failbacks += 1
-        except Exception as exc:  # noqa: BLE001 -- genuine config errors (missing
-            # credentials, unsupported vendor) stay skip-only: there is no
-            # live device state to record a health *reading* against, and
-            # retrying every sweep tick would just repeat the same log line
-            # until an admin fixes the configuration -- see per-link
-            # isolation docstring above.
+        except _ISP_LINK_CONFIGURATION_ERRORS as exc:
+            # Genuine configuration errors stay skip-only, exactly as
+            # before: there is no live device state to record a health
+            # *reading* against, and retrying every tick would just repeat
+            # the same log line until an admin fixes the configuration.
+            #
+            # What is new is that they are COUNTED and NAMED separately.
+            # Lumped into ``errors``, a permanently broken fleet produced
+            # the same number as a transient blip, and the log line said
+            # only "link_failed" -- so "checked 0, errors 7, every 30
+            # seconds, forever" read as mysterious rather than as "seven
+            # links whose routers have no usable credentials". The
+            # exception class is now in the log line, which turns the next
+            # diagnosis into one grep.
+            #
+            # ``errors`` is incremented TOO, deliberately: it keeps meaning
+            # exactly what it has always meant ("links this sweep could not
+            # check"), so nothing that already reads it changes behaviour,
+            # and ``misconfigured`` is a breakdown of it rather than a
+            # sibling that silently drains it. "errors 7, misconfigured 7"
+            # says "all seven are configuration, this will repeat forever";
+            # "errors 7, misconfigured 0" says "something transient". The
+            # number alone could say neither.
+            errors += 1
+            misconfigured += 1
+            logger.warning(
+                "isp_health_check_sweep_link_misconfigured",
+                extra={
+                    "isp_link_id": str(link.id),
+                    "router_id": str(link.router_id),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 -- per-link isolation, see docstring
             errors += 1
             logger.warning(
                 "isp_health_check_sweep_link_failed",
-                extra={"isp_link_id": str(link.id), "error": str(exc)},
+                extra={
+                    "isp_link_id": str(link.id),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
             )
+    if links and checked == 0:
+        # A sweep that checked NOTHING is not a quiet sweep, it is a broken
+        # one -- and it is invisible at INFO because the per-link warnings
+        # above name links, never the fleet. This is the line that would
+        # have said, on the very first run, that ISP health had stopped
+        # being measured platform-wide and that every IspLink.health_status
+        # on the platform was now frozen at whatever it last happened to be.
+        logger.error(
+            "isp_health_check_sweep_checked_nothing",
+            extra={
+                "links": len(links),
+                "skipped": skipped,
+                "misconfigured": misconfigured,
+                "errors": errors,
+            },
+        )
     return HealthCheckSweepSummary(
         checked=checked,
         failovers=failovers,
         failbacks=failbacks,
         skipped=skipped,
         errors=errors,
+        misconfigured=misconfigured,
     )
 
 

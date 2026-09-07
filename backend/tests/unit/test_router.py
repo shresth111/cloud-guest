@@ -36,8 +36,18 @@ from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
+from app.domains.router.constants import (
+    ROUTER_REACHABILITY_HITS_TO_RESOLVE,
+    ROUTER_REACHABILITY_MISSES_TO_ALERT,
+    ROUTER_REACHABILITY_SILENCE_SECONDS,
+    ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS,
+)
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
-from app.domains.router.enums import RouterStatus
+from app.domains.router.enums import (
+    RouterHealthStatus,
+    RouterReachabilityState,
+    RouterStatus,
+)
 from app.domains.router.exceptions import (
     CrossOrganizationRouterAccessError,
     DuplicateMacAddressError,
@@ -206,6 +216,11 @@ class FakeRouterRepository:
 
     routers: dict[uuid.UUID, Router] = field(default_factory=dict)
     tokens: dict[uuid.UUID, RouterProvisioningToken] = field(default_factory=dict)
+    # router_id -> last moment an agent credential for it was used. Stands
+    # in for the real join onto ``router_agent_credentials.last_used_at``;
+    # a router missing from this dict has no usable credential and the real
+    # query excludes it. See ``list_reachability_candidates`` below.
+    agent_contact: dict[uuid.UUID, datetime] = field(default_factory=dict)
 
     async def get_by_id(
         self, router_id: uuid.UUID, *, include_deleted: bool = False
@@ -332,6 +347,30 @@ class FakeRouterRepository:
         token.is_deleted = True
         token.deleted_at = _now()
         return token
+
+    async def list_reachability_candidates(
+        self, *, now: object
+    ) -> list[tuple[Router, object]]:
+        """Mirrors ``reachability_candidate_statement`` on the two axes
+        that decide who gets judged: only ONLINE/OFFLINE routers, and only
+        those with a usable (unrevoked, unexpired) agent credential to read
+        a ``last_used_at`` from.
+
+        ``agent_contact`` here stands in for the real join onto
+        ``router_agent_credentials.last_used_at``; a router absent from the
+        dict is one with no usable credential and is excluded exactly as
+        the real query excludes it -- which is the behaviour
+        ``test_a_router_with_no_usable_agent_credential_is_never_judged``
+        below pins down.
+        """
+        return [
+            (r, self.agent_contact[r.id])
+            for r in self.routers.values()
+            if not r.is_deleted
+            and r.status
+            in (RouterStatus.ONLINE.value, RouterStatus.OFFLINE.value)
+            and r.id in self.agent_contact
+        ]
 
     async def list_online_routers_with_stale_heartbeat(
         self, *, cutoff: object
@@ -2455,3 +2494,608 @@ class TestHostAddressValidation:
     def test_heartbeat_request_accepts_valid_ipv4(self) -> None:
         request = HeartbeatRequest(management_ip_address="192.168.1.1")
         assert request.management_ip_address == "192.168.1.1"
+
+
+class TestSweepRouterReachability:
+    """The FAST outage path, and the guards that keep a two-minute
+    threshold from crying wolf.
+
+    Context these tests are written against, from production on
+    2026-09-07: a real router at a real venue went down twice inside 35
+    minutes (03:50-04:12 and again from 04:16). Five minutes into the first
+    outage the dashboard still said ``online``, because ``Router.status``
+    only moves at the shared 15-minute
+    ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES``. Nobody was emailed at all.
+    Meanwhile the ``/agent/authorized-macs`` poll -- every 60 seconds --
+    had stopped within a minute of the site going away, both times. This
+    sweep reads that signal.
+    """
+
+    async def _router(
+        self,
+        service,
+        location_lookup,
+        org_lookup,
+        repo,
+        *,
+        agent_contact,
+        status: str = RouterStatus.ONLINE.value,
+        reachability_state: str | None = None,
+        misses: int = 0,
+        hits: int = 0,
+    ) -> Router:
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        router = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(
+                serial_number=f"SN-{uuid.uuid4()}",
+                mac_address=_unique_mac(),
+            ),
+        )
+        router.status = status
+        router.reachability_state = reachability_state
+        router.reachability_consecutive_misses = misses
+        router.reachability_consecutive_hits = hits
+        if agent_contact is not None:
+            repo.agent_contact[router.id] = agent_contact
+        return router
+
+    @staticmethod
+    def _awake(now: datetime) -> datetime:
+        """A ``previous_sweep_at`` that satisfies the awake-window guard --
+        i.e. the platform was demonstrably running one interval ago."""
+        return now - timedelta(seconds=ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS)
+
+    async def test_a_silent_router_is_declared_unreachable_within_two_minutes(
+        self,
+    ) -> None:
+        """THE HEADLINE REQUIREMENT, expressed as a clock.
+
+        Two consecutive misses at a 30-second cadence, against a 90-second
+        silence window, puts the UNREACHABLE verdict on the board no later
+        than ~120s after the site went quiet. The alert evaluation sweep
+        (also 30s) then has it as an ``Alert`` and an email inside the
+        founder's two minutes.
+        """
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(seconds=100)
+        )
+
+        first = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+        assert first["marked_unreachable"] == 0, "one miss must not be enough"
+        assert repo.routers[router.id].reachability_state is None
+
+        later = now + timedelta(seconds=ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS)
+        second = await service.sweep_router_reachability(
+            now=later, previous_sweep_at=self._awake(later)
+        )
+
+        assert second["marked_unreachable"] == 1
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_a_single_missed_poll_never_alerts(self) -> None:
+        """A dropped packet, a 502 during a release, a worker running a
+        second late -- one miss is noise, and the debounce exists so noise
+        does not reach a venue owner's inbox."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(seconds=100)
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["silent"] == 1
+        assert result["marked_unreachable"] == 0
+        assert repo.routers[router.id].reachability_consecutive_misses == 1
+
+    async def test_a_router_still_polling_us_is_reachable(self) -> None:
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(seconds=20)
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["silent"] == 0
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.REACHABLE.value
+        )
+
+    async def test_our_own_downtime_does_not_declare_the_fleet_unreachable(
+        self,
+    ) -> None:
+        """THE DEPLOY GUARD.
+
+        On 2026-09-07 the api container restarted at 03:49:19. Any sweep
+        that reasoned across that gap would have seen every router in the
+        fleet as silent -- because nothing was listening -- and paged every
+        venue we have. Absence may only be judged over a window we can
+        prove we were awake for.
+        """
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(minutes=10)
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=now - timedelta(minutes=9)
+        )
+
+        assert result["skipped_platform_gap"] == 1
+        assert result["marked_unreachable"] == 0
+        assert repo.routers[router.id].reachability_state is None
+        assert repo.routers[router.id].reachability_consecutive_misses == 0, (
+            "a window we slept through must not even count as a miss"
+        )
+
+    async def test_a_first_ever_run_judges_nobody(self) -> None:
+        """No recorded previous sweep means a cold worker. Failing safe
+        costs one 30-second cycle; failing open costs an email to every
+        venue on the platform."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(minutes=10)
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=None
+        )
+
+        assert result["skipped_platform_gap"] == 1
+        assert result["marked_unreachable"] == 0
+
+    async def test_most_of_the_fleet_going_quiet_at_once_is_read_as_our_fault(
+        self,
+    ) -> None:
+        """Four venues do not lose power in the same 30-second window. Our
+        broker, our hub, or our network does."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        for _ in range(4):
+            await self._router(
+                service, loc, org, repo, agent_contact=now - timedelta(seconds=200)
+            )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["silent"] == 4
+        assert result["skipped_fleet_outage"] == 4
+        assert result["marked_unreachable"] == 0
+
+    async def test_the_fleet_guard_does_not_silence_a_small_deployment(self) -> None:
+        """With two routers deployed, "half the fleet is silent" is just
+        "one real venue is down" -- which is precisely the alert this
+        feature exists to send. The guard must not swallow it."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        down = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+        await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(seconds=10)
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["skipped_fleet_outage"] == 0
+        assert result["marked_unreachable"] == 1
+        assert (
+            repo.routers[down.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_a_live_tunnel_withholds_the_alert(self) -> None:
+        """Silent to us but the tunnel is still handshaking = our agent
+        script is broken, not their power. Alerting here would send a venue
+        owner to check a plug that is already in the wall."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+
+        async def probe(routers):
+            return {r.id: True for r in routers}
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now), tunnel_probe=probe
+        )
+
+        assert result["tunnel_alive_despite_silence"] == 1
+        assert result["marked_unreachable"] == 0
+        assert repo.routers[router.id].reachability_state != (
+            RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_a_dead_tunnel_confirms_the_alert(self) -> None:
+        """Both signals agree. This is the 2026-09-07 shape exactly: agent
+        polls stopped, and port 8728 went from 24ms to an 8-second
+        timeout."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+
+        async def probe(routers):
+            return {r.id: False for r in routers}
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now), tunnel_probe=probe
+        )
+
+        assert result["marked_unreachable"] == 1
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_a_probe_that_raises_never_blocks_the_alert(self) -> None:
+        """The confirmation is allowed to withhold an alert, never to
+        prevent one by failing. A hub bridge that is down must degrade to
+        absence-alone, which is the no-probe behaviour."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+
+        async def probe(routers):
+            raise RuntimeError("hub bridge unreachable")
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now), tunnel_probe=probe
+        )
+
+        assert result["marked_unreachable"] == 1
+
+    async def test_a_flapping_router_does_not_resolve_on_first_contact(self) -> None:
+        """THE FLAP GUARD, against the real night.
+
+        The router came back at 04:12 and went down again at 04:16.
+        Resolving on the first successful poll would have emailed "it's
+        back" at 04:13 and "it's down" again at 04:18 -- four emails for
+        one bad night. The alert must stay open until the site has held on.
+        """
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=5),
+            reachability_state=RouterReachabilityState.UNREACHABLE.value,
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["marked_reachable"] == 0
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        ), "still unreachable, so the open alert stays open and sends nothing"
+        assert repo.routers[router.id].reachability_consecutive_hits == 1
+
+    async def test_a_router_that_stays_up_eventually_resolves(self) -> None:
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=5),
+            reachability_state=RouterReachabilityState.UNREACHABLE.value,
+            hits=ROUTER_REACHABILITY_HITS_TO_RESOLVE - 1,
+        )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["marked_reachable"] == 1
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.REACHABLE.value
+        )
+
+    async def test_going_down_again_resets_the_recovery_counter(self) -> None:
+        """The half of the flap guard that makes it a guard rather than a
+        delay: partial recovery earns no credit toward being called back."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            reachability_state=RouterReachabilityState.UNREACHABLE.value,
+            hits=ROUTER_REACHABILITY_HITS_TO_RESOLVE - 1,
+        )
+
+        await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert repo.routers[router.id].reachability_consecutive_hits == 0
+        assert (
+            repo.routers[router.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_a_router_with_no_usable_agent_credential_is_never_judged(
+        self,
+    ) -> None:
+        """An expired or revoked credential makes ``CurrentAgent`` raise
+        before it stamps anything, so such a router looks permanently
+        silent. Alerting on it would blame a venue's power for our own
+        credential lifecycle -- and it would never stop."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(service, loc, org, repo, agent_contact=None)
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["considered"] == 0
+        assert repo.routers[router.id].reachability_state is None
+
+    async def test_administrative_states_are_never_judged(self) -> None:
+        """A venue we suspended or decommissioned on purpose must not email
+        anybody at 3am about being off. Same reasoning
+        ``stale_heartbeat_statement`` gives for leaving PROVISIONING
+        alone."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        for status in (
+            RouterStatus.SUSPENDED.value,
+            RouterStatus.DECOMMISSIONED.value,
+            RouterStatus.PENDING_PROVISIONING.value,
+        ):
+            await self._router(
+                service,
+                loc,
+                org,
+                repo,
+                agent_contact=now - timedelta(hours=5),
+                status=status,
+            )
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["considered"] == 0
+
+    async def test_one_router_failing_never_aborts_the_sweep(self) -> None:
+        """The same per-router isolation contract
+        ``sweep_stale_heartbeats`` documents, in the sweep that now sits on
+        the critical path for every outage email."""
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        broken = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+        healthy = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            misses=1,
+        )
+
+        original_update = repo.update_router
+
+        async def exploding_update(router, data):
+            if router.id == broken.id:
+                raise RuntimeError("row is wedged")
+            return await original_update(router, data)
+
+        repo.update_router = exploding_update
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now)
+        )
+
+        assert result["failed"] == 1
+        assert result["marked_unreachable"] == 1
+        assert (
+            repo.routers[healthy.id].reachability_state
+            == RouterReachabilityState.UNREACHABLE.value
+        )
+
+    async def test_the_shared_offline_definition_is_left_completely_alone(
+        self,
+    ) -> None:
+        """THE CONSTRAINT THAT SHAPED THIS WHOLE DESIGN.
+
+        ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`` is read by
+        ``compute_lifecycle_stage``, ``compute_internet_availability`` and
+        the frontend's ``location-liveness`` module, and
+        ``sweep_stale_heartbeats``'s docstring says a second, slightly
+        different definition of "offline" is how two screens start
+        disagreeing about one router. So the fast path had to be a new
+        column with a new name, not a faster threshold on the old one --
+        and this test fails the moment somebody "simplifies" it back.
+        """
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service, loc, org, repo, agent_contact=now - timedelta(seconds=200)
+        )
+        router.last_seen_at = now - timedelta(seconds=200)
+        router.health_status = RouterHealthStatus.HEALTHY.value
+
+        for tick in range(ROUTER_REACHABILITY_MISSES_TO_ALERT):
+            moment = now + timedelta(
+                seconds=ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS * tick
+            )
+            await service.sweep_router_reachability(
+                now=moment, previous_sweep_at=self._awake(moment)
+            )
+
+        stored = repo.routers[router.id]
+        assert (
+            stored.reachability_state == RouterReachabilityState.UNREACHABLE.value
+        ), "the fast verdict is in"
+        assert stored.status == RouterStatus.ONLINE.value, (
+            "but Router.status is untouched -- it belongs to the 15-minute sweep"
+        )
+        assert stored.health_status == RouterHealthStatus.HEALTHY.value
+        assert stored.last_seen_at == now - timedelta(seconds=200)
+
+    async def test_a_live_tunnel_also_never_resolves_an_open_outage(self) -> None:
+        """The other direction of the same abstention.
+
+        A router already declared UNREACHABLE, still not talking to us, but
+        whose tunnel has come back must not accumulate recovery credit.
+        Letting it would eventually mail "back online and has stayed up"
+        about a site we have not heard a word from -- a sentence we would
+        have no evidence for.
+        """
+        service, repo, loc, org, _audit = make_service()
+        now = _now()
+        router = await self._router(
+            service,
+            loc,
+            org,
+            repo,
+            agent_contact=now - timedelta(seconds=200),
+            reachability_state=RouterReachabilityState.UNREACHABLE.value,
+            hits=ROUTER_REACHABILITY_HITS_TO_RESOLVE - 1,
+        )
+
+        async def probe(routers):
+            return {r.id: True for r in routers}
+
+        result = await service.sweep_router_reachability(
+            now=now, previous_sweep_at=self._awake(now), tunnel_probe=probe
+        )
+
+        assert result["tunnel_alive_despite_silence"] == 1
+        assert result["marked_reachable"] == 0
+        stored = repo.routers[router.id]
+        assert stored.reachability_state == RouterReachabilityState.UNREACHABLE.value
+        assert stored.reachability_consecutive_hits == (
+            ROUTER_REACHABILITY_HITS_TO_RESOLVE - 1
+        ), "untouched -- we abstained, we did not vote"
+
+
+class TestReachabilitySweepIsActuallyScheduled:
+    """A sweep that is registered but absent from ``beat_schedule``, or
+    scheduled under a task name nothing registered, never runs -- and it
+    fails exactly as silently as a fleet that is entirely healthy.
+
+    That is not hypothetical here. The whole reason this feature was needed
+    is that ``AlertService.evaluate_alert_rules`` sat fully built and
+    dormant for a long time, and that ``sweep_stale_heartbeats`` -- the only
+    writer of ONLINE -> OFFLINE -- did not exist at all while every screen
+    happily reported ``online``. Both halves are asserted, and that they
+    name the same task.
+    """
+
+    def test_the_sweep_is_registered_and_scheduled_under_the_same_name(self) -> None:
+        import app.domains.router.tasks  # noqa: F401 -- registers the task
+        from app.core.celery_app import celery_app
+        from app.domains.router.constants import (
+            TASK_RUN_ROUTER_REACHABILITY_SWEEP,
+        )
+
+        entry = celery_app.conf.beat_schedule.get("router-reachability-sweep")
+        assert entry is not None, "the fast outage path has no Beat entry"
+        assert entry["task"] == TASK_RUN_ROUTER_REACHABILITY_SWEEP
+        assert entry["schedule"] == ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS
+        assert TASK_RUN_ROUTER_REACHABILITY_SWEEP in celery_app.tasks, (
+            "scheduled under a task name nothing registered"
+        )
+
+    def test_the_two_minute_budget_still_adds_up(self) -> None:
+        """The founder's number, as arithmetic rather than as a comment.
+
+        Detection is (misses required) x (sweep interval), plus up to one
+        more interval of silence before the first miss is even observed;
+        the alert evaluation sweep then adds its own interval before the
+        email goes out. If somebody widens any of these three constants,
+        this fails rather than quietly turning two minutes into six.
+        """
+        from app.domains.monitoring.constants import (
+            ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS,
+        )
+
+        worst_case_seconds = (
+            ROUTER_REACHABILITY_SILENCE_SECONDS
+            + ROUTER_REACHABILITY_MISSES_TO_ALERT
+            * ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS
+            + ALERT_RULE_EVALUATION_SWEEP_INTERVAL_SECONDS
+        )
+        assert worst_case_seconds <= 180, (
+            f"detection-to-email worst case is now {worst_case_seconds}s; the "
+            "founder asked for two minutes and this budget no longer fits it"
+        )
+
+    def test_the_recovery_window_is_long_enough_to_absorb_a_flap(self) -> None:
+        """The 2026-09-07 router was back for four minutes before it went
+        down again. The recovery window has to be comfortably longer than
+        that, or the flap guard is decorative."""
+        recovery_seconds = (
+            ROUTER_REACHABILITY_HITS_TO_RESOLVE
+            * ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS
+        )
+        assert recovery_seconds >= 300, (
+            f"recovery needs only {recovery_seconds}s of uptime; the real "
+            "outage came back for ~4 minutes before dropping again"
+        )

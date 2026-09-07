@@ -88,10 +88,7 @@ from app.domains.monitored_hardware.repository import MonitoredHardwareRepositor
 from app.domains.monitored_hardware.service import MonitoredHardwareService
 from app.domains.organization.repository import OrganizationRepository
 from app.domains.organization.service import OrganizationService
-from app.domains.otp.service import (
-    get_configured_email_provider,
-    get_configured_sms_provider,
-)
+from app.domains.otp.service import get_configured_sms_provider
 from app.domains.rbac.repository import RBACRepository
 from app.domains.router.repository import RouterRepository
 from app.domains.router.service import RouterService
@@ -106,6 +103,7 @@ from .constants import (
     TASK_RUN_ALERT_RULE_EVALUATION_SWEEP,
     TASK_RUN_HEALTH_CHECK_SWEEP,
 )
+from .email_provider import resolve_email_provider
 from .repository import MonitoringRepository
 from .service import (
     AlertEvaluationResult,
@@ -127,7 +125,7 @@ async def _run_alert_rule_evaluation_sweep_async() -> AlertEvaluationResult:
                 repository,
                 http_client,
                 sms_provider=get_configured_sms_provider(settings),
-                email_provider=get_configured_email_provider(settings),
+                email_provider=resolve_email_provider(settings),
             )
             # Real composition chain for ALERT_TARGET_MONITORED_HARDWARE
             # evaluation (access points/printers/cameras down), same
@@ -248,6 +246,12 @@ def run_alert_rule_evaluation_sweep() -> dict[str, int]:
     summary = {
         "triggered": len(result.triggered),
         "resolved": len(result.resolved),
+        # Surfaced in the task's own return value, not just in a log line
+        # somewhere: a non-zero count here means some customer's rule was
+        # stepped over this pass. Per-rule isolation is only an improvement
+        # if the skipping is visible -- otherwise it is just a quieter way
+        # to not evaluate a rule. See AlertEvaluationResult's docstring.
+        "skipped_rules": result.skipped_rules,
     }
     logger.info("monitoring_task_alert_rule_evaluation_sweep_completed", extra=summary)
     return summary
