@@ -572,6 +572,7 @@ class QueueManagementService:
         target_type: QueueTargetType | None = None,
         target_id: uuid.UUID | None = None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         status: QueueStatus | None = None,
         page: int = 1,
         page_size: int = 25,
@@ -585,6 +586,8 @@ class QueueManagementService:
             filters["target_id"] = target_id
         if router_id is not None:
             filters["router_id"] = router_id
+        if location_id is not None:
+            filters["location_id"] = location_id
         if status is not None:
             filters["status"] = status.value
         return await self.repository.list_assignments(
@@ -1130,6 +1133,80 @@ class QueueManagementService:
             new_device_target=device_target,
             auto_apply=auto_apply,
         )
+
+    async def reapply_active_sessions_for_location(
+        self,
+        *,
+        location_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> dict[str, int]:
+        """Re-resolve every currently-``ACTIVE`` SESSION queue assignment
+        for one location against the location's *current* bandwidth policy.
+
+        This is the "a venue just raised their speeds" hook -- the
+        counterpart to the per-login ``resolve_and_assign_queue`` call in
+        ``GuestService._assign_guest_queue``. A bandwidth-policy publish
+        only changes what the *next* login resolves until this runs; this
+        method makes the change reach guests who are already connected,
+        without waiting for their session to die or for a reconnect.
+
+        Each affected assignment is fed back through the exact same
+        ``resolve_and_assign_queue`` pipeline a fresh login uses, so the
+        semantics are identical to a returning guest: an unchanged rate
+        resolves to the same profile and returns without a device call
+        (idempotent by construction -- see that method's own docstring),
+        and a genuinely changed rate goes through ``move_queue``, which
+        applies the new ``/queue simple`` before pulling the old one, so a
+        connected guest is never left at zero bandwidth in between. The
+        session's own stored ``device_target`` (the concrete IP the live
+        queue already names) is reused -- re-resolving policy does not need
+        to re-discover an address that has not changed.
+
+        One assignment's device failure is caught and counted, never
+        aborting the rest of the location's own re-applications -- mirrors
+        ``reapply_assignments_for_router``'s identical per-item isolation
+        contract. Returns ``{"reapplied": n, "failed": n}``.
+
+        The repo lists by ``status`` + filters; ``location_id`` and
+        ``target_type`` are the two real filters that select the sessions
+        this method exists to reach, and only ``ACTIVE`` rows are touched
+        (a ``PENDING``/``DISABLED`` assignment belongs to a target that is
+        not currently online, and will pick the new policy up whenever it
+        is next applied on its own)."""
+        assignments, _ = await self.list_assignments(
+            requesting_organization_id=requesting_organization_id,
+            location_id=location_id,
+            status=QueueStatus.ACTIVE,
+            page=1,
+            page_size=1000,
+        )
+        reapplied = 0
+        failed = 0
+        for assignment in assignments:
+            if assignment.target_type != QueueTargetType.SESSION.value:
+                continue
+            if assignment.router_id is None:
+                continue
+            try:
+                await self.resolve_and_assign_queue(
+                    requesting_organization_id=assignment.organization_id,
+                    location_id=assignment.location_id,
+                    router_id=assignment.router_id,
+                    target_type=QueueTargetType.SESSION,
+                    target_id=assignment.target_id,
+                    device_target=assignment.device_target or "",
+                    actor_user_id=actor_user_id,
+                    guest_id=None,
+                )
+                reapplied += 1
+            except Exception as exc:  # noqa: BLE001 -- per-assignment isolation, see docstring
+                failed += 1
+                logger.warning(
+                    "queue_reapply_session_failed",
+                    extra={"assignment_id": str(assignment.id), "error": str(exc)},
+                )
+        return {"reapplied": reapplied, "failed": failed}
 
     # ========================================================================
     # Internal helpers

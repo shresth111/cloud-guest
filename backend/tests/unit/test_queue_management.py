@@ -1613,6 +1613,158 @@ class TestGetRateLimitReplyForSession:
 
 
 # ============================================================================
+# Policy-publish reapply (reapply_active_sessions_for_location)
+# ============================================================================
+
+
+class TestReapplyActiveSessionsForLocation:
+    """The "a venue just raised their speeds" hook: a bandwidth-policy
+    publish must reach guests who are already connected, not just the next
+    login. These mirror TestResolveAndAssignQueue's own policy-lookup
+    fakes (rules_by_scope) -- reapply is the same pipeline, driven by an
+    admin action instead of a login."""
+
+    async def _session_assignment(self, h: Harness, router: Router) -> QueueAssignment:
+        """One ACTIVE SESSION assignment at 1 Mbps on the given router,
+        created via resolve_and_assign_queue so the policy fake is the
+        single source of truth for its rate."""
+        h.policy_lookup.rules_by_scope[(router.organization_id, router.location_id)] = {
+            "download_rate_kbps": 1000,
+            "upload_rate_kbps": 1000,
+            "burst_download_kbps": None,
+            "burst_upload_kbps": None,
+            "burst_threshold_kbps": None,
+            "burst_time_seconds": None,
+            "priority": None,
+        }
+        session_id = uuid.uuid4()
+        return await h.service.resolve_and_assign_queue(
+            requesting_organization_id=router.organization_id,
+            location_id=router.location_id,
+            router_id=router.id,
+            target_type=QueueTargetType.SESSION,
+            target_id=session_id,
+            device_target="10.0.0.5/32",
+        )
+
+    async def test_reapply_moves_active_session_to_the_new_rate(self) -> None:
+        """The core promise: a location's policy going from 1 Mbps to 5
+        Mbps re-resolves the ACTIVE session's queue to the new profile --
+        the device sees an update, not a create-plus-ghost."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        assignment = await self._session_assignment(h, router)
+        assert assignment.status == QueueStatus.ACTIVE.value
+        old_profile = await h.service.get_profile(assignment.queue_profile_id)
+        assert old_profile.download_rate_kbps == 1000
+        created_before = len(h.device_adapter.created_ids)
+
+        # The venue raises the speed to 5 Mbps and publishes.
+        h.policy_lookup.rules_by_scope[(router.organization_id, router.location_id)] = {
+            "download_rate_kbps": 5000,
+            "upload_rate_kbps": 5000,
+            "burst_download_kbps": None,
+            "burst_upload_kbps": None,
+            "burst_threshold_kbps": None,
+            "burst_time_seconds": None,
+            "priority": None,
+        }
+        result = await h.service.reapply_active_sessions_for_location(
+            location_id=router.location_id,
+            requesting_organization_id=router.organization_id,
+        )
+        assert result == {"reapplied": 1, "failed": 0}
+
+        # move_queue applies the new queue before pulling the old one --
+        # one create for the new profile row's device queue.
+        assert len(h.device_adapter.created_ids) == created_before + 1
+        active = await h.repository.get_active_assignment_for_target(
+            target_type=QueueTargetType.SESSION.value,
+            target_id=assignment.target_id,
+        )
+        assert active is not None and active.id != assignment.id
+        new_profile = await h.service.get_profile(active.queue_profile_id)
+        assert new_profile.download_rate_kbps == 5000
+
+    async def test_reapply_is_idempotent_when_rate_unchanged(self) -> None:
+        """A publish that did not change this location's rate must not
+        touch the device -- same idempotency contract as
+        resolve_and_assign_queue, so an unrelated policy edit elsewhere in
+        the org costs no router calls for a session it does not affect."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        assignment = await self._session_assignment(h, router)
+        created_before = len(h.device_adapter.created_ids)
+
+        result = await h.service.reapply_active_sessions_for_location(
+            location_id=router.location_id,
+            requesting_organization_id=router.organization_id,
+        )
+        assert result == {"reapplied": 1, "failed": 0}
+        assert len(h.device_adapter.created_ids) == created_before
+        active = await h.repository.get_active_assignment_for_target(
+            target_type=QueueTargetType.SESSION.value,
+            target_id=assignment.target_id,
+        )
+        assert active is not None and active.id == assignment.id
+
+    async def test_reapply_ignores_pending_assignments(self) -> None:
+        """Only ACTIVE rows are touched -- a PENDING assignment belongs to
+        a target that is not currently online and will pick the new policy
+        up whenever it is next applied on its own."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        # Build an ACTIVE assignment for one session...
+        await self._session_assignment(h, router)
+        # ...and a never-applied (PENDING) one for another.
+        profile = await h.service.create_profile(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            name="PENDING rate",
+            download_rate_kbps=2000,
+            upload_rate_kbps=2000,
+        )
+        await h.service.create_assignment(
+            actor_user_id=None,
+            requesting_organization_id=router.organization_id,
+            target_type=QueueTargetType.SESSION,
+            target_id=uuid.uuid4(),
+            router_id=router.id,
+            location_id=router.location_id,
+            device_target="10.0.0.6/32",
+            queue_profile_id=profile.id,
+        )
+        result = await h.service.reapply_active_sessions_for_location(
+            location_id=router.location_id,
+            requesting_organization_id=router.organization_id,
+        )
+        assert result == {"reapplied": 1, "failed": 0}
+
+    async def test_per_assignment_device_failure_is_isolated(self) -> None:
+        """One session whose router rejects the write must not abort the
+        reapply of the location's other sessions."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        await self._session_assignment(h, router)
+        # Raise the rate so the reapply actually attempts a device write.
+        h.policy_lookup.rules_by_scope[(router.organization_id, router.location_id)] = {
+            "download_rate_kbps": 5000,
+            "upload_rate_kbps": 5000,
+            "burst_download_kbps": None,
+            "burst_upload_kbps": None,
+            "burst_threshold_kbps": None,
+            "burst_time_seconds": None,
+            "priority": None,
+        }
+        h.device_adapter.create_should_fail = True
+        result = await h.service.reapply_active_sessions_for_location(
+            location_id=router.location_id,
+            requesting_organization_id=router.organization_id,
+        )
+        assert result == {"reapplied": 0, "failed": 1}
+
+
+# ============================================================================
 # RBAC -- every route requires a permission dependency
 # ============================================================================
 
