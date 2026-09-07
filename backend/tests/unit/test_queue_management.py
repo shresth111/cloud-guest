@@ -369,6 +369,10 @@ class FakePolicyLookup:
 class FakeQueueDeviceAdapter:
     vendor: str = "mikrotik"
     created_ids: list[str] = field(default_factory=list)
+    # Every argument each create actually carried -- a queue is only as
+    # correct as the ``target`` it was written against, and recording just
+    # the returned id cannot show that.
+    created_calls: list[dict[str, object]] = field(default_factory=list)
     updated_calls: list[dict[str, object]] = field(default_factory=list)
     removed_ids: list[str] = field(default_factory=list)
     create_should_fail: bool = False
@@ -380,6 +384,7 @@ class FakeQueueDeviceAdapter:
         self._counter += 1
         device_id = f"*{self._counter}"
         self.created_ids.append(device_id)
+        self.created_calls.append(dict(kwargs))
         return device_id
 
     async def update_simple_queue(
@@ -1315,6 +1320,77 @@ class TestResolveAndAssignQueue:
         assert second.id != first.id
         old_refetched = await h.repository.get_assignment_by_id(first.id)
         assert old_refetched.status == QueueStatus.EXPIRED.value
+
+
+class TestResolveFollowsTheGuestsCurrentAddress:
+    """A ``/queue simple`` entry matches on one concrete IP. A guest who
+    reconnects on a fresh DHCP lease keeps the same session (the login
+    paths reuse an ACTIVE one and refresh its ``ip_address``) and the same
+    rate, so the resolved ``QueueProfile`` compares equal -- and the old
+    "same profile, nothing to do" check returned early on exactly that,
+    leaving the live queue naming an address the guest no longer holds. A
+    queue that matches nothing rate-limits nothing, and every layer above
+    the device still reported the rate as applied."""
+
+    async def test_a_new_address_at_the_same_rate_re_points_the_queue(self) -> None:
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        target_id = uuid.uuid4()
+
+        first = await h.service.resolve_and_assign_queue(
+            requesting_organization_id=router.organization_id,
+            location_id=router.location_id,
+            router_id=router.id,
+            target_type=QueueTargetType.SESSION,
+            target_id=target_id,
+            device_target="10.0.0.5/32",
+        )
+        # Captured now: removing the old queue nulls this field on the very
+        # row being compared against.
+        first_device_queue_id = first.device_queue_id
+
+        second = await h.service.resolve_and_assign_queue(
+            requesting_organization_id=router.organization_id,
+            location_id=router.location_id,
+            router_id=router.id,
+            target_type=QueueTargetType.SESSION,
+            target_id=target_id,
+            device_target="10.0.0.77/32",
+        )
+
+        assert second.id != first.id
+        assert second.device_target == "10.0.0.77/32"
+        assert second.queue_profile_id == first.queue_profile_id
+        # The device was told, not just the database.
+        assert h.device_adapter.created_calls[-1]["target"] == "10.0.0.77/32"
+        # ...and the entry on the address the guest gave up is gone, rather
+        # than left behind for the next guest who gets that lease.
+        assert h.device_adapter.removed_ids == [first_device_queue_id]
+        old_refetched = await h.repository.get_assignment_by_id(first.id)
+        assert old_refetched.status == QueueStatus.EXPIRED.value
+
+    async def test_the_same_address_at_the_same_rate_still_touches_nothing(
+        self,
+    ) -> None:
+        """The idempotency that makes it safe to re-resolve on every login
+        has to survive this. One create, no update, no remove."""
+        h = make_harness()
+        router = h.router_lookup.add(_make_router())
+        target_id = uuid.uuid4()
+
+        for _ in range(3):
+            await h.service.resolve_and_assign_queue(
+                requesting_organization_id=router.organization_id,
+                location_id=router.location_id,
+                router_id=router.id,
+                target_type=QueueTargetType.SESSION,
+                target_id=target_id,
+                device_target="10.0.0.5/32",
+            )
+
+        assert len(h.device_adapter.created_calls) == 1
+        assert h.device_adapter.updated_calls == []
+        assert h.device_adapter.removed_ids == []
 
 
 # ============================================================================
