@@ -56,8 +56,11 @@ from app.domains.network_config.exceptions import (
     NoNetwatchTargetsError,
 )
 from app.domains.network_config.renderers import (
+    API_HTTPS_WALLED_GARDEN_COMMENT,
+    GUEST_PORTAL_HOST,
     HOTSPOT_DNS_NAME,
     MANAGED_WALLED_GARDEN_COMMENT,
+    PORTAL_HTTPS_WALLED_GARDEN_COMMENT,
     RADIUS_CLIENT_COMMENT,
     ROGUE_DHCP_ALERT_COMMENT,
     render_agent_heartbeat_scheduler,
@@ -75,6 +78,7 @@ from app.domains.network_config.renderers import (
     render_isp_netwatch_entry,
     render_network_config,
     render_port_forwarding_rule,
+    render_portal_https_walled_garden_verification,
     render_qos_traffic_rule,
     render_radius_client,
     render_vlan,
@@ -778,7 +782,24 @@ class TestRenderBootstrapScript:
         # be allowed too or the one hostname guests are actually sent to is
         # the one hostname walled off. Keeps the one line of slack this cap
         # has carried since the 30 -> 36 raise.
-        assert len(lines) <= 39
+        #
+        # Raised 39 -> 42 on 2026-09-07 for the three lines that make the
+        # HTTPS portal reachable at all: a fourth host-based row for
+        # `GUEST_PORTAL_HOST` (the host the guest is actually sent to, which
+        # this section had never allowed -- only the redirect host it passes
+        # over on the way there), one joined line of address-based
+        # `/ip hotspot walled-garden ip` writes, and one verification line.
+        # The address-based row is not redundancy: RouterOS rejects
+        # unauthenticated HTTPS outright rather than proxying it since 7.5,
+        # so the host-based row can never match a TLS flow and sits at
+        # HITS: 0 forever -- observed twice on real hardware, with ~98% of
+        # real guest traffic arriving over HTTPS. Every write is guarded, so
+        # the verification line re-reads the device and `:error`s rather
+        # than letting a router finish enrollment looking provisioned and
+        # serving nobody. Held to one joined line for all the address-based
+        # writes: a `:local` does not survive across entered lines, so they
+        # could not have been split even if the cap wanted it.
+        assert len(lines) <= 42
 
         assert lines[0] == '/system identity set name="LOC-2026-000039"'
         # The provisioning token is embedded (the one deliberate, one-time,
@@ -2385,8 +2406,19 @@ class TestRenderHotspotWalledGarden:
         script = self._script()
         assert 'dst-host="wifi.wyfyguest.com"' in script
         assert 'dst-host="app.wyfyguest.com"' in script
-        assert script.count("walled-garden add") == 3
+        assert script.count("walled-garden add") == 4
         assert "action=allow" in script
+
+    def test_the_host_the_guest_actually_lands_on_is_allowed(self) -> None:
+        """The redirect host and the portal host are two different names on
+        purpose (see `GUEST_PORTAL_HOST`). Allowing only the redirect host
+        walls in the name the browser passes over in a fraction of a second
+        and blocks the one it has to load -- which fails as a certificate
+        error, on every guest, on a router the platform calls provisioned.
+        Only the Master console's hand-pasted script ever wrote this."""
+        script = self._script()
+        assert GUEST_PORTAL_HOST != HOTSPOT_DNS_NAME
+        assert f'dst-host="{GUEST_PORTAL_HOST}"' in script
 
     def test_the_per_vlan_hostname_is_covered_by_a_wildcard(self) -> None:
         """`_render_vlan_hotspot` redirects to `{tag}.HOTSPOT_DNS_NAME`, not
@@ -2426,24 +2458,155 @@ class TestRenderHotspotWalledGarden:
         serving guests. Adding a duplicate allow rule is harmless; removing
         one out from under an in-flight request is not."""
         script = self._script()
-        assert script.count("= 0) do=") == 3
+        # Four host-based rows plus one add-guard per address-based target.
+        assert script.count("= 0) do=") == 6
         assert "walled-garden remove" not in script
 
     def test_it_only_ever_matches_its_own_rows(self) -> None:
         """An operator's hand-added walled-garden entries carry a different
         comment (or none) and must never be found by this section."""
         script = self._script()
-        assert script.count(f'comment="{MANAGED_WALLED_GARDEN_COMMENT}"') == 6
+        # Two per host-based row: the `find where` guard and the `add`.
+        assert script.count(f'comment="{MANAGED_WALLED_GARDEN_COMMENT}"') == 8
 
     def test_a_host_that_is_also_the_portal_is_not_duplicated(self) -> None:
         """RouterOS would accept two identical rows; the guard that keeps
         this section to one line per host should not be defeated by a
         deployment that serves portal and API from one name."""
         script = self._script(f"https://{HOTSPOT_DNS_NAME}/agent/check-in")
-        # Two, not three: the bare name and its wildcard are both always
-        # emitted; what must not appear is a third, duplicate row for the
-        # API host when it IS the portal host.
-        assert script.count("walled-garden add") == 2
+        # Three, not four: the bare redirect name, its wildcard and the
+        # portal host are always emitted; what must not appear is a fourth,
+        # duplicate row for the API host when it IS one of those names.
+        assert script.count("walled-garden add") == 3
+
+
+class TestThePortalHttpsWalledGarden:
+    """The address-based half. RouterOS has two independent walled gardens:
+    the host-based menu keys on the HTTP `Host` header at a proxy layer that
+    does not exist for TLS, and since 7.5 an unauthenticated HTTPS flow is
+    rejected outright rather than proxied. The portal is HTTPS-only, so the
+    host-based row alone is not a partial fix -- it is no fix, and it
+    reports success. Confirmed twice on real hardware (2026-08-18 fleet-wide
+    hit-counters, 2026-08-27 "huda city center" at HITS: 0)."""
+
+    API_URL = "https://app.wyfyguest.com/agent/check-in"
+
+    def _script(self, api_url: str | None = None) -> str:
+        return "\n".join(render_hotspot_walled_garden(api_url=api_url or self.API_URL))
+
+    def test_the_portal_gets_an_address_based_row(self) -> None:
+        script = self._script()
+        assert "/ip hotspot walled-garden ip add action=accept" in script
+        assert f'comment="{PORTAL_HTTPS_WALLED_GARDEN_COMMENT}"' in script
+
+    def test_the_address_is_resolved_on_the_device_never_baked_in(self) -> None:
+        """A generate-time literal goes stale the instant a DNS record moves,
+        with no signal to an already-provisioned router. This fleet has paid
+        that bill: a hardcoded hub address was baked into 64 routers that
+        then needed physical visits."""
+        script = self._script()
+        assert f':resolve "{GUEST_PORTAL_HOST}"' in script
+        # No dotted quad anywhere in the emitted section.
+        assert not re.search(r"dst-address=\d{1,3}\.\d{1,3}", script)
+
+    def test_the_gate_is_the_type_not_the_length(self) -> None:
+        """`:local x ""` binds a STRING; a successful `:resolve` rebinds it
+        to RouterOS's `ip` type. A length test would pass on junk and write
+        `dst-address=` from it."""
+        script = self._script()
+        assert '[:typeof $cgWgIp0] = "ip"' in script
+        assert "[:len $cgWgIp0]" not in script
+
+    def test_every_local_and_its_uses_share_one_entered_line(self) -> None:
+        """A `:local` does not survive across entered lines, so a write that
+        reads a variable declared on a previous line silently sees an empty
+        string. Same one-joined-line shape `render_guest_data_path` uses."""
+        lines = render_hotspot_walled_garden(api_url=self.API_URL)
+        address_lines = [line for line in lines if "walled-garden ip" in line]
+        assert len(address_lines) == 1
+        assert ":local cgWgIp0" in address_lines[0]
+        assert "dst-address=$cgWgIp0" in address_lines[0]
+
+    def test_a_failed_resolve_writes_nothing(self) -> None:
+        """Degraded means 'nothing was written', never a row pointed at a
+        plausible-looking wrong address."""
+        script = self._script()
+        for statement in script.split("; "):
+            if "walled-garden ip add" in statement or "walled-garden ip set" in (
+                statement
+            ):
+                assert "$cgWgOk" in statement, statement
+
+    def test_it_converges_rather_than_pinning_a_dead_address(self) -> None:
+        """The row's whole content is an address that moves whenever the
+        platform's own A record moves -- add-only would pin a router to a
+        dead address forever. The `set` also re-enables a row an operator
+        disabled while debugging."""
+        script = self._script()
+        assert "[:len $cgWgRow0] = 0" in script  # absent -> add
+        assert "[:len $cgWgRow0] > 0" in script  # present -> re-point
+        assert "disabled=no" in script
+
+    def test_the_redirect_host_never_gets_an_address_row(self) -> None:
+        """`HOTSPOT_DNS_NAME` resolves, on the router, to the router's own
+        LAN address. An `action=accept` on that address would bypass hotspot
+        authentication for everything the router itself listens on, for
+        every unauthenticated guest. The host-based row is both sufficient
+        and correct for it -- that page is plain HTTP by design."""
+        script = self._script()
+        address_half = script.split("walled-garden ip", 1)[1]
+        assert f':resolve "{HOTSPOT_DNS_NAME}"' not in address_half
+        assert f':resolve "*.{HOTSPOT_DNS_NAME}"' not in script
+
+    def test_the_portal_comment_is_byte_equal_with_the_master_console(
+        self,
+    ) -> None:
+        """`RouterDetailTabs.tsx::buildWalledGardenLines` writes this exact
+        comment on the same fleet. Sharing it makes each path ADOPT the
+        other's row with a converging `set` instead of stacking a second
+        accept beside a working one -- the same 'duplicated on purpose, must
+        stay identical' rule `RADIUS_CLIENT_COMMENT` states."""
+        assert PORTAL_HTTPS_WALLED_GARDEN_COMMENT == "cloudguest-portal-https"
+
+    def test_one_row_per_name_even_when_they_share_an_address(self) -> None:
+        """`auth`, `portal`, `app` and `master` are one host in production
+        today. Two accepts for one address are harmless and converge
+        independently; a row suppressed because the addresses matched at
+        paste time would go stale unnoticed the moment they are split."""
+        script = self._script()
+        assert f'comment="{PORTAL_HTTPS_WALLED_GARDEN_COMMENT}"' in script
+        assert f'comment="{API_HTTPS_WALLED_GARDEN_COMMENT}"' in script
+        assert ":local cgWgIp1" in script
+
+    def test_an_api_host_that_is_the_portal_host_gets_no_second_row(self) -> None:
+        script = self._script(f"https://{GUEST_PORTAL_HOST}/agent/check-in")
+        assert f'comment="{API_HTTPS_WALLED_GARDEN_COMMENT}"' not in script
+        assert ":local cgWgIp1" not in script
+
+
+class TestPortalHttpsWalledGardenVerification:
+    def _line(self) -> str:
+        return "\n".join(render_portal_https_walled_garden_verification())
+
+    def test_it_rereads_the_device_rather_than_trusting_the_write(self) -> None:
+        """Every write in the section is guarded, and a guarded command that
+        did not fire is indistinguishable from one that succeeded."""
+        line = self._line()
+        assert "/ip hotspot walled-garden ip find where" in line
+        assert "$cgWgOk" not in line
+        assert "$cgWgIp" not in line
+
+    def test_it_stops_the_script_rather_than_reporting_success(self) -> None:
+        """A router that finishes enrollment without this row intercepts,
+        serves login.html, redirects the guest to the HTTPS portal, and then
+        hands every one of them the router's own certificate instead."""
+        line = self._line()
+        assert ":error" in line
+        assert "no address-based walled-garden entry" in line
+        assert GUEST_PORTAL_HOST in line
+
+    def test_a_disabled_row_does_not_count_as_established(self) -> None:
+        assert "disabled=no" in self._line()
 
 
 class TestBootstrapRendersTheWalledGarden:
@@ -2474,6 +2637,43 @@ class TestBootstrapRendersTheWalledGarden:
         script = self._script()
         assert 'dst-host="api.example.com"' in script
         assert "app.wyfyguest.com" not in script
+
+    def test_onsite_bootstrap_carries_the_portal_host_and_its_address_row(
+        self,
+    ) -> None:
+        """The two halves that make the HTTPS portal reachable pre-auth. A
+        bootstrap that ships neither produces a router which authenticates
+        every guest and then hands them a certificate error instead of the
+        sign-in page they were just redirected to."""
+        script = self._script()
+        assert f'dst-host="{GUEST_PORTAL_HOST}"' in script
+        assert f'comment="{PORTAL_HTTPS_WALLED_GARDEN_COMMENT}"' in script
+        assert f':resolve "{GUEST_PORTAL_HOST}"' in script
+
+    def test_onsite_bootstrap_fails_loudly_when_the_address_row_is_missing(
+        self,
+    ) -> None:
+        """A fresh box with a technician present is exactly where stopping
+        with a named reason beats completing and being wrong."""
+        assert "no address-based walled-garden entry" in self._script()
+
+    def test_remote_bootstrap_carries_the_rows_but_never_the_hard_stop(
+        self,
+    ) -> None:
+        """A live, already-serving router. Aborting a re-provision over a
+        walled-garden row would be worse than the missing row -- the same
+        call `render_guest_data_path_verification` is deliberately left out
+        of this path for."""
+        script = "\n".join(
+            render_bootstrap_script(
+                location_code="LOC-2026-000053",
+                provisioning_token="tok",
+                api_base_url="https://api.example.com",
+                mode=BootstrapMode.REMOTE,
+            )
+        )
+        assert f'comment="{PORTAL_HTTPS_WALLED_GARDEN_COMMENT}"' in script
+        assert "no address-based walled-garden entry" not in script
 
 
 class TestBootstrapAssertsTheGuestDataPath:
