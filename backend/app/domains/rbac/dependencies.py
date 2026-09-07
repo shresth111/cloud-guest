@@ -80,9 +80,18 @@ from .cache import PermissionCache
 from .context import ScopeContext
 from .enums import ScopeType
 from .exceptions import (
+    CrossOrganizationScopeDeniedError,
     InvalidScopeHeaderError,
     MissingScopeContextError,
     RoleNotHeldError,
+    SingleOrganizationRequiredError,
+    UnspecifiedOrganizationScopeError,
+)
+from .organization_scope import (
+    ORGANIZATION_SCOPE_HEADER,
+    ORGANIZATION_SCOPE_QUERY_PARAM,
+    OrganizationScope,
+    wants_all_organizations,
 )
 from .repository import RBACRepository, RBACRepositoryProtocol
 from .scope_params import ScopeDimension, scope_dimension_for
@@ -174,81 +183,80 @@ def _parse_uuid_path_param(request: Request, param_name: str) -> uuid.UUID | Non
         return None
 
 
-async def CurrentOrganization(
+async def CurrentOrganizationScope(
     request: Request,
     user: AuthUser = Depends(CurrentUser),
     db: AsyncSession = Depends(get_db_session),
     repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
-) -> uuid.UUID | None:
-    """The organization context for this request, if any (``X-Organization-Id``).
+) -> OrganizationScope:
+    """Which tenant this request is about -- one organization, or explicitly all.
 
-    When the header is present, validates the organization exists and, for
-    everyone except a GLOBAL-scoped caller, that the current user is an
-    *active* member of it (see module docstring for why this is no longer a
-    trust-the-header parse). Returns ``None`` (no DB lookup performed) when
-    the header is absent.
+    See ``app.domains.rbac.organization_scope`` for why this returns a value
+    object rather than a nullable UUID. The short version: ``None`` used to mean
+    both "a platform admin deliberately reading the whole estate" and "nobody
+    said, so I picked the whole estate", and the second one was what a founder
+    with a ``Super Admin`` role got every time he opened a report about his own
+    venue.
 
-    ## GLOBAL-scope bypass
+    ## Resolution order
+
+    1. **The organization the route itself names** -- a path or query parameter
+       recognised by ``SCOPE_PARAM_ALIASES`` (``organization_id``,
+       ``customer_id``, ...). This is deliberately checked *before* the header,
+       because it is the order ``_current_scope_context`` already uses to decide
+       what ``RequirePermission`` checks against. Reading them in a different
+       order is precisely the defect class this codebase has already been bitten
+       by -- the permission check evaluated against the header's organization
+       while the handler went on to operate on the path's. Same source, same
+       order, one answer.
+    2. **``X-Organization-Id``**, as before.
+    3. **``X-Organization-Scope: all``** (or ``?organization_scope=all``) -- a
+       deliberate cross-tenant read. Honoured only for a caller holding an
+       active GLOBAL-scoped role.
+
+    A named organization always wins over an all-organizations request. The two
+    together are contradictory, and narrowing is the safe way to resolve a
+    contradiction: a stale "all" left on a client cannot widen a request that
+    names its tenant.
+
+    ## What is *not* relaxed
+
+    Whichever of (1) or (2) supplied the id, it goes through the same checks it
+    always did: the organization must exist, and a caller who does **not** hold
+    a GLOBAL-scoped role must hold an *active* ``OrganizationMember`` row for
+    it. Widening where an id may come from is not the same as widening who may
+    use one, and a client-supplied id is still worth nothing to a caller with no
+    membership behind it.
+
+    ## GLOBAL-scope bypass (unchanged)
 
     A platform-level admin (any active role with ``Role.scope_type ==
     ScopeType.GLOBAL``, e.g. Super Admin/Platform Admin) is never an
-    ``OrganizationMember`` row of any individual organization -- their
-    authority comes from holding a global role, not from tenant membership,
-    the same distinction ``app.domains.rbac.seed``'s own module docstring
-    draws ("a GLOBAL-scoped role can always exercise a location-level
-    permission"). Before this bypass, every org-scoped read/write endpoint
-    that resolves ``X-Organization-Id`` (which is most of them) was
-    unreachable for such a caller on any organization they hadn't also been
-    separately, manually added to as a member -- a real gap surfaced by the
-    Master (super-admin) dashboard's cross-tenant pages 403ing on every
-    organization except the one an operator had happened to add a
-    membership row for by hand. The membership check below still applies in
-    full to every non-GLOBAL caller -- this narrows, not removes, the
-    original guard.
+    ``OrganizationMember`` row of any individual organization -- their authority
+    comes from holding a global role, not from tenant membership, the same
+    distinction ``app.domains.rbac.seed``'s own module docstring draws ("a
+    GLOBAL-scoped role can always exercise a location-level permission"). The
+    membership check below still applies in full to every non-GLOBAL caller.
 
-    ## Why an absent header is not simply ``None``
+    ## Why a caller who says nothing is now an error
 
-    Returning ``None`` for a missing header made ``None`` mean two different
-    things: "a platform-level caller with no tenant" *and* "this client did
-    not send the header". Every tenant guard in the codebase reads it as only
-    the first -- ``LocationService._enforce_organization_scope``,
-    ``RouterService._enforce_organization_scope`` and every list service
-    (``if requesting_organization_id is not None: filters[...] = ...``) treat
-    ``None`` as "platform caller, apply no organization filter".
+    A tenant caller who names no organization has always been an error
+    (``MissingScopeContextError``) -- ``ScopeResolver.satisfies`` compares only
+    ``location_id`` for a LOCATION grant, so before that check existed a
+    front-desk account could send ``X-Location-Id`` alone, resolve LOCATION
+    scope, and have the handler run unfiltered across every tenant.
 
-    That gap was reachable by any authenticated user. ``ScopeResolver.satisfies``
-    compares *only* ``location_id`` for a LOCATION grant (see its own
-    docstring: "it relies entirely on the caller ... supplying
-    ``organization_id`` alongside ``location_id``"), so a caller holding a
-    LOCATION-scoped grant on their own site A could send ``X-Location-Id: A``
-    and **omit** ``X-Organization-Id``: ``_infer_scope_type`` resolved
-    LOCATION, the grant satisfied the check, and the handler then ran with
-    ``requesting_organization_id=None`` -- i.e. unfiltered, across every
-    tenant on the platform. Seven seeded roles are LOCATION-scoped
-    (``reception-staff``, ``helpdesk``, ``guest-operator``, ...), so this was
-    reachable from an ordinary front-desk account.
-
-    So the header is now *required* of anyone who is not a genuine
-    platform-level caller. ``None`` is returned only for a caller who holds an
-    active GLOBAL-scoped role -- exactly the population the bypass above was
-    written for -- which makes the assumption every service already documents
-    true in fact.
+    A *platform* caller who names no organization used to fall through to
+    ``None`` -- "every organization". That is now
+    ``UnspecifiedOrganizationScopeError``, because a platform admin has two
+    genuinely different intentions here and the request has to say which. Every
+    caller that really does want the estate says so in one header.
     """
-    organization_id = _parse_uuid_header(request, _ORG_HEADER)
-    if organization_id is None:
-        resolver = RoleResolver(repository)
-        active_assignments = await resolver.get_active_assignments(uuid.UUID(user.id))
-        if any(
-            assignment.role.scope_type == ScopeType.GLOBAL.value
-            for assignment in active_assignments
-        ):
-            return None
-        raise MissingScopeContextError("organization")
-
-    organization_repo = GenericRepository(Organization, db)
-    organization = await organization_repo.get_by_id(organization_id)
-    if organization is None:
-        raise OrganizationNotFoundError(organization_id)
+    organization_id = _requested_organization_id(request)
+    asked_for_all = wants_all_organizations(
+        request.headers.get(ORGANIZATION_SCOPE_HEADER),
+        _query_param(request, ORGANIZATION_SCOPE_QUERY_PARAM),
+    )
 
     resolver = RoleResolver(repository)
     active_assignments = await resolver.get_active_assignments(uuid.UUID(user.id))
@@ -256,6 +264,20 @@ async def CurrentOrganization(
         assignment.role.scope_type == ScopeType.GLOBAL.value
         for assignment in active_assignments
     )
+
+    if organization_id is None:
+        if asked_for_all:
+            if not holds_global_role:
+                raise CrossOrganizationScopeDeniedError()
+            return OrganizationScope.all()
+        if holds_global_role:
+            raise UnspecifiedOrganizationScopeError()
+        raise MissingScopeContextError("organization")
+
+    organization_repo = GenericRepository(Organization, db)
+    organization = await organization_repo.get_by_id(organization_id)
+    if organization is None:
+        raise OrganizationNotFoundError(organization_id)
 
     if not holds_global_role:
         member_repo = GenericRepository(OrganizationMember, db)
@@ -276,7 +298,58 @@ async def CurrentOrganization(
     # critical (only descriptive metadata on an audit row), so this is
     # populated opportunistically rather than guaranteed for every route.
     get_masking_context().organization_id = str(organization_id)
-    return organization_id
+    return OrganizationScope.for_organization(organization_id)
+
+
+async def CurrentOrganization(
+    scope: OrganizationScope = Depends(CurrentOrganizationScope),
+) -> uuid.UUID | None:
+    """The organization to scope this request's data to, or ``None`` for all.
+
+    Kept as ``uuid.UUID | None`` because ~456 handlers, services and
+    repositories already consume that shape, and every one of them reads
+    ``None`` as "no organization filter -- every tenant". That reading is now
+    *true*: :func:`CurrentOrganizationScope` only ever produces ``None`` for a
+    caller who holds a GLOBAL-scoped role **and** explicitly asked for every
+    organization. The ~90 ``if requesting_organization_id is not None:`` filter
+    sites downstream are therefore correct as written, without touching one of
+    them -- the value reaching them is what they always assumed it was.
+
+    New code that genuinely needs to tell the two states apart (rather than
+    inferring them from a nullable) should depend on
+    :func:`CurrentOrganizationScope` directly.
+    """
+    return scope.organization_id
+
+
+def _requested_organization_id(request: Request) -> uuid.UUID | None:
+    """The organization this request names, from the route first then the header.
+
+    Route-named first, deliberately: see :func:`CurrentOrganizationScope`.
+    """
+    named = _named_scope_ids(request).get(ScopeDimension.ORGANIZATION)
+    if named is not None:
+        return named
+    return _parse_uuid_header(request, _ORG_HEADER)
+
+
+def _query_param(request: Request, name: str) -> str | None:
+    """One query-string value, or ``None``.
+
+    Guarded the same way :func:`_named_scope_ids` guards these accessors:
+    Starlette's ``query_params`` is a property that *raises* when the ASGI scope
+    has no ``query_string`` key, which several unit-test request doubles do not
+    set, so a bare ``getattr(..., None)`` would return the exception rather than
+    a default.
+    """
+    try:
+        query_params = request.query_params
+    except (KeyError, AttributeError):
+        return None
+    if query_params is None:
+        return None
+    value = query_params.get(name)
+    return value if isinstance(value, str) else None
 
 
 async def CurrentLocation(
@@ -473,11 +546,20 @@ async def _location_owner(db: AsyncSession, location_id: uuid.UUID) -> uuid.UUID
 
 
 async def RequireOrganization(
-    organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope: OrganizationScope = Depends(CurrentOrganizationScope),
 ) -> uuid.UUID:
-    """400s if no valid organization context (``X-Organization-Id``) is present."""
+    """The one organization this request is about; 400s if it is about all of them.
+
+    ``CurrentOrganizationScope`` has already rejected a caller who named no
+    tenancy at all, so the only way to arrive here with nothing is to have
+    explicitly asked for every organization on a route whose answer is only
+    meaningful for one -- a per-tenant report, a usage summary, an invoice list.
+    Saying that out loud beats the old message, which told a platform admin to
+    send a header they had deliberately replaced with a different one.
+    """
+    organization_id = scope.organization_id
     if organization_id is None:
-        raise MissingScopeContextError("organization")
+        raise SingleOrganizationRequiredError()
     return organization_id
 
 

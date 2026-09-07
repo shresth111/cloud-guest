@@ -3151,8 +3151,17 @@ class ZtpMonitoringService:
         total_pages = (
             max(1, (total_items + page_size - 1) // page_size) if total_items else 0
         )
+        # Mirrors the `unclaimed_enrollments` decision above, which this tile
+        # contradicted. An enrollment request carries no organization_id, so
+        # `count_pending_enrollment_requests` is unavoidably platform-wide --
+        # and it was rendered on an org-scoped ZTP dashboard as "N routers
+        # waiting to be approved at this venue", next to a list that had
+        # correctly excluded every one of them. A count that disagrees with
+        # the list beside it is the version of this bug nobody can see.
         pending_enrollment_count = (
-            await self.repository.count_pending_enrollment_requests()
+            0
+            if organization_id is not None
+            else await self.repository.count_pending_enrollment_requests()
         )
 
         return ZtpDashboardResult(
