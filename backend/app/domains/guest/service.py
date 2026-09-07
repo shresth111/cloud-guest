@@ -1724,7 +1724,7 @@ class GuestService:
         """Best-effort, additive dynamic bandwidth-queue assignment -- see
         ``QueueAssignmentProtocol``'s own docstring for the full write-up.
         A no-op when no ``queue_assignment_hook`` was wired (the default);
-        never raises. Targets the newly-created ``session`` itself (not
+        never raises. Targets the ``session`` itself (not
         the guest) -- a real RouterOS ``/queue simple`` entry is tied to
         one concrete IP address, and ``session.ip_address`` is the only
         one that is actually correct *right now*; a guest-level
@@ -1734,7 +1734,50 @@ class GuestService:
         GUEST-targeted bandwidth override for *this* guest outranks the
         location's own default when picking which queue profile to apply
         -- only the RouterOS-facing target stays session-scoped, the
-        policy that determines its rate is guest-scoped."""
+        policy that determines its rate is guest-scoped.
+
+        **Called on every login, not only when a session was created.**
+        Every one of the five login methods runs this outside its own
+        ``if created:`` block, unlike the real-time arrival broadcast and
+        the visit counter, which describe an arrival that did not happen
+        on a reused row.
+
+        Speed is the one entitlement that does not live on the session
+        row. ``_reuse_or_create_session`` deliberately re-resolves and
+        writes ``session_timeout_minutes``, ``idle_timeout_minutes``,
+        ``data_limit_mb``, ``auth_method`` and ``voucher_id`` onto a
+        reused session, precisely so a returning guest gets what the venue
+        has configured *now*. Speed instead lives in the SESSION-targeted
+        ``QueueAssignment`` this method creates -- the row
+        ``RadiusService.authorize`` reads to compose the
+        ``Mikrotik-Rate-Limit`` reply attribute, and the row
+        ``QueueManagementService.apply_queue`` turns into a real
+        ``/queue simple`` entry. Resolving it only on ``created`` pinned a
+        guest to the rate that applied the moment their session first
+        opened.
+
+        That was not a short window. A guest who keeps using the network
+        never reaches that moment again: each re-login is a reuse, and a
+        reuse bumps ``last_activity_at``, so the session is refreshed
+        rather than replaced, indefinitely. Their speed could not change,
+        whatever the dashboard showed and whatever the RADIUS reply
+        recomputed around it. Bug report: "speed is only set to 20 and not
+        updating".
+
+        Running it on every login is safe because
+        ``QueueManagementService.resolve_and_assign_queue`` is idempotent
+        by construction: an unchanged rate resolves to the same
+        ``QueueProfile``, finds this session's existing assignment already
+        pointing at it, and returns without a single device call. Only a
+        genuinely changed rate does work, and it does it through
+        ``move_queue``, which applies the new ``/queue simple`` *before*
+        pulling the old one -- so a guest is never left at zero bandwidth
+        in between.
+
+        ``_assign_voucher_queue`` deliberately did **not** move with it:
+        it creates a fresh VOUCHER-targeted assignment on every call with
+        no find-or-reuse step, so running it per login would accumulate
+        duplicate assignments rather than converge on one."""
         if not session.ip_address:
             return
 
@@ -2007,13 +2050,19 @@ class GuestService:
                 auth_method=auth_method.value,
                 is_new_guest=is_new,
             )
-            await self._assign_guest_queue(
-                session=session,
-                router=router,
-                location_id=location_id,
-                organization_id=resolved_org_id,
-            )
             await self._bump_guest_visit(guest)
+        # Deliberately outside the ``if created:`` block above, unlike
+        # every other side effect there -- see ``_assign_guest_queue``'s
+        # own docstring for why, and for the bug that put it here. The
+        # same call sits outside ``if created:`` in all five login
+        # methods.
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -2170,12 +2219,6 @@ class GuestService:
                 auth_method=GuestAuthMethod.VOUCHER.value,
                 is_new_guest=is_new,
             )
-            await self._assign_guest_queue(
-                session=session,
-                router=router,
-                location_id=location_id,
-                organization_id=resolved_org_id,
-            )
             # Phase 1 BhaiFi-parity: additive, best-effort speed-linked
             # voucher assignment -- see _assign_voucher_queue's own
             # docstring.
@@ -2187,6 +2230,18 @@ class GuestService:
                 organization_id=resolved_org_id,
             )
             await self._bump_guest_visit(guest)
+        # Deliberately outside the ``if created:`` block above, unlike
+        # every other side effect there -- see ``_assign_guest_queue``'s
+        # own docstring for why, and for the bug that put it here. The
+        # same call sits outside ``if created:`` in all five login
+        # methods.
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -2351,13 +2406,19 @@ class GuestService:
                 auth_method=GuestAuthMethod.USERNAME_PASSWORD.value,
                 is_new_guest=False,
             )
-            await self._assign_guest_queue(
-                session=session,
-                router=router,
-                location_id=location_id,
-                organization_id=resolved_org_id,
-            )
             await self._bump_guest_visit(guest)
+        # Deliberately outside the ``if created:`` block above, unlike
+        # every other side effect there -- see ``_assign_guest_queue``'s
+        # own docstring for why, and for the bug that put it here. The
+        # same call sits outside ``if created:`` in all five login
+        # methods.
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -2654,13 +2715,19 @@ class GuestService:
                 auth_method=GuestAuthMethod.PIN.value,
                 is_new_guest=False,
             )
-            await self._assign_guest_queue(
-                session=session,
-                router=router,
-                location_id=location_id,
-                organization_id=resolved_org_id,
-            )
             await self._bump_guest_visit(guest)
+        # Deliberately outside the ``if created:`` block above, unlike
+        # every other side effect there -- see ``_assign_guest_queue``'s
+        # own docstring for why, and for the bug that put it here. The
+        # same call sits outside ``if created:`` in all five login
+        # methods.
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -2848,13 +2915,19 @@ class GuestService:
                 auth_method=GuestAuthMethod.MAC_WHITELIST.value,
                 is_new_guest=is_new,
             )
-            await self._assign_guest_queue(
-                session=session,
-                router=router,
-                location_id=location_id,
-                organization_id=resolved_org_id,
-            )
             await self._bump_guest_visit(guest)
+        # Deliberately outside the ``if created:`` block above, unlike
+        # every other side effect there -- see ``_assign_guest_queue``'s
+        # own docstring for why, and for the bug that put it here. The
+        # same call sits outside ``if created:`` in all five login
+        # methods.
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+
         await self._record_login_success(
             guest=guest,
             identifier=identifier,

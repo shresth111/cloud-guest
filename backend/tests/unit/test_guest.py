@@ -3193,6 +3193,115 @@ class TestGuestQueueAssignmentIsOffTheRequestPath:
         assert recorded["target_type"] == QueueTargetType.SESSION
 
 
+class TestABandwidthChangeReachesAnAlreadyConnectedGuest:
+    """A venue's Guest WiFi Limits screen says, right above its Save
+    button, "Applies immediately -- including to guests already
+    connected." A guest's speed does not live on ``guest_sessions`` the
+    way their session/idle timeout does; it lives in a SESSION-targeted
+    ``QueueAssignment`` pointing at a ``QueueProfile``, and that
+    assignment is what ``RadiusService.authorize`` reads to compose the
+    ``Mikrotik-Rate-Limit`` reply attribute and what
+    ``QueueManagementService.apply_queue`` writes as a real RouterOS
+    ``/queue simple`` entry.
+
+    ``_reuse_or_create_session`` deliberately refreshes every *other*
+    entitlement onto a reused row -- ``session_timeout_minutes``,
+    ``idle_timeout_minutes``, ``data_limit_mb``, ``auth_method``,
+    ``voucher_id`` -- precisely so a returning guest gets what the venue
+    configured *now*, not what it had configured when their session was
+    first opened. Bandwidth was the one entitlement left behind, because
+    ``_assign_guest_queue`` sat inside every login method's ``if
+    created:`` block. A guest who never actually disconnects (each
+    re-login bumps ``last_activity_at``, so the session never ages out)
+    therefore kept the rate resolved at their very first login, for ever,
+    while the dashboard showed the new one. Bug report: "speed is only
+    set to 20 and not updating".
+
+    ``resolve_and_assign_queue`` is idempotent by construction -- an
+    unchanged rate returns the existing assignment without touching the
+    device, and a changed one goes through ``move_queue``, which applies
+    the new ``/queue simple`` *before* pulling the old one -- so running
+    it on a reused session is safe as well as necessary."""
+
+    @staticmethod
+    def _dispatcher(record: list[dict]):
+        async def _dispatch(**kwargs):
+            record.append(kwargs)
+
+        return _dispatch
+
+    async def _login(self, fx, ip: str = "10.0.0.5"):
+        return await fx.guest_service.login_via_otp(
+            identifier="regular@example.com",
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:01",
+            ip_address=ip,
+        )
+
+    async def test_a_reused_session_re_resolves_its_bandwidth(self) -> None:
+        dispatched: list[dict] = []
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        fx.guest_service.queue_assignment_dispatcher = self._dispatcher(dispatched)
+
+        first = await self._login(fx)
+        second = await self._login(fx)
+
+        # The premise: this is the reuse path, not two separate sessions.
+        # If this ever stops holding, the test below stops meaning what
+        # it says, so it is asserted rather than assumed.
+        assert second.session.id == first.session.id
+
+        assert len(dispatched) == 2, (
+            "a returning guest's queue was never re-resolved, so a "
+            "bandwidth change made while they were connected never "
+            "reached them"
+        )
+        assert dispatched[1]["session_id"] == first.session.id
+        assert dispatched[1]["device_target"] == "10.0.0.5"
+
+    async def test_the_re_resolve_follows_a_new_dhcp_lease(self) -> None:
+        """The reuse path refreshes ``ip_address`` when the guest comes
+        back on a different lease. A ``/queue simple`` entry is bound to
+        one concrete IP, so the re-resolve has to carry the *new* address
+        or it would re-apply the rate to an address the guest no longer
+        holds."""
+        dispatched: list[dict] = []
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        fx.guest_service.queue_assignment_dispatcher = self._dispatcher(dispatched)
+
+        await self._login(fx, ip="10.0.0.5")
+        await self._login(fx, ip="10.0.0.77")
+
+        assert [d["device_target"] for d in dispatched] == ["10.0.0.5", "10.0.0.77"]
+
+    async def test_a_reused_session_still_skips_the_new_session_side_effects(
+        self,
+    ) -> None:
+        """Re-resolving the queue is the *only* thing that moves out of
+        ``if created:``. The visit counter and the real-time "a guest just
+        arrived" broadcast still describe an arrival that did not happen
+        on a reused row, and ``_assign_voucher_queue`` is not idempotent
+        (it creates a fresh assignment per call), so those stay put."""
+        dispatched: list[dict] = []
+        fx = make_fixture(queue_assignment_hook=FakeQueueAssignmentHook())
+        fx.guest_service.queue_assignment_dispatcher = self._dispatcher(dispatched)
+
+        first = await self._login(fx)
+        guest_id = first.session.guest_id
+        before = await fx.repository.get_guest_by_id(guest_id)
+        visits_after_first = before.total_visit_count
+
+        await self._login(fx)
+
+        assert (
+            await fx.repository.get_guest_by_id(guest_id)
+        ).total_visit_count == visits_after_first
+
+
 class TestFupQuotaReadsAreBatched:
     """Design spec §5 S9: the three-iteration quota loop issued one SELECT
     per period against the same table for the same guest."""

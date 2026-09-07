@@ -921,6 +921,7 @@ class QueueManagementService:
         requesting_organization_id: uuid.UUID | None,
         new_queue_profile_id: uuid.UUID | None = None,
         new_queue_schedule_id: uuid.UUID | None = None,
+        new_device_target: str | None = None,
         auto_apply: bool = True,
     ) -> QueueAssignment:
         """Real rollback on failure: the new assignment is applied to the
@@ -935,7 +936,15 @@ class QueueManagementService:
         queue is deliberately left untouched (and *not* yet marked
         superseded) until an admin explicitly calls ``apply_queue`` on the
         new row -- the same "never leave a target with zero bandwidth"
-        principle, just deferred to a later, explicit action."""
+        principle, just deferred to a later, explicit action.
+
+        ``new_device_target`` re-points the queue at a different address,
+        defaulting to the one the old assignment already had. A
+        ``/queue simple`` entry matches on one concrete IP, so a guest who
+        comes back on a new DHCP lease needs the entry rebuilt against the
+        new address or their rate applies to an address they no longer
+        hold -- and the apply-then-remove ordering above is exactly what
+        makes that safe to do while they are online."""
         old = await self.get_assignment(
             assignment_id, requesting_organization_id=requesting_organization_id
         )
@@ -947,7 +956,7 @@ class QueueManagementService:
             target_id=old.target_id,
             router_id=old.router_id,
             location_id=old.location_id,
-            device_target=old.device_target,
+            device_target=new_device_target or old.device_target,
             queue_profile_id=new_queue_profile_id or old.queue_profile_id,
             queue_schedule_id=new_queue_schedule_id
             if new_queue_schedule_id is not None
@@ -1100,7 +1109,17 @@ class QueueManagementService:
                 )
             return new_assignment
 
-        if existing.queue_profile_id == profile.id:
+        # Both halves matter. The profile is the rate; ``device_target`` is
+        # the address that rate is enforced against, and a ``/queue simple``
+        # entry matches on one concrete IP. A returning guest on a fresh DHCP
+        # lease keeps their assignment (same rate, so the profile compares
+        # equal) while the live queue on the device still names the address
+        # they used to hold -- and a queue that matches nothing rate-limits
+        # nothing. Comparing only the profile made that the silent case.
+        if (
+            existing.queue_profile_id == profile.id
+            and existing.device_target == device_target
+        ):
             return existing
 
         return await self.move_queue(
@@ -1108,6 +1127,7 @@ class QueueManagementService:
             actor_user_id=actor_user_id,
             requesting_organization_id=requesting_organization_id,
             new_queue_profile_id=profile.id,
+            new_device_target=device_target,
             auto_apply=auto_apply,
         )
 
