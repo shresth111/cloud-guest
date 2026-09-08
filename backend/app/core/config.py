@@ -1367,7 +1367,8 @@ class Settings(BaseSettings):
         description=(
             "Which concrete SmsProviderProtocol implementation "
             "app.domains.otp.service.get_configured_sms_provider selects: "
-            "'logging' (default, no real send), 'twilio', or 'exotel'."
+            "'logging' (default, no real send), 'twilio', 'exotel', or "
+            "'ping4sms'."
         ),
     )
     twilio_account_sid: str = Field(default="")
@@ -1392,6 +1393,37 @@ class Settings(BaseSettings):
             "TRAI DLT-registered template id -- the OTP message body sent "
             "must match this template's approved text exactly, or Indian "
             "carriers silently drop the message."
+        ),
+    )
+    ping4sms_api_key: str = Field(
+        default="",
+        description=(
+            "Ping4SMS account API key (the 'key' query parameter of "
+            "https://site.ping4sms.com/api/smsapi). Secret -- set via "
+            "environment, never committed."
+        ),
+    )
+    ping4sms_route: str = Field(
+        default="",
+        description=(
+            "Ping4SMS route selector (the 'route' query parameter) -- "
+            "provider-account specific; your Ping4SMS dashboard names it."
+        ),
+    )
+    ping4sms_sender_id: str = Field(
+        default="",
+        description=(
+            "DLT-approved sender ID Ping4SMS sends SMS as (the 'sender' "
+            "query parameter)."
+        ),
+    )
+    ping4sms_dlt_template_id: str = Field(
+        default="",
+        description=(
+            "TRAI DLT-registered template id (the 'templateid' query "
+            "parameter) -- the OTP message body sent must match this "
+            "template's approved text exactly, or Indian carriers "
+            "silently drop the message."
         ),
     )
 

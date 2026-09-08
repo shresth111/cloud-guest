@@ -902,6 +902,66 @@ class ExotelSmsProvider:
             response.raise_for_status()
 
 
+class Ping4SmsProvider:
+    """Real ``SmsProviderProtocol`` implementation: a plain
+    ``httpx`` GET to Ping4SMS's documented transactional SMS API
+    (https://site.ping4sms.com/api/smsapi?key=...&route=...&sender=...
+    &number=...&sms=...&templateid=...).
+
+    Unlike the Basic-auth POSTs of :class:`TwilioSmsProvider`/
+    :class:`ExotelSmsProvider`, this API takes every parameter -- the API
+    key included -- as a URL query string, and it returns plain text (a
+    numeric message id) rather than JSON. ``route``/``sender``/``template_id``
+    are provider-account configuration (``route`` selects the operator
+    route, ``templateid`` is the TRAI DLT template that the message body
+    must match exactly, or the carrier silently drops it -- the caller,
+    ``OtpService``, is responsible for composing ``message`` to match).
+
+    The key is passed via ``params``, never string-concatenated into the
+    URL, so httpx percent-encodes it and the value never breaks the URL.
+    ``raise_for_status`` catches transport-level failures; the API's
+    documented non-numeric text responses ("Invalid Api Key", "Sender Id
+    Not Found", etc.) are surfaced by checking that the body is a numeric
+    id, since a non-numeric body means the send failed even when the HTTP
+    status was 200."""
+
+    _TIMEOUT_SECONDS = 10.0
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        route: str,
+        sender_id: str,
+        dlt_template_id: str = "",
+    ) -> None:
+        self.api_key = api_key
+        self.route = route
+        self.sender_id = sender_id
+        self.dlt_template_id = dlt_template_id
+
+    async def send(self, phone_number: str, message: str) -> None:
+        import httpx
+
+        params = {
+            "key": self.api_key,
+            "route": self.route,
+            "sender": self.sender_id,
+            "number": phone_number,
+            "sms": message,
+        }
+        if self.dlt_template_id:
+            params["templateid"] = self.dlt_template_id
+        async with httpx.AsyncClient(timeout=self._TIMEOUT_SECONDS) as client:
+            response = await client.get(
+                "https://site.ping4sms.com/api/smsapi", params=params
+            )
+            response.raise_for_status()
+            body = response.text.strip()
+            if not body.isdigit():
+                raise RuntimeError(f"ping4sms send failed: {body}")
+
+
 @functools.lru_cache(maxsize=32)
 def warn_email_identity_fallback(
     requested_identity: str, email_delivery_provider: str, reason: str
@@ -1058,6 +1118,22 @@ def get_configured_sms_provider(settings: Settings) -> SmsProviderProtocol:
             subdomain=settings.exotel_subdomain,
             dlt_entity_id=settings.exotel_dlt_entity_id,
             dlt_template_id=settings.exotel_dlt_template_id,
+        )
+    if provider == "ping4sms":
+        if (
+            not settings.ping4sms_api_key
+            or not settings.ping4sms_route
+            or not settings.ping4sms_sender_id
+        ):
+            raise SmsProviderNotConfiguredError(
+                "sms_delivery_provider='ping4sms' but ping4sms_api_key/"
+                "ping4sms_route/ping4sms_sender_id is empty."
+            )
+        return Ping4SmsProvider(
+            api_key=settings.ping4sms_api_key,
+            route=settings.ping4sms_route,
+            sender_id=settings.ping4sms_sender_id,
+            dlt_template_id=settings.ping4sms_dlt_template_id,
         )
     return LoggingSmsProvider()
 
@@ -1396,6 +1472,7 @@ __all__ = [
     "TwilioSmsProvider",
     "TwilioWhatsAppProvider",
     "ExotelSmsProvider",
+    "Ping4SmsProvider",
     "EmailProviderNotConfiguredError",
     "SmsProviderNotConfiguredError",
     "WhatsAppProviderNotConfiguredError",
