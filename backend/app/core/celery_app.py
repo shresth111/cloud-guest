@@ -121,7 +121,9 @@ from app.domains.campaigns.constants import (
 )
 from app.domains.connected_devices.constants import (
     CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
+    MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
+    TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP,
     TASK_SYNC_SINGLE_ROUTER_DEVICES,
 )
 from app.domains.dhcp.constants import (
@@ -555,6 +557,17 @@ celery_app.conf.update(
         "connected-device-sync-sweep": {
             "task": TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
             "schedule": CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
+        },
+        # Monitored Hardware: fast ping-driven liveness (every 30s) -- makes
+        # a monitored device that physically dies flip to DOWN within a
+        # minute instead of waiting out its RouterOS DHCP lease plus the
+        # 15-minute discovery sweep above. Registered hardware is a small
+        # list (handfuls per venue), so this cadence is safe at today's
+        # scale -- see MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS's
+        # own docstring for the full reasoning and the scale caveat.
+        "monitored-hardware-liveness-sweep": {
+            "task": TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP,
+            "schedule": MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS,
         },
         # Campaigns domain: keeps the stored Campaign.status reasonably
         # fresh for admin dashboards (SCHEDULED -> ACTIVE -> ENDED) --

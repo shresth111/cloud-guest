@@ -57,10 +57,17 @@ from app.domains.rbac.location_scope import (
     LocationScope,
     enforce_entity_location,
 )
+from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 
-from .constants import ConnectionType
-from .device_adapters import DeviceCredentials, get_connected_device_adapter
+from .constants import (
+    MONITORED_HARDWARE_LIVENESS_PING_COUNT,
+    ConnectionType,
+)
+from .device_adapters import (
+    DeviceCredentials,
+    get_connected_device_adapter,
+)
 from .events import (
     ConnectedDeviceAccessRuleApplied,
     ConnectedDeviceDeleted,
@@ -69,10 +76,13 @@ from .events import (
     ConnectedDeviceUpdated,
 )
 from .exceptions import (
+    ConnectedDeviceConnectionError,
     ConnectedDeviceMissingCredentialsError,
     ConnectedDeviceNotFoundError,
+    ConnectedDeviceOperationError,
     CrossLocationConnectedDeviceAccessError,
     CrossOrganizationConnectedDeviceAccessError,
+    UnsupportedConnectedDeviceVendorError,
 )
 from .models import ConnectedDevice
 from .repository import ConnectedDeviceRepositoryProtocol
@@ -186,6 +196,27 @@ class DeviceSyncSweepSummary:
     disconnected: int
 
 
+@dataclass(frozen=True, slots=True)
+class MonitoredHardwareLivenessSummary:
+    """The per-run outcome of ``run_monitored_hardware_liveness_sweep``.
+
+    ``devices_up``/``devices_down`` are *this run's verdicts*, not global
+    state: every probed device lands in exactly one (``received > 0`` ->
+    up, ``received == 0`` -> down). ``skipped`` are targets the sweep
+    could not probe (no known IP yet -- the device has never been
+    observed by a discovery sync, so there is no management address to
+    ping). ``routers_failed`` are routers whose whole probe batch was
+    skipped because the router itself was unreachable -- reported apart
+    from ``skipped`` so "nothing was probed because the site is down"
+    cannot be mistaken for "every device is down"."""
+
+    routers_probed: int
+    routers_failed: int
+    devices_up: int
+    devices_down: int
+    skipped: int
+
+
 # ============================================================================
 # Service
 # ============================================================================
@@ -289,6 +320,15 @@ class ConnectedDeviceService:
 
         existing = await self.repository.list_devices_for_router(router.id)
         existing_by_mac = {device.mac_address: device for device in existing}
+        # Monitored devices' liveness fields are owned by the ping sweep
+        # (``run_monitored_hardware_liveness_sweep``), not by this DHCP
+        # discovery sync -- see that function's docstring for why a bound
+        # lease is bookkeeping, not a live-device verdict. Fetching the
+        # set once per router keeps every per-device branch below a single
+        # ``mac_address in monitored_macs`` check.
+        monitored_macs = await self.repository.list_monitored_macs_for_router(
+            router.id
+        )
         now = datetime.now(UTC)
         seen_macs: set[str] = set()
         discovered_count = 0
@@ -328,25 +368,33 @@ class ConnectedDeviceService:
                 )
                 logger.info("connected_device_discovered", extra=_event_extra(event))
             else:
-                was_inactive = not existing_row.is_active
-                await self.repository.update_device(
-                    existing_row,
-                    {
-                        "ip_address": discovered.ip_address or existing_row.ip_address,
-                        "hostname": discovered.hostname or existing_row.hostname,
-                        "vendor": vendor or existing_row.vendor,
-                        "connection_type": connection_type.value,
-                        "interface": discovered.interface or existing_row.interface,
-                        "signal_strength_dbm": discovered.signal_strength_dbm,
-                        "is_active": True,
-                        "connected_at": now
-                        if was_inactive
-                        else existing_row.connected_at,
-                        "last_seen_at": now,
-                        "guest_id": guest_id,
-                        "guest_session_id": guest_session_id,
-                    },
-                )
+                update: dict[str, object] = {
+                    "ip_address": discovered.ip_address or existing_row.ip_address,
+                    "hostname": discovered.hostname or existing_row.hostname,
+                    "vendor": vendor or existing_row.vendor,
+                    "connection_type": connection_type.value,
+                    "interface": discovered.interface or existing_row.interface,
+                    "signal_strength_dbm": discovered.signal_strength_dbm,
+                    "guest_id": guest_id,
+                    "guest_session_id": guest_session_id,
+                }
+                if discovered.mac_address not in monitored_macs:
+                    # Only the discovery sync's own rows get its liveness
+                    # verdict. A monitored device stays under the ping
+                    # sweep's control -- ``is_active``/``connected_at``/
+                    # ``last_seen_at`` reflect real ICMP reachability, not
+                    # "the router still holds a lease for this MAC".
+                    was_inactive = not existing_row.is_active
+                    update.update(
+                        {
+                            "is_active": True,
+                            "connected_at": now
+                            if was_inactive
+                            else existing_row.connected_at,
+                            "last_seen_at": now,
+                        }
+                    )
+                await self.repository.update_device(existing_row, update)
                 updated_count += 1
 
         disconnected_count = 0
@@ -694,6 +742,165 @@ async def run_device_sync_sweep(
     )
 
 
+def _resolve_liveness_credentials(
+    router: Router, router_lookup: RouterLookupProtocol
+) -> DeviceCredentials:
+    """Builds ``DeviceCredentials`` for a liveness-probe router from the
+    router's own connection fields -- the identical resolution
+    ``ConnectedDeviceService._resolve_credentials`` performs for discovery,
+    lifted to module scope so the sweep below needs no service instance."""
+    host = router.management_ip_address or router.public_ip_address
+    secret = router_lookup.get_decrypted_api_secret(router)
+    if not host or not router.api_username or not secret:
+        raise ConnectedDeviceMissingCredentialsError(router.id)
+    return DeviceCredentials(
+        host=host, username=router.api_username, password=secret
+    )
+
+
+async def run_monitored_hardware_liveness_sweep(
+    repository: ConnectedDeviceRepositoryProtocol,
+    router_lookup: RouterLookupProtocol,
+    *,
+    device_adapter_resolver=get_connected_device_adapter,
+    ping_count: int = MONITORED_HARDWARE_LIVENESS_PING_COUNT,
+) -> MonitoredHardwareLivenessSummary:
+    """The fast, ping-driven liveness sweep that ``tasks
+    .run_monitored_hardware_liveness_sweep`` (Celery Beat) drives -- pulled
+    out to module scope for the same "Celery task + test suite share one
+    real implementation" reason every other sweep function in this
+    codebase is.
+
+    ## Why this sweep exists at all
+
+    The platform's monitored-hardware status is derived from
+    ``connected_devices.is_active`` (see ``app.domains.monitored_hardware
+    .service.MonitoredHardwareService.with_status``). Before this sweep,
+    the ONLY writer of that flag was the DHCP-lease/ARP discovery sync --
+    which treats a RouterOS ``bound`` lease as "device seen". RouterOS
+    keeps a lease ``bound`` for a client that powered off without
+    releasing until the lease time elapses, so a venue access point that
+    physically died stayed UP on the dashboard for (lease time + one
+    discovery interval) -- the "AP Hall Lobby is down but the console
+    still says UP" bug this sweep is the real fix for. The discovery
+    sync's age-window (see ``STALE_SIGHTING_AFTER_SECONDS``) catches a
+    *stalled* sweep or an unreachable router, but it cannot distinguish a
+    lease-bound-but-dead AP from a live one.
+
+    ## The signal: ICMP through the uplink router
+
+    A monitored device's management IP lives on the venue LAN behind its
+    router -- unreachable from this backend directly. So this sweep pings
+    each device *from the router that genuinely observed it* (the
+    ``ConnectedDevice.router_id`` the target row carries), via the
+    adapter's ``ping`` (RouterOS ``/tool/ping``), and writes the verdict
+    straight to that device's own ``ConnectedDevice`` row:
+    ``received > 0`` -> ``is_active=True`` with ``connected_at`` (re)set
+    and ``last_seen_at`` refreshed; ``received == 0`` -> ``is_active=
+    False`` with ``last_seen_at`` deliberately untouched (it must keep
+    meaning "last time we confirmed it alive", never the time a failed
+    probe ran). ``MonitoredHardwareService.with_status`` then reports the
+    existing derived UP/DOWN within one sweep tick (~30s) of a real power
+    loss -- no waiting out the lease.
+
+    ## Per-router isolation, and why a router failure skips not downs
+
+    Each router's probe batch is independent: an unreachable/misconfigured
+    router is caught, logged
+    (``connected_device_liveness_sweep_router_failed``), and skipped --
+    never aborting the sweep for every other router, and never writing
+    false DOWN verdicts for an entire venue whose uplink (not its devices)
+    is what failed. That router's devices keep their previous state and
+    age out through the discovery sync's existing stale-sighting window
+    instead. This mirrors ``run_device_sync_sweep``'s identical
+    per-router isolation contract.
+
+    ## Why the discovery sync no longer overrides monitored rows
+
+    ``sync_router`` (above) fetches
+    ``repository.list_monitored_macs_for_router`` and skips the liveness
+    fields on those rows -- otherwise the 15-minute discovery sync would
+    keep marking a lease-bound monitored AP ``is_active=True`` between
+    this sweep's ticks, and the dashboard would flicker UP/DOWN every
+    sweep period instead of showing the ping verdict. Discovery still
+    owns those rows' metadata (IP/hostname/interface/guest association);
+    only the three liveness columns moved here.
+    """
+    targets = await repository.list_monitored_targets()
+    by_router: dict[uuid.UUID, list[ConnectedDevice]] = {}
+    for device, _hardware in targets:
+        by_router.setdefault(device.router_id, []).append(device)
+
+    routers_probed = 0
+    routers_failed = 0
+    devices_up = 0
+    devices_down = 0
+    skipped = 0
+
+    for router_id, devices in by_router.items():
+        try:
+            router = await router_lookup.get_router(router_id)
+            credentials = _resolve_liveness_credentials(router, router_lookup)
+            adapter = device_adapter_resolver(router.vendor)
+        except (
+            ConnectedDeviceMissingCredentialsError,
+            UnsupportedConnectedDeviceVendorError,
+            RouterNotFoundError,
+        ) as exc:
+            routers_failed += 1
+            logger.warning(
+                "connected_device_liveness_sweep_router_failed",
+                extra={"router_id": str(router_id), "error": str(exc)},
+            )
+            continue
+        try:
+            for device in devices:
+                if not device.ip_address:
+                    skipped += 1
+                    continue
+                result = await adapter.ping(
+                    credentials, target=device.ip_address, count=ping_count
+                )
+                if result.received > 0:
+                    was_inactive = not device.is_active
+                    await repository.update_device(
+                        device,
+                        {
+                            "is_active": True,
+                            "connected_at": datetime.now(UTC)
+                            if was_inactive
+                            else device.connected_at,
+                            "last_seen_at": datetime.now(UTC),
+                        },
+                    )
+                    devices_up += 1
+                else:
+                    await repository.update_device(device, {"is_active": False})
+                    devices_down += 1
+            routers_probed += 1
+        except (
+            ConnectedDeviceConnectionError,
+            ConnectedDeviceOperationError,
+        ) as exc:
+            # The router (not the devices) is the thing that failed --
+            # skip the whole batch rather than writing false DOWNs for a
+            # venue whose uplink just went silent. See module docstring.
+            routers_failed += 1
+            logger.warning(
+                "connected_device_liveness_sweep_router_failed",
+                extra={"router_id": str(router_id), "error": str(exc)},
+            )
+            continue
+
+    return MonitoredHardwareLivenessSummary(
+        routers_probed=routers_probed,
+        routers_failed=routers_failed,
+        devices_up=devices_up,
+        devices_down=devices_down,
+        skipped=skipped,
+    )
+
+
 __all__ = [
     "RouterLookupProtocol",
     "GuestAccessProtocol",
@@ -701,6 +908,8 @@ __all__ = [
     "AuditLogWriter",
     "DeviceSyncSummary",
     "DeviceSyncSweepSummary",
+    "MonitoredHardwareLivenessSummary",
     "ConnectedDeviceService",
     "run_device_sync_sweep",
+    "run_monitored_hardware_liveness_sweep",
 ]

@@ -107,6 +107,51 @@ CONNECTED_DEVICE_SYNC_SWEEP_LOCK_REDIS_KEY = (
 # may take.
 CONNECTED_DEVICE_SYNC_SWEEP_LOCK_TTL_SECONDS = 300
 
+# ============================================================================
+# Monitored-hardware liveness sweep -- Celery Beat task wiring.
+# ============================================================================
+
+#: The fast, ping-driven sweep that makes a monitored device flip to DOWN
+#: within a minute of actually going offline -- instead of waiting out the
+#: DHCP lease the router still holds as ``bound`` plus the next
+#: CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS discovery tick (see
+#: ``service.run_monitored_hardware_liveness_sweep``'s docstring for the
+#: full "the discovery sweep cannot see a power-cut AP, only a lease"
+#: write-up). The cadence is deliberately close to
+#: ``app.domains.isp.constants.ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS``'s
+#: own 30s: a venue access point going down is exactly as operationally
+#: urgent as a WAN uplink failing, and the sweep's real per-router cost is
+#: one RouterOS ping per registered device (handfuls per venue, not the
+#: full discovery call), so the sequential-sweep overrun risk the ISP
+#: sweep's own docstring documents does not apply at today's scale. The
+#: real fleet is a handful of routers today; whoever revisits this once
+#: monitored-device count actually grows should apply the same
+#: bounded-concurrency/overlap-lock note that sweep's docstring ends with.
+MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS = 30.0
+
+#: How many ICMP echoes one liveness probe issues per device. 2, not 1: a
+#: single dropped packet on a wired link is noise and must not read as a
+#: false DOWN. ``0`` of these received is the DOWN verdict -- no extra
+#: consecutive-miss guard, per the founder's "ping drop hote hi down
+#: dikha do" (a wired venue AP answering 0/2 echoes is down, full stop).
+MONITORED_HARDWARE_LIVENESS_PING_COUNT = 2
+
+# Redis SETNX-style overlap-prevention lock for the liveness sweep's
+# coordinator phase -- identical shape/scope to
+# CONNECTED_DEVICE_SYNC_SWEEP_LOCK_REDIS_KEY above.
+MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY = (
+    "connected_devices:monitored_hardware_liveness:lock"
+)
+
+# Crash-safety backstop for the coordinator's own quick listing+dispatch
+# phase -- see CONNECTED_DEVICE_SYNC_SWEEP_LOCK_TTL_SECONDS above.
+MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_TTL_SECONDS = 120
+
+#: The Beat-scheduled coordinator task name -- see tasks.py.
+TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP = (
+    "app.domains.connected_devices.tasks.run_monitored_hardware_liveness_sweep"
+)
+
 
 __all__ = [
     "ConnectionType",
@@ -117,4 +162,9 @@ __all__ = [
     "CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS",
     "CONNECTED_DEVICE_SYNC_SWEEP_LOCK_REDIS_KEY",
     "CONNECTED_DEVICE_SYNC_SWEEP_LOCK_TTL_SECONDS",
+    "MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS",
+    "MONITORED_HARDWARE_LIVENESS_PING_COUNT",
+    "MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY",
+    "MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_TTL_SECONDS",
+    "TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP",
 ]
