@@ -17,6 +17,8 @@ live Postgres/Redis in this environment.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import csv
 import io
 import uuid
@@ -319,13 +321,49 @@ class FakeVoucherRepository:
         code_set = set(codes)
         return [v.code for v in self.vouchers.values() if v.code in code_set]
 
-    async def update_voucher(
-        self, voucher: Voucher, data: dict[str, object]
-    ) -> Voucher:
-        for key, value in data.items():
-            setattr(voucher, key, value)
-        voucher.version += 1
-        return voucher
+    async def redeem_voucher_conditionally(
+        self,
+        voucher: Voucher,
+        batch: VoucherBatch,
+        *,
+        expected_status: str,
+        expected_use_count: int,
+        max_uses_per_voucher: int,
+        last_used_at: datetime,
+        first_use_fields: dict[str, object] | None,
+    ) -> Voucher | None:
+        """In-memory mirror of ``VoucherRepository
+        .redeem_voucher_conditionally``: applies one redemption only when
+        the stored row still matches the caller's read-time snapshot
+        (``status``/``use_count`` unchanged, batch still ``ACTIVE``) --
+        i.e. models the real single conditional ``UPDATE``'s rowcount==0
+        semantics. Returns ``None`` (without mutating anything) when the
+        row changed first, so a service-level test can reproduce the
+        second-concurrent-redeemer path without a live database."""
+        current = self.vouchers.get(voucher.id)
+        current_batch = self.batches.get(batch.id)
+        if (
+            current is None
+            or current.is_deleted
+            or current_batch is None
+            or current_batch.is_deleted
+            or current_batch.status != VoucherBatchStatus.ACTIVE.value
+            or current.status != expected_status
+            or current.use_count != expected_use_count
+        ):
+            return None
+        current.use_count += 1
+        current.last_used_at = last_used_at
+        current.updated_at = last_used_at
+        current.version += 1
+        current.status = (
+            VoucherStatus.EXHAUSTED.value
+            if current.use_count >= max_uses_per_voucher
+            else VoucherStatus.ACTIVE.value
+        )
+        for key, value in (first_use_fields or {}).items():
+            setattr(current, key, value)
+        return current
 
     async def list_vouchers_for_batch(
         self, batch_id: uuid.UUID, *, page: int, page_size: int
@@ -492,6 +530,45 @@ async def _create_batch(
         has_manage_permission=has_manage_permission,
         plan_id=plan_id,
         series_id=series_id,
+    )
+
+
+async def _gated_concurrent_redeems(
+    fx: Fixture, *, code: str, count: int = 2
+) -> list[tuple[Voucher, VoucherBatch] | Exception]:
+    """Runs ``count`` concurrent ``redeem_voucher`` attempts on ``code``,
+    gating ``FakeVoucherRepository.redeem_voucher_conditionally`` until
+    every attempt has passed its read/validate phase -- so each attempt
+    reaches the compare-and-swap still holding the *same* pre-race
+    snapshot, the deterministic equivalent of ``count`` requests arriving
+    in the same instant. Returns ``asyncio.gather`` results with
+    ``return_exceptions=True``: success tuples, or the exception the
+    losing attempt raised.
+    """
+    real_conditional_update = fx.repository.redeem_voucher_conditionally
+    arrivals = 0
+    all_ready = asyncio.Event()
+
+    async def gated_conditional_update(
+        *args: object, **kwargs: object
+    ) -> Voucher | None:
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals == count:
+            all_ready.set()
+        else:
+            await all_ready.wait()
+        return await real_conditional_update(*args, **kwargs)
+
+    fx.repository.redeem_voucher_conditionally = gated_conditional_update
+
+    async def attempt() -> tuple[Voucher, VoucherBatch]:
+        return await fx.service.redeem_voucher(
+            code=code, identifier="+15551234567", source="1.2.3.4"
+        )
+
+    return await asyncio.gather(
+        *[attempt() for _ in range(count)], return_exceptions=True
     )
 
 
@@ -1231,6 +1308,133 @@ class TestSingleVsMultiUse:
         await _create_batch(fx, quantity=1, has_manage_permission=True)
         voucher = next(iter(fx.repository.vouchers.values()))
         assert voucher.expires_at is None
+
+
+# ============================================================================
+# Concurrent redemption (the double-redeem race)
+# ============================================================================
+
+
+class TestConcurrentRedemption:
+    """Regression coverage for the silent double-redeem race: two
+    concurrent ``redeem_voucher`` calls presenting the same code must admit
+    exactly one winner -- the loser gets a clean 409
+    (``VoucherExhaustedError``), never a silent second success and never a
+    500, and the stored ``use_count`` must end up exact.
+
+    There is no live Postgres in this suite, so the race is simulated at
+    the repository boundary: ``FakeVoucherRepository
+    .redeem_voucher_conditionally`` models the real repository's single
+    conditional ``UPDATE ... WHERE status = :expected AND use_count =
+    :expected`` (rowcount == 0) semantics, and each test forces the losing
+    call to reach that conditional write still holding the stale snapshot
+    a genuinely concurrent second request would hold mid-race."""
+
+    async def test_two_concurrent_redeems_of_single_use_code_only_one_wins(
+        self,
+    ) -> None:
+        """The reported bug, reproduced: two requests redeem the same
+        single-use code at once. Both pass the read/validate phase against
+        the same ``UNUSED``/``use_count == 0`` snapshot (the write is
+        gated until both have read), then exactly one conditional UPDATE
+        may land. The loser must surface ``VoucherExhaustedError`` and the
+        row must end ``EXHAUSTED`` with ``use_count == 1`` -- the state the
+        bug left as ``use_count == 2`` with two successes."""
+        fx = make_service()
+        await _create_batch(fx, quantity=1, has_manage_permission=True)
+        code = next(iter(fx.repository.vouchers.values())).code
+
+        results = await _gated_concurrent_redeems(fx, code=code)
+        successes = [r for r in results if not isinstance(r, Exception)]
+        failures = [r for r in results if isinstance(r, Exception)]
+        assert len(successes) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], VoucherExhaustedError)
+        assert successes[0][0].use_count == 1
+
+        refreshed = await fx.repository.get_voucher_by_code(code)
+        assert refreshed.status == VoucherStatus.EXHAUSTED.value
+        assert refreshed.use_count == 1
+        assert refreshed.redeemed_at is not None
+        assert refreshed.redeemed_identifier == "+15551234567"
+
+    async def test_concurrent_last_use_redeems_of_multi_use_code_only_one_wins(
+        self,
+    ) -> None:
+        """The same compare-and-swap at the *last* use of a multi-use code:
+        two concurrent requests redeem use #3 of a ``max_uses_per_voucher
+        == 3`` code that has already been used twice. Exactly one lands
+        (``EXHAUSTED``/``use_count == 3``); the other gets the clean 409 --
+        use_count must never overshoot ``max_uses_per_voucher``."""
+        fx = make_service()
+        await _create_batch(
+            fx, quantity=1, max_uses_per_voucher=3, has_manage_permission=True
+        )
+        code = next(iter(fx.repository.vouchers.values())).code
+
+        first, _ = await fx.service.redeem_voucher(
+            code=code, identifier="first@example.com", source="1.2.3.4"
+        )
+        assert first.use_count == 1
+        assert first.status == VoucherStatus.ACTIVE.value
+        second, _ = await fx.service.redeem_voucher(
+            code=code, identifier="second@example.com", source="1.2.3.4"
+        )
+        assert second.use_count == 2
+        assert second.status == VoucherStatus.ACTIVE.value
+
+        results = await _gated_concurrent_redeems(fx, code=code)
+        successes = [r for r in results if not isinstance(r, Exception)]
+        failures = [r for r in results if isinstance(r, Exception)]
+        assert len(successes) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], VoucherExhaustedError)
+        assert successes[0][0].use_count == 3
+
+        refreshed = await fx.repository.get_voucher_by_code(code)
+        assert refreshed.status == VoucherStatus.EXHAUSTED.value
+        assert refreshed.use_count == 3
+
+    async def test_second_redeem_rejected_when_row_changed_before_write(
+        self,
+    ) -> None:
+        """The conditional-write loser path in isolation, no scheduling
+        involved: after one redeem exhausts the code, a second call that
+        reaches the write still holding the pre-redemption snapshot (its
+        own earlier read -- exactly what a concurrent request would hold)
+        must be rejected with the clean 409 rather than silently
+        succeeding a second time."""
+        fx = make_service()
+        await _create_batch(fx, quantity=1, has_manage_permission=True)
+        voucher = next(iter(fx.repository.vouchers.values()))
+        code = voucher.code
+        # The losing request's snapshot, captured before the winner writes.
+        stale_snapshot = copy.deepcopy(voucher)
+        assert stale_snapshot.status == VoucherStatus.UNUSED.value
+        assert stale_snapshot.use_count == 0
+
+        winner, _ = await fx.service.redeem_voucher(
+            code=code, identifier="+15551234567", source="1.2.3.4"
+        )
+        assert winner.status == VoucherStatus.EXHAUSTED.value
+        assert winner.use_count == 1
+
+        # Force the second redeem's read phase to return the stale
+        # snapshot -- the row the losing request validated before the
+        # winner's UPDATE committed.
+        async def stale_lookup(code_: str) -> Voucher | None:
+            return stale_snapshot if code_ == stale_snapshot.code else None
+
+        fx.repository.get_voucher_by_code = stale_lookup
+        with pytest.raises(VoucherExhaustedError):
+            await fx.service.redeem_voucher(
+                code=code, identifier="guest@example.com", source="1.2.3.4"
+            )
+
+        # The loser must not have mutated the stored row.
+        stored = fx.repository.vouchers[voucher.id]
+        assert stored.status == VoucherStatus.EXHAUSTED.value
+        assert stored.use_count == 1
 
 
 # ============================================================================

@@ -644,3 +644,54 @@ class TestOtpRequestIsGatedThroughTheRealDependencyGraph:
 
         assert resp.status_code not in (401, 403), resp.text
         assert resp.status_code == 201, resp.text
+
+
+# ============================================================================
+# Guest-facing limit errors: the 409 text the portal renders verbatim
+# ============================================================================
+
+
+class TestGuestFacingLimitErrorMessagesDoNotLeakTheGuestId:
+    """The 409 ``message`` of the session/device/FUP limit errors is what a
+    guest's captive-portal screen shows verbatim, and until de-identified it
+    began with the guest's internal ``Guest.id`` UUID -- an identifier the
+    unauthenticated client was never meant to see. The exception-level
+    assertions in ``test_guest.py`` pin the text at the source; this pins
+    the *response* a real login route returns once the app-wide handler has
+    serialised ``exc.message`` into the 409 body, which is the exact bytes
+    the portal renders."""
+
+    async def test_a_409_concurrent_session_message_contains_no_guest_uuid(
+        self,
+    ) -> None:
+        from app.domains.guest.constants import (
+            DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+        )
+
+        fx = make_fixture()
+        app = _build_app(fx, RecordingAccessRepository())
+
+        first = await _login(app, fx, device_mac=None)
+        assert first.status_code == 200, first.text
+        guest_id = first.json()["data"]["guest_id"]
+
+        # Fill the guest's concurrent-session allowance over the real
+        # dependency graph, the way a repeated-login guest actually hits it.
+        for _ in range(DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST - 1):
+            fill = await _login(app, fx, device_mac=None)
+            assert fill.status_code == 200, fill.text
+
+        over = await _login(app, fx, device_mac=None)
+
+        assert over.status_code == 409, over.text
+        body = over.json()
+        assert body["success"] is False
+        assert "active session(s)" in body["message"]
+        # The regression this test exists for: the setup guest's UUID used
+        # to be interpolated straight into this message.
+        assert guest_id not in body["message"]
+        # The structured half is unchanged -- the machine-readable limit is
+        # still surfaced to the caller.
+        assert body["data"] == {
+            "max_concurrent_sessions": DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
+        }

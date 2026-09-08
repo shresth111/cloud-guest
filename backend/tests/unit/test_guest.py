@@ -830,6 +830,21 @@ class FakeGuestRepository:
     # (GuestService._enforce_device_limit's fetch reused via known_device,
     # not re-queried a second time by get_or_create_device).
     get_device_by_mac_call_count: int = 0
+    # Per-guest ``asyncio.Lock`` used by ``get_guest_for_update`` to
+    # emulate the real repository's ``SELECT ... FOR UPDATE`` row lock --
+    # see that method's own docstring. Internal bookkeeping, never fixture
+    # data, hence ``init=False``.
+    _guest_locks: dict[uuid.UUID, asyncio.Lock] = field(
+        default_factory=dict, init=False
+    )
+
+    def _release_guest_lock(self, guest_id: uuid.UUID) -> None:
+        """Releases this guest's emulated row lock if this fake currently
+        holds it -- called from ``create_session``/``update_session`` (see
+        ``get_guest_for_update`` for why those are the release points)."""
+        lock = self._guest_locks.get(guest_id)
+        if lock is not None and lock.locked():
+            lock.release()
 
     # -- guests ----------------------------------------------------------------
     async def create_guest(self, **fields: object) -> Guest:
@@ -841,6 +856,33 @@ class FakeGuestRepository:
         self, guest_id: uuid.UUID, *, include_deleted: bool = False
     ) -> Guest | None:
         return self.guests.get(guest_id)
+
+    async def get_guest_for_update(self, guest_id: uuid.UUID) -> Guest | None:
+        """Emulates ``GuestRepository.get_guest_for_update`` (the real
+        ``SELECT ... FOR UPDATE`` row lock) with a per-guest
+        ``asyncio.Lock`` held until the holder's next mutating session
+        write for that guest (``create_session``/``update_session``) -- the
+        fake has no transaction, so that write is its closest analogue to
+        the real lock's release-at-commit. A concurrently-racing second
+        caller therefore blocks here until the first caller's session row
+        exists, exactly as it would block on the winner's open transaction
+        in Postgres, and its reuse read then finds that row. This is what
+        lets ``test_concurrent_double_submit_...`` race two genuinely
+        concurrent ``_reuse_or_create_session`` calls and observe the same
+        single-row outcome the database produces."""
+        lock = self._guest_locks.setdefault(guest_id, asyncio.Lock())
+        await lock.acquire()
+        # Yield once while holding the lock so a concurrently-started
+        # second caller is guaranteed to reach its own acquire (and block)
+        # before this caller finishes -- making the serialization the test
+        # is about actually observable rather than schedule-dependent.
+        await asyncio.sleep(0)
+        guest = self.guests.get(guest_id)
+        if guest is None:
+            # Nothing to hold the lock for -- release it so a later caller
+            # for the same (absent) guest does not deadlock.
+            lock.release()
+        return guest
 
     async def get_guest_by_identifier(
         self, organization_id: uuid.UUID, identifier: str
@@ -1023,6 +1065,9 @@ class FakeGuestRepository:
     async def create_session(self, **fields: object) -> GuestSession:
         session = GuestSession(**_base_fields(**fields))
         self.sessions[session.id] = session
+        # The row now exists, which is what a concurrent caller blocked in
+        # get_guest_for_update is waiting to observe -- see that method.
+        self._release_guest_lock(session.guest_id)
         return session
 
     async def get_session_by_id(
@@ -1036,6 +1081,9 @@ class FakeGuestRepository:
         for key, value in data.items():
             setattr(session, key, value)
         session.version += 1
+        # Reuse is the other way a session-creation critical section ends
+        # (no new row is inserted) -- see get_guest_for_update.
+        self._release_guest_lock(session.guest_id)
         return session
 
     async def list_sessions(
@@ -1869,6 +1917,178 @@ class TestOtpLogin:
                 location_id=fx.location_id,
                 router_id=fx.router.id,
             )
+
+
+class TestConcurrentSessionCreationRace:
+    """Regression tests for the *concurrency* half of the duplicate-ACTIVE-
+    session defect documented on ``GuestService._reuse_or_create_session``
+    (the production incident left 18 rows for one guest across ~6.5 hours,
+    several only 7-13 minutes long): two near-simultaneous logins for the
+    same guest+router+device can both run the reuse read, both see "no
+    reusable ACTIVE session", and both insert a redundant ``ACTIVE`` row.
+    ``_reuse_or_create_session`` now takes a real row lock on the ``Guest``
+    row (``GuestRepository.get_guest_for_update``, ``SELECT ... FOR
+    UPDATE``) before that read, so concurrent calls serialize exactly like
+    sequential ones: exactly one session is ever created and the loser
+    reuses the winner's row. These tests race the method for real (the
+    fake repository's ``get_guest_for_update`` emulates the row lock) and
+    pin the lock's position relative to the reuse read."""
+
+    def _seed_guest_and_device(
+        self, fx: Fixture, *, mac: str = "AA:BB:CC:DD:EE:FF"
+    ) -> tuple[Guest, GuestDevice]:
+        now = _now()
+        guest = Guest(
+            **_base_fields(
+                organization_id=fx.organization_id,
+                location_id=fx.location_id,
+                identifier="+15551234567",
+                first_seen_at=now,
+                last_seen_at=now,
+                total_visit_count=0,
+                is_blocked=False,
+                blocked_reason=None,
+            )
+        )
+        fx.repository.guests[guest.id] = guest
+        device = GuestDevice(
+            **_base_fields(
+                guest_id=guest.id,
+                mac_address=mac,
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+        )
+        fx.repository.devices[device.id] = device
+        return guest, device
+
+    async def _reuse(
+        self,
+        fx: Fixture,
+        *,
+        guest: Guest,
+        device: GuestDevice | None,
+    ) -> tuple[GuestSession, bool]:
+        return await fx.guest_service._reuse_or_create_session(
+            guest=guest,
+            device=device,
+            router=fx.router,
+            location_id=fx.location_id,
+            auth_method=GuestAuthMethod.OTP_SMS,
+            voucher_id=None,
+            ip_address=None,
+            user_agent=None,
+            accept_language=None,
+            data_limit_mb=None,
+            session_timeout_minutes=DEFAULT_SESSION_TIMEOUT_MINUTES,
+        )
+
+    async def test_concurrent_double_submit_creates_one_session_not_two(
+        self,
+    ) -> None:
+        """The double-submit race itself: two ``_reuse_or_create_session``
+        calls for the same guest+router+device overlap in flight with no
+        session existing yet -- the exact window in which both callers
+        would otherwise see "no reusable ACTIVE session" and insert a
+        duplicate ``ACTIVE`` row. The guest-row lock (emulated by the fake
+        repository) serializes them, so exactly one ``ACTIVE`` session is
+        created and the loser reuses the winner's row: one caller gets
+        ``created=True``, the other ``created=False`` on the *same*
+        session id, and ``fx.repository.sessions`` holds one row, not
+        two."""
+        fx = make_fixture()
+        guest, device = self._seed_guest_and_device(fx)
+        real_read = fx.repository.list_active_sessions_for_guest
+
+        async def overlapping_read(
+            guest_id: uuid.UUID,
+        ) -> list[GuestSession]:
+            # Read first, then yield mid-call: this makes the racing
+            # second caller take its own reuse-read snapshot (also of the
+            # still-empty table) before either caller inserts -- the exact
+            # window in which the unguarded read-then-insert creates a
+            # duplicate row. With the guest-row lock in place the reads
+            # never overlap (the loser is still blocked on the lock),
+            # which is precisely what the assertion below verifies.
+            sessions = await real_read(guest_id)
+            await asyncio.sleep(0)
+            return sessions
+
+        fx.repository.list_active_sessions_for_guest = overlapping_read
+
+        first, second = await asyncio.gather(
+            self._reuse(fx, guest=guest, device=device),
+            self._reuse(fx, guest=guest, device=device),
+        )
+
+        assert {first[1], second[1]} == {True, False}, (
+            "exactly one of the two concurrent logins may create a session"
+        )
+        assert first[0].id == second[0].id
+        assert len(fx.repository.sessions) == 1
+        (only_session,) = fx.repository.sessions.values()
+        assert only_session.guest_id == guest.id
+        assert only_session.router_id == fx.router.id
+        assert only_session.device_id == device.id
+        assert only_session.status == GuestSessionStatus.ACTIVE.value
+
+    async def test_guest_row_lock_is_acquired_before_the_reuse_read(self) -> None:
+        """The guard's position is what makes it correct: the row lock must
+        be acquired *before* ``_find_reusable_active_session``'s read, or a
+        second caller could still slip its read in between the first
+        caller's read and insert. Asserts the call order directly, since
+        that ordering -- not the fake's emulation -- is what the real
+        database serialization depends on."""
+        fx = make_fixture()
+        guest, device = self._seed_guest_and_device(fx)
+        calls: list[str] = []
+        real_read = fx.repository.list_active_sessions_for_guest
+        real_lock = fx.repository.get_guest_for_update
+
+        async def recorded_read(guest_id: uuid.UUID) -> list[GuestSession]:
+            calls.append("reuse_read")
+            return await real_read(guest_id)
+
+        async def recorded_lock(guest_id: uuid.UUID) -> Guest | None:
+            calls.append("row_lock")
+            return await real_lock(guest_id)
+
+        fx.repository.list_active_sessions_for_guest = recorded_read
+        fx.repository.get_guest_for_update = recorded_lock
+
+        session, created = await self._reuse(fx, guest=guest, device=device)
+
+        assert created is True
+        assert calls == ["row_lock", "reuse_read"]
+
+    async def test_a_macless_login_never_takes_the_row_lock(self) -> None:
+        """A login that never presented a MAC cannot reuse anything (see
+        ``_find_reusable_active_session``'s "requires a real device_id"
+        write-up), so there is no read-then-insert race to serialize and no
+        row lock is taken -- preserving the existing MAC-less behavior
+        exactly."""
+        fx = make_fixture()
+        guest, _device = self._seed_guest_and_device(fx)
+        calls: list[str] = []
+        real_read = fx.repository.list_active_sessions_for_guest
+        real_lock = fx.repository.get_guest_for_update
+
+        async def recorded_read(guest_id: uuid.UUID) -> list[GuestSession]:
+            calls.append("reuse_read")
+            return await real_read(guest_id)
+
+        async def recorded_lock(guest_id: uuid.UUID) -> Guest | None:
+            calls.append("row_lock")
+            return await real_lock(guest_id)
+
+        fx.repository.list_active_sessions_for_guest = recorded_read
+        fx.repository.get_guest_for_update = recorded_lock
+
+        session, created = await self._reuse(fx, guest=guest, device=None)
+
+        assert created is True
+        assert session.device_id is None
+        assert calls == []
 
 
 # ============================================================================
@@ -4481,8 +4701,9 @@ class TestConcurrentSessionLimit:
     async def test_login_raises_once_limit_reached(self) -> None:
         fx = make_fixture()
         identifier = "+15559990002"
+        last = None
         for _ in range(DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST):
-            await fx.guest_service.login_via_otp(
+            last = await fx.guest_service.login_via_otp(
                 identifier=identifier,
                 code="GOOD",
                 auth_method=GuestAuthMethod.OTP_SMS,
@@ -4504,6 +4725,18 @@ class TestConcurrentSessionLimit:
         assert exc_info.value.limit == DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
         # No new session row was created for the rejected attempt.
         assert len(fx.repository.sessions) == sessions_before
+        # The 409 text stays guest-safe: the captive portal renders this
+        # message verbatim on the guest's screen, so neither the internal
+        # Guest.id UUID nor the identifier may appear in it. The structured
+        # data keeps carrying the resolved limit untouched.
+        assert last is not None
+        assert str(last.guest.id) not in str(exc_info.value)
+        assert identifier not in str(exc_info.value)
+        assert "This account already has" in exc_info.value.message
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.data == {
+            "max_concurrent_sessions": DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
+        }
 
     async def test_login_rejected_before_otp_verification_is_attempted(self) -> None:
         """A guest already at the limit must never spend a real OTP
@@ -4665,6 +4898,17 @@ class TestDeviceLimit:
         assert exc_info.value.limit == DEFAULT_MAX_DEVICES_PER_GUEST
         # No new device row was created for the rejected attempt.
         assert len(fx.repository.devices) == devices_before
+        # The 409 text stays guest-safe: the captive portal renders this
+        # message verbatim on the guest's screen, so neither the internal
+        # Guest.id UUID nor the identifier may appear in it. The structured
+        # data keeps carrying the resolved limit untouched.
+        assert str(result.guest.id) not in str(exc_info.value)
+        assert identifier not in str(exc_info.value)
+        assert "This account already has" in exc_info.value.message
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.data == {
+            "max_devices_per_guest": DEFAULT_MAX_DEVICES_PER_GUEST
+        }
 
     async def test_login_rejected_before_otp_verification_is_attempted(self) -> None:
         """Mirrors ``TestConcurrentSessionLimit``'s identical-named test:
@@ -5033,6 +5277,20 @@ class TestEnforceFupQuotaLoginGate:
         assert exc_info.value.period_type == QuotaPeriodType.DAILY.value
         assert exc_info.value.metric == "data"
         assert exc_info.value.limit == 100
+        # The 409 text stays guest-safe: the captive portal renders this
+        # message verbatim on the guest's screen, so neither the internal
+        # Guest.id UUID nor the identifier may appear in it. The structured
+        # data keeps carrying the cap fields untouched.
+        assert str(first.guest.id) not in str(exc_info.value)
+        assert identifier not in str(exc_info.value)
+        assert "This account has used" in exc_info.value.message
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.data == {
+            "period_type": QuotaPeriodType.DAILY.value,
+            "metric": "data",
+            "limit": 100,
+            "used": 100,
+        }
 
     async def test_raises_once_a_configured_daily_time_cap_is_already_met(
         self,

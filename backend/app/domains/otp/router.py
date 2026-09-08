@@ -42,6 +42,24 @@ refusal, its Trusted-Devices reconciliation, and its
 ``guest_login_history`` record must be the *same* logic the login gate
 uses, or the two drift and a venue's refusal list stops meaning one thing.
 
+The same composition, and the same argument, covers the two venue gates
+the login path enforces through ``GuestService._require_method_enabled``:
+the requested channel's own ``CaptivePortalConfig`` enabled flag
+(``otp_sms_enabled``/``otp_email_enabled``/``otp_whatsapp_enabled``) and
+Open Hours. Login is *after* this endpoint has already paid for a real
+SMS/email/WhatsApp, so a request for a disabled channel -- or one made
+while the venue is closed -- would otherwise send a code the login step is
+guaranteed to refuse. ``request_otp`` therefore calls
+``GuestService.check_otp_request_allowed`` (a public seam over that exact
+``_require_method_enabled`` logic, so the two call sites cannot drift)
+between the whitelist check and the send: an unconfigured location gets the
+same clean 404 the login path gives it, a disabled channel gets
+``GuestAuthMethodNotEnabledError`` (403), and a closed venue gets
+``VenueClosedError`` (403) -- all with the guest-friendly messages the
+portal renders. Callers naming no organization and no location (an
+account-level code carries no venue) are unaffected -- no venue, no venue
+flags to read.
+
 Direction of the import: ``otp.router`` -> ``guest.dependencies``. The
 existing dependency runs ``guest.dependencies`` -> ``otp.dependencies``
 (``GuestService`` composes ``OtpService``), and ``otp.dependencies``
@@ -172,6 +190,30 @@ async def request_otp(
     # all (an account-level code carries no venue). See its own docstring.
     await guest_service.check_portal_admission(
         identifier=payload.identifier,
+        auth_method=_CHANNEL_TO_AUTH_METHOD[payload.channel],
+        organization_id=payload.organization_id,
+        location_id=payload.location_id,
+    )
+    # The venue gates the login path enforces are *also* enforced here,
+    # before a code is generated and a provider is paid -- the same way
+    # whitelist-only mode is, and for the same reason (see the block
+    # above). The login step's `GuestService._require_method_enabled`/
+    # `_require_venue_open` gates fire only *after* this endpoint has spent
+    # the venue's money: a request for a channel the venue disabled in its
+    # `CaptivePortalConfig`, or made while the venue is closed, would
+    # deliver a real SMS/email/WhatsApp that the login step is guaranteed to
+    # refuse. Refusing here instead means the venue never pays for a send
+    # that cannot succeed, and the guest is told now rather than while
+    # waiting for a code that cannot help them.
+    #
+    # `check_otp_request_allowed` reuses the exact `_require_method_enabled`
+    # logic the login paths call (config resolution, per-channel enabled
+    # flag, Open Hours -- 404/403 with the same guest-friendly messages), so
+    # the request-time and login-time gates cannot drift. It is a no-op for
+    # callers that name no organization and no location (an account-level
+    # code carries no venue), and unconfigured locations get the same clean
+    # 404 login gives them, not a 500.
+    await guest_service.check_otp_request_allowed(
         auth_method=_CHANNEL_TO_AUTH_METHOD[payload.channel],
         organization_id=payload.organization_id,
         location_id=payload.location_id,

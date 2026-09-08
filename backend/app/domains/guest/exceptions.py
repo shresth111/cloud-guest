@@ -490,13 +490,24 @@ class ConcurrentSessionLimitExceededError(GuestError):
     the existing ``terminate_session``/``disconnect_session`` endpoints --
     this module deliberately does not auto-evict the oldest session on the
     guest's behalf, so a guest never loses an active connection they didn't
-    ask to end."""
+    ask to end.
+
+    **The message names no guest identifier.** This 409 is answered to the
+    unauthenticated captive-portal client, and the portal renders the
+    exception ``message`` verbatim on the guest's own screen -- so the
+    internal ``Guest.id`` UUID this error is raised with must not appear in
+    the text (``GuestBlockedError``'s docstring makes the identical
+    argument for an admin's ``reason``). ``guest_id`` is kept as
+    ``self.guest_id``, an attribute that is never serialised, so the raise
+    site can still log it; ``data`` carries only the machine-readable
+    limit, never the guest."""
 
     def __init__(self, *, guest_id: uuid.UUID | str, limit: int) -> None:
+        self.guest_id = guest_id
         self.limit = limit
         super().__init__(
-            f"Guest {guest_id} already has {limit} active session(s), which "
-            "is the maximum allowed at once",
+            f"This account already has {limit} active session(s), which is "
+            "the maximum allowed at once",
             status_code=status.HTTP_409_CONFLICT,
             data={"max_concurrent_sessions": limit},
         )
@@ -516,13 +527,20 @@ class GuestDeviceLimitExceededError(GuestError):
     the limit back to the caller as structured ``data``" convention. MAC
     uniqueness itself is unchanged by this check -- it only gates *how
     many* devices one guest may hold, never which physical device a MAC
-    address belongs to."""
+    address belongs to.
+
+    **The message names no guest identifier** -- the same captive-portal
+    reasoning as ``ConcurrentSessionLimitExceededError`` above: this 409 is
+    rendered verbatim on the guest's own screen, so the internal
+    ``Guest.id`` UUID stays in ``self.guest_id`` (an attribute, never
+    serialised) rather than in the text the portal shows."""
 
     def __init__(self, *, guest_id: uuid.UUID | str, limit: int) -> None:
+        self.guest_id = guest_id
         self.limit = limit
         super().__init__(
-            f"Guest {guest_id} already has {limit} device(s) registered, "
-            "which is the maximum allowed",
+            f"This account already has {limit} device(s) registered, which "
+            "is the maximum allowed",
             status_code=status.HTTP_409_CONFLICT,
             data={"max_devices_per_guest": limit},
         )
@@ -543,7 +561,13 @@ class FairUsagePolicyExceededError(GuestError):
     ``FUP``); a deployment with no Policy Engine configured, or one with
     no FUP policy assigned, never raises this at all. ``metric``
     distinguishes a data cap (``"data"``, ``limit``/``used`` in MB) from a
-    time cap (``"time"``, ``limit``/``used`` in minutes)."""
+    time cap (``"time"``, ``limit``/``used`` in minutes).
+
+    **The message names no guest identifier** -- same reasoning as
+    ``ConcurrentSessionLimitExceededError``/``GuestDeviceLimitExceededError``
+    above: this 409 is rendered verbatim on the guest's own screen, so the
+    internal ``Guest.id`` UUID stays in ``self.guest_id`` (an attribute,
+    never serialised) rather than in the text the portal shows."""
 
     def __init__(
         self,
@@ -554,13 +578,14 @@ class FairUsagePolicyExceededError(GuestError):
         limit: int,
         used: int,
     ) -> None:
+        self.guest_id = guest_id
         self.period_type = period_type
         self.metric = metric
         self.limit = limit
         self.used = used
         unit = "MB" if metric == "data" else "minute(s)"
         super().__init__(
-            f"Guest {guest_id} has used {used} {unit} of their {period_type} "
+            f"This account has used {used} {unit} of its {period_type} "
             f"{metric} allowance ({limit} {unit}), which is the maximum "
             "allowed for this period",
             status_code=status.HTTP_409_CONFLICT,
