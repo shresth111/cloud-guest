@@ -843,6 +843,17 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "guest-quota-reset-sweep",
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
+        # Monitored hardware liveness: the fast ping-driven UP/DOWN path
+        # for registered devices. The 15-minute discovery sweep above
+        # treats a RouterOS bound lease as "seen" -- a device that powered
+        # off keeps its lease until it expires, so without this entry a
+        # dead venue AP would keep reading UP for lease-time + one
+        # discovery interval. This sweep pings each registered device
+        # through its uplink router every 30s and owns the liveness fields
+        # on those rows. Its absence from this set is not a missing
+        # schedule entry, it is a dashboard whose UP means "the router
+        # still holds a lease for a dead device".
+        "monitored-hardware-liveness-sweep",
         "campaigns-sweep-status-transitions",
         "provisioning-engine-router-health-poll-sweep",
         "router-provisioning-token-cleanup-sweep",

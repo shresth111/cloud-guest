@@ -151,6 +151,22 @@ class DiscoveredDevice:
     signal_strength_dbm: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class PingResult:
+    """The real, parsed result of one ``/tool/ping`` execution -- issued
+    *from the router itself* (not from this backend) at a target on the
+    venue LAN, which is the only address space a monitored access point's
+    management IP lives in. Mirrors ``app.domains.isp.device_adapters
+    .PingResult``'s identical shape; the connected-device service's
+    monitored-hardware liveness sweep consumes ``received`` (``0`` = the
+    device is not answering = DOWN)."""
+
+    sent: int
+    received: int
+    packet_loss_percentage: float
+    avg_rtt_ms: float | None
+
+
 class BaseConnectedDeviceAdapter(Protocol):
     """What a vendor implements to plug real device discovery/disconnect
     into the Connected Device Management domain. A new vendor is
@@ -169,6 +185,18 @@ class BaseConnectedDeviceAdapter(Protocol):
         A vendor whose hardware genuinely cannot report wireless
         association must set ``is_wireless=None`` rather than ``False``
         -- see :class:`DiscoveredDevice`."""
+        ...
+
+    async def ping(
+        self, credentials: DeviceCredentials, *, target: str, count: int
+    ) -> PingResult:
+        """Issues ``count`` real ICMP echoes at ``target`` *from the
+        router itself* (never from this backend -- a venue-LAN address is
+        not reachable from here) and returns the parsed result. ``0``
+        received means the target is not answering; ``count`` defaults to
+        2 in the caller so a single dropped packet on a wired link is not
+        a false DOWN (see ``constants
+        .MONITORED_HARDWARE_LIVENESS_PING_COUNT``)."""
         ...
 
     async def disconnect_device(
@@ -224,6 +252,31 @@ class MikroTikConnectedDeviceAdapter:
             for device in results
         ]
 
+    async def ping(
+        self, credentials: DeviceCredentials, *, target: str, count: int
+    ) -> PingResult:
+        creds = self._gateway_credentials(credentials)
+        try:
+            result = await get_adapter(DeviceVendor.MIKROTIK).ping(
+                creds,
+                target=target,
+                count=count,
+                # The socket-level bound; the gateway's own ping docstring
+                # notes RouterOS's ``/tool/ping`` has no matching parameter,
+                # so this is what actually bounds one call.
+                timeout_seconds=credentials.timeout_seconds,
+            )
+        except MikroTikConnectionError as exc:
+            raise ConnectedDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ConnectedDeviceOperationError("ping", exc.detail) from exc
+        return PingResult(
+            sent=result.sent,
+            received=result.received,
+            packet_loss_percentage=result.packet_loss_percentage,
+            avg_rtt_ms=result.avg_rtt_ms,
+        )
+
     async def disconnect_device(
         self, credentials: DeviceCredentials, *, mac_address: str, interface: str | None
     ) -> None:
@@ -261,6 +314,7 @@ def list_supported_connected_device_vendors() -> list[str]:
 __all__ = [
     "DeviceCredentials",
     "DiscoveredDevice",
+    "PingResult",
     "BaseConnectedDeviceAdapter",
     "MikroTikConnectedDeviceAdapter",
     "get_connected_device_adapter",

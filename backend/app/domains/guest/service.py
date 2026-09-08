@@ -4629,6 +4629,59 @@ class GuestService:
             whitelist_only_denied_message=config.whitelist_only_denied_message,
         )
 
+    async def check_otp_request_allowed(
+        self,
+        *,
+        auth_method: GuestAuthMethod,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> None:
+        """The login path's own venue gates, asked *before* an OTP code is
+        spent on a guest -- ``POST /otp/request``'s counterpart to
+        ``check_portal_admission``.
+
+        ## Why this exists
+
+        ``POST /otp/request`` is where the venue's money is spent: it sends
+        a real SMS/email/WhatsApp before the guest ever reaches
+        ``POST /guest/login/otp``. The login path enforces two venue gates
+        *at login* -- the requested method's ``CaptivePortalConfig``
+        enabled-flag (``otp_sms_enabled``/``otp_email_enabled``/
+        ``otp_whatsapp_enabled``) and Open Hours -- via
+        ``_require_method_enabled``. Gate only the login call and the venue
+        pays for sends that can never succeed: a request for a channel the
+        venue disabled, or made while the venue is closed, still delivers a
+        real code that the later login step is guaranteed to refuse. That is
+        the identical "gate the spend, not just the outcome" argument
+        ``check_portal_admission`` makes for whitelist-only mode, and this
+        method is its sibling for the per-channel/Open-Hours gates.
+
+        It is a thin, public seam over the *same* ``_require_method_enabled``
+        the login paths call -- no logic is reimplemented here, so the two
+        call sites cannot drift. The raises are identical to login's:
+        ``CaptivePortalConfigNotConfiguredError`` (404) when no config
+        resolves for the location/organization, ``GuestAuthMethodNotEnabledError``
+        (403) when the channel's flag is off, ``VenueClosedError`` (403)
+        when ``business_hours_enabled`` is on and the venue is closed right
+        now (failing open on disabled hours/bad timezone exactly as login
+        does).
+
+        ## No venue named means no gate
+
+        Returns immediately when the caller supplied neither an organization
+        nor a location -- with no property resolved there are no per-venue
+        flags to read, the same no-op ``check_portal_admission`` already
+        performs for the venue-less (non-portal) callers of
+        ``POST /otp/request``.
+        """
+        if organization_id is None and location_id is None:
+            return
+        await self._require_method_enabled(
+            organization_id=organization_id,
+            location_id=location_id,
+            auth_method=auth_method,
+        )
+
     # ========================================================================
     # Internal helpers
     # ========================================================================
@@ -4999,7 +5052,7 @@ class GuestService:
         was wired: a venue could publish a SESSION policy raising the
         concurrent-session allowance, see it resolve, and still have every
         login counted against the platform-wide
-        ``constants.DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` (3),
+        ``constants.DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` (20),
         because this method never asked. That constant remains the fallback,
         so a venue with no SESSION policy assigned behaves exactly as before.
 
@@ -5672,7 +5725,45 @@ class GuestService:
         must skip their own "new session"
         side effects (real-time broadcast, queue assignment, visit-count
         bump) when ``created`` is ``False`` -- those already ran for this
-        same still-open session."""
+        same still-open session.
+
+        **Why this method locks the ``Guest`` row before its reuse read.**
+        The find-then-insert above has no uniqueness backstop of its own:
+        two near-simultaneous logins for the same guest+router+device (a
+        captive-portal tab remounting and re-POSTing before its own
+        client-side cooldown window, two open tabs, a guest double-tapping
+        "Verify", RouterOS reissuing a fresh hotspot redirect while the
+        prior login is still mid-flight) can both run
+        ``_find_reusable_active_session``, both observe "no reusable
+        ACTIVE session", and both insert a second, fully redundant
+        ``ACTIVE`` row -- the *concurrent* half of the production incident
+        ``_find_reusable_active_session``'s own docstring documents (18
+        rows for one guest across ~6.5 hours, several only 7-13 minutes
+        long), which that sequential fix does not close. So this method
+        acquires a real row lock on the ``Guest`` row
+        (``GuestRepository.get_guest_for_update``, ``SELECT ... FOR
+        UPDATE`` -- the same pattern ``IspRepository.get_link_for_update``
+        established for its own read-then-write race) *before* running the
+        reuse read, whenever a real ``device_id`` makes reuse possible at
+        all. The loser's lock waits on the winner's open request
+        transaction; by the time it proceeds the winner's ``ACTIVE`` row
+        is committed and visible, the loser's reuse read finds it, and it
+        takes the reuse branch above -- the exact outcome the sequential
+        case already produces, with no duplicate row and no error surfaced
+        to either guest. Deliberately skipped when ``device`` is ``None``:
+        a login that never presented a MAC can never reuse (see
+        ``_find_reusable_active_session``), so there is no race to
+        serialize."""
+        # Acquired before -- never after -- the reuse read. A database
+        # unique index cannot express "at most one *reusable* ACTIVE
+        # session" (a row ACTIVE but past its own wall-clock limit is
+        # deliberately not reused, and can legitimately coexist with the
+        # fresh row this method then inserts -- see
+        # ``_find_reusable_active_session``), so the serialization has to
+        # happen on the guest row itself. Skipped for ``device is None``:
+        # nothing is ever reused there, so there is nothing to serialize.
+        if device is not None:
+            await self.repository.get_guest_for_update(guest.id)
         reusable = await self._find_reusable_active_session(
             guest_id=guest.id,
             router_id=router.id,

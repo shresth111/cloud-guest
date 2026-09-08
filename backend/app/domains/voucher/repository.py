@@ -8,8 +8,12 @@ per table -- ``VoucherPlan``/``VoucherSeries`` (Phase 1 BhaiFi-parity
 additions) and the original ``VoucherBatch``/``Voucher``), plus a handful of
 hand-written statements for the few queries ``GenericRepository``'s
 equality/IN-filter support genuinely can't express: a grouped per-status
-count (used by ``VoucherService.get_batch_stats``) and a bulk status update
-scoped to a batch (used by ``VoucherService.revoke_batch``'s cascade).
+count (used by ``VoucherService.get_batch_stats``), a bulk status update
+scoped to a batch (used by ``VoucherService.revoke_batch``'s cascade), and
+the atomic conditional redemption ``UPDATE``
+(``redeem_voucher_conditionally``, used by ``VoucherService
+.redeem_voucher`` -- a plain ``GenericRepository.update`` cannot express
+the ``WHERE``-predicate compare-and-swap that makes redemption race-free).
 """
 
 from __future__ import annotations
@@ -20,14 +24,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta
 
-from .constants import VoucherStatus
+from .constants import VoucherBatchStatus, VoucherStatus
 from .models import Voucher, VoucherBatch, VoucherPlan, VoucherSeries
 
 
@@ -125,9 +129,17 @@ class VoucherRepositoryProtocol(Protocol):
 
     async def find_existing_codes(self, codes: Sequence[str]) -> list[str]: ...
 
-    async def update_voucher(
-        self, voucher: Voucher, data: dict[str, object]
-    ) -> Voucher: ...
+    async def redeem_voucher_conditionally(
+        self,
+        voucher: Voucher,
+        batch: VoucherBatch,
+        *,
+        expected_status: str,
+        expected_use_count: int,
+        max_uses_per_voucher: int,
+        last_used_at: datetime,
+        first_use_fields: dict[str, object] | None,
+    ) -> Voucher | None: ...
 
     async def list_vouchers_for_batch(
         self,
@@ -306,10 +318,93 @@ class VoucherRepository:
         )
         return [row.code for row in results]
 
-    async def update_voucher(
-        self, voucher: Voucher, data: dict[str, object]
-    ) -> Voucher:
-        return await self.vouchers.update(voucher, data)
+    async def redeem_voucher_conditionally(
+        self,
+        voucher: Voucher,
+        batch: VoucherBatch,
+        *,
+        expected_status: str,
+        expected_use_count: int,
+        max_uses_per_voucher: int,
+        last_used_at: datetime,
+        first_use_fields: dict[str, object] | None,
+    ) -> Voucher | None:
+        """Performs one redemption as a single conditional ``UPDATE`` -- the
+        atomicity guarantee ``VoucherService.redeem_voucher`` relies on.
+
+        Redemption is a check-then-act, and the naive implementation (read
+        ``use_count``/``status`` in memory, then ``GenericRepository.update``,
+        a plain ORM ``UPDATE`` with no ``WHERE`` predicate) lets two
+        concurrent requests that both validated the same snapshot both
+        write -- both increment ``use_count`` and both report success for
+        one single-use code. This method closes that window with one
+        statement whose ``WHERE`` re-checks the exact state the caller
+        validated (same ``status`` *and* ``use_count``, row not
+        soft-deleted, batch still ``ACTIVE`` -- batch state gates
+        redemption, see ``VoucherService._redemption_failure_reason``):
+        ``use_count`` is incremented in SQL (``use_count = use_count + 1``,
+        never a read-modify-write of a stale in-memory value) and
+        ``status`` is recomputed from the live count (``EXHAUSTED`` once it
+        reaches ``max_uses_per_voucher``, mirroring the service's own
+        first-use/subsequent-use state machine).
+
+        Exactly one of two concurrent callers can match the ``WHERE``; the
+        loser's statement affects zero rows and this method returns
+        ``None`` -- after refreshing both ``voucher`` and ``batch`` to
+        their now-committed state, so the service can re-derive the exact
+        clean error (``VoucherExhaustedError``/``VoucherRevokedError``/
+        ``VoucherBatchNotActiveError``/...) the sequential path would have
+        raised. Returns the refreshed ``Voucher`` when this call won."""
+        statement = (
+            update(Voucher)
+            .where(
+                Voucher.id == voucher.id,
+                Voucher.status == expected_status,
+                Voucher.use_count == expected_use_count,
+                Voucher.is_deleted.is_(False),
+                # A non-``ACTIVE`` batch must not be redeemable mid-race
+                # either (e.g. one a concurrent request lazily flipped to
+                # ``EXPIRED`` via ``_refresh_batch_expiry``). Kept as an
+                # ``IN`` subquery against the indexed ``status`` column
+                # because SQLAlchemy Core ``UPDATE`` cannot join another
+                # table directly.
+                Voucher.batch_id.in_(
+                    select(VoucherBatch.id).where(
+                        VoucherBatch.status == VoucherBatchStatus.ACTIVE.value,
+                        VoucherBatch.is_deleted.is_(False),
+                    )
+                ),
+            )
+            .values(
+                use_count=Voucher.use_count + 1,
+                last_used_at=last_used_at,
+                # Core ``UPDATE`` bypasses the ORM's ``onupdate``/version
+                # bookkeeping that ``GenericRepository.update`` otherwise
+                # applies -- keep both counters moving here explicitly.
+                updated_at=last_used_at,
+                version=Voucher.version + 1,
+                status=case(
+                    (
+                        Voucher.use_count + 1 >= max_uses_per_voucher,
+                        VoucherStatus.EXHAUSTED.value,
+                    ),
+                    else_=VoucherStatus.ACTIVE.value,
+                ),
+                **(first_use_fields or {}),
+            )
+        )
+        result = await self.session.execute(statement)
+        await self.session.flush()
+        if int(result.rowcount or 0) == 0:
+            # Lost the race (or the voucher/batch changed out from under
+            # this call) -- refresh both rows to the current committed
+            # state so the caller's re-derivation sees reality, not the
+            # stale snapshot this call validated against.
+            await self.session.refresh(voucher)
+            await self.session.refresh(batch)
+            return None
+        await self.session.refresh(voucher)
+        return voucher
 
     async def list_vouchers_for_batch(
         self,

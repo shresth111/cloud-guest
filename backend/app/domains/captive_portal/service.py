@@ -628,6 +628,42 @@ _INFLIGHT_RESOLUTIONS: dict[
 ] = {}
 
 
+# Every ``CaptivePortalConfig`` column that is a NOT NULL ``Boolean`` and
+# that ``schemas.CaptivePortalConfigUpdateRequest`` types ``bool | None``.
+# ``None`` on that schema is how "leave it alone" is spelled on every
+# field, but ``model_dump(exclude_unset=True)`` keeps an *explicit* JSON
+# ``null`` -- which would otherwise be assigned straight onto the NOT NULL
+# column by ``GenericRepository.update`` and fail the constraint as a 500
+# (``_flush_or_raise`` re-raises the IntegrityError as a non-domain error).
+# On each of these toggles an explicit null and an omitted key mean the
+# same thing, so ``update_config`` normalizes the former to the latter,
+# uniformly, before any merge or validation reads the payload. Kept as one
+# explicit set (mirroring ``_CACHED_CONFIG_SCALAR_FIELDS``) so the sync
+# test can assert it never drifts from the model's own Boolean columns;
+# `is_deleted` is deliberately absent -- the soft-delete flag is protected
+# by ``GenericRepository`` and never reachable through the update request.
+_NOT_NULL_BOOLEAN_UPDATE_FIELDS = frozenset(
+    {
+        "is_active",
+        "is_default",
+        "powered_by_enabled",
+        "collect_guest_name",
+        "collect_guest_email",
+        "review_card_enabled",
+        "guest_feedback_enabled",
+        "otp_sms_enabled",
+        "otp_email_enabled",
+        "otp_whatsapp_enabled",
+        "voucher_enabled",
+        "username_password_enabled",
+        "pin_login_enabled",
+        "social_login_enabled",
+        "business_hours_enabled",
+        "whitelist_only_enabled",
+    }
+)
+
+
 # ============================================================================
 # Service
 # ============================================================================
@@ -924,6 +960,22 @@ class CaptivePortalService:
         update_data.pop("organization_id", None)
         update_data.pop("location_id", None)
 
+        # `whitelist_only_enabled` was the first NOT NULL boolean found
+        # carrying this latent 500, but every sibling toggle has the
+        # identical shape: the update request types each one `bool | None`
+        # because `None` is how "leave it alone" is spelled on every field
+        # of that schema, while `model_dump(exclude_unset=True)` keeps an
+        # *explicit* JSON `null` -- which would travel all the way to the
+        # repository and fail the NOT NULL constraint as a 500. An
+        # explicit null and an omitted key mean the same thing on each of
+        # these toggles, so the former is normalized to the latter here,
+        # before any of the merges below read the payload, rather than
+        # left to the database. See `_NOT_NULL_BOOLEAN_UPDATE_FIELDS` for
+        # the full field list and the sync test that keeps it honest.
+        for field in _NOT_NULL_BOOLEAN_UPDATE_FIELDS:
+            if field in update_data and update_data[field] is None:
+                del update_data[field]
+
         merged_primary = str(update_data.get("primary_color", config.primary_color))
         merged_secondary = str(
             update_data.get("secondary_color", config.secondary_color)
@@ -953,23 +1005,6 @@ class CaptivePortalService:
         validate_default_scope(
             is_default=merged_is_default, location_id=config.location_id
         )
-
-        # `whitelist_only_enabled` is NOT NULL, and this schema types it
-        # `bool | None` because `None` is how "leave it alone" is spelled
-        # on every field of the update request. But `model_dump(
-        # exclude_unset=True)` keeps an *explicit* JSON `null`, which would
-        # travel all the way to the repository and fail the NOT NULL
-        # constraint as a 500. An explicit null and an omitted key mean the
-        # same thing on this schema, so the former is normalized to the
-        # latter here rather than left to the database.
-        #
-        # Flagged, not fixed wholesale: `business_hours_enabled` and the
-        # login-method toggles beside it have the identical shape and the
-        # identical latent 500. Sweeping every NOT NULL boolean on this
-        # request is a change with its own blast radius and does not belong
-        # in a dark schema PR.
-        if update_data.get("whitelist_only_enabled", False) is None:
-            update_data.pop("whitelist_only_enabled")
 
         # Scoped against the config's **stored** location_id, not anything
         # in the payload -- location_id is immutable after creation and was

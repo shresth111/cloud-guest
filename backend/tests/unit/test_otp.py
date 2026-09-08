@@ -24,14 +24,22 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 
+from app.common.exceptions import register_exception_handlers
 from app.core.config import Settings
 from app.database.constants import SortOrder
 from app.database.utils.pagination import PageParams, PaginationMeta
+from app.domains.captive_portal.exceptions import CaptivePortalConfigNotConfiguredError
+from app.domains.guest.dependencies import get_guest_service
+from app.domains.guest.service import GuestService
 from app.domains.otp.constants import OtpChannel, OtpPurpose
+from app.domains.otp.dependencies import get_otp_service
 from app.domains.otp.exceptions import (
     InvalidOtpIdentifierError,
     OtpAlreadyConsumedError,
@@ -42,6 +50,7 @@ from app.domains.otp.exceptions import (
     OtpRequestRateLimitExceededError,
 )
 from app.domains.otp.models import OtpRequest
+from app.domains.otp.router import router as otp_router
 from app.domains.otp.service import (
     LoggingEmailProvider,
     LoggingSmsProvider,
@@ -999,3 +1008,288 @@ def test_otp_requests_listing_resolves_org_from_auth_scope_not_query_param():
     # ... it is resolved via the CurrentOrganization dependency instead.
     dependency_calls = {dep.call for dep in dependant.dependencies}
     assert CurrentOrganization in dependency_calls
+
+
+# ============================================================================
+# Venue gates on POST /otp/request
+# ----------------------------------------------------------------------------
+# `POST /otp/request` sends a real provider message *before* the guest ever
+# reaches `POST /guest/login/otp`, so the two venue gates the login path
+# enforces (the requested channel's `CaptivePortalConfig` enabled flag and
+# Open Hours) must fire at request time too -- otherwise a venue pays for
+# sends that can never succeed (a disabled channel or a closed venue
+# delivers a real code that the login step is guaranteed to refuse).
+#
+# These are endpoint-level tests driven through the real `otp_router` with
+# only the two leaf services it consumes swapped -- the same
+# ASGI-dependency-overrides approach `test_guest_login_composition.py`
+# uses -- because the deliverable is the *response* the portal renders (a
+# 403/404 with the login path's exact messages) plus the assertion the
+# money rides on: no provider send. `OtpService` is real (see
+# `make_service` above); `GuestService` is real too, over a stub
+# captive-portal lookup that mirrors `resolve_portal_config`'s 404 when no
+# config is registered.
+# ============================================================================
+
+_ALWAYS_OPEN_SCHEDULE: dict[str, dict[str, object]] = {
+    day: {"open": True, "start": "00:00", "end": "23:59"}
+    for day in (
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    )
+}
+_ALWAYS_CLOSED_SCHEDULE: dict[str, dict[str, object]] = {
+    day: {"open": False, "start": "09:00", "end": "17:00"}
+    for day in (
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    )
+}
+
+
+def _venue_config(
+    *,
+    otp_sms_enabled: bool = True,
+    otp_email_enabled: bool = True,
+    otp_whatsapp_enabled: bool = True,
+    business_hours_enabled: bool = False,
+    business_hours_timezone: str = "UTC",
+    business_hours_schedule: dict[str, dict[str, object]] | None = None,
+    business_hours_closed_message: str | None = None,
+) -> SimpleNamespace:
+    """A resolved ``CaptivePortalConfig``-shaped venue holding only the
+    fields ``GuestService``'s gates read. All channels default **on** and
+    business hours default **off** (always open), so each test overrides
+    just the knob it is exercising."""
+    return SimpleNamespace(
+        organization_id=uuid.uuid4(),
+        whitelist_only_enabled=False,
+        whitelist_only_denied_message=None,
+        otp_sms_enabled=otp_sms_enabled,
+        otp_email_enabled=otp_email_enabled,
+        otp_whatsapp_enabled=otp_whatsapp_enabled,
+        # ``_require_method_enabled`` builds its enabled-flag map over every
+        # ``GuestAuthMethod`` member before consulting the requested one, so
+        # the shape needs the non-OTP flags present too (never consulted on
+        # this path -- no login orchestration runs here).
+        voucher_enabled=True,
+        username_password_enabled=False,
+        pin_login_enabled=False,
+        business_hours_enabled=business_hours_enabled,
+        business_hours_timezone=business_hours_timezone,
+        business_hours_schedule=business_hours_schedule or _ALWAYS_OPEN_SCHEDULE,
+        business_hours_closed_message=business_hours_closed_message,
+    )
+
+
+class _FakeCaptivePortalLookup:
+    """Minimal ``CaptivePortalService.resolve_portal_config`` stand-in for
+    the venue gates.
+
+    ``config=None`` stands in for a venue with no ``CaptivePortalConfig``
+    configured, and raises the real service's own
+    ``CaptivePortalConfigNotConfiguredError`` (the 404 contract under
+    test) rather than a fake's ``KeyError``."""
+
+    def __init__(self, config: SimpleNamespace | None) -> None:
+        self._config = config
+
+    async def resolve_portal_config(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> SimpleNamespace:
+        if self._config is None:
+            raise CaptivePortalConfigNotConfiguredError(
+                organization_id if organization_id is not None else location_id
+            )
+        return SimpleNamespace(config=self._config)
+
+
+def _otp_venue_gate_app(fx: Fixture, *, config: SimpleNamespace | None) -> FastAPI:
+    """The real ``otp_router`` with only the leaf services it consumes
+    swapped: the fixture's recording ``OtpService`` and a real
+    ``GuestService`` over the stub captive-portal lookup. No login
+    orchestration runs on this path, so ``GuestService``'s repository and
+    sibling services stay ``None`` -- only the venue gates are reached."""
+    app = FastAPI()
+    register_exception_handlers(app)
+    app.include_router(otp_router, prefix="/api/v1")
+    guest_service = GuestService(
+        None,  # repository
+        None,  # otp_service
+        None,  # voucher_service
+        _FakeCaptivePortalLookup(config),
+        None,  # router_lookup
+    )
+    app.dependency_overrides[get_otp_service] = lambda: fx.service
+    app.dependency_overrides[get_guest_service] = lambda: guest_service
+    return app
+
+
+async def _post_otp_request(
+    app: FastAPI,
+    *,
+    channel: OtpChannel,
+    identifier: str,
+    organization_id: uuid.UUID | None = None,
+    location_id: uuid.UUID | None = None,
+) -> httpx.Response:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.post(
+            "/api/v1/otp/request",
+            json={
+                "identifier": identifier,
+                "channel": channel.value,
+                "purpose": OtpPurpose.GUEST_LOGIN.value,
+                "organization_id": str(organization_id) if organization_id else None,
+                "location_id": str(location_id) if location_id else None,
+            },
+        )
+
+
+class TestOtpRequestEnforcesVenueGates:
+    async def test_disabled_channel_is_refused_before_any_send(self) -> None:
+        """(a) The request channel's own enabled flag gates the send: a
+        venue whose config has email OTP off gets the login path's exact
+        403 ``GuestAuthMethodNotEnabledError`` message, and no code is
+        ever generated -- no ``OtpRequest`` row, no provider call -- so the
+        send that login would have refused never happens."""
+        fx = make_service()
+        app = _otp_venue_gate_app(fx, config=_venue_config(otp_email_enabled=False))
+
+        resp = await _post_otp_request(
+            app,
+            channel=OtpChannel.EMAIL,
+            identifier="guest@example.com",
+            location_id=uuid.uuid4(),
+        )
+
+        assert resp.status_code == 403, resp.text
+        assert "not enabled for this location's captive portal" in resp.text
+        assert fx.repository.requests == {}
+        assert fx.email_provider.sent == []
+
+    async def test_request_while_the_venue_is_closed_is_refused_403(self) -> None:
+        """(b) Open Hours gate: a venue with ``business_hours_enabled`` on
+        and a schedule that excludes right now refuses the request with the
+        login path's 403 ``VenueClosedError`` message -- the venue's own
+        words when it set them -- before any send."""
+        fx = make_service()
+        app = _otp_venue_gate_app(
+            fx,
+            config=_venue_config(
+                business_hours_enabled=True,
+                business_hours_schedule=_ALWAYS_CLOSED_SCHEDULE,
+                business_hours_closed_message="We are closed - see you at 8am!",
+            ),
+        )
+
+        resp = await _post_otp_request(
+            app,
+            channel=OtpChannel.SMS,
+            identifier="+15551234567",
+            location_id=uuid.uuid4(),
+        )
+
+        assert resp.status_code == 403, resp.text
+        assert "see you at 8am" in resp.text
+        assert fx.repository.requests == {}
+        assert fx.sms_provider.sent == []
+
+    async def test_closed_venue_without_a_message_uses_the_generic_copy(self) -> None:
+        """The same refusal at a venue that wrote no closed message -- the
+        guest sees ``VenueClosedError``'s generic default instead, exactly
+        as they would at the login step."""
+        fx = make_service()
+        app = _otp_venue_gate_app(
+            fx,
+            config=_venue_config(
+                business_hours_enabled=True,
+                business_hours_schedule=_ALWAYS_CLOSED_SCHEDULE,
+            ),
+        )
+
+        resp = await _post_otp_request(
+            app,
+            channel=OtpChannel.SMS,
+            identifier="+15551234567",
+            location_id=uuid.uuid4(),
+        )
+
+        assert resp.status_code == 403, resp.text
+        assert "This WiFi network is closed right now." in resp.text
+        assert fx.sms_provider.sent == []
+
+    async def test_all_channels_enabled_and_venue_open_still_sends(self) -> None:
+        """(c) No regression: with every channel the venue could enable on,
+        and business hours enabled *and* currently open, the request goes
+        through exactly as it always did -- 201 and a real recorded send."""
+        fx = make_service()
+        app = _otp_venue_gate_app(
+            fx,
+            config=_venue_config(
+                otp_email_enabled=True,
+                business_hours_enabled=True,
+                business_hours_schedule=_ALWAYS_OPEN_SCHEDULE,
+            ),
+        )
+
+        resp = await _post_otp_request(
+            app,
+            channel=OtpChannel.EMAIL,
+            identifier="guest@example.com",
+            location_id=uuid.uuid4(),
+        )
+
+        assert resp.status_code == 201, resp.text
+        assert len(fx.email_provider.sent) == 1
+
+    async def test_unconfigured_location_is_a_clean_404(self) -> None:
+        """(d) A location with no ``CaptivePortalConfig`` configured at all
+        gets the login path's clean 404
+        (``CaptivePortalConfigNotConfiguredError``), never a 500 -- and
+        again, no code is generated or sent."""
+        fx = make_service()
+        app = _otp_venue_gate_app(fx, config=None)
+
+        resp = await _post_otp_request(
+            app,
+            channel=OtpChannel.SMS,
+            identifier="+15551234567",
+            location_id=uuid.uuid4(),
+        )
+
+        assert resp.status_code == 404, resp.text
+        assert "No active captive portal config is configured" in resp.text
+        assert fx.repository.requests == {}
+        assert fx.sms_provider.sent == []
+
+    async def test_no_venue_named_is_not_gated(self) -> None:
+        """A request naming no organization and no location carries no
+        venue for the venue gates to read (an account-level code) -- it is
+        allowed even with every channel flag off, mirroring
+        ``check_portal_admission``'s identical no-venue no-op."""
+        fx = make_service()
+        app = _otp_venue_gate_app(fx, config=_venue_config(otp_sms_enabled=False))
+
+        resp = await _post_otp_request(
+            app,
+            channel=OtpChannel.SMS,
+            identifier="+15551234567",
+        )
+
+        assert resp.status_code == 201, resp.text
+        assert len(fx.sms_provider.sent) == 1

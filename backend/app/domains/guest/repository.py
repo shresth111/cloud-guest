@@ -137,6 +137,8 @@ class GuestRepositoryProtocol(Protocol):
         self, guest_id: uuid.UUID, *, include_deleted: bool = False
     ) -> Guest | None: ...
 
+    async def get_guest_for_update(self, guest_id: uuid.UUID) -> Guest | None: ...
+
     async def get_guest_by_identifier(
         self, organization_id: uuid.UUID, identifier: str
     ) -> Guest | None: ...
@@ -440,6 +442,32 @@ class GuestRepository:
         self, guest_id: uuid.UUID, *, include_deleted: bool = False
     ) -> Guest | None:
         return await self.guests.get_by_id(guest_id, include_deleted=include_deleted)
+
+    async def get_guest_for_update(self, guest_id: uuid.UUID) -> Guest | None:
+        """Real row-level lock (``SELECT ... FOR UPDATE``) on this single
+        ``Guest`` row -- used by ``GuestService._reuse_or_create_session``
+        immediately before its read-then-insert of an ``ACTIVE``
+        ``GuestSession`` for this guest. Two concurrent logins for the
+        same guest can otherwise both observe "no reusable ACTIVE session"
+        and both insert a duplicate ``ACTIVE`` row (the production
+        double-submit incident documented at ``_find_reusable_active_session``);
+        ``with_for_update()`` makes the second transaction to reach this
+        guest block until the first commits, then run its reuse check
+        against the first transaction's *committed* session -- real
+        serialization of the find-then-insert, not a fixed sleep/retry
+        guess. Mirrors ``IspRepository.get_link_for_update``'s identical
+        pattern and reasoning. ``populate_existing=True`` guards the
+        (same-session) case where this guest was already loaded earlier in
+        the same request, so this always reflects the row's current
+        committed values rather than a stale identity-mapped object."""
+        statement = (
+            select(Guest)
+            .where(Guest.id == guest_id, Guest.is_deleted.is_(False))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
 
     async def get_guest_by_identifier(
         self, organization_id: uuid.UUID, identifier: str

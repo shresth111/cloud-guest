@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
+from app.domains.monitored_hardware.models import MonitoredHardware
 from app.domains.router.models import Router
 
 from .models import ConnectedDevice
@@ -68,6 +69,18 @@ class ConnectedDeviceRepositoryProtocol(Protocol):
 
     async def list_routers_for_sync(
         self, *, organization_id: uuid.UUID | None = None
+    ) -> list[Router]: ...
+
+    async def list_monitored_targets(
+        self,
+    ) -> list[tuple[ConnectedDevice, MonitoredHardware]]: ...
+
+    async def list_monitored_macs_for_router(
+        self, router_id: uuid.UUID
+    ) -> set[str]: ...
+
+    async def list_routers_with_monitored_hardware(
+        self,
     ) -> list[Router]: ...
 
 
@@ -146,6 +159,74 @@ class ConnectedDeviceRepository:
         statement = select(Router).where(Router.is_deleted.is_(False))
         if organization_id is not None:
             statement = statement.where(Router.organization_id == organization_id)
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def list_monitored_targets(
+        self,
+    ) -> list[tuple[ConnectedDevice, MonitoredHardware]]:
+        """Every registered (non-deleted) monitored device that the device
+        sync has ever observed, paired with its ``ConnectedDevice`` row --
+        the liveness sweep's target list. The join is deliberately on
+        ``location_id + mac_address`` (the same key
+        ``MonitoredHardwareService.with_status`` resolves status through),
+        not on ``router_id``: ``MonitoredHardware.router_id`` is the
+        *intended* uplink, which is nullable and can drift from where the
+        device actually showed up, whereas the ``ConnectedDevice`` row's
+        own ``router_id`` is the router that genuinely saw it -- and that
+        same router is where the device's management IP lives, which is
+        the address a ping must target."""
+        statement = (
+            select(ConnectedDevice, MonitoredHardware)
+            .join(
+                MonitoredHardware,
+                (MonitoredHardware.location_id == ConnectedDevice.location_id)
+                & (MonitoredHardware.mac_address == ConnectedDevice.mac_address),
+            )
+            .where(MonitoredHardware.is_deleted.is_(False))
+        )
+        result = await self.session.execute(statement)
+        return [(device, hardware) for device, hardware in result.all()]
+
+    async def list_monitored_macs_for_router(self, router_id: uuid.UUID) -> set[str]:
+        """MACs of every non-deleted monitored device under a router's own
+        location -- used by ``ConnectedDeviceService.sync_router`` to stop
+        the DHCP-discovery sync from overwriting the liveness verdict
+        (``is_active``/``connected_at``/``last_seen_at``) the ping sweep
+        owns for those rows. See ``service.sync_router``'s own docstring
+        for the full "discovery sees a lease, not a live device" reason
+        the exemption exists."""
+        statement = (
+            select(MonitoredHardware.mac_address)
+            .join(
+                Router,
+                Router.location_id == MonitoredHardware.location_id,
+            )
+            .where(Router.id == router_id, MonitoredHardware.is_deleted.is_(False))
+        )
+        result = await self.session.execute(statement)
+        return set(result.scalars().all())
+
+    async def list_routers_with_monitored_hardware(
+        self,
+    ) -> list[Router]:
+        """Routers whose own location has at least one non-deleted
+        monitored device -- the liveness sweep's fan-out list (a router
+        with nothing to probe is skipped entirely, mirroring how
+        ``list_routers_for_sync``'s callers skip nothing because every
+        router has guests)."""
+        statement = (
+            select(Router)
+            .join(
+                MonitoredHardware,
+                MonitoredHardware.location_id == Router.location_id,
+            )
+            .where(
+                Router.is_deleted.is_(False),
+                MonitoredHardware.is_deleted.is_(False),
+            )
+            .distinct()
+        )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
 

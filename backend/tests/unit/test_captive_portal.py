@@ -882,6 +882,129 @@ class TestWhitelistOnlyScope:
         )
 
 
+class TestExplicitNullOnNotNullBooleanToggles:
+    """Every NOT NULL boolean on ``CaptivePortalConfig`` is typed
+    ``bool | None`` on the update request because ``None`` is how "leave
+    it alone" is spelled on every field of that schema -- and an explicit
+    JSON ``null`` survives ``model_dump(exclude_unset=True)``. Without
+    normalization each one would be assigned straight onto its NOT NULL
+    column by ``GenericRepository.update`` and 500 on the constraint.
+    ``test_an_explicit_null_is_treated_as_omitted`` above documents the
+    original ``whitelist_only_enabled`` instance; this class pins the
+    uniform sweep across every sibling toggle (see
+    ``service._NOT_NULL_BOOLEAN_UPDATE_FIELDS``). Each test flips a toggle
+    on first, then PUTs an explicit null and asserts the stored value is
+    untouched -- the "200, no change" contract."""
+
+    async def test_username_password_enabled_null_is_treated_as_omitted(
+        self,
+    ) -> None:
+        fx = make_service()
+        config = await _create_config(fx, username_password_enabled=True)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"username_password_enabled": None},
+        )
+        assert updated.username_password_enabled is True
+
+    async def test_pin_login_enabled_null_is_treated_as_omitted(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, pin_login_enabled=True)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"pin_login_enabled": None},
+        )
+        assert updated.pin_login_enabled is True
+
+    async def test_otp_email_enabled_null_is_treated_as_omitted(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        config = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"otp_email_enabled": True},
+        )
+        assert config.otp_email_enabled is True
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"otp_email_enabled": None},
+        )
+        assert updated.otp_email_enabled is True
+
+    async def test_business_hours_enabled_null_is_treated_as_omitted(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        config = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"business_hours_enabled": True},
+        )
+        assert config.business_hours_enabled is True
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"business_hours_enabled": None},
+        )
+        assert updated.business_hours_enabled is True
+
+    async def test_voucher_enabled_null_is_treated_as_omitted(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        assert config.voucher_enabled is True
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"voucher_enabled": None},
+        )
+        assert updated.voucher_enabled is True
+
+    async def test_is_active_and_is_default_null_leave_the_row_untouched(self) -> None:
+        """``is_active``/``is_default`` are booleans too, and had the same
+        latent 500 before the sweep -- a null reaching the NOT NULL column
+        failed the constraint exactly like any toggle. An explicit null on
+        either must be a no-change PUT, not a deactivate/un-default."""
+        fx = make_service()
+        config = await _create_config(fx, is_active=True, is_default=True)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"is_active": None, "is_default": None},
+        )
+        assert updated.is_active is True
+        assert updated.is_default is True
+
+    def test_set_covers_every_not_null_boolean_column(self) -> None:
+        """The whole point of the sweep: a NOT NULL boolean added to the
+        model but not to ``_NOT_NULL_BOOLEAN_UPDATE_FIELDS`` would be a
+        fresh instance of the exact latent 500 this class exists for.
+        ``is_deleted`` is the one NOT NULL boolean on the table that is
+        not an update toggle -- it is protected by ``GenericRepository``
+        and never reachable through the update request."""
+        from sqlalchemy import Boolean
+
+        from app.domains.captive_portal.service import _NOT_NULL_BOOLEAN_UPDATE_FIELDS
+
+        not_null_booleans = {
+            name
+            for name, column in CaptivePortalConfig.__table__.columns.items()
+            if isinstance(column.type, Boolean) and not column.nullable
+        }
+        assert not_null_booleans - {"is_deleted"} == set(
+            _NOT_NULL_BOOLEAN_UPDATE_FIELDS
+        )
+
+
 class TestWhitelistOnlyIsNotAnnouncedToGuests:
     """``GET /captive-portal/resolve`` is fetched by an unauthenticated
     guest device before any login. It must not report that the venue is
