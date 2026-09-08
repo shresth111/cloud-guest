@@ -1050,16 +1050,30 @@ class TestPing4SmsProvider:
 
         assert "templateid" not in (captured["params"] or {})  # type: ignore[operator]
 
+    async def test_send_raises_on_numeric_error_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The API returns a numeric message id on success and one of the
+        documented numeric error codes (101-110, e.g. 101 "Invalid user",
+        108 "Low credits") on failure -- both over HTTP 200 -- so the
+        provider must treat a matched error code as a failed send, not
+        swallow it as a message id."""
+
+        async def fake_get(self, url, *, params=None):  # noqa: ANN001
+            return httpx.Response(200, text="101", request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        provider = Ping4SmsProvider(api_key="bad", route="1", sender_id="TESTIN")
+        with pytest.raises(RuntimeError, match="Invalid user"):
+            await provider.send("+919876543210", message="hi")
+
     async def test_send_raises_on_non_numeric_body(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The API returns a numeric id on success and a plain-text error
-        ("Invalid Api Key", "Sender Id Not Found", ...) even on HTTP 200 --
-        so the provider must treat a non-numeric body as a failed send."""
-
         async def fake_get(self, url, *, params=None):  # noqa: ANN001
             return httpx.Response(
-                200, text="Invalid Api Key", request=httpx.Request("GET", url)
+                200, text="something unexpected", request=httpx.Request("GET", url)
             )
 
         monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)

@@ -1406,8 +1406,11 @@ class Settings(BaseSettings):
     ping4sms_route: str = Field(
         default="",
         description=(
-            "Ping4SMS route selector (the 'route' query parameter) -- "
-            "provider-account specific; your Ping4SMS dashboard names it."
+            "Ping4SMS route selector (the 'route' query parameter): "
+            "1=Promotional, 2=Transactional, 3=Optin, 4=Trans OTP, "
+            "5=Promo DND, 6=Whatsapp, 7=International. Use '4' for OTP "
+            "sends (Transactional/Trans OTP routes are the DLT-compliant "
+            "ones for a login code)."
         ),
     )
     ping4sms_sender_id: str = Field(

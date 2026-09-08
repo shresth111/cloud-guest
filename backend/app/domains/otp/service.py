@@ -910,22 +910,43 @@ class Ping4SmsProvider:
 
     Unlike the Basic-auth POSTs of :class:`TwilioSmsProvider`/
     :class:`ExotelSmsProvider`, this API takes every parameter -- the API
-    key included -- as a URL query string, and it returns plain text (a
-    numeric message id) rather than JSON. ``route``/``sender``/``template_id``
-    are provider-account configuration (``route`` selects the operator
-    route, ``templateid`` is the TRAI DLT template that the message body
-    must match exactly, or the carrier silently drops it -- the caller,
-    ``OtpService``, is responsible for composing ``message`` to match).
+    key included -- as a URL query string, and it returns plain text.
+    ``route``/``sender``/``template_id`` are provider-account
+    configuration (``route`` selects the operator route, ``templateid`` is
+    the TRAI DLT template that the message body must match exactly, or the
+    carrier silently drops it -- the caller, ``OtpService``, is responsible
+    for composing ``message`` to match).
+
+    SUCCESS VS ERROR, PER THE PROVIDER'S OWN DOCUMENTATION. A successful
+    send returns a numeric slot/message id; an error returns one of the
+    documented numeric codes 101-110 ("Invalid user", "Invalid sender ID",
+    ..., "Invalid DLT Template ID"). Both are numeric, so "is the body a
+    number" alone cannot tell them apart -- the check is "numeric AND not
+    one of the 101-110 error codes", and a matched error code is raised
+    with the provider's own meaning so the failure is visible rather than
+    being swallowed as a message id.
 
     The key is passed via ``params``, never string-concatenated into the
-    URL, so httpx percent-encodes it and the value never breaks the URL.
-    ``raise_for_status`` catches transport-level failures; the API's
-    documented non-numeric text responses ("Invalid Api Key", "Sender Id
-    Not Found", etc.) are surfaced by checking that the body is a numeric
-    id, since a non-numeric body means the send failed even when the HTTP
-    status was 200."""
+    URL, so httpx percent-encodes it and the value never breaks the URL;
+    ``raise_for_status`` catches transport-level failures."""
 
     _TIMEOUT_SECONDS = 10.0
+
+    # Documented Ping4SMS error codes (numeric, returned with HTTP 200 --
+    # see the provider docstring above for why they must be checked even
+    # though they parse as integers).
+    _ERROR_CODES: dict[int, str] = {
+        101: "Invalid user",
+        102: "Invalid sender ID",
+        103: "Invalid contact(s)",
+        104: "Invalid route",
+        105: "Invalid message",
+        106: "Spam blocked",
+        107: "Promotional block",
+        108: "Low credits in the specified route",
+        109: "Promotional route is only active 9am-8:45pm",
+        110: "Invalid DLT Template ID",
+    }
 
     def __init__(
         self,
@@ -958,8 +979,13 @@ class Ping4SmsProvider:
             )
             response.raise_for_status()
             body = response.text.strip()
-            if not body.isdigit():
-                raise RuntimeError(f"ping4sms send failed: {body}")
+            if body.isdigit():
+                code = int(body)
+                if code in self._ERROR_CODES:
+                    reason = self._ERROR_CODES[code]
+                    raise RuntimeError(f"ping4sms send failed: {reason}")
+                return
+            raise RuntimeError(f"ping4sms send failed: {body}")
 
 
 @functools.lru_cache(maxsize=32)
