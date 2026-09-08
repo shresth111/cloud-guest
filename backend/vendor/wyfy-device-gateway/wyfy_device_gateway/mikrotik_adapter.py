@@ -7090,6 +7090,20 @@ def _merge_connected_devices(
         mac = _row_mac(row)
         if mac is None:
             continue
+        # A lease row is address bookkeeping, not physical liveness.
+        # RouterOS keeps the entry for a client that powered off without
+        # releasing -- its ``status`` moves to ``expired``/``waiting`` once
+        # the lease time elapses, but the row itself stays. Treating every
+        # row as "seen" therefore kept a dead access point UP forever: the
+        # 15-minute device sync kept finding its MAC and refreshing
+        # ``is_active``/``last_seen_at`` (bug report: "AP Hall Lobby went
+        # down but the console still shows UP"). Only a ``bound`` lease is
+        # a client the router is actually willing to serve. The ``status``
+        # key is absent in this project's fake transports and on some
+        # RouterOS print shapes -- absence keeps the row (backward
+        # compatible), an explicit non-``bound`` status drops it.
+        if (status := row.get("status")) is not None and status != "bound":
+            continue
         existing = merged.get(mac)
         merged[mac] = ConnectedDevice(
             mac_address=mac,
