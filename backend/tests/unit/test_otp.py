@@ -57,9 +57,12 @@ from app.domains.otp.service import (
     LoggingWhatsAppProvider,
     OtpRateLimiter,
     OtpService,
+    Ping4SmsProvider,
+    SmsProviderNotConfiguredError,
     TwilioWhatsAppProvider,
     WhatsAppProviderNotConfiguredError,
     generate_numeric_code,
+    get_configured_sms_provider,
     get_configured_whatsapp_provider,
     hash_otp_code,
 )
@@ -964,6 +967,132 @@ class TestTwilioWhatsAppProvider:
         )
         with pytest.raises(httpx.HTTPStatusError):
             await provider.send("+15551234567", code="042817", message="ignored")
+
+
+class TestPing4SmsProviderSelection:
+    def test_default_is_logging_provider(self) -> None:
+        settings = Settings()
+        provider = get_configured_sms_provider(settings)
+        assert isinstance(provider, LoggingSmsProvider)
+
+    def test_ping4sms_selected_but_unconfigured_raises(self) -> None:
+        """sms_delivery_provider='ping4sms' with no credentials is a real
+        error, not a silent fallback -- same posture every other provider
+        selection in this module already establishes."""
+        settings = Settings(sms_delivery_provider="ping4sms")
+        with pytest.raises(SmsProviderNotConfiguredError):
+            get_configured_sms_provider(settings)
+
+    def test_ping4sms_fully_configured_returns_real_provider(self) -> None:
+        settings = Settings(
+            sms_delivery_provider="ping4sms",
+            ping4sms_api_key="key123",
+            ping4sms_route="1",
+            ping4sms_sender_id="TESTIN",
+            ping4sms_dlt_template_id="1107161234567890123",
+        )
+        provider = get_configured_sms_provider(settings)
+        assert isinstance(provider, Ping4SmsProvider)
+        assert provider.api_key == "key123"
+        assert provider.route == "1"
+        assert provider.sender_id == "TESTIN"
+        assert provider.dlt_template_id == "1107161234567890123"
+
+
+class TestPing4SmsProvider:
+    """Asserts the real outbound HTTP call shape -- ``httpx.AsyncClient``
+    is monkeypatched at the method level (no live network in this sandbox),
+    mirroring the WhatsApp/Twilio provider tests above."""
+
+    async def test_send_get_with_all_params(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        async def fake_get(self, url, *, params=None):  # noqa: ANN001
+            captured["url"] = url
+            captured["params"] = params
+            return httpx.Response(200, text="12345", request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        provider = Ping4SmsProvider(
+            api_key="key123",
+            route="1",
+            sender_id="TESTIN",
+            dlt_template_id="1107161234567890123",
+        )
+        await provider.send("+919876543210", message="Your code is 123456")
+
+        assert captured["url"] == "https://site.ping4sms.com/api/smsapi"
+        assert captured["params"] == {
+            "key": "key123",
+            "route": "1",
+            "sender": "TESTIN",
+            "number": "+919876543210",
+            "sms": "Your code is 123456",
+            "templateid": "1107161234567890123",
+        }
+
+    async def test_send_omits_template_when_not_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        async def fake_get(self, url, *, params=None):  # noqa: ANN001
+            captured["params"] = params
+            return httpx.Response(200, text="12345", request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        provider = Ping4SmsProvider(api_key="key123", route="1", sender_id="TESTIN")
+        await provider.send("+919876543210", message="Your code is 123456")
+
+        assert "templateid" not in (captured["params"] or {})  # type: ignore[operator]
+
+    async def test_send_raises_on_numeric_error_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The API returns a numeric message id on success and one of the
+        documented numeric error codes (101-110, e.g. 101 "Invalid user",
+        108 "Low credits") on failure -- both over HTTP 200 -- so the
+        provider must treat a matched error code as a failed send, not
+        swallow it as a message id."""
+
+        async def fake_get(self, url, *, params=None):  # noqa: ANN001
+            return httpx.Response(200, text="101", request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        provider = Ping4SmsProvider(api_key="bad", route="1", sender_id="TESTIN")
+        with pytest.raises(RuntimeError, match="Invalid user"):
+            await provider.send("+919876543210", message="hi")
+
+    async def test_send_raises_on_non_numeric_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_get(self, url, *, params=None):  # noqa: ANN001
+            return httpx.Response(
+                200, text="something unexpected", request=httpx.Request("GET", url)
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        provider = Ping4SmsProvider(api_key="bad", route="1", sender_id="TESTIN")
+        with pytest.raises(RuntimeError):
+            await provider.send("+919876543210", message="hi")
+
+    async def test_send_raises_on_http_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_get(self, url, *, params=None):  # noqa: ANN001
+            return httpx.Response(500, request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        provider = Ping4SmsProvider(api_key="key123", route="1", sender_id="TESTIN")
+        with pytest.raises(httpx.HTTPStatusError):
+            await provider.send("+919876543210", message="hi")
 
 
 # ============================================================================

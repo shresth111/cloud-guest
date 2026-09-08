@@ -31,17 +31,31 @@ structured contract every other user-facing endpoint returns.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
+from app.core.storage import ObjectStorageError, get_object_storage
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
 from app.domains.billing.dependencies import get_entitlement_checker
 from app.domains.billing.service import EntitlementChecker
 from app.domains.branding.service import (
+    _EXTENSION_TO_CONTENT_TYPE,
+    BACKGROUND_IMAGE_ALLOWED_CONTENT_TYPES,
+    BACKGROUND_IMAGE_MAX_BYTES,
     PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE,
     PUBLIC_LOGO_PATH_TEMPLATE,
 )
@@ -52,6 +66,7 @@ from app.domains.rbac.dependencies import (
 )
 
 from .dependencies import get_captive_portal_service
+from .exceptions import InvalidContentImageError
 from .models import CaptivePortalConfig
 from .schemas import (
     CaptivePortalConfigCreateRequest,
@@ -64,6 +79,15 @@ from .service import CaptivePortalService
 from .validators import is_open_now
 
 router = APIRouter(tags=["Captive Portal"])
+
+# The unauthenticated proxy path the uploaded pre-login content image is
+# served from -- the guest portal renders `content_image_url` straight as
+# an <img src> on its own separate origin (same absolute-URL reasoning as
+# the branding fallback block in resolve), so this is a full path off the
+# API base built per request, never a bare relative one.
+PUBLIC_CONTENT_IMAGE_PATH_TEMPLATE = (
+    "/captive-portal-configs/{config_id}/content-image/public"
+)
 
 
 def get_entitlement_aware_captive_portal_service(
@@ -417,6 +441,171 @@ async def deactivate_captive_portal_config(
         message="Captive portal config deactivated",
         data=_config_response(config).model_dump(),
         request_id=_request_id(request),
+    )
+
+
+# ============================================================================
+# Per-venue content image ("Before sign-in: show a picture") upload
+# ============================================================================
+#
+# The picture itself is venue content for one portal, so unlike the
+# org-level logo/background (app.domains.branding, one row per org) it is
+# keyed by the config row and stored under this domain's own namespace in
+# the shared object storage. Admin upload/delete carry
+# ``captive_portal.update`` (same write permission as every other config
+# edit); the public GET streams the bytes with no auth at all -- a real
+# captive-portal guest has no platform-user identity, exactly the
+# branding public-proxy exception (see that router's get_logo_public).
+
+
+def _content_image_asset_response(
+    request: Request,
+    *,
+    content: bytes,
+    content_type: str,
+) -> Response:
+    """Serves uploaded content-image bytes with the same strong-ETag
+    browser caching the branding public proxies use (branding/router.py's
+    ``_asset_response``) -- content-addressed hash, ``max-age`` from the
+    branding asset TTL setting. The image URL never changes (it is the
+    config's public path), so without the ETag every guest page load
+    re-downloads the same bytes."""
+    etag = hashlib.sha256(content).hexdigest()
+    quoted_etag = f'"{etag}"'
+    ttl = get_settings().branding_asset_cache_ttl_seconds
+    headers = {
+        "Cache-Control": f"public, max-age={ttl}, must-revalidate",
+        "ETag": quoted_etag,
+    }
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match is not None and quoted_etag in {
+        tag.strip() for tag in if_none_match.split(",")
+    }:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return Response(content=content, media_type=content_type, headers=headers)
+
+
+@router.post(
+    "/captive-portal-configs/{config_id}/content-image",
+    response_model=ApiResponse[CaptivePortalConfigResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("captive_portal.update"))],
+)
+async def upload_captive_portal_content_image(
+    request: Request,
+    config_id: uuid.UUID,
+    file: UploadFile = File(...),
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: CaptivePortalService = Depends(get_captive_portal_service),
+):
+    """Uploads (replacing any existing) the per-venue "Before sign-in:
+    show a picture" content image for one portal config. Same constraints
+    as the branding uploads (png/jpeg/webp/gif, <= 5 MiB); the bytes go
+    to object storage and the config row records the durable key plus the
+    absolute public URL the guest portal renders as an <img src>."""
+    config = await service.get_config(
+        config_id, requesting_organization_id=requesting_organization_id
+    )
+    content = await file.read()
+    content_type = file.content_type or "application/octet-stream"
+    extension = BACKGROUND_IMAGE_ALLOWED_CONTENT_TYPES.get(content_type)
+    if extension is None:
+        raise InvalidContentImageError(
+            "Unsupported image type. Upload a PNG, JPEG, WebP or GIF."
+        )
+    if len(content) > BACKGROUND_IMAGE_MAX_BYTES:
+        max_mb = BACKGROUND_IMAGE_MAX_BYTES // (1024 * 1024)
+        raise InvalidContentImageError(f"Image is too large. The limit is {max_mb} MB.")
+
+    api_base = str(request.base_url).rstrip("/") + get_settings().api_v1_prefix
+    public_path = PUBLIC_CONTENT_IMAGE_PATH_TEMPLATE.format(config_id=config_id)
+    content_image_url = api_base + public_path
+    content_image_key = (
+        f"captive_portal/{config.organization_id}/content/{config_id}/"
+        f"{uuid.uuid4()}.{extension}"
+    )
+    try:
+        await get_object_storage().upload(
+            key=content_image_key,
+            content=content,
+            content_type=content_type,
+        )
+    except ObjectStorageError as exc:
+        raise InvalidContentImageError(
+            "Could not store the image right now. Please try again."
+        ) from exc
+
+    updated = await service.set_content_image(
+        config_id,
+        content_image_key=content_image_key,
+        content_image_url=content_image_url,
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Content image uploaded",
+        data=_config_response(updated).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.delete(
+    "/captive-portal-configs/{config_id}/content-image",
+    response_model=ApiResponse[CaptivePortalConfigResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("captive_portal.update"))],
+)
+async def delete_captive_portal_content_image(
+    request: Request,
+    config_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: CaptivePortalService = Depends(get_captive_portal_service),
+):
+    """Removes the uploaded pre-login content image from a config row.
+    The object bytes are left in storage (orphaned) exactly as branding's
+    own delete does -- the row no longer references them, which is the
+    observable contract."""
+    updated = await service.clear_content_image(
+        config_id,
+        actor_user_id=uuid.UUID(user.id),
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        message="Content image removed",
+        data=_config_response(updated).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/captive-portal-configs/{config_id}/content-image/public",
+    status_code=status.HTTP_200_OK,
+)
+async def get_captive_portal_content_image_public(
+    request: Request,
+    config_id: uuid.UUID,
+    service: CaptivePortalService = Depends(get_captive_portal_service),
+):
+    """Streams a config's uploaded pre-login content image with **no auth**
+    -- the guest portal renders ``content_image_url`` straight as an
+    ``<img src>`` before the guest has any identity. ``config_id`` in the
+    path is the (unguessable) capability, mirroring the branding public
+    proxies; a config with no uploaded image 404s."""
+    key = await service.get_content_image_key(config_id)
+    if not key:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+    try:
+        content = await get_object_storage().download(key=key)
+    except ObjectStorageError:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+    extension = key.rsplit(".", 1)[-1].lower() if "." in key else ""
+    content_type = _EXTENSION_TO_CONTENT_TYPE.get(extension, "application/octet-stream")
+    return _content_image_asset_response(
+        request, content=content, content_type=content_type
     )
 
 

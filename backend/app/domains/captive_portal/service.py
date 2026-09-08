@@ -447,6 +447,7 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "content_heading",
     "content_body",
     "content_image_url",
+    "content_image_key",
     "content_survey",
     "collect_guest_name",
     "collect_guest_email",
@@ -515,6 +516,7 @@ class _CachedCaptivePortalConfig:
     content_heading: str | None
     content_body: str | None
     content_image_url: str | None
+    content_image_key: str | None
     content_survey: dict[str, Any] | None
     collect_guest_name: bool
     collect_guest_email: bool
@@ -923,6 +925,83 @@ class CaptivePortalService:
             error=CrossLocationCaptivePortalConfigAccessError(),
         )
         return config
+
+    async def set_content_image(
+        self,
+        config_id: uuid.UUID,
+        *,
+        content_image_key: str,
+        content_image_url: str,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> CaptivePortalConfig:
+        """Records a freshly uploaded pre-login content image on a config
+        row (the object bytes themselves are stored by the router through
+        the platform's object storage -- this service call persists the
+        resulting key + public URL and invalidates the resolve cache)."""
+        config = await self.get_config(
+            config_id, requesting_organization_id=requesting_organization_id
+        )
+        updated = await self.repository.update_config(
+            config,
+            {
+                "content_image_key": content_image_key,
+                "content_image_url": content_image_url,
+                "updated_by": actor_user_id,
+            },
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.CAPTIVE_PORTAL_CONFIG_UPDATED,
+            config,
+            f"Content image added to portal config '{config.name}'",
+        )
+        await self._invalidate_resolve_cache(config.organization_id, config.location_id)
+        return updated
+
+    async def clear_content_image(
+        self,
+        config_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> CaptivePortalConfig:
+        """Removes the uploaded pre-login content image (key + public URL)
+        from a config row. The object-storage delete is the router's job;
+        this is the persisted half + cache invalidation."""
+        config = await self.get_config(
+            config_id, requesting_organization_id=requesting_organization_id
+        )
+        updated = await self.repository.update_config(
+            config,
+            {
+                "content_image_key": None,
+                "content_image_url": None,
+                "updated_by": actor_user_id,
+            },
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.CAPTIVE_PORTAL_CONFIG_UPDATED,
+            config,
+            f"Content image removed from portal config '{config.name}'",
+        )
+        await self._invalidate_resolve_cache(config.organization_id, config.location_id)
+        return updated
+
+    async def get_content_image_key(
+        self, config_id: uuid.UUID
+    ) -> str | None:
+        """The object-storage key of a config's uploaded content image, or
+        ``None`` when none is uploaded -- read by the unauthenticated
+        public proxy endpoint (GET .../content-image/public), which must
+        not require a platform-user identity. No tenant-scope enforcement:
+        the config id itself is the (unguessable) capability, mirroring the
+        branding public-proxy endpoints' own reasoning."""
+        config = await self.repository.get_config(config_id)
+        if config is None or config.is_deleted:
+            return None
+        return config.content_image_key
 
     async def list_configs(
         self,

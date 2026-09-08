@@ -16,12 +16,14 @@ import uuid
 from collections.abc import Sequence
 from typing import Protocol
 
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
 
+from .constants import GuestTeamStatus
 from .models import GuestTeam, GuestTeamMember
 
 
@@ -48,6 +50,10 @@ class GuestTeamRepositoryProtocol(Protocol):
         sort_by: str = DEFAULT_SORT_FIELD,
         sort_order: SortOrder = SortOrder.DESC,
     ) -> tuple[list[GuestTeam], PaginationMeta]: ...
+
+    async def list_active_teams_for_portal(
+        self, organization_id: uuid.UUID, location_id: uuid.UUID | None
+    ) -> list[GuestTeam]: ...
 
     async def find_existing_codes(self, codes: Sequence[str]) -> list[str]: ...
 
@@ -115,6 +121,33 @@ class GuestTeamRepository:
             sort_by=sort_by,
             sort_order=sort_order,
         )
+
+    async def list_active_teams_for_portal(
+        self, organization_id: uuid.UUID, location_id: uuid.UUID | None
+    ) -> list[GuestTeam]:
+        """Every non-deleted, active team a guest at ``location_id`` could
+        join: teams scoped to exactly that location, PLUS the organization's
+        location-wide teams (``location_id IS NULL`` -- an org-wide team is
+        joinable from any of its locations' portals). Hand-written: a plain
+        equality filter cannot express "this location OR null", the same
+        reason the admin list's own location filter cannot -- see
+        ``app.domains.captive_portal.repository``'s module docstring on
+        GenericRepository's None-filter skip."""
+        statement = (
+            select(GuestTeam)
+            .where(
+                GuestTeam.organization_id == organization_id,
+                GuestTeam.status == GuestTeamStatus.ACTIVE.value,
+                GuestTeam.is_deleted.is_(False),
+                or_(
+                    GuestTeam.location_id == location_id,
+                    GuestTeam.location_id.is_(None),
+                ),
+            )
+            .order_by(GuestTeam.name.asc())
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def find_existing_codes(self, codes: Sequence[str]) -> list[str]:
         """Mirrors ``app.domains.voucher.repository.VoucherRepository

@@ -505,6 +505,15 @@ class CaptivePortalConfig(BaseModel):
     content_heading: Mapped[str | None] = mapped_column(String(200), nullable=True)
     content_body: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Object-storage key of the uploaded "Before sign-in: show a picture"
+    # content image -- mirrors app.domains.branding's own
+    # ``background_image_key``/``logo_key`` exactly (key + public proxy URL
+    # built per-request by the router, never a bare browser-loadable URL
+    # stored here). NULL when the image was never uploaded (or was deleted);
+    # a venue can still point content_image_url at an externally hosted
+    # image it typed in itself, and the two never collide because resolve
+    # only adopts the proxy when the KEY exists (see router.py).
+    content_image_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # content_mode == "survey": the survey definition -- a small
     # JSON object ({"questions": [...], "submitLabel": "..."}), the same
     # "explicit column, JSONB when the shape is a self-contained document"
