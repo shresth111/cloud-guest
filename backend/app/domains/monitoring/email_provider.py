@@ -47,6 +47,7 @@ from app.core.logging import get_logger
 from app.domains.otp.service import (
     EmailProviderNotConfiguredError,
     EmailProviderProtocol,
+    MailIdentity,
     get_configured_email_provider,
 )
 
@@ -76,16 +77,31 @@ class UnconfiguredEmailProvider:
         )
 
 
-def resolve_email_provider(settings: Settings) -> EmailProviderProtocol:
+def resolve_email_provider(
+    settings: Settings, *, identity: MailIdentity = MailIdentity.ADMIN
+) -> EmailProviderProtocol:
     """``get_configured_email_provider``, except that a misconfiguration can
-    no longer abort whatever was being constructed around it."""
+    no longer abort whatever was being constructed around it.
+
+    ``identity`` defaults to ``MailIdentity.ADMIN`` -- the administrative
+    mailbox, not the shared ``DEFAULT`` one that carries commercial/sales
+    mail (``sales@...`` in production). Monitoring alerts used to ride the
+    DEFAULT identity, so a venue owner receiving an AP-down alert saw it
+    arrive from the same sales mailbox that sends demo requests and
+    quotations -- which reads as sales mail no matter how the subject line
+    is phrased (bug report: "ye alert sales wali mail se jaata hai, wo
+    admin se jaana chahiye"). Alert mail is an operational message to the
+    venue's own staff; it belongs on the admin identity, the same one
+    password-reset and venue-welcome mail already use.
+    """
     try:
-        return get_configured_email_provider(settings)
+        return get_configured_email_provider(settings, identity=identity)
     except EmailProviderNotConfiguredError as exc:
         logger.error(
             "alert_email_provider_unconfigured",
             extra={
                 "email_delivery_provider": settings.email_delivery_provider,
+                "identity": identity.value,
                 "error": str(exc),
             },
         )
