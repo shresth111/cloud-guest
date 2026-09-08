@@ -238,6 +238,7 @@ def make_service(
     request_window_minutes: int = 60,
     expiry_seconds: int = 300,
     code_length: int = 6,
+    sms_message_template: str = "",
 ) -> Fixture:
     repository = FakeOtpRepository()
     redis = FakeRedis()
@@ -257,6 +258,7 @@ def make_service(
         max_verification_attempts=max_verification_attempts,
         max_requests_per_window=max_requests_per_window,
         request_window_minutes=request_window_minutes,
+        sms_message_template=sms_message_template,
     )
     return Fixture(
         repository=repository,
@@ -398,6 +400,98 @@ class TestRequestAndVerifyHappyPath:
             location_id=None,
         )
         assert fx.audit_writer.entries == []
+
+
+# ============================================================================
+# DLT message template (Settings.otp_sms_message_template)
+# ============================================================================
+
+
+class TestDltSmsMessageTemplate:
+    """When ``sms_message_template`` is set, the SMS body actually sent for
+    the guest-login code must be that DLT-approved text with the code
+    substituted for the ``{#num#}`` placeholder -- Indian carriers drop a
+    body that does not match the registered template exactly."""
+
+    _TEMPLATE = (
+        "{#num#} is your verification code for Wi-Fi. "
+        "Please do not share it with anyone. Powered by WyFyGuest EYETHIRD"
+    )
+
+    async def test_guest_login_sms_body_matches_template(self) -> None:
+        fx = make_service(sms_message_template=self._TEMPLATE)
+        await fx.service.request_otp(
+            identifier="+919876543210",
+            channel=OtpChannel.SMS,
+            purpose=OtpPurpose.GUEST_LOGIN,
+            organization_id=None,
+            location_id=None,
+        )
+        assert len(fx.sms_provider.sent) == 1
+        sent_phone, sent_body = fx.sms_provider.sent[0]
+        assert sent_phone == "+919876543210"
+        # The body is the template with the code in place of {#num#} --
+        # and the code is a 6-digit number (it is embedded in the body,
+        # not carried separately, exactly like a real SMS).
+        assert " is your verification code for Wi-Fi." in sent_body
+        assert sent_body.endswith(
+            "Please do not share it with anyone. Powered by WyFyGuest EYETHIRD"
+        )
+        prefix = sent_body.split(" is your verification code", 1)[0]
+        assert prefix.isdigit() and len(prefix) == 6
+
+        code = prefix
+        verified = await fx.service.verify_otp(
+            identifier="+919876543210", code=code, purpose=OtpPurpose.GUEST_LOGIN
+        )
+        assert verified.is_consumed is True
+
+    async def test_email_and_whatsapp_channels_are_not_template_rewritten(
+        self,
+    ) -> None:
+        """The DLT template only governs the SMS channel; email/whatsapp
+        keep their own composed copy (and the whatsapp provider still gets
+        the raw code separately)."""
+        fx = make_service(sms_message_template=self._TEMPLATE)
+
+        await fx.service.request_otp(
+            identifier="guest@example.com",
+            channel=OtpChannel.EMAIL,
+            purpose=OtpPurpose.GUEST_LOGIN,
+            organization_id=None,
+            location_id=None,
+        )
+        assert len(fx.email_provider.sent) == 1
+        # email body still carries the code via the shared "code is N."
+        # shape that _extract_code reads back.
+        _extract_code(fx.email_provider.sent[0])
+
+        await fx.service.request_otp(
+            identifier="+919876543210",
+            channel=OtpChannel.WHATSAPP,
+            purpose=OtpPurpose.GUEST_LOGIN,
+            organization_id=None,
+            location_id=None,
+        )
+        assert len(fx.whatsapp_provider.sent) == 1
+        _extract_code(fx.whatsapp_provider.sent[0])
+
+    async def test_data_masking_sms_keeps_purpose_copy(self) -> None:
+        """The DLT template covers the guest Wi-Fi login code only. The
+        authenticated data-masking code keeps its own purpose-specific copy
+        (that flow is not the DLT-gated guest sign-in)."""
+        fx = make_service(sms_message_template=self._TEMPLATE)
+        await fx.service.request_otp(
+            identifier="+919876543210",
+            channel=OtpChannel.SMS,
+            purpose=OtpPurpose.ACCOUNT_DATA_MASKING,
+            organization_id=None,
+            location_id=None,
+        )
+        assert len(fx.sms_provider.sent) == 1
+        sent_body = fx.sms_provider.sent[0][1]
+        assert "guest-data masking" in sent_body
+        assert "is your verification code for Wi-Fi." not in sent_body
 
 
 # ============================================================================

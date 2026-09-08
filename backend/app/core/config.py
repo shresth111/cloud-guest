@@ -1371,6 +1371,18 @@ class Settings(BaseSettings):
             "'ping4sms'."
         ),
     )
+    otp_sms_message_template: str = Field(
+        default="",
+        description=(
+            "Optional DLT-approved SMS body template for the guest-login "
+            "OTP, with the code as a `{#num#}` placeholder -- e.g. \"{#num#} "
+            "is your verification code for Wi-Fi.\". When set, OtpService "
+            "sends SMS bodies composed from this template (placeholder "
+            "replaced with the code) so the text matches the registered "
+            "template exactly; TRAI DLT carriers silently drop a body that "
+            "doesn't. Empty (default) keeps the built-in message."
+        ),
+    )
     twilio_account_sid: str = Field(default="")
     twilio_auth_token: str = Field(default="")
     twilio_from_number: str = Field(default="")

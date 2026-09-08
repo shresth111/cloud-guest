@@ -79,6 +79,7 @@ def get_otp_service(
         max_verification_attempts=settings.otp_max_verification_attempts,
         max_requests_per_window=settings.otp_max_requests_per_window,
         request_window_minutes=settings.otp_request_window_minutes,
+        sms_message_template=settings.otp_sms_message_template,
     )
 
 
