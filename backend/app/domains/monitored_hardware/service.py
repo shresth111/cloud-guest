@@ -14,7 +14,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from app.domains.location.models import Location
@@ -25,7 +25,7 @@ from app.domains.rbac.location_scope import (
 )
 from app.domains.router.models import Router
 
-from .constants import HardwareStatus
+from .constants import STALE_SIGHTING_AFTER_SECONDS, HardwareStatus
 from .events import MonitoredHardwareDeleted, MonitoredHardwareRegistered
 from .exceptions import DuplicateMonitoredHardwareError, MonitoredHardwareNotFoundError
 from .models import MonitoredHardware
@@ -206,7 +206,23 @@ class MonitoredHardwareService:
                 last_seen_at=None,
                 connected_at=None,
             )
-        status = HardwareStatus.UP if connected.is_active else HardwareStatus.DOWN
+        # An ``is_active`` row whose last sighting is older than the stale
+        # window is not a live device -- it is a row the device-sync sweep
+        # could not refresh (its uplink router went unreachable, or the
+        # sweep itself stalled), and deriving UP from it repeats the
+        # reported bug: a venue access point that physically went down kept
+        # showing UP because the sweep that would have flipped ``is_active``
+        # never ran. See STALE_SIGHTING_AFTER_SECONDS in this domain's
+        # constants for the window's derivation. ``last_seen_at`` is never
+        # None for a row the sync wrote (every create/update branch stamps
+        # it), so a None here falls back to trusting ``is_active`` alone --
+        # the pre-existing contract the unit tests pin.
+        if connected.is_active and connected.last_seen_at is not None:
+            age_seconds = (datetime.now(UTC) - connected.last_seen_at).total_seconds()
+            is_active = age_seconds <= STALE_SIGHTING_AFTER_SECONDS
+        else:
+            is_active = connected.is_active
+        status = HardwareStatus.UP if is_active else HardwareStatus.DOWN
         return HardwareWithStatus(
             device=device,
             status=status,
@@ -218,7 +234,7 @@ class MonitoredHardwareService:
             # venue owner means when they ask "how long has it been up?".
             # Deliberately only surfaced for UP devices: a DOWN device's
             # stale ``connected_at`` would read as current uptime.
-            connected_at=connected.connected_at if connected.is_active else None,
+            connected_at=connected.connected_at if is_active else None,
         )
 
     async def list_devices(
