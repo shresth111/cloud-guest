@@ -4668,18 +4668,16 @@ class GuestService:
         ``_require_method_enabled``. Open Hours arrived bolted onto that
         method because it was "the one chokepoint every authenticated login
         method passes through" -- but it is not: ``login_via_mac_whitelist``
-        skips ``_require_method_enabled`` on purpose (a whitelist entry's mere
-        existence is its own per-device enable signal -- see that method's own
-        docstring), and so it silently inherited an exemption from Open Hours
-        that nobody chose. That path is live: ``RadiusService.authorize`` falls
-        through to ``login_via_mac_whitelist`` to originate a session at RADIUS
-        authorize time, so a whitelisted device connecting to a closed venue got
-        a real session and a real Access-Accept.
+        skips ``_require_method_enabled`` on purpose (a whitelist entry's
+        mere existence is its own per-device enable signal -- see that
+        method's own docstring).
 
-        Splitting the two checks apart lets the MAC path keep the exemption it
-        actually wants (the enabled-method booleans, which do not describe it)
-        while losing the one it never asked for. "Whether this venue is open"
-        is a property of the venue, not of how a guest proves who they are.
+        Open Hours does *not* share that exemption: whether a venue is open
+        is a property of the venue, not of how a guest proves who they are,
+        and ``login_via_mac_whitelist`` calls this helper explicitly
+        (``RadiusService.authorize`` falls through to it to originate a
+        session at RADIUS authorize time, so a whitelisted device connecting
+        to a closed venue gets refused, the same as any other login method).
 
         ``is_open_now`` is deliberately forgiving: business hours disabled
         means always open, and a malformed stored timezone degrades to "open"
