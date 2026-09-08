@@ -22,8 +22,9 @@ import pytest
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.auth.models import User
 from app.domains.auth.password import PasswordManager, PasswordStrengthError
-from app.domains.rbac.enums import ScopeType
+from app.domains.rbac.enums import PermissionModule, ScopeType
 from app.domains.rbac.models import Role, UserRole
+from app.domains.rbac.seed import SYSTEM_ROLES
 from app.domains.router_provisioning.models import ConfigTemplate
 from scripts.seed import (
     SUPER_ADMIN_ROLE_SLUG,
@@ -351,3 +352,21 @@ async def test_ensure_default_system_template_ignores_stale_rows() -> None:
 
     assert created is True
     assert template not in repo.templates[:2]
+
+
+def test_auditor_role_does_not_grant_router_scoped_device_console() -> None:
+    """Regression: the seeded Auditor role (ORGANIZATION scope, READ default)
+    used to inherit DEVICE_CONSOLE's READ permission via its default level,
+    which made the role unassignable by an org owner -- the escalation guard
+    (`rbac.service._assert_no_role_escalation`) requires the assigner to
+    already hold every permission the role grants, and DEVICE_CONSOLE is
+    ROUTER-scope, which no org owner holds. Every ORGANIZATION-scope role
+    must explicitly NONE out ROUTER-scoped modules."""
+    auditor = next((r for r in SYSTEM_ROLES if r.slug == "auditor"), None)
+    assert auditor is not None, "seeded Auditor role must exist"
+    assert auditor.scope_type == ScopeType.ORGANIZATION
+    # Default READ must not leak ROUTER-scoped modules the role can never
+    # legitimately hold (or be assigned).
+    assert (
+        auditor.overrides[PermissionModule.DEVICE_CONSOLE].name == "NONE"
+    ), "Auditor must explicitly NONE out ROUTER-scoped DEVICE_CONSOLE"
