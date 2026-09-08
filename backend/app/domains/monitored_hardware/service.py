@@ -81,11 +81,16 @@ class HardwareWithStatus:
     """A ``MonitoredHardware`` row plus its derived status -- see module
     docstring. ``last_seen_at`` is only ever a real
     ``ConnectedDevice.last_seen_at`` value (or ``None`` when the device
-    has never been observed), never invented."""
+    has never been observed), never invented. ``connected_at`` is the
+    companion fact that answers a different question -- "how long has
+    this device actually been on the network" rather than "when did the
+    sync sweep last see it" -- and is likewise only ever a real
+    ``ConnectedDevice.connected_at`` (``None`` when never observed)."""
 
     device: MonitoredHardware
     status: HardwareStatus
     last_seen_at: datetime | None
+    connected_at: datetime | None
 
 
 class MonitoredHardwareService:
@@ -196,11 +201,24 @@ class MonitoredHardwareService:
         )
         if connected is None:
             return HardwareWithStatus(
-                device=device, status=HardwareStatus.UNKNOWN, last_seen_at=None
+                device=device,
+                status=HardwareStatus.UNKNOWN,
+                last_seen_at=None,
+                connected_at=None,
             )
         status = HardwareStatus.UP if connected.is_active else HardwareStatus.DOWN
         return HardwareWithStatus(
-            device=device, status=status, last_seen_at=connected.last_seen_at
+            device=device,
+            status=status,
+            last_seen_at=connected.last_seen_at,
+            # ``connected_at`` is preserved by the sync sweep across ticks
+            # for a device that stays active (see connected_devices/
+            # service.py's own update branch) -- i.e. it is genuinely
+            # "this device has been on the network since", the fact a
+            # venue owner means when they ask "how long has it been up?".
+            # Deliberately only surfaced for UP devices: a DOWN device's
+            # stale ``connected_at`` would read as current uptime.
+            connected_at=connected.connected_at if connected.is_active else None,
         )
 
     async def list_devices(
