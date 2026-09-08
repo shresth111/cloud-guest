@@ -1262,6 +1262,7 @@ class OtpService:
         max_verification_attempts: int = 5,
         max_requests_per_window: int = 5,
         request_window_minutes: int = 60,
+        sms_message_template: str = "",
     ) -> None:
         self.repository = repository
         self.redis = redis
@@ -1278,6 +1279,7 @@ class OtpService:
         self.max_verification_attempts = max_verification_attempts
         self.max_requests_per_window = max_requests_per_window
         self.request_window_minutes = request_window_minutes
+        self.sms_message_template = sms_message_template
 
     # ========================================================================
     # Request
@@ -1359,6 +1361,18 @@ class OtpService:
             )
             intro = "Use this code to finish signing in."
         if channel == OtpChannel.SMS:
+            # TRAI DLT compliance: when the venue has registered an SMS
+            # message template (`Settings.otp_sms_message_template`, a
+            # `{#num#}` placeholder body that matches the registered
+            # template id exactly), the body actually sent MUST be that
+            # approved text with the code substituted -- Indian carriers
+            # silently drop a body that doesn't match the registered
+            # template. Only the guest-login code is covered by that
+            # template; the data-masking code keeps its purpose-specific
+            # copy (that flow is an authenticated dashboard control, not
+            # the DLT-gated guest sign-in).
+            if self.sms_message_template and purpose == OtpPurpose.GUEST_LOGIN:
+                message = self.sms_message_template.replace("{#num#}", code)
             await self.sms_provider.send(otp_request.identifier, message)
         elif channel == OtpChannel.WHATSAPP:
             await self.whatsapp_provider.send(
