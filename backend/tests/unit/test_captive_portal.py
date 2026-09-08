@@ -1005,6 +1005,94 @@ class TestExplicitNullOnNotNullBooleanToggles:
         )
 
 
+class TestContentImage:
+    """``set_content_image``/``clear_content_image``/``get_content_image_key``
+    -- the service half of the per-venue "Before sign-in: show a picture"
+    upload (the object-storage interaction itself lives in the router)."""
+
+    async def test_set_content_image_records_key_and_url(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        updated = await fx.service.set_content_image(
+            config.id,
+            content_image_key="captive_portal/org/cfg/img.png",
+            content_image_url="https://api.example/api/v1/captive-portal-configs/x/content-image/public",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+        )
+        assert updated.content_image_key == "captive_portal/org/cfg/img.png"
+        assert updated.content_image_url is not None
+        assert (
+            await fx.service.get_content_image_key(config.id)
+            == "captive_portal/org/cfg/img.png"
+        )
+
+    async def test_clear_content_image_nulls_key_and_url(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        await fx.service.set_content_image(
+            config.id,
+            content_image_key="captive_portal/org/cfg/img.png",
+            content_image_url="https://api.example/...",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+        )
+        updated = await fx.service.clear_content_image(
+            config.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+        )
+        assert updated.content_image_key is None
+        assert updated.content_image_url is None
+        assert await fx.service.get_content_image_key(config.id) is None
+
+    async def test_content_image_writes_are_audited(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        await fx.service.set_content_image(
+            config.id,
+            content_image_key="k",
+            content_image_url="https://u",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+        )
+        actions = [entry["action"] for entry in fx.audit_writer.entries]
+        assert "captive_portal_config_updated" in actions
+
+    async def test_get_content_image_key_none_for_missing_config(self) -> None:
+        fx = make_service()
+        assert await fx.service.get_content_image_key(uuid.uuid4()) is None
+
+    async def test_get_content_image_key_none_for_deleted_config(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        await fx.repository.soft_delete_config(config)
+        assert await fx.service.get_content_image_key(config.id) is None
+
+    async def test_set_content_image_invalidates_resolve_cache(self) -> None:
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx)
+        await fx.resolve_cache.set(  # type: ignore[union-attr]
+            fx.organization.id,
+            config.location_id,
+            {"name": "stale"},
+            index_organization_id=fx.organization.id,
+        )
+        await fx.service.set_content_image(
+            config.id,
+            content_image_key="k",
+            content_image_url="https://u",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+        )
+        assert (
+            await fx.resolve_cache.get(  # type: ignore[union-attr]
+                fx.organization.id, config.location_id
+            )
+            is None
+        )
+
+
 class TestWhitelistOnlyIsNotAnnouncedToGuests:
     """``GET /captive-portal/resolve`` is fetched by an unauthenticated
     guest device before any login. It must not report that the venue is

@@ -458,3 +458,14 @@ class InvalidUserPortalUrlError(CaptivePortalError):
             "hotspot name",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+
+class InvalidContentImageError(CaptivePortalError):
+    """The uploaded pre-login content image was not a png/jpeg/webp/gif
+    or exceeded the 5 MiB ceiling -- same constraints as the branding
+    logo/background uploads. 400, and the message names the real problem
+    (unsupported type vs too large) so the dashboard's upload control can
+    surface it verbatim."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
