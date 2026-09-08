@@ -87,6 +87,21 @@ _UNAUTHENTICATED_BY_DESIGN: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/branding/{organization_id}/background-image/public"): (
         "Public branding asset, fetched by the portal page itself."
     ),
+    ("GET", "/api/v1/captive-portal-configs/{config_id}/content-image/public"): (
+        "Public per-venue content image, fetched by the guest portal's own "
+        "<img> before the guest has any identity -- same class of exception "
+        "as the branding public proxies above it. The config_id path param "
+        "is the (unguessable) capability; the endpoint only streams that "
+        "one image's bytes."
+    ),
+    ("GET", "/api/v1/guest-teams/open"): (
+        "Guest-facing: the optional 'which group do you belong to?' "
+        "dropdown data for the sign-in screen. The guest is anonymous "
+        "(pre-login, inside the captive portal), and the endpoint reads "
+        "only the organization_id/location_id the request itself names -- "
+        "the same query params the portal was resolved with -- returning "
+        "nothing but open team names and public join codes."
+    ),
     ("GET", "/api/v1/guest/session/active"): (
         "Guest-facing: a connected guest reading their own session state."
     ),

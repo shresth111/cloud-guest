@@ -154,6 +154,14 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/guest-teams/join"): (
         "Unauthenticated guest presenting a team join code."
     ),
+    ("GET", "/api/v1/guest-teams/open"): (
+        "Unauthenticated guest reading which teams at this portal are "
+        "joinable, for the sign-in dropdown."
+    ),
+    ("GET", "/api/v1/captive-portal-configs/{config_id}/content-image/public"): (
+        "Unauthenticated guest-portal <img> fetch of the venue's uploaded "
+        "pre-login content image -- mirrors the branding public proxies."
+    ),
     # -- Device/NAS/webhook: a different, non-RBAC identity mechanism --
     ("GET", "/api/v1/agent/actions"): "Router agent -- CurrentAgent device credential.",
     ("GET", "/api/v1/agent/config"): "Router agent -- CurrentAgent device credential.",

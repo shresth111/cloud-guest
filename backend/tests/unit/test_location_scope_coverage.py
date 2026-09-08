@@ -613,6 +613,24 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "resolves by team code off the repository rather than through the "
         "confined `get_team` -- so being unconfined here grants nothing."
     ),
+    ("GET", "/api/v1/guest-teams/open"): (
+        "The sign-in screen's optional 'which group do you belong to?' "
+        "dropdown, fetched by an anonymous guest in the captive portal "
+        "before they have signed in -- the same pre-identity moment as "
+        "`POST /guest-teams/join` next to it. `list_open_teams` reads only "
+        "the organization/location the request itself names and returns "
+        "nothing but team names/codes that are already public join tokens; "
+        "requiring a credential would 401 every guest out of the dropdown."
+    ),
+    ("GET", "/api/v1/captive-portal-configs/{config_id}/content-image/public"): (
+        "The uploaded 'Before sign-in: show a picture' content image, "
+        "rendered by the guest portal's own <img> before the guest has any "
+        "identity -- the same class of exception as the branding public "
+        "proxies (GET /branding/{organization_id}/logo/public). The config "
+        "id in the path is the (unguessable) capability and the endpoint "
+        "only ever streams one image's bytes; a credential requirement "
+        "would break every portal that uses the feature."
+    ),
 }
 
 
