@@ -514,20 +514,20 @@ class ConcurrentSessionLimitExceededError(GuestError):
 
 
 class GuestDeviceLimitExceededError(GuestError):
-    """The guest already has ``limit`` (or more) distinct
-    :class:`~.models.GuestDevice` rows registered -- raised by
-    ``service._enforce_device_limit`` before a *new* device would be
-    registered (or an existing device reassigned to this guest) via
-    ``login_via_otp``/``login_via_voucher``. ``limit`` is resolved through
-    the real ``PolicyType.DEVICE`` seam when a ``policy_lookup`` hook is
-    wired (``app.domains.policy.schemas.DevicePolicyRules
-    .max_devices_per_guest``), falling back to
+    """The guest already has ``limit`` (or more) distinct devices
+    **connected at the same time** (each holding an ``ACTIVE`` session) --
+    raised by ``service._enforce_device_limit`` before another device would
+    push the guest's simultaneously-connected devices over their limit via
+    ``login_via_otp``/``login_via_voucher``. The basis is connected, not
+    registered: a registered-but-idle device does not occupy the limit,
+    and registering a new device is never itself an error -- only bringing
+    one online while ``limit`` others are already connected is. ``limit``
+    is resolved through the real ``PolicyType.DEVICE`` seam when a
+    ``policy_lookup`` hook is wired (``app.domains.policy.schemas
+    .DevicePolicyRules.max_devices_per_guest``), falling back to
     ``constants.DEFAULT_MAX_DEVICES_PER_GUEST`` otherwise -- mirrors
     ``ConcurrentSessionLimitExceededError``'s identical shape and "surface
-    the limit back to the caller as structured ``data``" convention. MAC
-    uniqueness itself is unchanged by this check -- it only gates *how
-    many* devices one guest may hold, never which physical device a MAC
-    address belongs to.
+    the limit back to the caller as structured ``data``" convention.
 
     **The message names no guest identifier** -- the same captive-portal
     reasoning as ``ConcurrentSessionLimitExceededError`` above: this 409 is
@@ -539,8 +539,8 @@ class GuestDeviceLimitExceededError(GuestError):
         self.guest_id = guest_id
         self.limit = limit
         super().__init__(
-            f"This account already has {limit} device(s) registered, which "
-            "is the maximum allowed",
+            f"This account already has {limit} device(s) connected at the "
+            "same time, which is the maximum allowed",
             status_code=status.HTTP_409_CONFLICT,
             data={"max_devices_per_guest": limit},
         )

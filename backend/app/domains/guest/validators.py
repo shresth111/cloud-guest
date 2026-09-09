@@ -209,10 +209,12 @@ def is_concurrent_session_limit_reached(*, active_count: int, limit: int) -> boo
 def is_device_limit_reached(*, device_count: int, limit: int) -> bool:
     """Guest Session Engine (Phase 1): a pure, in-memory comparison used by
     ``GuestService._enforce_device_limit`` after the repository's own
-    ``count_devices_for_guest`` has already fetched ``device_count`` --
-    mirrors ``is_concurrent_session_limit_reached``'s identical shape and
+    ``count_active_devices_for_guest`` has already fetched ``device_count``
+    (distinct devices currently holding ``ACTIVE`` sessions -- the basis is
+    connected, not registered) -- mirrors
+    ``is_concurrent_session_limit_reached``'s identical shape and
     ``>=`` (not ``>``) reasoning: a guest with exactly ``limit`` devices
-    has already reached it."""
+    connected at the same time has already reached it."""
     return device_count >= limit
 
 

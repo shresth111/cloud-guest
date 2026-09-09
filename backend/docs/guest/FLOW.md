@@ -272,10 +272,16 @@ as a one-off `Organization.settings` key.
 ## 6b. Per-guest device limit (Phase 1 BhaiFi-parity)
 
 `login_via_otp`/`login_via_voucher` also reject a login with
-`GuestDeviceLimitExceededError` (`409`) if registering the presented MAC
-against the resolved guest would push their distinct-device count to or
-past the resolved limit. Unlike §6a's concurrent-session limit, this one
-**is** wired through the real Policy Engine:
+`GuestDeviceLimitExceededError` (`409`) when it would put more of the
+resolved guest's devices **online at the same time** than the resolved
+limit allows. The basis is deliberately **connected**, not **registered**:
+the count is distinct devices currently holding `ACTIVE` sessions (a
+registered-but-idle device does not occupy the limit, and registering a
+new device is never itself an error) -- see
+`GuestService._enforce_device_limit` and
+`GuestRepository.count_active_devices_for_guest`. Unlike §6a's
+concurrent-session limit, this one **is** wired through the real Policy
+Engine:
 
 * `GuestService._resolve_device_limit` calls
   `PolicyService.resolve_effective_policy(policy_type=PolicyType.DEVICE,
@@ -285,9 +291,11 @@ past the resolved limit. Unlike §6a's concurrent-session limit, this one
   no Policy Engine is configured at all, or the resolved rules omit the
   field.
 * `_enforce_device_limit` is a no-op when `device_mac` is absent (nothing
-  to register) or when the MAC already belongs to this exact guest (a
-  returning device, not a new one) -- checked via `get_device_by_mac`
-  without mutating anything.
+  to register). The device currently logging in is excluded from the
+  connected count when it already belongs to this guest (a reconnect of an
+  already-online device reuses its `ACTIVE` session and never counts
+  against itself); a new device is blocked exactly when `limit` other
+  devices are already connected.
 * Placed in the identical "reject before OTP verification/voucher
   redemption" position §6a's own check occupies.
 

@@ -285,10 +285,13 @@ DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST = 20
 # Device limit -- Guest Session Engine (Phase 1).
 # ============================================================================
 
-# The maximum number of distinct ``GuestDevice`` rows (by MAC address) one
-# guest may have registered at once, enforced by
-# ``service._enforce_device_limit`` at the start of both
-# ``login_via_otp``/``login_via_voucher``. Unlike
+# The maximum number of a guest's devices that may be **connected at the
+# same time** (distinct devices currently holding ``ACTIVE`` sessions),
+# enforced by ``service._enforce_device_limit`` at the start of both
+# ``login_via_otp``/``login_via_voucher``. The basis is deliberately
+# *connected*, not *registered*: a guest can register more devices than
+# this over time (each was once connected), and an idle registered device
+# does not occupy the limit. Unlike
 # ``DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` above (which predates
 # ``app.domains.policy`` and was only ever a plain constant), this value is
 # resolved through the real ``PolicyType.DEVICE`` seam
