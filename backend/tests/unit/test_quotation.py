@@ -266,7 +266,9 @@ class TestRenderQuotationPdf:
         # The feature spec requires these exact, verbatim strings -- a
         # silent rename here would break the platform's real branding
         # requirement without any other test catching it.
-        assert QUOTATION_COMPANY_LEGAL_NAME == "Infovertias Technologies Pvt Ltd"
+        assert QUOTATION_COMPANY_LEGAL_NAME == (
+            "INFOVERITAS TECHNOLOGIES PRIVATE LIMITED"
+        )
         assert QUOTATION_PRODUCT_NAME == "WyfyGuest"
 
 
