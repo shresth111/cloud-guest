@@ -1143,6 +1143,20 @@ class FakeGuestRepository:
             if s.guest_id == guest_id and s.status == GuestSessionStatus.ACTIVE.value
         )
 
+    async def count_active_devices_for_guest(
+        self, *, guest_id: uuid.UUID, exclude_device_id: uuid.UUID | None = None
+    ) -> int:
+        seen: set[uuid.UUID] = set()
+        for s in self.sessions.values():
+            if (
+                s.guest_id == guest_id
+                and s.status == GuestSessionStatus.ACTIVE.value
+                and s.device_id is not None
+                and (exclude_device_id is None or s.device_id != exclude_device_id)
+            ):
+                seen.add(s.device_id)
+        return len(seen)
+
     async def get_latest_ended_session_for_device(
         self,
         *,
@@ -4839,7 +4853,12 @@ class TestDeviceLimit:
         assert is_device_limit_reached(device_count=3, limit=3) is True
         assert is_device_limit_reached(device_count=4, limit=3) is True
 
-    async def test_count_devices_for_guest_counts_distinct_macs(self) -> None:
+    async def test_count_active_devices_for_guest_counts_distinct_connected(
+        self,
+    ) -> None:
+        """The limit's basis: distinct devices holding ``ACTIVE`` sessions
+        right now -- a disconnected device (still registered) must not
+        count, and two ACTIVE sessions on the same device count once."""
         fx = make_fixture()
         identifier = "+15559990010"
         first = await fx.guest_service.login_via_otp(
@@ -4851,7 +4870,6 @@ class TestDeviceLimit:
             router_id=fx.router.id,
             device_mac="AA:BB:CC:DD:EE:01",
         )
-        await fx.guest_service.disconnect_session(session_id=first.session.id)
         await fx.guest_service.login_via_otp(
             identifier=identifier,
             code="GOOD",
@@ -4861,10 +4879,31 @@ class TestDeviceLimit:
             router_id=fx.router.id,
             device_mac="AA:BB:CC:DD:EE:02",
         )
-        count = await fx.repository.count_devices_for_guest(first.guest.id)
+        count = await fx.repository.count_active_devices_for_guest(
+            guest_id=first.guest.id
+        )
         assert count == 2
+        # A reconnect of the first (still-active) device must not count
+        # against itself.
+        excluded = await fx.repository.count_active_devices_for_guest(
+            guest_id=first.guest.id, exclude_device_id=first.device.id
+        )
+        assert excluded == 1
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        after_disconnect = await fx.repository.count_active_devices_for_guest(
+            guest_id=first.guest.id
+        )
+        assert after_disconnect == 1
+        # The device row is still registered -- only the active count drops.
+        assert await fx.repository.count_devices_for_guest(first.guest.id) == 2
 
-    async def test_login_raises_once_device_limit_reached(self) -> None:
+    async def test_registered_but_idle_devices_never_block_a_new_connection(
+        self,
+    ) -> None:
+        """The QA report: a guest who has registered ``limit`` devices
+        over time (each now disconnected) must not be blocked on a new
+        connection -- the limit is on devices connected *at the same
+        time*, not devices ever registered."""
         fx = make_fixture()
         identifier = "+15559990011"
         for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
@@ -4877,12 +4916,44 @@ class TestDeviceLimit:
                 router_id=fx.router.id,
                 device_mac=f"AA:BB:CC:DD:EE:{index:02d}",
             )
-            # Disconnected between iterations so the (same-valued) concurrent
-            # session limit never trips before the device limit does -- see
-            # this class's own module-level discussion in the roadmap
-            # write-up. Disconnecting frees the session slot but leaves the
-            # GuestDevice row (and thus the device count) intact.
+            # Disconnect so the device is registered but NOT connected --
+            # under the old registered-device basis this was the setup that
+            # used to raise; under the connected basis it must not.
             await fx.guest_service.disconnect_session(session_id=result.session.id)
+        assert await fx.repository.count_devices_for_guest(result.guest.id) == (
+            DEFAULT_MAX_DEVICES_PER_GUEST
+        )
+        devices_before = len(fx.repository.devices)
+
+        new_result = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="AA:BB:CC:DD:EE:FF",
+        )
+        assert new_result.session.status == GuestSessionStatus.ACTIVE.value
+        # The new device registered (a 4th row is fine) and is online.
+        assert len(fx.repository.devices) == devices_before + 1
+
+    async def test_login_raises_when_limit_devices_connected_at_once(self) -> None:
+        """The connected-basis block: with ``limit`` OTHER devices ACTIVE
+        right now, a new device's login raises ``GuestDeviceLimitExceededError``."""
+        fx = make_fixture()
+        identifier = "+15559990012"
+        for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
+            result = await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac=f"AB:BB:CC:DD:EE:{index:02d}",
+            )
+            assert result.session.status == GuestSessionStatus.ACTIVE.value
         devices_before = len(fx.repository.devices)
 
         with pytest.raises(GuestDeviceLimitExceededError) as exc_info:
@@ -4893,7 +4964,7 @@ class TestDeviceLimit:
                 organization_id=None,
                 location_id=fx.location_id,
                 router_id=fx.router.id,
-                device_mac="AA:BB:CC:DD:EE:FF",
+                device_mac="AB:BB:CC:DD:EE:FF",
             )
         assert exc_info.value.limit == DEFAULT_MAX_DEVICES_PER_GUEST
         # No new device row was created for the rejected attempt.
@@ -4905,6 +4976,7 @@ class TestDeviceLimit:
         assert str(result.guest.id) not in str(exc_info.value)
         assert identifier not in str(exc_info.value)
         assert "This account already has" in exc_info.value.message
+        assert "connected at the same time" in exc_info.value.message
         assert exc_info.value.status_code == 409
         assert exc_info.value.data == {
             "max_devices_per_guest": DEFAULT_MAX_DEVICES_PER_GUEST
@@ -4912,12 +4984,12 @@ class TestDeviceLimit:
 
     async def test_login_rejected_before_otp_verification_is_attempted(self) -> None:
         """Mirrors ``TestConcurrentSessionLimit``'s identical-named test:
-        a guest already at the device limit must never spend a real OTP
-        verification attempt on a login that was always going to be
-        rejected -- see ``GuestService._enforce_device_limit``'s call-site
-        placement in ``login_via_otp``."""
+        a guest already at the connected-device limit must never spend a
+        real OTP verification attempt on a login that was always going to
+        be rejected -- see ``GuestService._enforce_device_limit``'s
+        call-site placement in ``login_via_otp``."""
         fx = make_fixture()
-        identifier = "+15559990012"
+        identifier = "+15559990013"
         for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
             result = await fx.guest_service.login_via_otp(
                 identifier=identifier,
@@ -4928,7 +5000,7 @@ class TestDeviceLimit:
                 router_id=fx.router.id,
                 device_mac=f"BB:CC:DD:EE:FF:{index:02d}",
             )
-            await fx.guest_service.disconnect_session(session_id=result.session.id)
+            assert result.session.status == GuestSessionStatus.ACTIVE.value
 
         with pytest.raises(GuestDeviceLimitExceededError):
             await fx.guest_service.login_via_otp(
@@ -4941,27 +5013,85 @@ class TestDeviceLimit:
                 device_mac="BB:CC:DD:EE:FF:FF",
             )
 
-    async def test_returning_device_never_counts_against_the_limit(self) -> None:
-        """The same MAC logging in repeatedly is a *returning* device, not
-        a new one -- ``_enforce_device_limit`` recognizes it via
-        ``get_device_by_mac`` + ``guest_id`` match and never raises,
-        regardless of how many times it reconnects."""
+    async def test_reconnect_of_an_already_online_device_never_counts_against_itself(
+        self,
+    ) -> None:
+        """At the limit, reconnecting a device that is ALREADY online (its
+        ``ACTIVE`` session is reused) is allowed: the device is excluded
+        from its own connected count, so a reconnect never looks like an
+        extra connection."""
         fx = make_fixture()
-        identifier = "+15559990013"
-        mac = "CC:DD:EE:FF:00:01"
-        for _ in range(DEFAULT_MAX_DEVICES_PER_GUEST + 2):
-            result = await fx.guest_service.login_via_otp(
+        identifier = "+15559990014"
+        results = []
+        for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
+            results.append(
+                await fx.guest_service.login_via_otp(
+                    identifier=identifier,
+                    code="GOOD",
+                    auth_method=GuestAuthMethod.OTP_SMS,
+                    organization_id=None,
+                    location_id=fx.location_id,
+                    router_id=fx.router.id,
+                    device_mac=f"CC:DD:EE:FF:00:{index:02d}",
+                )
+            )
+        first = results[0]
+        again = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="CC:DD:EE:FF:00:00",
+        )
+        assert again.session.id == first.session.id  # reused, not a new row
+        connected = await fx.repository.count_active_devices_for_guest(
+            guest_id=first.guest.id
+        )
+        assert connected == DEFAULT_MAX_DEVICES_PER_GUEST
+
+    async def test_returning_idle_device_is_blocked_when_limit_others_connected(
+        self,
+    ) -> None:
+        """The same guest's OWN device, back after its session ended while
+        ``limit`` OTHER devices are already connected, is a genuinely new
+        simultaneous connection -- and is blocked. Registered state alone
+        never grants a slot; only an ACTIVE session does."""
+        fx = make_fixture()
+        identifier = "+15559990015"
+        # Device A: registered, then disconnected (idle but still owned).
+        first = await fx.guest_service.login_via_otp(
+            identifier=identifier,
+            code="GOOD",
+            auth_method=GuestAuthMethod.OTP_SMS,
+            organization_id=None,
+            location_id=fx.location_id,
+            router_id=fx.router.id,
+            device_mac="DD:EE:FF:00:11:00",
+        )
+        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        # Devices B/C/D: three ACTIVE connections (limit reached).
+        for index in range(1, DEFAULT_MAX_DEVICES_PER_GUEST + 1):
+            await fx.guest_service.login_via_otp(
                 identifier=identifier,
                 code="GOOD",
                 auth_method=GuestAuthMethod.OTP_SMS,
                 organization_id=None,
                 location_id=fx.location_id,
                 router_id=fx.router.id,
-                device_mac=mac,
+                device_mac=f"DD:EE:FF:00:11:{index:02d}",
             )
-            await fx.guest_service.disconnect_session(session_id=result.session.id)
-        count = await fx.repository.count_devices_for_guest(result.guest.id)
-        assert count == 1
+        with pytest.raises(GuestDeviceLimitExceededError):
+            await fx.guest_service.login_via_otp(
+                identifier=identifier,
+                code="GOOD",
+                auth_method=GuestAuthMethod.OTP_SMS,
+                organization_id=None,
+                location_id=fx.location_id,
+                router_id=fx.router.id,
+                device_mac="DD:EE:FF:00:11:00",
+            )
 
     async def test_device_limit_check_is_skipped_when_no_device_mac(self) -> None:
         """A login with no ``device_mac`` at all registers no device, so it
@@ -4969,7 +5099,7 @@ class TestDeviceLimit:
         the guest is already sitting at the limit via other, MAC-bearing
         logins."""
         fx = make_fixture()
-        identifier = "+15559990014"
+        identifier = "+15559990016"
         for index in range(DEFAULT_MAX_DEVICES_PER_GUEST):
             result = await fx.guest_service.login_via_otp(
                 identifier=identifier,
@@ -4999,7 +5129,7 @@ class TestDeviceLimit:
         ``DEFAULT_MAX_DEVICES_PER_GUEST`` -- see
         ``GuestService._resolve_device_limit``."""
         fx = make_fixture(policy_lookup=FakeDevicePolicyLookup(max_devices_per_guest=1))
-        identifier = "+15559990015"
+        identifier = "+15559990017"
         first = await fx.guest_service.login_via_otp(
             identifier=identifier,
             code="GOOD",
@@ -5009,7 +5139,7 @@ class TestDeviceLimit:
             router_id=fx.router.id,
             device_mac="EE:FF:00:11:22:01",
         )
-        await fx.guest_service.disconnect_session(session_id=first.session.id)
+        assert first.session.status == GuestSessionStatus.ACTIVE.value
 
         with pytest.raises(GuestDeviceLimitExceededError) as exc_info:
             await fx.guest_service.login_via_otp(

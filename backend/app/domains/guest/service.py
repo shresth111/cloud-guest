@@ -5287,17 +5287,29 @@ class GuestService:
         location_id: uuid.UUID | None,
     ) -> GuestDevice | None:
         """Guest Session Engine (Phase 1): raises
-        ``GuestDeviceLimitExceededError`` if registering ``mac_address``
-        against ``guest_id`` would push the guest over their own resolved
-        device limit. A no-op when ``mac_address`` is absent (no device to
-        register at all) or when the device already belongs to this exact
-        guest (a returning device, not a new one -- mirrors
-        ``get_or_create_device``'s own "reassignment" logic, checked here
-        without mutating anything). Called from ``login_via_otp``/
-        ``login_via_voucher`` after ``_enforce_concurrent_session_limit``,
-        before ``_maybe_get_or_create_device`` ever creates or reassigns a
-        row -- the identical "reject before touching anything with a side
-        effect" ordering that method's own docstring establishes.
+        ``GuestDeviceLimitExceededError`` if this connection would put
+        more of ``guest_id``'s devices **online at the same time** than
+        the guest's own resolved device limit allows. The basis is
+        currently-CONNECTED devices (distinct devices holding ``ACTIVE``
+        sessions), **not** registered devices: a guest may have registered
+        more devices than the limit over time (each was once connected),
+        and a registered-but-idle device does not occupy the limit -- only
+        devices with an ``ACTIVE`` session right now do. A no-op when
+        ``mac_address`` is absent (no device to register at all).
+
+        The device currently logging in is excluded from the count when it
+        already belongs to this guest: if it is already online, this is a
+        reconnect/refresh of one of the connected devices (its ``ACTIVE``
+        session is reused, not added); if it is idle, excluding it is a
+        no-op. A *new* device is therefore blocked exactly when ``limit``
+        OTHER devices are already connected -- the cap this check exists to
+        enforce. Mirrors ``get_or_create_device``'s own "reassignment"
+        logic, checked here without mutating anything. Called from
+        ``login_via_otp``/``login_via_voucher`` after
+        ``_enforce_concurrent_session_limit``, before
+        ``_maybe_get_or_create_device`` ever creates or reassigns a row --
+        the identical "reject before touching anything with a side effect"
+        ordering that method's own docstring establishes.
 
         Returns the real ``GuestDevice`` row this check already fetched by
         ``mac_address`` (``None`` when ``mac_address`` is absent) -- every
@@ -5312,13 +5324,24 @@ class GuestService:
         existing_device = await self.repository.get_device_by_mac(
             normalize_mac_address(mac_address)
         )
-        if existing_device is not None and existing_device.guest_id == guest_id:
-            return existing_device
-        device_count = await self.repository.count_devices_for_guest(guest_id)
+        # Only this guest's OWN device id is excluded from the connected
+        # count -- an existing own device that is online right now is being
+        # reconnected (session reuse), never added as a new connection. A
+        # device registered to another guest is not this guest's, so it
+        # cannot be the device this login is about (it will be reassigned
+        # by get_or_create_device) and excludes nothing.
+        exclude_device_id = (
+            existing_device.id
+            if existing_device is not None and existing_device.guest_id == guest_id
+            else None
+        )
+        connected_devices = await self.repository.count_active_devices_for_guest(
+            guest_id=guest_id, exclude_device_id=exclude_device_id
+        )
         limit = await self._resolve_device_limit(
             organization_id=organization_id, location_id=location_id, guest_id=guest_id
         )
-        if is_device_limit_reached(device_count=device_count, limit=limit):
+        if is_device_limit_reached(device_count=connected_devices, limit=limit):
             raise GuestDeviceLimitExceededError(guest_id=guest_id, limit=limit)
         return existing_device
 

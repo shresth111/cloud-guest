@@ -243,6 +243,10 @@ class GuestRepositoryProtocol(Protocol):
 
     async def count_active_sessions_for_guest(self, guest_id: uuid.UUID) -> int: ...
 
+    async def count_active_devices_for_guest(
+        self, *, guest_id: uuid.UUID, exclude_device_id: uuid.UUID | None = None
+    ) -> int: ...
+
     async def get_latest_ended_session_for_device(
         self,
         *,
@@ -913,6 +917,34 @@ class GuestRepository:
                 "status": GuestSessionStatus.ACTIVE.value,
             }
         )
+
+    async def count_active_devices_for_guest(
+        self, *, guest_id: uuid.UUID, exclude_device_id: uuid.UUID | None = None
+    ) -> int:
+        """Guest Session Engine (Phase 1): how many **distinct** devices
+        ``guest_id`` currently has ``ACTIVE`` sessions on -- backs
+        ``GuestService._enforce_device_limit``'s "connected devices, not
+        registered devices" basis. ``GenericRepository`` can only express
+        equality-filtered counts, never a ``COUNT(DISTINCT column)`` (its
+        grouped-count precedent is ``app.domains.voucher.repository``'s
+        ``get_batch_status_counts``), so this is hand-written: distinct
+        non-null ``device_id`` among the guest's ACTIVE sessions,
+        optionally excluding one device id -- the device currently logging
+        in, so a reconnect/refresh of an already-online device never counts
+        against itself."""
+        query = (
+            select(func.count(func.distinct(GuestSession.device_id)))
+            .where(
+                GuestSession.guest_id == guest_id,
+                GuestSession.status == GuestSessionStatus.ACTIVE.value,
+                GuestSession.device_id.is_not(None),
+                GuestSession.is_deleted.is_(False),
+            )
+        )
+        if exclude_device_id is not None:
+            query = query.where(GuestSession.device_id != exclude_device_id)
+        result = await self.session.execute(query)
+        return int(result.scalar_one())
 
     async def get_latest_ended_session_for_device(
         self,
