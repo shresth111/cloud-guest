@@ -22,7 +22,7 @@ directly from what each credential actually is (see ``auth.py``):
 | ``list_clients``     | **no**                        | yes                            |
 | ``get_client``       | **no**                        | yes                            |
 | ``authorize_guest``  | yes                           | yes, *if* operator credentials are also stored |
-| ``deauthorize_guest``| **no** (see below)            | **no** (see below)             |
+| ``deauthorize_guest``| **no** (Open API only)        | yes (see below)                |
 
 The legacy "no"s are not laziness. A hotspot operator account exists to
 authorize portal clients; the controller's inventory lives behind its admin
@@ -38,14 +38,22 @@ The only portal-authorization endpoint with primary TP-Link documentation is
 operator login. ``PortalAuthContext`` is literally the shape of that
 endpoint's redirect parameters.
 
-There are references in circulation to an Open API equivalent at
-``/openapi/v1/{omadacId}/sites/{siteId}/hotspot/clients/{clientMac}/auth``,
-but we could not tie that path to any primary TP-Link source or to any
-open-source client that calls it, so it is deliberately **not** implemented.
-Contract section 1's rule -- do not invent Omada API endpoints -- binds
-hardest on the one call that decides whether a paying guest gets internet.
-Guessing here and being wrong means a guest sits at a spinner while the
-controller 404s.
+An Open API equivalent does exist, and unlike when this was first written it
+now has a primary source: ``authClient``,
+``POST /openapi/v1/{omadacId}/sites/{siteId}/hotspot/clients/{clientMac}/auth``,
+in TP-Link's own OpenAPI specification at
+<https://use1-omada-northbound.tplinkcloud.com/v3/api-docs>. It is still
+deliberately **not** used for authorization, for a reason the spec itself
+supplies: it takes **no request body**, only the three path parameters. It
+cannot carry a duration, a rate limit, an SSID or an AP MAC. It is the
+"authorize this MAC" button from the controller's client list, not the
+external-portal grant. Authorizing a paying guest for a specific length of
+time is exactly what the legacy ``extPortal/auth`` endpoint is for, and it
+is the only one of the two that can express it.
+
+Its inverse, ``cancelAuthClient``, *is* used -- see ``deauthorize_guest``
+below. Revocation needs no duration, so the bodyless shape costs nothing
+there.
 
 So: an integration in ``openapi`` mode that also stores operator credentials
 authorizes through the legacy endpoint. One that does not gets
@@ -355,37 +363,54 @@ class OmadaControllerAdapter:
     async def deauthorize_guest(
         self, creds: ControllerCredentials, site_id: str, client_mac: str
     ) -> bool:
-        """Always raises ``OmadaUnsupportedApiError``. This is not a stub.
+        """End a guest's portal authorization now. **Open API mode only.**
 
-        TP-Link documents no way to revoke an external-portal authorization.
-        Every version of the *API and Code Sample for External Portal Server*
-        document covers exactly two calls -- operator login and client
-        authorization -- and neither the v4, v5 nor v6.2.10 revision mentions
-        deauthorization, expiry-shortening, or session teardown.
+        This method used to raise unconditionally, on the strength of CR-001
+        ("TP-Link publishes no client-deauthorization endpoint in any
+        generation"). CR-001 was wrong, and the correction is worth stating
+        plainly because a whole product decision was built on it.
 
-        The options were: invent an endpoint (forbidden by contract section
-        1, and a wrong guess on a write is how you knock a paying guest
-        offline); repurpose the Open API's ``clients/{mac}/block`` route,
-        which is a *blocklist* -- a materially more punitive and longer-lived
-        action than ending a portal session, and one an operator would have
-        to undo by hand; or say plainly that this cannot be done and let the
-        caller handle it.
+        What was true: the *external portal* API family -- docs 13023, 13080
+        and 132060 -- documents exactly two calls, operator login and client
+        authorization, and none of the three revisions mentions revocation.
+        Reading only those, the conclusion follows.
 
-        We say plainly that it cannot be done. Access ends when the
-        ``duration_seconds`` passed to ``authorize_guest`` elapses, which is
-        the mechanism Omada actually provides, so the backend should size
-        that duration to the session it wants rather than planning to revoke
-        early. ``OMADA_API_UNSUPPORTED`` is a normalized, catchable code, so
-        a caller can degrade gracefully.
+        What was missed: TP-Link publishes a machine-readable OpenAPI 3.0.1
+        specification for the Omada *Open* API from its own cloud host,
+        <https://use1-omada-northbound.tplinkcloud.com/v3/api-docs>. It has
+        an ``Authorized Client`` tag containing ``cancelAuthClient`` --
+        ``POST /openapi/v1/{omadacId}/sites/{siteId}/hotspot/clients/
+        {clientMac}/unauth``, "Cancel authentication the given client" -- and
+        the same spec's ``authType`` enum confirms it covers "4: External
+        Portal Server" sessions, which is exactly what ``authorize_guest``
+        creates. See ``portal.py``'s docstring for the full sourcing, the
+        per-version availability, and why ``block``/``disconnect``/
+        ``authed-records`` were each rejected in its favour.
 
-        The signature keeps the contract's ``-> bool`` so the Protocol is
-        satisfied and the shape stays correct if TP-Link ever publishes one.
+        The version floor is the Open API's own: the operation is present
+        from ``oc_series`` 5.13.0, the first firmware with Open API at all.
+
+        Legacy mode still cannot do this, and says so rather than pretending.
+        A hotspot operator credential authorizes portal clients and nothing
+        else; revocation lives behind Open API. That is a real, honest
+        capability gap for a legacy-only integration and the caller must
+        surface it as one -- but it is a much narrower gap than "nobody can
+        ever revoke anyone", which is what CR-001 asserted.
         """
-        raise OmadaUnsupportedApiError(
-            "Omada does not provide a way to end a guest's network access "
-            "early. Access ends automatically when the authorized duration "
-            "expires."
-        )
+        if creds.auth_mode != ControllerAuthMode.OPENAPI:
+            raise OmadaUnsupportedApiError(
+                "Ending a guest's access early needs Omada Open API access. "
+                "This integration is configured with a hotspot operator "
+                "login, which can authorize guests but cannot revoke them. "
+                "Add Open API credentials (controller v5.13+, Settings > "
+                "Platform Integration > Open API) to enable it. Until then, "
+                "access ends only when the authorized duration expires."
+            )
+        async with self._client(creds) as client:
+            omadac_id = await client.resolve_omadac_id()
+            return await portal_module.deauthorize_client(
+                client, omadac_id, site_id, client_mac
+            )
 
 
 def _as_legacy(creds: ControllerCredentials) -> ControllerCredentials:

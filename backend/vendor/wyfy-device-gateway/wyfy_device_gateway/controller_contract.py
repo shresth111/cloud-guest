@@ -223,6 +223,20 @@ class PortalAuthContext:
     vid: int | None = None
     t: str | None = None
     redirect_url: str | None = None
+    #: VERIFIED (TP-Link doc 132060, "API and Code Samples for External
+    #: Portal Server (Omada Controller v6.2.10 or Above)"). On v6.2.10+ the
+    #: controller adds ``clientIp`` to the portal redirect and lists it among
+    #: the parameters the authorization body "must contain", for both the EAP
+    #: and the Gateway shape. It does not appear anywhere in the v5.0.15-
+    #: v6.2.0 document (13080), which is why it is optional here: omit it and
+    #: an older controller is unaffected, populate it and a v6.2.10+
+    #: controller gets a body that matches its own documentation.
+    #:
+    #: Callers should pass through whatever ``clientIp`` arrived on the
+    #: redirect and must NOT substitute the HTTP peer address of the portal
+    #: request -- behind NAT or a proxy that is a different address, and a
+    #: wrong client IP is worse than an absent one.
+    client_ip: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import random
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 
 from wyfy_device_gateway.controller_contract import (
@@ -20,6 +21,7 @@ from wyfy_device_gateway.controller_contract import (
 from wyfy_device_gateway.omada.adapter import OmadaControllerAdapter
 from wyfy_device_gateway.omada.errors import (
     OmadaAuthorizationError,
+    OmadaError,
     OmadaUnsupportedApiError,
 )
 from wyfy_device_gateway.omada.portal import MAX_DURATION_SECONDS, build_authorize_body
@@ -29,6 +31,7 @@ from omada_support import (
     OMADAC_ID,
     SESSION_COOKIE_VALUE,
     FakeOmadaController,
+    envelope,
     make_creds,
     no_sleep,
 )
@@ -261,9 +264,46 @@ async def test_authorize_recovers_from_an_expired_operator_session():
 # --- deauthorization -------------------------------------------------------
 
 
-async def test_deauthorize_reports_unsupported_rather_than_guessing():
-    """TP-Link publishes no deauthorization endpoint. We say so with a
-    normalized, catchable code instead of repurposing the blocklist."""
+async def test_deauthorize_calls_tp_links_documented_unauth_endpoint():
+    """CR-001 said no deauthorization endpoint exists anywhere. It does:
+    ``cancelAuthClient`` in TP-Link's own published OpenAPI specification."""
+    controller = FakeOmadaController()
+
+    result = await _adapter(controller).deauthorize_guest(
+        make_creds(ControllerAuthMode.OPENAPI), "SITE-1", "AA-BB-CC-DD-EE-FF"
+    )
+
+    assert result is True
+    request = controller.requests[-1]
+    assert request.method == "POST"
+    assert request.url.path == (
+        f"/openapi/v1/{OMADAC_ID}/sites/SITE-1/hotspot/clients/"
+        "AA-BB-CC-DD-EE-FF/unauth"
+    )
+    # The spec documents no request body for this operation, and sending one
+    # we invented is exactly the failure mode CR-001 was trying to avoid.
+    assert not request.content
+
+
+async def test_deauthorize_normalizes_the_mac_to_omadas_documented_form():
+    """The spec spells the path parameter out as "format: AA-BB-CC-DD-EE-FF".
+    A caller holding colon-separated lower case must still address the same
+    client rather than silently revoking nobody."""
+    controller = FakeOmadaController()
+
+    await _adapter(controller).deauthorize_guest(
+        make_creds(ControllerAuthMode.OPENAPI), "SITE-1", "aa:bb:cc:dd:ee:ff"
+    )
+
+    assert controller.requests[-1].url.path.endswith(
+        "/clients/AA-BB-CC-DD-EE-FF/unauth"
+    )
+
+
+async def test_deauthorize_refuses_in_legacy_mode_without_sending_anything():
+    """``cancelAuthClient`` is an Open API operation. A hotspot operator
+    credential cannot make it, and pretending otherwise would report a
+    revocation that never happened."""
     controller = FakeOmadaController()
 
     with pytest.raises(OmadaUnsupportedApiError) as excinfo:
@@ -272,15 +312,79 @@ async def test_deauthorize_reports_unsupported_rather_than_guessing():
         )
 
     assert excinfo.value.code == "OMADA_API_UNSUPPORTED"
-    assert "expires" in str(excinfo.value).lower()
-    # Crucially: it never sent a write to the controller.
+    assert "open api" in str(excinfo.value).lower()
     assert controller.requests == []
 
 
-async def test_deauthorize_is_unsupported_in_openapi_mode_too():
+async def test_deauthorize_propagates_a_controller_refusal():
+    """A non-zero errorCode must not come back as ``True``."""
     controller = FakeOmadaController()
-    with pytest.raises(OmadaUnsupportedApiError):
+    controller.routes["/unauth"] = lambda request: httpx.Response(
+        200, json=envelope(error_code=-1600, msg="Operation not supported.")
+    )
+
+    with pytest.raises(OmadaError):
         await _adapter(controller).deauthorize_guest(
-            make_creds(ControllerAuthMode.OPENAPI), "Default", "AA-BB-CC-DD-EE-FF"
+            make_creds(ControllerAuthMode.OPENAPI), "SITE-1", "AA-BB-CC-DD-EE-FF"
         )
-    assert controller.requests == []
+
+
+# --- clientIp: required on v6.2.10+, absent before it -----------------------
+# VERIFIED against TP-Link doc 132060 ("API and Code Samples for External
+# Portal Server (Omada Controller v6.2.10 or Above)"), which lists clientIp
+# among the parameters the body "must contain" for both the EAP and the
+# Gateway shape, and against doc 13080 (v5.0.15-v6.2.0), which does not
+# contain the string at all.
+
+
+def test_client_ip_is_sent_when_the_redirect_carried_it():
+    body = build_authorize_body(
+        PortalAuthContext(
+            client_mac="AA-BB-CC-DD-EE-FF",
+            site="Default",
+            ap_mac="11-22-33-44-55-66",
+            ssid_name="Wyfy Guest",
+            radio_id=1,
+            client_ip="10.0.0.99",
+        ),
+        duration_seconds=600,
+    )
+    assert body["clientIp"] == "10.0.0.99"
+
+
+def test_client_ip_is_omitted_entirely_on_an_older_controllers_redirect():
+    """A v5 controller never sends clientIp, so we must not invent one --
+    an empty string or a guessed peer address is a value the controller
+    would try to match against a real pending session and fail."""
+    body = build_authorize_body(
+        PortalAuthContext(
+            client_mac="AA-BB-CC-DD-EE-FF",
+            site="Default",
+            gateway_mac="11-22-33-44-55-66",
+            vid=30,
+        ),
+        duration_seconds=600,
+    )
+    assert "clientIp" not in body
+
+
+async def test_client_ip_reaches_the_controller_on_the_authorize_call():
+    controller = FakeOmadaController()
+    ctx = PortalAuthContext(
+        client_mac="AA-BB-CC-DD-EE-FF",
+        site="Default",
+        ap_mac="11-22-33-44-55-66",
+        ssid_name="Wyfy Guest",
+        radio_id=1,
+        client_ip="10.0.0.99",
+    )
+
+    await _adapter(controller).authorize_guest(
+        make_creds(ControllerAuthMode.LEGACY), ctx, duration_seconds=600
+    )
+
+    authorize_body = controller.bodies[-1]
+    assert authorize_body["clientIp"] == "10.0.0.99"
+    assert authorize_body["clientMac"] == "AA-BB-CC-DD-EE-FF"
+    assert authorize_body["authType"] == "4"
+    assert authorize_body["time"] == 600_000

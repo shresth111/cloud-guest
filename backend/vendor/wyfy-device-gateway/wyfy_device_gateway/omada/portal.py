@@ -59,6 +59,25 @@ rejected or expire instantly -- a loud, immediately-obvious failure on first
 contact with real hardware, not a silent one. That is the main reason it is
 safe to ship the inference and verify it on the first real controller.
 
+## ``clientIp`` is required on v6.2.10+ and absent before it
+
+**VERIFIED**, and a genuine version split. Doc 132060 (v6.2.10 or above)
+says the body "must contain the following parameters" and lists
+``clientIp`` second in both the EAP and the Gateway shape:
+
+    For EAP: {"clientMac":"...","clientIp":"...","apMac":"...","ssidName":
+    "...","radioId":"...","time":"...","authType":"4","originUrl":"", ...}
+
+and the redirect it documents carries it too
+(``...?clientMac=...&clientIp=CLIENT_IP&apMac=...``). Doc 13080
+(v5.0.15-v6.2.0) does not contain the string ``clientIp`` at all -- not in
+the redirect, not in the body, not in the parameter table.
+
+So it is sent only when ``PortalAuthContext.client_ip`` is populated, which
+is exactly when the controller itself supplied it on the redirect. That
+makes the same code correct on both sides of the split without us having to
+predict a version.
+
 ## Bandwidth limits are v6.2.10+ only
 
 ``downloadRateLimitKbps`` / ``uploadRateLimitKbps`` /
@@ -69,10 +88,64 @@ JSON fields in the bodies we have seen, but sending version-specific fields
 unconditionally to an older controller is an avoidable risk on the one call
 in this package that a paying guest's internet access depends on.
 
-## There is no deauthorization endpoint
+## Deauthorization DOES exist -- CR-001 was wrong (corrected 2026-09-10)
 
-TP-Link publishes no way to revoke an external-portal authorization. See
-``adapter.deauthorize_guest``.
+The original CR-001 claimed "TP-Link publishes no client-deauthorization
+endpoint in any generation". That claim was based on the external-portal
+documents alone, and within that family it is true: docs 13023, 13080 and
+132060 document exactly two calls, login and authorize, and none of them
+mentions revoking anything.
+
+It is false for the product as a whole. TP-Link publishes a machine-readable
+OpenAPI 3.0.1 specification for the Omada Open API from its own cloud host,
+<https://use1-omada-northbound.tplinkcloud.com/v3/api-docs> (rendered at
+``/doc.html``, and mirrored as human docs at
+<https://omada-northbound-docs.tplinkcloud.com/>). That spec contains an
+entire ``Authorized Client`` tag, and in it:
+
+    POST /openapi/v1/{omadacId}/sites/{siteId}/hotspot/clients/{clientMac}/unauth
+    operationId: cancelAuthClient
+    summary:     "Cancel authentication the given client"
+    description: "Cancel the authentication of this client with the given
+                  omadacId, siteId, clientMac."
+    parameters:  omadacId, siteId, clientMac -- all path, all required
+    body:        none
+    response:    {"errorCode": int, "msg": str}
+
+This is the exact inverse of ``authClient``
+(``.../hotspot/clients/{clientMac}/auth``) and it covers external-portal
+sessions specifically: the same spec's ``AuthClientOpenApiVO.authType``
+enumerates "4: External Portal Server", which is precisely the ``authType``
+this module sends when it authorizes.
+
+**Availability.** TP-Link's docs site publishes the operation list per model
+and per firmware version. ``cancelAuthClient`` is present in every version it
+covers, from ``oc_series`` 5.13.0 (the first release with Open API at all)
+through 6.2.14, in ``software`` 6.2.0+, and in Omada Pro v1.3.0+. So it
+raises no firmware floor beyond the one Open API already imposes.
+
+**Why this endpoint and not one of the others.** The spec also offers
+``blockClient``/``unblockClient`` (5.13.0+), ``reconnectClient`` (5.13.0+),
+``disconnectClient`` (5.15.24+), ``disconnectHotspotAuthedClient`` and
+``deleteHotspotAuthedClient`` (both 5.15.20+, and both keyed on an
+authed-record id we would have to look up first), plus MAC filters and ACLs.
+``unauth`` is the only one that is semantically "end this portal session",
+takes only the MAC we already hold, needs no lookup and no body, and raises
+no version floor. ``block`` remains deliberately unused: it is a persistent
+controller-level denial that an operator must clear by hand, which is a
+materially different and more punitive action than ending a session.
+
+**The one thing this does NOT do:** it is an *Open API* call. A hotspot
+operator credential cannot make it. An integration configured for legacy
+mode only can still authorize guests and still cannot revoke them --
+``adapter.deauthorize_guest`` says exactly that.
+
+Note also ``extendHotspotAuthedClient``
+(``.../hotspot/authed-records/{id}/period``) will not serve as a "shorten to
+zero" trick: its ``period`` is documented as "within the range of 60000 to
+86400000000000", so 60 seconds is the floor. And ``time: 0`` on the
+external-portal authorize call is undocumented in every TP-Link revision --
+do not rely on it.
 """
 
 from __future__ import annotations
@@ -85,9 +158,19 @@ from .auth import LEGACY_AUTHORIZE_PATH
 from .client import OmadaHttpClient
 from .errors import OmadaAuthorizationError
 from .redaction import sanitize_detail
+from .types import normalize_mac
 
 #: VERIFIED (TP-Link docs 13080 / 132060): external portal / RADIUS-free auth.
+#: Corroborated a second way by the Open API spec, whose
+#: ``AuthClientOpenApiVO.authType`` enumerates "4: External Portal Server".
 AUTH_TYPE_EXTERNAL_PORTAL = 4
+
+#: VERIFIED (TP-Link's own OpenAPI 3.0.1 spec, ``operationId:
+#: cancelAuthClient``). See this module's docstring for the full quotation
+#: and the per-version availability.
+OPENAPI_UNAUTH_PATH = (
+    "/openapi/v1/{omadac_id}/sites/{site_id}/hotspot/clients/{client_mac}/unauth"
+)
 
 #: Sanity ceiling on a single authorization, 24 hours. A caller passing a
 #: nonsense duration (a timestamp mistaken for a duration, say) would
@@ -126,6 +209,13 @@ def build_authorize_body(
         # have seen.
         "authType": str(AUTH_TYPE_EXTERNAL_PORTAL),
     }
+
+    # VERIFIED (doc 132060): required on v6.2.10+, and absent from doc 13080
+    # entirely. Sent only when the redirect actually carried it, which is the
+    # only situation in which we have a trustworthy value -- see
+    # ``PortalAuthContext.client_ip``.
+    if ctx.client_ip:
+        body["clientIp"] = ctx.client_ip
 
     is_gateway_path = ctx.gateway_mac is not None or ctx.vid is not None
     if is_gateway_path:
@@ -201,9 +291,45 @@ async def authorize_client(
     )
 
 
+async def deauthorize_client(
+    client: OmadaHttpClient,
+    omadac_id: str,
+    site_id: str,
+    client_mac: str,
+) -> bool:
+    """End one client's portal authorization now, via the Open API.
+
+    Returns ``True`` on ``errorCode: 0``. Anything else has already been
+    turned into a normalized ``OmadaError`` by ``client.request``, so there
+    is no falsy-but-fine path here -- the ``bool`` return exists to satisfy
+    contract section 2's signature, and a caller that gets ``True`` can trust
+    the controller accepted the revocation.
+
+    The MAC is normalized to Omada's own documented ``AA-BB-CC-DD-EE-FF``
+    form (the spec spells the parameter out as "Client MAC, format:
+    AA-BB-CC-DD-EE-FF") so that a caller holding ``aa:bb:cc:dd:ee:ff`` --
+    which is what the portal redirect and our own database both tend to
+    carry -- does not silently address a different client, or none.
+
+    Note what this is not: it is not a block. The client can walk back to the
+    captive portal and authorize again, which is the correct behaviour for
+    "this session is over" and the reason ``blockClient`` is not used here.
+    """
+    normalized = normalize_mac(client_mac) or client_mac
+    await client.request(
+        "POST",
+        OPENAPI_UNAUTH_PATH.format(
+            omadac_id=omadac_id, site_id=site_id, client_mac=normalized
+        ),
+    )
+    return True
+
+
 __all__ = [
     "AUTH_TYPE_EXTERNAL_PORTAL",
     "MAX_DURATION_SECONDS",
+    "OPENAPI_UNAUTH_PATH",
     "authorize_client",
     "build_authorize_body",
+    "deauthorize_client",
 ]

@@ -52,9 +52,8 @@ account for the captive portal.
 
 See ``adapter.py``'s module docstring for the full table. The short version:
 inventory needs ``openapi``; guest authorization needs operator credentials
-in either mode; **deauthorization is not possible at all**, because TP-Link
-publishes no endpoint for it -- ``deauthorize_guest`` raises
-``OmadaUnsupportedApiError`` rather than guessing at a write operation.
+in either mode; **deauthorization needs ``openapi``** and is done with
+TP-Link's documented ``cancelAuthClient`` operation (see ``portal.py``).
 
 ## The endpoint transposition (contract section 1a), resolved
 

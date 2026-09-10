@@ -1,13 +1,35 @@
 """Managed devices (APs, switches, gateways) for one site, via the Open API.
 
-## Sourcing
+## Sourcing -- VERIFIED (upgraded 2026-09-10)
 
-``GET /openapi/v1/{omadacId}/sites/{siteId}/devices`` is **corroborated, not
-primary**: it is what the community client at
-<https://github.com/bullitt186/ha-omada-open-api> uses (``const.py``:
-``API_DEVICES = "/openapi/v1/{omada_id}/sites/{site_id}/devices"``). The
-authoritative reference is the Online API Document served by a running
-controller, which is not publicly reachable.
+``GET /openapi/v1/{omadacId}/sites/{siteId}/devices`` is **VERIFIED against a
+primary TP-Link source**: ``operationId: getGridSiteDevices``, summary "Get
+site device list", in TP-Link's own OpenAPI 3.0.1 specification at
+<https://use1-omada-northbound.tplinkcloud.com/v3/api-docs>
+(rendered at ``/doc.html``; human docs at
+<https://omada-northbound-docs.tplinkcloud.com/>). ``page`` and ``pageSize``
+are documented as **required** query parameters, which ``get_all_pages``
+already sends.
+
+It was previously marked corroborated-only, from the community client at
+<https://github.com/bullitt186/ha-omada-open-api>. That client had the path
+exactly right.
+
+## What the spec says is NOT here
+
+Two fields this module reads for do not exist in TP-Link's ``DeviceInfo``
+schema, and are left in place only as harmless fallbacks:
+
+* **client count.** There is no ``clientNum``/``clientCount``/``clients``
+  field. ``ControllerDevice.client_count`` will therefore be ``None`` for
+  every device. Getting a per-AP client count means grouping the client list
+  by ``apMac``, which is a caller's decision, not this parser's.
+* **uptime as a number.** ``DeviceInfo.uptime`` is typed **string**, not
+  integer. If a controller sends a numeric string, ``coerce_int`` parses it;
+  if it sends a formatted duration ("2day(s) 3h 4m"), ``coerce_int`` returns
+  ``None``. Blank is the right failure here -- a mis-parsed uptime is worse
+  than an absent one -- so this is documented rather than guessed at, and
+  wants confirming against a real controller.
 
 ## Field names are read defensively, on purpose
 
@@ -39,7 +61,7 @@ from .types import (
     normalize_mac,
 )
 
-#: CORROBORATED (community client), not primary.
+#: VERIFIED (TP-Link OpenAPI spec, ``getGridSiteDevices``).
 DEVICES_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/devices"
 
 
