@@ -63,6 +63,7 @@ Read the entries as a review, not as a checklist that has been ticked.
 from __future__ import annotations
 
 import ast
+import functools
 import pathlib
 
 import pytest
@@ -406,8 +407,15 @@ def _calls_a_narrowing_helper(parents: dict, tree: ast.Module) -> set[str]:
     return narrowed
 
 
+@functools.cache
 def _router_read_sites() -> dict[str, bool]:
-    """``{"<path>::<qualname>": narrowed_in_sql}`` for the whole app."""
+    """``{"<path>::<qualname>": narrowed_in_sql}`` for the whole app.
+
+    Cached: a dozen assertions below each want the same answer, and
+    re-parsing every module in ``app/`` once per test added twenty seconds
+    to a suite that already takes minutes. The tree does not change while
+    the suite runs.
+    """
     sites: dict[str, bool] = {}
     for path in sorted(APP_ROOT.rglob("*.py")):
         if path == THE_GATE_ITSELF:
