@@ -104,7 +104,11 @@ from app.domains.rbac.location_scope import (
 )
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
-from app.domains.router.vendor_capabilities import supports_zero_touch_provisioning
+from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import (
+    agent_managed_rows,
+    supports_zero_touch_provisioning,
+)
 from app.domains.router_provisioning.constants import EnrollmentStatus
 from app.domains.router_provisioning.models import RouterEvent
 
@@ -1700,6 +1704,45 @@ class AlertService:
             return await self._evaluate_threshold_rule(rule)
         return await self._evaluate_event_occurred_rule(rule)
 
+    async def _agent_managed_routers(
+        self, organization_id: uuid.UUID | None
+    ) -> list[Router]:
+        """The roster an alert rule may judge.
+
+        Contract 11.5. Every router-targeted rule in this service reads a
+        column only this platform's own agent ever writes --
+        ``health_status`` (stamped from an agent health snapshot),
+        ``reachability_state`` (written solely by
+        ``RouterService.sweep_router_reachability``, which is driven by
+        ``router_agent_credentials.last_used_at``), and the threshold
+        rules' ``RouterHealthSnapshot`` metrics. A controller-managed fleet
+        row -- a TP-Link Omada controller, present only because
+        ``guest_sessions.router_id`` is NOT NULL -- runs no agent, so those
+        columns are NULL for it permanently and by construction, not
+        temporarily.
+
+        Today that makes most of those comparisons quietly false, which is
+        why nothing has fired yet. That is luck, not design: it holds only
+        while every one of those columns stays NULL and no rule is ever
+        written against the NULL-ish states. A single rule created for
+        ``health_status = 'unknown'``, or one future sweep that stamps a
+        default, turns a healthy Omada venue into a paging alert with no
+        remedy -- there is no action an operator could take on a device
+        that will never run an agent. Excluded here, once, rather than
+        re-derived at each of the three branches.
+
+        ``repository.list_routers`` is deliberately left unfiltered.
+        ``get_router_names_for_alerts`` uses the same read to turn a
+        router id into a name for the Alerts page, and a controller
+        missing from *that* lookup would put a bare UUID back on a
+        customer's dashboard -- the defect that method exists to fix. One
+        read, two questions, and the vendor question belongs to whichever
+        of them is about a device's health.
+        """
+        return agent_managed_rows(
+            await self.repository.list_routers(organization_id=organization_id)
+        )
+
     async def _evaluate_health_status_rule(
         self, rule: AlertRule
     ) -> tuple[list[Alert], list[Alert]]:
@@ -1793,9 +1836,7 @@ class AlertService:
             return await self._evaluate_rogue_dhcp_guard_rule(rule, expected_status)
 
         if rule.target_component == ALERT_TARGET_ROUTER_REACHABILITY:
-            routers = await self.repository.list_routers(
-                organization_id=rule.organization_id
-            )
+            routers = await self._agent_managed_routers(rule.organization_id)
             for router in routers:
                 # `reachability_state` is written only by
                 # `RouterService.sweep_router_reachability`, already
@@ -1835,9 +1876,7 @@ class AlertService:
             return triggered, resolved
 
         if rule.target_component == ALERT_TARGET_ROUTER:
-            routers = await self.repository.list_routers(
-                organization_id=rule.organization_id
-            )
+            routers = await self._agent_managed_routers(rule.organization_id)
             for router in routers:
                 condition_met = router.health_status == expected_status
                 existing = await self.repository.find_active_alert(
@@ -2054,9 +2093,7 @@ class AlertService:
         operator = ThresholdOperator(rule.condition_config["operator"])
         threshold_value = float(rule.condition_config["value"])
 
-        routers = await self.repository.list_routers(
-            organization_id=rule.organization_id
-        )
+        routers = await self._agent_managed_routers(rule.organization_id)
         for router in routers:
             snapshot = await self.repository.get_latest_router_health_snapshot(
                 router.id

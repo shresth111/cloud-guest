@@ -790,6 +790,23 @@ class MonitoringRepository:
     async def list_routers(
         self, *, organization_id: uuid.UUID | None = None
     ) -> list[Router]:
+        """Every non-deleted router in scope -- **including
+        controller-managed ones**, deliberately.
+
+        Two callers want different things from this one read.
+        ``AlertService.get_router_names_for_alerts`` needs every row, a
+        controller included, or an alert that references one renders a bare
+        UUID on the customer's Alerts page -- the exact defect that method
+        was written to fix. The rule evaluator needs only the rows an agent
+        reports for, and narrows this result itself through
+        ``AlertService._agent_managed_routers``.
+
+        So the vendor question is answered at the call site here rather
+        than in the WHERE clause, and which call sites those are is pinned
+        by ``tests/unit/test_router_read_vendor_coverage.py``. Contrast
+        ``ConnectedDeviceRepository.list_routers_for_sync``, where there is
+        no such second caller and the filter belongs in the query.
+        """
         statement = select(Router).where(Router.is_deleted.is_(False))
         if organization_id is not None:
             statement = statement.where(Router.organization_id == organization_id)
