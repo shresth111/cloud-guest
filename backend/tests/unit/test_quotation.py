@@ -35,6 +35,7 @@ from app.domains.quotation.constants import (
 from app.domains.quotation.exceptions import QuotationNotFoundError
 from app.domains.quotation.models import Quotation, QuotationLineItem
 from app.domains.quotation.quotation_pdf import render_quotation_pdf
+from app.domains.quotation.router import _build_quotation_response
 from app.domains.quotation.service import LineItemInput, QuotationService
 
 # ============================================================================
@@ -270,6 +271,37 @@ class TestRenderQuotationPdf:
             "INFOVERITAS TECHNOLOGIES PRIVATE LIMITED"
         )
         assert QUOTATION_PRODUCT_NAME == "WyfyGuest"
+
+
+class TestBuildQuotationResponse:
+    def test_response_builder_passes_payment_and_terms_fields(self) -> None:
+        """Regression: adding payment_terms/terms_and_conditions to the
+        response schema made them required, but the response builder did not
+        forward them -- so every POST/GET /quotations returned a Pydantic
+        ValidationError (500). This pins the builder to the model's fields."""
+        quotation = Quotation(
+            **_base_fields(
+                quotation_number="QUO-2026-TEST",
+                status=QuotationStatus.SENT.value,
+                client_name="Jane Doe",
+                client_email="jane@example.com",
+                client_company_name="Example Hotel",
+                subtotal=Decimal("100.00"),
+                tax_percentage=Decimal("0"),
+                tax_amount=Decimal("0"),
+                total_amount=Decimal("100.00"),
+                currency="INR",
+                valid_until=_now() + timedelta(days=7),
+                notes="hello",
+                payment_terms="50% advance",
+                terms_and_conditions="1. One week.",
+                sent_at=_now(),
+                email_error=None,
+            )
+        )
+        response = _build_quotation_response(quotation, [])
+        assert response.payment_terms == "50% advance"
+        assert response.terms_and_conditions == "1. One week."
 
 
 # ============================================================================

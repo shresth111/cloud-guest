@@ -65,6 +65,8 @@ def _build_quotation_response(
         currency=quotation.currency,
         valid_until=quotation.valid_until,
         notes=quotation.notes,
+        payment_terms=quotation.payment_terms,
+        terms_and_conditions=quotation.terms_and_conditions,
         sent_at=quotation.sent_at,
         email_error=quotation.email_error,
         created_at=quotation.created_at,
