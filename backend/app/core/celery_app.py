@@ -158,6 +158,10 @@ from app.domains.network_diagnostics.constants import (
     DIAGNOSTIC_RUN_RETENTION_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
 )
+from app.domains.network_integration.constants import (
+    NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS,
+    TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP,
+)
 from app.domains.notification.constants import TASK_RUN_NOTIFICATION_DISPATCH_SWEEP
 from app.domains.provisioning_engine.constants import (
     PROVISION_QUEUE_DRAIN_INTERVAL_SECONDS,
@@ -228,6 +232,7 @@ celery_app = Celery(
         "app.domains.isp.tasks",
         "app.domains.monitoring.tasks",
         "app.domains.network_diagnostics.tasks",
+        "app.domains.network_integration.tasks",
         "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
@@ -307,6 +312,17 @@ celery_app.conf.update(
         TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER: {
             "queue": DEVICE_IO_QUEUE_NAME
         },
+        # The network-integration sync sweep issues real HTTPS round trips
+        # to *customer-owned* network controllers -- one login plus several
+        # resource reads per enabled integration, each with its own
+        # multi-second timeout against hardware this platform does not
+        # operate and cannot restart. Exactly the reason this queue exists,
+        # and the same "single sequential sweep, no per-integration
+        # fan-out, real device I/O of its own" shape as
+        # TASK_RUN_ISP_HEALTH_CHECK_SWEEP above: even un-fanned-out, one
+        # unreachable controller can no longer starve a pure-DB sweep
+        # waiting behind it in the shared default queue.
+        TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
     },
     beat_schedule={
         # Hub reconciliation -- every 5 minutes, the shortest cadence in
@@ -699,6 +715,24 @@ celery_app.conf.update(
         "network-diagnostics-run-retention-sweep": {
             "task": TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
             "schedule": DIAGNOSTIC_RUN_RETENTION_SWEEP_INTERVAL_SECONDS,
+        },
+        # Network integrations: poll each enabled third-party controller
+        # (TP-Link Omada today) for its sites/devices/clients. The
+        # 60-second schedule here is the Beat *tick*, not the polling
+        # period -- each integration row carries its own
+        # sync_interval_seconds (300s by default) and the sweep selects
+        # only the rows whose own interval has actually elapsed, because a
+        # single Beat entry cannot express "every row has its own period".
+        # The tick is therefore the floor of the allowed intervals; see
+        # app.domains.network_integration.constants
+        # .NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS's own comment,
+        # and app.domains.notification.tasks for the identical
+        # arrangement. Routed onto DEVICE_IO_QUEUE_NAME above -- unlike
+        # every other entry in this block it does real outbound I/O to
+        # hardware this platform does not own.
+        "network-integration-sync-sweep": {
+            "task": TASK_RUN_NETWORK_INTEGRATION_SYNC_SWEEP,
+            "schedule": NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS,
         },
     },
 )

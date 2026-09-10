@@ -98,6 +98,12 @@ NOT_SCOPE_BEARING_ID_PARAMS: frozenset[str] = frozenset(
         "entry_id",
         "guest_id",
         "incident_id",
+        # A network integration is reached by its own id. It names no
+        # scope dimension: an integration_id says nothing about which
+        # tenant or site owns it until the row is loaded, which is why
+        # app.domains.network_integration.service._load_owned_integration
+        # re-verifies organization_id AND location on every by-id path.
+        "integration_id",
         "invoice_id",
         "job_id",
         "license_id",

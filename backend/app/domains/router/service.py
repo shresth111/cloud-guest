@@ -95,9 +95,11 @@ from .exceptions import (
     RouterDecommissionedError,
     RouterLiveCredentialRotationFailedError,
     RouterNotFoundError,
+    RouterVendorNotProvisionableError,
 )
 from .models import Router, RouterProvisioningToken
 from .repository import RouterRepositoryProtocol
+from .vendor_capabilities import supports_zero_touch_provisioning
 
 logger = logging.getLogger(__name__)
 
@@ -637,6 +639,15 @@ class RouterService:
         router = await self.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # Checked before the status ladder below, because "wrong status" is
+        # a temporary answer and this one is permanent -- a controller-managed
+        # device is never going to be in a status where a token is useful.
+        # `app.domains.router_provisioning.adapters.get_provisioning_adapter`
+        # would refuse this vendor a few steps later anyway; refusing here
+        # means the operator is told before a single-use token is minted and
+        # handed to them, rather than after.
+        if not supports_zero_touch_provisioning(router):
+            raise RouterVendorNotProvisionableError(router_id, router.vendor)
         if router.status not in (
             RouterStatus.PENDING_PROVISIONING.value,
             RouterStatus.PROVISIONING.value,

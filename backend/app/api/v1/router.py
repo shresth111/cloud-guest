@@ -51,6 +51,12 @@ from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
 from app.domains.network_device.router import router as network_device_router
 from app.domains.network_diagnostics.router import router as network_diagnostics_router
+from app.domains.network_integration.router import (
+    portal_router as network_integration_portal_router,
+)
+from app.domains.network_integration.router import (
+    router as network_integration_router,
+)
 from app.domains.notification.router import router as notification_router
 from app.domains.organization.router import router as organization_router
 from app.domains.otp.router import router as otp_router
@@ -97,6 +103,14 @@ from app.domains.workspace.router import router as workspace_router
 #   Cutting a venue's guest WiFi over a billing state would punish the guests
 #   standing in its lobby for the owner's lapsed card, and turn a revenue
 #   problem into an outage. This is the single most important line here.
+# * `network_integration_portal_router` -- the single unauthenticated
+#   `POST /network-integrations/portal/authorize`, which is the network-
+#   enforcement step of a guest getting online (the Omada equivalent of the
+#   MikroTik `link-login-only` POST). Gating it would mean a venue whose card
+#   lapsed stops being able to put guests on its WiFi at all -- the same
+#   reasoning that keeps every other guest-facing path off this list, and the
+#   reason this domain ships two routers rather than one: the customer/platform
+#   CRUD half IS gated, immediately below.
 # * `voucher_router` -- it carries two *unauthenticated* POSTs,
 #   `/vouchers/validate` and `/vouchers/redeem`, which are how a guest with a
 #   front-desk code gets online. They sit on the same router as the admin
@@ -167,6 +181,13 @@ api_v1_router.include_router(hotspot_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(qos_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(network_diagnostics_router)
 api_v1_router.include_router(network_device_router, dependencies=_PAID_WRITES)
+# Two routers, one prefix. The customer/platform CRUD half is a paid
+# feature; the guest-facing portal authorize half must never be, for the
+# reason spelled out in the licence-gating note above.
+api_v1_router.include_router(
+    network_integration_router, dependencies=_PAID_WRITES
+)
+api_v1_router.include_router(network_integration_portal_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(campaigns_guest_router)

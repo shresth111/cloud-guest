@@ -50,6 +50,20 @@ class ChecklistItemStatus(StrEnum):
     FAIL = "fail"
     MANUALLY_CONFIRMED = "manually_confirmed"
     MANUALLY_FAILED = "manually_failed"
+    # This check cannot apply to this device, and never will. Every item on
+    # this checklist asks a question about a MikroTik running a platform
+    # agent -- "did it heartbeat", "is its WireGuard peer up", "is the
+    # RouterOS API reachable". For a controller-managed device (a TP-Link
+    # Omada controller registered as a fleet row so its venue's guests can
+    # have a `guest_sessions.router_id` at all) every one of those has no
+    # answer rather than a failing one.
+    #
+    # Deliberately neither PASSING nor FAILING below. Counting it as
+    # passing would claim a check this platform never made; counting it as
+    # failing would report a healthy venue as broken, which is the precise
+    # outcome contract §11.5 says must not ship. It is a fifth bucket
+    # because it is a fifth state.
+    NOT_APPLICABLE = "not_applicable"
 
 
 # Statuses that read as "this item is in good shape" for the checklist's
@@ -59,6 +73,12 @@ PASSING_STATUSES: frozenset[ChecklistItemStatus] = frozenset(
 )
 FAILING_STATUSES: frozenset[ChecklistItemStatus] = frozenset(
     {ChecklistItemStatus.FAIL, ChecklistItemStatus.MANUALLY_FAILED}
+)
+# Statuses that read as "there is nothing to do here" -- excluded from both
+# counts above, and from the "outstanding work" a readiness percentage is
+# meant to represent.
+NOT_APPLICABLE_STATUSES: frozenset[ChecklistItemStatus] = frozenset(
+    {ChecklistItemStatus.NOT_APPLICABLE}
 )
 
 

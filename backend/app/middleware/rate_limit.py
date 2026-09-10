@@ -88,6 +88,24 @@ RATE_LIMITED_PATH_PREFIXES: tuple[str, ...] = (
     # domain. The prefix also covers the RBAC-gated console GET/PATCH,
     # matching every other entry above's whole-domain grain.
     "/api/v1/demo-bookings",
+    # The captive-portal network-enforcement step for a third-party
+    # controller integration (TP-Link Omada). Public and unauthenticated by
+    # design -- it authenticates nobody; OTP/voucher/consent all stay in
+    # app.domains.guest -- and it is the one endpoint in that domain that
+    # reaches out to a *customer-owned* network controller on a caller's
+    # say-so. So this per-IP throttle is the first of two layers: the
+    # second is an in-domain limiter keyed on the guest session
+    # (app.domains.network_integration.constants
+    # .PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW), the same
+    # identifier-scoped shape OtpRateLimiter/VoucherRedemptionRateLimiter
+    # already use. The two cover different dimensions and both are needed:
+    # this one bounds one source hammering the endpoint while rotating
+    # session ids, that one bounds one session being replayed from many
+    # sources. Deliberately the exact authorize path rather than the whole
+    # /network-integrations prefix -- the rest of that domain is RBAC-gated
+    # admin CRUD, which the module docstring above explains is why a blunt
+    # IP limiter does not belong on it.
+    "/api/v1/network-integrations/portal/authorize",
 )
 
 _RATE_LIMIT_KEY_TEMPLATE = "rate_limit:{client_ip}:{path}"

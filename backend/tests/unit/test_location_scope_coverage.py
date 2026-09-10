@@ -93,6 +93,25 @@ LOCATION_SCOPED: dict[str, str] = {
         "necessarily -- this service backs every guest login route and is "
         "composed into eleven other domains."
     ),
+    "network_integration": (
+        "TWO location-bearing models, and the by-id surface is a single "
+        "chokepoint. `NetworkIntegration` carries a nullable `location_id` "
+        "and is reached by `{integration_id}` on fifteen routes; every one "
+        "of them funnels through "
+        "`NetworkIntegrationService._load_owned_integration`, which does the "
+        "organization comparison AND `enforce_entity_location` in the same "
+        "place, so a new endpoint cannot reach a row without both. "
+        "`NetworkIntegrationAuthorization` also carries a `location_id` but "
+        "has no by-id route at all -- it is written by the portal path and "
+        "read only as a count, so there is no getter to confine. "
+        "Anonymous-tolerant, necessarily: this service also backs the "
+        "public `POST /network-integrations/portal/authorize`, and the "
+        "strict dependency would drag `CurrentUser` in and 401 every guest "
+        "joining WiFi. That route does not use the confinement at all -- it "
+        "proves an ACTIVE GuestSession whose own organization AND location "
+        "match the body, and resolves the integration from the session's "
+        "venue rather than the caller's."
+    ),
     "monitoring": (
         "Seven service classes; only one owns a location-bearing row reached "
         "by id. `Alert` via `AlertService.get_alert` -- whose docstring "
@@ -454,6 +473,16 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "The guest portal render. Pre-login by definition; the caller holds no "
         "roles, and `resolve_portal_config` resolves by organization+location "
         "rather than through the confined `get_config`."
+    ),
+    ("POST", "/api/v1/network-integrations/portal/authorize"): (
+        "Captive-portal network enforcement for a guest who has just been "
+        "issued a GuestSession by app.domains.guest. They hold no roles, so "
+        "there is no confinement to derive, and the handler does not use "
+        "one: it resolves the integration by (organization, location) taken "
+        "from the SESSION -- not from the caller and not from the body -- "
+        "via `find_enabled_integration_for_location`, never through the "
+        "confined `_load_owned_integration`. Unconfined is correct here "
+        "because the caller is a guest acting on their own session."
     ),
     ("POST", "/api/v1/vouchers/redeem"): (
         "A guest redeeming or checking a code handed to them at a front desk -- the "

@@ -29,6 +29,11 @@ class ChecklistSummary(BaseModel):
     passing: int
     failing: int
     not_checked: int
+    # Checks that cannot apply to this device at all -- a controller-managed
+    # fleet row (TP-Link Omada) has no agent, no WireGuard peer and no
+    # RouterOS API to check. Defaulted so a caller reading an older response
+    # shape, or a service that has not been redeployed, still validates.
+    not_applicable: int = 0
 
 
 class ChecklistResponse(BaseModel):

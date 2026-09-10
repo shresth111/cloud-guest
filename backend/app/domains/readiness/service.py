@@ -35,10 +35,16 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from app.domains.router.vendor_capabilities import (
+    NOT_APPLICABLE_REASON,
+    is_agent_managed,
+)
+
 from .constants import (
     CHECKLIST_ITEMS,
     CHECKLIST_ITEMS_BY_KEY,
     FAILING_STATUSES,
+    NOT_APPLICABLE_STATUSES,
     PASSING_STATUSES,
     ChecklistItemKey,
     ChecklistItemStatus,
@@ -223,11 +229,19 @@ class ReadinessService:
         not_checked = sum(
             1 for r in rows if r.status == ChecklistItemStatus.NOT_CHECKED.value
         )
+        not_applicable = sum(
+            1 for r in rows if r.status in _values(NOT_APPLICABLE_STATUSES)
+        )
         return {
             "total": len(rows),
             "passing": passing,
             "failing": failing,
             "not_checked": not_checked,
+            # Additive fifth bucket -- `total` still counts every row, so a
+            # caller that only reads the original four sees no change in
+            # them. See ChecklistItemStatus.NOT_APPLICABLE for why this is
+            # not folded into either of the other two.
+            "not_applicable": not_applicable,
         }
 
     # ========================================================================
@@ -270,6 +284,31 @@ class ReadinessService:
         self, router: Any, *, requesting_organization_id: uuid.UUID | None
     ) -> dict[str, tuple[ChecklistItemStatus, str, dict[str, Any]]]:
         results: dict[str, tuple[ChecklistItemStatus, str, dict[str, Any]]] = {}
+
+        if not is_agent_managed(router):
+            # Contract §11.5. Every auto check below asks a question about a
+            # MikroTik running a platform agent, and this device is not one
+            # -- a TP-Link Omada controller has no agent, no WireGuard peer
+            # and no RouterOS API. Running them would produce seven FAILs
+            # for a venue that is working perfectly, which is exactly the
+            # "reported as a broken MikroTik" failure the vendor gating
+            # exists to prevent.
+            #
+            # Marked NOT_APPLICABLE rather than skipped, so the checklist
+            # says why it is empty instead of looking like it has not run
+            # yet. Manual items are untouched: an operator confirming "guest
+            # sign-in works at this venue" by hand is just as meaningful for
+            # an Omada site as for a MikroTik one.
+            not_applicable = (
+                ChecklistItemStatus.NOT_APPLICABLE,
+                NOT_APPLICABLE_REASON,
+                {"vendor": getattr(router, "vendor", None)},
+            )
+            for definition in CHECKLIST_ITEMS:
+                if definition.detection_mode == DetectionMode.AUTO:
+                    results[definition.key.value] = not_applicable
+            return results
+
         results[ChecklistItemKey.HEARTBEAT.value] = self._check_heartbeat(router)
         results[ChecklistItemKey.SAAS_PROVISIONING.value] = (
             await self._check_saas_provisioning(router)

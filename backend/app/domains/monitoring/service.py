@@ -104,6 +104,7 @@ from app.domains.rbac.location_scope import (
 )
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.crypto import decrypt_secret, encrypt_secret
+from app.domains.router.vendor_capabilities import supports_zero_touch_provisioning
 from app.domains.router_provisioning.constants import EnrollmentStatus
 from app.domains.router_provisioning.models import RouterEvent
 
@@ -3304,7 +3305,28 @@ class ZtpMonitoringService:
         guest-session) does not need single-query optimization the way the
         *statistics*/*analytics* methods below do (those ARE real SQL
         ``GROUP BY``/``AVG`` aggregates)."""
-        routers = await self.repository.list_routers(organization_id=organization_id)
+        routers = [
+            r
+            for r in await self.repository.list_routers(
+                organization_id=organization_id
+            )
+            # Contract §11.5. This dashboard is a *zero-touch provisioning*
+            # view: every stage it can report -- PENDING, APPROVED, CLAIMED,
+            # PROVISIONING, PROVISIONED, ONLINE, OFFLINE -- is a step in a
+            # workflow that begins with an enrollment request and ends with
+            # a platform agent checking in. A controller-managed fleet row
+            # (a TP-Link Omada controller, registered so its venue's guests
+            # have a `guest_sessions.router_id` at all) enters none of those
+            # steps and would sit at APPROVED forever, reading as a device
+            # someone forgot to finish provisioning.
+            #
+            # Excluded rather than given a stage of its own, because a
+            # ninth stage would have to be threaded through every consumer
+            # of `RouterLifecycleStage` to mean "this list is the wrong
+            # place to ask". The right place is the network integration's
+            # own status, which is what the Integrations surface shows.
+            if supports_zero_touch_provisioning(r)
+        ]
         all_enrollments = await self.repository.list_all_enrollment_requests()
         # Enrollment requests carry no organization_id of their own (they
         # are, by definition, submitted before any Router/tenant

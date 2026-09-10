@@ -509,6 +509,26 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # the future deactivate/reactivate action (see models.py's `status`
     # column comment -- no API surface for it yet).
     PermissionModule.CHANNEL_PARTNERS: (_A.CREATE, _A.READ, _A.MANAGE),
+    # Network Integrations: plain CRUD on the integration row plus MANAGE
+    # (the platform-console enable/disable, a real admin action distinct
+    # from a field edit -- the same reasoning
+    # PermissionModule.NETWORK_DEVICE's own entry above documents for its
+    # compliance-assessment endpoint). Deliberately the identical 5-action
+    # shape as NETWORK_DEVICE, and deliberately *no* EXECUTE: every route
+    # this domain exposes is gated on .read/.create/.update/.delete (the
+    # test-connection/sync/credential-rotation endpoints are all .update,
+    # since each one changes stored state on the row it targets), so an
+    # EXECUTE here would be a permission key no route ever checks -- dead
+    # permission data that reads like a capability. If a genuinely
+    # device-facing action with no persisted effect ever lands here, it
+    # gets EXECUTE then, with a route to point at.
+    PermissionModule.NETWORK_INTEGRATIONS: (
+        _A.CREATE,
+        _A.READ,
+        _A.UPDATE,
+        _A.DELETE,
+        _A.MANAGE,
+    ),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -570,6 +590,7 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.QUOTATIONS: "Quotations",
     PermissionModule.READINESS: "Router Readiness Checklist",
     PermissionModule.CHANNEL_PARTNERS: "Channel Partners",
+    PermissionModule.NETWORK_INTEGRATIONS: "Network Integrations",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -694,6 +715,16 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # identical ScopeType.GLOBAL reasoning as PermissionModule.QUOTATIONS'
     # own entry above.
     PermissionModule.CHANNEL_PARTNERS: ScopeType.GLOBAL,
+    # A network integration's own location_id is nullable (one controller
+    # can serve several of a tenant's venues, or be registered before the
+    # operator maps it to a WyfyGuest location) -- ScopeType.LOCATION, the
+    # identical "no mandatory router, and no mandatory location either"
+    # reasoning PermissionModule.NETWORK_DEVICE's own entry above already
+    # documents. LOCATION is the narrowest scope that is *meaningful*
+    # here: the controller itself is not one of this platform's routers, so
+    # ScopeType.ROUTER would be a scope no integration row can ever be
+    # assigned at.
+    PermissionModule.NETWORK_INTEGRATIONS: ScopeType.LOCATION,
 }
 
 
@@ -1055,6 +1086,19 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_DIAGNOSTICS: _L.FULL,
             _M.READINESS: _L.FULL,
             _M.NETWORK_DEVICE: _L.FULL,
+            # Connecting this location's own third-party network
+            # controller (Omada) and pointing the captive portal at it is
+            # squarely this role's job -- FULL, matching its own
+            # NETWORK_DEVICE level immediately above. Deliberately NOT
+            # granted to the guest-facing location roles (Location
+            # Manager, Reception Staff, Helpdesk, Guest Operator, Office
+            # Admin): configuring a venue's network controller, and
+            # holding the credentials that reach it, is not front-desk
+            # work -- exactly why NETWORK_DEVICE is not granted to them
+            # either. All five have default_level=_L.NONE, so they get
+            # nothing here without an explicit override, and none is
+            # added.
+            _M.NETWORK_INTEGRATIONS: _L.FULL,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,
@@ -1096,6 +1140,13 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.NETWORK_DIAGNOSTICS: _L.OPERATE,
             _M.READINESS: _L.OPERATE,
             _M.NETWORK_DEVICE: _L.OPERATE,
+            # Same "this location's own network controller" posture as
+            # Network Administrator's own override, at OPERATE rather than
+            # FULL -- matching every other module's level on this role,
+            # which excludes DELETE/MANAGE and so leaves removing an
+            # integration (and the platform-console enable/disable) to
+            # Network Administrator and org admins.
+            _M.NETWORK_INTEGRATIONS: _L.OPERATE,
             # Day-to-day network operations plainly includes knowing
             # whether THIS location's own internet uplink is up (ISP) and
             # what hardware is registered on its network (MONITORED_

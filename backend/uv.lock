@@ -2626,6 +2626,7 @@ version = "0.1.0"
 source = { editable = "vendor/wyfy-device-gateway" }
 dependencies = [
     { name = "asyncssh" },
+    { name = "httpx" },
     { name = "librouteros" },
     { name = "pysnmp" },
 ]
@@ -2633,6 +2634,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "asyncssh", specifier = "==2.14.2" },
+    { name = "httpx", specifier = "==0.27.2" },
     { name = "librouteros", specifier = "==3.2.1" },
     { name = "pysnmp", specifier = "==7.1.28" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==8.3.4" },

@@ -28,6 +28,7 @@ __all__ = [
     "ProvisioningTokenAlreadyUsedError",
     "ProvisioningTokenRouterStateError",
     "ProvisioningTokenGenerationNotAllowedError",
+    "RouterVendorNotProvisionableError",
     "RouterLiveCredentialRotationFailedError",
 ]
 
@@ -180,6 +181,31 @@ class ProvisioningTokenGenerationNotAllowedError(RouterError):
             f"status '{current_status}' -- only allowed while "
             "pending_provisioning",
             status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+class RouterVendorNotProvisionableError(RouterError):
+    """Zero-touch provisioning was requested for a device that has no
+    provisioning path at all.
+
+    Not a status problem, which is what
+    ``ProvisioningTokenGenerationNotAllowedError`` above reports -- this
+    device will never be in a status where a token would help. A TP-Link
+    Omada controller is registered in the fleet so its venue's guests can
+    have a ``guest_sessions.router_id`` (contract §11.3); it runs no
+    platform agent, so a token minted for it could never be redeemed and
+    the operator holding it would spend the afternoon wondering why.
+
+    422 rather than 409: a conflict invites a retry, and there is no later
+    moment at which this one succeeds.
+    """
+
+    def __init__(self, router_id: uuid.UUID, vendor: str) -> None:
+        super().__init__(
+            f"Router {router_id} is a '{vendor}' device, which this platform "
+            "does not provision. It is managed through its vendor's "
+            "controller -- see the network integration for this location.",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
 

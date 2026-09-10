@@ -830,6 +830,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # app.domains.router.service.RouterService.sweep_router_reachability's
     # own docstring for the awake-window, fleet-outage and tunnel-
     # confirmation guards.
+    # Network Integrations adds a twenty-third Beat entry
+    # ("network-integration-sync-sweep") -- the only thing that refreshes a
+    # third-party controller's status without a human pressing Sync Now.
+    # See app.domains.network_integration.tasks's own module docstring.
     assert schedule_names == {
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
@@ -899,6 +903,15 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # exactly like one that is -- there is no alert row, no error, and
         # nothing anywhere that says so.
         "dhcp-rogue-detection-sweep",
+        # Polls each enabled network integration's controller for status,
+        # devices, clients and guest sessions, on that integration's own
+        # configured interval. Its absence from this set is not a missing
+        # schedule entry, it is an Integrations page whose "Last synced" and
+        # connection status only ever change when someone presses Sync Now
+        # -- an integration whose controller died would go on reporting
+        # CONNECTED indefinitely. See
+        # app.domains.network_integration.tasks's own module docstring.
+        "network-integration-sync-sweep",
     }
 
 
