@@ -86,6 +86,24 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "Static platform feature catalog, not customer-specific -- same "
         "public-catalog category as GET /branding/default."
     ),
+    ("POST", "/api/v1/network-integrations/portal/authorize"): (
+        "Captive-portal network enforcement. A guest joining WiFi has no "
+        "platform login and no RBAC grants, so there is no permission to "
+        "check -- same category as GET /captive-portal/resolve and POST "
+        "/vouchers/redeem above. It authenticates nobody: by the time it is "
+        "called, app.domains.guest has already decided the guest may go "
+        "online and issued a GuestSession, and this is the step that tells "
+        "the venue's network controller to let them through (the Omada "
+        "equivalent of the MikroTik link-login-only POST). What stands in "
+        "for a permission check is proof of a genuine session, enforced in "
+        "NetworkIntegrationService.authorize_portal_client: the GuestSession "
+        "must be ACTIVE and its own organization_id AND location_id must "
+        "match the request body, and the integration is resolved from the "
+        "SESSION's venue rather than the body's, so a consistently-lying "
+        "body still cannot reach a foreign controller. Rate limited twice -- "
+        "per client IP in app.middleware.rate_limit, per guest session in "
+        "that service."
+    ),
     # -- Auth: pre-identity flows by definition --------------------------
     ("POST", "/api/v1/auth/register"): "Self-registration -- no account exists yet.",
     ("POST", "/api/v1/auth/login"): "Login -- no session exists yet.",

@@ -153,6 +153,17 @@ class PermissionModule(StrEnum):
     # DEMO_REQUESTS above -- a channel partner is Wyfy Guest's own business
     # relationship, never scoped to a customer Organization.
     CHANNEL_PARTNERS = "channel_partners"
+    # Network Integrations: a tenant's own connection to a third-party
+    # network controller they own and operate (TP-Link Omada today) -- the
+    # controller URL, auth mode, encrypted credentials, the Omada site the
+    # integration is bound to, and the guest SSID the captive portal
+    # authorizes clients onto. See app.domains.network_integration's own
+    # module docstring. Distinct from NETWORK_DEVICE (this platform's NAC
+    # registry of devices seen on a network) and from ROUTERS (hardware
+    # this platform itself provisioned): the box on the other end of an
+    # integration belongs to the customer, and this module gates who may
+    # point this platform at it.
+    NETWORK_INTEGRATIONS = "network_integrations"
 
 
 class OverrideEffect(StrEnum):

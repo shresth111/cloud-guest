@@ -73,6 +73,9 @@ from app.domains.network_device import models as network_device_models  # noqa: 
 from app.domains.network_diagnostics import (
     models as network_diagnostics_models,  # noqa: F401,E501
 )
+from app.domains.network_integration import (
+    models as network_integration_models,  # noqa: F401,E501
+)
 from app.domains.notification import models as notification_models  # noqa: F401
 from app.domains.organization import models as organization_models  # noqa: F401
 from app.domains.otp import models as otp_models  # noqa: F401
