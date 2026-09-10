@@ -128,7 +128,7 @@ migration has been exercised against a real Omada controller. It creates
 tables; whether the provider layer above them works against real hardware
 is not something this file can or does claim.
 
-Revision ID: 0114_create_network_integration_tables
+Revision ID: 0122_create_network_integration_tables
 Revises: 0113_create_router_rogue_dhcp_statuses_table
 Create Date: 2026-09-10
 """
@@ -138,8 +138,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0114_create_network_integration_tables"
-down_revision = "0113_create_router_rogue_dhcp_statuses_table"
+revision = "0122_create_network_integration_tables"
+down_revision = "0121_add_quotation_payment_and_terms"
 branch_labels = None
 depends_on = None
 
