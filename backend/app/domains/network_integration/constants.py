@@ -73,6 +73,8 @@ __all__ = [
     "MIN_SYNC_INTERVAL_SECONDS",
     "NETWORK_INTEGRATION_SYNC_SWEEP_INTERVAL_SECONDS",
     "NetworkProviderKind",
+    "PORTAL_READINESS_GAP_LABELS",
+    "PortalReadinessGap",
     "ROUTER_VENDOR_BY_PROVIDER",
     "PORTAL_AUTHORIZE_RATE_LIMIT_KEY_TEMPLATE",
     "PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW",
@@ -182,6 +184,64 @@ class SyncStatus(StrEnum):
     NEVER = "never"
 
 
+class PortalReadinessGap(StrEnum):
+    """What is missing before this integration can authorize a single guest.
+
+    ## Why this exists as its own vocabulary
+
+    An operator can complete the onboarding wizard, see a green
+    ``CONNECTED`` badge, and have a venue where nobody gets online. That is
+    not hypothetical: ``_sync`` used to set ``CONNECTED`` on the strength
+    of the controller conversation alone -- credentials worked,
+    ``GET /api/info`` answered, sites listed -- while
+    ``authorize_portal_client`` refused every guest because no site had
+    been picked. Two different questions ("can we reach the controller"
+    and "do we know what to ask it") wearing one status.
+
+    ## Each member is a real branch in the authorize path, verified
+
+    Not a wish list of fields that look important. Each one is a place
+    ``authorize_portal_client`` actually stops:
+
+    * ``CREDENTIALS_MISSING`` -- ``_credentials_for`` raises.
+    * ``LOCATION_NOT_MAPPED`` -- the portal path resolves an integration by
+      ``(organization_id, location_id, provider)``, so a NULL
+      ``location_id`` means this row is never selected for any venue.
+    * ``SITE_NOT_SELECTED`` -- an explicit
+      ``NetworkIntegrationSiteNotSelectedError``.
+
+    ``guest_ssid_id`` is deliberately **not** here. The wizard asks for it
+    and the list view shows it, but nothing on the authorize path reads it
+    -- the SSID name arrives in the controller's own redirect. Listing it
+    as blocking would send an operator to fix something that was never
+    stopping anyone, which is the same class of misdirection this enum
+    exists to end.
+
+    ``is_enabled = False`` is not here either: that is an operator's
+    deliberate choice and ``IntegrationStatus.DISABLED`` already says so.
+    A gap means unfinished, not switched off.
+    """
+
+    CREDENTIALS_MISSING = "credentials_missing"
+    LOCATION_NOT_MAPPED = "location_not_mapped"
+    SITE_NOT_SELECTED = "site_not_selected"
+
+
+# One human sentence per gap, written for the operator who has to fix it
+# -- so it names the step in the setup flow, not the column.
+PORTAL_READINESS_GAP_LABELS: dict[PortalReadinessGap, str] = {
+    PortalReadinessGap.CREDENTIALS_MISSING: (
+        "no controller credentials have been saved"
+    ),
+    PortalReadinessGap.LOCATION_NOT_MAPPED: (
+        "it is not mapped to a location, so no venue's guests resolve to it"
+    ),
+    PortalReadinessGap.SITE_NOT_SELECTED: (
+        "no controller site has been selected"
+    ),
+}
+
+
 class IntegrationEventType(StrEnum):
     """What happened, for the operational feed
     (``network_integration_events``).
@@ -261,6 +321,12 @@ class ErrorCode(StrEnum):
     # than a user error -- see the exception of the same name for why this
     # refuses instead of falling back to a plain integration create.
     FLEET_DEVICE_UNAVAILABLE = "NETWORK_INTEGRATION_FLEET_DEVICE_UNAVAILABLE"
+    # The controller answered, and the integration still authorizes nobody
+    # because the operator has not finished mapping it. Distinct from
+    # CREDENTIALS_REQUIRED (which is one specific half of the same story)
+    # so a caller can tell "we could not talk to the box" from "we talked
+    # to the box and there is nothing to talk to it about".
+    SETUP_INCOMPLETE = "NETWORK_INTEGRATION_SETUP_INCOMPLETE"
 
     AUTH_FAILED = "OMADA_AUTH_FAILED"
     CONNECTION_FAILED = "OMADA_CONNECTION_FAILED"

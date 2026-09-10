@@ -143,6 +143,10 @@ class NetworkIntegrationRepositoryProtocol(Protocol):
         provider: str,
     ) -> NetworkIntegration | None: ...
 
+    async def find_integration_for_router(
+        self, router_id: uuid.UUID
+    ) -> NetworkIntegration | None: ...
+
     async def list_due_for_sync(
         self, *, now: datetime, limit: int
     ) -> list[NetworkIntegration]: ...
@@ -405,6 +409,40 @@ class NetworkIntegrationRepository:
                 NetworkIntegration.provider == provider,
                 NetworkIntegration.is_enabled.is_(True),
             )
+            .order_by(NetworkIntegration.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(statement)).scalars().first()
+
+    async def find_integration_for_router(
+        self, router_id: uuid.UUID
+    ) -> NetworkIntegration | None:
+        """The integration a controller-managed fleet row belongs to.
+
+        The inverse of ``NetworkIntegration.router_id``, and the only read
+        ``app.domains.readiness`` needs from this domain -- so it lives
+        here rather than making that domain query this table itself.
+
+        **Deliberately not scoped by organization.** The caller
+        (``ReadinessService._check_controller_integration``) has already
+        resolved the router through its own org-scoped
+        ``router_lookup.get_router``, and ``network_integrations.router_id``
+        is written only by ``create_integration_with_fleet_device``, in one
+        transaction, from the same organization. Adding an org parameter
+        that the query then compared against the *caller's* header rather
+        than the router's owner would be the path-id scoping shape this
+        codebase has found across a number of handlers: permission checked
+        on one thing, row read by another.
+
+        Disabled integrations are returned. "Switched off" is an answer the
+        readiness item has to be able to give -- filtering them out here
+        would make a deliberately-disabled venue indistinguishable from one
+        that was never linked at all, and send an operator to create a
+        second integration.
+        """
+        statement = (
+            self._live()
+            .where(NetworkIntegration.router_id == router_id)
             .order_by(NetworkIntegration.created_at.desc())
             .limit(1)
         )

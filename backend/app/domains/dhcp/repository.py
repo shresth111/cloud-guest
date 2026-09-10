@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
+from app.domains.router.fleet_scope import agent_managed_only
 from app.domains.router.models import Router
 
 from .models import DhcpPool, RouterRogueDhcpStatus
@@ -167,8 +168,8 @@ class DhcpRepository:
         return list(seen)
 
     async def list_all_router_ids(self) -> list[uuid.UUID]:
-        """Every non-deleted router in the fleet -- the set the
-        captive-portal DHCP-option sweep fans out over.
+        """Every non-deleted, agent-managed router in the fleet -- the set
+        the captive-portal DHCP-option sweep fans out over.
 
         Deliberately **not** ``list_router_ids_serving_dhcp``. That one is
         scoped to routers this platform has its own ``DhcpPool`` row for,
@@ -183,9 +184,20 @@ class DhcpRepository:
         paginated and requires a ``location_id``, so it cannot answer a
         fleet-wide question, and adding a fleet-wide lister to the router
         domain to serve one caller in this one would be the wider change.
+
+        ``agent_managed_only`` -- contract 11.5. "Every router" meant
+        literally every row, and each id is handed straight to
+        ``converge_captive_portal_dhcp_option_for_router``, which opens a
+        RouterOS session and edits a DHCP network. A controller-managed row
+        has no RouterOS API and no DHCP server of ours; dispatching for it
+        produced one guaranteed device failure per row per sweep. The
+        paragraph above argues against narrowing by *DhcpPool*, which is
+        still right -- a router this platform never configured must stay in
+        the set. A device that cannot run RouterOS at all is the different
+        question.
         """
         result = await self.session.execute(
-            select(Router.id).where(Router.is_deleted.is_(False))
+            agent_managed_only(select(Router.id).where(Router.is_deleted.is_(False)))
         )
         return list(result.scalars().all())
 

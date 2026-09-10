@@ -70,6 +70,7 @@ import ipaddress
 import re
 import socket
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -81,7 +82,9 @@ from .constants import (
     MAX_SYNC_INTERVAL_SECONDS,
     MIN_SESSION_DURATION_SECONDS,
     MIN_SYNC_INTERVAL_SECONDS,
+    PORTAL_READINESS_GAP_LABELS,
     ControllerAuthMode,
+    PortalReadinessGap,
 )
 from .exceptions import NetworkIntegrationUrlRejectedError
 
@@ -90,8 +93,10 @@ __all__ = [
     "ValidatedControllerUrl",
     "allowed_controller_ports",
     "assert_address_is_public",
+    "describe_portal_readiness_gaps",
     "normalize_client_mac",
     "parse_controller_url",
+    "portal_readiness_gaps",
     "synthesize_fleet_identity",
     "validate_auth_mode_credentials",
     "validate_controller_url",
@@ -540,3 +545,67 @@ def parse_uuid(value: str, *, field_name: str) -> uuid.UUID:
         return uuid.UUID(str(value))
     except (ValueError, AttributeError, TypeError) as exc:
         raise ValueError(f"{field_name} is not a valid UUID") from exc
+
+
+# ============================================================================
+# "Configured enough to authorize anybody"
+# ============================================================================
+
+
+def portal_readiness_gaps(integration: object) -> tuple[PortalReadinessGap, ...]:
+    """Everything standing between this integration and its first
+    authorized guest, in the order an operator would fix it.
+
+    ## Read this against `service.authorize_portal_client`, not against the
+    ## wizard
+
+    Each member of :class:`PortalReadinessGap` is a branch that method
+    really takes, and nothing else is included -- see that enum's own
+    docstring for why `guest_ssid_id` is absent despite being a step in
+    the setup flow. Deriving the list from the *setup screens* instead
+    would produce a check that agrees with the UI and disagrees with the
+    code, which is the failure this whole idea is meant to catch.
+
+    ## Why a function rather than a column
+
+    Every input is already a column on the row, so a derived
+    `is_portal_ready` flag would be a second copy of the same facts, able
+    to disagree with them the moment a mapping is edited by anything that
+    forgets to recompute it. Computing it on read means a half-configured
+    integration cannot look finished.
+
+    Duck-typed on purpose: `ReadinessService` holds whatever its lookup
+    Protocol returned, and the sweep holds a real `NetworkIntegration`.
+    Neither should have to convert for the other.
+    """
+    gaps: list[PortalReadinessGap] = []
+    if not getattr(integration, "credentials_encrypted", None):
+        gaps.append(PortalReadinessGap.CREDENTIALS_MISSING)
+    if getattr(integration, "location_id", None) is None:
+        gaps.append(PortalReadinessGap.LOCATION_NOT_MAPPED)
+    if not getattr(integration, "external_site_id", None):
+        gaps.append(PortalReadinessGap.SITE_NOT_SELECTED)
+    return tuple(gaps)
+
+
+def describe_portal_readiness_gaps(gaps: Sequence[PortalReadinessGap]) -> str:
+    """One sentence naming what is missing and what it costs.
+
+    The cost half is the point. "Site not selected" reads like a setting
+    somebody has not got round to; "no guest at this venue can get online"
+    is the same fact and the reason it is urgent. An operator who does not
+    know the second one has no way to rank this against everything else on
+    their screen.
+    """
+    if not gaps:
+        return "This integration is fully configured."
+    reasons = [PORTAL_READINESS_GAP_LABELS[gap] for gap in gaps]
+    if len(reasons) == 1:
+        joined = reasons[0]
+    else:
+        joined = ", ".join(reasons[:-1]) + " and " + reasons[-1]
+    return (
+        f"This integration cannot authorize any guest: {joined}. "
+        "Until it is finished, guests at this venue complete sign-in and "
+        "still have no internet."
+    )

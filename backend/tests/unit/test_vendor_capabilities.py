@@ -26,6 +26,7 @@ import pytest
 
 from app.domains.readiness.constants import (
     CHECKLIST_ITEMS,
+    CONTROLLER_MANAGED_ITEMS,
     ChecklistItemStatus,
     DetectionMode,
 )
@@ -166,7 +167,15 @@ class TestReadinessChecklist:
 
     async def test_not_a_single_auto_item_reads_as_failing(self) -> None:
         """The specific outcome §11.5 says must not ship: a working venue
-        rendered as a broken one."""
+        rendered as a broken one.
+
+        The one item that CAN fail for a controller is
+        CONTROLLER_INTEGRATION, and only when the venue really is dead --
+        no integration linked, or one that authorizes nobody. It is
+        NOT_CHECKED here because `_build_service` supplies no
+        network-integration lookup; `test_readiness_controller_integration
+        .py` covers the states it does report.
+        """
         rows = await self._checklist(_OMADA)
         assert not [
             r for r in rows if r.status == ChecklistItemStatus.FAIL.value
@@ -235,8 +244,19 @@ class TestReadinessSummary:
         assert summary["failing"] == 0
         assert summary["passing"] == 0
         # `total` still counts every row, so a caller reading only the
-        # original four buckets sees no change in any of them.
-        assert summary["total"] == len(CHECKLIST_ITEMS)
+        # original four buckets sees no change in any of them. A controller
+        # gets one row MORE than the sixteen shared items -- the
+        # CONTROLLER_INTEGRATION check, the one question that is answerable
+        # for it (see `constants.CONTROLLER_MANAGED_ITEMS`). It reads
+        # NOT_CHECKED here because `_build_service` wires no
+        # network-integration lookup, which is itself the contract: a
+        # collaborator that was not supplied must never produce a PASS.
+        assert summary["total"] == len(CHECKLIST_ITEMS) + len(
+            CONTROLLER_MANAGED_ITEMS
+        )
+        assert summary["not_checked"] == len(CONTROLLER_MANAGED_ITEMS) + len(
+            [i for i in CHECKLIST_ITEMS if i.detection_mode == DetectionMode.MANUAL]
+        )
 
 
 # ============================================================================
