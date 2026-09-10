@@ -297,6 +297,11 @@ class ReadinessService:
         await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # CHECKLIST_ITEMS_BY_KEY, not DEFINITIONS_BY_KEY, and deliberately:
+        # this is the CONFIRMABLE set. CONTROLLER_INTEGRATION is absent
+        # from it, so an operator cannot tick "controller integration" by
+        # hand over a venue that authorizes nobody -- see that item's own
+        # note in `constants`.
         if item_key not in CHECKLIST_ITEMS_BY_KEY:
             raise UnknownChecklistItemError(item_key)
         return await self.repository.upsert_item(

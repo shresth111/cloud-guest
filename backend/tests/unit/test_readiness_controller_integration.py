@@ -48,7 +48,9 @@ import pytest
 
 from app.domains.readiness.constants import (
     CHECKLIST_ITEMS,
+    CHECKLIST_ITEMS_BY_KEY,
     CONTROLLER_MANAGED_ITEMS,
+    DEFINITIONS_BY_KEY,
     ChecklistItemKey,
     ChecklistItemStatus,
     DetectionMode,
@@ -383,3 +385,54 @@ class TestItReachesTheSummary:
             )
         }
         assert second[_KEY].status == ChecklistItemStatus.PASS.value
+
+
+# ============================================================================
+# The serializer has to know about it, or the page 500s on the one row
+# that matters
+# ============================================================================
+
+
+class TestTheRowCanActuallyBeRendered:
+    """Caught in review, not by the tests above -- which is the point of
+    writing it down here.
+
+    `CONTROLLER_INTEGRATION` is deliberately absent from
+    `CHECKLIST_ITEMS_BY_KEY` so `confirm_item` refuses a manual override.
+    `router._item_response` was looking definitions up in that same
+    mapping, so the first controller checklist ever fetched would have
+    raised `KeyError` and returned a 500 -- a screen that fails outright
+    instead of one that reports the venue. Every service-level test above
+    passed throughout, because none of them go through the serializer.
+    """
+
+    def test_the_serializer_can_render_every_item_a_checklist_can_contain(
+        self,
+    ) -> None:
+        from app.domains.readiness.models import RouterChecklistItem
+        from app.domains.readiness.router import _item_response
+
+        for agent_managed in (True, False):
+            for definition in checklist_items_for(agent_managed=agent_managed):
+                row = RouterChecklistItem(
+                    router_id=uuid.uuid4(),
+                    item_key=definition.key.value,
+                    status=ChecklistItemStatus.NOT_CHECKED.value,
+                    detection_mode=definition.detection_mode.value,
+                    detail=None,
+                    evidence={},
+                    last_checked_at=None,
+                    checked_by_user_id=None,
+                )
+                response = _item_response(row)
+                assert response.item_key == definition.key.value
+                assert response.label == definition.label
+
+    def test_the_display_mapping_covers_both_registries(self) -> None:
+        for definition in CHECKLIST_ITEMS + CONTROLLER_MANAGED_ITEMS:
+            assert definition.key in DEFINITIONS_BY_KEY
+
+    def test_the_confirmable_mapping_deliberately_does_not(self) -> None:
+        """The two mappings answer two questions and must not be merged."""
+        assert ChecklistItemKey.CONTROLLER_INTEGRATION in DEFINITIONS_BY_KEY
+        assert ChecklistItemKey.CONTROLLER_INTEGRATION not in CHECKLIST_ITEMS_BY_KEY

@@ -356,6 +356,26 @@ CONTROLLER_MANAGED_ITEMS: tuple[ChecklistItemDefinition, ...] = (
 )
 
 
+# Every definition this domain can ever put on a checklist, keyed for
+# display. SEPARATE FROM `CHECKLIST_ITEMS_BY_KEY` above, and the split is
+# load-bearing in both directions:
+#
+#   * `router._item_response` renders a stored row by looking its
+#     definition up, so it must know about EVERY item or a controller's
+#     checklist 500s on the one row that matters. It uses this one.
+#   * `service.confirm_item` validates the key an operator asked to tick,
+#     so it must know only the CONFIRMABLE items. It uses the other one,
+#     and CONTROLLER_INTEGRATION's absence there is what refuses a manual
+#     override of a computed check.
+#
+# Two mappings because they answer two questions. Merging them would
+# either 500 the page or hand the operator back the green badge over the
+# dead venue.
+DEFINITIONS_BY_KEY: dict[ChecklistItemKey, ChecklistItemDefinition] = {
+    item.key: item for item in CHECKLIST_ITEMS + CONTROLLER_MANAGED_ITEMS
+}
+
+
 def checklist_items_for(*, agent_managed: bool) -> tuple[ChecklistItemDefinition, ...]:
     """The checklist a given device actually has.
 
@@ -380,5 +400,6 @@ __all__ = [
     "CHECKLIST_ITEMS",
     "CHECKLIST_ITEMS_BY_KEY",
     "CONTROLLER_MANAGED_ITEMS",
+    "DEFINITIONS_BY_KEY",
     "checklist_items_for",
 ]
