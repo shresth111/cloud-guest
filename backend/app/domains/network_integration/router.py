@@ -1176,6 +1176,12 @@ async def authorize_portal_client(
         vid=payload.vid,
         t=payload.t,
         redirect_url=payload.redirect_url,
+        # CR-004: whatever ``clientIp`` the controller's redirect carried,
+        # and nothing else. Deliberately not defaulted from
+        # ``request.client.host`` or an ``X-Forwarded-For`` hop -- this
+        # route sits behind a proxy and a NAT, so those addresses are the
+        # infrastructure's, not the guest's.
+        client_ip=payload.client_ip,
     )
     response = PortalAuthorizeResponse(
         authorized=outcome.authorized,

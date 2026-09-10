@@ -2035,6 +2035,7 @@ class NetworkIntegrationService:
         vid: int | None = None,
         t: str | None = None,
         redirect_url: str | None = None,
+        client_ip: str | None = None,
     ) -> PortalAuthorizationOutcome:
         """Authorize one guest device on the venue's controller.
 
@@ -2146,6 +2147,15 @@ class NetworkIntegrationService:
             vid=vid,
             t=t,
             redirect_url=redirect_url,
+            # CR-004. Carried, not computed: this is the ``clientIp`` the
+            # controller put on its own redirect. This method never
+            # consults the HTTP request's source address -- it does not
+            # have one, and the layer that does (``router.py``) is
+            # forbidden from substituting it, because behind the venue's
+            # NAT and this platform's proxy that address is not the
+            # guest's. ``None`` means the redirect carried none, and the
+            # provider then omits the field entirely.
+            client_ip=client_ip,
         )
         try:
             result = await provider_impl.authorize_guest(

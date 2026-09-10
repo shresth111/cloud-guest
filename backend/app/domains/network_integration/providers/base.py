@@ -173,6 +173,18 @@ class ProviderPortalContext:
     redirect. ``providers/omada.py`` reconciles it against the
     integration's stored ``external_site_id``; ``service.py`` does not
     interpret it.
+
+    ``client_ip`` is **captured, never derived** (CR-004). It is the
+    ``clientIp`` query parameter the controller itself put on the redirect,
+    and it is required in the authorize body on controller v6.2.10+. It is
+    *not* the source address of the HTTP request that carried this context
+    here: the portal is reached through a proxy and a NAT, so that address
+    belongs to the proxy, and a wrong client IP authorizes the wrong device
+    or nobody -- which is strictly worse than an absent one. When the
+    redirect carried no ``clientIp`` (any controller before v6.2.10 -- the
+    parameter does not appear in TP-Link doc 13080 at all), this stays
+    ``None`` and the field is omitted from the body, leaving those
+    controllers exactly as they were.
     """
 
     client_mac: str
@@ -184,6 +196,7 @@ class ProviderPortalContext:
     vid: int | None = None
     t: str | None = None
     redirect_url: str | None = None
+    client_ip: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
