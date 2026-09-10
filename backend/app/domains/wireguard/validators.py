@@ -15,6 +15,7 @@ import ipaddress
 
 from app.domains.router.enums import RouterStatus
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import is_controller_managed
 
 from .constants import HUB_RESERVED_HOST_COUNT, PEER_STATUS_TRANSITIONS, PeerStatus
 from .exceptions import (
@@ -22,6 +23,7 @@ from .exceptions import (
     InvalidWireGuardCidrError,
     TunnelIPPoolExhaustedError,
     WireGuardRouterNotEligibleError,
+    WireGuardVendorNotSupportedError,
 )
 
 # A router in either of these BE-008 lifecycle statuses has no business
@@ -35,6 +37,23 @@ _ROUTER_STATUSES_INELIGIBLE_FOR_WIREGUARD = frozenset(
 
 
 def validate_router_eligible_for_wireguard(router: Router) -> None:
+    """Refuse a tunnel this device cannot use.
+
+    The vendor check runs FIRST, and deliberately so. A status is a
+    temporary answer -- reinstate the router and it becomes eligible -- so
+    reporting "wrong status" for a controller would send an operator
+    looking for a state change that would not help. The vendor answer is
+    permanent.
+
+    It also has to run before ``allocate_tunnel_via_hub`` reaches the hub,
+    because that call is irreversible: the agent has no delete verb, so a
+    peer minted for a controller leaks a hub peer and a /24 address
+    forever, and a peer that never handshakes is indistinguishable from a
+    device someone has not finished setting up. See
+    ``WireGuardVendorNotSupportedError``.
+    """
+    if is_controller_managed(router):
+        raise WireGuardVendorNotSupportedError(router.id, router.vendor)
     if router.status in _ROUTER_STATUSES_INELIGIBLE_FOR_WIREGUARD:
         raise WireGuardRouterNotEligibleError(router.id, router.status)
 

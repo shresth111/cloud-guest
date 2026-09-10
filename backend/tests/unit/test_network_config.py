@@ -2131,6 +2131,55 @@ class TestConfigAgentBridgeRetirement:
     """Regression guards for the retired config-agent HTTP bridge (router-
     fleet plan section A1). Live pushes now go through wyfy_device_gateway."""
 
+    async def test_apply_live_refuses_a_controller_without_revealing_secrets(
+        self,
+    ) -> None:
+        """network_integration contract 11.5.
+
+        A TP-Link Omada controller is a fleet row that speaks no RouterOS
+        API, so there is nothing to push to it. Before the vendor gate it
+        fell through to the credential branch and was refused with "Router
+        has no stored connection details" -- which reads as "add some and
+        retry" for a device where no credential would ever help -- and it
+        got there only after `reveal_credentials` had audit-logged a
+        decrypt of a secret that is NULL by construction.
+        """
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.domains.network_config.router import apply_network_config_live
+
+        fake_request = SimpleNamespace(state=SimpleNamespace(request_id="req-1"))
+        provisioning_service = AsyncMock()
+        provisioning_service.get_version = AsyncMock(
+            return_value=SimpleNamespace(rendered_content="/ip address add ...")
+        )
+        router_service = MagicMock()
+        router_service.get_router = AsyncMock(
+            return_value=SimpleNamespace(vendor="tplink_omada")
+        )
+        router_service.reveal_credentials = AsyncMock()
+
+        result = await apply_network_config_live(
+            request=fake_request,  # type: ignore[arg-type]
+            router_id=uuid.uuid4(),
+            version_id=uuid.uuid4(),
+            user=SimpleNamespace(id=str(uuid.uuid4())),  # type: ignore[arg-type]
+            requesting_organization_id=None,
+            provisioning_service=provisioning_service,
+            router_service=router_service,  # type: ignore[arg-type]
+        )
+
+        assert result["data"]["applied"] is False
+        detail = result["data"]["detail"]
+        assert "tplink_omada" in detail
+        assert "controller" in detail.lower()
+        # The old, misleading refusal must not be what a controller gets.
+        assert "no stored connection details" not in detail.lower()
+        # And the secret was never decrypted or audit-logged for a row that
+        # has none -- that is why the gate sits before this call.
+        router_service.reveal_credentials.assert_not_awaited()
+
     async def test_apply_live_reports_missing_connection_details(self) -> None:
         from types import SimpleNamespace
         from unittest.mock import AsyncMock, MagicMock
@@ -2142,6 +2191,13 @@ class TestConfigAgentBridgeRetirement:
         provisioning_service = AsyncMock()
         provisioning_service.get_version = AsyncMock(return_value=version)
         router_service = MagicMock()
+        # The vendor gate added for network_integration contract 11.5 reads
+        # the row before `reveal_credentials`, so that a controller-managed
+        # device is refused without decrypting (and audit-logging) a secret
+        # it does not have. These cases are all MikroTik.
+        router_service.get_router = AsyncMock(
+            return_value=SimpleNamespace(vendor="mikrotik")
+        )
         router_service.reveal_credentials = AsyncMock(
             return_value=SimpleNamespace(
                 management_ip_address=None,
@@ -2185,6 +2241,13 @@ class TestConfigAgentBridgeRetirement:
         provisioning_service = AsyncMock()
         provisioning_service.get_version = AsyncMock(return_value=version)
         router_service = MagicMock()
+        # The vendor gate added for network_integration contract 11.5 reads
+        # the row before `reveal_credentials`, so that a controller-managed
+        # device is refused without decrypting (and audit-logging) a secret
+        # it does not have. These cases are all MikroTik.
+        router_service.get_router = AsyncMock(
+            return_value=SimpleNamespace(vendor="mikrotik")
+        )
         router_service.reveal_credentials = AsyncMock(
             return_value=SimpleNamespace(
                 management_ip_address="10.20.0.41",
