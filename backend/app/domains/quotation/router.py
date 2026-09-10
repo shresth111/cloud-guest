@@ -106,6 +106,8 @@ async def create_and_send_quotation(
         currency=payload.currency,
         valid_until=payload.valid_until,
         notes=payload.notes,
+        payment_terms=payload.payment_terms,
+        terms_and_conditions=payload.terms_and_conditions,
     )
     response_payload = await _quotation_response(quotation, service)
     return build_response(

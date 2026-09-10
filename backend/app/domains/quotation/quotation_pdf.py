@@ -72,6 +72,7 @@ from __future__ import annotations
 import io
 from decimal import Decimal
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
@@ -123,6 +124,18 @@ _FONT_INTER = "Inter"
 _FONT_INTER_SEMIBOLD = "Inter-SemiBold"
 _FONT_INTER_BOLD = "Inter-Bold"
 _FONT_DISPLAY = "Space Grotesk"
+
+
+def _with_line_breaks(text: str) -> str:
+    """Escape an operator-editable copy block for a reportlab ``Paragraph``
+    and keep its line structure.
+
+    The text is plain text typed into a textarea -- it may contain ``&`` or
+    ``<`` (both of which are invalid XML to reportlab) and it is written one
+    point per line (a terms list). ``escape`` first, then newlines become
+    ``<br/>``; doing it the other way round would escape the tag it just
+    inserted."""
+    return escape(text).replace("\n", "<br/>")
 
 
 def _register_fonts() -> None:
@@ -584,6 +597,29 @@ def render_quotation_pdf(
     if quotation.notes:
         story.append(Paragraph("NOTES", styles["section_label"]))
         story.append(Paragraph(quotation.notes, styles["notes_body"]))
+        story.append(Spacer(1, 0.5 * cm))
+
+    # Operator-editable generic copy, each its own section (see the model's
+    # own column notes): PAYMENT TERMS then TERMS & CONDITIONS. Rendered
+    # only when set, so quotations created before these fields existed --
+    # and quotations where an operator cleared them -- look exactly as they
+    # did. Newlines in the operator's text are honoured (a terms list is
+    # written one point per line), hence the <br/> join rather than letting
+    # reportlab collapse whitespace.
+    if quotation.payment_terms:
+        story.append(Paragraph("PAYMENT TERMS", styles["section_label"]))
+        story.append(
+            Paragraph(_with_line_breaks(quotation.payment_terms), styles["notes_body"])
+        )
+        story.append(Spacer(1, 0.5 * cm))
+
+    if quotation.terms_and_conditions:
+        story.append(Paragraph("TERMS &amp; CONDITIONS", styles["section_label"]))
+        story.append(
+            Paragraph(
+                _with_line_breaks(quotation.terms_and_conditions), styles["notes_body"]
+            )
+        )
         story.append(Spacer(1, 0.5 * cm))
 
     story.append(Spacer(1, 0.3 * cm))

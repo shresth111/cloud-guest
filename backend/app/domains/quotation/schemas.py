@@ -53,6 +53,8 @@ class QuotationCreateRequest(BaseModel):
         ..., description="Date this quotation's pricing stays valid until."
     )
     notes: str | None = Field(default=None, max_length=5_000)
+    payment_terms: str | None = Field(default=None, max_length=5_000)
+    terms_and_conditions: str | None = Field(default=None, max_length=10_000)
 
     @field_validator("currency")
     @classmethod
@@ -92,6 +94,8 @@ class QuotationResponse(BaseModel):
     currency: str
     valid_until: datetime
     notes: str | None
+    payment_terms: str | None
+    terms_and_conditions: str | None
     sent_at: datetime | None
     email_error: str | None
     created_at: datetime

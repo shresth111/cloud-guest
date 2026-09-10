@@ -278,6 +278,46 @@ class TestRenderQuotationPdf:
 
 
 class TestCreateAndSendQuotation:
+    async def test_stores_payment_terms_and_terms_and_conditions(
+        self,
+    ) -> None:
+        """The two operator-editable copy blocks reach the stored row, trimmed
+        -- and are simply absent (NULL) when the operator leaves them blank,
+        which is what keeps pre-existing quotations rendering unchanged."""
+        service, _repository = _make_service(email_provider=FakeEmailProvider())
+
+        quotation = await service.create_and_send_quotation(
+            actor_user_id=uuid.uuid4(),
+            client_name="Jane Doe",
+            client_email="jane@example.com",
+            client_company_name="Example Hotel",
+            line_items=_make_line_items(),
+            tax_percentage=Decimal("0"),
+            currency="INR",
+            valid_until=_now() + timedelta(days=10),
+            notes=None,
+            payment_terms="  50% advance with the PO.  ",
+            terms_and_conditions="1. Prices exclude GST.\n2. 1 week validity.",
+        )
+        assert quotation.payment_terms == "50% advance with the PO."
+        assert quotation.terms_and_conditions == (
+            "1. Prices exclude GST.\n2. 1 week validity."
+        )
+
+        blank = await service.create_and_send_quotation(
+            actor_user_id=uuid.uuid4(),
+            client_name="John Doe",
+            client_email="john@example.com",
+            client_company_name="Example Inn",
+            line_items=_make_line_items(),
+            tax_percentage=Decimal("0"),
+            currency="INR",
+            valid_until=_now() + timedelta(days=10),
+            notes=None,
+        )
+        assert blank.payment_terms is None
+        assert blank.terms_and_conditions is None
+
     async def test_computes_subtotal_tax_and_total_correctly(self) -> None:
         provider = FakeEmailProvider()
         service, _repository = _make_service(email_provider=provider)
