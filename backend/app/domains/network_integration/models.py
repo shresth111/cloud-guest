@@ -117,14 +117,24 @@ class NetworkIntegration(BaseModel):
         ForeignKey("organizations.id", ondelete="CASCADE"),
         nullable=False,
     )
-    # NULL = organization-wide (a controller that serves several of the
-    # tenant's venues, or a row created before the operator picked which
-    # WyfyGuest location it maps to). The portal authorize path resolves an
-    # integration *by location*, so a NULL here means this row will never
-    # be selected for a portal authorization -- which is the honest
-    # behaviour rather than guessing at a mapping the operator has not
-    # made. `MODULE_NARROWEST_SCOPE[NETWORK_INTEGRATIONS] = LOCATION`
-    # follows from this column being nullable, exactly as it does for
+    # NULL means "not mapped to a venue", and nothing more than that.
+    #
+    # This comment used to open with "NULL = organization-wide (a
+    # controller that serves several of the tenant's venues)". That
+    # semantic is not implemented anywhere: the portal authorize path
+    # resolves an integration by an EXACT (organization, location,
+    # provider) match, so a NULL here is selected for no venue at all --
+    # not for all of them. Reading it as organization-wide is exactly how
+    # an operator ends up with a controller that looks configured and
+    # authorizes nobody, so the wording is corrected rather than left to
+    # be discovered.
+    #
+    # `PortalReadinessGap.LOCATION_NOT_MAPPED` is the surfacing of it:
+    # `_sync` refuses to call such a row CONNECTED and the readiness
+    # checklist fails its CONTROLLER_INTEGRATION item.
+    #
+    # `MODULE_NARROWEST_SCOPE[NETWORK_INTEGRATIONS] = LOCATION` follows
+    # from this column being nullable, exactly as it does for
     # PermissionModule.NETWORK_DEVICE.
     location_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
