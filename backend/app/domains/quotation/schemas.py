@@ -94,8 +94,8 @@ class QuotationResponse(BaseModel):
     currency: str
     valid_until: datetime
     notes: str | None
-    payment_terms: str | None
-    terms_and_conditions: str | None
+    payment_terms: str | None = None
+    terms_and_conditions: str | None = None
     sent_at: datetime | None
     email_error: str | None
     created_at: datetime
