@@ -53,6 +53,8 @@ from app.domains.network_integration.constants import (
     AuthorizationStatus,
     ControllerAuthMode,
     ErrorCode,
+    IntegrationEventStatus,
+    IntegrationEventType,
     IntegrationStatus,
     NetworkProviderKind,
     SyncStatus,
@@ -2316,7 +2318,14 @@ class TestSyncAndBackoff:
     async def test_a_successful_sync_caches_the_counts(self) -> None:
         org = uuid.uuid4()
         repo = FakeRepository()
-        integration = repo.add(_integration(organization_id=org))
+        # `location_id` is passed explicitly: `_integration()` defaults it
+        # to None, which is a real half-configured state (the portal path
+        # resolves an integration BY location, so a NULL one is never
+        # selected for any venue) and now reports itself as such. This test
+        # is about the fully-configured case.
+        integration = repo.add(
+            _integration(organization_id=org, location_id=uuid.uuid4())
+        )
         service = _service(repo)
         outcome = await service.sync_integration(
             integration.id, requesting_organization_id=org
@@ -2326,6 +2335,128 @@ class TestSyncAndBackoff:
         assert integration.provider_metadata["device_count"] == 2
         assert integration.last_sync_status == SyncStatus.OK.value
         assert integration.status == IntegrationStatus.CONNECTED.value
+        assert integration.last_error_code is None
+        assert integration.last_error_message is None
+
+    async def test_a_sync_will_not_call_a_half_configured_venue_connected(
+        self,
+    ) -> None:
+        """The defect this exists to end. Credentials work, `/api/info`
+        answers, sites list -- and no site has been picked, so
+        `authorize_portal_client` refuses every guest at the venue. Before
+        this, all of that produced a green CONNECTED badge."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                location_id=uuid.uuid4(),
+                external_site_id=None,
+            )
+        )
+        service = _service(repo)
+
+        outcome = await service.sync_integration(
+            integration.id, requesting_organization_id=org
+        )
+
+        assert integration.status == IntegrationStatus.UNCONFIGURED.value
+        assert outcome.status == IntegrationStatus.UNCONFIGURED.value
+        assert integration.last_error_code == ErrorCode.SETUP_INCOMPLETE.value
+        assert "no controller site has been selected" in (
+            integration.last_error_message or ""
+        )
+
+    async def test_the_message_says_what_it_costs_not_only_what_is_missing(
+        self,
+    ) -> None:
+        """An operator ranking this against everything else on their screen
+        needs the consequence, not the field name."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(organization_id=org, location_id=None)
+        )
+        service = _service(repo)
+
+        await service.sync_integration(
+            integration.id, requesting_organization_id=org
+        )
+
+        message = integration.last_error_message or ""
+        assert "cannot authorize any guest" in message
+        assert "still have no internet" in message
+
+    async def test_a_half_configured_venue_keeps_being_polled(self) -> None:
+        """`last_sync_status` stays OK and the failure counter stays at
+        zero, deliberately. Marking the sync itself failed would put the
+        row into the backoff and stop polling it -- so the moment the
+        operator finished the mapping, nothing would notice."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(organization_id=org, location_id=None)
+        )
+        service = _service(repo)
+
+        outcome = await service.sync_integration(
+            integration.id, requesting_organization_id=org
+        )
+
+        assert outcome.synced is True
+        assert integration.last_sync_status == SyncStatus.OK.value
+        assert (
+            integration.provider_metadata.get("consecutive_failure_count") == 0
+        )
+
+    async def test_the_events_feed_records_it_as_an_error(self) -> None:
+        """The feed answers "what has this integration been doing". "It has
+        been talking to the controller perfectly and authorizing nobody" is
+        the most important thing it can say, and an OK row does not say
+        it."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(organization_id=org, location_id=None)
+        )
+        service = _service(repo)
+
+        await service.sync_integration(
+            integration.id, requesting_organization_id=org
+        )
+
+        sync_events = [
+            e
+            for e in repo.events
+            if e.event_type == IntegrationEventType.SYNC.value
+        ]
+        assert len(sync_events) == 1
+        assert sync_events[0].status == IntegrationEventStatus.ERROR.value
+        assert sync_events[0].error_code == ErrorCode.SETUP_INCOMPLETE.value
+
+    async def test_finishing_the_setup_clears_it_on_the_next_sync(self) -> None:
+        """The state has to be able to leave, not only arrive."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org, location_id=uuid.uuid4(), external_site_id=None
+            )
+        )
+        service = _service(repo)
+        await service.sync_integration(
+            integration.id, requesting_organization_id=org
+        )
+        assert integration.status == IntegrationStatus.UNCONFIGURED.value
+
+        integration.external_site_id = "site-1"
+        await service.sync_integration(
+            integration.id, requesting_organization_id=org
+        )
+
+        assert integration.status == IntegrationStatus.CONNECTED.value
+        assert integration.last_error_code is None
+        assert integration.last_error_at is None
 
     async def test_a_failed_sync_records_the_error_and_increments_the_counter(
         self,

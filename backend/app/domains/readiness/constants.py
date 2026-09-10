@@ -111,6 +111,8 @@ class ChecklistItemKey(StrEnum):
     ROGUE_DHCP_GUARD = "rogue_dhcp_guard"
     DOH_DOT_BLOCKING = "doh_dot_blocking"
     REBOOT_PERSISTENCE = "reboot_persistence"
+    # Controller-managed devices only -- see CONTROLLER_MANAGED_ITEMS.
+    CONTROLLER_INTEGRATION = "controller_integration"
 
 
 class ChecklistCategory(StrEnum):
@@ -307,14 +309,76 @@ CHECKLIST_ITEMS_BY_KEY: dict[ChecklistItemKey, ChecklistItemDefinition] = {
     item.key: item for item in CHECKLIST_ITEMS
 }
 
+
+# Items that exist ONLY for a controller-managed device, appended to the
+# sixteen above rather than mixed into them.
+#
+# ## Why appended and not a seventeenth entry in CHECKLIST_ITEMS
+#
+# `get_checklist` iterates whichever tuple it is given and writes a row per
+# definition. A seventeenth shared item would give every MikroTik in
+# production an extra NOT_CHECKED row and move `summarize`'s `total` from
+# 16 to 17 -- a change to every existing customer's readiness page, to
+# carry a question that has no meaning for their hardware. Kept separate,
+# an agent-managed router's checklist is byte-identical to what it was.
+#
+# ## Why a controller gets an extra item rather than a shorter list
+#
+# The nine MANUAL items still mean something at an Omada venue -- an
+# operator confirming "guest sign-in works here" is the same claim
+# whatever the hardware -- and the seven AUTO ones already report
+# NOT_APPLICABLE with a reason. What was missing was the one question that
+# IS answerable, and is the only thing that can actually be wrong: has
+# anyone finished pointing this controller at a site.
+#
+# ## Deliberately absent from CHECKLIST_ITEMS_BY_KEY
+#
+# `service.confirm_item` validates against that mapping, so this item
+# cannot be manually ticked -- which is the point. Every other item on
+# this checklist is a claim a human can reasonably make from the outside.
+# This one is computed from rows this platform owns, and letting an
+# operator mark a dead venue "confirmed" would reintroduce exactly the
+# green-badge-over-a-broken-venue failure it exists to end.
+CONTROLLER_MANAGED_ITEMS: tuple[ChecklistItemDefinition, ...] = (
+    ChecklistItemDefinition(
+        key=ChecklistItemKey.CONTROLLER_INTEGRATION,
+        label="Controller integration",
+        description=(
+            "This controller is linked to a network integration that is "
+            "finished -- credentials saved, mapped to a location, and a "
+            "controller site selected. Until all three are true it "
+            "authorizes nobody, and guests here complete sign-in with no "
+            "internet."
+        ),
+        detection_mode=DetectionMode.AUTO,
+        category=ChecklistCategory.CONNECTIVITY,
+    ),
+)
+
+
+def checklist_items_for(*, agent_managed: bool) -> tuple[ChecklistItemDefinition, ...]:
+    """The checklist a given device actually has.
+
+    A function rather than two exported tuples so there is one place that
+    decides, and so the agent-managed answer is literally `CHECKLIST_ITEMS`
+    -- the same object, in the same order, as before any of this existed.
+    """
+    if agent_managed:
+        return CHECKLIST_ITEMS
+    return CHECKLIST_ITEMS + CONTROLLER_MANAGED_ITEMS
+
+
 __all__ = [
     "ChecklistItemStatus",
     "PASSING_STATUSES",
     "FAILING_STATUSES",
+    "NOT_APPLICABLE_STATUSES",
     "DetectionMode",
     "ChecklistItemKey",
     "ChecklistCategory",
     "ChecklistItemDefinition",
     "CHECKLIST_ITEMS",
     "CHECKLIST_ITEMS_BY_KEY",
+    "CONTROLLER_MANAGED_ITEMS",
+    "checklist_items_for",
 ]

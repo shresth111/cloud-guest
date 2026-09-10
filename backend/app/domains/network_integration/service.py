@@ -148,7 +148,9 @@ from .providers.base import (
 )
 from .repository import NetworkIntegrationRepositoryProtocol
 from .validators import (
+    describe_portal_readiness_gaps,
     normalize_client_mac,
+    portal_readiness_gaps,
     synthesize_fleet_identity,
     validate_auth_mode_credentials,
     validate_controller_url,
@@ -980,6 +982,30 @@ class NetworkIntegrationService:
             integration_id, requesting_organization_id=requesting_organization_id
         )
 
+    async def find_integration_for_router(
+        self, router_id: uuid.UUID
+    ) -> NetworkIntegration | None:
+        """The integration a controller-managed fleet row belongs to, or
+        ``None``.
+
+        Satisfies ``readiness.NetworkIntegrationLookupProtocol`` -- the
+        "smallest interface the sibling already implements" convention this
+        codebase uses everywhere, rather than letting `readiness` query
+        `network_integrations` itself.
+
+        No ``requesting_organization_id``, and that omission is the
+        deliberate part: see the repository method's own docstring. The
+        caller resolves the router org-scoped before it gets here, and this
+        row's `router_id` was written alongside that router in one
+        transaction. A parameter compared against the *caller's* header
+        instead of the router's owner would be the path-id scoping defect
+        rather than a fix for it.
+
+        Reads only. Nothing here decrypts a credential, so no reveal is
+        audit-logged for a checklist page refresh.
+        """
+        return await self.repository.find_integration_for_router(router_id)
+
     async def list_integrations(
         self,
         *,
@@ -1797,15 +1823,33 @@ class NetworkIntegrationService:
         metadata["client_count"] = len(clients)
         metadata["site_count"] = len(sites)
         metadata["consecutive_failure_count"] = 0
+        # A successful controller conversation is not the same claim as a
+        # working venue, and reporting it as one is how an operator ends up
+        # with a green CONNECTED badge over a site where nobody gets
+        # online. `portal_readiness_gaps` asks the narrower question --
+        # would `authorize_portal_client` actually get as far as the
+        # controller for a guest at this venue -- and every gap it can
+        # return is a branch that method really takes.
+        gaps = portal_readiness_gaps(integration)
         updates: dict[str, object] = {
-            "status": IntegrationStatus.CONNECTED.value,
+            "status": (
+                IntegrationStatus.UNCONFIGURED.value
+                if gaps
+                else IntegrationStatus.CONNECTED.value
+            ),
             "controller_id": info.controller_id or integration.controller_id,
             "controller_version": info.controller_version,
             "last_sync_at": now,
+            # The *sync* did succeed, and saying otherwise would put this
+            # row into the failure backoff and stop it being polled -- so
+            # the moment the operator finishes the mapping, nothing would
+            # notice. Two different facts, two different columns.
             "last_sync_status": SyncStatus.OK.value,
-            "last_error_code": None,
-            "last_error_message": None,
-            "last_error_at": None,
+            "last_error_code": ErrorCode.SETUP_INCOMPLETE.value if gaps else None,
+            "last_error_message": (
+                describe_portal_readiness_gaps(gaps) if gaps else None
+            ),
+            "last_error_at": now if gaps else None,
             "provider_metadata": metadata,
         }
         # Refresh the cached site name if the controller renamed it. The
@@ -1820,12 +1864,24 @@ class NetworkIntegrationService:
         await self._record_event(
             updated,
             event_type=IntegrationEventType.SYNC,
-            status=IntegrationEventStatus.OK,
-            message="Sync completed",
+            # Recorded as an ERROR rather than an OK-with-a-note. This feed
+            # is what a human reads to answer "what has this integration
+            # been doing", and "it has been talking to the controller
+            # perfectly and authorizing nobody" is the single most
+            # important thing it can say. No extra rows: one SYNC event per
+            # sync either way.
+            status=(
+                IntegrationEventStatus.ERROR if gaps else IntegrationEventStatus.OK
+            ),
+            error_code=ErrorCode.SETUP_INCOMPLETE.value if gaps else None,
+            message=(
+                describe_portal_readiness_gaps(gaps) if gaps else "Sync completed"
+            ),
             context={
                 "site_count": len(sites),
                 "device_count": len(devices),
                 "client_count": len(clients),
+                **({"readiness_gaps": [gap.value for gap in gaps]} if gaps else {}),
             },
         )
         return SyncOutcome(
@@ -1835,6 +1891,8 @@ class NetworkIntegrationService:
             site_count=len(sites),
             device_count=len(devices),
             client_count=len(clients),
+            error_code=ErrorCode.SETUP_INCOMPLETE.value if gaps else None,
+            message=describe_portal_readiness_gaps(gaps) if gaps else None,
         )
 
     # -- platform (Master console) ----------------------------------------
