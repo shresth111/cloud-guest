@@ -70,6 +70,12 @@ class Quotation(BaseModel):
         DateTime(timezone=True), nullable=False
     )
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Operator-editable generic copy printed on the PDF as their own
+    # sections, distinct from `notes` (the free-text catch-all): payment
+    # terms ("50% advance...") and the terms & conditions block. Nullable
+    # so a quotation that predates them renders exactly as before.
+    payment_terms: Mapped[str | None] = mapped_column(Text, nullable=True)
+    terms_and_conditions: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Delivery outcome -- mirrors app.domains.billing.router's own
     # "a failed/unconfigured email send is never a rollback of the
