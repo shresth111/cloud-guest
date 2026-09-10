@@ -30,6 +30,7 @@ from app.domains.router.device_adapters import (
     push_live_config,
 )
 from app.domains.router.service import RouterService
+from app.domains.router.vendor_capabilities import is_controller_managed
 from app.domains.router_provisioning.dependencies import get_router_provisioning_service
 from app.domains.router_provisioning.models import ConfigVersion, ProvisioningJob
 from app.domains.router_provisioning.schemas import (
@@ -224,6 +225,42 @@ async def apply_network_config_live(
         version_id=version_id,
         requesting_organization_id=requesting_organization_id,
     )
+    # Vendor first, and before `reveal_credentials` rather than after.
+    #
+    # Two reasons. A controller-managed device (a TP-Link Omada controller,
+    # registered as a fleet row so its venue's guests can be issued a
+    # session at all) speaks no RouterOS API, so `push_config` over a
+    # tunnel it does not have could never work -- and the credential branch
+    # below would refuse it with "no stored connection details", which
+    # reads as "add some and retry" for a device where no credential would
+    # ever help.
+    #
+    # And `reveal_credentials` is an audited, high-trust operation that
+    # decrypts a secret. Running it for a row whose `api_credentials_encrypted`
+    # is NULL by construction writes an audit entry for a reveal that
+    # revealed nothing, which is noise in exactly the log an auditor reads
+    # to find real credential access.
+    gate_row = await router_service.get_router(
+        router_id, requesting_organization_id=requesting_organization_id
+    )
+    if is_controller_managed(gate_row):
+        payload = NetworkConfigApplyLiveResponse(
+            router_id=str(router_id),
+            version_id=str(version_id),
+            applied=False,
+            detail=(
+                f"This is a '{gate_row.vendor}' device, managed through its "
+                "own controller. This platform does not push RouterOS "
+                "configuration to it, so there is nothing to apply live."
+            ),
+        )
+        return build_response(
+            success=True,
+            message="Live apply does not apply to this vendor",
+            data=payload.model_dump(),
+            request_id=_request_id(request),
+        )
+
     router_row = await router_service.reveal_credentials(
         actor_user_id=uuid.UUID(user.id),
         router_id=router_id,
