@@ -31,14 +31,22 @@ device.
 
 ## Two ports, not one -- why ``creds.extra["ssh_port"]`` exists
 
-Every read/write operation below except ``provision_device`` uses
-MikroTik's structured RouterOS API (``librouteros``, default TCP port
-8728, taken from ``creds.port``). ``provision_device`` is the one
-operation ported from ``provisioning_engine.device_adapters`` that
-genuinely needs SSH + SFTP instead (RouterOS's API protocol has no
-file-transfer primitive; ``/import`` is a file-system-level operation --
-see that module's own docstring for the full "why both librouteros AND
-asyncssh" reasoning, mirrored here unchanged). Since
+Almost every operation below uses MikroTik's structured RouterOS API
+(``librouteros``, default TCP port 8728, taken from ``creds.port``). The
+exceptions are the ones that genuinely move *files*: ``provision_device``,
+``push_config``/``verify_config``, ``backup``/``restore`` and
+``upload_file`` need SSH + SFTP, because RouterOS's API protocol has no
+file-transfer primitive and ``/import`` is a file-system-level operation
+(see ``provisioning_engine.device_adapters``'s own docstring for the full
+"why both librouteros AND asyncssh" reasoning, mirrored here unchanged).
+
+``execute_raw_command`` used to be in that SSH list and is not any more:
+port 22 is filtered on this fleet, so the Master Console device console
+timed out on commands the API answers in milliseconds. It now runs over
+the API whenever the command can be translated faithfully, and falls back
+to SSH only for the shapes the API cannot express -- see that method's own
+docstring for the incident and :func:`_console_command_to_api_sentence`
+for what "faithfully" means. Since
 ``DeviceCredentials`` (the vendor-agnostic contract type) has only one
 ``port`` field, the SSH port is read from ``creds.extra["ssh_port"]``
 (defaulting to 22 if absent/unparsable) -- exactly the escape hatch the
@@ -65,8 +73,10 @@ import hashlib
 import ipaddress
 import logging
 import re
+import shlex
+import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import asyncssh
 import librouteros
@@ -81,8 +91,16 @@ from .contract import (
     DeviceHealthResult,
     DeviceInterfaceCounters,
     DeviceVendor,
+    DhcpOptionBinding,
+    DhcpOptionConfig,
+    DhcpOptionInfo,
+    DhcpOptionRemoval,
+    DhcpOptionSetInfo,
+    DhcpOptionSnapshot,
     DhcpPoolConfig,
     HotspotActiveSession,
+    HotspotCertificatePush,
+    HotspotCertificatePushResult,
     HotspotDisconnectResult,
     HotspotSessionControl,
     InterfaceInfo,
@@ -110,6 +128,21 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_API_PORT = 8728
 _DEFAULT_SSH_PORT = 22
+
+# The RouterOS menus that make up a custom DHCP option. Written out as
+# module constants because the removal path has to walk all four in a
+# fixed order and getting one of them wrong is a silent no-op.
+_DHCP_OPTION_PATH = ("ip", "dhcp-server", "option")
+_DHCP_OPTION_SET_PATH = ("ip", "dhcp-server", "option", "sets")
+_DHCP_NETWORK_PATH = ("ip", "dhcp-server", "network")
+# Every menu whose rows can hand a DHCP option to clients, paired with the
+# field that identifies a row to a human. ``/ip dhcp-server`` itself is
+# deliberately absent: it carries no ``dhcp-option``/``dhcp-option-set``
+# field, and probing it would only add a round trip that can never match.
+_DHCP_OPTION_BINDING_PATHS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (_DHCP_NETWORK_PATH, "address"),
+    (("ip", "dhcp-server", "lease"), "address"),
+)
 # ported from provisioning_engine/device_adapters.py's own module-level
 # filename constants -- push_config/verify_config and backup/restore each
 # round-trip through the *same* filename, so they must stay in sync with
@@ -601,6 +634,183 @@ def _describe_exception(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+# ============================================================================
+# Raw-console command translation: RouterOS CLI text -> a RouterOS API
+# sentence. See ``MikroTikAdapter.execute_raw_command``'s own docstring for
+# why the console runs over the API (8728) rather than SSH (22).
+# ============================================================================
+
+# A bare (non ``key=value``) console token is only ever a menu segment or a
+# command word. Anything outside this shape -- ``[find ...]``, ``:put``,
+# ``$var``, a ``;``-chained second command, a redirect -- has no API-sentence
+# equivalent, and *guessing* one would run something other than what the
+# operator typed. Those commands are handed to the SSH fallback instead.
+_CONSOLE_BARE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_CONSOLE_ARG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# RouterOS CLI keywords that read as bare words but are *not* menu segments.
+# ``/interface print where running=yes`` naively concatenates to the
+# nonexistent path ``/interface/print/where``; the API expresses that filter
+# as a query word instead, which this translator deliberately does not try to
+# construct. Presence of any of these means "not translatable".
+_CONSOLE_CLI_ONLY_KEYWORDS = frozenset(
+    {
+        "where",
+        "from",
+        "do",
+        "as-value",
+        "follow",
+        "follow-only",
+        "without-paging",
+        "detail",
+        "brief",
+        "terse",
+        "count-only",
+        "file",
+        "append",
+        "value-list",
+    }
+)
+
+# RouterOS command words -- the verb that terminates a menu path. A
+# translatable command's LAST bare token must be one of these, and no
+# earlier token may be.
+#
+# This is what keeps *positional* CLI syntax out. ``/user set admin
+# password=x`` is a real command an operator might type, and naive
+# concatenation turns it into the nonexistent path ``/user/set/admin``
+# (the API expresses that target as a ``.id``/``numbers`` word, not a path
+# segment). Requiring the verb to come last rejects it, and the SSH
+# fallback then reports honestly instead of the platform issuing a sentence
+# nobody asked for.
+#
+# The list is deliberately conservative and incomplete. A command whose
+# verb is not here is not translated -- it is not mangled -- so growing
+# this set is a safe, additive change, while a wrong entry is not.
+_ROUTEROS_ACTION_WORDS = frozenset(
+    {
+        "add",
+        "backup",
+        "blink",
+        "cancel",
+        "check-for-updates",
+        "clear",
+        "comment",
+        "disable",
+        "discover",
+        "download",
+        "enable",
+        "export",
+        "find",
+        "flush",
+        "get",
+        "install",
+        "load",
+        "monitor",
+        "move",
+        "ping",
+        "print",
+        "reboot",
+        "refresh",
+        "register",
+        "release",
+        "remove",
+        "renew",
+        "reset",
+        "reset-configuration",
+        "reset-counters",
+        "resolve",
+        "restart",
+        "restore",
+        "run",
+        "save",
+        "scan",
+        "send",
+        "set",
+        "shutdown",
+        "sign",
+        "start",
+        "stop",
+        "unset",
+        "upgrade",
+    }
+)
+
+
+def _console_command_to_api_sentence(
+    command: str,
+) -> tuple[str, dict[str, str]] | None:
+    """Translates one RouterOS console line into ``(sentence, arguments)``
+    for ``librouteros``' raw calling form (``api("/interface/print")``), or
+    returns ``None`` when the line cannot be translated *faithfully*.
+
+    ``None`` is not a failure -- it means "this command's meaning is not
+    expressible as a single API sentence", and the caller falls back to the
+    SSH transport rather than running an approximation of what the operator
+    asked for. Translating conservatively and refusing loudly is the whole
+    point: a console that silently runs a *different* command than the one
+    typed is worse than one that cannot run it at all.
+    """
+    try:
+        tokens = shlex.split(command.strip())
+    except ValueError:  # unbalanced quotes -- let SSH's own parser judge it
+        return None
+    if not tokens or not tokens[0].startswith("/"):
+        return None
+
+    segments: list[str] = []
+    arguments: dict[str, str] = {}
+    seen_argument = False
+    for index, token in enumerate(tokens):
+        name, separator, value = token.partition("=")
+        if separator and not token.startswith("/"):
+            if not _CONSOLE_ARG_NAME_RE.match(name):
+                return None
+            arguments[name] = value
+            seen_argument = True
+            continue
+        # A bare word after arguments have started is a second command or a
+        # CLI construct, never a menu segment.
+        if seen_argument:
+            return None
+        bare = token.lstrip("/") if index == 0 else token
+        if index > 0 and bare in _CONSOLE_CLI_ONLY_KEYWORDS:
+            return None
+        if not _CONSOLE_BARE_TOKEN_RE.match(bare):
+            return None
+        segments.extend(part for part in bare.split("/") if part)
+
+    # A menu path alone (``/interface``) only opens a submenu on the CLI; it
+    # is not a command the API can execute. Needs at least menu + verb.
+    if len(segments) < 2:
+        return None
+    # The verb terminates the path, and appears exactly once. Anything else
+    # means a positional argument or a second command is in play -- see
+    # ``_ROUTEROS_ACTION_WORDS``.
+    if segments[-1] not in _ROUTEROS_ACTION_WORDS:
+        return None
+    if any(segment in _ROUTEROS_ACTION_WORDS for segment in segments[:-1]):
+        return None
+    return "/" + "/".join(segments), arguments
+
+
+def _format_console_rows(rows: Sequence[Mapping[str, object]]) -> str:
+    """Renders RouterOS API reply rows as console-style text.
+
+    The API answers with structured rows where the CLI answers with a text
+    table, so this is the one place the two transports genuinely differ in
+    what an operator sees. ``key=value`` per row (``.id`` first, since that
+    is what a follow-up command needs) is chosen over imitating the CLI's
+    column layout because it is unambiguous: no truncated columns, and no
+    value silently reformatted to fit a width."""
+    lines: list[str] = []
+    for index, row in enumerate(rows):
+        ordered = sorted(row.items(), key=lambda item: (item[0] != ".id", item[0]))
+        rendered = " ".join(f"{key}={value}" for key, value in ordered)
+        lines.append(f"{index:>3} {rendered}".rstrip())
+    return "\n".join(lines)
+
+
 def _domain_subdomain_regex(domain: str) -> str:
     """Ported verbatim from
     ``network_config/renderers.py::_domain_subdomain_regex`` -- the real
@@ -731,6 +941,61 @@ def _interface_counters_from_rows(
     return tuple(counters) or None
 
 
+# How long a hotspot-certificate push waits for the device to agree that a
+# write landed before treating it as not having landed. Six reads half a
+# second apart, i.e. up to ~2.5s -- generously more than the ``:delay 1s``
+# each of these replaces in ``renew-hotspot-certs.sh``, and still short
+# enough that a genuinely silent no-op is reported inside one push.
+_SETTLE_ATTEMPTS = 6
+_SETTLE_DELAY_SECONDS = 0.5
+
+
+def _dns_name_covered(dns_name: str | None, san_names: Sequence[str]) -> bool:
+    """Whether a certificate carrying ``san_names`` is actually valid for
+    the hostname a hotspot profile redirects guests to.
+
+    Wildcard-aware in the one way X.509 defines and no further:
+    ``*.portal.wyfyguest.com`` covers ``site42.portal.wyfyguest.com`` and
+    does **not** cover ``portal.wyfyguest.com`` or
+    ``a.b.portal.wyfyguest.com``. Getting this wrong in the permissive
+    direction would wave through a push whose only visible effect is a
+    full-screen certificate warning on every guest device -- so an empty or
+    unreadable ``dns-name`` is treated as not covered, never as "probably
+    fine".
+    """
+    if not dns_name:
+        return False
+    host = dns_name.strip().lower().rstrip(".")
+    if not host:
+        return False
+    for raw in san_names:
+        san = str(raw).strip().lower().rstrip(".")
+        if not san:
+            continue
+        if san == host:
+            return True
+        if san.startswith("*."):
+            suffix = san[1:]  # ".portal.wyfyguest.com"
+            if host.endswith(suffix) and "." not in host[: -len(suffix)]:
+                return True
+    return False
+
+
+def _login_by_tokens(value: str | None) -> frozenset[str]:
+    """A RouterOS ``login-by`` list as a set of methods.
+
+    Compared as a set, never as a string: the API accepts
+    ``"https,http-pap"`` on write and is free to answer the read in its own
+    order, so a string comparison would report every correctly-rebound
+    profile as a failed rebind.
+    """
+    if not value:
+        return frozenset()
+    return frozenset(
+        token.strip().lower() for token in str(value).split(",") if token.strip()
+    )
+
+
 def _is_truthy(value: object) -> bool:
     """RouterOS booleans, read back honestly.
 
@@ -743,6 +1008,21 @@ def _is_truthy(value: object) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "yes"}
+
+
+def _split_routeros_list(value: object) -> tuple[str, ...]:
+    """Split one of RouterOS's comma-separated list fields (``options`` on
+    an option set, ``dhcp-option`` on a network/lease row) into its
+    entries, dropping the empties an absent field and a trailing comma both
+    produce.
+
+    Kept apart from :func:`_split_valid_servers`, which canonicalises MAC
+    addresses on the way through. These entries are *names*, and
+    upper-casing them would stop them matching the option they refer to.
+    """
+    if value is None:
+        return ()
+    return tuple(part.strip() for part in str(value).split(",") if part.strip())
 
 
 def _split_valid_servers(value: object) -> tuple[str, ...]:
@@ -1876,6 +2156,660 @@ class MikroTikAdapter:
         )
 
     # ------------------------------------------------------------------
+    # hotspot TLS certificate
+    # ------------------------------------------------------------------
+
+    async def push_hotspot_certificate(
+        self, creds: DeviceCredentials, *, push: HotspotCertificatePush
+    ) -> HotspotCertificatePushResult:
+        """See :meth:`DeviceGatewayAdapter.push_hotspot_certificate`, and
+        :meth:`_push_hotspot_certificate_sync` for the ordering -- every
+        line of which is ported from
+        ``ops/letsencrypt-hotspot/renew-hotspot-certs.sh``'s
+        ``REMOTE_SCRIPT`` rather than re-derived.
+
+        ``creds.timeout_seconds`` covers two real HTTP downloads by the
+        device plus two imports; size it like a ``run_speed_test`` call,
+        not like a health-check read.
+        """
+        return await asyncio.to_thread(
+            self._push_hotspot_certificate_sync, creds, push
+        )
+
+    def _push_hotspot_certificate_sync(
+        self, creds: DeviceCredentials, push: HotspotCertificatePush
+    ) -> HotspotCertificatePushResult:
+        """The whole push, in one API session, in the order the 2026-08-18
+        incident settled.
+
+        ## Why this exists at all
+
+        The mechanism this replaces (``renew-hotspot-certs.sh``) moves the
+        PEMs with ``scp`` and drives the re-import over ``ssh``. Measured
+        against the live fleet on 2026-09-06: on the only reachable router,
+        ports 21/22/23/80/443/8291 all *time out* -- filtered by a firewall
+        drop, not refused -- and only 8728/8729 answer. The push could not
+        work on any router in the fleet, and the hotspot certificate
+        expires 2026-11-16. A bound-but-expired certificate is not a
+        cosmetic problem: with ``login-by=https,http-pap`` it is the
+        confirmed three-symptom failure (no login page on Windows/macOS,
+        the captive window never closing, an Android certificate warning)
+        that PR #153 exists to prevent.
+
+        ``/tool fetch`` inverts the direction -- the router pulls -- and is
+        an ordinary API command on 8728. ``_run_speed_test_sync`` in this
+        same module already drives it against real hardware today,
+        including ``dst-path`` writing to flash and a real ``/file remove``
+        cleanup; that is the proof the transport works, and this method is
+        modelled on it.
+
+        ## Ordering (ported, not re-derived)
+
+        1. **Read the profile first.** Nothing is written until the profile
+           named in ``push`` has been found and, if the caller supplied the
+           certificate's SANs, its ``dns-name`` confirmed covered. A
+           certificate that does not match the address in the guest's URL
+           bar produces the same full-screen warning the certificate effort
+           exists to remove, while looking like a success in every log.
+        2. **Fetch both PEMs before touching the certificate store.** The
+           shell script uploads first too, and the reason matters: step 3
+           removes the currently-serving intermediate, so every failure
+           mode that can be moved *before* that removal must be.
+        3. **Remove the ephemeral and stable chain artifacts of the last
+           round** (``<name>.fullchain.pem*`` and ``<name>-chain-*``).
+           RouterOS dedupes an import against an identical object already
+           in the store, so leaving last round's intermediate in place
+           makes this round's import produce no intermediate object to
+           rename -- which is why this sweep must run before the import and
+           not after it. It is also the *only* place that broad sweep runs;
+           see step 8.
+
+           Known cost, stated rather than hidden: between here and step 8
+           the router is serving its *current* leaf with no intermediate
+           beside it, i.e. the incomplete chain of the incident, for the
+           few seconds the import and rebind take. That is accepted
+           deliberately -- the alternative is a push that reliably ends
+           with no intermediate at all, which is the same failure
+           permanently -- but it does mean a push should not be run
+           against a venue mid-event for fun.
+        3b. **Wait for the device to agree, at each gate.** Steps 5 and 6b
+           poll rather than assume, replacing the two ``:delay 1s`` lines
+           in the shell script. See :meth:`_settle`.
+        4. **Import fullchain, then privkey**, and read the reply's
+           counters if RouterOS sends any. Whether it does over the API on
+           this firmware has never been confirmed against this fleet, so
+           the counters are recorded but never gated on -- step 5 is.
+        5. **Find the new leaf by name and stop here if it is absent.**
+           ``<name>.fullchain.pem_0`` is what an import of a file called
+           ``<name>.fullchain.pem`` produces for the first certificate in
+           it. If it is not there, the import silently did nothing, and the
+           router is still on its previous, working certificate: raise, and
+           leave it that way. This is the single reason nothing destructive
+           happens earlier.
+        6. **Rename + trust the new leaf under a temporary name**, so the
+           live certificate is never deleted while still referenced, then
+           **rebind the profile** -- ``ssl-certificate`` and ``login-by``
+           in ONE ``set``. Splitting them across two calls is what silently
+           no-op'd during the incident.
+        6b. **Read the profile back and stop if the rebind did not take.**
+           The shell script delays a second here and then deletes the old
+           leaf regardless. On the silent-no-op path that destroys the
+           certificate the router is still serving. Nothing is removed
+           until the device itself reports the new binding.
+        7. **Only now remove the old leaf** (nothing references it any
+           more), rename the new one onto the stable name, and re-issue the
+           bind against that stable name -- see the inline comment at step
+           7b for why the rename alone is not enough to rely on.
+        8. **Rename every remaining ``<name>.fullchain.pem*`` object onto a
+           stable ``<name>-chain-N`` name and mark it trusted.** These are
+           the intermediate(s) -- however many Let's Encrypt's current
+           chain has; do not assume exactly one. This step is the fix for
+           the incident: an earlier version deleted them via the SAME broad
+           sweep now used only in step 3, run a second time at the end,
+           which by then matched only the still-ephemerally-named
+           intermediates (the leaf had been renamed away in step 6) and
+           deleted them right after importing them. RouterOS's hotspot TLS
+           server builds the served chain from whatever trusted certificate
+           objects are present and issuer-linked (skid/akid) to the bound
+           leaf -- it needs no explicit ``ca=`` field, but it very much
+           needs the intermediate object to still exist. Losing it left the
+           router serving the leaf alone: genuinely LE-issued, verifiable
+           offline, incomplete on the wire -- which strict/embedded TLS
+           clients reject outright and desktop browsers paper over.
+        9. **Final sweep of the ephemeral pattern** -- by now everything
+           wanted has been renamed off it in steps 6 and 8, so this is a
+           true no-op safety net, not a deletion mechanism.
+        10. **``/file remove`` the two uploads**, always -- the private key
+            must not sit on the router's flash after the push. Same
+            unconditional cleanup ``_run_speed_test_sync`` does.
+        11. **Verify by reading the device back**, and raise if it does not
+            agree. See :meth:`_verify_hotspot_certificate`.
+        """
+        upload_fullchain = f"{push.cert_name}.fullchain.pem"
+        upload_privkey = f"{push.cert_name}.privkey.pem"
+        temp_leaf_name = f"{push.cert_name}-new"
+        ephemeral_prefix = f"{upload_fullchain}_"
+        chain_prefix = f"{push.cert_name}-chain-"
+        profile_dns_name: str | None = None
+        chain_names: tuple[str, ...] = ()
+        certificates_imported: int | None = None
+        private_keys_imported: int | None = None
+
+        api = self._connect_api(creds)
+        try:
+            try:
+                # 1. profile preflight -- read-only, before any write.
+                profile = self._find_hotspot_profile(api, push.hotspot_profile)
+                if profile is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: no /ip hotspot profile "
+                        f"named {push.hotspot_profile!r} on this device -- "
+                        "nothing to rebind",
+                    )
+                profile_dns_name = _safe_str(profile.get("dns-name"))
+                if push.expected_dns_names and not _dns_name_covered(
+                    profile_dns_name, push.expected_dns_names
+                ):
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: this router's portal "
+                        f"redirects to {profile_dns_name!r}, which the "
+                        "certificate being pushed does not cover "
+                        f"(SANs: {', '.join(push.expected_dns_names)}) -- "
+                        "installing it would show every guest the exact "
+                        "browser warning this push exists to remove",
+                    )
+
+                # 2. both PEMs onto flash, before anything is removed.
+                self._fetch_to_flash(
+                    api, creds, url=push.fullchain_url, dst_path=upload_fullchain
+                )
+                self._fetch_to_flash(
+                    api, creds, url=push.privkey_url, dst_path=upload_privkey
+                )
+
+                cert_menu = api.path("certificate")
+
+                # 3. last round's artifacts. See docstring for why before.
+                self._remove_certificates(
+                    cert_menu,
+                    lambda name: name.startswith(ephemeral_prefix)
+                    or name in (upload_fullchain, upload_privkey)
+                    or name.startswith(chain_prefix),
+                )
+
+                # 4. import both. Counters recorded, never gated on.
+                certificates_imported, _ = self._import_certificate(
+                    api, creds, file_name=upload_fullchain
+                )
+                _, private_keys_imported = self._import_certificate(
+                    api, creds, file_name=upload_privkey
+                )
+
+                # 5. the fail-closed gate.
+                leaf = self._settle(
+                    lambda: self._find_certificate(
+                        cert_menu, f"{upload_fullchain}_0"
+                    )
+                )
+                if leaf is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: /certificate import "
+                        f"produced no {upload_fullchain}_0 object within "
+                        f"{_SETTLE_ATTEMPTS * _SETTLE_DELAY_SECONDS:.0f}s -- "
+                        "the import did nothing, and this router is still on "
+                        "its previous certificate (which is the safe "
+                        "outcome; nothing was removed or rebound)",
+                    )
+
+                # 6. temp name + trust, then the atomic rebind.
+                cert_menu.update(
+                    **{".id": leaf[".id"], "name": temp_leaf_name, "trusted": "yes"}
+                )
+                self._rebind_hotspot_profile(
+                    api, profile[".id"], certificate=temp_leaf_name, push=push
+                )
+
+                # 6b. The SECOND fail-closed gate, and the reason step 7 is
+                # allowed to delete anything at all.
+                #
+                # The shell script this is ported from puts a `:delay 1s`
+                # here and then deletes the old leaf unconditionally. That is
+                # a gap, not a subtlety to preserve: a `set` on
+                # /ip hotspot profile that returns cleanly and changes
+                # nothing is the exact 2026-08-18 failure, and on that path
+                # the script destroys the certificate the router is at that
+                # moment still serving. Reading the profile back instead
+                # turns "old certificate gone, portal unbound, loud error"
+                # into "nothing touched, loud error".
+                if self._settle(
+                    lambda: self._profile_bound_to(
+                        api, push.hotspot_profile, temp_leaf_name
+                    )
+                ) is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: the rebind of "
+                        f"{push.hotspot_profile!r} onto {temp_leaf_name!r} "
+                        "returned cleanly and did not take -- the profile "
+                        "still reports a different ssl-certificate. This is "
+                        "the 2026-08-18 silent-no-op shape; nothing has been "
+                        "removed, so this router is still serving the "
+                        "certificate it was serving before",
+                    )
+
+                # 7. old leaf out, new leaf onto the stable name.
+                old_leaf = self._find_certificate(cert_menu, push.cert_name)
+                if old_leaf is not None:
+                    cert_menu.remove(old_leaf[".id"])
+                new_leaf = self._find_certificate(cert_menu, temp_leaf_name)
+                if new_leaf is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "push_hotspot_certificate: the renamed leaf "
+                        f"{temp_leaf_name!r} vanished between the rebind and "
+                        "the rename -- the profile is bound to a name that "
+                        "no longer exists, needs a human",
+                    )
+                cert_menu.update(**{".id": new_leaf[".id"], "name": push.cert_name})
+
+                # 7b. Re-issue the bind against the STABLE name. The shell
+                # script this is ported from stops after the rename, which
+                # is correct only if RouterOS rewrites a profile's
+                # ssl-certificate reference when the certificate it names is
+                # renamed out from under it. It may well do exactly that --
+                # but nobody has confirmed it on this firmware, and the
+                # failure mode if it does not is a profile pointing at a
+                # name that no longer exists, i.e. a portal serving no
+                # certificate at all. Re-issuing the same atomic
+                # ssl-certificate+login-by set costs one API call and is
+                # correct under either behavior.
+                self._rebind_hotspot_profile(
+                    api, profile[".id"], certificate=push.cert_name, push=push
+                )
+
+                # 8. THE INCIDENT FIX: preserve the intermediate(s).
+                chain_names = self._preserve_chain_certificates(
+                    cert_menu,
+                    ephemeral_prefix=ephemeral_prefix,
+                    chain_prefix=chain_prefix,
+                )
+
+                # 9. no-op safety net, deliberately after step 8.
+                self._remove_certificates(
+                    cert_menu, lambda name: name.startswith(ephemeral_prefix)
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"push_hotspot_certificate: {exc}"
+                ) from exc
+            finally:
+                # 10. The private key must not be left on flash whatever
+                # happened above -- same unconditional cleanup
+                # _run_speed_test_sync does for its own temp file.
+                self._remove_files(api, creds, (upload_fullchain, upload_privkey))
+
+            # 11. Success is a read-back, not an absence of errors.
+            #
+            # Outside the try above on purpose: the cleanup in its `finally`
+            # must have run before anything reads the device back, so that a
+            # verification failure is never also a report of a private key
+            # still sitting on the router's flash.
+            try:
+                return self._verify_hotspot_certificate(
+                    api,
+                    creds,
+                    push=push,
+                    profile_dns_name=profile_dns_name,
+                    chain_cert_names=chain_names,
+                    certificates_imported=certificates_imported,
+                    private_keys_imported=private_keys_imported,
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host,
+                    "push_hotspot_certificate: the push ran but the device "
+                    f"could not be read back to confirm it: {exc}",
+                ) from exc
+        finally:
+            api.close()
+
+    # -- push_hotspot_certificate helpers -------------------------------
+
+    def _rebind_hotspot_profile(
+        self,
+        api,  # noqa: ANN001
+        profile_id: str,
+        *,
+        certificate: str,
+        push: HotspotCertificatePush,
+    ) -> None:
+        """One ``set`` carrying BOTH ``ssl-certificate`` and ``login-by``.
+
+        Never split these into two calls. Doing so is what silently no-op'd
+        during the 2026-08-18 incident: the commands returned cleanly, the
+        profile did not change, and the logs said the push had worked.
+        """
+        api.path("ip", "hotspot", "profile").update(
+            **{
+                ".id": profile_id,
+                "ssl-certificate": certificate,
+                "login-by": push.login_by,
+            }
+        )
+
+    def _find_hotspot_profile(self, api, name: str) -> dict | None:  # noqa: ANN001
+        for row in api.path("ip", "hotspot", "profile"):
+            if row.get("name") == name:
+                return dict(row)
+        return None
+
+    def _profile_bound_to(
+        self, api, profile_name: str, certificate: str  # noqa: ANN001
+    ) -> dict | None:
+        """The profile row, but only once it actually reports ``certificate``
+        as its ``ssl-certificate``. ``None`` while it does not."""
+        profile = self._find_hotspot_profile(api, profile_name)
+        if profile is None:
+            return None
+        if _safe_str(profile.get("ssl-certificate")) != certificate:
+            return None
+        return profile
+
+    def _settle(self, read):  # noqa: ANN001, ANN201
+        """Poll ``read`` until it returns something truthy, or give up.
+
+        This is the port of the two ``:delay 1s`` lines in
+        ``renew-hotspot-certs.sh``'s ``REMOTE_SCRIPT``. They are there because
+        neither ``/certificate import`` nor a profile ``set`` is guaranteed to
+        be visible to the very next command, and dropping them would have made
+        the first hardware run fail spuriously -- which, on a path whose whole
+        purpose is to find out whether ``/certificate import`` works over the
+        API at all, would have produced exactly the wrong answer to the one
+        question the run exists to settle.
+
+        A poll rather than a blind sleep: it returns the instant the device
+        agrees, so the fast path costs nothing, and it still fails closed
+        because a caller that gets ``None`` has read the device and found it
+        unchanged rather than merely not waited long enough.
+        """
+        for attempt in range(_SETTLE_ATTEMPTS):
+            found = read()
+            if found:
+                return found
+            if attempt + 1 < _SETTLE_ATTEMPTS:
+                time.sleep(_SETTLE_DELAY_SECONDS)
+        return None
+
+    def _find_certificate(self, cert_menu, name: str) -> dict | None:  # noqa: ANN001
+        for row in cert_menu:
+            if row.get("name") == name:
+                return dict(row)
+        return None
+
+    def _fetch_to_flash(
+        self, api, creds: DeviceCredentials, *, url: str, dst_path: str  # noqa: ANN001
+    ) -> None:
+        """Make the device pull ``url`` onto its own flash as ``dst_path``.
+
+        Same command, same reply-shape checks as
+        ``_run_speed_test_sync``'s ``/tool/fetch`` -- which is the one
+        ``/tool fetch`` call in this codebase already exercised against
+        real hardware, so its handling of ``status``/``downloaded`` is
+        copied rather than reinvented.
+
+        ``check-certificate`` is set to ``yes`` for an ``https`` URL and
+        omitted otherwise. The speed test passes ``no`` because it is
+        downloading a throwaway blob from a public host and only the byte
+        count matters; here the response *is* the fleet private key, so an
+        unverified peer is not an acceptable place to get it from. The
+        intended deployment does not need it: the URL is served on the
+        WireGuard tunnel, over plain HTTP, on an address the public
+        internet cannot route to -- the tunnel is the encryption and the
+        authentication. ``https`` remains available for a deployment that
+        can present a certificate the router will actually verify.
+        """
+        mode = "https" if url.lower().startswith("https") else "http"
+        params: dict[str, str] = {"dst-path": dst_path}
+        if mode == "https":
+            params["check-certificate"] = "yes"
+        rows = list(api("/tool/fetch", url=url, mode=mode, **params))
+        if not rows:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: no reply from /tool/fetch for "
+                f"{dst_path} -- the router could not be told to pull it",
+            )
+        status = str(rows[-1].get("status", ""))
+        if status != "finished":
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: the router could not fetch "
+                f"{dst_path} (status={status!r}). This is the step that has "
+                "never been exercised in this direction: every use of the "
+                "tunnel so far has been app-server-to-router, and this is "
+                "the router reaching back. Check that the URL's address is "
+                "one the router routes over the tunnel and that something "
+                "is listening on it.",
+            )
+
+    def _import_certificate(
+        self, api, creds: DeviceCredentials, *, file_name: str  # noqa: ANN001
+    ) -> tuple[int | None, int | None]:
+        """Run ``/certificate import`` for one uploaded file and return its
+        ``(certificates-imported, private-keys-imported)`` counters --
+        ``(None, None)`` if it reports nothing at all.
+
+        Two of RouterOS's reply counters are genuine hard failures and are
+        raised on: a ``decryption-failure`` means the PEM was encrypted and
+        the empty passphrase did not open it, and
+        ``keys-with-no-certificate`` means a private key landed with
+        nothing to pair it to. Both are silent otherwise -- the command
+        returns normally.
+
+        The *absence* of counters is deliberately NOT a failure. Whether
+        this firmware reports import results over the API (as opposed to on
+        the console) is one of the three things this work could not settle
+        without a device, so the counters are treated as a bonus and the
+        real gate is the read-back in
+        :meth:`_verify_hotspot_certificate`.
+        """
+        rows = list(
+            api("/certificate/import", **{"file-name": file_name, "passphrase": ""})
+        )
+        if not rows:
+            return None, None
+        last = rows[-1]
+        failures = _safe_int(last.get("decryption-failures"), default=0) or 0
+        if failures:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: /certificate import {file_name} "
+                f"reported {failures} decryption failure(s) -- the PEM is "
+                "encrypted and this push imports with an empty passphrase",
+            )
+        orphan_keys = _safe_int(last.get("keys-with-no-certificate"), default=0) or 0
+        if orphan_keys:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"push_hotspot_certificate: /certificate import {file_name} "
+                f"reported {orphan_keys} key(s) with no matching certificate "
+                "-- the private key does not belong to the certificate that "
+                "was imported alongside it",
+            )
+        return (
+            _safe_int(last.get("certificates-imported"), default=None),
+            _safe_int(last.get("private-keys-imported"), default=None),
+        )
+
+    def _remove_certificates(self, cert_menu, matches) -> None:  # noqa: ANN001
+        """Remove every ``/certificate`` row whose ``name`` ``matches``.
+
+        The rows are collected before the first removal rather than removed
+        while iterating: a RouterOS menu iteration is a live ``print``, and
+        deleting out from under it is how a sweep silently skips half its
+        matches.
+        """
+        doomed = [
+            row[".id"]
+            for row in cert_menu
+            if row.get(".id") and matches(str(row.get("name") or ""))
+        ]
+        for cert_id in doomed:
+            cert_menu.remove(cert_id)
+
+    def _preserve_chain_certificates(
+        self, cert_menu, *, ephemeral_prefix: str, chain_prefix: str  # noqa: ANN001
+    ) -> tuple[str, ...]:
+        """Rename every surviving ``<name>.fullchain.pem_N`` object onto a
+        stable ``<name>-chain-N`` name and mark it trusted.
+
+        This is the 2026-08-18 fix. Read
+        :meth:`_push_hotspot_certificate_sync`'s docstring, step 8, before
+        changing anything here -- the ordering relative to the leaf rename
+        is the entire point, and it is not re-derivable from the code
+        alone.
+        """
+        survivors = [
+            dict(row)
+            for row in cert_menu
+            if str(row.get("name") or "").startswith(ephemeral_prefix)
+        ]
+        names: list[str] = []
+        for index, row in enumerate(survivors, start=1):
+            stable = f"{chain_prefix}{index}"
+            cert_menu.update(**{".id": row[".id"], "name": stable, "trusted": "yes"})
+            names.append(stable)
+        return tuple(names)
+
+    def _remove_files(
+        self, api, creds: DeviceCredentials, filenames: Sequence[str]  # noqa: ANN001
+    ) -> None:
+        wanted = set(filenames)
+        try:
+            file_menu = api.path("file")
+            doomed = [
+                row[".id"]
+                for row in file_menu
+                if row.get(".id") and row.get("name") in wanted
+            ]
+            for file_id in doomed:
+                file_menu.remove(file_id)
+        except LibRouterosError:
+            # Worth a loud warning rather than an exception: the push
+            # itself may well have succeeded, and failing it here would
+            # send an operator to re-run a rebind that already worked. But
+            # one of these files is the fleet private key sitting on a
+            # router's flash, so this must never pass silently.
+            logger.warning(
+                "mikrotik_hotspot_cert_upload_cleanup_failed",
+                extra={"host": creds.host, "filenames": sorted(wanted)},
+            )
+
+    def _verify_hotspot_certificate(
+        self,
+        api,  # noqa: ANN001
+        creds: DeviceCredentials,
+        *,
+        push: HotspotCertificatePush,
+        profile_dns_name: str | None,
+        chain_cert_names: tuple[str, ...],
+        certificates_imported: int | None,
+        private_keys_imported: int | None,
+    ) -> HotspotCertificatePushResult:
+        """Read the device back and refuse to call this a success unless it
+        agrees.
+
+        Three things are checked, and each of them is a failure this
+        codebase has actually seen:
+
+        * **the profile is bound to the stable name** -- the rebind
+          silently no-op'd once already, when ``ssl-certificate`` and
+          ``login-by`` were set in separate calls;
+        * **the leaf has its private key** -- a certificate imported
+          without one binds fine and then serves nothing, because RouterOS
+          cannot complete a handshake with it;
+        * **the leaf's issuer is present in the store** -- its ``akid``
+          matched by some other certificate's ``skid``. This is the
+          2026-08-18 incident stated as a check. It is deliberately *not*
+          "did we rename N chain objects": RouterOS dedupes an import
+          against an identical object already present, so counting objects
+          this push happened to create would fail on a router that already
+          had the intermediate under some other name, while the thing that
+          actually matters -- can the router build a complete chain -- is
+          true. An orphaned ``akid`` is what a real incomplete chain looks
+          like on the device.
+        """
+        profile = self._find_hotspot_profile(api, push.hotspot_profile)
+        bound = _safe_str((profile or {}).get("ssl-certificate"))
+        bound_login_by = _safe_str((profile or {}).get("login-by"))
+
+        certificates = [dict(row) for row in api.path("certificate")]
+        leaf = next(
+            (row for row in certificates if row.get("name") == push.cert_name), None
+        )
+        has_key = leaf is not None and _is_truthy(leaf.get("private-key"))
+        akid = _safe_str((leaf or {}).get("akid"))
+        issuer_present = bool(akid) and any(
+            _safe_str(row.get("skid")) == akid
+            for row in certificates
+            if row.get("name") != push.cert_name
+        )
+
+        result = HotspotCertificatePushResult(
+            cert_name=push.cert_name,
+            hotspot_profile=push.hotspot_profile,
+            profile_dns_name=profile_dns_name,
+            certificates_imported=certificates_imported,
+            private_keys_imported=private_keys_imported,
+            bound_ssl_certificate=bound,
+            bound_login_by=bound_login_by,
+            leaf_has_private_key=has_key,
+            leaf_invalid_after=_safe_str((leaf or {}).get("invalid-after")),
+            chain_issuer_present=issuer_present,
+            chain_cert_names=chain_cert_names,
+        )
+
+        problems: list[str] = []
+        if leaf is None:
+            problems.append(
+                f"no /certificate named {push.cert_name!r} exists after the push"
+            )
+        if bound != push.cert_name:
+            problems.append(
+                f"profile {push.hotspot_profile!r} is bound to "
+                f"{bound!r}, not {push.cert_name!r}"
+            )
+        if leaf is not None and not has_key:
+            problems.append(
+                f"{push.cert_name!r} has no private key -- it will bind and "
+                "then fail every TLS handshake"
+            )
+        if _login_by_tokens(bound_login_by) != _login_by_tokens(push.login_by):
+            problems.append(
+                f"profile {push.hotspot_profile!r} reports "
+                f"login-by={bound_login_by!r}, not {push.login_by!r} -- the "
+                "rebind did not take, and this half of it is what decides "
+                "whether the portal is served over TLS at all"
+            )
+        if leaf is not None and not issuer_present:
+            problems.append(
+                f"{push.cert_name!r} has an orphaned akid: no certificate in "
+                "the store claims to be its issuer, so the router will serve "
+                "the leaf alone. This is the 2026-08-18 incomplete-chain "
+                "failure -- strict TLS clients reject it and browsers hide it"
+            )
+        if problems:
+            raise MikroTikDeviceError(
+                creds.host,
+                "push_hotspot_certificate: the device does not agree the "
+                "push worked -- " + "; ".join(problems),
+            )
+        return result
+
+    # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
 
@@ -2696,6 +3630,599 @@ class MikroTikAdapter:
         for row in list(menu):
             if row.get("address") == address and row.get("comment") == owner:
                 menu.remove(row[".id"])
+
+    # ------------------------------------------------------------------
+    # custom DHCP options (/ip dhcp-server option [+ sets])
+    # ------------------------------------------------------------------
+    #
+    # Read the whole of this before changing anything below it. Three of
+    # the four facts here were established by trying them on a live venue
+    # router, and none of them are inferable from the RouterOS
+    # documentation.
+    #
+    # 1. **Removal order is forced.** RouterOS refuses to remove an option
+    #    that an option-set still lists, and refuses to remove an
+    #    option-set that a ``/ip dhcp-server network`` row still names. So
+    #    the only order that works is detach -> shrink/remove the set ->
+    #    remove the option. Any other order fails partway and leaves the
+    #    device in a state where the option is still being handed out.
+    #
+    # 2. **``dhcp-option-set`` is a name-reference property, and clearing it
+    #    takes the ``!`` prefix.** Two other shapes were shipped first and
+    #    both failed on the venue router, with two different errors:
+    #    ``set dhcp-option-set=""`` gives ``ambiguous value of
+    #    dhcp-option-set, more than one possible value matches input``
+    #    (RouterOS prefix-matches name-typed values, and "" prefixes every
+    #    candidate), and ``unset value-name=dhcp-option-set`` gives ``input
+    #    does not match any value of value-name`` (``unset`` is
+    #    undocumented, per-menu optional, and does not list this field on
+    #    this menu). The *documented* clear, ``set !dhcp-option-set``, is
+    #    accepted by 7.23.3 and SILENTLY DOES NOTHING. What actually
+    #    clears the field is ``set dhcp-option-set=none``, confirming the
+    #    ``name | none`` typing. All three observations are from the venue
+    #    router. :meth:`_clear_field` tries them in that order and *proves*
+    #    the result by re-reading the row -- three shapes have now been
+    #    wrong on this one menu, so do not "simplify" it to a single
+    #    command, and do not drop the read-back.
+    #
+    # 3. **Match the option by its own name, never by ``code=114``.** A
+    #    code-scoped sweep can only ever hit a row somebody else added. A
+    #    venue running its own PXE/TFTP option on a code we also use is a
+    #    real configuration, and deleting it is a worse outage than the one
+    #    being fixed.
+    #
+    # 4. **``force=yes`` changes the blast radius.** With it, every client
+    #    receives the option whether or not it asked for that code. It is
+    #    set on the fleet today, which is why an option-114 defect went
+    #    from affecting the clients that ask to affecting all of them.
+
+    async def read_dhcp_options(self, creds: DeviceCredentials) -> DhcpOptionSnapshot:
+        """Reads ``/ip dhcp-server option``, ``/ip dhcp-server option
+        sets``, and every row that binds one of them to clients.
+
+        Read-only. This is the call that answers "does this venue still
+        advertise the captive-portal URI" without writing anything, and it
+        is deliberately separate from the removal so a fleet audit can run
+        against production without being a fleet change.
+        """
+        return await asyncio.to_thread(self._read_dhcp_options_sync, creds)
+
+    def _read_dhcp_options_sync(self, creds: DeviceCredentials) -> DhcpOptionSnapshot:
+        api = self._connect_api(creds)
+        try:
+            try:
+                # ``supported`` distinguishes "this RouterOS has no option
+                # menu" from "this router has no options" -- see
+                # DhcpOptionSnapshot. _safe_query flattens both to [], so
+                # the menu is probed once, on its own, first.
+                supported = True
+                try:
+                    option_rows = list(api.path(*_DHCP_OPTION_PATH))
+                except LibRouterosError as exc:
+                    logger.info(
+                        "mikrotik_dhcp_option_menu_unavailable",
+                        extra={"host": creds.host, "detail": str(exc)},
+                    )
+                    supported = False
+                    option_rows = []
+                # The sets menu is a separate probe: RouterOS 6 has the
+                # option menu without ``option sets``, so a missing sets
+                # menu must not be read as a router with no options at all.
+                set_rows = (
+                    self._safe_query(api, *_DHCP_OPTION_SET_PATH) if supported else []
+                )
+                bindings: list[DhcpOptionBinding] = []
+                if supported:
+                    for path, identity_field in _DHCP_OPTION_BINDING_PATHS:
+                        for row in self._safe_query(api, *path):
+                            option_names = _split_routeros_list(row.get("dhcp-option"))
+                            option_set = _safe_str(row.get("dhcp-option-set"))
+                            if not option_names and not option_set:
+                                continue
+                            bindings.append(
+                                DhcpOptionBinding(
+                                    menu="/".join(path),
+                                    identity=_safe_str(row.get(identity_field))
+                                    or _safe_str(row.get(".id"))
+                                    or "",
+                                    option_names=option_names,
+                                    option_set_name=option_set,
+                                )
+                            )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_dhcp_options: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return DhcpOptionSnapshot(
+            supported=supported,
+            options=tuple(
+                DhcpOptionInfo(
+                    name=_safe_str(row.get("name")) or "",
+                    code=_safe_int(row.get("code")),
+                    value=_safe_str(row.get("value")),
+                    force=_is_truthy(row.get("force")),
+                )
+                for row in option_rows
+                if row.get("name")
+            ),
+            option_sets=tuple(
+                DhcpOptionSetInfo(
+                    name=_safe_str(row.get("name")) or "",
+                    option_names=_split_routeros_list(row.get("options")),
+                )
+                for row in set_rows
+                if row.get("name")
+            ),
+            bindings=tuple(bindings),
+        )
+
+    async def configure_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> None:
+        """Writes the option, the set that carries it, and the bindings that
+        hand it to clients -- the state a human previously produced only by
+        pasting a setup script.
+
+        ``code`` and ``value`` are required here even though they are
+        optional on the config: a removal is identified by name alone, but
+        an option cannot be *created* without the two fields that give it
+        meaning, and inventing either would put a fabricated URI in front
+        of every guest device on the network.
+        """
+        if option.code is None or not option.value:
+            raise MikroTikDeviceError(
+                creds.host,
+                "configure_dhcp_option: code and value are both required to "
+                f"create option {option.name!r}",
+            )
+        await asyncio.to_thread(self._configure_dhcp_option_sync, creds, option)
+
+    def _configure_dhcp_option_sync(
+        self, creds: DeviceCredentials, option: DhcpOptionConfig
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            try:
+                desired = {
+                    "code": str(option.code),
+                    "value": option.value or "",
+                    "force": "yes" if option.force else "no",
+                }
+                self._ensure_named_row(api, _DHCP_OPTION_PATH, option.name, desired)
+                if option.option_set_name:
+                    self._ensure_option_set_contains(
+                        api, option.option_set_name, option.name
+                    )
+                for address in option.network_addresses:
+                    self._attach_option_to_network(api, address, option)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"configure_dhcp_option: {exc}"
+                ) from exc
+        finally:
+            api.close()
+
+    def _ensure_named_row(
+        self, api, path: tuple[str, ...], name: str, desired: dict[str, str]
+    ) -> None:  # noqa: ANN001
+        """Create the row of this name, or bring an existing one into line.
+
+        Updating rather than skipping is the point: an option whose
+        ``value`` drifted still reads as configured on the dashboard and
+        hands every client the old URI. Same reasoning as
+        :meth:`_ensure_ip_pool`.
+        """
+        menu = api.path(*path)
+        for row in menu:
+            if row.get("name") == name:
+                changed = {
+                    key: value
+                    for key, value in desired.items()
+                    # ``force`` comes back from RouterOS as a real bool,
+                    # so comparing it as a string reports a difference on
+                    # every push and writes forever. Same trap
+                    # _ensure_dhcp_server documents for ``disabled``.
+                    if not (
+                        key == "force"
+                        and _is_truthy(row.get(key)) == (value == "yes")
+                    )
+                    and str(row.get(key, "")) != value
+                }
+                if changed:
+                    menu.update(**{".id": row[".id"], **changed})
+                return
+        menu.add(name=name, **desired)
+
+    def _ensure_option_set_contains(
+        self, api, set_name: str, option_name: str
+    ) -> None:  # noqa: ANN001
+        """Make ``set_name`` list ``option_name``, keeping whatever else it
+        already lists.
+
+        Appending rather than overwriting: ``options`` is a list field, and
+        a push that replaced it would silently drop another feature's
+        option out of a shared set.
+        """
+        menu = api.path(*_DHCP_OPTION_SET_PATH)
+        for row in menu:
+            if row.get("name") == set_name:
+                current = _split_routeros_list(row.get("options"))
+                if option_name in current:
+                    return
+                menu.update(
+                    **{
+                        ".id": row[".id"],
+                        "options": ",".join((*current, option_name)),
+                    }
+                )
+                return
+        menu.add(name=set_name, options=option_name)
+
+    def _attach_option_to_network(
+        self, api, address: str, option: DhcpOptionConfig
+    ) -> None:  # noqa: ANN001
+        """Bind this option (via its set where there is one, directly
+        otherwise) to the ``/ip dhcp-server network`` row for ``address``.
+
+        A subnet with no network row is skipped rather than created. This
+        method's job is to attach an option, and fabricating a network row
+        here would invent a gateway and DNS for a subnet nobody asked this
+        code about -- exactly the silent cross-feature damage
+        :meth:`_remove_dhcp_network`'s marker exists to prevent.
+        """
+        menu = api.path(*_DHCP_NETWORK_PATH)
+        for row in menu:
+            if row.get("address") != address:
+                continue
+            if option.option_set_name:
+                if _safe_str(row.get("dhcp-option-set")) == option.option_set_name:
+                    return
+                menu.update(
+                    **{
+                        ".id": row[".id"],
+                        "dhcp-option-set": option.option_set_name,
+                    }
+                )
+                return
+            current = _split_routeros_list(row.get("dhcp-option"))
+            if option.name in current:
+                return
+            menu.update(
+                **{
+                    ".id": row[".id"],
+                    "dhcp-option": ",".join((*current, option.name)),
+                }
+            )
+            return
+        logger.info(
+            "mikrotik_dhcp_option_network_row_absent",
+            extra={"address": address, "option": option.name},
+        )
+
+    async def delete_dhcp_option(
+        self, creds: DeviceCredentials, *, option: DhcpOptionConfig
+    ) -> DhcpOptionRemoval:
+        """Removes one named option and every reference to it, in the only
+        order RouterOS accepts.
+
+        Takes the same :class:`DhcpOptionConfig` as the writer, but reads
+        only ``name`` (and ``option_set_name`` as a hint): what the option
+        is attached to is discovered from the device, never assumed from
+        the caller's idea of it. That is what makes this safe to run
+        against a router configured by a pasted script this platform never
+        saw -- which is every router in the fleet today.
+
+        Idempotent in the strong sense: against a router that never had
+        the option, against one already cleaned, and against one cleaned
+        halfway by a previous run that failed mid-sequence.
+        """
+        return await asyncio.to_thread(self._delete_dhcp_option_sync, creds, option)
+
+    def _delete_dhcp_option_sync(
+        self, creds: DeviceCredentials, option: DhcpOptionConfig
+    ) -> DhcpOptionRemoval:
+        api = self._connect_api(creds)
+        try:
+            try:
+                # --- plan, from the device's own state -------------------
+                # Only sets that actually list our option are touched, and
+                # only ours is taken out of them. A set that carries
+                # somebody else's option too is shrunk, not deleted.
+                sets_to_remove: list[str] = []
+                sets_to_rewrite: dict[str, tuple[str, ...]] = {}
+                for row in self._safe_query(api, *_DHCP_OPTION_SET_PATH):
+                    listed = _split_routeros_list(row.get("options"))
+                    if option.name not in listed:
+                        continue
+                    name = _safe_str(row.get("name")) or ""
+                    remaining = tuple(n for n in listed if n != option.name)
+                    if remaining:
+                        sets_to_rewrite[name] = remaining
+                    else:
+                        sets_to_remove.append(name)
+
+                # --- step 1: detach ------------------------------------
+                # Must come first. RouterOS refuses to remove an
+                # option-set a network row still names, and refuses to
+                # remove an option a set still lists.
+                detached = self._detach_dhcp_option(
+                    api,
+                    host=creds.host,
+                    option_name=option.name,
+                    set_names=frozenset(sets_to_remove),
+                )
+
+                # --- step 2: shrink or remove the sets -----------------
+                set_menu = api.path(*_DHCP_OPTION_SET_PATH)
+                rewritten: list[str] = []
+                removed_sets: list[str] = []
+                for row in list(self._safe_query(api, *_DHCP_OPTION_SET_PATH)):
+                    name = _safe_str(row.get("name")) or ""
+                    if name in sets_to_rewrite:
+                        set_menu.update(
+                            **{
+                                ".id": row[".id"],
+                                "options": ",".join(sets_to_rewrite[name]),
+                            }
+                        )
+                        rewritten.append(name)
+                    elif name in sets_to_remove:
+                        set_menu.remove(row[".id"])
+                        removed_sets.append(name)
+
+                # --- step 3: the option itself -------------------------
+                option_removed = False
+                option_menu = api.path(*_DHCP_OPTION_PATH)
+                for row in list(self._safe_query(api, *_DHCP_OPTION_PATH)):
+                    # By name. Never by code -- see the block comment at
+                    # the top of this section.
+                    if row.get("name") == option.name:
+                        option_menu.remove(row[".id"])
+                        option_removed = True
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"delete_dhcp_option: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return DhcpOptionRemoval(
+            option_removed=option_removed,
+            option_sets_removed=tuple(removed_sets),
+            option_sets_rewritten=tuple(rewritten),
+            bindings_detached=tuple(detached),
+        )
+
+    def _detach_dhcp_option(
+        self, api, *, host: str, option_name: str, set_names: frozenset[str]
+    ) -> list[str]:  # noqa: ANN001
+        """Take the option, and the sets that exist only to carry it, off
+        every row that hands them to clients. Returns what it detached
+        from, for the caller's report.
+
+        Two fields, two different removals:
+
+        * ``dhcp-option-set`` is a single name-reference value, so clearing
+          it goes through :meth:`_clear_field` -- ``set
+          dhcp-option-set=""`` does not work and is not a shortcut, and
+          neither does ``unset``. See that method for the two errors the
+          venue router gives and why the documented shape is ``!``.
+        * ``dhcp-option`` is a *list*, so ours is edited out of it and the
+          rest written back. Only when nothing else is left is the whole
+          field cleared. A blanket clear here would drop another feature's
+          option on the way past.
+
+        Raises :class:`MikroTikDeviceError` if a field will not clear,
+        leaving the device exactly as it was found. Detaching is the step
+        everything after it depends on, so a half-detach must not be
+        allowed to look like progress.
+        """
+        detached: list[str] = []
+        for path, identity_field in _DHCP_OPTION_BINDING_PATHS:
+            rows = self._safe_query(api, *path)
+            if not rows:
+                continue
+            menu = api.path(*path)
+            for row in list(rows):
+                row_id = row.get(".id")
+                if row_id is None:
+                    continue
+                identity = (
+                    _safe_str(row.get(identity_field)) or _safe_str(row_id) or ""
+                )
+                touched = False
+                if _safe_str(row.get("dhcp-option-set")) in set_names:
+                    self._clear_field_or_fail(
+                        api, host, path, row_id, "dhcp-option-set", identity
+                    )
+                    touched = True
+                listed = _split_routeros_list(row.get("dhcp-option"))
+                if option_name in listed:
+                    remaining = tuple(n for n in listed if n != option_name)
+                    if remaining:
+                        menu.update(
+                            **{".id": row_id, "dhcp-option": ",".join(remaining)}
+                        )
+                    else:
+                        self._clear_field_or_fail(
+                            api, host, path, row_id, "dhcp-option", identity
+                        )
+                    touched = True
+                if touched:
+                    detached.append(f"{'/'.join(path)}:{identity}")
+        return detached
+
+    def _clear_field_or_fail(
+        self,
+        api,  # noqa: ANN001
+        host: str,
+        path: tuple[str, ...],
+        row_id: object,
+        field: str,
+        identity: str,
+    ) -> None:
+        """:meth:`_clear_field`, but refusing to continue when the device
+        will not let go of the field.
+
+        This is the fail-closed hinge of the whole removal. If the binding
+        is still attached, the option is still being handed to clients, and
+        removing the set and the option underneath it would either be
+        refused by RouterOS or leave a dangling reference. Raising here
+        stops the sequence with the device in its original, working state
+        and lets the caller report ``changed: False`` honestly -- which is
+        the one thing the shipped version got right.
+        """
+        if self._clear_field(api, path, row_id, field):
+            return
+        raise MikroTikDeviceError(
+            host,
+            f"could not clear {field} on /{'/'.join(path)} row {identity!r}: "
+            "the router refused every supported clear shape "
+            f"(set !{field}, set {field}=none, unset value-name={field}). "
+            "Nothing further was written; the option is still attached.",
+        )
+
+    def _field_is_clear(
+        self, api, path: tuple[str, ...], row_id: object, field: str
+    ) -> bool:  # noqa: ANN001
+        """Re-reads one row and answers whether ``field`` is now empty.
+
+        ``none`` counts as empty: it is the literal RouterOS stores for a
+        ``name | none`` property that points at nothing, and a row that
+        reads back ``none`` is a row that hands out no option set.
+
+        A row that has vanished is *not* reported as clear -- that is a
+        different and much worse event than a cleared field, and the
+        caller must not mistake one for the other.
+        """
+        for row in self._safe_query(api, *path):
+            if row.get(".id") != row_id:
+                continue
+            return _safe_str(row.get(field)) in (None, "none")
+        return False
+
+    def _clear_field(
+        self, api, path: tuple[str, ...], row_id: object, field: str
+    ) -> bool:  # noqa: ANN001
+        """Clear one field on one row, and *prove* it was cleared.
+
+        Returns ``True`` only when a re-read of the row says the field is
+        empty. Never infers success from the absence of an exception: a
+        RouterOS ``set`` that returns cleanly and changes nothing is a real
+        failure mode on this fleet (2026-08-18, hotspot profile rebind).
+
+        ## Why this is a ladder and not one command
+
+        Two shapes were shipped before this one and *both* failed on the
+        venue router (RouterOS 7.23.3, hEX lite), with two different
+        errors, which is what makes this worth writing down:
+
+        * ``update(**{".id": id, "dhcp-option-set": ""})`` fails with
+          ``ambiguous value of dhcp-option-set, more than one possible
+          value matches input``. ``dhcp-option-set`` is a *name-reference*
+          property, and RouterOS resolves name-typed values by **prefix**.
+          The empty string is a prefix of every candidate name, so with
+          ``none`` plus at least one defined option set it matches more
+          than one. (Same error, same cause, reproduced by other people on
+          ``/ip firewall nat`` ``in-interface``.)
+        * ``("unset", value-name="dhcp-option-set")`` fails with ``input
+          does not match any value of value-name``. ``unset`` is
+          undocumented and per-menu optional -- it is absent from the
+          Console page's list of general commands -- and its ``value-name``
+          argument is an enum. A property that always has a value (default
+          ``none``) is not a member of that enum on this menu, so the
+          sentence is rejected before it does anything.
+
+        The shape that *is* documented is the ``!`` prefix on ``set``:
+        RouterOS Scripting docs, ``set`` -- "The parameter can be unset by
+        specifying '!' before the parameter." Over the binary API that is
+        the attribute word ``=!dhcp-option-set=``, and ``librouteros``
+        composes exactly that from a ``"!"``-prefixed key:
+
+            /ip/dhcp-server/network/set  =.id=*1  =!dhcp-option-set=
+
+        **...and on 7.23.3 the documented shape is a silent no-op.** Run
+        against the venue router on 2026-09-07, ``set !dhcp-option-set``
+        was accepted -- no ``!trap``, no error -- and the read-back showed
+        ``dhcp-option-set`` still set to ``cloudguest-opts``. The shape
+        that actually cleared it was ``set dhcp-option-set=none``, which
+        also confirms the ``name | none`` typing that explains the
+        "ambiguous" error above.
+
+        That is the whole argument for this method's design in one
+        observation: the *documented* command returned success and changed
+        nothing. Any version of this that trusted a clean return would have
+        reported a removal that did not happen. Only the read-back caught
+        it, and only the next rung fixed it.
+
+        Rung order is therefore hardware-first, not documentation-first:
+        the shape observed to work on this fleet's firmware leads, and the
+        documented one is kept behind it for the menus and firmwares where
+        it does work.
+        """
+        rungs: tuple[tuple[str, Callable[[], object]], ...] = (
+            # 1. The `name | none` clear literal -- OBSERVED to work on
+            #    7.23.3 (hEX lite) for dhcp-option-set. Unambiguous where
+            #    "" is not, because it matches exactly one candidate. Only
+            #    meaningful for a name-reference field: on an ordinary list
+            #    field like `dhcp-option` there is no option called "none",
+            #    so RouterOS rejects it and the next rung runs.
+            (
+                f"set {field}=none",
+                lambda: api.path(*path).update(**{".id": row_id, field: "none"}),
+            ),
+            # 2. The DOCUMENTED clear ("The parameter can be unset by
+            #    specifying '!' before the parameter"), wire word
+            #    `=!<field>=`. Kept, but demoted: on 7.23.3 this is
+            #    accepted and does nothing for dhcp-option-set. It is here
+            #    for the menus and firmwares where it does work, and it is
+            #    harmless where it does not -- the read-back is what
+            #    decides, never the clean return.
+            (
+                f"set !{field}",
+                lambda: api.path(*path).update(**{".id": row_id, f"!{field}": ""}),
+            ),
+            # 3. RouterOS's own `unset`, for the menus that do list this
+            #    field in the value-name enum. ``Path.__call__`` is a
+            #    *generator*, so the sentence is only written when it is
+            #    consumed -- hence ``tuple(...)``. A bare call sends nothing.
+            (
+                f"unset value-name={field}",
+                lambda: tuple(
+                    api.path(*path)(
+                        "unset", **{".id": row_id, "value-name": field}
+                    )
+                ),
+            ),
+        )
+        for label, attempt in rungs:
+            try:
+                attempt()
+            except LibRouterosError as exc:
+                logger.info(
+                    "mikrotik_clear_field_rung_rejected",
+                    extra={
+                        "menu": "/".join(path),
+                        "field": field,
+                        "shape": label,
+                        "detail": str(exc),
+                    },
+                )
+            # Read back even after a rejection: a RouterOS error does not
+            # always mean nothing changed, and the device's own answer is
+            # the only thing this method is willing to believe.
+            if self._field_is_clear(api, path, row_id, field):
+                logger.info(
+                    "mikrotik_clear_field_succeeded",
+                    extra={
+                        "menu": "/".join(path),
+                        "field": field,
+                        "shape": label,
+                    },
+                )
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # rogue DHCP detection (/ip dhcp-server alert)
@@ -4876,18 +6403,94 @@ class MikroTikAdapter:
     async def execute_raw_command(
         self, creds: DeviceCredentials, *, command: str
     ) -> RawCommandResult:
-        """Ported from
-        ``provisioning_engine/device_adapters.py::execute_raw_command`` --
-        runs exactly ``command`` over the device's real SSH console
-        connection with no interpretation, whitelisting, or retry. Unlike
-        every other method here, a non-zero ``exit_status`` is not raised
-        as an exception (see :class:`~.contract.RawCommandResult`'s own
-        docstring)."""
+        """Runs exactly ``command`` on the device, with no whitelisting or
+        retry. Unlike every other method here, a non-zero ``exit_status`` is
+        not raised as an exception (see
+        :class:`~.contract.RawCommandResult`'s own docstring) -- a typo in
+        the console is a result, not a 500.
+
+        ## Why this runs over the API (8728), not SSH (22)
+
+        This method was ported from ``provisioning_engine/device_adapters
+        .py`` running over SSH, and SSH does not reach this fleet. Port 22
+        is filtered on real routers -- a port sweep from the platform
+        reached only 8728, and 22 timed out (recorded in
+        ``app.domains.qos.models`` and ``app.domains.content_filtering
+        .device_adapters``, both of which moved off this same dead
+        transport for the same reason). The failure that motivated *this*
+        change: Master Console's Device Console ran ``/interface print``
+        against a healthy router and reported "connection attempt timed
+        out" after asyncssh's own 10s ``connect_timeout``, while the same
+        credential over 8728 answered the same command in 57ms. Nothing
+        was wrong with the device, the credential, the host or the tunnel
+        -- the console was simply knocking on a port nothing answers.
+
+        So a command that can be expressed *faithfully* as a single API
+        sentence is executed over the API, the transport that actually
+        reaches the fleet. Anything else (``[find ...]``, ``:``-script
+        commands, ``where`` filters, ``;``-chained lines --
+        see :func:`_console_command_to_api_sentence`) still goes over SSH
+        rather than being approximated, and its connection error now names
+        the transport and port it failed on so the next operator is not
+        sent hunting the wrong subsystem.
+        """
+        sentence = _console_command_to_api_sentence(command)
+        if sentence is None:
+            return await self._execute_raw_command_over_ssh(creds, command=command)
+        return await asyncio.to_thread(
+            self._execute_raw_command_over_api_sync, creds, command, *sentence
+        )
+
+    def _execute_raw_command_over_api_sync(
+        self,
+        creds: DeviceCredentials,
+        command: str,
+        sentence: str,
+        arguments: Mapping[str, str],
+    ) -> RawCommandResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                rows = [dict(row) for row in api(sentence, **arguments)]
+            except LibRouterosError as exc:
+                # A device-side rejection (unknown command, bad argument,
+                # permission denied) is this console's equivalent of a
+                # non-zero shell exit status, not a transport failure.
+                return RawCommandResult(
+                    command=command,
+                    stdout="",
+                    stderr=_describe_exception(exc),
+                    exit_status=1,
+                )
+        finally:
+            api.close()
+        return RawCommandResult(
+            command=command,
+            stdout=_format_console_rows(rows),
+            stderr="",
+            exit_status=0,
+        )
+
+    async def _execute_raw_command_over_ssh(
+        self, creds: DeviceCredentials, *, command: str
+    ) -> RawCommandResult:
+        """The original SSH path, kept for the commands the API cannot
+        express. See ``execute_raw_command``'s own docstring for why this is
+        no longer the default and why its connection error names the port:
+        an operator who sees a bare timeout has no way to tell "the device
+        is unreachable" from "this platform tried a port your fleet
+        filters"."""
         try:
             async with self._ssh_connect(creds) as conn:
                 result = await conn.run(command, check=False)
         except (OSError, asyncssh.Error) as exc:
-            raise MikroTikConnectionError(creds.host, _describe_exception(exc)) from exc
+            raise MikroTikConnectionError(
+                creds.host,
+                f"{_describe_exception(exc)} (over SSH, port "
+                f"{self._ssh_port(creds)}; this command has no RouterOS API "
+                f"equivalent, so it could not use port "
+                f"{creds.port or _DEFAULT_API_PORT})",
+            ) from exc
         return RawCommandResult(
             command=command,
             stdout=str(result.stdout or ""),
@@ -4924,6 +6527,7 @@ class MikroTikAdapter:
             "get_pppoe_interface_status": True,
             "get_interface_traffic_counters": True,
             "run_speed_test": True,
+            "push_hotspot_certificate": True,
             "create_simple_queue": True,
             "update_simple_queue": True,
             "delete_simple_queue": True,
@@ -5485,6 +7089,20 @@ def _merge_connected_devices(
     for row in leases:
         mac = _row_mac(row)
         if mac is None:
+            continue
+        # A lease row is address bookkeeping, not physical liveness.
+        # RouterOS keeps the entry for a client that powered off without
+        # releasing -- its ``status`` moves to ``expired``/``waiting`` once
+        # the lease time elapses, but the row itself stays. Treating every
+        # row as "seen" therefore kept a dead access point UP forever: the
+        # 15-minute device sync kept finding its MAC and refreshing
+        # ``is_active``/``last_seen_at`` (bug report: "AP Hall Lobby went
+        # down but the console still shows UP"). Only a ``bound`` lease is
+        # a client the router is actually willing to serve. The ``status``
+        # key is absent in this project's fake transports and on some
+        # RouterOS print shapes -- absence keeps the row (backward
+        # compatible), an explicit non-``bound`` status drops it.
+        if (status := row.get("status")) is not None and status != "bound":
             continue
         existing = merged.get(mac)
         merged[mac] = ConnectedDevice(

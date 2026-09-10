@@ -31,6 +31,7 @@ __all__ = [
     "CampaignNotActiveError",
     "WrongCampaignTypeError",
     "OrganizationRequiredError",
+    "TooManyCampaignQuestionsError",
 ]
 
 
@@ -133,6 +134,29 @@ class InvalidDisplayIntervalError(CampaignsError):
             "display_interval_days must be a positive integer when "
             "display_rule is once_per_n_days",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
+class TooManyCampaignQuestionsError(CampaignsError):
+    """One more question than ``constants.MAX_QUESTIONS_PER_CAMPAIGN``
+    allows.
+
+    The message names the number and says why, because a bare "limit
+    reached" on an authoring screen reads as an arbitrary product
+    restriction and the reason is the whole point: the guest answers this
+    on a phone, inside a captive-portal websheet, as one flat stacked
+    list with no pagination. A venue told *that* will trim their survey;
+    a venue told "maximum 10" will file a request to raise it."""
+
+    def __init__(self, limit: int, current: int) -> None:
+        super().__init__(
+            f"A campaign can ask at most {limit} questions -- this one "
+            f"already has {current}. Guests answer these on a phone, on "
+            "one scrolling screen, so a longer list mostly collects "
+            "abandonment. Split it into two campaigns, or remove a "
+            "question first.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={"max_questions": limit, "current_questions": current},
         )
 
 

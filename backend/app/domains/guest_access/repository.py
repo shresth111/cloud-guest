@@ -28,6 +28,7 @@ from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PaginationMeta
 
 from .models import DeviceAccessRule, GuestAccessRule
+from .validators import identifier_match_terms
 
 
 class GuestAccessRepositoryProtocol(Protocol):
@@ -62,6 +63,44 @@ class GuestAccessRepositoryProtocol(Protocol):
         identifier: str,
         now: datetime,
     ) -> list[GuestAccessRule]: ...
+
+    async def find_guest_rule_for_import(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        identifier: str,
+        rule_type: str,
+    ) -> GuestAccessRule | None:
+        """The existing row a bulk-import row would duplicate, if any.
+        ``identifier`` must already be canonical.
+
+        The match key is the whole of what makes two rules "the same rule"
+        for a venue: organization, location scope, identifier, rule type.
+        Deliberately ignores ``is_active`` and ``expires_at`` -- a guest who
+        checked out on Tuesday and checks in again on Friday is the same
+        person, and Friday's upload has to revive their row rather than
+        report it as a duplicate and leave them offline. See
+        ``GuestAccessService.import_guest_rules``.
+
+        It also matches the **pre-E.164 spellings** of the same number --
+        see the implementation for the bound and why the match is narrower
+        here than at read time.
+
+        Soft-deleted rows are excluded: a deleted rule is gone, and the
+        import writes a fresh one.
+        """
+        ...
+
+    async def list_all_guest_rules_for_organization(
+        self, organization_id: uuid.UUID
+    ) -> list[GuestAccessRule]:
+        """Every live guest rule for one organization, unpaginated --
+        backs the CSV export. Mirrors
+        ``app.domains.mac_authorization.repository`` \
+        ``.list_all_for_organization``'s identical "a file someone
+        downloads is not paginated" shape."""
+        ...
 
     # -- device (MAC-keyed) rules --------------------------------------------
     async def create_device_rule(self, **fields: object) -> DeviceAccessRule: ...
@@ -169,13 +208,42 @@ class GuestAccessRepository:
         ``AccessDecisionResolver.resolve``. Deliberately not expressible
         via ``GenericRepository``'s equality-filter support: this needs an
         OR across ``location_id IS NULL`` vs. a specific ``location_id``,
-        plus an ``expires_at IS NULL OR expires_at > now`` bound."""
+        plus an ``expires_at IS NULL OR expires_at > now`` bound.
+
+        ``identifier`` is matched against every spelling of the same phone
+        number this table may hold, not by ``==``. Exact equality is what
+        made every rule the customer dashboard ever wrote unmatchable in
+        2026-09 -- those rows hold bare national digits ("9876543210")
+        and guests sign in as E.164 ("+919876543210") -- and no migration
+        can reconcile them without inventing a country code nobody
+        recorded. ``validators.identifier_match_terms`` documents the
+        equivalence, its bounds, and the false-match risk it accepts;
+        ``validators.identifiers_match`` is the Python mirror of the
+        clause built here.
+        """
         scope_clause = GuestAccessRule.location_id.is_(None)
         if location_id is not None:
             scope_clause = or_(scope_clause, GuestAccessRule.location_id == location_id)
+        terms = identifier_match_terms(identifier)
+        identifier_clause = GuestAccessRule.identifier.in_(terms.exact)
+        if terms.prefix_patterns:
+            # The stored-value-is-longer direction (a rule written in
+            # E.164, a guest signing in without the country code). No IN
+            # list can enumerate it, so it is a bounded LIKE: "+" or
+            # nothing, then 1-3 single-character wildcards, then the
+            # digits themselves. No leading "%" -- the organization_id
+            # equality above already confines the scan to one tenant's
+            # rules, which is a handful of rows per venue.
+            identifier_clause = or_(
+                identifier_clause,
+                *(
+                    GuestAccessRule.identifier.like(pattern)
+                    for pattern in terms.prefix_patterns
+                ),
+            )
         statement = select(GuestAccessRule).where(
             GuestAccessRule.organization_id == organization_id,
-            GuestAccessRule.identifier == identifier,
+            identifier_clause,
             GuestAccessRule.is_active.is_(True),
             GuestAccessRule.is_deleted.is_(False),
             scope_clause,
@@ -183,6 +251,109 @@ class GuestAccessRepository:
                 GuestAccessRule.expires_at.is_(None),
                 GuestAccessRule.expires_at > now,
             ),
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_guest_rule_for_import(
+        self,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None,
+        identifier: str,
+        rule_type: str,
+    ) -> GuestAccessRule | None:
+        """See ``GuestAccessRepositoryProtocol.find_guest_rule_for_import``.
+
+        ``location_id`` is compared with ``IS NULL`` when it is ``None``
+        rather than ``= NULL`` (which is never true), so an organization-wide
+        rule is correctly recognised as the duplicate of another
+        organization-wide rule -- the case a hotel with one property hits on
+        every single upload.
+
+        ## Why this matches more than the exact identifier
+
+        Every ``guest_access_rules`` row written before the 2026-09 fix is a
+        bare national number ("9876543210") that matches no living guest;
+        ``identifier_match_terms`` carries them at read time rather than
+        migrating them, because filling in a country code needs a country
+        nobody recorded. A bulk import is the one moment a human *does*
+        supply it. If this lookup were exact, the first upload after that
+        fix would file a second, canonical row beside every dead one --
+        leaving the venue with two rows per guest, only one of which any
+        future edit or deletion touches.
+
+        So a stored bare spelling of the number being imported counts as
+        the same rule, and the service rewrites it to E.164 (see
+        ``GuestAccessService.import_guest_rules``). The nightly upload is
+        the migration.
+
+        ## Why it matches *less* than ``list_matching_guest_rules``
+
+        Only spellings **without** a leading "+" are candidates. The read
+        path also treats "+919876543210" and "+19876543210" as possibly the
+        same person, and accepts that looseness because the alternative is
+        every pre-fix rule dead. That trade does not carry over to a write:
+        here a false match does not merely admit the wrong guest for one
+        session, it *overwrites another real person's rule identifier* --
+        a US "+19876543210" silently relabelled as an Indian number, with
+        no record of what it used to be. A stored value that already has a
+        "+" is already canonical and belongs to whoever it says it does, so
+        it is never rewritten. Bare rows are the only ones that match
+        nobody today and therefore the only ones there is nothing to lose
+        by repairing.
+        """
+        scope_clause = (
+            GuestAccessRule.location_id.is_(None)
+            if location_id is None
+            else GuestAccessRule.location_id == location_id
+        )
+        # ``.exact`` is the bounded set of spellings of this number (the
+        # canonical one, plus it with 1-3 leading country-code digits
+        # dropped, floored at MIN_NATIONAL_DIGITS). Reused rather than
+        # re-derived so the importer cannot drift from the read path's
+        # notion of "the same number"; filtered to the "+"-less half for
+        # the reason in the docstring. For an email it is just the address.
+        candidates = [
+            spelling
+            for spelling in identifier_match_terms(identifier).exact
+            if not spelling.startswith("+")
+        ]
+        if identifier not in candidates:
+            candidates.append(identifier)
+        statement = (
+            select(GuestAccessRule)
+            .where(
+                GuestAccessRule.organization_id == organization_id,
+                GuestAccessRule.identifier.in_(candidates),
+                GuestAccessRule.rule_type == rule_type,
+                GuestAccessRule.is_deleted.is_(False),
+                scope_clause,
+            )
+            # Canonical first, so a venue that somehow holds both spellings
+            # updates the row that already works rather than resurrecting
+            # the dead one and leaving the live one behind.
+            .order_by(
+                (GuestAccessRule.identifier == identifier).desc(),
+                GuestAccessRule.created_at.asc(),
+            )
+            .limit(1)
+        )
+        result = await self.session.execute(statement)
+        return result.scalars().first()
+
+    async def list_all_guest_rules_for_organization(
+        self, organization_id: uuid.UUID
+    ) -> list[GuestAccessRule]:
+        """See ``GuestAccessRepositoryProtocol
+        .list_all_guest_rules_for_organization``."""
+        statement = (
+            select(GuestAccessRule)
+            .where(
+                GuestAccessRule.organization_id == organization_id,
+                GuestAccessRule.is_deleted.is_(False),
+            )
+            .order_by(GuestAccessRule.created_at.asc())
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())

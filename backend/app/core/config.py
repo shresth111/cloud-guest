@@ -31,6 +31,17 @@ class Settings(BaseSettings):
             # is here so it stays working if that ever stops being true,
             # not because anything currently depends on it.
             "https://wifi.wyfyguest.com",
+            # The origin the guest portal SPA is ACTUALLY served from --
+            # `network_config.renderers.GUEST_PORTAL_HOST`, and the host in
+            # the `location.replace()` the router's own login.html performs.
+            # The entry above covers the hop the browser passes over on the
+            # way here; this covers where it lands and stays. Same "here so
+            # it keeps working if same-origin ever stops being true"
+            # reasoning, but with a sharper edge: production serves the SPA
+            # on auth.wyfyguest.com and the Master API on
+            # master.wyfyguest.com, which is cross-origin the moment nginx
+            # stops proxying /api/ from the portal's own server block.
+            "https://auth.wyfyguest.com",
         ]
     )
 
@@ -1356,7 +1367,20 @@ class Settings(BaseSettings):
         description=(
             "Which concrete SmsProviderProtocol implementation "
             "app.domains.otp.service.get_configured_sms_provider selects: "
-            "'logging' (default, no real send), 'twilio', or 'exotel'."
+            "'logging' (default, no real send), 'twilio', 'exotel', or "
+            "'ping4sms'."
+        ),
+    )
+    otp_sms_message_template: str = Field(
+        default="",
+        description=(
+            "Optional DLT-approved SMS body template for the guest-login "
+            "OTP, with the code as a `{#num#}` placeholder -- e.g. \"{#num#} "
+            "is your verification code for Wi-Fi.\". When set, OtpService "
+            "sends SMS bodies composed from this template (placeholder "
+            "replaced with the code) so the text matches the registered "
+            "template exactly; TRAI DLT carriers silently drop a body that "
+            "doesn't. Empty (default) keeps the built-in message."
         ),
     )
     twilio_account_sid: str = Field(default="")
@@ -1381,6 +1405,40 @@ class Settings(BaseSettings):
             "TRAI DLT-registered template id -- the OTP message body sent "
             "must match this template's approved text exactly, or Indian "
             "carriers silently drop the message."
+        ),
+    )
+    ping4sms_api_key: str = Field(
+        default="",
+        description=(
+            "Ping4SMS account API key (the 'key' query parameter of "
+            "https://site.ping4sms.com/api/smsapi). Secret -- set via "
+            "environment, never committed."
+        ),
+    )
+    ping4sms_route: str = Field(
+        default="",
+        description=(
+            "Ping4SMS route selector (the 'route' query parameter): "
+            "1=Promotional, 2=Transactional, 3=Optin, 4=Trans OTP, "
+            "5=Promo DND, 6=Whatsapp, 7=International. Use '4' for OTP "
+            "sends (Transactional/Trans OTP routes are the DLT-compliant "
+            "ones for a login code)."
+        ),
+    )
+    ping4sms_sender_id: str = Field(
+        default="",
+        description=(
+            "DLT-approved sender ID Ping4SMS sends SMS as (the 'sender' "
+            "query parameter)."
+        ),
+    )
+    ping4sms_dlt_template_id: str = Field(
+        default="",
+        description=(
+            "TRAI DLT-registered template id (the 'templateid' query "
+            "parameter) -- the OTP message body sent must match this "
+            "template's approved text exactly, or Indian carriers "
+            "silently drop the message."
         ),
     )
 

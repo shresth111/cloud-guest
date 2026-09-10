@@ -114,6 +114,7 @@ from .constants import (
     ALERT_TARGET_MONITORED_HARDWARE,
     ALERT_TARGET_ROGUE_DHCP_GUARD,
     ALERT_TARGET_ROUTER,
+    ALERT_TARGET_ROUTER_REACHABILITY,
     AUDIT_LOG_SOURCE_DOMAIN,
     DEFAULT_EVENT_TIMELINE_LIMIT,
     DEFAULT_FAILURE_SAMPLE_LIMIT,
@@ -1192,10 +1193,21 @@ def _event_extra(event: object) -> dict[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class AlertEvaluationResult:
-    """The result of one ``AlertService.evaluate_alert_rules`` pass."""
+    """The result of one ``AlertService.evaluate_alert_rules`` pass.
+
+    ``skipped_rules`` counts rules this pass could not evaluate and stepped
+    over. It is part of the result, and logged by the Beat task, on
+    purpose: per-rule isolation is only an improvement if the skipping is
+    LOUD. A silent ``except Exception`` around a loop body is how this
+    codebase has already shipped wiring that no test exercised (see
+    ``tests/unit/test_monitoring_alerts.FakeRepository``'s own note about
+    cloud-guest#131), so the count travels all the way out to the task's
+    return value where a non-zero number is visible without reading logs.
+    """
 
     triggered: list[Alert]
     resolved: list[Alert]
+    skipped_rules: int = 0
 
 
 
@@ -1584,24 +1596,54 @@ class AlertService:
         ``MonitoringService.run_all_health_checks``) as well as being safely
         callable on demand (``POST /alerts/evaluate``-style admin action);
         it re-derives everything from current repository state rather than
-        depending on being invoked at any particular cadence."""
+        depending on being invoked at any particular cadence.
+
+        ## Per-rule failure isolation
+
+        One rule failing costs that rule and nothing else -- the same
+        contract ``RouterService.sweep_stale_heartbeats`` documents for its
+        own per-router loop ("one router's transition failing is logged and
+        skipped, never aborting the sweep for the rest").
+
+        This was the single most expensive missing guarantee on the
+        platform. Two malformed demo rules -- rows inserted around the
+        validator, carrying ``threshold`` where the canonical key is
+        ``value`` -- raised ``KeyError`` out of the middle of this loop on
+        every pass. 276 tracebacks and zero completed runs in six hours,
+        which means no rule belonging to any real customer was evaluated
+        once. Two demo rows blinded alerting for every customer on the
+        platform.
+
+        Isolation alone would have been the wrong fix, though: it would
+        have turned a loud crash into a quiet skip and left the malformed
+        rows undiagnosed. So ``_evaluate_one_rule`` re-validates each rule's
+        stored config first, which turns that whole class of row into a
+        named, actionable failure; the isolation here then steps over it
+        and counts it into ``AlertEvaluationResult.skipped_rules``, which
+        the Beat task reports."""
         triggered: list[Alert] = []
         resolved: list[Alert] = []
+        skipped = 0
         rules = await self.repository.list_active_alert_rules()
         for rule in rules:
-            if rule.trigger_type == AlertTriggerType.HEALTH_STATUS_CHANGE.value:
-                rule_triggered, rule_resolved = await self._evaluate_health_status_rule(
-                    rule
+            try:
+                rule_triggered, rule_resolved = await self._evaluate_one_rule(rule)
+            except Exception as exc:  # noqa: BLE001 -- per-rule isolation, see docstring
+                skipped += 1
+                logger.warning(
+                    "alert_rule_evaluation_failed",
+                    extra={
+                        "rule_id": str(rule.id),
+                        "rule_name": rule.name,
+                        "organization_id": (
+                            str(rule.organization_id) if rule.organization_id else None
+                        ),
+                        "trigger_type": rule.trigger_type,
+                        "target_component": rule.target_component,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
                 )
-            elif rule.trigger_type == AlertTriggerType.THRESHOLD.value:
-                rule_triggered, rule_resolved = await self._evaluate_threshold_rule(
-                    rule
-                )
-            else:
-                (
-                    rule_triggered,
-                    rule_resolved,
-                ) = await self._evaluate_event_occurred_rule(rule)
+                continue
             triggered.extend(rule_triggered)
             resolved.extend(rule_resolved)
 
@@ -1614,7 +1656,49 @@ class AlertService:
         for alert in resolved:
             await self._dispatch_for_alert(alert)
 
-        return AlertEvaluationResult(triggered=triggered, resolved=resolved)
+        return AlertEvaluationResult(
+            triggered=triggered, resolved=resolved, skipped_rules=skipped
+        )
+
+    async def _evaluate_one_rule(
+        self, rule: AlertRule
+    ) -> tuple[list[Alert], list[Alert]]:
+        """Evaluate exactly one rule, after re-checking that its stored
+        ``condition_config`` still matches the shape its ``trigger_type``
+        requires.
+
+        THE RE-VALIDATION IS THE POINT, and it is not belt-and-braces.
+        ``create_alert_rule``/``update_alert_rule`` both run
+        ``validate_alert_rule_condition_config``, so every rule written
+        through the API is well-formed -- but rows do not only arrive
+        through the API. Two demo rows on production carried
+        ``{"metric": ..., "operator": ..., "threshold": 75}``: the key is
+        ``value``, and nothing in either the backend or the frontend has
+        ever written ``threshold``, so those rows were inserted around the
+        validator. ``_evaluate_threshold_rule``'s bare
+        ``rule.condition_config["value"]`` then raised ``KeyError('value')``
+        on every single pass -- 276 tracebacks and zero completed runs in
+        six hours, which meant no rule for any real customer was evaluated
+        at all.
+
+        Validating here turns that class of row into a precise, named,
+        skippable failure ("condition_config.value must be a number for
+        threshold rules", against a rule id) instead of a ``KeyError`` from
+        the middle of a subscript, and the caller's per-rule isolation then
+        steps over it. Both halves are needed: the isolation alone would
+        have hidden the malformed rows behind an anonymous exception, and
+        the validation alone would still have aborted the pass.
+        """
+        validate_alert_rule_condition_config(
+            AlertTriggerType(rule.trigger_type),
+            rule.target_component,
+            rule.condition_config or {},
+        )
+        if rule.trigger_type == AlertTriggerType.HEALTH_STATUS_CHANGE.value:
+            return await self._evaluate_health_status_rule(rule)
+        if rule.trigger_type == AlertTriggerType.THRESHOLD.value:
+            return await self._evaluate_threshold_rule(rule)
+        return await self._evaluate_event_occurred_rule(rule)
 
     async def _evaluate_health_status_rule(
         self, rule: AlertRule
@@ -1707,6 +1791,48 @@ class AlertService:
 
         if rule.target_component == ALERT_TARGET_ROGUE_DHCP_GUARD:
             return await self._evaluate_rogue_dhcp_guard_rule(rule, expected_status)
+
+        if rule.target_component == ALERT_TARGET_ROUTER_REACHABILITY:
+            routers = await self.repository.list_routers(
+                organization_id=rule.organization_id
+            )
+            for router in routers:
+                # `reachability_state` is written only by
+                # `RouterService.sweep_router_reachability`, already
+                # debounced over two consecutive missed agent polls and
+                # already confirmed against the hub's live WireGuard state.
+                # This branch adds no judgement of its own -- it must not,
+                # or there would be two places deciding what "down" means.
+                #
+                # NULL and "unknown" both fall through to `condition_met =
+                # False`, which is deliberate: a router the sweep has never
+                # been able to judge is an unanswered question, not an
+                # outage. The validator refuses to let a rule ask for
+                # either one.
+                condition_met = router.reachability_state == expected_status
+                existing = await self.repository.find_active_alert(
+                    rule_id=rule.id,
+                    organization_id=router.organization_id,
+                    location_id=router.location_id,
+                    router_id=router.id,
+                )
+                if condition_met and existing is None:
+                    alert = await self._create_alert(
+                        rule,
+                        organization_id=router.organization_id,
+                        location_id=router.location_id,
+                        router_id=router.id,
+                        message=_router_unreachable_message(router.name),
+                    )
+                    triggered.append(alert)
+                elif not condition_met and existing is not None:
+                    resolved.append(
+                        await self._auto_resolve(
+                            existing,
+                            resolved_message=_router_reachable_message(router.name),
+                        )
+                    )
+            return triggered, resolved
 
         if rule.target_component == ALERT_TARGET_ROUTER:
             routers = await self.repository.list_routers(
@@ -2075,20 +2201,78 @@ class AlertService:
         return resolved
 
     async def _dispatch_for_alert(self, alert: Alert) -> None:
+        """Fan one alert out to every active channel its rule is linked to.
+
+        ## Every silent exit here is now a log line
+
+        This method had three ways to do nothing at all, none of which said
+        so: no ``NotificationService``, no linked channel, and a channel
+        that is linked but inactive. The middle one is the one that
+        mattered. An ``AlertRule`` created through ``POST /alert-rules``
+        without ``notification_channel_ids`` is linked to nothing, and this
+        returned on a bare ``if not channel_ids``. The operator saw an
+        ``Alert`` row appear and an ``alert_triggered`` log line, and drew
+        the obvious, wrong conclusion that alerting worked -- there was no
+        ``notification_logs`` row, no error, and nothing anywhere naming the
+        rule that had nobody to tell. A rule that can never notify anyone is
+        a configuration defect, so it is logged as a warning against the
+        rule id every time it fires, not passed over in silence.
+
+        ## Per-channel isolation
+
+        ``NotificationService.dispatch_notification`` already promises never
+        to raise for a delivery failure. The wrapper here is for everything
+        around the delivery -- an unknown ``channel_type`` missing from the
+        notifier registry (a plain ``KeyError``), a repository write
+        failing. Without it, one broken channel would abort the loop and
+        every remaining channel for this alert would go untried, and the
+        exception would then propagate into the per-rule isolation above
+        and skip the whole rule. Same discipline, one level down.
+        """
         if self.notification_service is None:
             return
         channel_ids = await self.repository.list_notification_channel_ids_for_rule(
             alert.rule_id
         )
         if not channel_ids:
+            logger.warning(
+                "alert_dispatch_no_channels_configured",
+                extra={
+                    "alert_id": str(alert.id),
+                    "rule_id": str(alert.rule_id),
+                    "organization_id": (
+                        str(alert.organization_id) if alert.organization_id else None
+                    ),
+                },
+            )
             return
         channels = await self.notification_service.list_channels_by_ids(channel_ids)
-        for channel in channels:
-            if not channel.is_active:
-                continue
-            await self.notification_service.dispatch_notification(
-                alert=alert, channel=channel
+        active = [channel for channel in channels if channel.is_active]
+        if not active:
+            logger.warning(
+                "alert_dispatch_no_active_channels",
+                extra={
+                    "alert_id": str(alert.id),
+                    "rule_id": str(alert.rule_id),
+                    "linked_channels": len(channel_ids),
+                },
             )
+            return
+        for channel in active:
+            try:
+                await self.notification_service.dispatch_notification(
+                    alert=alert, channel=channel
+                )
+            except Exception as exc:  # noqa: BLE001 -- per-channel isolation, see docstring
+                logger.warning(
+                    "alert_dispatch_channel_failed",
+                    extra={
+                        "alert_id": str(alert.id),
+                        "channel_id": str(channel.id),
+                        "channel_type": channel.channel_type,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
 
 
 # ============================================================================
@@ -2123,6 +2307,64 @@ def _health_status_message(name: str, health_status: str | None) -> str:
     if health_status == "healthy":
         return f"{name} is up"
     return f"{name} health status is {health_status}"
+
+
+def _router_unreachable_message(router_name: str) -> str:
+    """The trigger copy for ``ALERT_TARGET_ROUTER_REACHABILITY``.
+
+    EVERY WORD HERE IS CONSTRAINED BY WHAT THE PLATFORM ACTUALLY KNOWS, and
+    the constraint is not stylistic.
+
+    All the sweep behind this alert observed is that a router stopped
+    talking to us and its tunnel went with it. That is the *same*
+    observation whether the venue's internet line died, the building lost
+    power, or somebody unplugged the router -- and on 2026-09-07 it was the
+    third: the router cold-booted (its own log shows NTP correcting the
+    clock on the way back up) while the ISP was perfectly healthy. An email
+    saying "your ISP is down" would have been confidently, checkably wrong,
+    and it would have sent the owner to argue with their provider about an
+    outage the provider did not cause.
+
+    So the sentence says what was seen ("stopped responding"), what it
+    means for the guest ("Wi-Fi at this site is most likely down"), what we
+    cannot tell ("we can't tell from here whether..."), and what to
+    actually go and do. A vague honest sentence at 3am beats a confident
+    wrong one.
+
+    Contrast ``ALERT_TARGET_ISP_LINK``, which may legitimately name the
+    uplink: that signal comes from the router itself successfully reporting
+    that its own WAN is failing, i.e. from a device that is still reachable
+    and is telling us specifically about its internet line.
+
+    No timestamp. The email lands within about two minutes of the event, so
+    "just stopped responding" is accurate; an absolute time would have to
+    pick a timezone, and getting that wrong is its own small lie. The
+    recovery message carries the duration instead, which is the number
+    somebody actually wants afterwards.
+    """
+    return (
+        f"{router_name} stopped responding. Guest Wi-Fi at this site is "
+        "most likely down. We can't tell from here whether the internet "
+        "line dropped or the router lost power -- please check that the "
+        "router has power and that its internet cable is plugged in."
+    )
+
+
+def _router_reachable_message(router_name: str) -> str:
+    """The recovery copy, replacing the trigger text at resolve time for
+    the reason ``_auto_resolve``'s own docstring gives (``[RESOLVED] ...
+    stopped responding`` reads as a contradiction).
+
+    "Back online and has stayed up" is a literal claim, not a flourish: the
+    sweep only resolves after ``ROUTER_REACHABILITY_HITS_TO_RESOLVE``
+    consecutive successful polls -- ten minutes of continuous contact --
+    precisely so a flapping router does not send this sentence four times
+    in half an hour.
+    """
+    return (
+        f"{router_name} is back online and has stayed up. Guest Wi-Fi at "
+        "this site should be working again."
+    )
 
 
 def _rogue_dhcp_guard_message(router_name: str, interfaces: list[str]) -> str:
@@ -3173,8 +3415,17 @@ class ZtpMonitoringService:
         total_pages = (
             max(1, (total_items + page_size - 1) // page_size) if total_items else 0
         )
+        # Mirrors the `unclaimed_enrollments` decision above, which this tile
+        # contradicted. An enrollment request carries no organization_id, so
+        # `count_pending_enrollment_requests` is unavoidably platform-wide --
+        # and it was rendered on an org-scoped ZTP dashboard as "N routers
+        # waiting to be approved at this venue", next to a list that had
+        # correctly excluded every one of them. A count that disagrees with
+        # the list beside it is the version of this bug nobody can see.
         pending_enrollment_count = (
-            await self.repository.count_pending_enrollment_requests()
+            0
+            if organization_id is not None
+            else await self.repository.count_pending_enrollment_requests()
         )
 
         return ZtpDashboardResult(

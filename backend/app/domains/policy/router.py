@@ -20,6 +20,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.common.responses import ApiResponse, build_response
+from app.core.logging import get_logger
 from app.domains.auth.models import AuthUser
 from app.domains.rbac.authorization import RoleResolver
 from app.domains.rbac.dependencies import (
@@ -44,6 +45,17 @@ from .schemas import (
     ResolvedPolicyResponse,
 )
 from .service import PolicyService
+
+logger = get_logger(__name__)
+
+# The reapply task is imported inside the handler that dispatches it, not
+# at module scope: ``queue_management.tasks`` composes
+# ``policy.dependencies``/``policy.service`` (a QueueManagementService
+# needs the policy resolver), so importing it here at module scope would
+# create an import cycle at startup (policy.router ->
+# queue_management.tasks -> policy.dependencies -> policy.service).
+# Celery resolves the task by name at publish time, so the function-local
+# import is only ever about keeping the module-import graph acyclic.
 
 router = APIRouter(prefix="/policies", tags=["Policy"])
 
@@ -400,6 +412,28 @@ async def publish_policy_version(
         requesting_organization_id=requesting_organization_id,
         actor_user_id=uuid.UUID(user.id),
     )
+    # A bandwidth-policy publish must reach guests who are ALREADY
+    # connected, not just the next login -- see
+    # ``QueueManagementService.reapply_active_sessions_for_location``'s own
+    # docstring (and the "speed is only set to 20 and not updating" bug
+    # report that led to it). Dispatched to the worker rather than run
+    # inline so a router connect (10s timeout) never sits on the publish
+    # request, and best-effort by design: a reapply failure must not fail
+    # the publish itself -- the new policy is already published and
+    # correct for every *next* login either way. The import is
+    # function-local to keep the module-import graph acyclic (see the note
+    # above the router definition).
+    try:
+        from app.domains.queue_management.tasks import (
+            reapply_policy_assignments,
+        )
+
+        reapply_policy_assignments.delay(
+            policy_id=str(policy_id),
+            version_id=str(version_id),
+        )
+    except Exception:  # noqa: BLE001 -- never fail a publish over a dispatch hiccup
+        logger.exception("bandwidth_publish_reapply_dispatch_failed")
     return build_response(
         success=True,
         message="Policy version published",

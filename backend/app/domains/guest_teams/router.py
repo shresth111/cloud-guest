@@ -58,6 +58,7 @@ from .schemas import (
     GuestTeamRevokeRequest,
     GuestTeamRevokeResponse,
     GuestTeamSummaryResponse,
+    OpenGuestTeamResponse,
 )
 from .service import GuestTeamService
 
@@ -134,6 +135,52 @@ async def join_guest_team(
             is_new_membership=result.is_new_membership,
             membership=_member_response(result.membership),
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@guest_router.get(
+    "/open",
+    response_model=ApiResponse[list[OpenGuestTeamResponse]],
+    status_code=status.HTTP_200_OK,
+)
+async def list_open_guest_teams(
+    request: Request,
+    organization_id: uuid.UUID | None = Query(default=None),
+    location_id: uuid.UUID | None = Query(default=None),
+    service: GuestTeamService = Depends(get_guest_team_service),
+):
+    """Teams a guest at this portal can join right now, for the sign-in
+    screen's optional "which group do you belong to?" dropdown. No RBAC and
+    no tenant header -- same posture as ``POST /guest-teams/join``: the
+    caller is an anonymous guest in a venue's captive portal, identified
+    only by the same ``organization_id``/``location_id`` query params the
+    portal itself was resolved with (mirrors ``GET /captive-portal/
+    resolve``). Empty result = no dropdown. Only ever returns teams that
+    are genuinely open (see ``GuestTeamService.list_open_teams``)."""
+    if organization_id is None:
+        return build_response(
+            success=True,
+            message="Open guest teams retrieved",
+            data=[],
+            request_id=_request_id(request),
+        )
+    teams = await service.list_open_teams(
+        organization_id=organization_id, location_id=location_id
+    )
+    return build_response(
+        success=True,
+        message="Open guest teams retrieved",
+        data=[
+            OpenGuestTeamResponse(
+                id=str(team.id),
+                name=team.name,
+                team_code=team.team_code,
+                max_members=team.max_members,
+                member_count=member_count,
+            ).model_dump()
+            for team, member_count in teams
+        ],
         request_id=_request_id(request),
     )
 

@@ -17,8 +17,10 @@ from app.common.exceptions import CloudGuestError
 from .constants import (
     MAX_BACKGROUND_FOCAL,
     MAX_BACKGROUND_OVERLAY_STRENGTH,
+    MAX_FEEDBACK_DWELL_MINUTES,
     MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
+    MIN_FEEDBACK_DWELL_MINUTES,
     GuestFontChoice,
     PortalContentMode,
 )
@@ -41,6 +43,10 @@ __all__ = [
     "SplashTextTooLongError",
     "PostLoginHtmlTooLargeError",
     "PoweredByAttributionNotEntitledError",
+    "InvalidUserPortalUrlError",
+    "WhitelistOnlyRequiresLocationError",
+    "InvalidReviewUrlError",
+    "InvalidFeedbackDwellMinutesError",
 ]
 
 
@@ -114,6 +120,52 @@ class InvalidPortalContentSourceError(CaptivePortalError):
         )
 
 
+class InvalidReviewUrlError(CaptivePortalError):
+    """``review_url`` was not an ``https`` URL on a Google host -- see
+    ``validators.validate_review_url``.
+
+    Rejected at write time rather than at render time, because the failure
+    this prevents is silent: a venue pastes something that is not their
+    review link, the card renders, guests tap it, and nobody finds out
+    until someone asks why the review count never moved. A 400 in the
+    dashboard, in front of the person who did the pasting, is the only
+    moment the mistake is cheap.
+
+    Deliberately *not* a shape check on the path. This platform does not
+    know what a valid Google review path looks like from one quarter to the
+    next (see ``constants.REVIEW_URL_MAX_LENGTH``'s own comment), and a
+    validator that guessed would reject working links. Scheme and host are
+    the two things that have stayed true."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"That doesn't look like a Google review link: {reason}. Copy it "
+            "from your Google Business Profile -> Read reviews -> Get more "
+            "reviews.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidFeedbackDwellMinutesError(CaptivePortalError):
+    """``feedback_dwell_minutes`` was outside
+    ``[MIN_FEEDBACK_DWELL_MINUTES, MAX_FEEDBACK_DWELL_MINUTES]`` or was not
+    a whole number of minutes.
+
+    The message names the unit, because the field's whole failure mode is
+    a venue -- or a second client -- reading it as seconds. 1500 seconds
+    is a plausible dwell; 1500 minutes is a card no guest will ever be
+    connected long enough to see, and it fails silently rather than
+    loudly."""
+
+    def __init__(self, value: object) -> None:
+        super().__init__(
+            f"Feedback dwell must be a whole number of *minutes* between "
+            f"{MIN_FEEDBACK_DWELL_MINUTES} and {MAX_FEEDBACK_DWELL_MINUTES} "
+            f"-- got {value!r}.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 class InvalidDefaultConfigScopeError(CaptivePortalError):
     """``is_default=True`` was requested alongside a non-null
     ``location_id`` -- ``is_default`` only has meaning for an
@@ -124,6 +176,32 @@ class InvalidDefaultConfigScopeError(CaptivePortalError):
         super().__init__(
             "is_default can only be set on an organization-level config "
             "(location_id must be null)",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class WhitelistOnlyRequiresLocationError(CaptivePortalError):
+    """``whitelist_only_enabled=True`` was requested on an organization's
+    default config (``location_id IS NULL``).
+
+    An org default is inherited by every location that has no override of
+    its own, so setting the flag there would silently put *every* property
+    in the organization into whitelist-only mode at once -- every guest
+    without an Always Allowed entry refused, everywhere, from one toggle.
+    There is no legitimate use for that: the feature was asked for, and is
+    only ever operated, per property. Refused here rather than guarded in
+    the UI, because the UI is not the only caller.
+
+    Turning it **off** on an org default is always allowed -- ``False`` is
+    the column's own default and the value every existing row already
+    carries, so writing it can never widen anything.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "whitelist_only_enabled can only be set on a location-specific "
+            "config (location_id must not be null) -- enabling it on the "
+            "organization default would switch on every property at once",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -346,3 +424,48 @@ class PoweredByAttributionNotEntitledError(CaptivePortalError):
                 "required_feature": feature_key,
             },
         )
+
+
+class InvalidUserPortalUrlError(CaptivePortalError):
+    """The ``portal_url`` query parameter of the RFC 8908 endpoint was not
+    a URL on this platform's own hotspot name.
+
+    **This is a security boundary, not input hygiene.** That parameter is
+    reflected into the ``user-portal-url`` member of an
+    ``application/captive+json`` document, and a conforming operating
+    system *opens that URL by itself* -- no link, no click, no user
+    decision anywhere in the chain. An ordinary open redirect needs a
+    victim to follow it; this one needs a victim to plug in a network
+    cable. So the check is an allowlist of names this platform owns, and
+    anything else is refused rather than sanitised.
+
+    400 rather than 422: FastAPI's own 422 means "the request did not
+    match the declared schema", and this one did -- ``portal_url`` is a
+    string and a string arrived. What failed is a domain rule about
+    *which* strings are acceptable, which is the same category as every
+    other 400 in this module.
+    """
+
+    def __init__(self, portal_url: str) -> None:
+        # The offending value is deliberately NOT interpolated into the
+        # message. This endpoint is unauthenticated and reachable by any
+        # guest device, so the message is the one thing an attacker can
+        # reliably get the platform to emit; echoing their string back
+        # into it would hand back a smaller version of the same
+        # reflection this class exists to close.
+        super().__init__(
+            "portal_url must be an http:// URL on this platform's own "
+            "hotspot name",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidContentImageError(CaptivePortalError):
+    """The uploaded pre-login content image was not a png/jpeg/webp/gif
+    or exceeded the 5 MiB ceiling -- same constraints as the branding
+    logo/background uploads. 400, and the message names the real problem
+    (unsupported type vs too large) so the dashboard's upload control can
+    surface it verbatim."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)

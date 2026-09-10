@@ -129,7 +129,7 @@ LOCATION_SCOPED: dict[str, str] = {
         "`resolve_portal_config` deliberately does NOT come through here -- "
         "it resolves by organization+location, so the portal render a guest "
         "sees is untouched. Anonymous-tolerant anyway: `/captive-portal/"
-        "resolve` and `/rfc8908` are unauthenticated and the service is "
+        "resolve` is unauthenticated and the service is "
         "composed into `get_guest_service`."
     ),
     "voucher": (
@@ -470,16 +470,9 @@ def test_a_converted_domains_provider_supplies_the_confinement(domain: str) -> N
 # staff member reading a tenant's records.
 _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/captive-portal/resolve"): (
-        "The guest portal render and the RFC 8908 endpoint the device's own OS reads. "
-        "Both are pre-login by definition; the caller holds no roles, and "
-        "`resolve_portal_config` resolves by organization+location rather than through "
-        "the confined `get_config`."
-    ),
-    ("GET", "/api/v1/captive-portal/rfc8908"): (
-        "The guest portal render and the RFC 8908 endpoint the device's own OS reads. "
-        "Both are pre-login by definition; the caller holds no roles, and "
-        "`resolve_portal_config` resolves by organization+location rather than through "
-        "the confined `get_config`."
+        "The guest portal render. Pre-login by definition; the caller holds no "
+        "roles, and `resolve_portal_config` resolves by organization+location "
+        "rather than through the confined `get_config`."
     ),
     ("POST", "/api/v1/network-integrations/portal/authorize"): (
         "Captive-portal network enforcement for a guest who has just been "
@@ -560,6 +553,16 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "dependency resolves them to unconfined rather than 401ing them out of the "
         "portal."
     ),
+    ("POST", "/api/v1/guest/review-link-opened"): (
+        "A guest tapping the review card on their own connected session -- the same "
+        "shape as `/guest/profile` above, and unauthenticated for the same reason: "
+        "they hold no roles, so there is no confinement to derive, and the strict "
+        "dependency would drag `CurrentUser` in and 401 them out of the portal. It "
+        "records one bit against the session the caller already holds and reads "
+        "nothing, so being unconfined here widens nothing: the worst a caller can do "
+        "with a session id they do not own is mark someone else's review card as "
+        "already tapped, which suppresses a nudge and grants no access."
+    ),
     ("POST", "/api/v1/guest/set-password"): (
         "A guest acting on their own session, before or during login. They hold no "
         "roles, so there is no confinement to derive; the anonymous-tolerant "
@@ -577,6 +580,22 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "roles, so there is no confinement to derive; the anonymous-tolerant "
         "dependency resolves them to unconfined rather than 401ing them out of the "
         "portal."
+    ),
+    ("GET", "/api/v1/guest/session/last-ended"): (
+        "The read-only twin of `/guest/session/active` above, asked by the portal "
+        "only after that one answers 'no active session', and unauthenticated for "
+        "the identical reason: a guest whose session has just ended holds no roles, "
+        "so there is no confinement to derive, and the strict dependency would drag "
+        "`CurrentUser` in and 401 them out of the portal at exactly the moment the "
+        "screen exists to help them. Being unconfined widens nothing here, and this "
+        "route is deliberately narrower than its twin rather than as wide: it "
+        "returns a closed two-member enum plus the venue's own session-timeout "
+        "setting -- no identifier, no ids, no timestamp, no `disconnect_reason` -- "
+        "and returns null outright for any session an operator terminated, so it "
+        "cannot be used to ask whether a MAC is blocked at a venue. The most a "
+        "caller holding a MAC they do not own can learn is that some session on "
+        "that device ended within LAST_ENDED_SESSION_WINDOW_MINUTES, which is "
+        "strictly less than `/session/active` already discloses for a live one."
     ),
     ("POST", "/api/v1/guest/session/disconnect"): (
         "A guest acting on their own session, before or during login. They hold no "
@@ -606,11 +625,40 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "user session. Same reasoning as the RADIUS routes: a device is the caller, "
         "holds no grants, and must not be confined."
     ),
+    ("POST", "/api/v1/otp/request"): (
+        "A guest at a captive portal asking for a sign-in code, before they have any "
+        "identity at all -- the very first call the portal makes. It reaches a "
+        "confined service because it now composes `GuestService.check_portal_admission`"
+        ", the per-property whitelist-only gate that must refuse a non-listed guest "
+        "*before* the venue pays for an SMS. Being unconfined grants nothing: the "
+        "admission check resolves the portal config by the organization/location the "
+        "request itself names and reads only that property's own access rules, exactly "
+        "as `POST /guest/login/otp` does one step later. Requiring a credential here "
+        "would 401 every guest out of the portal."
+    ),
     ("POST", "/api/v1/guest-teams/join"): (
         "A guest joining a team with a code they were given. They hold no "
         "roles, so there is no confinement to derive, and `join_team` "
         "resolves by team code off the repository rather than through the "
         "confined `get_team` -- so being unconfined here grants nothing."
+    ),
+    ("GET", "/api/v1/guest-teams/open"): (
+        "The sign-in screen's optional 'which group do you belong to?' "
+        "dropdown, fetched by an anonymous guest in the captive portal "
+        "before they have signed in -- the same pre-identity moment as "
+        "`POST /guest-teams/join` next to it. `list_open_teams` reads only "
+        "the organization/location the request itself names and returns "
+        "nothing but team names/codes that are already public join tokens; "
+        "requiring a credential would 401 every guest out of the dropdown."
+    ),
+    ("GET", "/api/v1/captive-portal-configs/{config_id}/content-image/public"): (
+        "The uploaded 'Before sign-in: show a picture' content image, "
+        "rendered by the guest portal's own <img> before the guest has any "
+        "identity -- the same class of exception as the branding public "
+        "proxies (GET /branding/{organization_id}/logo/public). The config "
+        "id in the path is the (unguessable) capability and the endpoint "
+        "only ever streams one image's bytes; a credential requirement "
+        "would break every portal that uses the feature."
     ),
 }
 

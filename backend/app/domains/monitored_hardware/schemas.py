@@ -41,6 +41,13 @@ class MonitoredHardwareResponse(BaseModel):
     # for exactly how this is derived (never fabricated).
     status: str
     last_seen_at: datetime | None
+    # When the device was first observed on this network *and has stayed
+    # on since* -- the sync sweep preserves it across ticks for an active
+    # device, so for a "up" row it answers "how long has it been up?",
+    # which ``last_seen_at`` (the age of the sync sweep's own view)
+    # cannot. Null for "down"/"unknown"/never-observed rows -- never
+    # fabricated from ``last_seen_at``.
+    connected_at: datetime | None
     created_at: datetime
 
 

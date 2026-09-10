@@ -169,6 +169,67 @@ class Guest(BaseModel):
     # Nullable and never required to obtain network access -- see that
     # method's docstring.
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # When this guest declined the post-connect "add your name" card --
+    # the third and last thing that makes ``has_profile`` true on
+    # ``schemas.GuestLoginResponse`` (the other two being a
+    # ``display_name`` or an ``email`` actually on file).
+    #
+    # **This column exists so a storage read can leave the captive-portal
+    # browser.** The frontend used to remember a decline in
+    # ``localStorage``. Web Storage *throws* inside Apple's Captive
+    # Network Assistant -- the codebase already carries the scar, in
+    # ``OtpForm.tsx``'s own comment and in
+    # ``scripts/test-portal-cna-storage-safety.mjs``, which exists because
+    # a storage read once took down hydration and left guests on a
+    # permanent spinner. The read is try/catch-wrapped now, so it does not
+    # crash; it simply returns false every single time. The result is that
+    # an iPhone guest who types their name, taps Save, and is bounced back
+    # to the session page by the NAS -- which happens routinely -- is
+    # asked for their name again, having just given it. On the platform
+    # where the environment is worst, the product nagged hardest.
+    #
+    # Server-side, it survives storage loss and follows the guest across
+    # devices, which device-local state never could.
+    #
+    # A timestamp rather than a boolean because "when" is the question
+    # anybody asks next -- of a prompt-frequency rule, of a support
+    # ticket, of a DPDP records request -- and a boolean cannot be
+    # widened into one after the fact.
+    profile_prompt_declined_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # When this guest last tapped through to the venue's Google review
+    # link. Non-null is the whole of ``has_opened_review_link`` on
+    # ``schemas.GuestLoginResponse``, and the portal reads that bit to
+    # decide whether to render the review card again.
+    #
+    # Server-side for the same reason ``profile_prompt_declined_at`` is:
+    # the alternative is a ``localStorage`` flag, and Web Storage throws
+    # inside Apple's Captive Network Assistant. Without the column the
+    # card is not a feature, it is a nag -- shown on every visit, forever,
+    # including to the guest who already left the review.
+    #
+    # **This is not a metric and must never be reported as one.** It
+    # records that the link was *opened*, not that a review was written --
+    # Google exposes nothing that would let this platform know the
+    # difference, and any dashboard that implies otherwise is inventing a
+    # number. It also cannot see iOS at all: iPhone and iPad guests are
+    # sent to ``captive.apple.com/hotspot-detect.html`` after login rather
+    # than to ``/portal/session`` (deliberately -- the CNA only releases
+    # app traffic when its probe to that exact URL returns Apple's success
+    # body), so they never reach the screen the card is on and never write
+    # this column. A count over it is a count of Android and desktop
+    # guests who tapped a link, and it is only honest if it is labelled
+    # that way.
+    #
+    # Overwritten on each open rather than kept as a first-touch, unlike
+    # ``profile_prompt_declined_at``: a decline is an answer given once,
+    # while "when did they last go and review us" is a question whose
+    # useful answer is the most recent one.
+    review_link_opened_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -379,6 +440,23 @@ class GuestSession(BaseModel):
     # write-up (mirrors Voucher.expires_at's identical reasoning).
     data_limit_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
     session_timeout_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The venue's idle timeout as it stood when this session started --
+    # copied, not referenced, for the same reason ``session_timeout_minutes``
+    # directly above is (see service.py's module docstring). An operator who
+    # shortens the venue's idle timeout at 3pm must not retroactively
+    # shorten the allowance of a guest who connected at 2pm; the change
+    # applies to sessions started after it.
+    #
+    # This is also what lets ``/guest/session/last-ended`` tell a guest who
+    # was idled out *which* number ended their session, rather than the
+    # number that happens to be configured by the time they look.
+    #
+    # NULL means "no idle timeout was recorded for this session" -- true of
+    # every row written before this column existed, and of any future path
+    # that deliberately declines to impose one. Readers treat NULL as
+    # "send no ``Idle-Timeout`` attribute", which lets the NAS's own profile
+    # value stand, exactly as it did before this platform sent one at all.
+    idle_timeout_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     disconnect_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     __table_args__ = (

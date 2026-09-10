@@ -35,6 +35,10 @@ import pytest
 from app.domains.location.exceptions import CrossLocationScopeAccessError
 from app.domains.location.scoping import enforce_target_location
 from app.domains.rbac.dependencies import CurrentLocation
+from app.domains.rbac.organization_scope import (
+    ALL_ORGANIZATIONS_VALUE,
+    ORGANIZATION_SCOPE_HEADER,
+)
 
 # ---------------------------------------------------------------------------
 # The shared guard
@@ -119,7 +123,8 @@ class TestEnforceTargetLocation:
 
 
 # ---------------------------------------------------------------------------
-# The root invariant: ``None`` means "platform caller", never "no header sent"
+# The root invariant: ``None`` means "asked for every organization", never
+# "nobody said"
 # ---------------------------------------------------------------------------
 #
 # ``ScopeResolver.satisfies`` compares *only* ``location_id`` for a LOCATION
@@ -132,6 +137,15 @@ class TestEnforceTargetLocation:
 # tenant guard and every list service reads as "platform caller, no filter".
 # That is a cross-*organization* read from an ordinary staff account, and it
 # is strictly worse than the sibling-location case above.
+#
+# The invariant has since been tightened once more. Refusing a tenant caller
+# who named no organization was only half of it: a GLOBAL-scoped caller who
+# named none still fell through to ``None``, and a founder holding ``Super
+# Admin`` got a fourteen-tenant report every time he opened his own venue's
+# page. ``None`` now requires an explicit ``X-Organization-Scope: all``, so it
+# means "this caller asked for every organization" rather than "this caller
+# said nothing". See ``app.domains.rbac.organization_scope`` and
+# ``tests/unit/test_organization_scope_default.py``.
 
 
 class _FakeRole:
@@ -155,20 +169,34 @@ class _FakeRbacRepo:
 
 
 class _HeaderlessRequest:
-    """A request that sent no ``X-Organization-Id``."""
+    """A request that sent no ``X-Organization-Id``.
+
+    ``query_params``/``path_params`` are present and empty because
+    ``CurrentOrganizationScope`` now also reads the organization the *route*
+    names -- these doubles must say "the route named nothing either", not
+    "this attribute does not exist".
+    """
 
     headers: dict[str, str] = {}
+    query_params: dict[str, str] = {}
+    path_params: dict[str, str] = {}
+
+
+class _AllOrganizationsRequest(_HeaderlessRequest):
+    """A request that explicitly asked to read across every organization."""
+
+    headers = {ORGANIZATION_SCOPE_HEADER: ALL_ORGANIZATIONS_VALUE}
 
 
 class TestOrganizationContextRequiresAHeader:
     async def test_location_scoped_caller_omitting_the_header_is_refused(self) -> None:
         """The bypass itself. A LOCATION-scoped user must not be able to
         become a platform caller by dropping a header."""
-        from app.domains.rbac.dependencies import CurrentOrganization
+        from app.domains.rbac.dependencies import CurrentOrganizationScope
         from app.domains.rbac.exceptions import MissingScopeContextError
 
         with pytest.raises(MissingScopeContextError):
-            await CurrentOrganization(
+            await CurrentOrganizationScope(
                 _HeaderlessRequest(),
                 user=SimpleNamespace(id=str(uuid.uuid4())),
                 db=None,
@@ -178,37 +206,72 @@ class TestOrganizationContextRequiresAHeader:
     async def test_organization_scoped_caller_omitting_the_header_is_refused(
         self,
     ) -> None:
-        from app.domains.rbac.dependencies import CurrentOrganization
+        from app.domains.rbac.dependencies import CurrentOrganizationScope
         from app.domains.rbac.exceptions import MissingScopeContextError
 
         with pytest.raises(MissingScopeContextError):
-            await CurrentOrganization(
+            await CurrentOrganizationScope(
                 _HeaderlessRequest(),
                 user=SimpleNamespace(id=str(uuid.uuid4())),
                 db=None,
                 repository=_FakeRbacRepo(["organization"]),
             )
 
-    async def test_genuine_platform_caller_still_gets_none(self) -> None:
-        """A GLOBAL-scoped operator legitimately has no tenant. This is the
-        population the ``None`` return was written for, and it must keep
-        working -- the Master console's cross-tenant pages depend on it."""
-        from app.domains.rbac.dependencies import CurrentOrganization
+    async def test_a_platform_caller_who_asks_for_every_organization_gets_none(
+        self,
+    ) -> None:
+        """A GLOBAL-scoped operator legitimately reads across tenants. That is
+        the population the ``None`` return was written for and it must keep
+        working -- the Master console's cross-tenant pages depend on it -- but
+        it now has to *ask*."""
+        from app.domains.rbac.dependencies import CurrentOrganizationScope
 
-        result = await CurrentOrganization(
-            _HeaderlessRequest(),
+        scope = await CurrentOrganizationScope(
+            _AllOrganizationsRequest(),
             user=SimpleNamespace(id=str(uuid.uuid4())),
             db=None,
             repository=_FakeRbacRepo(["global"]),
         )
-        assert result is None
+        assert scope.all_organizations is True
+        assert scope.organization_id is None
+
+    async def test_a_platform_caller_who_asks_for_nothing_is_refused(self) -> None:
+        """The founder's case, and the reason this file's invariant moved.
+
+        Before this, a GLOBAL-scoped caller who named no organization silently
+        received every one of them -- fourteen in production, mostly demo and
+        QA fixtures -- rendered as one venue's report."""
+        from app.domains.rbac.dependencies import CurrentOrganizationScope
+        from app.domains.rbac.exceptions import UnspecifiedOrganizationScopeError
+
+        with pytest.raises(UnspecifiedOrganizationScopeError):
+            await CurrentOrganizationScope(
+                _HeaderlessRequest(),
+                user=SimpleNamespace(id=str(uuid.uuid4())),
+                db=None,
+                repository=_FakeRbacRepo(["global"]),
+            )
+
+    async def test_a_tenant_caller_cannot_ask_for_every_organization(self) -> None:
+        """403, not a silent narrowing: a caller who believes they are seeing
+        the whole estate and is not makes worse decisions than one told no."""
+        from app.domains.rbac.dependencies import CurrentOrganizationScope
+        from app.domains.rbac.exceptions import CrossOrganizationScopeDeniedError
+
+        with pytest.raises(CrossOrganizationScopeDeniedError):
+            await CurrentOrganizationScope(
+                _AllOrganizationsRequest(),
+                user=SimpleNamespace(id=str(uuid.uuid4())),
+                db=None,
+                repository=_FakeRbacRepo(["location"]),
+            )
 
     async def test_a_user_with_no_roles_at_all_is_refused(self) -> None:
-        from app.domains.rbac.dependencies import CurrentOrganization
+        from app.domains.rbac.dependencies import CurrentOrganizationScope
         from app.domains.rbac.exceptions import MissingScopeContextError
 
         with pytest.raises(MissingScopeContextError):
-            await CurrentOrganization(
+            await CurrentOrganizationScope(
                 _HeaderlessRequest(),
                 user=SimpleNamespace(id=str(uuid.uuid4())),
                 db=None,

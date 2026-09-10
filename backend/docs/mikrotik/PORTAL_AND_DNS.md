@@ -140,6 +140,46 @@ Every one of its ~40 columns (`theme`, `logo_url`, `primary_color`,
 of them can be made into one.** That is the single most important fact in
 this document and §2 is built on it.
 
+#### 1.1.1 "Put the portal on auth.wyfyguest.com" — it already is
+
+Asked periodically, and worth answering once in writing, because two of the
+three things it could mean are already true and the third is a configuration
+this platform has already tried and reverted.
+
+The guest's journey is **two hops, on purpose**:
+
+1. RouterOS intercepts and redirects to `http://wifi.wyfyguest.com/` — the
+   hotspot profile's own `dns-name`, served off the device.
+2. That page immediately `location.replace()`s to
+   `https://auth.wyfyguest.com/portal?…&mac=$(mac)&link-login-only=$(link-login-only)`,
+   which is where the SPA runs and where the guest stays.
+
+So the portal **is** on `auth.wyfyguest.com`, and has been. What briefly
+shows `wifi.wyfyguest.com` is hop 1 — the interception itself and the
+captive-portal sheet's address bar at that instant.
+
+**Hop 1 cannot be removed.** `$(link-login-only)` — the token the final
+`/login` POST needs in order to actually authorise the guest's MAC — is
+substituted by RouterOS only in pages RouterOS itself serves out of
+`html-directory`. Nothing on the cloud side can mint it.
+
+**And `dns-name` must not be changed to `auth.wyfyguest.com`.** `dns-name`
+makes RouterOS answer DNS for that name, for that router's own guests, with
+that router's own LAN address, and that answer is absolute for a connected
+guest — not a fallback a public A record could override. Point the real
+portal at the same name and every guest's browser resolves it to the router
+and loops back onto the local redirect page instead of reaching sign-in.
+This was confirmed live before the two names were split apart; see
+`RouterDetailTabs.tsx`'s `HOTSPOT_DNS_NAME` docstring. Two further reasons
+not to attempt it: the fleet Let's Encrypt certificate's SANs are
+`wifi.wyfyguest.com`, `portal.wyfyguest.com`, `*.portal.wyfyguest.com` —
+`auth.` is not among them — and that certificate expires 2026-11-16 with
+nothing renewing it, the renewal pipeline never having migrated off Azure.
+
+What *was* genuinely missing is the walled garden: until 2026-09-07 the
+platform-rendered bootstrap allowed hop 1's hostname through and blocked
+hop 2's. See §2.2.2.
+
 ### 1.2 Neither screen has a device path, and the DNS screen says so
 
 The Portal screen has no Apply/Push/Sync button, no router selector, and no
@@ -246,11 +286,40 @@ platform constants and one is derived from the router's own LAN address.
 | P3 | `/ip hotspot profile hsprof1 dns-name=` | `wifi.wyfyguest.com` (`HOTSPOT_DNS_NAME`) | `RouterDetailTabs.tsx:1704`, `renderers.py:706` |
 | P4 | `/ip hotspot profile hsprof1 login-by=` | `http-pap`, or `https,http-pap` **iff** the profile is already bound to the fleet certificate | `HOTSPOT_LOGIN_BY`, `RouterDetailTabs.tsx:6381-6384` |
 
-Plus one optional discovery hint, RFC 8910/8908:
-`/ip dhcp-server option code=114` pointing at
-`GET /captive-portal/rfc8908?portal_url=http://wifi.wyfyguest.com/`
-(`RouterDetailTabs.tsx:6296`, served by
-`captive_portal/router.py:captive_portal_api`).
+**There is no longer a fifth object.** The generator used to add one
+optional discovery hint — `/ip dhcp-server option code=114` pointing at
+`GET /captive-portal/rfc8908?portal_url=http://wifi.wyfyguest.com/`, served
+by `captive_portal/router.py:captive_portal_api`. Both halves are gone: the
+generator now *removes* that option instead of writing it (frontend #236),
+the platform can remove it from a device over the API (#175), and the cloud
+endpoint has been retired outright.
+
+RFC 8910's option does not carry "the portal's address" — it carries the
+address of an RFC 8908 API that a capport-aware OS **re-polls to learn
+whether it is still captive**. The cloud endpoint answered a hardcoded
+`captive: true` and could never answer anything else: RFC 8908 §4 requires
+the API server to see the same client address the enforcement device sees,
+and every guest reaches the cloud from behind the venue's NAT as one source
+IP. So advertising it replaced a heuristic that is correct in both
+directions (probe interception) with an authority that is correct in one,
+and a guest who signed in successfully kept the portal sheet open for ever.
+
+Measured, not argued: 856 requests over 27 Aug – 6 Sep, from four public
+IPs, all of them captive-detection agents — 363 from Apple's
+`CaptiveNetworkSupport`, 493 from a headless `Chrome/60` detector. Neither
+UA ever requested any other path on this platform, so for those devices
+this document was the *only* thing they consulted, and it told all 856 of
+them they were still captive.
+
+**The replacement is RouterOS's own.** MikroTik serves an RFC 8908 document
+at `https://<dns-name-of-hotspot>/api` (the `api.json` file in `/file`),
+whose template answers `"captive": $(if logged-in == 'yes')false$(else)true`
+— per-client and correct in both directions, from the box that is the
+enforcement device. It is emitted automatically, but only on a router that
+has both a `dns-name` and a valid certificate, which is the condition §4
+tracks. Where those are absent the device falls back to probe interception,
+which RFC 8908 §5 prescribes for exactly this case ("proceed to interact
+with the captive network as if the API capabilities were not present").
 
 **P1 and P2 are one feature and must be pushed together.** This is the most
 expensive lesson in the whole repo and it is recorded twice, live:
@@ -312,8 +381,8 @@ narrower than reality; its deliberately permissive validation happens to be
 correct anyway. **`path=` should not be relied on for HTTPS** — it cannot be
 visible inside TLS, and the docs never claim it works there.
 
-**The backend renderer has exactly this bug today.**
-`network_config/renderers.py::_portal_walled_garden_hosts` returns
+**The backend renderer had exactly this bug. Fixed 2026-09-07.**
+`network_config/renderers.py::_portal_walled_garden_hosts` used to return
 
 ```python
 hosts = [HOTSPOT_DNS_NAME, f"*.{HOTSPOT_DNS_NAME}"]   # wifi.wyfyguest.com
@@ -321,14 +390,47 @@ if api_host and api_host not in hosts:
     hosts.append(api_host)                             # api.wyfyguest.com
 ```
 
-— which walls in the *redirect* hostname and the *API* host, emits only
-host-based rows, and never mentions `auth.wyfyguest.com`, the host the guest
+— which walled in the *redirect* hostname and the *API* host, emitted only
+host-based rows, and never mentioned `auth.wyfyguest.com`, the host the guest
 is actually sent to, nor any `walled-garden ip` row. `HOTSPOT_DNS_NAME`'s
 own frontend docstring is explicit that these two names are deliberately
 different and that conflating them broke guests live
-(`RouterDetailTabs.tsx:1674-1703`). Fixing `_portal_walled_garden_hosts` is
-a prerequisite for this design, not part of it, and it is a defect worth
-raising on its own.
+(`RouterDetailTabs.tsx:1674-1703`).
+
+It now returns `GUEST_PORTAL_HOST` alongside those, and
+`render_hotspot_walled_garden` emits both menus:
+
+| | rows | source |
+|---|---|---|
+| host-based | `wifi.wyfyguest.com`, `*.wifi.wyfyguest.com`, `auth.wyfyguest.com`, `<api host>` | `_portal_walled_garden_hosts` |
+| address-based | `auth.wyfyguest.com` → `cloudguest-portal-https`, `<api host>` → `cloudguest-api-https` | `_portal_https_walled_garden_targets` |
+
+Three rules the implementation is built on, all of them consequences of §2.2.2
+above rather than choices:
+
+* **`HOTSPOT_DNS_NAME` gets no address-based row, deliberately.** On the
+  router that name resolves to the router's own LAN address, so an
+  `action=accept` on it would bypass hotspot authentication for everything
+  the router itself listens on, for every unauthenticated guest. Its
+  host-based row is both sufficient and correct — that page is plain HTTP by
+  design (`login-by=http-pap`), the one case the host menu really does cover.
+* **The `:resolve` stays on the device**, and the address-based rows
+  add-or-`set` rather than add-only: the row's whole content is an address
+  that moves whenever the platform's A record moves, and this fleet has
+  already paid for a generate-time literal once (`20.219.72.235`, baked into
+  64 routers that then needed physical visits).
+* **`cloudguest-portal-https` is byte-equal with the Master console's own
+  comment**, so the bootstrap and a pasted setup script adopt each other's
+  row with a converging `set` instead of stacking a second accept beside a
+  working one — the same rule `RADIUS_CLIENT_COMMENT` states for the paired
+  device writer.
+
+Paired with `render_portal_https_walled_garden_verification`, which re-reads
+the device's own table and `:error`s if the address-based row is absent. On
+the on-site path only: the remote path re-provisions a live, already-serving
+router, where aborting over a walled-garden row is worse than the missing
+row — the same call `render_guest_data_path_verification` is left out of that
+path for.
 
 #### 2.2.3 `login-by`: read before you write, never write `ssl-certificate`
 
@@ -463,9 +565,13 @@ was implemented, you will have to use 'Reset HTML' function, or manually
 add/edit the api.json file."* The `api.json` file is served at
 `https://<dns-name-of-hotspot>/api` **when DNS configuration and valid SSL
 certificates exist** — so on a router without the fleet certificate (i.e. all
-but one, §4), the RFC 7710 endpoint is not available and the DHCP option-114
-hint pointing at the platform's own `/captive-portal/rfc8908` is doing real
-work rather than duplicating RouterOS's.
+but one, §4), the RFC 7710 endpoint is not available. **That is now an
+argument for "Reset HTML" and a certificate, not for the platform serving
+the document itself:** the cloud endpoint that used to fill this gap has
+been retired (§2.2.2), because an API server behind the venue's NAT cannot
+identify the client (RFC 8908 §4) and could only ever answer `captive:
+true`. A router that cannot serve `/api` should fall back to probe
+interception, which RFC 8908 §5 prescribes.
 
 **(d) What a real upload path would cost, if it is ever wanted.**
 `renderers.py:1383-1394` already scopes it honestly and declines to ship it:
@@ -604,10 +710,20 @@ Two documented details do bear on the design regardless:
   therefore rests entirely on the plain-HTTP probe path and on the RFC 7710
   DHCP option — and that option is only emitted when the router has both a
   `dns-name` **and** a valid certificate, which all but one fleet router
-  lacks (§4). This is why the platform's own option-114 hint exists and is
-  doing real work rather than duplicating RouterOS. It is also the cleanest
-  explanation available for the two live walled-garden observations in
-  §2.2.2, and it is invisible to anyone reading only the prose docs.
+  lacks (§4). It is the cleanest explanation available for the two live
+  walled-garden observations in §2.2.2, and it is invisible to anyone
+  reading only the prose docs.
+
+  **This paragraph used to end "which is why the platform's own option-114
+  hint exists and is doing real work rather than duplicating RouterOS."
+  That conclusion has been reversed and the hint is gone** — see §2.2.2.
+  The premise was sound and the inference was not: a cloud-hosted RFC 8908
+  API cannot identify the client behind the venue's NAT (RFC 8908 §4), so
+  it could only ever answer `captive: true`, which is worse than answering
+  nothing. A router without the certificate should fall back to probe
+  interception (RFC 8908 §5), not be handed an authority that lies. Note
+  also that the router named in §4 as *having* the fleet certificate is the
+  one on which RouterOS's own `/api` document should already be live.
   **Never emit `https-redirect`** — a tool that does gets a hard error on
   7.5+.
 
@@ -1425,10 +1541,12 @@ Not part of the two adapters, but blocking them:
 
 1. `HOTSPOT_HTML_DIRECTORY` in `network_config/renderers.py:713` →
    `"hotspot"`. Today's value names a directory nothing creates.
-2. `_portal_walled_garden_hosts` must include the real portal host
+2. ~~`_portal_walled_garden_hosts` must include the real portal host
    (`auth.wyfyguest.com`, not just `wifi.wyfyguest.com` and the API host),
    and `render_hotspot_walled_garden` must emit `/ip hotspot walled-garden
-   ip` rows alongside the host-based ones.
+   ip` rows alongside the host-based ones.~~ **Done 2026-09-07** — see
+   §2.2.2. Both menus are emitted, with a verification line on the on-site
+   bootstrap that stops the script rather than reporting success.
 3. `read_only_reader.READ_ONLY_SECTION_PATHS` needs `("ip","dns","static")`
    and a `/file` listing section, or neither feature can reconcile.
 4. `collect_dns_config` should also collect the WAN DHCP client's

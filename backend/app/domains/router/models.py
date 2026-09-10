@@ -108,6 +108,63 @@ class Router(BaseModel):
     # RouterHealthStatus's module docstring.
     health_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
+    # ------------------------------------------------------------------
+    # Fast, alert-only reachability. Written ONLY by
+    # ``RouterService.sweep_router_reachability``; read by the Alert
+    # Engine's ALERT_TARGET_ROUTER_REACHABILITY branch. See
+    # ``enums.RouterReachabilityState`` for why this is a separate column
+    # rather than a faster ``status``/``last_seen_at`` threshold.
+    # ------------------------------------------------------------------
+
+    # NOTE ON THE INPUT SIGNAL, since it is deliberately NOT a column here:
+    # "last agent contact" is read from
+    # ``router_agent_credentials.last_used_at``, which
+    # ``app.domains.router_agent.dependencies.CurrentAgent`` already writes
+    # on EVERY device-authenticated request -- including the
+    # ``GET /agent/authorized-macs`` poll the agent scheduler runs every 60
+    # seconds, five times more often than the 5-minute heartbeat. That
+    # column is already ticking on the real fleet today; the platform just
+    # never read it as a liveness signal. Adding a duplicate column here
+    # would have been a second copy of a fact that already exists.
+    #
+    # It is emphatically not ``last_seen_at``. ``last_seen_at`` means "last
+    # heartbeat" and is what ``compute_lifecycle_stage``,
+    # ``compute_internet_availability`` and the frontend's
+    # ``location-liveness`` module all measure staleness against at
+    # ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES``; teaching a second writer
+    # to make it five times fresher would silently re-time every one of
+    # them -- exactly the drift ``sweep_stale_heartbeats``'s own docstring
+    # warns about.
+
+    # DELIBERATELY NOT EXPOSED IN ANY API RESPONSE. See
+    # ``app.domains.router.schemas`` -- no ``RouterResponse`` field carries
+    # this, and none should. The moment a screen can render it, the
+    # platform has two answers to "is this router up?" and they disagree
+    # for up to thirteen minutes, which is the precise failure the shared
+    # ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`` exists to prevent. This is
+    # an input to an alert, not a second status.
+    #
+    # ``RouterReachabilityState`` value, or None for "never evaluated".
+    # None and "unknown" both mean the same thing to the evaluator (never
+    # alertable); None simply distinguishes rows the sweep has not reached
+    # yet from ones it has looked at and cannot judge.
+    reachability_state: Mapped[str | None] = mapped_column(
+        String(20), nullable=True
+    )
+    reachability_state_changed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Debounce counters. Persisted rather than held in Redis on purpose: a
+    # worker restart must not reset a router's way through the debounce and
+    # start the two-minute clock over, and an operator diagnosing "why did
+    # this not fire" must be able to SELECT the answer.
+    reachability_consecutive_misses: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, server_default="0"
+    )
+    reachability_consecutive_hits: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, server_default="0"
+    )
+
     # RouterOS API connection credentials. ``api_username`` is stored in the
     # clear (a connection identifier, not a secret on its own -- the same
     # posture this codebase already takes for e.g. Organization.contact_email);

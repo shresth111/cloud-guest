@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
@@ -90,6 +91,15 @@ class AuditLogWriter(Protocol):
     shape every other domain's service defines for itself."""
 
     async def create_audit_log_entry(self, **fields: object) -> object: ...
+
+
+@dataclass(frozen=True, slots=True)
+class OverviewCounts:
+    """The three counts ``GET /dashboard`` puts at the top of the page."""
+
+    total_organizations: int
+    total_locations: int
+    total_routers: int
 
 
 def _reduce_router_counts(rows: list[tuple[str, int]]) -> tuple[int, int, int]:
@@ -278,6 +288,72 @@ class DashboardService:
     # ========================================================================
     # Organization Dashboard
     # ========================================================================
+
+    async def get_overview_counts(
+        self, user_id: uuid.UUID, *, organization_id: uuid.UUID | None
+    ) -> OverviewCounts:
+        """The three headline counts on ``GET /dashboard``, honestly scoped.
+
+        These tiles used to be platform-wide unconditionally: ``_get_overview``
+        in the dashboard domain accepted an ``organization_id``, threaded it
+        through two call layers, and then called
+        :meth:`get_super_admin_dashboard`, which takes no organization at all.
+        So a platform admin who *had* selected a venue -- who had sent
+        ``X-Organization-Id`` and every other tile on the page had honoured it
+        -- still read "14 organizations, every location, every router" and had
+        no way to tell those three numbers apart from the rest.
+
+        A blended count is the worst version of this bug. A blended *list* at
+        least shows rows belonging to somebody else; a blended count shows one
+        number that looks exactly like the right one.
+
+        With an organization selected, ``total_organizations`` is that
+        organization plus its children if it is an MSP -- the same set
+        :meth:`get_organization_dashboard` rolls up, so the two screens agree.
+        """
+        scope = await self.scope_resolver.resolve(user_id)
+
+        if organization_id is None:
+            scope.require_global()
+            router_rows = await self.repository.count_routers_by_status(
+                organization_id=None, location_id=None
+            )
+            _, _, total_routers = _reduce_router_counts(router_rows)
+            return OverviewCounts(
+                total_organizations=(
+                    await self.repository.count_platform_organizations()
+                ),
+                total_locations=await self.repository.count_platform_locations(),
+                total_routers=total_routers,
+            )
+
+        scope.require_organization(organization_id)
+        organization = await self.organization_lookup.get_organization(organization_id)
+        children = (
+            await self.organization_lookup.list_children(organization_id)
+            if organization.is_msp()
+            else []
+        )
+        organization_ids = [organization_id, *(child.id for child in children)]
+
+        total_locations = 0
+        total_routers = 0
+        for org_id in organization_ids:
+            location_ids = (
+                await self.repository.list_active_location_ids_for_organization(org_id)
+            )
+            total_locations += len(location_ids)
+            router_rows = await self.repository.count_routers_by_status(
+                organization_id=org_id, location_id=None
+            )
+            _, _, org_routers = _reduce_router_counts(router_rows)
+            total_routers += org_routers
+
+        return OverviewCounts(
+            total_organizations=len(organization_ids),
+            total_locations=total_locations,
+            total_routers=total_routers,
+        )
 
     async def get_organization_dashboard(
         self, user_id: uuid.UUID, organization_id: uuid.UUID

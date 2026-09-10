@@ -32,6 +32,7 @@ from app.domains.captive_portal.constants import (
     DEFAULT_BACKGROUND_FOCAL_X,
     DEFAULT_BACKGROUND_FOCAL_Y,
     DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
+    DEFAULT_FEEDBACK_DWELL_MINUTES,
     DEFAULT_GUEST_FONT_CHOICE,
     POST_LOGIN_HTML_MAX_BYTES,
     SPLASH_HEADLINE_MAX_LENGTH,
@@ -49,16 +50,19 @@ from app.domains.captive_portal.exceptions import (
     InvalidGuestFontChoiceError,
     InvalidHexColorError,
     InvalidPortalContentSourceError,
+    InvalidUserPortalUrlError,
     MissingPortalResolutionParamsError,
     PostLoginHtmlTooLargeError,
     PoweredByAttributionNotEntitledError,
     SplashTextTooLongError,
+    WhitelistOnlyRequiresLocationError,
 )
 from app.domains.captive_portal.html_sanitizer import (
     sanitize_post_login_html,
     sanitize_stylesheet,
 )
 from app.domains.captive_portal.models import CaptivePortalConfig
+from app.domains.captive_portal.router import _config_response
 from app.domains.captive_portal.service import (
     CaptivePortalService,
     PoweredByAttributionResetService,
@@ -72,12 +76,15 @@ from app.domains.captive_portal.validators import (
     validate_hex_color,
     validate_single_content_source,
     validate_splash_text_length,
+    validate_user_portal_url,
+    validate_whitelist_only_scope,
 )
 from app.domains.location.exceptions import (
     CrossOrganizationLocationAccessError,
     LocationNotFoundError,
 )
 from app.domains.location.models import Location
+from app.domains.network_config.renderers import HOTSPOT_DNS_NAME
 from app.domains.organization.enums import OrganizationType
 from app.domains.organization.exceptions import OrganizationNotFoundError
 from app.domains.organization.models import Organization
@@ -468,13 +475,24 @@ async def _create_config(
     social_login_providers: list[str] | None = None,
     splash_headline: str | None = None,
     splash_welcome_message: str | None = None,
-    # True (the real, standard "OTP once, then a saved password" baseline
-    # -- see CaptivePortalConfig.username_password_enabled's own
-    # docstring) mirrors this helper's own otp_sms_enabled/voucher_enabled
-    # defaults being the actually-enabled-by-default methods.
-    username_password_enabled: bool = True,
+    # False as of 2026-09-07, mirroring the real column/schema default --
+    # password sign-in is being retired from the guest portal (see
+    # CaptivePortalConfig's module docstring, "Retiring password sign-in",
+    # and tests/unit/test_guest_password_login_retirement.py). This helper
+    # passes the value through explicitly, so it never exercised the real
+    # default either way; it is aligned here so a config built by these
+    # tests looks like one a real location would get.
+    username_password_enabled: bool = False,
     pin_login_enabled: bool = False,
     post_login_html: str | None = None,
+    whitelist_only_enabled: bool = False,
+    whitelist_only_denied_message: str | None = None,
+    collect_guest_name: bool = False,
+    collect_guest_email: bool = False,
+    review_card_enabled: bool = False,
+    review_url: str | None = None,
+    guest_feedback_enabled: bool = False,
+    feedback_dwell_minutes: int = DEFAULT_FEEDBACK_DWELL_MINUTES,
     requesting_organization_id: uuid.UUID | None = None,
     organization_id: uuid.UUID | None = None,
 ) -> CaptivePortalConfig:
@@ -517,6 +535,14 @@ async def _create_config(
         social_login_enabled=social_login_enabled,
         social_login_providers=social_login_providers or [],
         post_login_html=post_login_html,
+        whitelist_only_enabled=whitelist_only_enabled,
+        whitelist_only_denied_message=whitelist_only_denied_message,
+        collect_guest_name=collect_guest_name,
+        collect_guest_email=collect_guest_email,
+        review_card_enabled=review_card_enabled,
+        review_url=review_url,
+        guest_feedback_enabled=guest_feedback_enabled,
+        feedback_dwell_minutes=feedback_dwell_minutes,
     )
 
 
@@ -714,6 +740,446 @@ class TestSingleDefaultEnforcement:
         # Legal combinations never raise.
         validate_default_scope(is_default=True, location_id=None)
         validate_default_scope(is_default=False, location_id=uuid.uuid4())
+
+
+# ============================================================================
+# Whitelist-only mode (schema + guardrails; the gate itself ships separately)
+# ============================================================================
+
+
+class TestWhitelistOnlyScope:
+    """``whitelist_only_enabled`` is a **per-property** switch, and the API
+    refuses to let it be anything else.
+
+    A config with ``location_id IS NULL`` is the organization's default,
+    inherited by every location that has no override of its own. The flag
+    set there would put every property in the organization into
+    whitelist-only mode from one toggle -- every guest without an Always
+    Allowed entry refused, everywhere, with nothing on the screen that
+    turned it on to say how far it reached. There is no legitimate use for
+    that, so it is refused at the write path rather than guarded in the
+    UI, because the UI is not the only caller.
+    """
+
+    async def test_defaults_off_and_unset(self) -> None:
+        """The default is what makes this feature a no-op for every config
+        that already exists -- worth an assertion rather than a comment."""
+        fx = make_service()
+        config = await _create_config(fx)
+        assert config.whitelist_only_enabled is False
+        assert config.whitelist_only_denied_message is None
+
+    async def test_enabled_on_a_location_config_is_allowed(self) -> None:
+        fx = make_service()
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        config = await _create_config(
+            fx,
+            location_id=location.id,
+            whitelist_only_enabled=True,
+            whitelist_only_denied_message="Ask reception to add your number.",
+        )
+        assert config.whitelist_only_enabled is True
+        assert config.whitelist_only_denied_message == (
+            "Ask reception to add your number."
+        )
+
+    async def test_enabled_on_the_org_default_rejected_on_create(self) -> None:
+        fx = make_service()
+        with pytest.raises(WhitelistOnlyRequiresLocationError):
+            await _create_config(fx, location_id=None, whitelist_only_enabled=True)
+
+    async def test_enabled_on_the_org_default_rejected_on_update(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, location_id=None, is_default=True)
+        with pytest.raises(WhitelistOnlyRequiresLocationError):
+            await fx.service.update_config(
+                actor_user_id=uuid.uuid4(),
+                config_id=config.id,
+                requesting_organization_id=fx.organization.id,
+                data={"whitelist_only_enabled": True},
+            )
+
+    async def test_disabling_on_the_org_default_is_always_allowed(self) -> None:
+        """``False`` is the column's own default and the value every
+        existing row carries, so writing it can never widen anything. A
+        guard that rejected it would make the org default's own portal
+        form unsaveable, since the dashboard PUTs its whole form."""
+        fx = make_service()
+        config = await _create_config(fx, location_id=None, is_default=True)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"whitelist_only_enabled": False},
+        )
+        assert updated.whitelist_only_enabled is False
+
+    async def test_the_denied_message_alone_is_not_gated(self) -> None:
+        """Copy is not enforcement. A venue may write (or clear) its
+        refusal wording on any config; only the switch is scoped."""
+        fx = make_service()
+        config = await _create_config(fx, location_id=None, is_default=True)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"whitelist_only_denied_message": "Ask the front desk."},
+        )
+        assert updated.whitelist_only_denied_message == "Ask the front desk."
+
+    async def test_an_unrelated_update_to_an_enabled_location_config_still_saves(
+        self,
+    ) -> None:
+        """The merge is against the **stored** ``location_id``/flag, not
+        against the payload. A PUT that never mentions the flag must not
+        be able to trip the guard on a config that legitimately has it on
+        -- otherwise a whitelist-only property could not change its logo.
+        """
+        fx = make_service()
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        config = await _create_config(
+            fx, location_id=location.id, whitelist_only_enabled=True
+        )
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"primary_color": "#000000"},
+        )
+        assert updated.whitelist_only_enabled is True
+
+    async def test_an_explicit_null_is_treated_as_omitted(self) -> None:
+        """``whitelist_only_enabled`` is NOT NULL, and the update request
+        types it ``bool | None`` because ``None`` is how every field on
+        that schema spells "leave it alone". ``exclude_unset=True`` keeps
+        an explicit JSON ``null`` though, so without normalizing it the
+        write reaches the database and 500s on the constraint."""
+        fx = make_service()
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        config = await _create_config(
+            fx, location_id=location.id, whitelist_only_enabled=True
+        )
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"whitelist_only_enabled": None},
+        )
+        assert updated.whitelist_only_enabled is True
+
+    async def test_validate_whitelist_only_scope_directly(self) -> None:
+        with pytest.raises(WhitelistOnlyRequiresLocationError):
+            validate_whitelist_only_scope(
+                whitelist_only_enabled=True, location_id=None
+            )
+        # Legal combinations never raise.
+        validate_whitelist_only_scope(
+            whitelist_only_enabled=True, location_id=uuid.uuid4()
+        )
+        validate_whitelist_only_scope(whitelist_only_enabled=False, location_id=None)
+        validate_whitelist_only_scope(
+            whitelist_only_enabled=False, location_id=uuid.uuid4()
+        )
+
+
+class TestExplicitNullOnNotNullBooleanToggles:
+    """Every NOT NULL boolean on ``CaptivePortalConfig`` is typed
+    ``bool | None`` on the update request because ``None`` is how "leave
+    it alone" is spelled on every field of that schema -- and an explicit
+    JSON ``null`` survives ``model_dump(exclude_unset=True)``. Without
+    normalization each one would be assigned straight onto its NOT NULL
+    column by ``GenericRepository.update`` and 500 on the constraint.
+    ``test_an_explicit_null_is_treated_as_omitted`` above documents the
+    original ``whitelist_only_enabled`` instance; this class pins the
+    uniform sweep across every sibling toggle (see
+    ``service._NOT_NULL_BOOLEAN_UPDATE_FIELDS``). Each test flips a toggle
+    on first, then PUTs an explicit null and asserts the stored value is
+    untouched -- the "200, no change" contract."""
+
+    async def test_username_password_enabled_null_is_treated_as_omitted(
+        self,
+    ) -> None:
+        fx = make_service()
+        config = await _create_config(fx, username_password_enabled=True)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"username_password_enabled": None},
+        )
+        assert updated.username_password_enabled is True
+
+    async def test_pin_login_enabled_null_is_treated_as_omitted(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx, pin_login_enabled=True)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"pin_login_enabled": None},
+        )
+        assert updated.pin_login_enabled is True
+
+    async def test_otp_email_enabled_null_is_treated_as_omitted(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        config = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"otp_email_enabled": True},
+        )
+        assert config.otp_email_enabled is True
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"otp_email_enabled": None},
+        )
+        assert updated.otp_email_enabled is True
+
+    async def test_business_hours_enabled_null_is_treated_as_omitted(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        config = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"business_hours_enabled": True},
+        )
+        assert config.business_hours_enabled is True
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"business_hours_enabled": None},
+        )
+        assert updated.business_hours_enabled is True
+
+    async def test_voucher_enabled_null_is_treated_as_omitted(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        assert config.voucher_enabled is True
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"voucher_enabled": None},
+        )
+        assert updated.voucher_enabled is True
+
+    async def test_is_active_and_is_default_null_leave_the_row_untouched(self) -> None:
+        """``is_active``/``is_default`` are booleans too, and had the same
+        latent 500 before the sweep -- a null reaching the NOT NULL column
+        failed the constraint exactly like any toggle. An explicit null on
+        either must be a no-change PUT, not a deactivate/un-default."""
+        fx = make_service()
+        config = await _create_config(fx, is_active=True, is_default=True)
+        updated = await fx.service.update_config(
+            actor_user_id=uuid.uuid4(),
+            config_id=config.id,
+            requesting_organization_id=fx.organization.id,
+            data={"is_active": None, "is_default": None},
+        )
+        assert updated.is_active is True
+        assert updated.is_default is True
+
+    def test_set_covers_every_not_null_boolean_column(self) -> None:
+        """The whole point of the sweep: a NOT NULL boolean added to the
+        model but not to ``_NOT_NULL_BOOLEAN_UPDATE_FIELDS`` would be a
+        fresh instance of the exact latent 500 this class exists for.
+        ``is_deleted`` is the one NOT NULL boolean on the table that is
+        not an update toggle -- it is protected by ``GenericRepository``
+        and never reachable through the update request."""
+        from sqlalchemy import Boolean
+
+        from app.domains.captive_portal.service import _NOT_NULL_BOOLEAN_UPDATE_FIELDS
+
+        not_null_booleans = {
+            name
+            for name, column in CaptivePortalConfig.__table__.columns.items()
+            if isinstance(column.type, Boolean) and not column.nullable
+        }
+        assert not_null_booleans - {"is_deleted"} == set(
+            _NOT_NULL_BOOLEAN_UPDATE_FIELDS
+        )
+
+
+class TestContentImage:
+    """``set_content_image``/``clear_content_image``/``get_content_image_key``
+    -- the service half of the per-venue "Before sign-in: show a picture"
+    upload (the object-storage interaction itself lives in the router)."""
+
+    async def test_set_content_image_records_key_and_url(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        updated = await fx.service.set_content_image(
+            config.id,
+            content_image_key="captive_portal/org/cfg/img.png",
+            content_image_url="https://api.example/api/v1/captive-portal-configs/x/content-image/public",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+        )
+        assert updated.content_image_key == "captive_portal/org/cfg/img.png"
+        assert updated.content_image_url is not None
+        assert (
+            await fx.service.get_content_image_key(config.id)
+            == "captive_portal/org/cfg/img.png"
+        )
+
+    async def test_clear_content_image_nulls_key_and_url(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        await fx.service.set_content_image(
+            config.id,
+            content_image_key="captive_portal/org/cfg/img.png",
+            content_image_url="https://api.example/...",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+        )
+        updated = await fx.service.clear_content_image(
+            config.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+        )
+        assert updated.content_image_key is None
+        assert updated.content_image_url is None
+        assert await fx.service.get_content_image_key(config.id) is None
+
+    async def test_content_image_writes_are_audited(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        await fx.service.set_content_image(
+            config.id,
+            content_image_key="k",
+            content_image_url="https://u",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+        )
+        actions = [entry["action"] for entry in fx.audit_writer.entries]
+        assert "captive_portal_config_updated" in actions
+
+    async def test_get_content_image_key_none_for_missing_config(self) -> None:
+        fx = make_service()
+        assert await fx.service.get_content_image_key(uuid.uuid4()) is None
+
+    async def test_get_content_image_key_none_for_deleted_config(self) -> None:
+        fx = make_service()
+        config = await _create_config(fx)
+        await fx.repository.soft_delete_config(config)
+        assert await fx.service.get_content_image_key(config.id) is None
+
+    async def test_set_content_image_invalidates_resolve_cache(self) -> None:
+        fx = make_service(with_cache=True)
+        config = await _create_config(fx)
+        await fx.resolve_cache.set(  # type: ignore[union-attr]
+            fx.organization.id,
+            config.location_id,
+            {"name": "stale"},
+            index_organization_id=fx.organization.id,
+        )
+        await fx.service.set_content_image(
+            config.id,
+            content_image_key="k",
+            content_image_url="https://u",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=fx.organization.id,
+        )
+        assert (
+            await fx.resolve_cache.get(  # type: ignore[union-attr]
+                fx.organization.id, config.location_id
+            )
+            is None
+        )
+
+
+class TestWhitelistOnlyIsNotAnnouncedToGuests:
+    """``GET /captive-portal/resolve`` is fetched by an unauthenticated
+    guest device before any login. It must not report that the venue is
+    running an allowlist.
+
+    A guest can do nothing with that fact except learn it -- and anyone
+    who curls the endpoint learns which properties are running closed. The
+    guest finds out if and when they are refused, in the venue's own
+    words. That message therefore **does** ride along, on the identical
+    path ``business_hours_closed_message`` already takes.
+    """
+
+    async def test_the_flag_is_absent_from_the_guest_payload(self) -> None:
+        fx = make_service()
+        await _create_config(fx, name="Org default", is_default=True)
+
+        data = await _call_resolve_route(fx, None)
+
+        assert "whitelist_only_enabled" not in data
+
+    async def test_the_denied_message_does_reach_the_portal_runtime(self) -> None:
+        fx = make_service()
+        await _create_config(
+            fx,
+            name="Org default",
+            is_default=True,
+            whitelist_only_denied_message="Ask reception to add your number.",
+        )
+
+        data = await _call_resolve_route(fx, None)
+
+        assert data["whitelist_only_denied_message"] == (
+            "Ask reception to add your number."
+        )
+        # The pair it was modelled on is right there beside it, unchanged.
+        assert "business_hours_closed_message" in data
+
+    async def test_the_flag_cannot_be_serialized_back_in_by_force(self) -> None:
+        """The second, independent guard: even a caller that constructs
+        the resolved response with the flag explicitly set to True gets a
+        payload without it.
+
+        The route also pops the key, but a pop is one line a refactor can
+        drop. This asserts the property at the schema, where it survives
+        the route being rewritten -- and it is the one that holds for the
+        real `response_model` serialization FastAPI performs, which
+        `_call_resolve_route` (a direct function call) does not exercise.
+        """
+        from app.domains.captive_portal.schemas import (
+            ResolvedCaptivePortalConfigResponse,
+        )
+
+        fx = make_service()
+        config = await _create_config(fx, name="Org default", is_default=True)
+        _apply_column_defaults(config)
+        payload = _config_response(config).model_dump()
+        payload.pop("whitelist_only_enabled", None)
+
+        resolved = ResolvedCaptivePortalConfigResponse(
+            **payload,
+            whitelist_only_enabled=True,
+            resolved_via_location_override=False,
+            is_open_now=True,
+        )
+
+        assert "whitelist_only_enabled" not in resolved.model_dump()
+        assert "whitelist_only_enabled" not in resolved.model_dump_json()
+
+    async def test_admin_crud_does_read_the_flag_back(self) -> None:
+        """The dashboard has to be able to build a toggle against this,
+        so the admin-facing response keeps both fields -- the exclusion is
+        specific to the guest-facing resolve payload, not a decision to
+        hide the column from its own operator."""
+        fx = make_service()
+        location = fx.location_lookup.add(organization_id=fx.organization.id)
+        config = await _create_config(
+            fx,
+            location_id=location.id,
+            whitelist_only_enabled=True,
+            whitelist_only_denied_message="Ask reception.",
+        )
+        _apply_column_defaults(config)
+
+        payload = _config_response(config).model_dump()
+
+        assert payload["whitelist_only_enabled"] is True
+        assert payload["whitelist_only_denied_message"] == "Ask reception."
 
 
 # ============================================================================
@@ -1207,20 +1673,28 @@ class TestSocialLoginPlaceholder:
         assert config.social_login_enabled is False
         assert config.social_login_providers == []
 
-    async def test_username_password_enabled_by_default(self) -> None:
-        """The standard baseline every location gets: a guest verifies
-        once via OTP, sets a password right after, and signs in with
-        phone/email + password from then on -- real and on by default,
-        same as otp_sms_enabled/voucher_enabled (an admin can still turn
-        it off per location, e.g. an SMS-OTP-only kiosk)."""
+    async def test_username_password_disabled_by_default(self) -> None:
+        """Password sign-in used to be the standard baseline every
+        location got -- verify once via OTP, save a password, sign in with
+        phone/email + password from then on. It is being retired from the
+        guest portal, so a location created now does not get it, and a
+        returning guest at such a location does an OTP on every visit.
+
+        Existing rows are deliberately not migrated and the endpoint
+        deliberately stays in place behind this flag -- the whole rollout,
+        and the three separate defaults that have to agree for it to hold,
+        are in tests/unit/test_guest_password_login_retirement.py."""
         fx = make_service()
         config = await _create_config(fx)
-        assert config.username_password_enabled is True
-
-    async def test_username_password_can_be_disabled_per_location(self) -> None:
-        fx = make_service()
-        config = await _create_config(fx, username_password_enabled=False)
         assert config.username_password_enabled is False
+
+    async def test_username_password_can_still_be_enabled_per_location(self) -> None:
+        """The reversal is a single field an admin sets -- no migration,
+        no redeploy. A venue that wants the returning-guest shortcut back
+        can have it, and one that already has it keeps it."""
+        fx = make_service()
+        config = await _create_config(fx, username_password_enabled=True)
+        assert config.username_password_enabled is True
 
     async def test_no_provider_registry_validation_is_performed(self) -> None:
         """Any string is accepted as a provider slug -- there is no real
@@ -2076,7 +2550,7 @@ class TestResolveSingleFlight:
 
 
 class TestResolveCacheKeyVersion:
-    def test_cache_key_is_v6(self) -> None:
+    def test_cache_key_is_v7(self) -> None:
         """Spec §0.3: the version must be bumped in the same change that
         changes the cached field set. Skipping it makes every payload
         written by the previous build raise KeyError out of the
@@ -2084,16 +2558,35 @@ class TestResolveCacheKeyVersion:
         joining WiFi until the TTL expires.
 
         v6 is ``post_login_html``, the venue's own post-sign-in page,
-        joining ``_CACHED_CONFIG_SCALAR_FIELDS``."""
+        joining ``_CACHED_CONFIG_SCALAR_FIELDS``. v7 is the per-property
+        whitelist-only pair (``whitelist_only_enabled`` /
+        ``whitelist_only_denied_message``) joining the same tuple -- the
+        bump is required even though that feature ships dark, because the
+        KeyError comes from deserializing a pre-deploy payload, not from
+        anything reading the new fields. v8 is the post-connect ask
+        columns -- ``collect_guest_name``, ``collect_guest_email``,
+        ``review_card_enabled``, ``review_url``, ``guest_feedback_enabled``
+        and ``feedback_dwell_minutes`` -- joining it again.
+
+        Two changes claimed v7 independently, in parallel worktrees. Had
+        both landed spelling it v7, the second would have served a new
+        field set under a key the first had already warmed. See
+        ``cache.py``'s own comment: the number versions the SHAPE of that
+        tuple, against main, not against the branch it was cut from."""
         from app.domains.captive_portal.cache import _CACHE_KEY_TEMPLATE
 
         key = _CACHE_KEY_TEMPLATE.format(organization_id="org", location_id="loc")
-        assert key == "captive_portal:resolve:v6:org:loc"
+        assert key == "captive_portal:resolve:v8:org:loc"
 
     def test_org_index_key_is_versioned_in_lockstep_with_the_payload_key(self) -> None:
         """The index names payload keys. Left at an older version it
         would fan a delete out to keys nothing reads anymore, silently
-        doing nothing -- so its version must move with the payload's."""
+        doing nothing -- so its version must move with the payload's.
+
+        Asserts the two are EQUAL rather than pinning a literal. The
+        literal belongs in the one test that is about a specific bump;
+        here it only meant that every bump failed two tests, one of them
+        for a reason that had nothing to do with what the test protects."""
         from app.domains.captive_portal.cache import (
             _CACHE_KEY_TEMPLATE,
             _ORG_INDEX_KEY_TEMPLATE,
@@ -2101,7 +2594,7 @@ class TestResolveCacheKeyVersion:
 
         payload_version = _CACHE_KEY_TEMPLATE.split(":")[2]
         index_version = _ORG_INDEX_KEY_TEMPLATE.split(":")[2]
-        assert payload_version == index_version == "v6"
+        assert payload_version == index_version
 
     def test_a_payload_from_the_previous_key_version_would_raise(self) -> None:
         """The mechanism §0.3 is actually about, asserted rather than
@@ -3496,3 +3989,117 @@ class TestPostLoginHtmlServiceWiring:
             organization_id=fx.organization.id, location_id=None
         )
         assert second.config.post_login_html == "<p>Welcome online</p>"
+
+
+class TestRfc8908UserPortalUrl:
+    """``portal_url`` was reflected into a document a conforming OS opens by
+    itself off a DHCP lease, so the allowlist here is a security boundary
+    rather than input hygiene -- see ``validate_user_portal_url``.
+
+    **The endpoint this guarded is gone** (the RFC 8908 route was retired
+    once the Master Console generator stopped advertising it), so
+    ``validate_user_portal_url`` currently has no production caller. Kept
+    with its tests rather than deleted in the same change: it is the vetted
+    allowlist for any future per-router ``user-portal-url``, and removing a
+    security boundary is a separate review from removing a dead route. If
+    nothing has claimed it by the time the fleet is swept, delete both.
+
+    The accept cases pin the *rebuilt* value, not merely a 200: the whole
+    design is that the caller's bytes never reach the response, and a test
+    that only asserted "no exception" would pass just as happily against a
+    check-then-reflect implementation.
+    """
+
+    def test_accepts_the_bare_hotspot_name_and_canonicalises_it(self) -> None:
+        assert (
+            validate_user_portal_url(f"http://{HOTSPOT_DNS_NAME}/")
+            == f"http://{HOTSPOT_DNS_NAME}/"
+        )
+
+    def test_accepts_the_per_vlan_name_render_vlan_hotspot_emits(self) -> None:
+        """``_render_vlan_hotspot`` renders ``vlan{id}.`` + the bare name --
+        the one subdomain shape this platform actually produces."""
+        assert (
+            validate_user_portal_url(f"http://vlan100.{HOTSPOT_DNS_NAME}/")
+            == f"http://vlan100.{HOTSPOT_DNS_NAME}/"
+        )
+
+    @pytest.mark.parametrize(
+        "supplied",
+        [
+            f"http://{HOTSPOT_DNS_NAME}",
+            f"http://{HOTSPOT_DNS_NAME}/login",
+            f"http://{HOTSPOT_DNS_NAME}/?next=%2Fevil",
+            f"http://{HOTSPOT_DNS_NAME}/#frag",
+            f"http://{HOTSPOT_DNS_NAME}.",
+            f"http://{HOTSPOT_DNS_NAME.upper()}/",
+            f"http://{HOTSPOT_DNS_NAME}:80/",
+        ],
+    )
+    def test_rebuilds_rather_than_reflecting(self, supplied: str) -> None:
+        """Everything that is not the hostname is discarded, not sanitised.
+        A path or query on our own hotspot is harmless in itself; dropping
+        it is what removes the whole class of parser-disagreement attacks
+        rather than playing whack-a-mole with encodings."""
+        assert validate_user_portal_url(supplied) == f"http://{HOTSPOT_DNS_NAME}/"
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "http://evil.example/",
+            # Userinfo: the classic "the real host is after the @".
+            f"http://{HOTSPOT_DNS_NAME}@evil.example/",
+            f"http://user:pass@{HOTSPOT_DNS_NAME}/",
+            # Suffix confusion -- endswith() on the bare name without the
+            # dot separator would accept this.
+            f"http://evil{HOTSPOT_DNS_NAME}/",
+            f"http://{HOTSPOT_DNS_NAME}.evil.example/",
+            # Backslash: WHATWG parsers treat it as a path separator and
+            # resolve the host as evil.example; Python's urlsplit does not.
+            f"http://{HOTSPOT_DNS_NAME}\\@evil.example/",
+            f"http://{HOTSPOT_DNS_NAME}\\.evil.example/",
+            # Scheme: https is not merely unsafe here, it is wrong -- the
+            # hotspot has no certificate a guest device trusts.
+            f"https://{HOTSPOT_DNS_NAME}/",
+            f"javascript:alert(1)//{HOTSPOT_DNS_NAME}",
+            f"data:text/html,<h1>{HOTSPOT_DNS_NAME}",
+            f"//{HOTSPOT_DNS_NAME}/",
+            # Non-default port: nothing this platform emits.
+            f"http://{HOTSPOT_DNS_NAME}:8080/",
+            f"http://{HOTSPOT_DNS_NAME}:notaport/",
+            # Whitespace and controls: stripped by some parsers, kept by
+            # others, emitted by none of ours.
+            f"http://{HOTSPOT_DNS_NAME}/ evil",
+            f"http://{HOTSPOT_DNS_NAME}\t/",
+            f"http://\n{HOTSPOT_DNS_NAME}/",
+            # Deeper than one label -- not a name this platform can render.
+            f"http://a.b.{HOTSPOT_DNS_NAME}/",
+            "",
+            "http://",
+        ],
+    )
+    def test_refuses_everything_else(self, hostile: str) -> None:
+        with pytest.raises(InvalidUserPortalUrlError):
+            validate_user_portal_url(hostile)
+
+    def test_the_error_does_not_echo_the_offending_value(self) -> None:
+        """The endpoint is unauthenticated, so its error message is the one
+        string an attacker can reliably make the platform emit. Echoing
+        their input into it would be a smaller copy of the reflection this
+        validator exists to close."""
+        marker = "canary-do-not-echo.example"
+        with pytest.raises(InvalidUserPortalUrlError) as excinfo:
+            validate_user_portal_url(f"http://{marker}/")
+        assert marker not in str(excinfo.value)
+
+    def test_allowlist_tracks_the_renderer_rather_than_a_second_literal(
+        self,
+    ) -> None:
+        """The name a guest may be *sent* to and the name
+        ``render_hotspot_walled_garden`` lets them *reach* have to be one
+        set. This asserts the validator reads the renderer's constant, so
+        changing ``HOTSPOT_DNS_NAME`` cannot leave the two disagreeing."""
+        assert validate_user_portal_url(f"http://{HOTSPOT_DNS_NAME}/").endswith(
+            f"{HOTSPOT_DNS_NAME}/"
+        )
+

@@ -113,12 +113,44 @@ placeholder, written before the ``guest`` module existed to authenticate
 against -- it no longer is. ``app.domains.guest.service.GuestService
 .login_via_password``/``POST /guest/login/password`` is a real, working
 login path today, and this flag genuinely gates it (see
-``GuestService._resolve_and_validate_method``). It defaults to ``True``
--- the standard baseline every location gets (OTP once, then a saved
-password from then on) -- mirroring
-``app.domains.location.provisioning_service._resolve_login_methods``'s
-identical always-on default for a freshly provisioned location; an admin
-can still turn it off per location.
+``GuestService._require_method_enabled``).
+
+## Retiring password sign-in
+
+It used to default to ``True`` -- the standard baseline every location
+got: verify once by OTP, set a password right after, then sign in with
+phone/email + password from then on. **It now defaults to ``False``.**
+
+That baseline is being withdrawn at the founder's request, and the cost is
+real and worth stating plainly rather than rediscovering in a support
+ticket: **every returning guest goes back to doing an OTP on every
+visit.** OTP (all three channels), vouchers and Portal PIN are unaffected.
+
+This is a rollout, not a switch-off, and the shape below is deliberate:
+
+* **New locations get it off.**
+  ``app.domains.location.provisioning_service._resolve_login_methods``
+  carries its own identical default and was changed in the same commit --
+  the two must agree, or the disagreement presents as a race.
+* **Existing rows are NOT migrated.** A venue that has it on today keeps
+  working until someone turns it off. Flipping stored config under live
+  venues is not reversible by a redeploy.
+* **The endpoint stays.** ``POST /guest/login/password`` and
+  ``GuestService.login_via_password`` are untouched and still gated by
+  this flag, so a request arriving for a location that has it off fails
+  the way it always has -- ``GuestAuthMethodNotEnabledError``, a 403 with
+  a guest-safe message, never a 500 and never a stack trace.
+* **The portal no longer offers it** regardless of this flag, via
+  ``PASSWORD_SIGN_IN_OFFERED`` in cloudguest-foundation's
+  ``src/lib/portal-auth-methods.ts``. That one constant is the whole
+  reversal on the guest side; flipping it back restores the method for
+  every venue whose stored flag is still on. The set-password prompt goes
+  with it, so the population of guests holding a usable password can only
+  shrink from here.
+
+An admin can still turn it on per location, and the enum member
+``GuestAuthMethod.USERNAME_PASSWORD`` stays -- it is the ``auth_method``
+on live and historical ``guest_sessions`` rows.
 """
 
 from __future__ import annotations
@@ -135,12 +167,14 @@ from .constants import (
     DEFAULT_BACKGROUND_FOCAL_X,
     DEFAULT_BACKGROUND_FOCAL_Y,
     DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
+    DEFAULT_FEEDBACK_DWELL_MINUTES,
     DEFAULT_GUEST_FONT_CHOICE,
     DEFAULT_LANGUAGE,
     DEFAULT_PORTAL_CONTENT_MODE,
     DEFAULT_PRIMARY_COLOR,
     DEFAULT_SECONDARY_COLOR,
     DEFAULT_THEME,
+    REVIEW_URL_MAX_LENGTH,
 )
 from .constants import DEFAULT_SUPPORTED_LANGUAGES as _DEFAULT_LANGS
 
@@ -328,6 +362,127 @@ class CaptivePortalConfig(BaseModel):
     # through the service layer.
     post_login_html: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # -- what a guest is asked AFTER the gate opens --------------------------
+    #
+    # Every flag in this block governs the *post-connect* screen
+    # (``/portal/session``), reached only after the RADIUS session is
+    # authorised and the NAS gate is open. Nothing here can change whether,
+    # how fast, or how long a guest is connected -- that is the property
+    # that makes the profile ask lawful under DPDP (a service may not be
+    # conditioned on non-essential data) and the review ask defensible
+    # under Google's Rating Manipulation policy (free WiFi is a "free
+    # good and/or service", so nothing about the WiFi may be conditioned
+    # on a review in either direction).
+    #
+    # They are deliberately **not** ``content_mode`` values and not
+    # campaign types. ``content_mode`` is the pre-login content step; a
+    # campaign is a full-screen takeover that replaces the connected
+    # screen and of which exactly one is served per session. See
+    # ``app.domains.campaigns.service.get_next_campaign_for_session``: a
+    # review ask modelled as a campaign would compete with the venue's
+    # actual promotions for that single slot, so a cafe running a weekend
+    # offer would silently stop asking for reviews.
+
+    # The two halves of the post-connect "add your name / add your email"
+    # card, one flag each rather than one flag plus a field list -- a venue
+    # may reasonably want name-only (a salon greeting its regulars) or
+    # email-only (a co-working space), and two booleans express that
+    # without a JSON array whose legal values have to be validated.
+    #
+    # **Both default False, for existing rows as well as new ones**, and
+    # that is a deliberate behaviour change: the card ships today and is
+    # unconditional, so this migration switches it off everywhere until a
+    # venue turns it on. The venue, not this platform, is the Data
+    # Fiduciary under DPDP for the name and email of a guest standing in
+    # their premises; a migration that switched personal-data collection
+    # *on* on their behalf would be making that decision for them. The
+    # cost is real and is stated rather than hidden -- capture stops at
+    # every live venue on deploy until each one opts in.
+    #
+    # Enforced server-side as well as in the UI:
+    # ``app.domains.guest.service.GuestService.update_guest_profile``
+    # rejects a field whose flag is off. A hidden field that still accepts
+    # a write is how a venue ends up holding data it never agreed to hold.
+    collect_guest_name: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    collect_guest_email: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
+    # The post-connect "would you review us on Google" card. Defaults off:
+    # it is greenfield, it has no value at all without ``review_url``
+    # below, and switching a review request on for a venue that has not
+    # read Google's policy is not a decision to make by migration -- the
+    # penalty for getting it wrong lands on *their* Business Profile
+    # (reviews unpublished, a public "fake reviews were removed" banner,
+    # account-level suspension across every profile the account owns), not
+    # on this platform.
+    #
+    # This flag is the only thing about the review ask a venue controls,
+    # besides the URL. Its frequency, its copy, its position, and its
+    # separation from any private-feedback prompt are product constants,
+    # not settings -- a settings screen that offers a choice implies the
+    # choice is safe.
+    review_card_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
+    # The venue's own Google review link, pasted verbatim. See
+    # ``constants.REVIEW_URL_MAX_LENGTH`` for why it is never synthesised
+    # from a place id, and ``validators.validate_review_url`` for what is
+    # and is not checked on write.
+    #
+    # Null means no card -- not a disabled state, not a placeholder, and
+    # never a fallback to a Maps search for the venue name, which would
+    # land guests on the wrong branch of a chain.
+    #
+    # This column is world-readable: ``GET /captive-portal/resolve`` is
+    # unauthenticated (it has to be -- it renders the portal for a guest
+    # who has not logged in yet) and every field on this model goes out in
+    # that response. A review link is public information by construction,
+    # so that is fine here. It is a reminder for the next person adding a
+    # column to this model.
+    review_url: Mapped[str | None] = mapped_column(
+        String(REVIEW_URL_MAX_LENGTH), nullable=True
+    )
+
+    # The post-connect **private** feedback card -- a star rating that goes
+    # to the venue's own results page and nowhere public.
+    #
+    # Kept as its own flag rather than folded into ``review_card_enabled``
+    # because the two must be separately switchable, and the reason is
+    # Google's Rating Manipulation policy rather than product taste.
+    # Routing unhappy guests to a private form while routing happy ones to
+    # a public review is "review gating", which the policy prohibits
+    # outright; the two asks therefore have to be able to exist
+    # independently, and nothing in this platform may sequence one on the
+    # outcome of the other. One flag with two behaviours is how that
+    # coupling would get built by accident.
+    guest_feedback_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
+    # How many minutes a guest must have been connected before the
+    # feedback card may appear. See
+    # ``constants.DEFAULT_FEEDBACK_DWELL_MINUTES`` for where 25 comes from
+    # and why the floor is 5 rather than 0.
+    #
+    # Minutes, not seconds -- the venue types this into a dashboard field
+    # and thinks in minutes. The unit is in the column name because a
+    # number called ``feedback_dwell`` is a bug waiting for whoever reads
+    # it next.
+    #
+    # ⚠ The gate is evaluated by the portal against session start, and
+    # the portal is a page **iOS guests never reach**: after login they are
+    # sent to ``captive.apple.com/hotspot-detect.html`` deliberately, so
+    # the Captive Network Assistant releases app traffic. So this dwell is
+    # a rule about a screen, not about a visit, and the population it
+    # applies to is Android and desktop only.
+    feedback_dwell_minutes: Mapped[int] = mapped_column(
+        Integer, default=DEFAULT_FEEDBACK_DWELL_MINUTES, nullable=False
+    )
+
     # -- content mode --------------------------------------------------------
     # What the portal presents as its primary content before/instead of the
     # sign-in form -- see constants.PortalContentMode. A plain String (not a
@@ -350,6 +505,15 @@ class CaptivePortalConfig(BaseModel):
     content_heading: Mapped[str | None] = mapped_column(String(200), nullable=True)
     content_body: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Object-storage key of the uploaded "Before sign-in: show a picture"
+    # content image -- mirrors app.domains.branding's own
+    # ``background_image_key``/``logo_key`` exactly (key + public proxy URL
+    # built per-request by the router, never a bare browser-loadable URL
+    # stored here). NULL when the image was never uploaded (or was deleted);
+    # a venue can still point content_image_url at an externally hosted
+    # image it typed in itself, and the two never collide because resolve
+    # only adopts the proxy when the KEY exists (see router.py).
+    content_image_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # content_mode == "survey": the survey definition -- a small
     # JSON object ({"questions": [...], "submitLabel": "..."}), the same
     # "explicit column, JSONB when the shape is a self-contained document"
@@ -376,9 +540,13 @@ class CaptivePortalConfig(BaseModel):
     )
     voucher_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # Real, working login-method gate -- see module docstring. Defaults
-    # on: the standard "OTP once, then a saved password" baseline.
+    # OFF as of 2026-09-07: password sign-in is being retired from the
+    # guest portal, so a newly provisioned location must not be handed it
+    # as a baseline. Existing rows are deliberately NOT migrated -- see
+    # the module docstring's "Retiring password sign-in" note for the
+    # rollout, and for why the endpoint stays in place behind this flag.
     username_password_enabled: Mapped[bool] = mapped_column(
-        Boolean, default=True, nullable=False
+        Boolean, default=False, nullable=False
     )
     # Real, working login-method gate for Portal PIN
     # (app.domains.guest.service.GuestService.login_via_pin /
@@ -430,6 +598,41 @@ class CaptivePortalConfig(BaseModel):
     # renderers/service -- this domain has no renderer, the frontend
     # supplies the default copy).
     business_hours_closed_message: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+
+    # -- whitelist-only mode -------------------------------------------------
+    # Per-property "only the Always Allowed list gets online" switch. When
+    # enabled, a guest with no matching `guest_access`/`device_access` rule
+    # is refused **at the portal**, on the same login chokepoint business
+    # hours already gate -- nobody bypasses the portal, no device-side
+    # configuration changes, and the venue's own Always Allowed list stays
+    # the single source of truth for who gets through.
+    #
+    # It lives here rather than on the policy domain for the same reason
+    # the business-hours pair above does: this row is already org-scoped
+    # with a nullable `location_id` resolved most-specific-wins, and it is
+    # already resolved on the login path *before* the access gate runs, so
+    # the flag costs no extra query and adds no new way to fail.
+    #
+    # Disabled (False) is the shipped behaviour of every existing row and
+    # is what makes this column a no-op on rollout: the access gate keeps
+    # its default-allow for a guest nothing matches. **Only meaningful on
+    # a location-specific config** -- see validators.validate_whitelist_
+    # only_scope for why an org default (`location_id IS NULL`) may never
+    # carry it.
+    whitelist_only_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    # Shown on the guest-facing refusal screen in place of the normal
+    # sign-in card, in the venue's own words ("Ask reception to add your
+    # number"). Null means the venue wrote nothing and the frontend
+    # supplies its own generic default copy -- exactly the contract
+    # `business_hours_closed_message` above already has, and the reason
+    # this column is nullable rather than defaulted server-side: a stored
+    # default would be indistinguishable from a venue that deliberately
+    # typed the same words.
+    whitelist_only_denied_message: Mapped[str | None] = mapped_column(
         Text, nullable=True
     )
 

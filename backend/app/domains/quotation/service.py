@@ -109,6 +109,8 @@ class QuotationService:
         currency: str,
         valid_until: datetime,
         notes: str | None,
+        payment_terms: str | None = None,
+        terms_and_conditions: str | None = None,
     ) -> Quotation:
         subtotal = sum(
             (item.quantity * item.unit_price for item in line_items),
@@ -132,6 +134,10 @@ class QuotationService:
             currency=currency.upper(),
             valid_until=valid_until,
             notes=notes.strip() if notes else None,
+            payment_terms=payment_terms.strip() if payment_terms else None,
+            terms_and_conditions=(
+                terms_and_conditions.strip() if terms_and_conditions else None
+            ),
             sent_at=None,
             email_error=None,
             created_by=actor_user_id,
@@ -222,6 +228,20 @@ class QuotationService:
                         ),
                         ("Valid until", esc(valid_until)),
                     ]
+                )
+                + (
+                    # The payment terms are the one block worth repeating in
+                    # the email body (the PDF carries the full terms &
+                    # conditions); newlines collapse to spaces -- this is a
+                    # single HTML paragraph, and the PDF is the document of
+                    # record for the operator's line-by-line formatting.
+                    paragraph(
+                        "<strong>Payment terms:</strong> "
+                        + esc(quotation.payment_terms.replace("\n", " ")),
+                        muted=True,
+                    )
+                    if quotation.payment_terms
+                    else ""
                 )
                 + paragraph(
                     "If you have any questions, just reply to this email.",

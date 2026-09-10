@@ -172,6 +172,14 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/guest-teams/join"): (
         "Unauthenticated guest presenting a team join code."
     ),
+    ("GET", "/api/v1/guest-teams/open"): (
+        "Unauthenticated guest reading which teams at this portal are "
+        "joinable, for the sign-in dropdown."
+    ),
+    ("GET", "/api/v1/captive-portal-configs/{config_id}/content-image/public"): (
+        "Unauthenticated guest-portal <img> fetch of the venue's uploaded "
+        "pre-login content image -- mirrors the branding public proxies."
+    ),
     # -- Device/NAS/webhook: a different, non-RBAC identity mechanism --
     ("GET", "/api/v1/agent/actions"): "Router agent -- CurrentAgent device credential.",
     ("GET", "/api/v1/agent/config"): "Router agent -- CurrentAgent device credential.",
@@ -249,13 +257,6 @@ _ALLOWED_UNAUTHENTICATED_ROUTES: dict[tuple[str, str], str] = {
         "Router agent -- CurrentAgent device credential. Reports the MACs "
         "of this router's own currently-ACTIVE guest sessions for the "
         "hotspot ip-binding sync; same class as the /agent/* entries above."
-    ),
-    # -- Guest device OS, pre-identity ---------------------------------
-    ("GET", "/api/v1/captive-portal/rfc8908"): (
-        "RFC 8908 Captive Portal API discovery document, fetched by an "
-        "unauthenticated guest device's OS via the RFC 8910 DHCP Option "
-        "114 URI -- same pre-identity guest category as GET "
-        "/captive-portal/resolve, which is allowlisted by prefix above."
     ),
     # -- Self-service data-masking step-up: CurrentUser establishes
     # identity and the OTP is always sent to the caller's *own* phone/

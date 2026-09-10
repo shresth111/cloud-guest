@@ -74,15 +74,47 @@ from app.core.config import get_settings
 # the post-login screen, so a stale payload here does not merely serve an
 # old colour -- it serves the previous version of a page the venue
 # believes they just published, for up to a full TTL, with nothing on
-# screen to suggest the save did not take.
-_CACHE_KEY_TEMPLATE = "captive_portal:resolve:v6:{organization_id}:{location_id}"
+# screen to suggest the save did not take. v7 is whitelist_only_enabled/
+# whitelist_only_denied_message, the per-property whitelist-only pair,
+# added to that same tuple -- the identical bump for the identical
+# reason. Note the bump is required even though that feature ships dark:
+# the KeyError is raised by ``_config_from_cache_payload`` deserializing
+# a pre-deploy payload, not by anything reading the new fields, so
+# "nothing consumes the flag yet" buys no protection at all.
+#
+# v8 is the post-connect ask columns -- ``collect_guest_name``,
+# ``collect_guest_email``, ``review_card_enabled``, ``review_url``,
+# ``guest_feedback_enabled`` and ``feedback_dwell_minutes`` -- added to
+# that same tuple again.
+#
+# TWO CHANGES CLAIMED v7 INDEPENDENTLY, and that is the thing to notice
+# rather than the bump itself. The whitelist-only pair and the
+# post-connect asks were written in parallel worktrees, each correctly
+# reasoned that the field set had changed and each moved v6 to v7. Had
+# both landed spelling it v7, the second would have deployed a new field
+# set under a key the first had already warmed -- reintroducing the exact
+# KeyError both authors bumped to prevent, with both diffs looking right
+# in review.
+#
+# So the number is not a version of this file, it is a version of the
+# SHAPE of ``_CACHED_CONFIG_SCALAR_FIELDS``. Anything that changes that
+# tuple takes the next integer, and takes it against whatever is on main
+# at the time -- never against the branch it was cut from. Restating it
+# here because this is now the eighth bump and the first collision:
+# ``_config_from_cache_payload`` indexes that tuple with
+# ``payload[field_name]``, unguarded and deliberately so, so the first
+# resolve after deploy against a payload written by the previous version
+# raises ``KeyError`` inside ``GET /captive-portal/resolve`` -- which is
+# unauthenticated, is the first call every guest device makes, and would
+# therefore 500 every login at every venue until the TTL ran out.
+_CACHE_KEY_TEMPLATE = "captive_portal:resolve:v8:{organization_id}:{location_id}"
 
 # Redis SET of every resolve key currently written for one organization,
 # so an organization-scoped edit can fan out to *all* of them (see
 # ``invalidate_organization``). Deliberately versioned in lockstep with
 # ``_CACHE_KEY_TEMPLATE`` -- an index holding keys from a previous
 # payload version would fan a delete out to keys nothing reads anymore.
-_ORG_INDEX_KEY_TEMPLATE = "captive_portal:resolve:v6:org-index:{organization_id}"
+_ORG_INDEX_KEY_TEMPLATE = "captive_portal:resolve:v8:org-index:{organization_id}"
 
 # The index set must outlive the payloads it points at, or a payload
 # written at second 59 of the index's own TTL would be orphaned (indexed

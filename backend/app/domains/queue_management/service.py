@@ -572,6 +572,7 @@ class QueueManagementService:
         target_type: QueueTargetType | None = None,
         target_id: uuid.UUID | None = None,
         router_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
         status: QueueStatus | None = None,
         page: int = 1,
         page_size: int = 25,
@@ -585,6 +586,8 @@ class QueueManagementService:
             filters["target_id"] = target_id
         if router_id is not None:
             filters["router_id"] = router_id
+        if location_id is not None:
+            filters["location_id"] = location_id
         if status is not None:
             filters["status"] = status.value
         return await self.repository.list_assignments(
@@ -921,6 +924,7 @@ class QueueManagementService:
         requesting_organization_id: uuid.UUID | None,
         new_queue_profile_id: uuid.UUID | None = None,
         new_queue_schedule_id: uuid.UUID | None = None,
+        new_device_target: str | None = None,
         auto_apply: bool = True,
     ) -> QueueAssignment:
         """Real rollback on failure: the new assignment is applied to the
@@ -935,7 +939,15 @@ class QueueManagementService:
         queue is deliberately left untouched (and *not* yet marked
         superseded) until an admin explicitly calls ``apply_queue`` on the
         new row -- the same "never leave a target with zero bandwidth"
-        principle, just deferred to a later, explicit action."""
+        principle, just deferred to a later, explicit action.
+
+        ``new_device_target`` re-points the queue at a different address,
+        defaulting to the one the old assignment already had. A
+        ``/queue simple`` entry matches on one concrete IP, so a guest who
+        comes back on a new DHCP lease needs the entry rebuilt against the
+        new address or their rate applies to an address they no longer
+        hold -- and the apply-then-remove ordering above is exactly what
+        makes that safe to do while they are online."""
         old = await self.get_assignment(
             assignment_id, requesting_organization_id=requesting_organization_id
         )
@@ -947,7 +959,7 @@ class QueueManagementService:
             target_id=old.target_id,
             router_id=old.router_id,
             location_id=old.location_id,
-            device_target=old.device_target,
+            device_target=new_device_target or old.device_target,
             queue_profile_id=new_queue_profile_id or old.queue_profile_id,
             queue_schedule_id=new_queue_schedule_id
             if new_queue_schedule_id is not None
@@ -1100,7 +1112,17 @@ class QueueManagementService:
                 )
             return new_assignment
 
-        if existing.queue_profile_id == profile.id:
+        # Both halves matter. The profile is the rate; ``device_target`` is
+        # the address that rate is enforced against, and a ``/queue simple``
+        # entry matches on one concrete IP. A returning guest on a fresh DHCP
+        # lease keeps their assignment (same rate, so the profile compares
+        # equal) while the live queue on the device still names the address
+        # they used to hold -- and a queue that matches nothing rate-limits
+        # nothing. Comparing only the profile made that the silent case.
+        if (
+            existing.queue_profile_id == profile.id
+            and existing.device_target == device_target
+        ):
             return existing
 
         return await self.move_queue(
@@ -1108,8 +1130,83 @@ class QueueManagementService:
             actor_user_id=actor_user_id,
             requesting_organization_id=requesting_organization_id,
             new_queue_profile_id=profile.id,
+            new_device_target=device_target,
             auto_apply=auto_apply,
         )
+
+    async def reapply_active_sessions_for_location(
+        self,
+        *,
+        location_id: uuid.UUID,
+        requesting_organization_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> dict[str, int]:
+        """Re-resolve every currently-``ACTIVE`` SESSION queue assignment
+        for one location against the location's *current* bandwidth policy.
+
+        This is the "a venue just raised their speeds" hook -- the
+        counterpart to the per-login ``resolve_and_assign_queue`` call in
+        ``GuestService._assign_guest_queue``. A bandwidth-policy publish
+        only changes what the *next* login resolves until this runs; this
+        method makes the change reach guests who are already connected,
+        without waiting for their session to die or for a reconnect.
+
+        Each affected assignment is fed back through the exact same
+        ``resolve_and_assign_queue`` pipeline a fresh login uses, so the
+        semantics are identical to a returning guest: an unchanged rate
+        resolves to the same profile and returns without a device call
+        (idempotent by construction -- see that method's own docstring),
+        and a genuinely changed rate goes through ``move_queue``, which
+        applies the new ``/queue simple`` before pulling the old one, so a
+        connected guest is never left at zero bandwidth in between. The
+        session's own stored ``device_target`` (the concrete IP the live
+        queue already names) is reused -- re-resolving policy does not need
+        to re-discover an address that has not changed.
+
+        One assignment's device failure is caught and counted, never
+        aborting the rest of the location's own re-applications -- mirrors
+        ``reapply_assignments_for_router``'s identical per-item isolation
+        contract. Returns ``{"reapplied": n, "failed": n}``.
+
+        The repo lists by ``status`` + filters; ``location_id`` and
+        ``target_type`` are the two real filters that select the sessions
+        this method exists to reach, and only ``ACTIVE`` rows are touched
+        (a ``PENDING``/``DISABLED`` assignment belongs to a target that is
+        not currently online, and will pick the new policy up whenever it
+        is next applied on its own)."""
+        assignments, _ = await self.list_assignments(
+            requesting_organization_id=requesting_organization_id,
+            location_id=location_id,
+            status=QueueStatus.ACTIVE,
+            page=1,
+            page_size=1000,
+        )
+        reapplied = 0
+        failed = 0
+        for assignment in assignments:
+            if assignment.target_type != QueueTargetType.SESSION.value:
+                continue
+            if assignment.router_id is None:
+                continue
+            try:
+                await self.resolve_and_assign_queue(
+                    requesting_organization_id=assignment.organization_id,
+                    location_id=assignment.location_id,
+                    router_id=assignment.router_id,
+                    target_type=QueueTargetType.SESSION,
+                    target_id=assignment.target_id,
+                    device_target=assignment.device_target or "",
+                    actor_user_id=actor_user_id,
+                    guest_id=None,
+                )
+                reapplied += 1
+            except Exception as exc:  # noqa: BLE001 -- per-assignment isolation, see docstring
+                failed += 1
+                logger.warning(
+                    "queue_reapply_session_failed",
+                    extra={"assignment_id": str(assignment.id), "error": str(exc)},
+                )
+        return {"reapplied": reapplied, "failed": failed}
 
     # ========================================================================
     # Internal helpers

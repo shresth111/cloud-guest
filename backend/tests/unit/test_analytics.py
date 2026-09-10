@@ -820,7 +820,17 @@ def test_celery_app_imports_and_constructs_without_a_broker():
     # ("network-diagnostics-run-retention-sweep") -- the first and only
     # thing that ever deletes a `diagnostic_runs` row. See
     # app.domains.network_diagnostics.tasks's own module docstring.
-    # Network Integrations adds a twenty-second Beat entry
+    # Router domain adds a twenty-second Beat entry
+    # ("router-reachability-sweep") -- the FAST outage path, and a
+    # different question from "router-stale-heartbeat-sweep" rather than a
+    # faster copy of it. That one owns `Router.status` at the 15-minute
+    # ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES every screen shares; this one
+    # owns a separate, alert-only `Router.reachability_state` sized to a
+    # two-minute outage email. See
+    # app.domains.router.service.RouterService.sweep_router_reachability's
+    # own docstring for the awake-window, fleet-outage and tunnel-
+    # confirmation guards.
+    # Network Integrations adds a twenty-third Beat entry
     # ("network-integration-sync-sweep") -- the only thing that refreshes a
     # third-party controller's status without a human pressing Sync Now.
     # See app.domains.network_integration.tasks's own module docstring.
@@ -837,9 +847,25 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "guest-quota-reset-sweep",
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
+        # Monitored hardware liveness: the fast ping-driven UP/DOWN path
+        # for registered devices. The 15-minute discovery sweep above
+        # treats a RouterOS bound lease as "seen" -- a device that powered
+        # off keeps its lease until it expires, so without this entry a
+        # dead venue AP would keep reading UP for lease-time + one
+        # discovery interval. This sweep pings each registered device
+        # through its uplink router every 30s and owns the liveness fields
+        # on those rows. Its absence from this set is not a missing
+        # schedule entry, it is a dashboard whose UP means "the router
+        # still holds a lease for a dead device".
+        "monitored-hardware-liveness-sweep",
         "campaigns-sweep-status-transitions",
         "provisioning-engine-router-health-poll-sweep",
         "router-provisioning-token-cleanup-sweep",
+        # Its absence from this set is not a missing schedule entry, it is
+        # a venue whose router went down and whose owner finds out when a
+        # guest complains -- which is exactly what happened on 2026-09-07,
+        # for twenty-two minutes, with nothing sent.
+        "router-reachability-sweep",
         # `GET /monitoring/health` only reads the stored `service_health`
         # table; it probes nothing. Without this entry the sole writer is
         # the Master console's own button, so the page's timestamps are as

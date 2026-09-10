@@ -32,4 +32,21 @@ class HardwareStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
-__all__ = ["HardwareType", "HardwareStatus"]
+#: How old a connected-device sighting may be before an ``is_active`` row
+#: stops meaning "UP". The device-sync sweep refreshes a genuinely live
+#: device's ``last_seen_at`` every
+#: ``CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS`` (900s, see
+#: ``app.domains.connected_devices.constants``), so a row whose last sighting
+#: is older than two full sweep periods cannot be a device the uplink router
+#: is actually serving right now -- it is a row nobody has been able to
+#: refresh (router unreachable, sweep stalled), and deriving "UP" from it
+#: would repeat the exact bug this constant exists for: a venue access point
+#: that went down kept showing UP because the sync that would have flipped
+#: ``is_active`` never ran. Two periods rather than one deliberately
+#: tolerates a single dropped sweep (per-router isolation means one
+#: unreachable router fails its own tick without affecting the fleet) while
+#: still bounding staleness to ~30 minutes.
+STALE_SIGHTING_AFTER_SECONDS = 2 * 900 + 60  # two sweeps + a one-minute grace
+
+
+__all__ = ["HardwareStatus", "HardwareType", "STALE_SIGHTING_AFTER_SECONDS"]

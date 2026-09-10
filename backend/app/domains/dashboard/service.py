@@ -225,18 +225,32 @@ class DashboardService:
         (``analytics.dashboard_schemas``) -- so the guard was permanently
         False and this endpoint reported **0 routers** for every account since
         it shipped, with the correct value one attribute away.
+
+        ## Why ``organization_id`` is now actually used
+
+        It was accepted here, and by ``get_dashboard`` above, and then never
+        read: the organization count came from an ``OrganizationService`` call
+        made with no scope, and the location/router counts came from
+        ``get_super_admin_dashboard``, which takes no organization argument at
+        all. So these three tiles stayed platform-wide even for a caller who
+        *had* selected a venue and whose every other tile honoured it -- a
+        count blended across fourteen tenants, rendered identically to a
+        correct one. ``AnalyticsDashboardService.get_overview_counts`` scopes
+        all three, and still answers platform-wide for a caller who explicitly
+        asked for every organization.
+
+        (The ``OrganizationService`` call was also passing
+        ``requesting_user_id=`` to a method whose only keyword-only parameter
+        is ``requesting_organization_id``, so it could not have executed as
+        written.)
         """
-        orgs = await self.organization_service.list_organizations(
-            requesting_user_id=user_id, page=1, page_size=1
+        counts = await self.analytics_dashboard.get_overview_counts(
+            user_id, organization_id=organization_id
         )
-        total_orgs = orgs[1].total_items if len(orgs) > 1 else 0
-
-        dash = await self.analytics_dashboard.get_super_admin_dashboard(user_id)
-
         return DashboardOverview(
-            total_organizations=total_orgs,
-            total_locations=dash.total_locations,
-            total_routers=dash.total_routers,
+            total_organizations=counts.total_organizations,
+            total_locations=counts.total_locations,
+            total_routers=counts.total_routers,
         )
 
     async def _get_widgets(

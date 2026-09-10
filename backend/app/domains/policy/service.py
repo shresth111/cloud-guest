@@ -183,6 +183,49 @@ class RoleLookupProtocol(Protocol):
 # ============================================================================
 
 
+def _resolution_key(
+    assignment: PolicyAssignment,
+) -> tuple[int, int, int, datetime, str]:
+    """Total, reproducible ordering over candidate assignments.
+
+    The first three components are the real precedence rules -- WHO
+    (``target_type``), then WHERE (``scope_type``), then the operator's own
+    ``priority``. The last two exist because those three do not always
+    separate two candidates, and until they were added the winner of a tie
+    was whatever order Postgres happened to return rows in:
+    ``list_candidate_assignments`` has no ``ORDER BY``, and ``max`` keeps
+    the first maximal element it sees.
+
+    A tie is not a corner case here, it is the normal result of using the
+    product. Two different screens under Access & Policy both write
+    ``BANDWIDTH`` policies and both map them to a location the same way --
+    Guest WiFi Limits (``LocationPolicies.tsx``) and Access Tiers
+    (``CreateGroup.tsx``) -- and every assignment either one creates is
+    ``scope_type="location"``, ``target_type="none"``, ``priority=0``.
+    A venue that has used both therefore has two candidates with
+    identical keys, and which speed a guest actually got was decided by
+    the query planner, not by the venue. Editing the one they were looking
+    at could change nothing at all. Bug report: "speed is only set to 20
+    and not updating".
+
+    Newest assignment wins the tie, because the most recently made
+    assignment is the one the operator most recently asked for. ``id`` is
+    the final separator so that two assignments written inside the same
+    transaction (identical ``created_at``) still resolve the same way on
+    every query, rather than being reproducibly ordered only most of the
+    time. ``created_at`` is populated on flush, so an unflushed row sorts
+    oldest rather than raising."""
+    return (
+        _TARGET_SPECIFICITY.get(
+            assignment.target_type or PolicyAssignmentTargetType.NONE.value, -1
+        ),
+        _SCOPE_SPECIFICITY.get(assignment.scope_type, -1),
+        assignment.priority,
+        assignment.created_at or datetime.min.replace(tzinfo=UTC),
+        str(assignment.id),
+    )
+
+
 class PolicyResolver:
     """Pure precedence resolution over already-fetched candidate
     assignments -- see module docstring.
@@ -192,21 +235,15 @@ class PolicyResolver:
     or untargeted one, regardless of which WHERE tier (``scope_type``)
     either was defined at, since a personalized override is meant to be
     the most specific possible match. The existing WHERE-tier/``priority``
-    ordering remains the tiebreaker within the same WHO tier."""
+    ordering remains the tiebreaker within the same WHO tier, and
+    ``_resolution_key`` carries two further components after it so that
+    candidates those three cannot separate still resolve the same way on
+    every query rather than in whatever order the rows arrived."""
 
     def resolve(self, *, candidates: list[PolicyAssignment]) -> PolicyAssignment | None:
         if not candidates:
             return None
-        return max(
-            candidates,
-            key=lambda a: (
-                _TARGET_SPECIFICITY.get(
-                    a.target_type or PolicyAssignmentTargetType.NONE.value, -1
-                ),
-                _SCOPE_SPECIFICITY.get(a.scope_type, -1),
-                a.priority,
-            ),
-        )
+        return max(candidates, key=_resolution_key)
 
 
 # ============================================================================

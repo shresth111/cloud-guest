@@ -113,3 +113,43 @@ class RouterHealthStatus(StrEnum):
 
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
+
+
+class RouterReachabilityState(StrEnum):
+    """"Is this site's router talking to us **right now**?" -- a fast,
+    alert-only liveness verdict, deliberately separate from
+    ``RouterStatus.OFFLINE``/``RouterHealthStatus``.
+
+    ## Why this is not just ``RouterStatus.OFFLINE``
+
+    ``RouterStatus.OFFLINE`` is written by
+    ``RouterService.sweep_stale_heartbeats`` at
+    ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`` (15 minutes), and that
+    constant is shared on purpose: ``compute_lifecycle_stage``,
+    ``compute_internet_availability`` and the frontend's
+    ``location-liveness`` module all read the same number, and that sweep's
+    own docstring says in as many words that "a second, slightly different
+    definition of 'offline' is how two screens start disagreeing about one
+    router". Lowering it to satisfy an alerting requirement would silently
+    re-time every one of those readers.
+
+    So this is not a second definition of "offline". It is a different,
+    narrower question with its own name: *has this router contacted the
+    platform within the last couple of minutes, and -- when we could check
+    -- is its management tunnel also gone?* ``Router.status`` keeps meaning
+    exactly what it meant. Nothing that reads ``status`` or ``last_seen_at``
+    changes behaviour because of this enum.
+
+    ## Why ``UNKNOWN`` is a real state and never alerts
+
+    A router that has never checked in (freshly enrolled, mid-provisioning,
+    or one whose agent scheduler was never installed) has no absence to
+    measure. Alerting on it would page a venue for a router that has simply
+    never been switched on. Same discipline as
+    ``app.domains.dhcp.constants.RogueDhcpAlertState``'s own ``UNKNOWN``:
+    an unanswered question is not an alert.
+    """
+
+    REACHABLE = "reachable"
+    UNREACHABLE = "unreachable"
+    UNKNOWN = "unknown"

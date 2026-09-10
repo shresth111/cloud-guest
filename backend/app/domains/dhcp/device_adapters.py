@@ -54,6 +54,7 @@ from typing import Protocol
 from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
 from wyfy_device_gateway.contract import (
     DeviceVendor,
+    DhcpOptionConfig,
     DhcpPoolConfig,
     RogueDhcpAlertConfig,
 )
@@ -123,6 +124,88 @@ class RogueDhcpInterfaceReading:
         return self.alert_present and self.enabled
 
 
+@dataclass(frozen=True, slots=True)
+class DhcpOptionSpec:
+    """One custom DHCP option this platform owns on a router.
+
+    Independently defined rather than a re-export of
+    ``wyfy_device_gateway.contract.DhcpOptionConfig`` -- the same posture
+    ``DhcpCredentials`` above takes towards the gateway's own
+    ``DeviceCredentials``. The service layer consumes this and never
+    imports the vendor contract.
+
+    ``name`` is the identity and the only field a removal needs. See the
+    gateway contract's ``DhcpOptionConfig`` for why matching on ``code``
+    would be a fleet-damaging mistake.
+    """
+
+    name: str
+    code: int | None = None
+    value: str | None = None
+    force: bool = False
+    option_set_name: str | None = None
+    network_addresses: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionReading:
+    """One ``/ip dhcp-server option`` row as the device reports it."""
+
+    name: str
+    code: int | None
+    value: str | None
+    force: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionSnapshotReading:
+    """What one router currently advertises, in this domain's own terms.
+
+    ``supported`` is carried through from the gateway unchanged: a router
+    whose RouterOS has no option menu is a router we could not ask, not a
+    router that answered "none". Collapsing the two would let an audit
+    report a whole class of devices as clean because the question could not
+    be put to them -- the identical trap ``RogueDhcpAlertState.UNKNOWN``
+    exists for one menu over.
+    """
+
+    supported: bool
+    options: tuple[DhcpOptionReading, ...]
+    option_set_names: tuple[str, ...]
+    bindings: tuple[str, ...]
+
+    def option(self, name: str) -> DhcpOptionReading | None:
+        return next((o for o in self.options if o.name == name), None)
+
+    def advertises(self, name: str) -> bool:
+        return self.option(name) is not None
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpOptionRemovalReport:
+    """What a removal actually changed, as opposed to what it attempted.
+
+    A removal is idempotent, so success alone says nothing: it succeeds
+    against a router that was cleaned last week too. ``changed`` is the
+    fact worth logging and the fact an operator asking "did this venue
+    still have it?" is actually asking.
+    """
+
+    option_removed: bool = False
+    option_sets_removed: tuple[str, ...] = ()
+    option_sets_rewritten: tuple[str, ...] = ()
+    bindings_detached: tuple[str, ...] = ()
+
+    @property
+    def changed(self) -> bool:
+        return bool(
+            self.option_removed
+            or self.option_sets_removed
+            or self.option_sets_rewritten
+            or self.bindings_detached
+        )
+
+
 class BaseDhcpAdapter(Protocol):
     """What a vendor implements to plug real DHCP operations into this
     domain."""
@@ -178,6 +261,50 @@ class BaseDhcpAdapter(Protocol):
         finding worth having, and it has no alert row of its own to be
         listed by. An answer built only from the rows present would be
         silent about exactly the routers worth knowing about.
+        """
+        ...
+
+    async def read_dhcp_options(
+        self, credentials: DhcpCredentials
+    ) -> DhcpOptionSnapshotReading:
+        """Which custom DHCP options this router currently hands out.
+
+        Reads only. This is the call that answers "does this venue still
+        advertise the captive-portal URI" without changing anything, so a
+        fleet audit is not itself a fleet change.
+        """
+        ...
+
+    async def configure_dhcp_option(
+        self, credentials: DhcpCredentials, *, option: DhcpOptionSpec
+    ) -> None:
+        """Realizes one custom DHCP option, its option set, and the network
+        rows it is bound to.
+
+        Idempotent, and updating rather than skipping when the value
+        drifted: an option carrying a stale URL is worse than an absent
+        one, because it reads as configured while pointing every client at
+        the wrong place.
+        """
+        ...
+
+    async def remove_dhcp_option(
+        self, credentials: DhcpCredentials, *, option: DhcpOptionSpec
+    ) -> DhcpOptionRemovalReport:
+        """Takes one named option, and every reference to it, off the
+        device.
+
+        Until this existed, **this platform could not write or remove a
+        DHCP option at all** -- ``network_config/renderers.py`` renders
+        pools, servers and network rows and has never rendered an
+        ``option`` line, so the only writer in the whole system was a human
+        pasting the Master Console setup script, and the only remover was a
+        human with an API session open. That is why a captive-portal option
+        that keeps the portal sheet open after a successful login had to be
+        removed by hand, router by router.
+
+        Idempotent: safe against a router that never had the option, one
+        already cleaned, and one left halfway by a previous failed run.
         """
         ...
 
@@ -342,6 +469,74 @@ class MikroTikDhcpAdapter:
             raise DhcpDeviceOperationError("delete_dhcp_pool", exc.detail) from exc
 
 
+    @staticmethod
+    def _option_config(option: DhcpOptionSpec) -> DhcpOptionConfig:
+        return DhcpOptionConfig(
+            name=option.name,
+            code=option.code,
+            value=option.value,
+            force=option.force,
+            option_set_name=option.option_set_name,
+            network_addresses=tuple(option.network_addresses),
+        )
+
+    async def read_dhcp_options(
+        self, credentials: DhcpCredentials
+    ) -> DhcpOptionSnapshotReading:
+        creds = self._gateway_credentials(credentials)
+        try:
+            snapshot = await get_adapter(DeviceVendor.MIKROTIK).read_dhcp_options(creds)
+        # MikroTikConnectionError subclasses MikroTikDeviceError -- catch the
+        # narrower one first, or every connection failure is mislabelled.
+        except MikroTikConnectionError as exc:
+            raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DhcpDeviceOperationError("read_dhcp_options", exc.detail) from exc
+        return DhcpOptionSnapshotReading(
+            supported=snapshot.supported,
+            options=tuple(
+                DhcpOptionReading(
+                    name=o.name, code=o.code, value=o.value, force=o.force
+                )
+                for o in snapshot.options
+            ),
+            option_set_names=tuple(s.name for s in snapshot.option_sets),
+            bindings=tuple(f"{b.menu}:{b.identity}" for b in snapshot.bindings),
+        )
+
+    async def configure_dhcp_option(
+        self, credentials: DhcpCredentials, *, option: DhcpOptionSpec
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).configure_dhcp_option(
+                creds, option=self._option_config(option)
+            )
+        except MikroTikConnectionError as exc:
+            raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DhcpDeviceOperationError("configure_dhcp_option", exc.detail) from exc
+
+    async def remove_dhcp_option(
+        self, credentials: DhcpCredentials, *, option: DhcpOptionSpec
+    ) -> DhcpOptionRemovalReport:
+        creds = self._gateway_credentials(credentials)
+        try:
+            removal = await get_adapter(DeviceVendor.MIKROTIK).delete_dhcp_option(
+                creds, option=self._option_config(option)
+            )
+        except MikroTikConnectionError as exc:
+            raise DhcpDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise DhcpDeviceOperationError("remove_dhcp_option", exc.detail) from exc
+        return DhcpOptionRemovalReport(
+            option_removed=removal.option_removed,
+            option_sets_removed=removal.option_sets_removed,
+            option_sets_rewritten=removal.option_sets_rewritten,
+            bindings_detached=removal.bindings_detached,
+        )
+
+
 _DHCP_ADAPTERS: dict[str, BaseDhcpAdapter] = {"mikrotik": MikroTikDhcpAdapter()}
 
 
@@ -361,6 +556,10 @@ def list_supported_dhcp_vendors() -> list[str]:
 __all__ = [
     "BaseDhcpAdapter",
     "DhcpCredentials",
+    "DhcpOptionReading",
+    "DhcpOptionRemovalReport",
+    "DhcpOptionSnapshotReading",
+    "DhcpOptionSpec",
     "RogueDhcpInterfaceReading",
     "MikroTikDhcpAdapter",
     "get_dhcp_adapter",

@@ -20,13 +20,17 @@ from pydantic import BaseModel, ConfigDict, Field
 from .constants import (
     CONTENT_BODY_MAX_LENGTH,
     CONTENT_HEADING_MAX_LENGTH,
+    DEFAULT_FEEDBACK_DWELL_MINUTES,
     DEFAULT_LANGUAGE,
     DEFAULT_PORTAL_CONTENT_MODE,
     DEFAULT_PRIMARY_COLOR,
     DEFAULT_SECONDARY_COLOR,
     DEFAULT_SUPPORTED_LANGUAGES,
     DEFAULT_THEME,
+    MAX_FEEDBACK_DWELL_MINUTES,
+    MIN_FEEDBACK_DWELL_MINUTES,
     POST_LOGIN_HTML_MAX_BYTES,
+    REVIEW_URL_MAX_LENGTH,
     SPLASH_HEADLINE_MAX_LENGTH,
     SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
 )
@@ -160,6 +164,76 @@ class CaptivePortalConfigCreateRequest(BaseModel):
             "the frontend (PortalSurvey) owns the schema."
         ),
     )
+    collect_guest_name: bool = Field(
+        default=False,
+        description=(
+            "Ask a guest for their name on the connected screen, after "
+            "they are already online. Never on the sign-in card, never "
+            "before the connection, never required -- see "
+            "`models.CaptivePortalConfig`'s own comment. Defaults off: "
+            "the venue is the Data Fiduciary for this data, so nothing "
+            "collects it until they say so."
+        ),
+    )
+    collect_guest_email: bool = Field(
+        default=False,
+        description=(
+            "The email half of the same post-connect card. Independent of "
+            "`otp_email_enabled`, which is a *sign-in method* -- a venue "
+            "that conflates the two will believe it is collecting emails "
+            "when it is not. Defaults off, for the same reason "
+            "`collect_guest_name` does. An email captured here is a "
+            "contact attribute, not a marketing list: there is no "
+            "marketing-consent artifact in this codebase yet, so nothing "
+            "collected here may be mailed offers."
+        ),
+    )
+    review_card_enabled: bool = Field(
+        default=False,
+        description=(
+            "Show the post-connect 'review us on Google' card. Does "
+            "nothing without `review_url`. Frequency, copy, position and "
+            "separation from any feedback prompt are product constants, "
+            "not settings."
+        ),
+    )
+    review_url: str | None = Field(
+        default=None,
+        max_length=REVIEW_URL_MAX_LENGTH,
+        description=(
+            "The venue's Google review link, copied from Business Profile "
+            "-> Read reviews -> Get more reviews. Stored **verbatim** -- "
+            "never synthesised from a place id, never normalised, never "
+            "rewritten. Validated on write to be `https` on a Google "
+            "host; the path is deliberately not checked, and the link is "
+            "not fetched. Null renders no card at all -- not a disabled "
+            "one. (The QR code Google offers alongside this link can only "
+            "be generated on desktop; venues ask.)"
+        ),
+    )
+    guest_feedback_enabled: bool = Field(
+        default=False,
+        description=(
+            "Show the post-connect private star-feedback card. Separate "
+            "from `review_card_enabled` on purpose and not a fallback for "
+            "it: sequencing one on the other's outcome -- private form "
+            "for unhappy guests, public review for happy ones -- is "
+            "review gating, which Google's Rating Manipulation policy "
+            "prohibits outright. Two flags, neither aware of the other."
+        ),
+    )
+    feedback_dwell_minutes: int = Field(
+        default=DEFAULT_FEEDBACK_DWELL_MINUTES,
+        ge=MIN_FEEDBACK_DWELL_MINUTES,
+        le=MAX_FEEDBACK_DWELL_MINUTES,
+        description=(
+            "Minutes a guest must have been connected before the feedback "
+            "card may appear. 0 means no gate. Inert while "
+            "`guest_feedback_enabled` is false. Note the gate is measured "
+            "on a screen iOS guests never reach -- see the model's own "
+            "comment."
+        ),
+    )
     otp_sms_enabled: bool = Field(default=True)
     otp_email_enabled: bool = Field(default=False)
     otp_whatsapp_enabled: bool = Field(
@@ -175,14 +249,18 @@ class CaptivePortalConfigCreateRequest(BaseModel):
     voucher_enabled: bool = Field(default=True)
     # Real, functional login method (GuestService.login_via_password /
     # POST /guest/login/password) -- no longer the placeholder this field
-    # started as. Defaults to True (the standard baseline: every guest can
-    # verify once via OTP, set a password right after, and use phone/email
-    # + password from then on) -- mirrors
+    # started as. Defaults to FALSE as of 2026-09-07: password sign-in is
+    # being retired from the guest portal, so a config created now must not
+    # be handed it as a baseline. Mirrors
     # app.domains.location.provisioning_service._resolve_login_methods's
-    # identical "always-on baseline" default for a newly provisioned
-    # location. An admin can still explicitly turn it off per location
-    # (e.g. an SMS-OTP-only kiosk) via CaptivePortalConfigUpdateRequest.
-    username_password_enabled: bool = Field(default=True)
+    # identical default for a newly provisioned location -- the two must
+    # agree or the disagreement presents as a race. Existing rows are
+    # deliberately not migrated and the endpoint deliberately stays in
+    # place behind the flag; see CaptivePortalConfig's module docstring
+    # ("Retiring password sign-in") for the whole rollout, including the
+    # guest-facing cost. An admin can still explicitly turn it on per
+    # location via CaptivePortalConfigUpdateRequest.
+    username_password_enabled: bool = Field(default=False)
     pin_login_enabled: bool = Field(
         default=False,
         description=(
@@ -206,6 +284,28 @@ class CaptivePortalConfigCreateRequest(BaseModel):
             "Forward-compatible extension point (e.g. ['google', "
             "'facebook']) -- stored and returned verbatim, never validated "
             "against a real provider registry since none exists."
+        ),
+    )
+    whitelist_only_enabled: bool = Field(
+        default=False,
+        description=(
+            "Per-property whitelist-only mode: when true, only guests with "
+            "a matching Always Allowed rule get online, and everyone else "
+            "still reaches the captive portal and is refused there. "
+            "**Rejected with a 400 when `location_id` is null** -- an "
+            "organization default is inherited by every location without "
+            "an override, so enabling it there would switch on every "
+            "property at once. Defaults false, which is exactly today's "
+            "behaviour."
+        ),
+    )
+    whitelist_only_denied_message: str | None = Field(
+        default=None,
+        description=(
+            "The venue's own words on the whitelist-only refusal screen "
+            "(e.g. 'Ask reception to add your number'). Null leaves the "
+            "frontend's generic default copy in place -- the identical "
+            "contract `business_hours_closed_message` already has."
         ),
     )
 
@@ -307,6 +407,25 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     content_body: str | None = Field(default=None, max_length=CONTENT_BODY_MAX_LENGTH)
     content_image_url: str | None = Field(default=None, max_length=500)
     content_survey: dict | None = Field(default=None)
+    collect_guest_name: bool | None = Field(default=None)
+    collect_guest_email: bool | None = Field(default=None)
+    review_card_enabled: bool | None = Field(default=None)
+    review_url: str | None = Field(
+        default=None,
+        max_length=REVIEW_URL_MAX_LENGTH,
+        description=(
+            "See the create schema for the full contract. Omit the key to "
+            "leave the stored link untouched; send null or an empty "
+            "string to clear it, which turns the card off in practice "
+            "whatever `review_card_enabled` says."
+        ),
+    )
+    guest_feedback_enabled: bool | None = Field(default=None)
+    feedback_dwell_minutes: int | None = Field(
+        default=None,
+        ge=MIN_FEEDBACK_DWELL_MINUTES,
+        le=MAX_FEEDBACK_DWELL_MINUTES,
+    )
     otp_sms_enabled: bool | None = Field(default=None)
     otp_email_enabled: bool | None = Field(default=None)
     otp_whatsapp_enabled: bool | None = Field(default=None)
@@ -319,6 +438,23 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     business_hours_timezone: str | None = Field(default=None, max_length=64)
     business_hours_schedule: dict | None = Field(default=None)
     business_hours_closed_message: str | None = Field(default=None)
+    whitelist_only_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Per-property whitelist-only mode -- see the create schema's "
+            "own description. Setting it true on an organization default "
+            "(`location_id` null) is rejected with a 400; setting it false "
+            "is always allowed."
+        ),
+    )
+    whitelist_only_denied_message: str | None = Field(
+        default=None,
+        description=(
+            "The venue's own words on the whitelist-only refusal screen. "
+            "Omit the key to leave the stored copy untouched; send null to "
+            "clear it and fall back to the frontend's generic default."
+        ),
+    )
     guest_font_choice: str | None = Field(
         default=None,
         max_length=20,
@@ -392,6 +528,12 @@ class CaptivePortalConfigResponse(BaseModel):
     content_body: str | None
     content_image_url: str | None
     content_survey: dict | None
+    collect_guest_name: bool
+    collect_guest_email: bool
+    review_card_enabled: bool
+    review_url: str | None
+    guest_feedback_enabled: bool
+    feedback_dwell_minutes: int
     otp_sms_enabled: bool
     otp_email_enabled: bool
     otp_whatsapp_enabled: bool
@@ -404,6 +546,8 @@ class CaptivePortalConfigResponse(BaseModel):
     business_hours_timezone: str
     business_hours_schedule: dict
     business_hours_closed_message: str | None
+    whitelist_only_enabled: bool
+    whitelist_only_denied_message: str | None
     guest_font_choice: str
     background_overlay_strength: int
     background_focal_x: int
@@ -436,6 +580,25 @@ class ResolvedCaptivePortalConfigResponse(CaptivePortalConfigResponse):
     # Computed live at resolve time (validators.is_open_now), never a
     # stored column -- see that function's own docstring.
     is_open_now: bool
+    # Inherited from CaptivePortalConfigResponse and deliberately taken
+    # back out of the guest-facing payload.
+    #
+    # This endpoint is the one response in this module served to an
+    # unauthenticated guest device, before any login. A guest has no need
+    # to be told the venue is running an allowlist -- they find out if and
+    # when they are refused, in the venue's own words
+    # (`whitelist_only_denied_message`, which DOES stay, exactly as
+    # `business_hours_closed_message` does). Announcing the mode up front
+    # tells anyone who curls this endpoint which properties are running
+    # closed and gives a guest nothing they can act on.
+    #
+    # Two independent guards, on purpose: `exclude=True` keeps it out of
+    # every serialization of this model no matter who builds one, and
+    # `router.resolve_captive_portal_config` additionally pops the key
+    # before construction (the `False` default here is what makes that pop
+    # safe). Either alone would hold; a future edit that removes one
+    # should not be able to leak the field.
+    whitelist_only_enabled: bool = Field(default=False, exclude=True)
     location_country: str | None = Field(
         default=None,
         description=(

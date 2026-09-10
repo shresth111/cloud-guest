@@ -115,6 +115,9 @@ class FakeAuditLogWriter:
 @dataclass
 class FakeGuest:
     id: uuid.UUID
+    #: The spelling the router knows this guest by -- see
+    #: ``enforcement.BlockedGuestRow``.
+    identifier: str = "+919876543210"
 
 
 @dataclass
@@ -291,7 +294,9 @@ def _build(
             adapter.active_macs.add(mac)
 
     session_lookup = FakeSessionLookup(
-        guests={(organization_id, identifier): FakeGuest(id=guest_id)},
+        guests={
+            (organization_id, identifier): FakeGuest(id=guest_id, identifier=identifier)
+        },
         sessions={
             guest_id: (
                 [
@@ -596,7 +601,7 @@ class TestEnforcementIsNeverSilent:
     async def test_a_block_created_with_no_enforcer_records_that_it_was_not_enforced(
         self,
     ) -> None:
-        """"Nothing needed doing" and "nobody was wired up to do it" are
+        """ "Nothing needed doing" and "nobody was wired up to do it" are
         different facts. Collapsing them is how a block that ends no
         sessions goes unnoticed -- which is how the original defect
         survived."""
@@ -732,3 +737,120 @@ class TestRetryAndUnblock:
 
 async def _empty() -> list[DeviceAccessRule]:
     return []
+
+
+# ============================================================================
+# Rules written before the 2026-09 identifier fix
+# ============================================================================
+
+
+class TestLegacySpellingRules:
+    async def test_re_enforcing_a_rule_stored_without_the_plus_finds_the_guest(
+        self,
+    ) -> None:
+        """Until 2026-09 this domain's ``_PHONE_RE`` made the leading "+"
+        optional, so ``guest_access_rules`` holds "919876543210" for
+        guests stored as "+919876543210". An exact-string guest lookup
+        found nobody, and the retry an operator reaches for after an
+        unreachable router therefore removed nothing, ended nothing, and
+        recorded ``ENFORCED`` over a guest who was still streaming.
+        """
+        fx = _build()
+        rule = GuestAccessRule(
+            **_base_fields(
+                organization_id=fx.organization_id,
+                location_id=None,
+                identifier="919876543210",  # no "+", as the old regex allowed
+                rule_type=AccessRuleType.BLOCKLIST.value,
+                reason="abuse",
+                email=None,
+                expires_at=None,
+                is_active=True,
+                enforcement_status=BlockEnforcementStatus.FAILED.value,
+            )
+        )
+        fx.repository.guest_rules[rule.id] = rule
+
+        enforced = await fx.service.enforce_guest_rule(
+            rule_id=rule.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+
+        assert enforced.enforcement_status == BlockEnforcementStatus.ENFORCED.value
+        assert enforced.sessions_ended == 1
+        assert fx.adapter.active_users == set()
+        assert fx.session_lookup.sessions[fx.guest_id][0].status == TERMINATED
+
+    async def test_known_gap_a_bare_national_number_still_resolves_to_no_guest(
+        self,
+    ) -> None:
+        """**This asserts a gap, not a desired behaviour.** Pinned so it
+        is visible and so whoever closes it sees this test fail loudly
+        rather than never noticing it existed.
+
+        A rule stored as "9876543210" names a guest stored as
+        "+919876543210". Recovering that needs a lookup for guests whose
+        identifier *ends with* these digits, and
+        ``LiveSessionLookupProtocol`` deliberately offers only an exact
+        lookup -- the guest domain owns that query and this domain may not
+        import it (see ``enforcement``'s module docstring on the one-way
+        guest -> guest_access dependency). ``check_access``, which every
+        login path consults and which is where the whitelist-only mode
+        gets its answer, *does* match these rows correctly
+        (``repository.list_matching_guest_rules``); it is only the
+        end-the-session-they-are-already-in half that cannot see them.
+        """
+        fx = _build()
+        rule = GuestAccessRule(
+            **_base_fields(
+                organization_id=fx.organization_id,
+                location_id=None,
+                identifier="9876543210",
+                rule_type=AccessRuleType.BLOCKLIST.value,
+                reason="abuse",
+                email=None,
+                expires_at=None,
+                is_active=True,
+                enforcement_status=BlockEnforcementStatus.FAILED.value,
+            )
+        )
+        fx.repository.guest_rules[rule.id] = rule
+
+        enforced = await fx.service.enforce_guest_rule(
+            rule_id=rule.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+
+        assert enforced.sessions_ended == 0
+        assert fx.session_lookup.sessions[fx.guest_id][0].status == ACTIVE
+
+    async def test_a_rule_for_a_different_number_still_ends_nothing(self) -> None:
+        """The widened lookup is bounded at one country code, not "ends
+        with" -- a block for someone else must not end this guest."""
+        fx = _build()
+        rule = GuestAccessRule(
+            **_base_fields(
+                organization_id=fx.organization_id,
+                location_id=None,
+                identifier="+919876500000",
+                rule_type=AccessRuleType.BLOCKLIST.value,
+                reason="abuse",
+                email=None,
+                expires_at=None,
+                is_active=True,
+                enforcement_status=BlockEnforcementStatus.PENDING.value,
+            )
+        )
+        fx.repository.guest_rules[rule.id] = rule
+
+        enforced = await fx.service.enforce_guest_rule(
+            rule_id=rule.id,
+            requesting_organization_id=fx.organization_id,
+            actor_user_id=uuid.uuid4(),
+        )
+
+        assert enforced.sessions_ended == 0
+        assert fx.adapter.active_users == {fx.identifier}
+        assert fx.session_lookup.sessions[fx.guest_id][0].status == ACTIVE

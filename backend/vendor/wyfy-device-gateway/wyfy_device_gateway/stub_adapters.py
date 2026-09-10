@@ -19,6 +19,8 @@ from .contract import (
     DeviceHealthResult,
     DeviceVendor,
     DhcpPoolConfig,
+    HotspotCertificatePush,
+    HotspotCertificatePushResult,
     HotspotDisconnectResult,
     HotspotSessionControl,
     InterfaceInfo,
@@ -143,6 +145,11 @@ class _StubAdapter:
     async def run_speed_test(
         self, creds: DeviceCredentials, *, download_url: str
     ) -> SpeedTestResult:
+        raise self._not_implemented()
+
+    async def push_hotspot_certificate(
+        self, creds: DeviceCredentials, *, push: HotspotCertificatePush
+    ) -> HotspotCertificatePushResult:
         raise self._not_implemented()
 
     async def create_simple_queue(
@@ -286,6 +293,7 @@ class _StubAdapter:
             "get_pppoe_interface_status": False,
             "get_interface_traffic_counters": False,
             "run_speed_test": False,
+            "push_hotspot_certificate": False,
             "create_simple_queue": False,
             "update_simple_queue": False,
             "delete_simple_queue": False,

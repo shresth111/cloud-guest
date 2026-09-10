@@ -476,6 +476,30 @@ class GuestTeamService:
         refreshed = [await self._refresh_team_expiry(team) for team in teams]
         return refreshed, meta
 
+    async def list_open_teams(
+        self, organization_id: uuid.UUID, location_id: uuid.UUID | None
+    ) -> list[tuple[GuestTeam, int]]:
+        """Every team this portal's login screen may offer in its "which
+        group do you belong to?" dropdown -- teams a guest at this location
+        could actually join right now: active (including a lazy expiry
+        refresh, same as every other read), scoped to the location or
+        org-wide, and NOT full (``max_members`` unlimited, or a live active-
+        member count under the cap). Returns ``(team, member_count)`` pairs
+        -- the count is the "not full" evidence AND what the dropdown's
+        "N of M seats filled" line renders."""
+        teams = await self.repository.list_active_teams_for_portal(
+            organization_id=organization_id, location_id=location_id
+        )
+        open_teams: list[tuple[GuestTeam, int]] = []
+        for team in teams:
+            refreshed = await self._refresh_team_expiry(team)
+            if GuestTeamStatus(refreshed.status) != GuestTeamStatus.ACTIVE:
+                continue
+            member_count = await self.repository.count_active_members(refreshed.id)
+            if refreshed.max_members is None or member_count < refreshed.max_members:
+                open_teams.append((refreshed, member_count))
+        return open_teams
+
     async def revoke_team(
         self,
         *,

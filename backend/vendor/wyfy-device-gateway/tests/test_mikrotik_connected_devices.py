@@ -181,3 +181,88 @@ async def test_rows_without_a_mac_are_skipped(patch_connect, mikrotik_creds):
     devices = await MikroTikAdapter().list_connected_devices(mikrotik_creds)
 
     assert [d.mac_address for d in devices] == ["AA:BB:CC:DD:EE:03"]
+
+
+# ============================================================================
+# A lease row is bookkeeping, not liveness (bug: AP down but still "UP")
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_expired_lease_row_is_not_a_seen_device(patch_connect, mikrotik_creds):
+    """RouterOS keeps a powered-off client's lease row after the lease time
+    elapses, its ``status`` now ``expired``. The 15-minute device sync used
+    to treat that row as a seen device and kept refreshing the device's
+    ``is_active``/``last_seen_at``, so a venue access point that physically
+    went down stayed "UP" forever (bug report: "AP Hall Lobby went down but
+    the console still shows UP"). An expired lease must not surface as a
+    device at all -- then the sync's own absent-device flip marks it down."""
+    api = _api(
+        leases=[
+            {
+                "mac-address": "AA:BB:CC:DD:EE:04",
+                "active-address": "10.5.50.23",
+                "status": "expired",
+            },
+            {
+                "mac-address": "AA:BB:CC:DD:EE:05",
+                "active-address": "10.5.50.24",
+                "status": "waiting",
+            },
+        ],
+        arp=[],
+    )
+    patch_connect(api)
+
+    devices = await MikroTikAdapter().list_connected_devices(mikrotik_creds)
+
+    assert devices == [], (
+        "neither an expired nor a waiting lease is a live client -- "
+        "both must be invisible to the sync so their devices flip down"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bound_lease_row_is_a_seen_device(patch_connect, mikrotik_creds):
+    """The counterpart: a genuinely bound lease is still served by the
+    router and must keep surfacing as a device."""
+    api = _api(
+        leases=[
+            {
+                "mac-address": "AA:BB:CC:DD:EE:06",
+                "active-address": "10.5.50.25",
+                "host-name": "pixel-7",
+                "status": "bound",
+            }
+        ],
+        arp=[],
+    )
+    patch_connect(api)
+
+    devices = await MikroTikAdapter().list_connected_devices(mikrotik_creds)
+
+    assert [d.mac_address for d in devices] == ["AA:BB:CC:DD:EE:06"]
+    assert devices[0].hostname == "pixel-7"
+
+
+@pytest.mark.asyncio
+async def test_lease_row_without_a_status_field_stays_visible(
+    patch_connect, mikrotik_creds
+):
+    """``status`` is absent on this project's older fake transports and some
+    RouterOS print shapes -- absence must keep the row (backward
+    compatible); only an explicit non-``bound`` status drops it."""
+    api = _api(
+        leases=[
+            {
+                "mac-address": "AA:BB:CC:DD:EE:07",
+                "active-address": "10.5.50.26",
+            }
+        ],
+        arp=[],
+    )
+    patch_connect(api)
+
+    devices = await MikroTikAdapter().list_connected_devices(mikrotik_creds)
+
+    assert [d.mac_address for d in devices] == ["AA:BB:CC:DD:EE:07"]

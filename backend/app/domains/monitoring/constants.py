@@ -317,6 +317,39 @@ ALERT_TARGET_ISP_LINK = "isp_link"
 # distinction that domain's own module docstring already draws.
 ALERT_TARGET_MONITORED_HARDWARE = "monitored_hardware"
 
+# Sentinel ``AlertRule.target_component`` value for the FAST outage rule:
+# a ``HEALTH_STATUS_CHANGE`` rule watching every in-scope
+# ``app.domains.router.models.Router.reachability_state``.
+#
+# ## Why this is not ``ALERT_TARGET_ROUTER``
+#
+# ``ALERT_TARGET_ROUTER`` watches ``Router.health_status``, which moves with
+# ``Router.status`` and is therefore written on the 15-minute
+# ``ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES`` clock that
+# ``compute_lifecycle_stage``, ``compute_internet_availability`` and the
+# frontend's ``location-liveness`` module all share. That is the right
+# number for "what does the platform believe about this router" and the
+# wrong number for "email the venue owner now": with a 5-minute heartbeat
+# on top of it, the floor is about twenty minutes. Lowering it would
+# silently re-time every one of those readers -- the exact drift
+# ``RouterService.sweep_stale_heartbeats``'s docstring warns about.
+#
+# So this is a second target, not a second threshold on the first one.
+# ``Router.reachability_state`` is written only by
+# ``RouterService.sweep_router_reachability`` (every 30s, off the 60-second
+# agent poll, debounced over two misses, confirmed against the hub's live
+# WireGuard state) and read only here. ``ALERT_TARGET_ROUTER`` keeps
+# meaning exactly what it meant, and a venue can sensibly have both rules:
+# this one pages in two minutes, that one is the slower, fleet-wide
+# statement of record.
+#
+# ``expected_status`` must be ``"unreachable"``. ``"unknown"``/NULL means
+# the sweep has never been able to judge this router -- a freshly enrolled
+# device, one whose agent credential expired, one mid-provisioning -- and
+# alerting on an unanswered question is precisely what
+# ``ALERT_TARGET_ROGUE_DHCP_GUARD``'s own validator refuses to do.
+ALERT_TARGET_ROUTER_REACHABILITY = "router_reachability"
+
 # Sentinel ``AlertRule.target_component`` value for a ``HEALTH_STATUS_CHANGE``
 # rule that watches, per router, whether that router is still *watching* for
 # a DHCP server on the guest network that isn't ours -- the rolled-up
@@ -700,6 +733,7 @@ __all__ = [
     "ALERT_TARGET_ROUTER",
     "ALERT_TARGET_ISP_LINK",
     "ALERT_TARGET_MONITORED_HARDWARE",
+    "ALERT_TARGET_ROUTER_REACHABILITY",
     "ALERT_TARGET_ROGUE_DHCP_GUARD",
     "ROGUE_DHCP_STATE_UNGUARDED",
     "ROGUE_DHCP_STATE_GUARDED",

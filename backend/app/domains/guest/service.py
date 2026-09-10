@@ -237,6 +237,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 import secrets
 import uuid
 from collections.abc import Sequence
@@ -254,8 +255,11 @@ from app.domains.auth.password import (
     PasswordVerificationError,
 )
 from app.domains.captive_portal.service import ResolvedPortalConfig
-from app.domains.captive_portal.validators import is_open_now
-from app.domains.guest_access.exceptions import GuestAccessDeniedError
+from app.domains.captive_portal.validators import compute_terms_version, is_open_now
+from app.domains.guest_access.exceptions import (
+    GuestAccessDeniedError,
+    WhitelistOnlyAccessDeniedError,
+)
 from app.domains.guest_access.service import AccessDecision
 from app.domains.location.models import Location
 from app.domains.mac_authorization.exceptions import MacAuthorizationError
@@ -283,10 +287,13 @@ from app.domains.voucher.models import Voucher, VoucherBatch
 
 from .constants import (
     BYTES_PER_MB,
+    DEFAULT_IDLE_TIMEOUT_MINUTES,
     DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
     DEFAULT_MAX_DEVICES_PER_GUEST,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
+    LAST_ENDED_SESSION_WINDOW_MINUTES,
     MAX_BULK_DEVICE_LOOKUP_IDS,
+    MAX_BULK_VOUCHER_LOOKUP_IDS,
     NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES,
     PIN_LENGTH,
     PIN_LOCKOUT_MINUTES,
@@ -295,7 +302,9 @@ from .constants import (
     RECONNECT_GRACE_MINUTES,
     SET_PASSWORD_SESSION_WINDOW_MINUTES,
     TERMINATION_RECONNECT_COOLDOWN_MINUTES,
+    WHITELIST_ONLY_LOGIN_FAILURE_REASON,
     GuestAuthMethod,
+    GuestSessionEndedReason,
     GuestSessionStatus,
     NasStatus,
     QuotaPeriodType,
@@ -325,6 +334,8 @@ from .events import (
     RadiusNasRegistered,
     RadiusNasSecretRegenerated,
     RadiusNasUpdated,
+    WhitelistOnlyGateFailedOpen,
+    WhitelistOnlyLoginRefused,
 )
 from .exceptions import (
     ConcurrentSessionLimitExceededError,
@@ -343,7 +354,9 @@ from .exceptions import (
     GuestPinLoginFailedError,
     GuestPinSetupNotAuthorizedError,
     GuestPinTooWeakError,
+    GuestProfileFieldNotCollectedError,
     GuestProfileUpdateNotAuthorizedError,
+    GuestReviewLinkOpenedNotAuthorizedError,
     GuestSelfDisconnectNotAuthorizedError,
     GuestSessionNotFoundError,
     GuestTeamSharedQuotaExceededError,
@@ -359,6 +372,7 @@ from .exceptions import (
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
     TooManyDeviceIdsError,
+    TooManyVoucherIdsError,
     VenueClosedError,
 )
 from .models import (
@@ -387,9 +401,11 @@ from .repository import (
     DeviceSessionCount,
     GuestRepositoryProtocol,
     LocationSessionCount,
+    VoucherRedemptionRow,
 )
 from .validators import (
     compute_period_start,
+    has_session_reached_time_limit,
     is_concurrent_session_limit_reached,
     is_device_limit_reached,
     is_fup_usage_exceeded,
@@ -760,6 +776,24 @@ class CaptivePortalLookupProtocol(Protocol):
         location_id: uuid.UUID | None,
     ) -> ResolvedPortalConfig: ...
 
+    async def get_config(
+        self,
+        config_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> Any:
+        """The one config the caller names by id, rather than the one that
+        resolves for an organization and location.
+
+        Needed by ``record_consent`` alone, and only because a consent row
+        is written against a specific ``captive_portal_config_id`` the
+        portal already resolved -- stamping it with the version of a
+        *differently* resolved config would be a worse record than no
+        version at all. Satisfied structurally by the real
+        ``CaptivePortalService``.
+        """
+        ...
+
 
 class RouterLookupProtocol(Protocol):
     async def get_router(
@@ -835,7 +869,15 @@ class AccessDecisionProtocol(Protocol):
     ``GuestSessionBroadcastProtocol``/``monitoring_hook`` above already
     establishes for the Real-Time Engine. See
     ``GuestService.__init__``'s docstring for why this hook is additive
-    (``None``-by-default) rather than a required dependency."""
+    (``None``-by-default) rather than a required dependency.
+
+    ``whitelist_only_enabled`` travels *down* this protocol rather than
+    being looked up behind it. ``app.domains.guest_access`` documents its
+    own acyclic module graph as a design constraint and must never import
+    ``app.domains.captive_portal``, where the flag lives -- and the caller
+    on this side has the resolved config in hand already (see
+    ``_enforce_access_control``). So the boolean is an argument, and the
+    resolver stays a pure function."""
 
     async def check_access(
         self,
@@ -845,6 +887,7 @@ class AccessDecisionProtocol(Protocol):
         location_id: uuid.UUID | None,
         identifier: str | None,
         mac_address: str | None,
+        whitelist_only_enabled: bool = False,
     ) -> AccessDecision: ...
 
 
@@ -861,7 +904,11 @@ class MacAuthorizationLookupProtocol(Protocol):
     ``policy_lookup``'s absent-hook fallback -- never a crash."""
 
     async def is_mac_authorized(
-        self, mac_address: str, *, organization_id: uuid.UUID
+        self,
+        mac_address: str,
+        *,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
     ) -> bool: ...
 
 
@@ -1004,45 +1051,94 @@ async def run_fup_time_accrual(
     own test suite can exercise the exact same logic against fakes with no
     live Postgres/Celery broker needed at all.
 
-    For every distinct ``(guest_id, organization_id)`` pair with at least
-    one currently ``ACTIVE`` session, resolves that organization's own
-    ``PolicyType.FUP`` time limits; if none are configured at all, the
-    guest is skipped entirely (no accrual round trip is worth paying for a
-    guest whose organization never opted into time-based quotas -- unlike
-    byte usage, which is tracked unconditionally in
-    ``GuestService.record_usage`` because it rides for free on a call
-    that already happens regardless). Otherwise, for each configured
-    period, adds the wall-clock minutes elapsed since the row's own
-    ``last_accrued_at`` (or ``period_start``) into ``minutes_used`` --
+    For every distinct guest with at least one currently ``ACTIVE``
+    session, resolves that guest's own ``PolicyType.FUP`` time limits; if
+    none are configured at all, the guest is skipped entirely (no accrual
+    round trip is worth paying for a guest whose organization never opted
+    into time-based quotas -- unlike byte usage, which is tracked
+    unconditionally in ``GuestService.record_usage`` because it rides for
+    free on a call that already happens regardless). Otherwise, for each
+    configured period, adds the wall-clock minutes elapsed since the row's
+    own ``last_accrued_at`` (or ``period_start``) into ``minutes_used`` --
     guest-level connected time, not summed across concurrent sessions (see
     ``models.GuestQuotaUsage``'s own docstring for why). A guest whose
     accrued usage now meets or exceeds a configured limit has every one of
     their currently ``ACTIVE`` sessions expired. Returns a summary dict
-    (rows accrued into, sessions expired)."""
+    (rows accrued into, sessions expired).
+
+    ## Resolution passes the guest's real location, and used not to
+
+    This resolved with a hardcoded ``location_id=None``.
+    ``repository.list_candidate_assignments`` only adds its LOCATION-scope
+    predicate when a real ``location_id`` arrives, so a ``PolicyAssignment``
+    with ``scope_type=location`` on an FUP policy was never a candidate
+    here -- the identical defect ``GuestService._enforce_fup_quota``'s own
+    docstring describes, in the one place it mattered most.
+
+    It mattered most here because these two halves are not independent.
+    ``_enforce_fup_quota`` is a login-time *gate*: it reads
+    ``minutes_used`` and refuses a guest who has already spent their
+    allowance. This sweep is the only thing that ever *writes*
+    ``minutes_used``. So a venue that assigned its FUP policy to a location
+    -- which is exactly what the dashboard's Guest WiFi Limits screen does,
+    it has no other scope to offer -- got a sweep that resolved no limits,
+    skipped the guest, and never accrued a minute. ``minutes_used`` stayed
+    0 for ever, so the login gate (fixed earlier, and correct) had nothing
+    to gate on and also never fired. Fixing either half alone leaves a
+    daily time limit that still does nothing; this is the other half.
+
+    ## One accrual per guest, even across locations
+
+    ``list_active_guest_org_pairs`` now returns one row per distinct
+    ``(guest, organization, location)``, so a guest holding active sessions
+    at two of an organization's locations appears twice. Accruing per row
+    would double their elapsed minutes and expire them at half their real
+    allowance. The rows are therefore grouped back together by guest, and
+    each guest is accrued exactly once.
+
+    Their limits are merged across those locations by taking the strictest
+    (smallest) configured value for each period. A guest connected at two
+    sites is genuinely subject to both venues' rules, and of the available
+    readings this is the only one that cannot let a guest exceed a limit
+    somebody actually set. The case is rare; picking a defensible answer
+    for it is cheaper than leaving it to row ordering.
+    """
     pairs = await repository.list_active_guest_org_pairs()
     accrued_rows = 0
     expired_sessions = 0
+    locations_by_guest: dict[tuple[uuid.UUID, uuid.UUID], list[uuid.UUID | None]] = {}
     for pair in pairs:
-        tz_name = await repository.get_organization_timezone(pair.organization_id)
-        resolved = await policy_lookup.resolve_effective_policy(
-            policy_type=PolicyType.FUP,
-            organization_id=pair.organization_id,
-            location_id=None,
-            guest_id=pair.guest_id,
+        locations_by_guest.setdefault((pair.guest_id, pair.organization_id), []).append(
+            pair.location_id
         )
-        time_limits = {
-            QuotaPeriodType.DAILY: resolved.rules.get("daily_time_limit_minutes"),
-            QuotaPeriodType.WEEKLY: resolved.rules.get("weekly_time_limit_minutes"),
-            QuotaPeriodType.MONTHLY: resolved.rules.get("monthly_time_limit_minutes"),
-        }
+    for (guest_id, organization_id), location_ids in locations_by_guest.items():
+        tz_name = await repository.get_organization_timezone(organization_id)
+        time_limits: dict[QuotaPeriodType, int | None] = dict.fromkeys(
+            FUP_TIME_LIMIT_RULE_KEYS
+        )
+        for location_id in location_ids:
+            resolved = await policy_lookup.resolve_effective_policy(
+                policy_type=PolicyType.FUP,
+                organization_id=organization_id,
+                location_id=location_id,
+                guest_id=guest_id,
+            )
+            for period_type, rule_key in FUP_TIME_LIMIT_RULE_KEYS.items():
+                candidate = resolved.rules.get(rule_key)
+                if candidate is None:
+                    continue
+                current = time_limits[period_type]
+                time_limits[period_type] = (
+                    candidate if current is None else min(current, candidate)
+                )
         if not any(time_limits.values()):
             continue
         violated_period: str | None = None
         for period_type, limit_minutes in time_limits.items():
             usage = await get_or_reset_quota_usage(
                 repository,
-                guest_id=pair.guest_id,
-                organization_id=pair.organization_id,
+                guest_id=guest_id,
+                organization_id=organization_id,
                 period_type=period_type,
                 tz_name=tz_name,
                 now=now,
@@ -1065,9 +1161,7 @@ async def run_fup_time_accrual(
             ):
                 violated_period = period_type.value
         if violated_period is not None:
-            active_sessions = await repository.list_active_sessions_for_guest(
-                pair.guest_id
-            )
+            active_sessions = await repository.list_active_sessions_for_guest(guest_id)
             reason = f"fup_time_quota_exceeded_{violated_period}"
             for active_session in active_sessions:
                 updated_session = await repository.update_session(
@@ -1200,11 +1294,196 @@ class GuestLoginResult:
     is_new_guest: bool
 
 
+#: The single ``disconnect_reason`` literal that means "this session ran
+#: out of time" -- written only by ``enforce_session_timeouts`` above.
+#: Matched exactly, never by prefix or substring: the other ``EXPIRED``
+#: reasons (``data_limit_exceeded``, ``fup_data_quota_exceeded_daily``,
+#: ...) are quota exhaustion, which is a different thing to tell a guest
+#: and is deliberately not told to them here at all.
+SESSION_TIMEOUT_DISCONNECT_REASON = "inactivity_timeout"
+
+#: RFC 2866 §5.10 ``Acct-Terminate-Cause`` value 5, forwarded verbatim by
+#: FreeRADIUS (``ops/freeradius/rest.conf``) into ``disconnect_reason``
+#: when a NAS stops accounting because its own ``Session-Timeout`` ran
+#: out. This is the founder's case as it actually arrives: RouterOS
+#: enforces the ``Session-Timeout`` this platform put in the Access-Accept
+#: and then reports the stop, so the session lands as ``DISCONNECTED``
+#: with this string -- **not** as ``EXPIRED``, which only the platform's
+#: own idle sweep ever writes.
+#:
+#: Matching a NAS-supplied string is safe in a way that matching an
+#: operator-supplied one would not be: it is compared, never returned,
+#: and it arrives from a NAS already authenticated by its shared secret,
+#: from a closed RFC enumeration rather than a free-text field.
+#:
+#: ``Idle-Timeout`` (cause 4) is not here, and has its own constant
+#: directly below. It used to be excluded outright, on the reasoning that
+#: "RouterOS's own hotspot profile carries ``idle-timeout: 30m``
+#: independently of anything this platform sends, and 'your device was
+#: idle' is what the generic disconnected copy already describes well."
+#: That reasoning was correct for as long as its premise held, and the
+#: premise has since stopped holding: this platform now *sends*
+#: ``Idle-Timeout`` on every Access-Accept, from the venue's own SESSION
+#: policy (``GuestService._resolve_idle_timeout_minutes``). Cause 4 no
+#: longer reports a number nobody chose -- it reports the venue's own
+#: setting firing, which is a different and tellable event.
+#:
+#: The two stay separate constants rather than becoming one set, because
+#: they must not collapse into one message. A guest whose Session-Timeout
+#: ran out has used their full allotted time and can sign straight back
+#: in; a guest whose Idle-Timeout fired was not using the connection at
+#: all and is usually surprised to find themselves signed out. Telling
+#: either of them the other's story is worse than telling them nothing.
+RADIUS_SESSION_TIMEOUT_TERMINATE_CAUSE = "Session-Timeout"
+
+#: RFC 2866 s5.10 ``Acct-Terminate-Cause`` value 4, arriving by the exact
+#: same route as ``RADIUS_SESSION_TIMEOUT_TERMINATE_CAUSE`` above (the NAS
+#: sets it, FreeRADIUS forwards it verbatim into ``disconnect_reason``, and
+#: the session lands ``DISCONNECTED``). It means the device passed no
+#: traffic for longer than the ``Idle-Timeout`` this platform put in the
+#: Access-Accept.
+#:
+#: Same safety argument as its sibling: compared, never returned, from a
+#: closed RFC enumeration, arriving from a NAS already authenticated by its
+#: shared secret.
+#:
+#: Honest limit, worth stating: a router provisioned before this platform
+#: sent the attribute -- or one whose hotspot profile still carries its own
+#: ``idle-timeout`` and whose firmware ignores the RADIUS value -- also
+#: reports cause 4. The guest is then shown "you were idle", which remains
+#: true; only the *number* on the screen (this session's recorded
+#: ``idle_timeout_minutes``) might not be the one the device applied. The
+#: copy is written to survive that: it names the venue's setting, and a
+#: session with no recorded value shows no number at all.
+RADIUS_IDLE_TIMEOUT_TERMINATE_CAUSE = "Idle-Timeout"
+
+#: The exact ``disconnect_reason`` literals ``run_fup_time_accrual`` writes
+#: when a guest has spent their venue-configured connected-time allowance
+#: for a period. Built from ``QuotaPeriodType`` rather than typed out, so a
+#: new period can never be added with an ending the portal silently fails
+#: to recognise.
+#:
+#: A frozenset of exact strings, matched by membership and never by prefix
+#: -- the same discipline ``SESSION_TIMEOUT_DISCONNECT_REASON`` keeps, and
+#: for the same reason: the neighbouring ``fup_data_quota_exceeded_*``
+#: reasons share this stem, and they are a different thing to tell a guest
+#: (data spent, not time spent).
+FUP_TIME_QUOTA_DISCONNECT_REASONS = frozenset(
+    f"fup_time_quota_exceeded_{period.value}" for period in QuotaPeriodType
+)
+
+#: Which ``FUPPolicyRules`` field carries each period's connected-time cap.
+#: Module scope so ``run_fup_time_accrual`` does not rebuild it once per
+#: guest, and so the mapping is stated once rather than spelled out at each
+#: of the two places that read these rules.
+FUP_TIME_LIMIT_RULE_KEYS: dict[QuotaPeriodType, str] = {
+    QuotaPeriodType.DAILY: "daily_time_limit_minutes",
+    QuotaPeriodType.WEEKLY: "weekly_time_limit_minutes",
+    QuotaPeriodType.MONTHLY: "monthly_time_limit_minutes",
+}
+
+
+def _ended_session_reason(session: GuestSession) -> GuestSessionEndedReason | None:
+    """Map an already-ended ``GuestSession`` to the coarse, guest-safe
+    vocabulary the captive portal is allowed to see, or ``None`` when a
+    guest should be told nothing at all about this ending.
+
+    Module scope, not a private method, so the whole decision table can
+    be tested against real ``GuestSession`` rows without standing up a
+    ``GuestService`` and its dependency chain -- the same reason
+    ``enforce_session_timeouts`` and ``is_session_timed_out`` live where
+    they do.
+
+    Fails closed by construction: the returns are an allowlist, and
+    anything not named -- a new status, a new ``EXPIRED`` reason -- falls
+    through to ``None`` and shows an ordinary sign-in page. The failure
+    mode of a missing case is a guest who is told nothing, which is
+    today's behaviour and is merely unhelpful. The failure mode of an
+    open default would be a guest told something false about why their
+    internet stopped.
+
+    See ``GuestService.get_last_ended_session_for_device`` for why each
+    branch is what it is.
+    """
+    if session.status == GuestSessionStatus.DISCONNECTED.value:
+        # The founder's case arrives here, not in the EXPIRED branch
+        # below: the router enforced the Session-Timeout and told us so
+        # via Accounting-Stop, which ends the session as DISCONNECTED and
+        # carries the NAS's own terminate cause. Reading it is what makes
+        # "your time is up" available instead of the vaguer "you were
+        # disconnected" -- the two are different messages to a guest, and
+        # only one of them explains a venue's 30-minute limit.
+        if session.disconnect_reason == RADIUS_SESSION_TIMEOUT_TERMINATE_CAUSE:
+            return GuestSessionEndedReason.TIMED_OUT
+        # The venue's own idle timeout, enforced on the device and reported
+        # back as cause 4. Checked before the DISCONNECTED fall-through
+        # rather than folded into it: since this platform started sending
+        # Idle-Timeout, this is the venue's setting firing, not an
+        # unattributable drop. See RADIUS_IDLE_TIMEOUT_TERMINATE_CAUSE.
+        if session.disconnect_reason == RADIUS_IDLE_TIMEOUT_TERMINATE_CAUSE:
+            return GuestSessionEndedReason.IDLE_TIMED_OUT
+        return GuestSessionEndedReason.DISCONNECTED
+    if session.status == GuestSessionStatus.EXPIRED.value:
+        if session.disconnect_reason == SESSION_TIMEOUT_DISCONNECT_REASON:
+            return GuestSessionEndedReason.TIMED_OUT
+        # The venue's daily/weekly/monthly connected-time allowance, spent.
+        # Separated from TIMED_OUT because the advice differs: a timed-out
+        # guest signs back in and carries on, whereas this guest cannot get
+        # back on until the period rolls over, and telling them to "sign in
+        # again" would send them round a loop that refuses them.
+        if session.disconnect_reason in FUP_TIME_QUOTA_DISCONNECT_REASONS:
+            return GuestSessionEndedReason.TIME_LIMIT_REACHED
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class GuestLastEndedSessionResult:
+    """What ``GuestService.get_last_ended_session_for_device`` hands back.
+
+    Carries no ``Guest`` and no ``GuestSession`` on purpose. Every other
+    read model in this module returns the ORM rows and lets the router
+    pick fields off them; this one cannot, because its consumer is an
+    unauthenticated endpoint and the rows carry an unmasked
+    ``identifier`` and a ``disconnect_reason`` holding operators' private
+    notes. Handing the router those rows would make leaking them a
+    one-line mistake in a file where that one line looks exactly like
+    every neighbouring line. The redaction is done here, once, by
+    construction -- what does not travel cannot be serialised.
+    """
+
+    reason: GuestSessionEndedReason
+    session_timeout_minutes: int | None
+    # The idle timeout this session actually carried, so a guest idled out
+    # can be told the venue's real number rather than whatever happens to be
+    # configured by the time they read the screen. None for a session that
+    # recorded none (every row predating the column), in which case the
+    # portal shows the reason without a number rather than inventing one.
+    #
+    # Safe by the same test every other field on this model had to pass: it
+    # is venue policy, identical for every guest at the location, so it
+    # tells a stranger holding an observed MAC nothing about the guest.
+    idle_timeout_minutes: int | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class RadiusAuthorizeResult:
     authorized: bool
     session_timeout_seconds: int | None
     data_limit_mb: int | None
+    # RFC 2865 s5.28 Idle-Timeout, in seconds -- how long the NAS lets this
+    # device pass zero bytes before closing the session. None means "send no
+    # attribute", which leaves whatever the device's own hotspot profile
+    # says standing; that is the behaviour every session had before this
+    # platform sent the attribute, and is what a session row predating
+    # GuestSession.idle_timeout_minutes still gets.
+    #
+    # Unlike session_timeout_seconds this is NOT a remaining allowance and
+    # must never be turned into one. An idle timeout is a rolling window the
+    # NAS resets on every packet, so the full configured value is the
+    # correct thing to send on every re-authorization; sending "what is
+    # left" would be a category error that shrank a guest's idle allowance
+    # each time anything spoke to RADIUS.
+    idle_timeout_seconds: int | None = None
     # A real Mikrotik-Rate-Limit RADIUS reply-attribute value (see
     # app.domains.queue_management.service.format_mikrotik_rate_limit),
     # or None when no queue_lookup hook is wired or the session has no
@@ -1388,6 +1667,13 @@ class GuestService:
         self.queue_assignment_hook = queue_assignment_hook
         self.queue_assignment_dispatcher = queue_assignment_dispatcher
         self.policy_lookup = policy_lookup
+        # Request-scoped memo for _resolve_session_policy_rules -- see its
+        # own docstring. GuestService is constructed per request by
+        # dependencies.get_guest_service, so this never outlives one login.
+        self._session_policy_cache: dict[
+            tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None],
+            dict[str, Any],
+        ] = {}
         self.mac_authorization_hook = mac_authorization_hook
         self.team_quota_hook = team_quota_hook
         self.redis = redis
@@ -1438,7 +1724,7 @@ class GuestService:
         """Best-effort, additive dynamic bandwidth-queue assignment -- see
         ``QueueAssignmentProtocol``'s own docstring for the full write-up.
         A no-op when no ``queue_assignment_hook`` was wired (the default);
-        never raises. Targets the newly-created ``session`` itself (not
+        never raises. Targets the ``session`` itself (not
         the guest) -- a real RouterOS ``/queue simple`` entry is tied to
         one concrete IP address, and ``session.ip_address`` is the only
         one that is actually correct *right now*; a guest-level
@@ -1448,7 +1734,50 @@ class GuestService:
         GUEST-targeted bandwidth override for *this* guest outranks the
         location's own default when picking which queue profile to apply
         -- only the RouterOS-facing target stays session-scoped, the
-        policy that determines its rate is guest-scoped."""
+        policy that determines its rate is guest-scoped.
+
+        **Called on every login, not only when a session was created.**
+        Every one of the five login methods runs this outside its own
+        ``if created:`` block, unlike the real-time arrival broadcast and
+        the visit counter, which describe an arrival that did not happen
+        on a reused row.
+
+        Speed is the one entitlement that does not live on the session
+        row. ``_reuse_or_create_session`` deliberately re-resolves and
+        writes ``session_timeout_minutes``, ``idle_timeout_minutes``,
+        ``data_limit_mb``, ``auth_method`` and ``voucher_id`` onto a
+        reused session, precisely so a returning guest gets what the venue
+        has configured *now*. Speed instead lives in the SESSION-targeted
+        ``QueueAssignment`` this method creates -- the row
+        ``RadiusService.authorize`` reads to compose the
+        ``Mikrotik-Rate-Limit`` reply attribute, and the row
+        ``QueueManagementService.apply_queue`` turns into a real
+        ``/queue simple`` entry. Resolving it only on ``created`` pinned a
+        guest to the rate that applied the moment their session first
+        opened.
+
+        That was not a short window. A guest who keeps using the network
+        never reaches that moment again: each re-login is a reuse, and a
+        reuse bumps ``last_activity_at``, so the session is refreshed
+        rather than replaced, indefinitely. Their speed could not change,
+        whatever the dashboard showed and whatever the RADIUS reply
+        recomputed around it. Bug report: "speed is only set to 20 and not
+        updating".
+
+        Running it on every login is safe because
+        ``QueueManagementService.resolve_and_assign_queue`` is idempotent
+        by construction: an unchanged rate resolves to the same
+        ``QueueProfile``, finds this session's existing assignment already
+        pointing at it, and returns without a single device call. Only a
+        genuinely changed rate does work, and it does it through
+        ``move_queue``, which applies the new ``/queue simple`` *before*
+        pulling the old one -- so a guest is never left at zero bandwidth
+        in between.
+
+        ``_assign_voucher_queue`` deliberately did **not** move with it:
+        it creates a fresh VOUCHER-targeted assignment on every call with
+        no find-or-reuse step, so running it per login would accumulate
+        duplicate assignments rather than converge on one."""
         if not session.ip_address:
             return
 
@@ -1613,6 +1942,13 @@ class GuestService:
             location_id=location_id,
             identifier=identifier,
             device_mac=device_mac,
+            auth_method=auth_method,
+            guest=existing_guest,
+            ip_address=ip_address,
+            whitelist_only_enabled=bool(resolved.config.whitelist_only_enabled),
+            whitelist_only_denied_message=(
+                resolved.config.whitelist_only_denied_message
+            ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
@@ -1622,7 +1958,11 @@ class GuestService:
             # before OTP verification below, not after, so a guest already
             # at the limit never spends a real (rate-limited, one-time) OTP
             # attempt on a login that was always going to be rejected.
-            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_concurrent_session_limit(
+                existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
             # Same "brand-new guest trivially holds zero devices" skip --
             # see _enforce_device_limit's own docstring. Its return value
             # is threaded into _maybe_get_or_create_device below as
@@ -1637,7 +1977,9 @@ class GuestService:
             )
             # Same skip -- see _enforce_fup_quota's own docstring.
             await self._enforce_fup_quota(
-                guest_id=existing_guest.id, organization_id=resolved_org_id
+                guest_id=existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -1675,6 +2017,11 @@ class GuestService:
             location_id=location_id,
             guest_id=guest.id,
         )
+        resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -1687,6 +2034,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=None,
             session_timeout_minutes=resolved_session_timeout,
+            idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:
             # BE-011 Part 3: additive, best-effort real-time broadcast --
@@ -1702,13 +2050,19 @@ class GuestService:
                 auth_method=auth_method.value,
                 is_new_guest=is_new,
             )
-            await self._assign_guest_queue(
-                session=session,
-                router=router,
-                location_id=location_id,
-                organization_id=resolved_org_id,
-            )
             await self._bump_guest_visit(guest)
+        # Deliberately outside the ``if created:`` block above, unlike
+        # every other side effect there -- see ``_assign_guest_queue``'s
+        # own docstring for why, and for the bug that put it here. The
+        # same call sits outside ``if created:`` in all five login
+        # methods.
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -1760,6 +2114,13 @@ class GuestService:
             location_id=location_id,
             identifier=identifier,
             device_mac=device_mac,
+            auth_method=GuestAuthMethod.VOUCHER,
+            guest=existing_guest,
+            ip_address=ip_address,
+            whitelist_only_enabled=bool(resolved.config.whitelist_only_enabled),
+            whitelist_only_denied_message=(
+                resolved.config.whitelist_only_denied_message
+            ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
@@ -1768,7 +2129,11 @@ class GuestService:
             # below, not after, so a guest already at the limit never
             # spends a real (single-use) voucher on a login that was always
             # going to be rejected.
-            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_concurrent_session_limit(
+                existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
             known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=device_mac,
@@ -1776,7 +2141,9 @@ class GuestService:
                 location_id=location_id,
             )
             await self._enforce_fup_quota(
-                guest_id=existing_guest.id, organization_id=resolved_org_id
+                guest_id=existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -1810,6 +2177,19 @@ class GuestService:
             device_name=device_name,
             known_device=known_device,
         )
+        # A voucher batch carries its own validity and data allowance, so
+        # those two come from the batch. It carries no idle timeout -- there
+        # is no such field on a batch and no reason there should be: how long
+        # a voucher is good for is a property of the voucher, whereas how long
+        # a silent device may hold a slot is a property of the venue's
+        # network. So this one resolves from the SESSION policy exactly as
+        # every other login path does, which also means a voucher guest and
+        # an OTP guest at the same location are treated identically.
+        resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         # Copied, not referenced -- see module docstring.
         session, created = await self._reuse_or_create_session(
             guest=guest,
@@ -1823,6 +2203,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=batch.data_limit_mb,
             session_timeout_minutes=batch.validity_minutes,
+            idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:
             # BE-011 Part 3: additive, best-effort real-time broadcast --
@@ -1838,12 +2219,6 @@ class GuestService:
                 auth_method=GuestAuthMethod.VOUCHER.value,
                 is_new_guest=is_new,
             )
-            await self._assign_guest_queue(
-                session=session,
-                router=router,
-                location_id=location_id,
-                organization_id=resolved_org_id,
-            )
             # Phase 1 BhaiFi-parity: additive, best-effort speed-linked
             # voucher assignment -- see _assign_voucher_queue's own
             # docstring.
@@ -1855,6 +2230,18 @@ class GuestService:
                 organization_id=resolved_org_id,
             )
             await self._bump_guest_visit(guest)
+        # Deliberately outside the ``if created:`` block above, unlike
+        # every other side effect there -- see ``_assign_guest_queue``'s
+        # own docstring for why, and for the bug that put it here. The
+        # same call sits outside ``if created:`` in all five login
+        # methods.
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -1936,10 +2323,21 @@ class GuestService:
             location_id=location_id,
             identifier=identifier,
             device_mac=device_mac,
+            auth_method=GuestAuthMethod.USERNAME_PASSWORD,
+            guest=existing_guest,
+            ip_address=ip_address,
+            whitelist_only_enabled=bool(resolved.config.whitelist_only_enabled),
+            whitelist_only_denied_message=(
+                resolved.config.whitelist_only_denied_message
+            ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
-            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_concurrent_session_limit(
+                existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
             known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=device_mac,
@@ -1947,7 +2345,9 @@ class GuestService:
                 location_id=location_id,
             )
             await self._enforce_fup_quota(
-                guest_id=existing_guest.id, organization_id=resolved_org_id
+                guest_id=existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -1977,6 +2377,11 @@ class GuestService:
             location_id=location_id,
             guest_id=guest.id,
         )
+        resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -1989,6 +2394,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=None,
             session_timeout_minutes=resolved_session_timeout,
+            idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:
             await self._broadcast_guest_session_started(
@@ -2000,13 +2406,19 @@ class GuestService:
                 auth_method=GuestAuthMethod.USERNAME_PASSWORD.value,
                 is_new_guest=False,
             )
-            await self._assign_guest_queue(
-                session=session,
-                router=router,
-                location_id=location_id,
-                organization_id=resolved_org_id,
-            )
             await self._bump_guest_visit(guest)
+        # Deliberately outside the ``if created:`` block above, unlike
+        # every other side effect there -- see ``_assign_guest_queue``'s
+        # own docstring for why, and for the bug that put it here. The
+        # same call sits outside ``if created:`` in all five login
+        # methods.
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -2181,10 +2593,21 @@ class GuestService:
             location_id=location_id,
             identifier=identifier,
             device_mac=device_mac,
+            auth_method=GuestAuthMethod.PIN,
+            guest=existing_guest,
+            ip_address=ip_address,
+            whitelist_only_enabled=bool(resolved.config.whitelist_only_enabled),
+            whitelist_only_denied_message=(
+                resolved.config.whitelist_only_denied_message
+            ),
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
-            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_concurrent_session_limit(
+                existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
             known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=device_mac,
@@ -2192,7 +2615,9 @@ class GuestService:
                 location_id=location_id,
             )
             await self._enforce_fup_quota(
-                guest_id=existing_guest.id, organization_id=resolved_org_id
+                guest_id=existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -2261,6 +2686,11 @@ class GuestService:
             location_id=location_id,
             guest_id=guest.id,
         )
+        resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -2273,6 +2703,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=None,
             session_timeout_minutes=resolved_session_timeout,
+            idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:
             await self._broadcast_guest_session_started(
@@ -2284,13 +2715,19 @@ class GuestService:
                 auth_method=GuestAuthMethod.PIN.value,
                 is_new_guest=False,
             )
-            await self._assign_guest_queue(
-                session=session,
-                router=router,
-                location_id=location_id,
-                organization_id=resolved_org_id,
-            )
             await self._bump_guest_visit(guest)
+        # Deliberately outside the ``if created:`` block above, unlike
+        # every other side effect there -- see ``_assign_guest_queue``'s
+        # own docstring for why, and for the bug that put it here. The
+        # same call sits outside ``if created:`` in all five login
+        # methods.
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -2371,11 +2808,18 @@ class GuestService:
             organization_id=organization_id, location_id=location_id
         )
         resolved_org_id = resolved.config.organization_id
+        # Open Hours applies to this path too, even though the enabled-method
+        # check above it deliberately does not -- see _require_venue_open.
+        self._require_venue_open(resolved.config)
 
         if self.mac_authorization_hook is None:
             raise MacAddressNotAuthorizedError(normalized_mac)
+        # location_id, not just the organization: a trust entry that names a
+        # location applies only there. See is_mac_authorized's own docstring.
         authorized = await self.mac_authorization_hook.is_mac_authorized(
-            normalized_mac, organization_id=resolved_org_id
+            normalized_mac,
+            organization_id=resolved_org_id,
+            location_id=location_id,
         )
         if not authorized:
             raise MacAddressNotAuthorizedError(normalized_mac)
@@ -2390,10 +2834,27 @@ class GuestService:
             location_id=location_id,
             identifier=identifier,
             device_mac=normalized_mac,
+            auth_method=GuestAuthMethod.MAC_WHITELIST,
+            guest=existing_guest,
+            ip_address=ip_address,
+            whitelist_only_enabled=bool(resolved.config.whitelist_only_enabled),
+            whitelist_only_denied_message=(
+                resolved.config.whitelist_only_denied_message
+            ),
+            # `is_mac_authorized` returned True barely a dozen lines above,
+            # for this exact MAC, organization and location. Passing that
+            # answer down rather than letting the gate ask again is the
+            # difference between one lookup and two on every whitelisted
+            # device's login.
+            device_mac_already_authorized=True,
         )
         known_device: GuestDevice | None = _DEVICE_NOT_PREFETCHED
         if existing_guest is not None:
-            await self._enforce_concurrent_session_limit(existing_guest.id)
+            await self._enforce_concurrent_session_limit(
+                existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
+            )
             known_device = await self._enforce_device_limit(
                 guest_id=existing_guest.id,
                 mac_address=normalized_mac,
@@ -2401,7 +2862,9 @@ class GuestService:
                 location_id=location_id,
             )
             await self._enforce_fup_quota(
-                guest_id=existing_guest.id, organization_id=resolved_org_id
+                guest_id=existing_guest.id,
+                organization_id=resolved_org_id,
+                location_id=location_id,
             )
 
         router = await self._get_eligible_router(router_id)
@@ -2423,6 +2886,11 @@ class GuestService:
             location_id=location_id,
             guest_id=guest.id,
         )
+        resolved_idle_timeout = await self._resolve_idle_timeout_minutes(
+            organization_id=resolved_org_id,
+            location_id=location_id,
+            guest_id=guest.id,
+        )
         session, created = await self._reuse_or_create_session(
             guest=guest,
             device=device,
@@ -2435,6 +2903,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=None,
             session_timeout_minutes=resolved_session_timeout,
+            idle_timeout_minutes=resolved_idle_timeout,
         )
         if created:
             await self._broadcast_guest_session_started(
@@ -2446,13 +2915,19 @@ class GuestService:
                 auth_method=GuestAuthMethod.MAC_WHITELIST.value,
                 is_new_guest=is_new,
             )
-            await self._assign_guest_queue(
-                session=session,
-                router=router,
-                location_id=location_id,
-                organization_id=resolved_org_id,
-            )
             await self._bump_guest_visit(guest)
+        # Deliberately outside the ``if created:`` block above, unlike
+        # every other side effect there -- see ``_assign_guest_queue``'s
+        # own docstring for why, and for the bug that put it here. The
+        # same call sits outside ``if created:`` in all five login
+        # methods.
+        await self._assign_guest_queue(
+            session=session,
+            router=router,
+            location_id=location_id,
+            organization_id=resolved_org_id,
+        )
+
         await self._record_login_success(
             guest=guest,
             identifier=identifier,
@@ -2627,6 +3102,7 @@ class GuestService:
         session_id: uuid.UUID,
         display_name: str | None,
         email: str | None,
+        declined: bool = False,
     ) -> Guest:
         """Lets a guest fill in their name/email right after a real OTP
         verification -- the skippable "tell us about yourself" prompt shown
@@ -2646,7 +3122,32 @@ class GuestService:
         Both fields are optional and independently settable (a guest may
         fill in only one) -- this call is only ever reached by choice; a
         guest who skips the prompt entirely never calls it at all, and
-        network access is never gated on it."""
+        network access is never gated on it.
+
+        Two things this method gained after the first version shipped, both
+        of which exist to move state out of the guest's browser and into
+        the row:
+
+        * ``declined=True`` records that the guest said no. That is the
+          third way ``validators.guest_has_profile`` becomes true, and it
+          is what lets the portal stop keeping a device-local "don't ask
+          again" flag -- see ``Guest.profile_prompt_declined_at``'s own
+          comment for why a ``localStorage`` flag was never a record on
+          the surface that matters.
+        * The venue's ``collect_guest_name``/``collect_guest_email`` flags
+          are enforced here, not only in the UI.
+
+        **Deliberately still post-connect only, and deliberately still
+        hard to call early.** The eligibility check above requires an
+        already-``ACTIVE`` OTP session; inside the login funnel, before the
+        NAS gate opens, that session exists but the guest is not yet on the
+        network, and the window this POST needs is the window the hotspot
+        login POST is racing through. Moving the ask earlier would mean
+        weakening this check or ordering two writes against a session
+        mid-handoff. It was tried, in the funnel, and reverted on purpose:
+        a third screen between a verified guest and their internet is where
+        they close the sheet, and the venue loses the *connection*, which
+        is the thing they are paying for. Keep it here."""
         guest = await self._require_guest(guest_id)
         session = await self.repository.get_session_by_id(session_id)
         now = datetime.now(UTC)
@@ -2666,11 +3167,50 @@ class GuestService:
         if not eligible:
             raise GuestProfileUpdateNotAuthorizedError()
 
+        # Per-venue enforcement: a field whose flag is off is refused
+        # here, not merely hidden in the UI.
+        #
+        # This is the same shape `_require_method_enabled` gives the auth
+        # flags, and it exists for the same reason: a hidden field that
+        # still accepts a write is how a venue ends up holding personal
+        # data it never agreed to hold. The venue is the Data Fiduciary
+        # for a guest's name and email under DPDP; "off" has to mean off
+        # on the server, or the flag is decoration.
+        #
+        # Resolved against the *session's* location, not the guest's.
+        # `Guest.location_id` is a "home" location -- where the guest was
+        # first seen -- and is explicitly never constrained to match the
+        # session's (see that column's own comment). For a multi-location
+        # chain, reading the guest's location would enforce the wrong
+        # venue's settings.
+        #
+        # Only consulted when a field is actually being written. A pure
+        # decline needs no config at all, so a guest can always say no,
+        # even at a venue whose portal config has since been deleted --
+        # refusing to record a refusal would be the wrong failure
+        # direction.
+        if display_name is not None or email is not None:
+            resolved = await self.captive_portal_service.resolve_portal_config(
+                organization_id=session.organization_id,
+                location_id=session.location_id,
+            )
+            config = resolved.config
+            if display_name is not None and not config.collect_guest_name:
+                raise GuestProfileFieldNotCollectedError("name")
+            if email is not None and not config.collect_guest_email:
+                raise GuestProfileFieldNotCollectedError("email")
+
         update_data: dict[str, object] = {}
         if display_name is not None:
             update_data["display_name"] = display_name
         if email is not None:
             update_data["email"] = email
+        # A decline is recorded only if the guest has not already answered
+        # -- `has_profile` is already true once a field is on file, and
+        # overwriting the timestamp on a later "not now" would mean the
+        # column stopped answering "when did they first refuse".
+        if declined and guest.profile_prompt_declined_at is None:
+            update_data["profile_prompt_declined_at"] = now
         if not update_data:
             return guest
 
@@ -2681,6 +3221,71 @@ class GuestService:
                 "event_guest_id": str(updated.id),
                 "event_fields": list(update_data.keys()),
             },
+        )
+        return updated
+
+    async def record_review_link_opened(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        session_id: uuid.UUID,
+    ) -> Guest:
+        """Records that a guest tapped through to the venue's Google review
+        link, so the card stops being shown to them.
+
+        Without this the review card has no memory. It renders on arrival,
+        every visit, forever -- including to the guest who already went and
+        left the review, which is the one guest it must never ask again.
+        That is the whole difference between a feature and a nag, and the
+        record has to live here rather than in the browser because the
+        browser cannot keep it: Web Storage throws inside Apple's Captive
+        Network Assistant, so the device-local flag reads false every time.
+
+        **Post-connect only, and it changes nothing about the connection.**
+        Like every other ask in this family, it is reachable only from
+        ``/portal/session``, which a guest sees after the RADIUS session is
+        authorised and the NAS gate is open. Nothing here can affect
+        whether, how fast, or how long anyone is connected -- and under
+        Google's Rating Manipulation policy nothing may, in either
+        direction: free WiFi is a "free good and/or service", so it can be
+        conditioned neither on leaving a review nor on declining to.
+
+        The write is idempotent in the only sense that matters -- a second
+        tap moves the timestamp, and ``has_opened_review_link`` was already
+        true -- so the portal can call it fire-and-forget without
+        sequencing it against the navigation.
+
+        ⚠ **This is not a review counter.** It records that a link was
+        opened. Google exposes nothing that would let this platform learn
+        whether a review was written, and it cannot see iOS at all: iPhone
+        and iPad guests are sent to ``captive.apple.com/hotspot-detect
+        .html`` after login rather than to ``/portal/session``, so they
+        never reach the card. Any aggregate over this column counts
+        Android and desktop guests who tapped a link. See
+        ``models.Guest.review_link_opened_at``.
+        """
+        guest = await self._require_guest(guest_id)
+        session = await self.repository.get_session_by_id(session_id)
+        # Proof of a live session for this guest, and nothing more. See
+        # ``GuestReviewLinkOpenedNotAuthorizedError`` for why this is
+        # deliberately weaker than the profile write's check: there is no
+        # auth-method filter and no recency window, because this stores
+        # nothing about the guest and a refusal is invisible to the caller
+        # while costing the guest another nag.
+        eligible = (
+            session is not None
+            and session.guest_id == guest.id
+            and session.status == GuestSessionStatus.ACTIVE.value
+        )
+        if not eligible:
+            raise GuestReviewLinkOpenedNotAuthorizedError()
+
+        updated = await self.repository.update_guest(
+            guest, {"review_link_opened_at": datetime.now(UTC)}
+        )
+        logger.info(
+            "guest_review_link_opened",
+            extra={"event_guest_id": str(updated.id)},
         )
         return updated
 
@@ -2738,7 +3343,21 @@ class GuestService:
         terms_version: str | None,
         ip_address: str | None,
     ) -> GuestConsent:
+        """Records a guest accepting a portal's terms.
+
+        ``terms_version`` is derived server-side when the caller does not
+        supply one -- see ``_resolve_terms_version``. Before that, every
+        consent row in production had ``terms_version = NULL``, because
+        the only caller (the portal's sign-in hook) posts a guest id and a
+        config id and nothing else. The column existed; nothing ever filled
+        it; the platform could prove *that* a guest consented and not *to
+        what*."""
         guest = await self._require_guest(guest_id)
+        if terms_version is None:
+            terms_version = await self._resolve_terms_version(
+                captive_portal_config_id=captive_portal_config_id,
+                guest_organization_id=guest.organization_id,
+            )
         consent = await self.repository.create_consent(
             guest_id=guest.id,
             captive_portal_config_id=captive_portal_config_id,
@@ -2753,6 +3372,72 @@ class GuestService:
         )
         logger.info("guest_consent_recorded", extra=_event_extra(event))
         return consent
+
+    async def _resolve_terms_version(
+        self,
+        *,
+        captive_portal_config_id: uuid.UUID | None,
+        guest_organization_id: uuid.UUID,
+    ) -> str | None:
+        """The version string for the terms this portal was showing, or
+        ``None`` when it genuinely cannot be established.
+
+        Derived here rather than trusted from the request. The caller is
+        an unauthenticated guest-facing endpoint; a version it supplied
+        would be a claim about the venue's own documents made by the
+        party the record exists to hold evidence *against*. The
+        request-supplied value is still honoured when present -- it is the
+        seam an admin backfill or a future consent-string registry would
+        use -- but the portal itself sends none, so in practice this is
+        the path every real consent takes.
+
+        Three ways it returns ``None``, all of them honest:
+
+        * **No config id.** Nothing to hash. A guest can consent without
+          the portal telling us which config it rendered, and that
+          possibility is not removed by pretending otherwise.
+        * **The config does not exist, or belongs to another
+          organization.** ``captive_portal_config_id`` arrives from an
+          unauthenticated request body and is stored as a plain FK with no
+          tenant check, so a caller can name any config in the platform.
+          Stamping this guest's consent with *another tenant's* terms
+          version would be a fabricated record -- strictly worse than a
+          NULL, because it looks like evidence. Rejecting the whole
+          consent instead would be the wrong failure direction: this runs
+          on the sign-in path, and refusing to record a consent because
+          the config id looked odd loses the record entirely.
+        * **The config has no terms or privacy content at all.** Then what
+          the guest saw came from the frontend's own hardcoded copy, which
+          this layer cannot see -- see ``compute_terms_version``.
+
+        A failure here never propagates. The consent row is the thing that
+        matters; a missing version degrades it, an exception would lose
+        it.
+        """
+        if captive_portal_config_id is None:
+            return None
+        try:
+            config = await self.captive_portal_service.get_config(
+                captive_portal_config_id
+            )
+        except Exception:  # noqa: BLE001 -- never lose a consent over this
+            logger.warning(
+                "guest_consent_terms_version_unresolved",
+                extra={"event_config_id": str(captive_portal_config_id)},
+            )
+            return None
+        if getattr(config, "organization_id", None) != guest_organization_id:
+            logger.warning(
+                "guest_consent_terms_version_cross_org",
+                extra={"event_config_id": str(captive_portal_config_id)},
+            )
+            return None
+        return compute_terms_version(
+            terms_and_conditions_text=config.terms_and_conditions_text,
+            terms_and_conditions_url=config.terms_and_conditions_url,
+            privacy_policy_text=config.privacy_policy_text,
+            privacy_policy_url=config.privacy_policy_url,
+        )
 
     # ========================================================================
     # Guest / device lookups
@@ -2880,6 +3565,82 @@ class GuestService:
             device_ids=device_ids, organization_id=requesting_organization_id
         )
 
+    async def list_devices_for_session_ids(
+        self,
+        *,
+        device_ids: list[uuid.UUID],
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[GuestDevice]:
+        """Resolve device ids taken from an already-tenant-filtered session
+        list -- backs ``GuestSessionResponse.device_mac``. See
+        ``GuestRepository.list_devices_for_session_ids`` for why this asks
+        a different tenancy question than ``list_devices_by_ids`` above.
+
+        Bounded like its sibling, and for the same reason: the router
+        chunks at ``MAX_BULK_DEVICE_LOOKUP_IDS`` before calling, so this
+        raises only if a future caller forgets to."""
+        if len(device_ids) > MAX_BULK_DEVICE_LOOKUP_IDS:
+            raise TooManyDeviceIdsError(
+                requested=len(device_ids), limit=MAX_BULK_DEVICE_LOOKUP_IDS
+            )
+        return await self.repository.list_devices_for_session_ids(
+            device_ids=device_ids, organization_id=requesting_organization_id
+        )
+
+    async def list_devices_for_guest_ids(
+        self,
+        *,
+        guest_ids: list[uuid.UUID],
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> dict[uuid.UUID, list[GuestDevice]]:
+        """Resolve one page of guests to their devices, grouped by
+        ``guest_id`` and newest-seen first within each group -- backs the
+        ``mac_addresses``/``device_count`` fields on ``GuestResponse``.
+
+        Deliberately takes no ``MAX_BULK_*`` bound of its own, unlike
+        ``list_devices_by_ids`` above. That bound exists because ``GET
+        /guest-devices`` lets an external caller choose the id list.
+        Here the list is one page of ``GET /guests``, already capped at
+        ``page_size <= 100`` by the route signature, so a second bound
+        would be an unreachable branch pretending to be a safeguard.
+
+        Returns a mapping rather than a flat list so the caller does no
+        grouping of its own; the repository's SQL ordering is preserved
+        within each group, which is what lets ``mac_addresses[0]`` mean
+        "the guest's current device" without a Python-side sort."""
+        devices = await self.repository.list_devices_for_guest_ids(
+            guest_ids=guest_ids, organization_id=requesting_organization_id
+        )
+        grouped: dict[uuid.UUID, list[GuestDevice]] = {}
+        for device in devices:
+            grouped.setdefault(device.guest_id, []).append(device)
+        return grouped
+
+    async def list_voucher_redemptions(
+        self,
+        *,
+        voucher_ids: list[uuid.UUID],
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[VoucherRedemptionRow]:
+        """Resolve ``voucher_ids`` to the device/address each was actually
+        redeemed on -- backs ``GET /voucher-redemptions`` for the Vouchers
+        screen. See ``GuestRepository.list_voucher_redemptions`` for the
+        two-hop join, and ``constants.MAX_BULK_VOUCHER_LOOKUP_IDS`` for
+        why this resolution lives in the guest domain rather than the
+        voucher one.
+
+        Raises ``TooManyVoucherIdsError`` rather than truncating, for the
+        identical reason ``list_devices_by_ids`` raises rather than
+        truncating: a silently dropped id renders as an empty cell that
+        is indistinguishable from "never redeemed"."""
+        if len(voucher_ids) > MAX_BULK_VOUCHER_LOOKUP_IDS:
+            raise TooManyVoucherIdsError(
+                requested=len(voucher_ids), limit=MAX_BULK_VOUCHER_LOOKUP_IDS
+            )
+        return await self.repository.list_voucher_redemptions(
+            voucher_ids=voucher_ids, organization_id=requesting_organization_id
+        )
+
     async def get_or_create_device(
         self,
         *,
@@ -2924,6 +3685,84 @@ class GuestService:
             update_data["device_name"] = device_name
         return await self.repository.update_device(device, update_data)
 
+    async def adopt_nas_asserted_device(
+        self, *, session: GuestSession, mac_address: str
+    ) -> GuestSession:
+        """Attach a ``GuestDevice`` to a session that was created without
+        one, using a MAC the **NAS itself asserted**.
+
+        ## The defect this exists to close
+
+        ``device_mac`` is optional on the OTP/voucher/password login
+        schemas -- deliberately, and in three places at once:
+        ``GuestPinLoginRequest`` documents that its own ``device_mac`` is
+        required "unlike every other login request schema's";
+        ``_find_reusable_active_session`` documents the MAC-less case
+        explicitly; and the captive portal's ``mac`` search param is
+        optional because a stale bookmark, a hand-typed URL or a cropped
+        QR code really does arrive without RouterOS's ``$(mac)``
+        substitution. So a session with ``device_id IS NULL`` is a
+        supported outcome, not corruption.
+
+        What was **not** supported is what happened to it afterwards.
+        Three separate consumers key on ``device_id`` and each one skips a
+        NULL silently:
+
+        1. ``get_active_session_for_device`` -- the captive portal's only
+           "are you already connected?" check. It resolves a MAC to a
+           device row and filters sessions on ``device_id``, so a session
+           with none can never be returned, at any point in its life. The
+           guest is online, the session is ``ACTIVE``, and the portal
+           shows them the sign-in form anyway.
+        2. ``_find_reusable_active_session`` -- returns ``None`` for a
+           NULL ``device_id``, so the next login inserts a second row
+           rather than reusing the first.
+        3. ``app.domains.router_agent``'s ``/agent/authorized-macs`` --
+           ``if session.device_id is None: continue``, so the session
+           contributes no MAC to the router's ip-binding bypass list.
+
+        Confirmed live: one guest, one iPhone, two OTP verifications 2m44s
+        apart, because the session created by the first was invisible to
+        the check that would have shown it to them.
+
+        ## Why healing here, and not refusing the login
+
+        Refusing a MAC-less login would turn "you occasionally sign in
+        twice" into "guests on a link without ``$(mac)`` can never sign in
+        at all" -- a documented, supported case, regressed into a hard
+        failure. Widening the lookup is not available either: a session
+        with no device stores no MAC anywhere, so there is no column to
+        match ``get_active_session_for_device``'s ``device_mac`` against
+        and no join path to one; and the portal, on a fresh load, knows
+        nothing else about the guest to key on (the identifier is what it
+        is about to ask for).
+
+        That leaves backfilling, and there is exactly one trustworthy
+        later source of the MAC: RFC 2865 Section 5.31
+        ``Calling-Station-Id``, asserted by an already
+        shared-secret-authenticated NAS at Authorize time. This module's
+        own ``RadiusService.authorize`` docstring makes the argument for
+        why that value -- and only that value -- can be trusted, in the
+        write-up of why ``POST /guest/login/mac`` was removed as an
+        authentication bypass. This method is that argument applied to a
+        session that already exists.
+
+        ## Bounds
+
+        Idempotent: a session that already has a ``device_id`` is returned
+        untouched, so the reauthentication a real NAS sends every few
+        minutes costs one comparison. ``get_or_create_device`` owns the
+        MAC-to-guest reassignment semantics, unchanged. The caller is
+        responsible for never letting a failure here turn a valid
+        authorize into a reject -- see ``RadiusService.authorize``.
+        """
+        if session.device_id is not None:
+            return session
+        device = await self.get_or_create_device(
+            guest_id=session.guest_id, mac_address=mac_address
+        )
+        return await self.repository.update_session(session, {"device_id": device.id})
+
     async def get_active_session_for_device(
         self,
         *,
@@ -2962,11 +3801,185 @@ class GuestService:
         if not sessions:
             return None
         session = sessions[0]
+        # An ACTIVE row is not proof the guest is on the network. If the
+        # venue set 30 minutes, the router dropped them at 30 minutes --
+        # and this row only becomes DISCONNECTED when the NAS's
+        # Accounting-Stop arrives, which is not guaranteed and is not
+        # instant. In the gap, answering "yes, you're connected" sends a
+        # guest with no internet to the "You're online" screen, which is
+        # the single most frustrating thing this portal can do. The
+        # session's own wall-clock limit is a fact we already hold, so
+        # there is no reason to wait to be told.
+        if has_session_reached_time_limit(session, now=datetime.now(UTC)):
+            return None
         guest = await self.repository.get_guest_by_id(session.guest_id)
         if guest is None:
             return None
         return GuestLoginResult(
             guest=guest, session=session, device=device, is_new_guest=False
+        )
+
+    async def _active_session_past_its_limit(
+        self,
+        *,
+        router_id: uuid.UUID,
+        device_id: uuid.UUID,
+        now: datetime,
+    ) -> GuestSession | None:
+        """The device's newest still-``ACTIVE`` session on this router, if
+        it has already outlived its own ``session_timeout_minutes``.
+
+        Bounded by the same freshness window as a genuinely-ended session,
+        deliberately: a row abandoned ACTIVE for a week is a bookkeeping
+        artefact, not something to greet a guest with. Without the bound
+        this would be the one path that could report an arbitrarily old
+        session, which is exactly the hole the SQL-level window on the
+        ended-session query exists to close.
+        """
+        sessions, _ = await self.repository.list_sessions(
+            page=1,
+            page_size=1,
+            filters={
+                "router_id": router_id,
+                "device_id": device_id,
+                "status": GuestSessionStatus.ACTIVE.value,
+            },
+            sort_by="started_at",
+            sort_order=SortOrder.DESC,
+        )
+        if not sessions:
+            return None
+        session = sessions[0]
+        if not has_session_reached_time_limit(session, now=now):
+            return None
+        ended_at = session.started_at + timedelta(
+            minutes=session.session_timeout_minutes or 0
+        )
+        if ended_at < now - timedelta(minutes=LAST_ENDED_SESSION_WINDOW_MINUTES):
+            return None
+        return session
+
+    async def get_last_ended_session_for_device(
+        self,
+        *,
+        router_id: uuid.UUID,
+        device_mac: str,
+        now: datetime | None = None,
+    ) -> GuestLastEndedSessionResult | None:
+        """ "This device had a session on this router, and it has just
+        ended" -- the answer the captive portal needs to greet a
+        returning guest with "you were disconnected" instead of the same
+        blank sign-in form a first-time visitor gets.
+
+        Same trust model as ``get_active_session_for_device`` above:
+        ``device_mac`` is RouterOS's own ``$(mac)`` substitution, the one
+        identity available before the guest types anything. It is weaker
+        here than there, though, and the difference drives everything
+        below: for an *active* session the MAC is corroborated by the
+        device actually being authorised on the NAS right now, whereas a
+        MAC whose session has ended is backed by nothing at all. So this
+        method answers the narrowest question that still makes the screen
+        possible, and returns ``None`` -- never an error -- for every
+        other shape of "no".
+
+        **Which endings a guest may be told about.** Not a taste
+        judgement; it follows ``GuestSessionStatus``'s own contract:
+
+        * ``DISCONNECTED`` -- yes. The enum defines this as "a normal,
+          non-punitive end of use ... reconnecting immediately is
+          allowed", which is exactly the precondition for a screen whose
+          main button is "Sign in again". Covers the NAS's own
+          Accounting-Stop (including the ``Lost-Service`` seen in
+          production), a router reboot, an admin ending a session with
+          no disciplinary intent, and the guest's own Disconnect tap.
+        * ``EXPIRED`` **and** ``disconnect_reason == "inactivity_timeout"``
+          -- yes, and this is the founder's case. The status alone is not
+          enough: ``EXPIRED`` is also written for ``data_limit_exceeded``
+          and for ``fup_{data,time}_quota_exceeded_*``. A guest who has
+          exhausted their data allowance has not "timed out", and telling
+          them to sign in again would send them round a loop that ends
+          the same way. Matching the one literal this codebase writes for
+          a real timeout is an allowlist, and it fails closed: any future
+          ``EXPIRED`` reason is silently excluded until somebody decides
+          what a guest should be told about it.
+        * ``TERMINATED`` -- **never**, for two independent reasons,
+          either of which alone would settle it. It is an operator's
+          punitive kill, and it is how a blocklist rule ends a session
+          (``guest_access.enforcement.BlocklistEnforcer`` writes exactly
+          this status). A blocked guest must not be shown "your session
+          expired": it is false, and it invites them to retry a sign-in
+          that is guaranteed to be refused, replacing a clear refusal at
+          the sign-in step with a confusing detour. Independently, this
+          status carries ``TERMINATION_RECONNECT_COOLDOWN_MINUTES``, so
+          "Sign in again" is an offer the platform will not honour. The
+          right destination for these guests is the ordinary sign-in
+          page, where ``_enforce_access_control`` refuses them properly
+          -- and, since backend #169, without the operator's note.
+        * ``PAUSED`` -- never. It is the one non-terminal status, has no
+          ``ended_at`` at all, and an admin may resume it back to
+          ``ACTIVE``. Nothing has ended, so there is nothing to report.
+        * ``ACTIVE`` -- not this method's question;
+          ``get_active_session_for_device`` above answers it, and the
+          portal asks that one first.
+
+        ``disconnect_reason`` is read here and never returned. It is free
+        text from three mutually distrusting sources -- see
+        ``GuestSessionEndedReason``'s docstring -- so it may inform a
+        decision but may not itself become an answer.
+
+        The ``LAST_ENDED_SESSION_WINDOW_MINUTES`` bound is applied in
+        SQL (``repository.get_latest_ended_session_for_device``), not
+        here, so no future caller can obtain an unbounded history of a
+        device by skipping a Python-side check.
+        """
+        now = now or datetime.now(UTC)
+        device = await self.repository.get_device_by_mac(
+            normalize_mac_address(device_mac)
+        )
+        if device is None:
+            return None
+        # The exact mirror of the skip in `get_active_session_for_device`,
+        # and it has to be here or that skip would make things worse
+        # rather than better: a guest whose router-side session has run
+        # out would stop being told "you're connected" (good) and start
+        # getting a blank sign-in form with no explanation (which is the
+        # bug this whole change exists to fix).
+        #
+        # This is also the case the feature has to survive on. If the NAS
+        # never sends an Accounting-Stop -- a real possibility nobody has
+        # been able to disprove on the device -- the row stays ACTIVE
+        # indefinitely, because the idle sweep cannot expire it either
+        # (see `has_session_reached_time_limit`). Deriving the answer from
+        # the session's own elapsed life rather than from a disconnect
+        # event means the screen works whether or not the router ever
+        # tells us anything.
+        overrun = await self._active_session_past_its_limit(
+            router_id=router_id, device_id=device.id, now=now
+        )
+        if overrun is not None:
+            return GuestLastEndedSessionResult(
+                reason=GuestSessionEndedReason.TIMED_OUT,
+                session_timeout_minutes=overrun.session_timeout_minutes,
+                idle_timeout_minutes=overrun.idle_timeout_minutes,
+            )
+        session = await self.repository.get_latest_ended_session_for_device(
+            router_id=router_id,
+            device_id=device.id,
+            statuses=(
+                GuestSessionStatus.DISCONNECTED.value,
+                GuestSessionStatus.EXPIRED.value,
+            ),
+            ended_after=now - timedelta(minutes=LAST_ENDED_SESSION_WINDOW_MINUTES),
+        )
+        if session is None:
+            return None
+        reason = _ended_session_reason(session)
+        if reason is None:
+            return None
+        return GuestLastEndedSessionResult(
+            reason=reason,
+            session_timeout_minutes=session.session_timeout_minutes,
+            idle_timeout_minutes=session.idle_timeout_minutes,
         )
 
     # ========================================================================
@@ -3415,6 +4428,14 @@ class GuestService:
             accept_language=prior.accept_language,
             data_limit_mb=prior.data_limit_mb,
             session_timeout_minutes=prior.session_timeout_minutes,
+            # Carried forward with the rest of the prior session's grant --
+            # a reconnect continues an existing entitlement rather than
+            # issuing a new one, so it must not quietly pick up a different
+            # idle allowance than the session it derives from. A prior
+            # session from before this column existed carries NULL, which
+            # reads as "send no Idle-Timeout", i.e. exactly the behaviour
+            # that prior session actually had.
+            idle_timeout_minutes=prior.idle_timeout_minutes,
         )
         await self._bump_guest_visit(guest)
         return session
@@ -3504,6 +4525,163 @@ class GuestService:
         was pulled out to module scope."""
         return await enforce_session_timeouts(self.repository)
 
+    async def check_portal_admission(
+        self,
+        *,
+        identifier: str,
+        auth_method: GuestAuthMethod,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        device_mac: str | None = None,
+        ip_address: str | None = None,
+    ) -> None:
+        """ "May this identifier begin a login at this property at all?" --
+        asked *before* anything is spent on them.
+
+        ## Why this exists
+
+        The captive portal does not start at ``POST /guest/login/otp``. It
+        starts at ``POST /otp/request``, which sends a real SMS, and only
+        afterwards calls the login endpoint where
+        ``_enforce_access_control`` runs. Gate only the second call and
+        whitelist-only mode means: anyone who walks past the venue and
+        types any phone number gets a real SMS at the owner's expense, and
+        is then refused. That is a live bill and an abuse vector -- a
+        stranger can drain a venue's SMS credit at will by typing numbers
+        into a page that is, by design, open to the street.
+
+        It is also simply the better guest experience. Someone who is not
+        on the list should be told so immediately, not left waiting for a
+        code that was never going to help them.
+
+        ## Scope: only where the property opted in
+
+        Returns immediately unless this property has
+        ``whitelist_only_enabled`` on. A property that never switched the
+        feature on sees no behaviour change here whatsoever -- in
+        particular, this is deliberately **not** an opportunity to start
+        enforcing blocklists at OTP-request time. That would be a real
+        behaviour change (a blocked guest currently does receive a code and
+        is refused at login) affecting every venue on the platform, and it
+        belongs to its own PR with its own argument.
+
+        Returns immediately, too, when the caller supplied neither an
+        organization nor a location: with no property resolved there is no
+        flag to read, and this is exactly the shape of the non-portal
+        callers of ``POST /otp/request`` (e.g. an account-level code, which
+        carries no venue at all).
+
+        Note that the gate is deliberately **not** conditioned on the OTP's
+        ``purpose``. ``purpose`` is client-supplied on an unauthenticated
+        endpoint, so conditioning on it would leave the SMS spend one JSON
+        field away from being unprotected -- and the check is about who is
+        asking and where, which no purpose changes.
+
+        ## The one new lookup, named honestly
+
+        Unlike the login path -- where the portal config is already
+        resolved by ``_require_method_enabled`` before the gate runs, and
+        the flag costs nothing -- this method *does* resolve the config
+        itself, because ``POST /otp/request`` had no reason to resolve one
+        before. If that resolution raises, the guest is let through and a
+        warning is logged, for the reason argued at length in
+        ``_enforce_access_control``: a venue whose config lookup hiccups
+        must not lose its WiFi entirely, and this path's fallback is
+        precisely the behaviour every property had before the feature
+        existed. The refusal still stands at login, which is the gate that
+        was always there.
+        """
+        if organization_id is None and location_id is None:
+            return
+        identifier = normalize_identifier(identifier)
+        try:
+            resolved = await self.captive_portal_service.resolve_portal_config(
+                organization_id=organization_id, location_id=location_id
+            )
+        except Exception as exc:
+            event = WhitelistOnlyGateFailedOpen(
+                organization_id=organization_id,
+                location_id=location_id,
+                identifier=identifier,
+                auth_method=auth_method.value,
+                detail=repr(exc),
+            )
+            logger.warning("whitelist_only_gate_failed_open", extra=_event_extra(event))
+            return
+        config = resolved.config
+        if not config.whitelist_only_enabled:
+            return
+        await self._enforce_access_control(
+            organization_id=config.organization_id,
+            location_id=location_id,
+            identifier=identifier,
+            device_mac=device_mac,
+            auth_method=auth_method,
+            # No `guest=`: resolving one would be a second query run on
+            # every OTP request at a whitelist-only property, including the
+            # overwhelming majority that are about to be allowed, purely to
+            # populate a nullable FK. `GuestLoginHistory.guest_id` is
+            # nullable for exactly this case (see that model's docstring --
+            # "failed attempts for an as-yet-unknown identifier"), and the
+            # column an operator reads a refusal list by is `identifier`.
+            ip_address=ip_address,
+            whitelist_only_enabled=True,
+            whitelist_only_denied_message=config.whitelist_only_denied_message,
+        )
+
+    async def check_otp_request_allowed(
+        self,
+        *,
+        auth_method: GuestAuthMethod,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+    ) -> None:
+        """The login path's own venue gates, asked *before* an OTP code is
+        spent on a guest -- ``POST /otp/request``'s counterpart to
+        ``check_portal_admission``.
+
+        ## Why this exists
+
+        ``POST /otp/request`` is where the venue's money is spent: it sends
+        a real SMS/email/WhatsApp before the guest ever reaches
+        ``POST /guest/login/otp``. The login path enforces two venue gates
+        *at login* -- the requested method's ``CaptivePortalConfig``
+        enabled-flag (``otp_sms_enabled``/``otp_email_enabled``/
+        ``otp_whatsapp_enabled``) and Open Hours -- via
+        ``_require_method_enabled``. Gate only the login call and the venue
+        pays for sends that can never succeed: a request for a channel the
+        venue disabled, or made while the venue is closed, still delivers a
+        real code that the later login step is guaranteed to refuse. That is
+        the identical "gate the spend, not just the outcome" argument
+        ``check_portal_admission`` makes for whitelist-only mode, and this
+        method is its sibling for the per-channel/Open-Hours gates.
+
+        It is a thin, public seam over the *same* ``_require_method_enabled``
+        the login paths call -- no logic is reimplemented here, so the two
+        call sites cannot drift. The raises are identical to login's:
+        ``CaptivePortalConfigNotConfiguredError`` (404) when no config
+        resolves for the location/organization, ``GuestAuthMethodNotEnabledError``
+        (403) when the channel's flag is off, ``VenueClosedError`` (403)
+        when ``business_hours_enabled`` is on and the venue is closed right
+        now (failing open on disabled hours/bad timezone exactly as login
+        does).
+
+        ## No venue named means no gate
+
+        Returns immediately when the caller supplied neither an organization
+        nor a location -- with no property resolved there are no per-venue
+        flags to read, the same no-op ``check_portal_admission`` already
+        performs for the venue-less (non-portal) callers of
+        ``POST /otp/request``.
+        """
+        if organization_id is None and location_id is None:
+            return
+        await self._require_method_enabled(
+            organization_id=organization_id,
+            location_id=location_id,
+            auth_method=auth_method,
+        )
+
     # ========================================================================
     # Internal helpers
     # ========================================================================
@@ -3530,27 +4708,41 @@ class GuestService:
         if not enabled_map[auth_method]:
             raise GuestAuthMethodNotEnabledError(auth_method.value)
 
-        # Open Hours, enforced rather than merely reported.
-        #
-        # This is the one chokepoint every authenticated login method already
-        # passes through, and it has the resolved portal config in hand, so
-        # gating here covers OTP (SMS/email/WhatsApp), voucher, password and
-        # PIN in one place instead of four -- and a login method added later
-        # is covered by construction rather than by remembering.
-        #
-        # `is_open_now` is deliberately forgiving: business hours disabled
-        # means always open, and a malformed stored timezone degrades to
-        # "open" rather than raising (see its own docstring). So the failure
-        # direction here is always "let the guest online", never "lock a venue
-        # out of its own WiFi because a row is bad".
+        self._require_venue_open(config)
+
+        return resolved
+
+    def _require_venue_open(self, config) -> None:
+        """Open Hours, enforced rather than merely reported. Raises
+        ``VenueClosedError`` when this location's own configured business
+        hours say it is closed right now.
+
+        Deliberately its own helper rather than inline in
+        ``_require_method_enabled``. Open Hours arrived bolted onto that
+        method because it was "the one chokepoint every authenticated login
+        method passes through" -- but it is not: ``login_via_mac_whitelist``
+        skips ``_require_method_enabled`` on purpose (a whitelist entry's
+        mere existence is its own per-device enable signal -- see that
+        method's own docstring).
+
+        Open Hours does *not* share that exemption: whether a venue is open
+        is a property of the venue, not of how a guest proves who they are,
+        and ``login_via_mac_whitelist`` calls this helper explicitly
+        (``RadiusService.authorize`` falls through to it to originate a
+        session at RADIUS authorize time, so a whitelisted device connecting
+        to a closed venue gets refused, the same as any other login method).
+
+        ``is_open_now`` is deliberately forgiving: business hours disabled
+        means always open, and a malformed stored timezone degrades to "open"
+        rather than raising (see its own docstring). So the failure direction
+        here is always "let the guest online", never "lock a venue out of its
+        own WiFi because a row is bad"."""
         if not is_open_now(
             enabled=config.business_hours_enabled,
             timezone=config.business_hours_timezone,
             schedule=config.business_hours_schedule,
         ):
             raise VenueClosedError(config.business_hours_closed_message)
-
-        return resolved
 
     async def _get_eligible_router(self, router_id: uuid.UUID) -> Router:
         router = await self.router_lookup.get_router(router_id)
@@ -3560,16 +4752,35 @@ class GuestService:
         return router
 
     def _reject_if_blocked(self, guest: Guest | None) -> None:
+        """The admin's ``blocked_reason`` is logged here and nowhere else on
+        this path -- it is not in the error's message or its ``data``, both of
+        which reach the guest's own screen. An operator asking "why was this
+        person turned away" reads it from here or from the guest row; the
+        person it is about does not read it at all."""
         if guest is not None and guest.is_blocked:
+            if guest.blocked_reason:
+                logger.info(
+                    "guest_blocked_login_refused",
+                    extra={
+                        "guest_id": str(guest.id),
+                        "reason": guest.blocked_reason,
+                    },
+                )
             raise GuestBlockedError(guest.blocked_reason)
 
     async def _enforce_access_control(
         self,
         *,
         organization_id: uuid.UUID,
-        location_id: uuid.UUID,
+        location_id: uuid.UUID | None,
         identifier: str,
         device_mac: str | None,
+        auth_method: GuestAuthMethod,
+        guest: Guest | None = None,
+        ip_address: str | None = None,
+        whitelist_only_enabled: bool = False,
+        whitelist_only_denied_message: str | None = None,
+        device_mac_already_authorized: bool = False,
     ) -> None:
         """Guest Access Control (Phase 1): a no-op when no
         ``access_control_hook`` was wired (the default -- see
@@ -3577,6 +4788,86 @@ class GuestService:
         ``AccessDecisionResolver`` (via ``GuestAccessService.check_access``)
         and raises ``GuestAccessDeniedError`` on a resolved ``BLOCKLIST``
         decision.
+
+        ## Whitelist-only mode
+
+        ``whitelist_only_enabled`` is this property's own
+        ``captive_portal_configs.whitelist_only_enabled``, read by the
+        caller off the config ``_require_method_enabled`` already resolved
+        on its way here. **It is threaded, not looked up**: no new query
+        runs on the login path, so this feature adds no new way for a login
+        to fail. (That is also why it lives on the captive-portal config
+        rather than in the Phase 2 policy domain, which would have meant a
+        second resolution -- and a second timeout -- in the middle of a
+        guest signing in.)
+
+        With it on, a guest who matched no rule gets ``_DEFAULT_DENY``
+        instead of ``_DEFAULT_ALLOW`` and is refused with
+        ``WhitelistOnlyAccessDeniedError``, carrying the property's own
+        ``whitelist_only_denied_message``. Deliberately a different
+        exception from ``GuestAccessDeniedError``: see that exception's
+        docstring -- "an operator wrote a rule about you" and "an operator
+        wrote a rule about everyone else" are different facts, and the
+        portal has to be able to say different things.
+
+        ## Trusted devices are reconciled, not duplicated
+
+        A trusted device's authorisation lives in
+        ``mac_authorization_entries``, a table ``check_access`` does not
+        query at all -- it resolves ``guest_access_rules``/
+        ``device_access_rules``. So switching a property to whitelist-only
+        would otherwise refuse every device an operator had already
+        trusted, on a list they can see in the dashboard, and the fix would
+        be "type all of them into a second list as well". That is the
+        silent-divergence shape this area is full of, so on a whitelist-only
+        denial with a MAC present this consults
+        ``mac_authorization_hook.is_mac_authorized`` before refusing.
+
+        The consultation is scoped by ``organization_id`` **and**
+        ``location_id`` -- a trust entry that names a location applies only
+        there, exactly as ``login_via_mac_whitelist`` already passes it.
+        It runs only on the denial path, so an ordinary property pays
+        nothing for it. ``device_mac_already_authorized`` lets
+        ``login_via_mac_whitelist`` skip the second lookup: that method has
+        just performed the identical check and would otherwise ask the same
+        question twice in one request.
+
+        ## Failure direction: fail open, and say so
+
+        If the rule lookup itself raises -- the connection pool is
+        exhausted, the replica is briefly gone -- and this property is in
+        whitelist-only mode, the guest is **allowed** and a WARNING is
+        logged.
+
+        This is uncomfortable and it is deliberate. The tension is real:
+        the entire purpose of the feature is to refuse people, and here it
+        admits someone it was told to refuse. But consider what failing
+        closed actually does at a whitelist-only property: *nobody* gets
+        online, including the guests who are on the list, including the
+        owner, including whoever is trying to diagnose it -- a database
+        hiccup becomes a total WiFi outage that looks, from the venue's
+        side, exactly like the feature working. Failing open degrades to
+        the behaviour every property on this platform had last week, which
+        is a known, survivable state, and it leaves a log line saying
+        precisely when it happened.
+
+        The scope of that swallow is deliberately narrow: it applies
+        **only** when ``whitelist_only_enabled`` is on. At every property
+        that never opted in, a raising lookup propagates exactly as it
+        always has -- a feature nobody switched on must not change how
+        their errors behave.
+
+        ## Every refusal is recorded
+
+        A whitelist-only refusal writes a ``GuestLoginHistory`` row through
+        the existing ``_record_login_failure`` path, with its own
+        ``failure_reason``. Without it a venue has no way to discover their
+        list is wrong -- and given that every rule written before PR #160
+        was a bare national number with no country code, "who did we turn
+        away?" is the first thing anyone will ask after switching this on.
+        A BLOCKLIST denial is deliberately left as it was (no history row):
+        changing that is a behaviour change for properties that never
+        enabled this feature, and belongs to its own PR.
 
         Placement: called from ``login_via_otp``/``login_via_voucher``
         immediately after ``_reject_if_blocked`` and before
@@ -3589,40 +4880,200 @@ class GuestService:
         and ``requesting_organization_id`` to ``check_access`` -- this is an
         internal, trusted call on behalf of the already-resolved captive
         portal's own organization, not a cross-tenant admin request, so
-        there is no separate "requesting" identity to distinguish."""
+        there is no separate "requesting" identity to distinguish.
+
+        **The unwired case is fail-open, and says so out loud.** Returning
+        on a missing hook lets every guest online with no access-control
+        decision made at all. That was defensible while the only rule
+        types were VIP/TEMPORARY/BLOCKLIST -- an unwired hook meant
+        blocklists silently did nothing, bad but visible to an operator
+        who tried one. It stops being defensible under per-property
+        whitelist-only mode, where the *entire* enforcement is "refuse
+        whoever does not match": an unwired hook there is a venue that
+        believes it is running closed and is in fact running wide open,
+        with nothing on any screen to say so.
+
+        The hook is wired by ``dependencies.get_guest_service`` for every
+        real request, so this branch means a mis-composed service graph,
+        not a configuration choice -- exactly the class of defect commit
+        ``a0f1522`` records (see
+        ``tests/unit/test_guest_login_composition.py``). It is logged at
+        WARNING rather than raised because ``GuestService`` is legitimately
+        constructed without the hook by Celery tasks and by this domain's
+        own test suite, and turning those into hard failures would be a
+        behaviour change this dark PR has no business making. The log line
+        is the loud part; the composition test is the part that fails
+        first."""
         if self.access_control_hook is None:
+            logger.warning(
+                "guest_access_control_hook_not_wired",
+                extra={
+                    "organization_id": str(organization_id),
+                    "location_id": str(location_id),
+                    "detail": (
+                        "GuestService was composed without an "
+                        "access_control_hook -- this login was allowed "
+                        "with no access-control decision made at all "
+                        "(fail-open). Every real request path wires it "
+                        "via dependencies.get_guest_service."
+                    ),
+                },
+            )
             return
-        decision: AccessDecision = await self.access_control_hook.check_access(
-            organization_id=organization_id,
-            requesting_organization_id=organization_id,
-            location_id=location_id,
-            identifier=identifier,
-            mac_address=device_mac,
-        )
-        if not decision.allowed:
+        try:
+            decision: AccessDecision = await self.access_control_hook.check_access(
+                organization_id=organization_id,
+                requesting_organization_id=organization_id,
+                location_id=location_id,
+                identifier=identifier,
+                mac_address=device_mac,
+                whitelist_only_enabled=whitelist_only_enabled,
+            )
+        except Exception as exc:
+            # Fail open, loudly -- and only where this feature is on. See
+            # this method's docstring for the argument; the short form is
+            # that a whitelist-only property failing closed is a total WiFi
+            # outage for a venue that cannot tell it from the feature
+            # working, while failing open is last week's behaviour plus a
+            # log line. A property that never opted in keeps propagating
+            # exactly as it always has.
+            if not whitelist_only_enabled:
+                raise
+            if isinstance(exc, GuestAccessDeniedError | WhitelistOnlyAccessDeniedError):
+                # A real refusal that happened to travel as an exception --
+                # never something to swallow.
+                raise
+            event = WhitelistOnlyGateFailedOpen(
+                organization_id=organization_id,
+                location_id=location_id,
+                identifier=identifier,
+                auth_method=auth_method.value,
+                detail=repr(exc),
+            )
+            logger.warning("whitelist_only_gate_failed_open", extra=_event_extra(event))
+            return
+        if decision.allowed:
+            return
+        if not decision.is_whitelist_only_denial:
+            # Same discipline as `_reject_if_blocked`: the matched rule's
+            # `reason` is an operator's private note, so it is logged rather
+            # than returned. The error carries neither it nor a `data` copy
+            # of it, because the app-wide handler serialises `data` into the
+            # response body the guest's browser reads.
+            if decision.reason:
+                logger.info(
+                    "guest_access_rule_login_refused",
+                    extra={
+                        "organization_id": str(organization_id),
+                        "location_id": str(location_id),
+                        "identifier": identifier,
+                        "reason": decision.reason,
+                    },
+                )
             raise GuestAccessDeniedError(decision.reason)
 
-    async def _enforce_concurrent_session_limit(self, guest_id: uuid.UUID) -> None:
+        # Whitelist-only, nothing matched. Before refusing, reconcile with
+        # Trusted Devices -- see this method's docstring for why operators
+        # must not have to keep the same device in two tables.
+        trusted_device_consulted = False
+        if device_mac is not None:
+            if device_mac_already_authorized:
+                return
+            if self.mac_authorization_hook is not None:
+                try:
+                    # Normalized here rather than handed over raw. A guest
+                    # arrives with whatever spelling their NAS reported
+                    # ("aa-bb-cc-..."), the Trusted Devices table stores one
+                    # canonical form, and a case-sensitive miss here would
+                    # refuse a device the operator can see on their own
+                    # trusted list. The real service normalizes internally
+                    # too; doing it explicitly means the two cannot quietly
+                    # disagree about which spellings match.
+                    normalized = normalize_whitelist_mac_address(device_mac)
+                except MacAuthorizationError:
+                    # Not MAC-shaped at all -- nothing to reconcile
+                    # against, and never a reason to admit someone.
+                    normalized = None
+                if normalized is not None:
+                    trusted_device_consulted = True
+                    if await self.mac_authorization_hook.is_mac_authorized(
+                        normalized,
+                        organization_id=organization_id,
+                        location_id=location_id,
+                    ):
+                        return
+
+        event = WhitelistOnlyLoginRefused(
+            organization_id=organization_id,
+            location_id=location_id,
+            identifier=identifier,
+            auth_method=auth_method.value,
+            mac_address=device_mac,
+            trusted_device_consulted=trusted_device_consulted,
+        )
+        logger.info("whitelist_only_login_refused", extra=_event_extra(event))
+        await self._record_login_failure(
+            guest=guest,
+            identifier=identifier,
+            auth_method=auth_method,
+            organization_id=organization_id,
+            location_id=location_id,
+            reason=WHITELIST_ONLY_LOGIN_FAILURE_REASON,
+            ip_address=ip_address,
+        )
+        raise WhitelistOnlyAccessDeniedError(whitelist_only_denied_message)
+
+    async def _enforce_concurrent_session_limit(
+        self,
+        guest_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
+    ) -> None:
         """Guest Session Engine (Phase 1): raises
         ``ConcurrentSessionLimitExceededError`` if ``guest_id`` already holds
-        ``constants.DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` (or more)
-        ``ACTIVE`` sessions. Called from ``login_via_otp``/
-        ``login_via_voucher`` after the guest identity is resolved but
-        before a new ``GuestSession`` row is created -- mirrors
+        this location's resolved maximum (or more) ``ACTIVE`` sessions.
+        Called from every login method after the guest identity is resolved
+        but before a new ``GuestSession`` row is created -- mirrors
         ``_reject_if_blocked``'s placement (reject before any further
         side effect). Deliberately **not** called from ``reconnect``: that
         method is already idempotent against the guest's own existing
         ``ACTIVE`` session (see its docstring) and only ever derives a new
         row when the guest currently holds zero active sessions, so it can
-        never itself push a guest over the limit."""
+        never itself push a guest over the limit.
+
+        The limit comes from ``PolicyType.SESSION``'s own
+        ``max_concurrent_sessions_per_guest``, resolved for this exact
+        ``organization_id``/``location_id`` via
+        ``_resolve_session_policy_rules`` -- the same lookup, same policy
+        type, and same resolved ``rules`` dict
+        ``_resolve_session_timeout_minutes`` already reads
+        ``session_timeout_minutes`` out of. Until now only the timeout half
+        was wired: a venue could publish a SESSION policy raising the
+        concurrent-session allowance, see it resolve, and still have every
+        login counted against the platform-wide
+        ``constants.DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST`` (20),
+        because this method never asked. That constant remains the fallback,
+        so a venue with no SESSION policy assigned behaves exactly as before.
+
+        ``organization_id``/``location_id`` default to ``None`` so a caller
+        with neither (and any test constructed before this was resolvable)
+        still gets the platform default rather than a signature error."""
         active_count = await self.repository.count_active_sessions_for_guest(guest_id)
+        rules = await self._resolve_session_policy_rules(
+            organization_id=organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+        )
+        limit = rules.get(
+            "max_concurrent_sessions_per_guest",
+            DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+        )
         if is_concurrent_session_limit_reached(
             active_count=active_count,
-            limit=DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST,
+            limit=limit,
         ):
-            raise ConcurrentSessionLimitExceededError(
-                guest_id=guest_id, limit=DEFAULT_MAX_CONCURRENT_SESSIONS_PER_GUEST
-            )
+            raise ConcurrentSessionLimitExceededError(guest_id=guest_id, limit=limit)
 
     async def _resolve_device_limit(
         self,
@@ -3637,15 +5088,36 @@ class GuestService:
         otherwise (or if the resolved rules omit the field, e.g. a
         ``GenericPolicyRules``-shaped override). ``guest_id``, when given,
         additionally surfaces a Group Policies "Map users" override for
-        this exact guest ahead of the location/organization default."""
+        this exact guest ahead of the location/organization default.
+
+        A failing policy lookup falls back rather than propagating, for the
+        reason ``_resolve_session_timeout_minutes`` states at length: this
+        resolver sits on the login path (``_enforce_device_limit``, called
+        by every login method), so the failure mode has to be "the default
+        device limit" and not "no WiFi". ``resolve_effective_policy`` is a
+        real database round trip that also validates the location against
+        the resolving organization, so it has more than one way to raise;
+        before this, any of them turned into a 500 on a guest login."""
         if self.policy_lookup is None:
             return DEFAULT_MAX_DEVICES_PER_GUEST
-        resolved = await self.policy_lookup.resolve_effective_policy(
-            policy_type=PolicyType.DEVICE,
-            organization_id=organization_id,
-            location_id=location_id,
-            guest_id=guest_id,
-        )
+        try:
+            resolved = await self.policy_lookup.resolve_effective_policy(
+                policy_type=PolicyType.DEVICE,
+                organization_id=organization_id,
+                location_id=location_id,
+                guest_id=guest_id,
+            )
+        except Exception:
+            logger.warning(
+                "device_policy_lookup_failed_using_default",
+                extra={
+                    "organization_id": str(organization_id),
+                    "location_id": str(location_id),
+                    "default_limit": DEFAULT_MAX_DEVICES_PER_GUEST,
+                },
+                exc_info=True,
+            )
+            return DEFAULT_MAX_DEVICES_PER_GUEST
         return resolved.rules.get(
             "max_devices_per_guest", DEFAULT_MAX_DEVICES_PER_GUEST
         )
@@ -3684,8 +5156,99 @@ class GuestService:
         online. This resolver sits on the login path, so the failure mode has
         to be "the default session length" and not "no WiFi".
         """
+        rules = await self._resolve_session_policy_rules(
+            organization_id=organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+        )
+        return rules.get("session_timeout_minutes", DEFAULT_SESSION_TIMEOUT_MINUTES)
+
+    async def _resolve_idle_timeout_minutes(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
+    ) -> int:
+        """Resolves how long a guest's device at this location may pass zero
+        bytes before the NAS closes the session, via the same
+        ``PolicyType.SESSION`` policy ``_resolve_session_timeout_minutes``
+        above reads -- one policy lookup, memoized, serves both.
+
+        The two are genuinely different settings and this is not a
+        duplicate: ``session_timeout_minutes`` is absolute elapsed time from
+        the session's start and ends a guest who is actively browsing;
+        ``idle_timeout_minutes`` is time spent passing no traffic and never
+        ends a guest who is using the WiFi. A venue can, and typically does,
+        want both.
+
+        Unlike the session timeout, this value was never merely defaulted --
+        it was never sent at all. Every Access-Accept this platform has ever
+        issued carried no ``Idle-Timeout``, so what actually governed a
+        guest was whatever RouterOS's ``default`` hotspot user profile
+        happened to say, which on a router provisioned by Master console is
+        30 minutes and on one provisioned before that constant existed is
+        ``none`` (i.e. never). The venue's own setting reached the device by
+        no path whatsoever.
+
+        ``DEFAULT_IDLE_TIMEOUT_MINUTES`` (30) is the fallback and is the
+        same number the setup script writes onto the device, so a venue with
+        no SESSION policy assigned sees no behaviour change -- the reply now
+        merely states what its router was already doing. What changes is
+        that the statement is now made by this platform, per session, so it
+        no longer depends on the router's provisioning history.
+
+        Falls back rather than propagating on a lookup failure, for the
+        identical reason ``_resolve_session_timeout_minutes`` does: this sits
+        on the login path, and the failure mode has to be "the default idle
+        timeout", never "no WiFi".
+        """
+        rules = await self._resolve_session_policy_rules(
+            organization_id=organization_id,
+            location_id=location_id,
+            guest_id=guest_id,
+        )
+        return rules.get("idle_timeout_minutes", DEFAULT_IDLE_TIMEOUT_MINUTES)
+
+    async def _resolve_session_policy_rules(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None,
+        guest_id: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
+        """One ``PolicyType.SESSION`` lookup, shared by every field that
+        policy type carries, so each new field does not re-copy the
+        ``policy_lookup is None`` and never-raise fallbacks (and so a
+        future one cannot quietly omit them -- which is exactly how
+        ``max_concurrent_sessions_per_guest`` came to be read from a
+        platform constant while ``session_timeout_minutes``, its neighbour
+        in the same resolved ``rules`` dict, was read from the policy).
+
+        Returns ``{}`` -- never raises, never ``None`` -- when no policy
+        engine is wired or the lookup itself fails, leaving every caller
+        to apply its own platform-constant default. See
+        ``_resolve_session_timeout_minutes`` for why "the default" and
+        never "no WiFi" is the only acceptable failure mode on a path
+        every guest login runs through.
+
+        Memoized for the life of this ``GuestService`` instance, which
+        ``dependencies.get_guest_service`` builds per request. A single login
+        reads this policy at two different moments -- the concurrent-session
+        check before OTP verification, and the session length after it -- and
+        ``resolve_effective_policy`` is several queries (location validation,
+        candidate assignments, policy, version). Without the memo, wiring the
+        second reader doubled that cost on the hottest path in the product,
+        for a value that cannot meaningfully change mid-login. A failed lookup
+        is deliberately *not* cached: it returns ``{}`` without storing it, so
+        a transient policy-service blip degrades one call rather than pinning
+        the whole login to defaults."""
         if self.policy_lookup is None:
-            return DEFAULT_SESSION_TIMEOUT_MINUTES
+            return {}
+        cache_key = (organization_id, location_id, guest_id)
+        cached = self._session_policy_cache.get(cache_key)
+        if cached is not None:
+            return cached
         try:
             resolved = await self.policy_lookup.resolve_effective_policy(
                 policy_type=PolicyType.SESSION,
@@ -3699,14 +5262,21 @@ class GuestService:
                 extra={
                     "organization_id": str(organization_id),
                     "location_id": str(location_id),
-                    "default_minutes": DEFAULT_SESSION_TIMEOUT_MINUTES,
                 },
                 exc_info=True,
             )
-            return DEFAULT_SESSION_TIMEOUT_MINUTES
-        return resolved.rules.get(
-            "session_timeout_minutes", DEFAULT_SESSION_TIMEOUT_MINUTES
-        )
+            return {}
+        # Drop null-valued keys so a caller's own ``.get(key, DEFAULT)`` is
+        # correct for both an omitted field and an explicit ``null``.
+        # ``SessionPolicyRules``' fields are all optional, and
+        # ``PolicyService`` persists ``model_dump()`` -- so a policy that sets
+        # only a session timeout is stored with the other three keys *present
+        # and null*. Without this, ``.get`` would find those keys, return
+        # ``None`` instead of the platform constant, and hand ``None`` to
+        # arithmetic on the login path.
+        rules = {k: v for k, v in resolved.rules.items() if v is not None}
+        self._session_policy_cache[cache_key] = rules
+        return rules
 
     async def _enforce_device_limit(
         self,
@@ -3717,17 +5287,29 @@ class GuestService:
         location_id: uuid.UUID | None,
     ) -> GuestDevice | None:
         """Guest Session Engine (Phase 1): raises
-        ``GuestDeviceLimitExceededError`` if registering ``mac_address``
-        against ``guest_id`` would push the guest over their own resolved
-        device limit. A no-op when ``mac_address`` is absent (no device to
-        register at all) or when the device already belongs to this exact
-        guest (a returning device, not a new one -- mirrors
-        ``get_or_create_device``'s own "reassignment" logic, checked here
-        without mutating anything). Called from ``login_via_otp``/
-        ``login_via_voucher`` after ``_enforce_concurrent_session_limit``,
-        before ``_maybe_get_or_create_device`` ever creates or reassigns a
-        row -- the identical "reject before touching anything with a side
-        effect" ordering that method's own docstring establishes.
+        ``GuestDeviceLimitExceededError`` if this connection would put
+        more of ``guest_id``'s devices **online at the same time** than
+        the guest's own resolved device limit allows. The basis is
+        currently-CONNECTED devices (distinct devices holding ``ACTIVE``
+        sessions), **not** registered devices: a guest may have registered
+        more devices than the limit over time (each was once connected),
+        and a registered-but-idle device does not occupy the limit -- only
+        devices with an ``ACTIVE`` session right now do. A no-op when
+        ``mac_address`` is absent (no device to register at all).
+
+        The device currently logging in is excluded from the count when it
+        already belongs to this guest: if it is already online, this is a
+        reconnect/refresh of one of the connected devices (its ``ACTIVE``
+        session is reused, not added); if it is idle, excluding it is a
+        no-op. A *new* device is therefore blocked exactly when ``limit``
+        OTHER devices are already connected -- the cap this check exists to
+        enforce. Mirrors ``get_or_create_device``'s own "reassignment"
+        logic, checked here without mutating anything. Called from
+        ``login_via_otp``/``login_via_voucher`` after
+        ``_enforce_concurrent_session_limit``, before
+        ``_maybe_get_or_create_device`` ever creates or reassigns a row --
+        the identical "reject before touching anything with a side effect"
+        ordering that method's own docstring establishes.
 
         Returns the real ``GuestDevice`` row this check already fetched by
         ``mac_address`` (``None`` when ``mac_address`` is absent) -- every
@@ -3742,23 +5324,38 @@ class GuestService:
         existing_device = await self.repository.get_device_by_mac(
             normalize_mac_address(mac_address)
         )
-        if existing_device is not None and existing_device.guest_id == guest_id:
-            return existing_device
-        device_count = await self.repository.count_devices_for_guest(guest_id)
+        # Only this guest's OWN device id is excluded from the connected
+        # count -- an existing own device that is online right now is being
+        # reconnected (session reuse), never added as a new connection. A
+        # device registered to another guest is not this guest's, so it
+        # cannot be the device this login is about (it will be reassigned
+        # by get_or_create_device) and excludes nothing.
+        exclude_device_id = (
+            existing_device.id
+            if existing_device is not None and existing_device.guest_id == guest_id
+            else None
+        )
+        connected_devices = await self.repository.count_active_devices_for_guest(
+            guest_id=guest_id, exclude_device_id=exclude_device_id
+        )
         limit = await self._resolve_device_limit(
             organization_id=organization_id, location_id=location_id, guest_id=guest_id
         )
-        if is_device_limit_reached(device_count=device_count, limit=limit):
+        if is_device_limit_reached(device_count=connected_devices, limit=limit):
             raise GuestDeviceLimitExceededError(guest_id=guest_id, limit=limit)
         return existing_device
 
     async def _enforce_fup_quota(
-        self, *, guest_id: uuid.UUID, organization_id: uuid.UUID
+        self,
+        *,
+        guest_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID | None = None,
     ) -> None:
         """Guest Session Engine (Phase 1): raises
         ``FairUsagePolicyExceededError`` if ``guest_id`` already meets or
         exceeds a ``PolicyType.FUP`` daily/weekly/monthly data or time cap
-        resolved for ``organization_id``. Unlike
+        resolved for ``organization_id``/``location_id``. Unlike
         ``_enforce_device_limit``/``_enforce_concurrent_session_limit``,
         there is no platform-wide fallback: a no-op entirely when no
         ``policy_lookup`` hook is wired, and (once resolved) a no-op for
@@ -3775,9 +5372,23 @@ class GuestService:
         its own call site so that every login path picks it up from the one
         place they all already go through, and so it is checked before OTP or
         voucher verification like every other rejection on this path.
+
+        ``location_id`` is passed straight into the resolution. It used to be
+        hardcoded ``None`` here, and ``repository.list_candidate_assignments``
+        only adds its LOCATION-scope predicate when a real ``location_id``
+        arrives -- so a ``PolicyAssignment`` with ``scope_type=location`` on an
+        FUP policy was never a resolution candidate. A venue could create one,
+        see it listed and active, and have it enforce nothing, with no error
+        anywhere. Every sibling resolver on this path (``_resolve_device_limit``,
+        ``_resolve_session_policy_rules``, and ``queue_management``'s own
+        BANDWIDTH resolution) already passed the real location; FUP was the
+        one that did not. Organization- and GLOBAL-scoped assignments resolved
+        correctly throughout and are unaffected -- a location-scoped one simply
+        now outranks them, which is the whole point of the scope.
         """
-        if self.team_quota_hook is not None and await (
-            self.team_quota_hook.is_over_shared_quota(guest_id)
+        if (
+            self.team_quota_hook is not None
+            and await self.team_quota_hook.is_over_shared_quota(guest_id)
         ):
             raise GuestTeamSharedQuotaExceededError()
         if self.policy_lookup is None:
@@ -3785,7 +5396,7 @@ class GuestService:
         resolved = await self.policy_lookup.resolve_effective_policy(
             policy_type=PolicyType.FUP,
             organization_id=organization_id,
-            location_id=None,
+            location_id=location_id,
             guest_id=guest_id,
         )
         rules = resolved.rules
@@ -3795,9 +5406,8 @@ class GuestService:
             QuotaPeriodType.MONTHLY: rules.get("monthly_data_limit_mb"),
         }
         time_limits = {
-            QuotaPeriodType.DAILY: rules.get("daily_time_limit_minutes"),
-            QuotaPeriodType.WEEKLY: rules.get("weekly_time_limit_minutes"),
-            QuotaPeriodType.MONTHLY: rules.get("monthly_time_limit_minutes"),
+            period_type: rules.get(rule_key)
+            for period_type, rule_key in FUP_TIME_LIMIT_RULE_KEYS.items()
         }
         if not any(data_limits.values()) and not any(time_limits.values()):
             return
@@ -3973,6 +5583,7 @@ class GuestService:
         ip_address: str | None,
         data_limit_mb: int | None,
         session_timeout_minutes: int | None,
+        idle_timeout_minutes: int | None = None,
         user_agent: str | None = None,
         accept_language: str | None = None,
     ) -> GuestSession:
@@ -3996,6 +5607,7 @@ class GuestService:
             bytes_downloaded=0,
             data_limit_mb=data_limit_mb,
             session_timeout_minutes=session_timeout_minutes,
+            idle_timeout_minutes=idle_timeout_minutes,
             disconnect_reason=None,
         )
         event = GuestSessionCreated(
@@ -4071,9 +5683,31 @@ class GuestService:
         with a short gap between them, not by this method."""
         if device_id is None:
             return None
+        now = datetime.now(UTC)
         active_sessions = await self.repository.list_active_sessions_for_guest(guest_id)
         for candidate in active_sessions:
             if candidate.router_id == router_id and candidate.device_id == device_id:
+                # An ACTIVE row that has already outlived its own
+                # `session_timeout_minutes` must not be reused, and this
+                # guard is what stops the rest of this change locking
+                # guests out. Reuse refreshes `last_activity_at` and
+                # `session_timeout_minutes` but never `started_at` -- by
+                # design, since backdating a closed accounting interval is
+                # the very thing this method's docstring refuses to do. So
+                # a guest signing in again after their 30 minutes ran out
+                # would land back on the same overrun row, be measured
+                # from the same old `started_at`, and be refused by
+                # Authorize again, for ever: the sign-in would appear to
+                # succeed and the internet would never come back.
+                #
+                # A fresh sign-in after the limit is a genuinely new
+                # connection interval and gets a genuinely new row, which
+                # is exactly what the append-only design already says
+                # should happen for a session that has ended -- this one
+                # has ended in every sense a guest can observe, whatever
+                # its status column still says.
+                if has_session_reached_time_limit(candidate, now=now):
+                    return None
                 return candidate
         return None
 
@@ -4091,6 +5725,7 @@ class GuestService:
         accept_language: str | None,
         data_limit_mb: int | None,
         session_timeout_minutes: int | None,
+        idle_timeout_minutes: int | None = None,
     ) -> tuple[GuestSession, bool]:
         """Shared by every guest self-service login method: returns
         ``(session, created)``, where ``created`` is ``False`` when an
@@ -4113,7 +5748,45 @@ class GuestService:
         must skip their own "new session"
         side effects (real-time broadcast, queue assignment, visit-count
         bump) when ``created`` is ``False`` -- those already ran for this
-        same still-open session."""
+        same still-open session.
+
+        **Why this method locks the ``Guest`` row before its reuse read.**
+        The find-then-insert above has no uniqueness backstop of its own:
+        two near-simultaneous logins for the same guest+router+device (a
+        captive-portal tab remounting and re-POSTing before its own
+        client-side cooldown window, two open tabs, a guest double-tapping
+        "Verify", RouterOS reissuing a fresh hotspot redirect while the
+        prior login is still mid-flight) can both run
+        ``_find_reusable_active_session``, both observe "no reusable
+        ACTIVE session", and both insert a second, fully redundant
+        ``ACTIVE`` row -- the *concurrent* half of the production incident
+        ``_find_reusable_active_session``'s own docstring documents (18
+        rows for one guest across ~6.5 hours, several only 7-13 minutes
+        long), which that sequential fix does not close. So this method
+        acquires a real row lock on the ``Guest`` row
+        (``GuestRepository.get_guest_for_update``, ``SELECT ... FOR
+        UPDATE`` -- the same pattern ``IspRepository.get_link_for_update``
+        established for its own read-then-write race) *before* running the
+        reuse read, whenever a real ``device_id`` makes reuse possible at
+        all. The loser's lock waits on the winner's open request
+        transaction; by the time it proceeds the winner's ``ACTIVE`` row
+        is committed and visible, the loser's reuse read finds it, and it
+        takes the reuse branch above -- the exact outcome the sequential
+        case already produces, with no duplicate row and no error surfaced
+        to either guest. Deliberately skipped when ``device`` is ``None``:
+        a login that never presented a MAC can never reuse (see
+        ``_find_reusable_active_session``), so there is no race to
+        serialize."""
+        # Acquired before -- never after -- the reuse read. A database
+        # unique index cannot express "at most one *reusable* ACTIVE
+        # session" (a row ACTIVE but past its own wall-clock limit is
+        # deliberately not reused, and can legitimately coexist with the
+        # fresh row this method then inserts -- see
+        # ``_find_reusable_active_session``), so the serialization has to
+        # happen on the guest row itself. Skipped for ``device is None``:
+        # nothing is ever reused there, so there is nothing to serialize.
+        if device is not None:
+            await self.repository.get_guest_for_update(guest.id)
         reusable = await self._find_reusable_active_session(
             guest_id=guest.id,
             router_id=router.id,
@@ -4124,6 +5797,13 @@ class GuestService:
                 "last_activity_at": datetime.now(UTC),
                 "data_limit_mb": data_limit_mb,
                 "session_timeout_minutes": session_timeout_minutes,
+                # Refreshed with the rest of this login's entitlement, for
+                # the same reason session_timeout_minutes is: the reused row
+                # represents the login that just happened, and the NAS is
+                # about to be told this session's idle allowance on the very
+                # next Access-Accept. Leaving a stale value here would send
+                # the previous login's number.
+                "idle_timeout_minutes": idle_timeout_minutes,
             }
             if reusable.auth_method != auth_method.value:
                 update_data["auth_method"] = auth_method.value
@@ -4145,6 +5825,7 @@ class GuestService:
             accept_language=accept_language,
             data_limit_mb=data_limit_mb,
             session_timeout_minutes=session_timeout_minutes,
+            idle_timeout_minutes=idle_timeout_minutes,
         )
         return session, True
 
@@ -4291,7 +5972,7 @@ class RadiusNasSecretRegenerationResult:
 
 
 class NasSecretPushProtocol(Protocol):
-    """"Put this secret into the real FreeRADIUS server's ``client{}``
+    """ "Put this secret into the real FreeRADIUS server's ``client{}``
     stanza, or raise."
 
     A *required* collaborator of ``RadiusService.regenerate_secret`` -- the
@@ -5042,6 +6723,36 @@ class RadiusService:
                 else:
                     session = result.session
 
+        if session is not None and session.device_id is None and calling_station_id:
+            # A session created by a login that carried no ``device_mac``
+            # (a supported case -- see ``GuestService
+            # .adopt_nas_asserted_device``) is invisible to the captive
+            # portal's own "already connected?" check, to login dedup, and
+            # to /agent/authorized-macs, all three of which key on
+            # ``device_id``. This is the first and only moment the platform
+            # is told that session's real MAC by something entitled to
+            # assert it, so it is where the row gets healed.
+            #
+            # Never allowed to change the verdict, exactly like
+            # ``_resolve_rate_limit_reply`` below: this is a repair, and a
+            # repair that failed must still leave an authorized guest
+            # authorized. A broad catch is deliberate for the same reason
+            # that method gives -- the alternative is a guest with a
+            # verified OTP and no internet because a device write raced.
+            try:
+                session = await self.guest_service.adopt_nas_asserted_device(
+                    session=session, mac_address=calling_station_id
+                )
+            except Exception as exc:  # noqa: BLE001 -- see comment above
+                logger.warning(
+                    "radius_authorize_device_adoption_failed",
+                    extra={
+                        "event_session_id": str(session.id),
+                        "event_calling_station_id": calling_station_id,
+                        "error": str(exc),
+                    },
+                )
+
         # The Authorize decision is otherwise invisible server-side: this
         # endpoint answers HTTP 200 for both Accept and Reject (the verdict
         # rides in ``control:Auth-Type``), so without this line an
@@ -5056,6 +6767,28 @@ class RadiusService:
             "event_router_id": str(router.id),
             "event_calling_station_id": calling_station_id,
         }
+        # A session that has already spent its wall-clock allowance is not
+        # an authorization, however ACTIVE its row still says it is. This
+        # is the hop that makes a venue's "30 min" actually mean the guest
+        # signs in again: without it, a guest dropped by the router at 30
+        # minutes hits the portal, the portal re-POSTs to the hotspot, the
+        # NAS re-asks RADIUS, and this method -- looking only at status --
+        # said yes and issued a fresh full timeout. The guest was silently
+        # let back on without signing in, for ever, and the setting could
+        # never be observed to work.
+        #
+        # Treated exactly like every other Authorize rejection: a plain
+        # `authorized=False`, never an exception. RADIUS has no notion of
+        # "why", and the guest's next stop is the portal, where
+        # `/guest/session/last-ended` gives them the real explanation.
+        if session is not None and has_session_reached_time_limit(
+            session, now=datetime.now(UTC)
+        ):
+            logger.info(
+                "radius_authorize_session_past_time_limit",
+                extra={**decision_extra, "event_session_id": str(session.id)},
+            )
+            session = None
         if session is None:
             logger.info(
                 "radius_authorize_decision",
@@ -5066,7 +6799,10 @@ class RadiusService:
                 },
             )
             return RadiusAuthorizeResult(
-                authorized=False, session_timeout_seconds=None, data_limit_mb=None
+                authorized=False,
+                session_timeout_seconds=None,
+                idle_timeout_seconds=None,
+                data_limit_mb=None,
             )
         logger.info(
             "radius_authorize_decision",
@@ -5078,14 +6814,55 @@ class RadiusService:
         )
         return RadiusAuthorizeResult(
             authorized=True,
-            session_timeout_seconds=(
-                session.session_timeout_minutes * 60
-                if session.session_timeout_minutes
+            # REMAINING time, not the full allowance again.
+            #
+            # This used to send `session_timeout_minutes * 60` on every
+            # Authorize. A NAS re-authorizes an already-connected device
+            # periodically, and the captive portal's own hotspot-login
+            # POST triggers one too -- so each of those handed the guest a
+            # brand-new full clock. A venue setting 30 minutes did not get
+            # a guest who must sign in again after 30 minutes; it got a
+            # guest whose 30 minutes restarted every time anything spoke
+            # to RADIUS. The limit was unreachable by construction, which
+            # is why "it just doesn't work" and not "it works late".
+            #
+            # A session at or past its limit is refused outright above, so
+            # this is always positive; `max(..., 1)` guards only the
+            # sub-second race between that check and this line, since a
+            # NAS given `Session-Timeout: 0` may treat it as unlimited --
+            # failing open on exactly the session we mean to end.
+            session_timeout_seconds=self._remaining_session_seconds(session),
+            # The FULL configured idle allowance, every time -- see the
+            # field's own comment for why this is deliberately not the
+            # "remaining" treatment its neighbour above gets.
+            idle_timeout_seconds=(
+                session.idle_timeout_minutes * 60
+                if session.idle_timeout_minutes
                 else None
             ),
             data_limit_mb=session.data_limit_mb,
             rate_limit=await self._resolve_rate_limit_reply(session.id),
         )
+
+    @staticmethod
+    def _remaining_session_seconds(session: GuestSession) -> int | None:
+        """Seconds left of ``session``'s own wall-clock allowance, or
+        ``None`` for an unbounded session (which stays unbounded -- absent
+        is how RADIUS says "no limit", and sending a number there would
+        impose one no venue asked for)."""
+        if not session.session_timeout_minutes:
+            return None
+        ends_at = session.started_at + timedelta(
+            minutes=session.session_timeout_minutes
+        )
+        remaining = (ends_at - datetime.now(UTC)).total_seconds()
+        # Rounded UP, not truncated: a session authorized microseconds
+        # after it was created has 14399.9997s left of a 240-minute
+        # allowance, and truncation would quietly shave a second off every
+        # venue's stated limit. Ceiling keeps a fresh session's reply
+        # exactly `session_timeout_minutes * 60`, which is both what the
+        # venue configured and what the existing wire-format tests pin.
+        return max(math.ceil(remaining), 1)
 
     async def _find_active_session_for_identifier(
         self, router: Router, identifier: str

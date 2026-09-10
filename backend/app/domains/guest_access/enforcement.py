@@ -81,6 +81,7 @@ from .exceptions import (
     RouterHasNoHotspotError,
     SessionStillActiveOnDeviceError,
 )
+from .validators import identifier_match_terms
 
 logger = logging.getLogger(__name__)
 
@@ -91,9 +92,18 @@ logger = logging.getLogger(__name__)
 
 
 class BlockedGuestRow(Protocol):
-    """The one field this module reads off a guest row."""
+    """The two fields this module reads off a guest row.
+
+    ``identifier`` is read rather than reusing the rule's own, because
+    the two are not always the same string: a rule written before the
+    2026-09 identifier fix spells the number without its country code (or
+    without the "+"), while the router's hotspot ``user`` is whatever the
+    guest signed in with -- which is exactly what ``Guest.identifier``
+    holds. Sending the rule's spelling to the device removes nothing.
+    """
 
     id: uuid.UUID
+    identifier: str
 
 
 class BlockedDeviceRow(Protocol):
@@ -244,11 +254,11 @@ class BlocklistEnforcer:
         """Cuts ``identifier`` off, on the device and in this platform's
         records, and reports honestly on both.
 
-        ``identifier`` must already be normalized -- the caller
+        ``identifier`` must already be canonical -- the caller
         (``GuestAccessService.create_guest_rule``) runs
-        ``normalize_identifier`` before the rule row is written, and this
-        method's guest lookup is an exact-string match against the same
-        normalized value every guest-creation path stores.
+        ``canonicalize_rule_identifier`` before the rule row is written.
+        The guest lookup itself is *not* an exact-string match: see
+        ``_resolve_guest``.
 
         **Device work happens before any session row is written**, and
         that ordering is the whole point. Reversed, a router that could
@@ -269,9 +279,7 @@ class BlocklistEnforcer:
         real non-2xx responses, never a ``200 {"success": false}`` --
         which the frontend's interceptor would read as success.
         """
-        guest = await self.session_lookup.get_guest_by_identifier(
-            organization_id, identifier
-        )
+        guest = await self._resolve_guest(organization_id, identifier)
         if guest is None:
             # A rule may legitimately be created for someone who has never
             # connected -- that is why these tables are identifier-keyed
@@ -291,7 +299,10 @@ class BlocklistEnforcer:
             outcome = await self._end_on_device(
                 session=session,
                 organization_id=organization_id,
-                identifier=identifier,
+                # The guest's own stored identifier, not the rule's --
+                # see ``BlockedGuestRow``. This is the string the router
+                # knows them by.
+                identifier=guest.identifier,
             )
             contacted_routers.add(session.router_id)
             # ``False`` from any router wins: reporting "CoA is available"
@@ -338,6 +349,48 @@ class BlocklistEnforcer:
     @staticmethod
     def _disconnect_reason(reason: str | None) -> str:
         return f"Blocked: {reason}" if reason else "Blocked by a guest access rule"
+
+    async def _resolve_guest(
+        self, organization_id: uuid.UUID, identifier: str
+    ) -> BlockedGuestRow | None:
+        """The guest a rule's ``identifier`` names, tried against every
+        stored spelling of the same phone number rather than one exact
+        string.
+
+        A single exact lookup is the 2026-09 "Always Allowed matches
+        nobody" defect wearing a different hat: rules and guests spell the
+        same number differently, so re-enforcing an older block
+        (``GuestAccessService.enforce_guest_rule`` -- the retry an
+        operator reaches for when a router was unreachable) found no
+        guest, ended nothing, and recorded ``ENFORCED`` over a guest who
+        was still streaming.
+
+        Candidates come from ``validators.identifier_match_terms`` and are
+        tried in its order -- canonical first, legacy spellings after --
+        so an exact match still wins and still costs one query. This
+        recovers the "+"-dropped spellings the old, "+"-optional
+        ``_PHONE_RE`` let into the table ("919876543210" for a guest
+        stored as "+919876543210").
+
+        **It does not recover a bare national number** ("9876543210" for
+        that same guest). That needs the ``prefix_patterns`` half of the
+        widening, which needs a ``LIKE``, and ``LiveSessionLookupProtocol``
+        offers only an exact lookup -- deliberately: the guest domain owns
+        that query and the dependency runs guest -> guest_access, not back
+        (see this module's docstring). ``check_access`` does match those
+        rows, so the rule still governs every *new* login; it is only the
+        end-the-session-they-are-already-in half that cannot see them.
+        Under-reaching is the safe direction here and the one this module
+        already chose everywhere else -- it ends fewer sessions than it
+        might, and never claims more than it ended.
+        """
+        for candidate in identifier_match_terms(identifier).exact:
+            guest = await self.session_lookup.get_guest_by_identifier(
+                organization_id, candidate
+            )
+            if guest is not None:
+                return guest
+        return None
 
     async def _end_on_device(
         self,

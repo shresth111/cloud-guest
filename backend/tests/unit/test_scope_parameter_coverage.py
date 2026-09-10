@@ -81,18 +81,44 @@ _UNAUTHENTICATED_BY_DESIGN: dict[tuple[str, str], str] = {
         "Guest portal render. The guest has not logged in yet -- this is the "
         "screen that lets them."
     ),
-    ("GET", "/api/v1/captive-portal/rfc8908"): (
-        "RFC 8908 Captive Portal API, read by the device's own OS before any "
-        "guest interaction."
-    ),
     ("GET", "/api/v1/branding/{organization_id}/logo/public"): (
         "Public branding asset, fetched by the portal page itself."
     ),
     ("GET", "/api/v1/branding/{organization_id}/background-image/public"): (
         "Public branding asset, fetched by the portal page itself."
     ),
+    ("GET", "/api/v1/captive-portal-configs/{config_id}/content-image/public"): (
+        "Public per-venue content image, fetched by the guest portal's own "
+        "<img> before the guest has any identity -- same class of exception "
+        "as the branding public proxies above it. The config_id path param "
+        "is the (unguessable) capability; the endpoint only streams that "
+        "one image's bytes."
+    ),
+    ("GET", "/api/v1/guest-teams/open"): (
+        "Guest-facing: the optional 'which group do you belong to?' "
+        "dropdown data for the sign-in screen. The guest is anonymous "
+        "(pre-login, inside the captive portal), and the endpoint reads "
+        "only the organization_id/location_id the request itself names -- "
+        "the same query params the portal was resolved with -- returning "
+        "nothing but open team names and public join codes."
+    ),
     ("GET", "/api/v1/guest/session/active"): (
         "Guest-facing: a connected guest reading their own session state."
+    ),
+    ("GET", "/api/v1/guest/session/last-ended"): (
+        "Guest-facing, and the reason it names `router_id` is the same as "
+        "`/session/active` above: the captive portal has no platform "
+        "identity to authorize against, only the router's own $(mac). The "
+        "`router_id` here narrows the lookup rather than widening it -- it "
+        "is ANDed with the device, so a caller who guesses a different "
+        "router's id gets fewer rows, never another tenant's. What comes "
+        "back is a two-member enum and the venue's own session-timeout "
+        "policy: no guest identifier, no timestamp, no disconnect_reason, "
+        "and nothing at all for a session an operator ended (see the "
+        "service method's docstring). So there is no cross-tenant read to "
+        "protect here -- the widest answer any router_id can produce is "
+        "'a session on some device ended recently', bounded by "
+        "LAST_ENDED_SESSION_WINDOW_MINUTES."
     ),
     # -- authorized in the handler rather than by a dependency ---------------
     #

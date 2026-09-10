@@ -489,6 +489,14 @@ class AuditAction(StrEnum):
     # flag flip doesn't need a dedicated one" judgment call.
     GUEST_ACCESS_RULE_CREATED = "guest_access_rule_created"
     GUEST_ACCESS_RULE_DELETED = "guest_access_rule_deleted"
+    # One row per bulk import, not per imported rule -- see
+    # ``GuestAccessService.import_guest_rules``. A 200-room hotel
+    # re-uploads its Always Allowed list nightly; auditing each row would
+    # write 200 entries a night per property to answer a question nobody
+    # asks at that granularity ("who uploaded the list, where, and when"
+    # is the question), and would drown the genuinely per-guest
+    # create/delete entries above.
+    GUEST_ACCESS_RULES_IMPORTED = "guest_access_rules_imported"
 
     # Billing domain events (Module 013 Part 1: Plan + License + Usage Core)
     # -- written through this same table by
@@ -799,6 +807,14 @@ class AuditAction(StrEnum):
     # nothing about any device -- and used to be the only DHCP audit entry
     # that ever existed, which is how "created" came to mean "a row exists".
     DHCP_POOL_PUSHED = "dhcp_pool_pushed"
+    # The captive-portal DHCP option (RFC 8910, code 114) written to, or
+    # removed from, a router. Its entity is a **router**, not a DhcpPool:
+    # the option is a property of the device and belongs to no pool row.
+    # Recorded only when the device actually changed -- a fleet sweep is
+    # idempotent, and a row per router per run would bury the handful of
+    # entries recording a real change to a production network.
+    DHCP_OPTION_WRITTEN = "dhcp_option_written"
+    DHCP_OPTION_REMOVED = "dhcp_option_removed"
 
     # Port Forwarding Management domain events -- written through this
     # same table by

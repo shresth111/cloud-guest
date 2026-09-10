@@ -39,6 +39,7 @@ from app.domains.router.models import Router
 
 from .constants import (
     DEFAULT_DISPLAY_INTERVAL_DAYS,
+    MAX_QUESTIONS_PER_CAMPAIGN,
     AnswerType,
     CampaignStatus,
     CampaignType,
@@ -64,6 +65,7 @@ from .exceptions import (
     GuestSessionNotActiveError,
     GuestSessionNotFoundError,
     OrganizationRequiredError,
+    TooManyCampaignQuestionsError,
     WrongCampaignTypeError,
 )
 from .models import (
@@ -595,6 +597,19 @@ class CampaignsService:
                 CampaignType.SURVEY.value, campaign.campaign_type
             )
         validate_question_options(answer_type, options)
+        # The cap, checked on the authoring path only. See
+        # `constants.MAX_QUESTIONS_PER_CAMPAIGN` for where 10 comes from and
+        # why `clone_campaign` is deliberately not gated the same way.
+        #
+        # Counted from live rows -- `list_questions_for_campaign` already
+        # filters `is_deleted` -- so deleting a question really does free a
+        # slot, which is the remedy the error message tells the venue to
+        # use.
+        existing = await self.repository.list_questions_for_campaign(campaign.id)
+        if len(existing) >= MAX_QUESTIONS_PER_CAMPAIGN:
+            raise TooManyCampaignQuestionsError(
+                MAX_QUESTIONS_PER_CAMPAIGN, len(existing)
+            )
         return await self.repository.create_question(
             campaign_id=campaign.id,
             order_index=order_index,

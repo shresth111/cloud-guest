@@ -137,11 +137,24 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.EXECUTE,
         _A.MANAGE,
     ),
+    # Guest Access Control: CRUD plus IMPORT/EXPORT for the bulk load and
+    # round-trip of a property's Always Allowed list -- its own permission
+    # pair rather than riding on ``guest_access.create``, because one
+    # request here rewrites the guest-access table for a whole venue and,
+    # under whitelist-only mode, that table is the venue's door. Mirrors
+    # PermissionModule.MAC_AUTHORIZATION's own identical inclusion of both
+    # actions for the same "bulk-load/download a whitelist" shape. Both
+    # fall inside GrantLevel.OPERATE (see ``expand_grant_level``), so every
+    # role already holding GUEST_ACCESS: OPERATE gains them -- which is
+    # correct: those are the front-desk and site-manager roles that
+    # maintain the list today, one number at a time.
     PermissionModule.GUEST_ACCESS: (
         _A.CREATE,
         _A.READ,
         _A.UPDATE,
         _A.DELETE,
+        _A.IMPORT,
+        _A.EXPORT,
         _A.MANAGE,
     ),
     PermissionModule.GUEST_TEAMS: (
@@ -1292,6 +1305,14 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         overrides={
             _M.AUDIT_LOGS: _L.FULL,
             _M.SYSTEM_SETTINGS: _L.NONE,
+            # DEVICE_CONSOLE is ROUTER-scope (see its own MODULE_ACTIONS
+            # comment) -- an ORGANIZATION-scoped role can never hold it, and
+            # leaving it at default READ made the Auditor role unassignable:
+            # the escalation guard requires the assigner (an org owner) to
+            # already hold every permission the role grants, and owners never
+            # hold ROUTER-scope device-console access. Same override every
+            # other org-scope role carries.
+            _M.DEVICE_CONSOLE: _L.NONE,
             # DEMO_REQUESTS is GLOBAL-only -- see Read Only's own identical
             # override above.
             _M.DEMO_REQUESTS: _L.NONE,

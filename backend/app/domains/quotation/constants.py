@@ -12,10 +12,11 @@ fixed strings, not new ``Settings`` fields the way
 ``platform_legal_business_name`` is for GST invoices. Two reasons:
 
 1. This is exact, non-negotiable legal/brand copy the feature spec calls
-   for verbatim ("Infovertias Technologies Pvt Ltd" / "WyfyGuest") -- unlike
-   an invoice's seller line (which legitimately varies per deployment/
-   white-label), a sales quotation for *this* platform is never issued
-   under a different legal entity or product name per environment.
+   for verbatim ("INFOVERITAS TECHNOLOGIES PRIVATE LIMITED" /
+   "WyfyGuest") -- unlike an invoice's seller line (which legitimately
+   varies per deployment/white-label), a sales quotation for *this*
+   platform is never issued under a different legal entity or product
+   name per environment.
 2. There is real precedent for exactly this choice already in this
    codebase: ``app.domains.billing.router.generate_and_send_invoice``'s own
    email body hardcodes ``"Wyfy Guest"`` directly in the message text
@@ -30,7 +31,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-QUOTATION_COMPANY_LEGAL_NAME = "Infovertias Technologies Pvt Ltd"
+QUOTATION_COMPANY_LEGAL_NAME = "INFOVERITAS TECHNOLOGIES PRIVATE LIMITED"
 QUOTATION_PRODUCT_NAME = "WyfyGuest"
 # Corporate Identification Number -- India's MCA-issued registration number
 # for QUOTATION_COMPANY_LEGAL_NAME, same "exact, non-negotiable legal copy"

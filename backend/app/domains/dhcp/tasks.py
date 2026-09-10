@@ -112,11 +112,16 @@ from app.domains.router.repository import RouterRepository
 from app.domains.router.service import RouterService
 
 from .constants import (
+    CAPTIVE_PORTAL_DHCP_OPTION_SWEEP_LOCK_REDIS_KEY,
+    CAPTIVE_PORTAL_DHCP_OPTION_SWEEP_LOCK_TTL_SECONDS,
     ROGUE_DHCP_DETECTION_SWEEP_LOCK_REDIS_KEY,
     ROGUE_DHCP_DETECTION_SWEEP_LOCK_TTL_SECONDS,
+    TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER,
     TASK_DETECT_ROGUE_DHCP_FOR_ROUTER,
+    TASK_RUN_CAPTIVE_PORTAL_DHCP_OPTION_SWEEP,
     TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
 )
+from .exceptions import DhcpDeviceConnectionError, DhcpError
 from .repository import DhcpRepository
 from .service import DhcpService, RogueDhcpDetectionSummary
 
@@ -269,4 +274,162 @@ def detect_rogue_dhcp_for_router(router_id: str) -> dict[str, int]:
     return result
 
 
-__all__ = ["run_rogue_dhcp_detection_sweep", "detect_rogue_dhcp_for_router"]
+# ============================================================================
+# Captive-portal DHCP-option sweep -- the remediation, as a push
+# ============================================================================
+#
+# Same coordinator + per-router fan-out shape as the rogue-DHCP sweep
+# above, and for the identical reason: the leaf is a real RouterOS round
+# trip on 8728, so one unreachable router must only ever delay its own
+# task.
+#
+# **Neither task is in ``app.core.celery_app``'s ``beat_schedule``.** That
+# is deliberate and is documented on the task-name constants: until the
+# Master Console setup script stops emitting the option-114 chunk, a
+# recurring remover would undo, in the background, what an operator had
+# just deliberately pasted onto a freshly-provisioned router. Dispatch this
+# explicitly -- once, fleet-wide -- and schedule it only after the
+# generator change lands.
+
+
+async def _dispatch_captive_portal_dhcp_option_sweep_async(
+    *, present: bool,
+) -> dict[str, object]:
+    """Take the overlap lock, list the whole fleet, fan out one leaf per
+    router. No device I/O of its own, so it stays on the default queue.
+
+    A fresh Redis client per invocation, never the shared module-level
+    singleton -- the same per-invocation event-loop discipline
+    ``_dispatch_rogue_dhcp_detection_sweep_async`` above documents in full.
+    """
+    redis = create_redis_client()
+    try:
+        acquired = await redis.set(
+            CAPTIVE_PORTAL_DHCP_OPTION_SWEEP_LOCK_REDIS_KEY,
+            "1",
+            nx=True,
+            ex=CAPTIVE_PORTAL_DHCP_OPTION_SWEEP_LOCK_TTL_SECONDS,
+        )
+        if not acquired:
+            logger.warning(
+                "dhcp_captive_portal_option_sweep_skipped_locked",
+                extra={"lock_key": CAPTIVE_PORTAL_DHCP_OPTION_SWEEP_LOCK_REDIS_KEY},
+            )
+            return {"dispatched": 0, "skipped_locked": True}
+        try:
+            async with SessionLocal() as session:
+                repository = DhcpRepository(session)
+                # Every router, not just the ones with a DhcpPool row of
+                # ours -- see the repository method's own docstring. The
+                # option was pasted onto routers this platform never
+                # configured, which is exactly the set a pool-scoped
+                # listing would skip.
+                router_ids = await repository.list_all_router_ids()
+            for router_id in router_ids:
+                converge_captive_portal_dhcp_option_for_router.delay(
+                    str(router_id), present
+                )
+            return {"dispatched": len(router_ids), "skipped_locked": False}
+        finally:
+            await redis.delete(CAPTIVE_PORTAL_DHCP_OPTION_SWEEP_LOCK_REDIS_KEY)
+    finally:
+        await redis.aclose()
+
+
+@celery_app.task(name=TASK_RUN_CAPTIVE_PORTAL_DHCP_OPTION_SWEEP)
+def run_captive_portal_dhcp_option_sweep(present: bool = False) -> dict[str, object]:
+    """Fleet-wide coordinator. ``present`` defaults to ``False`` because
+    removal is the only direction anyone runs fleet-wide -- writing the
+    option needs a per-router value, which a sweep has nowhere to get.
+
+    Its return value is a dispatch count, not a convergence summary: the
+    outcomes are only known once each leaf completes, independently.
+    """
+    result = run_celery_task(
+        _dispatch_captive_portal_dhcp_option_sweep_async(present=present)
+    )
+    logger.info("dhcp_captive_portal_option_sweep_dispatched", extra=result)
+    return result
+
+
+async def _converge_captive_portal_dhcp_option_async(
+    router_id: uuid.UUID, *, present: bool
+) -> dict[str, object]:
+    """One router's convergence, with its own session.
+
+    A device failure is caught and reported, never raised. One venue whose
+    router is offline must not fail the task and re-run it on Celery's
+    retry policy against a fleet where every other router has already been
+    converged -- and ``changed`` already carries the honest answer for the
+    routers that did respond. Narrowed to ``DhcpError`` on purpose: a bug
+    in this wiring (an adapter missing the new method, say) must surface as
+    a failed task rather than be recorded as an unreachable router. That
+    exact blanket-handler mistake let untested wiring pass in this domain
+    once already (cloud-guest#131).
+    """
+    async with SessionLocal() as session:
+        try:
+            service = _build_dhcp_service(session)
+            convergence = (
+                await service.converge_captive_portal_dhcp_option_for_router(
+                    router_id, present=present
+                )
+            )
+            await session.commit()
+        except DhcpError as exc:
+            await session.rollback()
+            # ``reachable`` means "did the router answer", not "did the
+            # operation succeed". A router that read back its own DHCP
+            # options a moment earlier and then *refused* a command --
+            # ``DhcpDeviceOperationError``, "Router rejected ..." -- was
+            # plainly reachable, and reporting it as unreachable sends the
+            # reader looking for a network fault instead of at the
+            # rejection the router actually gave. Only
+            # ``DhcpDeviceConnectionError`` is an unreachable router;
+            # everything else here is a device that answered, or a
+            # precondition this service failed before dialling at all.
+            return {
+                "router_id": str(router_id),
+                "changed": False,
+                "reachable": not isinstance(exc, DhcpDeviceConnectionError),
+                "detail": str(exc),
+            }
+        except Exception:
+            await session.rollback()
+            raise
+    return {
+        "router_id": str(router_id),
+        "changed": convergence.changed,
+        "reachable": True,
+        "option_removed": convergence.option_removed,
+        "bindings_detached": list(convergence.bindings_detached),
+    }
+
+
+@celery_app.task(name=TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER)
+def converge_captive_portal_dhcp_option_for_router(
+    router_id: str, present: bool = False
+) -> dict[str, object]:
+    """The per-router fan-out leaf -- a real RouterOS API round trip, so it
+    belongs off the default queue the cheap pure-DB sweeps share.
+
+    Removing the option affects only **new DHCP leases**. Guests already
+    holding a lease keep the option they were given until they renew, so a
+    run of this is not a fix for the sessions currently online; it is what
+    stops the next guest inheriting the problem.
+    """
+    result = run_celery_task(
+        _converge_captive_portal_dhcp_option_async(
+            uuid.UUID(router_id), present=present
+        )
+    )
+    logger.info("dhcp_captive_portal_option_router_completed", extra=result)
+    return result
+
+
+__all__ = [
+    "run_rogue_dhcp_detection_sweep",
+    "detect_rogue_dhcp_for_router",
+    "run_captive_portal_dhcp_option_sweep",
+    "converge_captive_portal_dhcp_option_for_router",
+]

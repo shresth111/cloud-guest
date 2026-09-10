@@ -28,6 +28,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 
+# Read-only cross-domain import, the same shape
+# ``app.domains.monitoring.repository`` already uses to read ``Router``/
+# ``IspLink``/``RouterRogueDhcpStatus``: this repository never writes a
+# ``RouterAgentCredential``, it only reads when one was last used.
+from app.domains.router_agent.models import RouterAgentCredential
+
 from .enums import RouterStatus
 from .models import Router, RouterProvisioningToken
 
@@ -55,6 +61,74 @@ def stale_heartbeat_statement(*, cutoff: datetime):
         Router.is_deleted.is_(False),
         Router.status == RouterStatus.ONLINE.value,
         or_(Router.last_seen_at.is_(None), Router.last_seen_at < cutoff),
+    )
+
+
+# The statuses whose routers are asked "are you talking to us right now?".
+#
+# ONLINE and OFFLINE only. A router in PENDING_PROVISIONING or PROVISIONING
+# has by definition never checked in, so its silence is not news -- exactly
+# the reasoning ``stale_heartbeat_statement`` gives for leaving PROVISIONING
+# alone. SUSPENDED and DECOMMISSIONED are administrative states: a venue we
+# switched off on purpose must not email anybody at 3am about being off.
+#
+# OFFLINE *is* included, and that is the interesting half: the fast sweep
+# has to keep evaluating a router the slow 15-minute sweep has already
+# demoted, or a site that went down before this feature existed could never
+# be seen to come back.
+REACHABILITY_ELIGIBLE_STATUSES = frozenset(
+    {RouterStatus.ONLINE.value, RouterStatus.OFFLINE.value}
+)
+
+
+def reachability_candidate_statement(*, now: datetime):
+    """Every router this sweep may judge, paired with the most recent
+    moment any of its agent credentials was actually used.
+
+    Extracted from the repository for the same reason
+    ``stale_heartbeat_statement`` is -- the suite drives ``RouterService``
+    through an in-memory fake, so a predicate living only inside the real
+    method is executed by no test, and this one carries two guarantees
+    worth pinning down.
+
+    **The join is to ``router_agent_credentials.last_used_at``, not to
+    ``routers.last_seen_at``.** ``CurrentAgent`` stamps ``last_used_at`` on
+    every device-authenticated request, and the agent scheduler's
+    ``GET /agent/authorized-macs`` poll runs every 60 seconds against the
+    5-minute heartbeat -- so this column is five times fresher than
+    ``last_seen_at`` and it has been ticking on the real fleet all along.
+    Nothing had ever read it as a liveness signal.
+
+    **A router with no usable credential is excluded, not defaulted to
+    silent.** A revoked or expired credential makes ``CurrentAgent`` raise
+    ``AgentCredentialRevoked``/``AgentCredentialExpired`` *before* it stamps
+    anything, so such a router would look permanently
+    silent and would be alerted on forever -- with copy blaming the venue's
+    power for what is actually our credential lifecycle. Excluding it
+    leaves ``reachability_state`` untouched (never alertable) and is the
+    honest answer: we do not know, because we made it impossible to know.
+    """
+    newest_use = (
+        select(
+            RouterAgentCredential.router_id.label("router_id"),
+            func.max(RouterAgentCredential.last_used_at).label("last_agent_contact_at"),
+        )
+        .where(
+            RouterAgentCredential.is_deleted.is_(False),
+            RouterAgentCredential.revoked_at.is_(None),
+            RouterAgentCredential.expires_at > now,
+        )
+        .group_by(RouterAgentCredential.router_id)
+        .subquery()
+    )
+    return (
+        select(Router, newest_use.c.last_agent_contact_at)
+        .join(newest_use, newest_use.c.router_id == Router.id)
+        .where(
+            Router.is_deleted.is_(False),
+            Router.status.in_(sorted(REACHABILITY_ELIGIBLE_STATUSES)),
+            newest_use.c.last_agent_contact_at.is_not(None),
+        )
     )
 
 
@@ -104,6 +178,10 @@ class RouterRepositoryProtocol(Protocol):
     async def list_online_routers_with_stale_heartbeat(
         self, *, cutoff: datetime
     ) -> list[Router]: ...
+
+    async def list_reachability_candidates(
+        self, *, now: datetime
+    ) -> list[tuple[Router, datetime]]: ...
 
     async def soft_delete_provisioning_token(
         self, token: RouterProvisioningToken
@@ -267,6 +345,18 @@ class RouterRepository:
         its docstring for why it is not inlined here."""
         result = await self.session.execute(stale_heartbeat_statement(cutoff=cutoff))
         return list(result.scalars().all())
+
+    async def list_reachability_candidates(
+        self, *, now: datetime
+    ) -> list[tuple[Router, datetime]]:
+        """``(router, last_agent_contact_at)`` for every router the
+        reachability sweep may judge -- see
+        ``reachability_candidate_statement`` for the predicate and why it
+        joins where it does."""
+        result = await self.session.execute(
+            reachability_candidate_statement(now=now)
+        )
+        return [(row[0], row[1]) for row in result.all()]
 
     async def soft_delete_provisioning_token(
         self, token: RouterProvisioningToken

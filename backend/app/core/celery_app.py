@@ -121,11 +121,14 @@ from app.domains.campaigns.constants import (
 )
 from app.domains.connected_devices.constants import (
     CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
+    MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
+    TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP,
     TASK_SYNC_SINGLE_ROUTER_DEVICES,
 )
 from app.domains.dhcp.constants import (
     ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,
+    TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER,
     TASK_DETECT_ROGUE_DHCP_FOR_ROUTER,
     TASK_RUN_ROGUE_DHCP_DETECTION_SWEEP,
 )
@@ -175,8 +178,10 @@ from app.domains.queue_management.constants import (
 )
 from app.domains.router.constants import (
     PROVISIONING_TOKEN_CLEANUP_SWEEP_INTERVAL_SECONDS,
+    ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS,
     STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP,
+    TASK_RUN_ROUTER_REACHABILITY_SWEEP,
     TASK_RUN_STALE_HEARTBEAT_SWEEP,
 )
 
@@ -299,6 +304,14 @@ celery_app.conf.update(
         # left off -- one DB query plus N .delay() calls, no device I/O of
         # its own.
         TASK_DETECT_ROGUE_DHCP_FOR_ROUTER: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The captive-portal DHCP-option converger -- one real RouterOS
+        # write per router, so it belongs here for the same reason. Routed
+        # but NOT Beat-scheduled: see the constant's own note on why a
+        # recurring remover must wait for the Master Console generator to
+        # stop emitting the option-114 chunk.
+        TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER: {
+            "queue": DEVICE_IO_QUEUE_NAME
+        },
         # The network-integration sync sweep issues real HTTPS round trips
         # to *customer-owned* network controllers -- one login plus several
         # resource reads per enabled integration, each with its own
@@ -561,6 +574,17 @@ celery_app.conf.update(
             "task": TASK_RUN_CONNECTED_DEVICE_SYNC_SWEEP,
             "schedule": CONNECTED_DEVICE_SYNC_SWEEP_INTERVAL_SECONDS,
         },
+        # Monitored Hardware: fast ping-driven liveness (every 30s) -- makes
+        # a monitored device that physically dies flip to DOWN within a
+        # minute instead of waiting out its RouterOS DHCP lease plus the
+        # 15-minute discovery sweep above. Registered hardware is a small
+        # list (handfuls per venue), so this cadence is safe at today's
+        # scale -- see MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS's
+        # own docstring for the full reasoning and the scale caveat.
+        "monitored-hardware-liveness-sweep": {
+            "task": TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP,
+            "schedule": MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS,
+        },
         # Campaigns domain: keeps the stored Campaign.status reasonably
         # fresh for admin dashboards (SCHEDULED -> ACTIVE -> ENDED) --
         # every 5 minutes, the same cadence as the guest-session-timeout/
@@ -625,6 +649,35 @@ celery_app.conf.update(
         "router-stale-heartbeat-sweep": {
             "task": TASK_RUN_STALE_HEARTBEAT_SWEEP,
             "schedule": STALE_HEARTBEAT_SWEEP_INTERVAL_SECONDS,
+        },
+        # The FAST half of the same problem, and a genuinely different
+        # question from the sweep above -- not a faster copy of it.
+        #
+        # The sweep above owns `Router.status` at the 15-minute
+        # `ROUTER_HEARTBEAT_OFFLINE_STALE_MINUTES` that
+        # `compute_lifecycle_stage`, `compute_internet_availability` and the
+        # frontend's `location-liveness` module all share. That number must
+        # not move: its own docstring says a second, slightly different
+        # definition of "offline" is how two screens start disagreeing about
+        # one router.
+        #
+        # But 15 minutes cannot produce the two-minute outage email a real
+        # venue needs. So this sweep writes a separate, alert-only
+        # `Router.reachability_state` off a separate, five-times-faster
+        # signal -- `router_agent_credentials.last_used_at`, stamped by the
+        # 60-second `/agent/authorized-macs` poll rather than the 5-minute
+        # heartbeat -- debounced over two consecutive misses and confirmed
+        # against the hub's live `wg show` before anything is raised.
+        # Nothing that reads `status` changes behaviour because of it.
+        #
+        # 30s matches the alert evaluation sweep below, so the two compose
+        # into: site dies -> <=120s to UNREACHABLE -> <=30s to an Alert and
+        # its email. See RouterService.sweep_router_reachability for the
+        # awake-window, fleet-outage and tunnel-confirmation guards that
+        # keep a two-minute threshold from crying wolf on our own deploys.
+        "router-reachability-sweep": {
+            "task": TASK_RUN_ROUTER_REACHABILITY_SWEEP,
+            "schedule": ROUTER_REACHABILITY_SWEEP_INTERVAL_SECONDS,
         },
         # Monitoring domain: the Alert Engine's evaluation sweep -- the real
         # background job behind an already-fully-built-but-previously-

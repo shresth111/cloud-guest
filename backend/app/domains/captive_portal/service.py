@@ -79,6 +79,7 @@ from app.domains.rbac.location_scope import (
 )
 
 from .constants import (
+    DEFAULT_FEEDBACK_DWELL_MINUTES,
     DEFAULT_PORTAL_CONTENT_MODE,
     PRIVACY_POLICY_LABEL,
     TERMS_AND_CONDITIONS_LABEL,
@@ -110,10 +111,13 @@ from .validators import (
     validate_business_hours_timezone,
     validate_content_mode,
     validate_default_scope,
+    validate_feedback_dwell_minutes,
     validate_guest_font_choice,
     validate_hex_color,
+    validate_review_url,
     validate_single_content_source,
     validate_splash_text_length,
+    validate_whitelist_only_scope,
 )
 
 logger = logging.getLogger(__name__)
@@ -443,7 +447,14 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "content_heading",
     "content_body",
     "content_image_url",
+    "content_image_key",
     "content_survey",
+    "collect_guest_name",
+    "collect_guest_email",
+    "review_card_enabled",
+    "review_url",
+    "guest_feedback_enabled",
+    "feedback_dwell_minutes",
     "otp_sms_enabled",
     "otp_email_enabled",
     "otp_whatsapp_enabled",
@@ -456,6 +467,8 @@ _CACHED_CONFIG_SCALAR_FIELDS = (
     "business_hours_timezone",
     "business_hours_schedule",
     "business_hours_closed_message",
+    "whitelist_only_enabled",
+    "whitelist_only_denied_message",
     "guest_font_choice",
     "background_overlay_strength",
     "background_focal_x",
@@ -503,7 +516,14 @@ class _CachedCaptivePortalConfig:
     content_heading: str | None
     content_body: str | None
     content_image_url: str | None
+    content_image_key: str | None
     content_survey: dict[str, Any] | None
+    collect_guest_name: bool
+    collect_guest_email: bool
+    review_card_enabled: bool
+    review_url: str | None
+    guest_feedback_enabled: bool
+    feedback_dwell_minutes: int
     otp_sms_enabled: bool
     otp_email_enabled: bool
     otp_whatsapp_enabled: bool
@@ -516,6 +536,8 @@ class _CachedCaptivePortalConfig:
     business_hours_timezone: str
     business_hours_schedule: dict[str, Any]
     business_hours_closed_message: str | None
+    whitelist_only_enabled: bool
+    whitelist_only_denied_message: str | None
     guest_font_choice: str
     background_overlay_strength: int
     background_focal_x: int
@@ -606,6 +628,42 @@ _NOT_CONFIGURED_MARKER = "__not_configured__"
 _INFLIGHT_RESOLUTIONS: dict[
     tuple[uuid.UUID | None, uuid.UUID | None], asyncio.Future[ResolvedPortalConfig]
 ] = {}
+
+
+# Every ``CaptivePortalConfig`` column that is a NOT NULL ``Boolean`` and
+# that ``schemas.CaptivePortalConfigUpdateRequest`` types ``bool | None``.
+# ``None`` on that schema is how "leave it alone" is spelled on every
+# field, but ``model_dump(exclude_unset=True)`` keeps an *explicit* JSON
+# ``null`` -- which would otherwise be assigned straight onto the NOT NULL
+# column by ``GenericRepository.update`` and fail the constraint as a 500
+# (``_flush_or_raise`` re-raises the IntegrityError as a non-domain error).
+# On each of these toggles an explicit null and an omitted key mean the
+# same thing, so ``update_config`` normalizes the former to the latter,
+# uniformly, before any merge or validation reads the payload. Kept as one
+# explicit set (mirroring ``_CACHED_CONFIG_SCALAR_FIELDS``) so the sync
+# test can assert it never drifts from the model's own Boolean columns;
+# `is_deleted` is deliberately absent -- the soft-delete flag is protected
+# by ``GenericRepository`` and never reachable through the update request.
+_NOT_NULL_BOOLEAN_UPDATE_FIELDS = frozenset(
+    {
+        "is_active",
+        "is_default",
+        "powered_by_enabled",
+        "collect_guest_name",
+        "collect_guest_email",
+        "review_card_enabled",
+        "guest_feedback_enabled",
+        "otp_sms_enabled",
+        "otp_email_enabled",
+        "otp_whatsapp_enabled",
+        "voucher_enabled",
+        "username_password_enabled",
+        "pin_login_enabled",
+        "social_login_enabled",
+        "business_hours_enabled",
+        "whitelist_only_enabled",
+    }
+)
 
 
 # ============================================================================
@@ -709,6 +767,29 @@ class CaptivePortalService:
         # None is also the value that means "unchanged": a config created
         # without one behaves exactly as every config does today.
         post_login_html: str | None = None,
+        # Per-property whitelist-only mode. Defaults to the column's own
+        # default (off / no venue copy) for the same reason
+        # pin_login_enabled and the content_* parameters above do: the
+        # smart-location provisioning flow in
+        # app.domains.location.provisioning_service, and this domain's own
+        # tests, never pass them, and off is the only value that leaves a
+        # brand-new config behaving exactly as every config does today.
+        whitelist_only_enabled: bool = False,
+        whitelist_only_denied_message: str | None = None,
+        # The post-connect ask flags. All default to the off/empty value
+        # for the same reason pin_login_enabled/content_* default above --
+        # the smart-location provisioning flow and this domain's tests
+        # never pass them -- and here "off" is additionally the only
+        # defensible default in its own right: the venue is the Data
+        # Fiduciary for a guest's name and email, and the penalty for a
+        # badly-configured review ask lands on the venue's own Google
+        # Business Profile. See the columns' own comments in models.py.
+        collect_guest_name: bool = False,
+        collect_guest_email: bool = False,
+        review_card_enabled: bool = False,
+        review_url: str | None = None,
+        guest_feedback_enabled: bool = False,
+        feedback_dwell_minutes: int = DEFAULT_FEEDBACK_DWELL_MINUTES,
     ) -> CaptivePortalConfig:
         validate_hex_color(primary_color, field_name="primary_color")
         validate_hex_color(secondary_color, field_name="secondary_color")
@@ -721,6 +802,9 @@ class CaptivePortalService:
             privacy_policy_text, privacy_policy_url, field_label=PRIVACY_POLICY_LABEL
         )
         validate_default_scope(is_default=is_default, location_id=location_id)
+        validate_whitelist_only_scope(
+            whitelist_only_enabled=whitelist_only_enabled, location_id=location_id
+        )
         # v7 §Part 2 (W2). Unconditional on create -- there is no existing
         # value to grandfather, so a brand-new config never gets to start
         # life over the limit. See update_config for why the same check is
@@ -728,6 +812,8 @@ class CaptivePortalService:
         validate_splash_text_length("splash_headline", splash_headline)
         validate_splash_text_length("splash_welcome_message", splash_welcome_message)
         validate_content_mode(content_mode)
+        validate_review_url(review_url)
+        validate_feedback_dwell_minutes(feedback_dwell_minutes)
         # Sanitize here, not at the schema layer and not on read. The value
         # bound to `post_login_html` from this point on is the *stored*
         # value, which is what makes the response the caller gets back the
@@ -786,6 +872,12 @@ class CaptivePortalService:
             content_body=content_body,
             content_image_url=content_image_url,
             content_survey=content_survey,
+            collect_guest_name=collect_guest_name,
+            collect_guest_email=collect_guest_email,
+            review_card_enabled=review_card_enabled,
+            review_url=review_url,
+            guest_feedback_enabled=guest_feedback_enabled,
+            feedback_dwell_minutes=feedback_dwell_minutes,
             otp_sms_enabled=otp_sms_enabled,
             otp_email_enabled=otp_email_enabled,
             otp_whatsapp_enabled=otp_whatsapp_enabled,
@@ -794,6 +886,8 @@ class CaptivePortalService:
             pin_login_enabled=pin_login_enabled,
             social_login_enabled=social_login_enabled,
             social_login_providers=list(social_login_providers),
+            whitelist_only_enabled=whitelist_only_enabled,
+            whitelist_only_denied_message=whitelist_only_denied_message,
             powered_by_enabled=powered_by_enabled,
             created_by=actor_user_id,
         )
@@ -832,6 +926,83 @@ class CaptivePortalService:
         )
         return config
 
+    async def set_content_image(
+        self,
+        config_id: uuid.UUID,
+        *,
+        content_image_key: str,
+        content_image_url: str,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> CaptivePortalConfig:
+        """Records a freshly uploaded pre-login content image on a config
+        row (the object bytes themselves are stored by the router through
+        the platform's object storage -- this service call persists the
+        resulting key + public URL and invalidates the resolve cache)."""
+        config = await self.get_config(
+            config_id, requesting_organization_id=requesting_organization_id
+        )
+        updated = await self.repository.update_config(
+            config,
+            {
+                "content_image_key": content_image_key,
+                "content_image_url": content_image_url,
+                "updated_by": actor_user_id,
+            },
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.CAPTIVE_PORTAL_CONFIG_UPDATED,
+            config,
+            f"Content image added to portal config '{config.name}'",
+        )
+        await self._invalidate_resolve_cache(config.organization_id, config.location_id)
+        return updated
+
+    async def clear_content_image(
+        self,
+        config_id: uuid.UUID,
+        *,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None,
+    ) -> CaptivePortalConfig:
+        """Removes the uploaded pre-login content image (key + public URL)
+        from a config row. The object-storage delete is the router's job;
+        this is the persisted half + cache invalidation."""
+        config = await self.get_config(
+            config_id, requesting_organization_id=requesting_organization_id
+        )
+        updated = await self.repository.update_config(
+            config,
+            {
+                "content_image_key": None,
+                "content_image_url": None,
+                "updated_by": actor_user_id,
+            },
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.CAPTIVE_PORTAL_CONFIG_UPDATED,
+            config,
+            f"Content image removed from portal config '{config.name}'",
+        )
+        await self._invalidate_resolve_cache(config.organization_id, config.location_id)
+        return updated
+
+    async def get_content_image_key(
+        self, config_id: uuid.UUID
+    ) -> str | None:
+        """The object-storage key of a config's uploaded content image, or
+        ``None`` when none is uploaded -- read by the unauthenticated
+        public proxy endpoint (GET .../content-image/public), which must
+        not require a platform-user identity. No tenant-scope enforcement:
+        the config id itself is the (unguessable) capability, mirroring the
+        branding public-proxy endpoints' own reasoning."""
+        config = await self.repository.get_config(config_id)
+        if config is None or config.is_deleted:
+            return None
+        return config.content_image_key
+
     async def list_configs(
         self,
         *,
@@ -868,6 +1039,22 @@ class CaptivePortalService:
         update_data.pop("organization_id", None)
         update_data.pop("location_id", None)
 
+        # `whitelist_only_enabled` was the first NOT NULL boolean found
+        # carrying this latent 500, but every sibling toggle has the
+        # identical shape: the update request types each one `bool | None`
+        # because `None` is how "leave it alone" is spelled on every field
+        # of that schema, while `model_dump(exclude_unset=True)` keeps an
+        # *explicit* JSON `null` -- which would travel all the way to the
+        # repository and fail the NOT NULL constraint as a 500. An
+        # explicit null and an omitted key mean the same thing on each of
+        # these toggles, so the former is normalized to the latter here,
+        # before any of the merges below read the payload, rather than
+        # left to the database. See `_NOT_NULL_BOOLEAN_UPDATE_FIELDS` for
+        # the full field list and the sync test that keeps it honest.
+        for field in _NOT_NULL_BOOLEAN_UPDATE_FIELDS:
+            if field in update_data and update_data[field] is None:
+                del update_data[field]
+
         merged_primary = str(update_data.get("primary_color", config.primary_color))
         merged_secondary = str(
             update_data.get("secondary_color", config.secondary_color)
@@ -898,6 +1085,21 @@ class CaptivePortalService:
             is_default=merged_is_default, location_id=config.location_id
         )
 
+        # Scoped against the config's **stored** location_id, not anything
+        # in the payload -- location_id is immutable after creation and was
+        # stripped from update_data above, so the stored value is the only
+        # truth there is. Merged the same way is_default is: a PUT that
+        # never mentions the field must not be able to change the answer,
+        # and a PUT that turns the flag off on an org default (the value
+        # every existing row already carries) must keep succeeding.
+        merged_whitelist_only = bool(
+            update_data.get("whitelist_only_enabled", config.whitelist_only_enabled)
+        )
+        validate_whitelist_only_scope(
+            whitelist_only_enabled=merged_whitelist_only,
+            location_id=config.location_id,
+        )
+
         if "business_hours_timezone" in update_data:
             validate_business_hours_timezone(
                 str(update_data["business_hours_timezone"])
@@ -910,6 +1112,19 @@ class CaptivePortalService:
             validate_guest_font_choice(str(update_data["guest_font_choice"]))
         if "content_mode" in update_data:
             validate_content_mode(str(update_data["content_mode"]))
+        # Validated only when the key is present, like content_mode above:
+        # a PUT that never mentions the review link must not be able to
+        # reject a save because of a value somebody stored earlier. Unlike
+        # the splash ceilings there is no grandfathering clause -- no row
+        # can predate this column, so there is no legacy value to protect.
+        if "review_url" in update_data:
+            submitted = update_data["review_url"]
+            validate_review_url(None if submitted is None else str(submitted))
+        # Same present-key-only rule, for the same reason: a PUT that never
+        # mentions the dwell must not reject a save over a value somebody
+        # stored earlier.
+        if "feedback_dwell_minutes" in update_data:
+            validate_feedback_dwell_minutes(update_data["feedback_dwell_minutes"])
         if "background_overlay_strength" in update_data:
             validate_background_overlay_strength(
                 update_data["background_overlay_strength"]

@@ -704,13 +704,87 @@ WIREGUARD_INTERFACE_NAME = "wg-cloudguard"
 # validation and dropping guests onto plain HTTP.
 HOTSPOT_DNS_NAME = "wifi.wyfyguest.com"
 
+# The host the guest's browser actually ends up on, and the one this
+# platform's real sign-in app is served from. **This is deliberately NOT
+# :data:`HOTSPOT_DNS_NAME`, and the two must never be merged.**
+#
+# ``HOTSPOT_DNS_NAME`` is router-local by construction: ``dns-name`` makes
+# RouterOS answer DNS for that name, for that router's own guests, with
+# that router's own LAN address, and that local answer is absolute for a
+# connected guest -- not a fallback a public A record could override. So a
+# name used as ``dns-name`` can only ever reach the small redirect page
+# stored in ``html-directory`` on the device. Point the *real* portal at
+# the same name and every guest's browser resolves it to the router and
+# loops back onto that redirect page instead of reaching sign-in.
+# ``cloudguest-foundation``'s ``RouterDetailTabs.tsx`` records that exact
+# outcome as confirmed live, before the two names were split apart.
+#
+# The guest's journey is therefore two hops on purpose, and each hop needs
+# a different name:
+#
+#   1. RouterOS intercepts and redirects to ``http://<HOTSPOT_DNS_NAME>/``,
+#      which is served off the device and is the only place RouterOS
+#      substitutes ``$(link-login-only)``/``$(mac)``/``$(link-orig)``.
+#   2. That page hands off to ``https://<GUEST_PORTAL_HOST>/portal?...``,
+#      carrying those substituted tokens, which is where the SPA runs.
+#
+# Hop 1 cannot be removed: the ``link-login-only`` token that the final
+# ``/login`` POST needs in order to actually authorize the guest's MAC only
+# exists inside a page the router itself served.
+#
+# Hardcoded rather than derived, mirroring ``RouterDetailTabs.tsx``'s
+# ``GUEST_PORTAL_PUBLIC_BASE`` byte-for-byte and for its reason: that
+# constant used to be ``window.location.origin``, which baked in whatever
+# URL the admin happened to be browsing from, and shipped already-generated
+# routers pointing at a host that was never the guest portal. The value
+# here must stay equal to the host in the ``location.replace()`` those
+# generated ``login.html`` pages perform, or this function walls in a host
+# no guest is sent to while the host they ARE sent to stays blocked.
+GUEST_PORTAL_HOST = "auth.wyfyguest.com"
+
 # RouterOS's ``/ip hotspot profile html-directory`` -- which uploaded page
 # set a portal serves. Was a bare literal inside ``_render_vlan_hotspot``
 # until ``app.domains.vlan.device_adapters`` had to push the same profile
 # over the API: the script path and the direct-push path must name the same
 # directory or a VLAN's portal serves different pages depending on which
 # path last touched the router.
-HOTSPOT_HTML_DIRECTORY = "cloudguest-hotspot"
+#
+# ``hotspot``, RouterOS's own stock directory -- NOT ``cloudguest-hotspot``,
+# which is what this said until 2026-09-06 and which pointed the profile at
+# a directory that does not exist on any device.
+#
+# Nothing on this platform ever created it or put a file in it. That is not
+# an oversight discovered from outside; it is stated eleven hundred lines
+# below, in :func:`render_hotspot_walled_garden`'s own "What this does NOT
+# fix": serving a login page from that directory "needs a file on the
+# device, so it needs either a ``/tool fetch`` of a page the API serves or a
+# ``/file`` write -- neither of which is rendered here". Both halves were
+# true and they were never read together. The directory was named as though
+# it would be filled in later, and the profile was pointed at it in the
+# meantime.
+#
+# What that cost: RouterOS serves the hotspot's pages out of
+# ``html-directory``, so a profile aimed at an empty one has no login page
+# to serve. And the Master Console's generated setup script writes
+# ``html-directory=hotspot`` (``RouterDetailTabs.tsx:6349``) and then
+# overwrites five stock pages inside it with a basename-anchored
+# ``/file set``. So on a router set up by the generator and later touched by
+# this renderer -- a VLAN push, a config re-render -- the profile moved off
+# the populated stock directory onto the empty one, and the venue's portal
+# stopped being served. The two paths this constant exists to keep in
+# agreement were in agreement with each other and not with the third path,
+# which is the only one that ever put a file on a device.
+#
+# There is now a second thing in that directory worth not losing. Since
+# RouterOS 7.3 the stock page set ships ``api.json``, MikroTik's own
+# RFC 8908 captive-portal API, whose ``captive`` member is real because the
+# router knows which client is asking. Pointing a profile away from the
+# stock directory takes that with it, silently, and it is the endpoint this
+# platform's whole captive-portal-detection story is meant to end up on.
+#
+# The stock name is also the one that cannot rot: it is present on a
+# factory-reset device before anything of ours runs.
+HOTSPOT_HTML_DIRECTORY = "hotspot"
 
 # ---------------------------------------------------------------------------
 # Markers and ports the paired device writers in
@@ -1132,23 +1206,81 @@ def render_port_forwarding_rule(rule: PortForwardingRule) -> list[str]:
 
 def render_hotspot_profile(profile: HotspotProfile) -> list[str]:
     """Renders one enabled ``HotspotProfile`` row -- see module docstring
-    for why only the user-profile/walled-garden slice is modeled."""
+    for why only the user-profile/walled-garden slice is modeled.
+
+    ## Why this is ``set``-or-``add``, and not just ``add``
+
+    This used to emit a bare ``/ip hotspot user profile add name=<identifier>
+    session-timeout=...``. ``_hotspot_identifier`` is stable across edits (it
+    is the profile's name plus the first eight characters of its immutable
+    id), and every push re-renders *every* enabled row, so the second push of
+    a profile always named one RouterOS already had. ``add`` cannot update an
+    existing row -- it fails with "already have such entry" -- and
+    :func:`_idempotent_lines` wraps every command in ``:do {...} on-error={}``,
+    which swallows exactly that error by design.
+
+    The result was that a venue could change its session timeout, watch the
+    row update, watch a push report success, and have the router keep the old
+    value forever, with nothing logged anywhere. The first push of a profile
+    won; every edit after it was silently discarded. That is a device-side
+    "the setting cannot be changed", independent of (and additional to) the
+    RADIUS ``Session-Timeout`` reply path, which reads a different source
+    entirely -- ``GuestSession.session_timeout_minutes``, resolved from
+    ``PolicyType.SESSION``.
+
+    The fix follows :func:`render_radius_client`'s own established shape in
+    this file: ``:if ([:len [... find ...]] = 0) do={ ... add ... } else={
+    ... set ... }``, one self-contained line, still safe to wrap in
+    ``_idempotent_lines``.
+
+    ## Why unset fields are emitted as explicit "unlimited", not omitted
+
+    ``set`` only changes the parameters it is given, so omitting a field
+    leaves whatever the device already had. Under the old ``add``-only shape
+    omission was harmless (the row was being created from nothing); under
+    ``set`` it would mean a venue can raise a limit but never clear one back
+    to unlimited. So each field is always emitted, using RouterOS's own
+    "no limit" values -- ``session-timeout=0`` (the convention
+    ``HotspotProfile.session_timeout_minutes``'s own column comment already
+    names for its ``NULL``), ``idle-timeout=none``, and an empty
+    ``rate-limit``.
+
+    The walled-garden rows are guarded by the same ``find``-length check
+    :func:`render_hotspot_walled_garden` already uses, for the same reason:
+    ``/ip hotspot walled-garden`` has no uniqueness constraint, so a bare
+    ``add`` re-run on every push accumulated a duplicate row per host per
+    push, unbounded. Note these rows are still only ever added -- dropping a
+    host from ``walled_garden_hosts`` does not withdraw it from the device.
+    """
     identifier = _hotspot_identifier(profile)
-    parts = [f"/ip hotspot user profile add name={identifier}"]
-    if profile.session_timeout_minutes is not None:
-        parts.append(f"session-timeout={profile.session_timeout_minutes}m")
-    if profile.idle_timeout_minutes is not None:
-        parts.append(f"idle-timeout={profile.idle_timeout_minutes}m")
+    fields = [
+        f"session-timeout={profile.session_timeout_minutes}m"
+        if profile.session_timeout_minutes is not None
+        else "session-timeout=0",
+        f"idle-timeout={profile.idle_timeout_minutes}m"
+        if profile.idle_timeout_minutes is not None
+        else "idle-timeout=none",
+    ]
     if profile.upload_limit_kbps is not None or profile.download_limit_kbps is not None:
-        parts.append(
+        fields.append(
             f"rate-limit={profile.upload_limit_kbps or 0}k/"
             f"{profile.download_limit_kbps or 0}k"
         )
-    lines = [" ".join(parts)]
+    else:
+        fields.append('rate-limit=""')
+    body = " ".join(fields)
+    found = f'[/ip hotspot user profile find where name="{identifier}"]'
+    lines = [
+        f":if ([:len {found}] = 0) "
+        f"do={{ /ip hotspot user profile add name={identifier} {body} }} "
+        f"else={{ /ip hotspot user profile set {found} {body} }}"
+    ]
     for host in profile.walled_garden_hosts:
         lines.append(
-            f"/ip hotspot walled-garden add dst-host={host} action=allow "
-            f'comment="{profile.name}"'
+            f":if ([:len [/ip hotspot walled-garden find where "
+            f'dst-host="{host}" && comment="{profile.name}"]] = 0) '
+            f"do={{ /ip hotspot walled-garden add dst-host={host} action=allow "
+            f'comment="{profile.name}" }}'
         )
     return lines
 
@@ -1559,9 +1691,27 @@ WALLED_GARDEN_SECTION_HEADER = (
 #: without ever matching -- or removing -- one an operator added by hand.
 MANAGED_WALLED_GARDEN_COMMENT = "cloudguest-walledgarden-live"
 
+#: ``comment=`` on the ``/ip hotspot walled-garden ip`` row that carries the
+#: guest portal. **Byte-equal with ``RouterDetailTabs.tsx``'s
+#: ``buildWalledGardenLines``, deliberately** -- the same "duplicated on
+#: purpose, must stay identical" rule :data:`RADIUS_CLIENT_COMMENT` above
+#: states for the paired device writer. The Master-console setup script and
+#: this bootstrap both write this row on the same fleet; sharing the comment
+#: makes each ADOPT the other's row with a converging ``set`` instead of
+#: stacking a second accept beside a working one.
+PORTAL_HTTPS_WALLED_GARDEN_COMMENT = "cloudguest-portal-https"
+
+#: ``comment=`` on the ``/ip hotspot walled-garden ip`` row for the API host.
+#: A separate name because the API host is DERIVED from ``api_url`` (so a
+#: staging deployment walls in its own), while the portal host is a fixed
+#: constant -- one row per name, so a staging API address can never overwrite
+#: the portal's row or vice versa. The Master console writes no equivalent
+#: row, so unlike the portal comment this one has no counterpart to match.
+API_HTTPS_WALLED_GARDEN_COMMENT = "cloudguest-api-https"
+
 
 def _portal_walled_garden_hosts(api_url: str) -> list[str]:
-    """The two hosts a not-yet-authenticated guest must be able to reach.
+    """Every host a not-yet-authenticated guest must be able to reach.
 
     ``api_url`` is any absolute URL on the platform's own API -- only its
     host is read, never its path -- which is what lets the bootstrap
@@ -1587,12 +1737,68 @@ def _portal_walled_garden_hosts(api_url: str) -> list[str]:
     Both forms are emitted because the wildcard conventionally does not
     match the bare name either, and a single-hotspot router bound straight
     to the constant is a real configuration.
+
+    **:data:`GUEST_PORTAL_HOST` is here because it was missing, and its
+    absence was the whole bug.** This function's own docstring used to claim
+    "the portal host is :data:`HOTSPOT_DNS_NAME`". That is true of the
+    *redirect* host and false of the portal: the redirect page served off
+    the device immediately hands the browser to
+    ``https://auth.wyfyguest.com/portal?...`` (see
+    :data:`GUEST_PORTAL_HOST` for why those two names are deliberately
+    different and what happens if they are merged). So the platform allowed
+    through the name the guest passes over in a fraction of a second and
+    blocked the name they actually have to load -- the exact drift this
+    docstring's own single-source-of-truth rule exists to prevent, inverted.
+    Only the Master console's hand-pasted setup script ever wrote this
+    entry, so a router provisioned purely by this bootstrap had no route to
+    sign-in at all.
     """
     api_host = urlsplit(api_url).hostname
-    hosts = [HOTSPOT_DNS_NAME, f"*.{HOTSPOT_DNS_NAME}"]
+    hosts = [HOTSPOT_DNS_NAME, f"*.{HOTSPOT_DNS_NAME}", GUEST_PORTAL_HOST]
     if api_host and api_host not in hosts:
         hosts.append(api_host)
     return hosts
+
+
+def _portal_https_walled_garden_targets(api_url: str) -> list[tuple[str, str]]:
+    """``(hostname, comment)`` for each host that must additionally get an
+    **address-based** ``/ip hotspot walled-garden ip`` row.
+
+    A strict subset of :func:`_portal_walled_garden_hosts`, and the subset
+    rule is "is this a real, publicly-resolvable host the guest reaches over
+    TLS":
+
+    * :data:`GUEST_PORTAL_HOST` and the API host qualify. Both are HTTPS and
+      both live on this platform's own public addresses.
+    * :data:`HOTSPOT_DNS_NAME` and its wildcard do NOT, and adding them
+      would be actively harmful rather than merely redundant. That name
+      resolves, on the router, to the router's own LAN address -- an
+      ``action=accept`` on that address would bypass hotspot authentication
+      for everything the router itself listens on, for every unauthenticated
+      guest. The host-based row is both sufficient and correct for it: the
+      redirect page is plain HTTP by design (``login-by=http-pap``), which
+      is the one case the host-based menu really does cover.
+
+    The hostnames are returned, not addresses: the ``:resolve`` happens on
+    the device, at paste time, deliberately. A generate-time literal goes
+    stale the moment a DNS record moves and an already-provisioned router
+    gets no signal -- this fleet has already paid that bill once, when a
+    hardcoded hub address was baked into 64 routers that then needed
+    physical visits.
+
+    One row per *name*, even when two names currently resolve to one
+    address -- which they do in production today (``auth``, ``portal``,
+    ``app`` and ``master`` are all one host). Two ``action=accept`` rows for
+    the same address are harmless and converge independently; a row shared
+    between two names, or suppressed because the addresses happened to
+    match at paste time, would go stale and unnoticed the moment the two
+    names are split onto different hosts.
+    """
+    targets = [(GUEST_PORTAL_HOST, PORTAL_HTTPS_WALLED_GARDEN_COMMENT)]
+    api_host = urlsplit(api_url).hostname
+    if api_host and api_host != GUEST_PORTAL_HOST:
+        targets.append((api_host, API_HTTPS_WALLED_GARDEN_COMMENT))
+    return targets
 
 
 def render_hotspot_walled_garden(*, api_url: str) -> list[str]:
@@ -1624,6 +1830,42 @@ def render_hotspot_walled_garden(*, api_url: str) -> list[str]:
     which is the entire point of ``dns-name``/``HOTSPOT_DNS_NAME`` -- that
     accident stops covering for the missing configuration.
 
+    ## Two walled gardens, not one, and the host-based half alone is no fix
+
+    RouterOS has two independent walled-garden menus and they are not
+    interchangeable. ``/ip hotspot walled-garden`` (host-based) keys on the
+    HTTP ``Host`` header at the hotspot's own proxy layer. That layer does
+    not exist for TLS -- since RouterOS 7.5 an unauthenticated HTTPS flow is
+    rejected outright rather than proxied -- so a host-based row can never
+    match an HTTPS request and sits at ``HITS: 0`` forever.
+    ``/ip hotspot walled-garden ip`` (address-based) acts at the
+    firewall/NAT layer, *before* that rejection, and is the only mechanism
+    that can pass HTTPS.
+
+    :data:`GUEST_PORTAL_HOST` is HTTPS-only. **A section that emitted only
+    the host-based row would therefore not be a partial fix, it would be no
+    fix -- and it would report success**, which is what this function did
+    until now. Confirmed twice on real hardware, both recorded in
+    ``cloudguest-foundation``'s ``buildWalledGardenLines``:
+
+    * 2026-08-18, router ``WYFY-GUEST``: 1,965 HTTPS hits against 30 HTTP
+      hits on the hotspot's own redirect rules -- ~98% of real guest
+      traffic was arriving over TLS.
+    * 2026-08-27, "huda city center": the host-based row for
+      ``auth.wyfyguest.com`` was present, at ``HITS: 0``, having never
+      matched anything, while the address-based menu was empty and Safari
+      reported "couldn't establish a secure connection".
+
+    MikroTik's own prose says the host menu covers "HTTP and HTTPs". The
+    live hit-counters say otherwise, twice, and the live evidence governs.
+
+    Both are emitted here, together, because they are one feature: the
+    hosts from :func:`_portal_walled_garden_hosts` as host-based rows, and
+    the subset from :func:`_portal_https_walled_garden_targets` as
+    address-based rows. Note also that ``dst-address`` on the IP menu is
+    *ignored* when ``dst-host`` is set on the same row, so the address-based
+    rows pass an address and never a name.
+
     ## Rendered idempotently, and it never deletes
 
     Each host is guarded by a ``find where dst-host=... && comment=...``
@@ -1642,13 +1884,23 @@ def render_hotspot_walled_garden(*, api_url: str) -> list[str]:
     own hotspot login page, with its own ``<form>``, over plain HTTP --
     ``dns-name`` changed the host in that URL, not its scheme. Removing the
     warning additionally requires the hotspot's ``html-directory``
-    (``cloudguest-hotspot``, already set by ``_render_vlan_hotspot``) to
-    hold a login page that carries no form of its own and merely redirects
-    to the platform's real HTTPS portal. That needs a file on the device,
-    so it needs either a ``/tool fetch`` of a page the API serves or a
-    ``/file`` write -- neither of which is rendered here, and neither of
-    which has been confirmed against a real device, which this module's own
-    "confirmed live" standard requires before it ships. This section is the
+    (:data:`HOTSPOT_HTML_DIRECTORY`, already set by
+    ``_render_vlan_hotspot``) to hold a login page that carries no form of
+    its own and merely redirects to the platform's real HTTPS portal. That
+    needs a file on the device, so it needs either a ``/tool fetch`` of a
+    page the API serves or a ``/file`` write -- neither of which is
+    rendered here, and neither of which has been confirmed against a real
+    device, which this module's own "confirmed live" standard requires
+    before it ships.
+
+    This paragraph used to name that directory ``cloudguest-hotspot``, and
+    saying "needs a file on the device, neither of which is rendered here"
+    about a directory the profile was *already pointed at* was the whole
+    defect: it reads as future work and it was in fact a live description
+    of a profile aimed at nothing. The constant now names RouterOS's stock
+    directory, which is populated on a factory-reset device, so this
+    remains genuinely outstanding work rather than a description of a
+    broken portal. This section is the
     half that is safe to ship without a device: the HTTPS portal is
     unreachable pre-auth *without* it, so it is a prerequisite for that
     work rather than an alternative to it.
@@ -1658,11 +1910,108 @@ def render_hotspot_walled_garden(*, api_url: str) -> list[str]:
     # own line-count cap (see tests) exists to keep it a thin paste, and a
     # temporary variable per host would double the footprint for no gain.
     return [
-        f":if ([:len [/ip hotspot walled-garden find where "
-        f'dst-host="{host}" && comment="{MANAGED_WALLED_GARDEN_COMMENT}"]] = 0) '
-        f'do={{ /ip hotspot walled-garden add dst-host="{host}" action=allow '
-        f'comment="{MANAGED_WALLED_GARDEN_COMMENT}" }}'
-        for host in _portal_walled_garden_hosts(api_url)
+        *(
+            f":if ([:len [/ip hotspot walled-garden find where "
+            f'dst-host="{host}" && comment="{MANAGED_WALLED_GARDEN_COMMENT}"]] = 0) '
+            f'do={{ /ip hotspot walled-garden add dst-host="{host}" action=allow '
+            f'comment="{MANAGED_WALLED_GARDEN_COMMENT}" }}'
+            for host in _portal_walled_garden_hosts(api_url)
+        ),
+        *_render_portal_https_walled_garden(api_url),
+    ]
+
+
+def _render_portal_https_walled_garden(api_url: str) -> list[str]:
+    """The address-based half -- the only one that can pass the HTTPS
+    portal. See :func:`render_hotspot_walled_garden`'s "Two walled gardens"
+    section for why the host-based rows alone are no fix at all.
+
+    **One entered line, every ``:local`` and its uses inside it**, exactly
+    as :func:`render_guest_data_path` does and for the same reason: a
+    ``:local`` does not survive across entered lines, so a write that reads
+    a variable declared on a previous line silently sees an empty string.
+
+    ``[:typeof $x] = "ip"``, never ``[:len $x] > 0``, is the gate.
+    ``:local x ""`` binds a *string*; a successful ``:resolve`` rebinds it
+    to RouterOS's ``ip`` type. Length-testing the string would pass on
+    junk and write ``dst-address=`` from it.
+
+    Add-or-``set``, not add-only. This is the one place in this section that
+    converges rather than only appending, and it has to: the row's whole
+    content is an address that moves whenever the platform's own A record
+    moves, so an add-only row would pin a router to a dead address forever
+    -- which is precisely what a stale generate-time literal would have done
+    and what the on-device ``:resolve`` exists to avoid. A ``set`` also
+    re-enables a row an operator disabled while debugging, so a re-run
+    genuinely restores the portal instead of finding a row and leaving it
+    inert.
+
+    A failed ``:resolve`` writes nothing and is not silent: the paired
+    :func:`render_portal_https_walled_garden_verification` re-reads the
+    table from the device and stops the script with a named reason.
+    """
+    statements: list[str] = []
+    for index, (host, comment) in enumerate(
+        _portal_https_walled_garden_targets(api_url)
+    ):
+        # Suffixed per target: two targets sharing one variable name inside
+        # this single entered line would have the second silently overwrite
+        # the first.
+        ip_var = f"cgWgIp{index}"
+        ok_var = f"cgWgOk{index}"
+        row_var = f"cgWgRow{index}"
+        statements.extend(
+            [
+                f':local {ip_var} ""',
+                f':do {{ :set {ip_var} [:resolve "{host}"] }} '
+                f'on-error={{ :set {ip_var} "" }}',
+                f':local {ok_var} ([:typeof ${ip_var}] = "ip")',
+                f":local {row_var} [/ip hotspot walled-garden ip find where "
+                f'comment="{comment}"]',
+                f":if (${ok_var} && [:len ${row_var}] = 0) do={{ "
+                f"/ip hotspot walled-garden ip add action=accept "
+                f'dst-address=${ip_var} comment="{comment}" }}',
+                f":if (${ok_var} && [:len ${row_var}] > 0) do={{ "
+                f"/ip hotspot walled-garden ip set ${row_var} action=accept "
+                f"dst-address=${ip_var} disabled=no }}",
+            ]
+        )
+    return ["; ".join(statements)] if statements else []
+
+
+def render_portal_https_walled_garden_verification() -> list[str]:
+    """Fail loudly if no address-based walled-garden row for the portal was
+    actually established.
+
+    Same separation, and the same reasoning, as
+    :func:`render_guest_data_path_verification`: asserting and verifying are
+    different claims, and every write in
+    :func:`_render_portal_https_walled_garden` is guarded, so a guarded
+    command that did not fire is indistinguishable from one that succeeded.
+    This re-reads the device's own table rather than trusting the variables
+    that wrote it.
+
+    ``:error`` rather than ``:log warning``, and the bar for that is met:
+    a router that finishes enrollment without this row intercepts, serves
+    ``login.html``, redirects the guest to the HTTPS portal, and then hands
+    every one of them the router's own self-signed certificate instead --
+    "secure connection failed", for every guest, on a router the platform
+    reports as provisioned. The realistic cause is that
+    :data:`GUEST_PORTAL_HOST` did not resolve on this device, which is
+    fixable on the spot and worth stopping for; the script reaches this
+    point only after several successful HTTPS calls of its own, so a
+    failure here is a real DNS fault rather than an expected condition.
+    """
+    return [
+        ":if ([:len [/ip hotspot walled-garden ip find where "
+        f'comment="{PORTAL_HTTPS_WALLED_GARDEN_COMMENT}" && disabled=no]] = 0) '
+        'do={ :error "CloudGuest bootstrap verification failed: no '
+        "address-based walled-garden entry for "
+        f"{GUEST_PORTAL_HOST} was established, so every guest would be "
+        "redirected to the sign-in page and then get this router's own "
+        "certificate instead of it. Usually this means "
+        f"{GUEST_PORTAL_HOST} did not resolve on this router -- check "
+        '/ip dns here and re-run." }',
     ]
 
 
@@ -2334,6 +2683,11 @@ def _render_onsite_bootstrap_lines(
         '"CloudGuest bootstrap verification failed: hub peer is missing on '
         f'{WIREGUARD_INTERFACE_NAME}" }}',
         *render_guest_data_path_verification(),
+        # A router that gets here with the guest data path but no
+        # address-based walled-garden row is the same shape of failure one
+        # layer up: every guest authenticates, gets internet, and still
+        # cannot load the sign-in page they had to pass through to get it.
+        *render_portal_https_walled_garden_verification(),
         f":if ({interface_exists} > 0 && {address_attached} > 0 && "
         f"{peer_exists} > 0) do={{ "
         f':log info "{success_message}"; :put "{success_message}" }}',
@@ -2654,7 +3008,15 @@ def _render_remote_bootstrap_lines(
         # -- walled garden, same add-only, never-remove shape. Safe on a
         #    live re-provision for the same reason the data path above is:
         #    it only ever adds its own comment-tagged allow rules and takes
-        #    nothing away from a router that is already serving guests.
+        #    nothing away from a router that is already serving guests. The
+        #    address-based rows it now also emits do `set` an existing row,
+        #    but only ever onto a freshly resolved address for a name this
+        #    platform owns -- and only its own comment-tagged rows.
+        #    Deliberately NOT paired with
+        #    render_portal_https_walled_garden_verification(), for the same
+        #    reason the data path above is not: aborting a re-provision of a
+        #    live, already-serving router over a walled-garden row would be
+        #    worse than the missing row.
         *render_hotspot_walled_garden(api_url=check_in_url),
         # -- stage: bake validated values into the two detached scripts ----
         f":local cut {_ros_string_expr(_join_embedded_commands(cutover_commands))}",
@@ -2865,14 +3227,18 @@ def _idempotent_lines(lines: list[str]) -> list[str]:
 
 __all__ = [
     "HOTSPOT_DNS_NAME",
+    "GUEST_PORTAL_HOST",
     "HOTSPOT_HTML_DIRECTORY",
     "MANAGED_WALLED_GARDEN_COMMENT",
+    "PORTAL_HTTPS_WALLED_GARDEN_COMMENT",
+    "API_HTTPS_WALLED_GARDEN_COMMENT",
     "WALLED_GARDEN_SECTION_HEADER",
     "render_dhcp_pool",
     "render_vlan",
     "render_port_forwarding_rule",
     "render_hotspot_profile",
     "render_hotspot_walled_garden",
+    "render_portal_https_walled_garden_verification",
     "render_qos_traffic_rule",
     "render_dns_record",
     "render_firewall_rule",
