@@ -118,6 +118,7 @@ from app.domains.provisioning_engine.planner.schemas import (
     ConfigurationPlanRenderResponse,
     ConfigurationPlanResponse,
     DiscoverRouterResponse,
+    DiscoveryPreflightResponse,
     GuestInterfaceAvailabilityResponse,
     RouterSnapshotListResponse,
     RouterSnapshotResponse,
@@ -1215,6 +1216,54 @@ async def preview_bootstrap_script(
 # ============================================================================
 # Wave 1 discovery / snapshot / compatibility
 # ============================================================================
+
+
+@router.get(
+    "/routers/{router_id}/discover/preflight",
+    response_model=ApiResponse[DiscoveryPreflightResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("routers.read"))],
+)
+async def get_discovery_preflight(
+    request: Request,
+    router_id: uuid.UUID,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    discovery_service: DiscoveryService = Depends(get_discovery_service),
+):
+    """Every discovery precondition, evaluated without dialling anything.
+
+    The service behind this has existed since #146 and was deliberately left
+    unrouted -- *"the HTTP endpoint is NOT wired: that needs a route,
+    permissions and its own tests, and inventing a public surface inside
+    someone else's half-finished feature is how the next person inherits this
+    same problem."* This is that route, those permissions and those tests.
+
+    It was not optional in practice: the fleet wizard has called
+    ``GET /routers/{id}/discover/preflight`` since #127 -- earlier than the
+    service landed -- so the precondition panel that tells an installer *why*
+    discovery will fail has been rendering its error state on every router, on
+    every run, against a 404. The backend could compute all of it.
+
+    ``routers.read``, not ``routers.manage``: this opens no socket, writes no
+    snapshot and changes nothing. Requiring the permission that lets someone
+    *run* discovery would hide the explanation from exactly the reader who
+    needs it -- somebody diagnosing why the button is disabled. The button
+    itself still needs ``routers.manage``.
+    """
+    result = await discovery_service.get_discovery_preflight(
+        router_id,
+        requesting_organization_id=requesting_organization_id,
+    )
+    return build_response(
+        success=True,
+        #  Deliberately neutral. `can_attempt` false is not a failure of this
+        #  call -- the report succeeded and its answer is "not yet" -- so the
+        #  message must not read as an error to a caller that only surfaces
+        #  `message`.
+        message="Discovery preflight evaluated",
+        data=result.model_dump(),
+        request_id=_request_id(request),
+    )
 
 
 @router.post(
