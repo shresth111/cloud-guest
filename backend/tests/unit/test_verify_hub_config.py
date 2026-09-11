@@ -1,3 +1,7 @@
+# ruff: noqa: E501 -- the fixtures below are verbatim FreeRADIUS config lines
+# captured from the hub. Reflowing them to 88 columns would change what is
+# being tested: the checker parses these strings, and a wrapped `%{expr:...}`
+# or a split JSON `data =` line is a different config than the one that shipped.
 """Tests for ``ops/freeradius/verify_hub_config.py``.
 
 The point of this suite is not that the checker runs -- it is that the
