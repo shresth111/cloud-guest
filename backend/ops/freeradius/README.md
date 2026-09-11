@@ -216,6 +216,55 @@ file is ahead of git: the 2026-08-18 dynamic-xlat and Message-Authenticator
 fixes were applied on the box and never committed.
 `sites-default.snippets.conf` is a diff, not a drop-in.
 
+## Checking what a `client{}` stanza actually resolves to (2026-09-11)
+
+`%{client:shortname}` and `%{client:backend_secret}` decide which venue a
+router authenticates to the platform API *as*, and a stanza missing one of
+those items fails **silently** — the router gets `Auth-Type: Reject` behind an
+HTTP 200, with nothing logged anywhere. `radiusd -XC` will not tell you; it
+validates the syntax and stops.
+
+This resolves them for real, off-box, in about a minute. It needs no hub
+access and touches nothing live:
+
+```bash
+cp -RL /etc/freeradius/3.0 /tmp/probe          # or a captured tree
+rm -f /tmp/probe/sites-enabled/* /tmp/probe/mods-enabled/eap
+cat > /tmp/probe/sites-enabled/probe <<'EOF'
+server default {
+	listen { type = auth
+		 ipaddr = 127.0.0.1
+		 port = 18812 }
+	authorize {
+		update reply {
+			Reply-Message := "SHORT=[%{client:shortname}] BSEC=[%{client:backend_secret}]"
+		}
+		update control { Auth-Type := Accept }
+	}
+	authenticate {}
+	post-auth {}
+}
+EOF
+# put ONLY the stanza under test in clients.conf, so 127.0.0.1 matches it
+radiusd -X -d /tmp/probe &
+echo "User-Name = probe@example.com, User-Password = x" \
+  | radclient -x 127.0.0.1:18812 auth <that stanza's secret>
+```
+
+Measured results for the two stanza shapes that matter:
+
+| stanza | `Reply-Message` |
+|---|---|
+| the hub's `cloudguest-dynamic-wan` (`0.0.0.0/0`, no `backend_secret`) | `SHORT=[cloudguest-dynamic-wan] BSEC=[]` |
+| a generated `0.0.0.0/0` fallback (with `shortname` + `backend_secret`) | `SHORT=[cg-bfc7ed1c] BSEC=[s-bfc7ed1c-REAL-SECRET]` |
+
+Two things worth knowing from that. `%{client:backend_secret}` on a stanza
+lacking the item expands to the **empty string** — not a literal, not an
+error — so such a stanza is a dead end at `CurrentNas`, which refuses an empty
+secret before any lookup. And `%{client:shortname}` falls back to the
+`client <label>`, which is *not* a registered `nas_identifier`, so the label
+being cosmetic stops being true the moment `shortname` is missing.
+
 ## Manual verification commands (matches what was actually run 2026-08-10)
 
 ```bash
