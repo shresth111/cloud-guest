@@ -74,6 +74,9 @@ from app.domains.rbac.enums import ScopeType
 from .dependencies import get_network_integration_service
 from .models import NetworkIntegration
 from .schemas import (
+    ControllerConfigureRequest,
+    ControllerConfigureResponse,
+    ControllerConfigureStepResponse,
     NetworkIntegrationClientListResponse,
     NetworkIntegrationClientResponse,
     NetworkIntegrationCreateRequest,
@@ -102,7 +105,7 @@ from .schemas import (
     TestConnectionRequest,
     TestConnectionResponse,
 )
-from .service import NetworkIntegrationService
+from .service import ControllerSetupOutcome, NetworkIntegrationService
 from .validators import build_external_portal_url, portal_readiness_gaps
 
 router = APIRouter(prefix="/network-integrations", tags=["Network Integrations"])
@@ -222,6 +225,42 @@ def _tls_fields(observation) -> dict[str, object]:  # noqa: ANN001
         "tls_certificate_issuer": observation.issuer,
         "tls_certificate_expires_at": observation.not_valid_after,
     }
+
+
+def _controller_configure_response(
+    outcome: ControllerSetupOutcome,
+) -> ControllerConfigureResponse:
+    """One builder for both configure routes, so the customer and platform
+    reports cannot drift into different shapes."""
+    return ControllerConfigureResponse(
+        integration_id=str(outcome.integration_id),
+        dry_run=outcome.dry_run,
+        ok=outcome.ok,
+        changed=outcome.changed,
+        steps=[
+            ControllerConfigureStepResponse(
+                step=step.step,
+                outcome=step.outcome,
+                message=step.message,
+                provider_code=step.provider_code,
+                details=dict(step.details),
+            )
+            for step in outcome.steps
+        ],
+        portal_id=outcome.portal_id,
+        guest_ssid_id=outcome.guest_ssid_id,
+        portal_url_scheme=outcome.portal_url_scheme,
+        portal_url_host_and_query=outcome.portal_url_host_and_query,
+        pre_auth_host=outcome.pre_auth_host,
+    )
+
+
+def _configure_message(outcome: ControllerSetupOutcome) -> str:
+    if outcome.dry_run:
+        return "Controller configuration planned (dry run, nothing changed)"
+    if outcome.ok:
+        return "Controller configured"
+    return "Controller configuration incomplete"
 
 
 def _event_response(event) -> NetworkIntegrationEventResponse:  # noqa: ANN001
@@ -504,6 +543,45 @@ async def test_platform_integration_connection(
         success=error is None,
         message="Connection test completed",
         data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/platform/integrations/{integration_id}/configure-controller",
+    response_model=ApiResponse[ControllerConfigureResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(
+            RequirePermission("network_integrations.update", scope=ScopeType.GLOBAL)
+        )
+    ],
+)
+async def configure_platform_integration_controller(
+    request: Request,
+    integration_id: uuid.UUID,
+    payload: ControllerConfigureRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+):
+    """Configure any tenant's controller automatically (platform staff).
+
+    GLOBAL scope is the access control, exactly as on the platform
+    test-connection route above. The run itself is the customer one: every
+    value written comes from the integration row's own organization, venue
+    and fleet device, so a platform caller picks which integration and
+    nothing else. See ``service.configure_platform_controller``.
+    """
+    outcome = await service.configure_platform_controller(
+        integration_id,
+        actor_user_id=_actor_id(actor),
+        dry_run=payload.dry_run,
+        take_over_ssid_portal=payload.take_over_ssid_portal,
+    )
+    return build_response(
+        success=outcome.ok,
+        message=_configure_message(outcome),
+        data=_controller_configure_response(outcome).model_dump(),
         request_id=_request_id(request),
     )
 
@@ -913,6 +991,52 @@ async def test_integration_connection(
         success=error is None,
         message="Connection test completed",
         data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/{integration_id}/configure-controller",
+    response_model=ApiResponse[ControllerConfigureResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+)
+async def configure_integration_controller(
+    request: Request,
+    integration_id: uuid.UUID,
+    payload: ControllerConfigureRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+):
+    """Configure this venue's controller automatically.
+
+    Creates or repairs the External Portal Server portal on the guest SSID,
+    adds the portal host to Pre-Authentication Access (merge-only), and
+    creates a hotspot operator account when the integration has none -- all
+    through the controller's Open API. ``dry_run: true`` reads only and
+    returns the plan.
+
+    The integration is loaded **with** ``requesting_organization_id`` in the
+    query, so another tenant's id is a 404. Refusals before any write are
+    409s with a typed ``data.code``: ``NETWORK_INTEGRATION_AUTOCONFIG_
+    PRECONDITIONS`` (``data.missing``), ``NETWORK_INTEGRATION_PORTAL_CONFLICT``
+    (``data.portal_name`` -- pass ``take_over_ssid_portal: true`` to release
+    the SSID), ``NETWORK_INTEGRATION_CONTROLLER_SITE_SHARED``,
+    ``NETWORK_INTEGRATION_GUEST_SSID_IN_USE``,
+    ``NETWORK_INTEGRATION_GUEST_SSID_NOT_FOUND`` and ``..._AMBIGUOUS``.
+    """
+    outcome = await service.configure_controller(
+        integration_id,
+        actor_user_id=_actor_id(actor),
+        requesting_organization_id=requesting_organization_id,
+        dry_run=payload.dry_run,
+        take_over_ssid_portal=payload.take_over_ssid_portal,
+    )
+    return build_response(
+        success=outcome.ok,
+        message=_configure_message(outcome),
+        data=_controller_configure_response(outcome).model_dump(),
         request_id=_request_id(request),
     )
 

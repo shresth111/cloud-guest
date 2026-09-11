@@ -60,6 +60,10 @@ __all__ = [
     "ProviderClient",
     "ProviderConnectionConfig",
     "ProviderControllerInfo",
+    "ProviderControllerSetupBlock",
+    "ProviderControllerSetupReport",
+    "ProviderControllerSetupRequest",
+    "ProviderControllerSetupStep",
     "ProviderDevice",
     "ProviderPortalContext",
     "ProviderSite",
@@ -268,6 +272,83 @@ class ProviderAuthorizationResult:
     request_snapshot: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderControllerSetupRequest:
+    """What "Configure controller automatically" should make true on one
+    controller site, for one integration.
+
+    Built by ``service.py`` from the integration row alone -- its own
+    organization, location, fleet device and site -- and never from request
+    input, so nothing a caller sends can point the run at another tenant's
+    portal URL, site or SSID.
+
+    ``ownership_query`` is the ``(key, value)`` pair that, found in a portal's
+    server URL query, marks that portal as this integration's even after a
+    venue renamed it. ``service.py`` uses the fleet ``routerId`` it already
+    stamps into the URL: unique per integration, so two locations sharing a
+    site cannot claim each other's portal.
+
+    ``new_operator_password`` is set only on a real run for an integration
+    that holds no operator login. ``repr=False`` keeps it out of tracebacks.
+    """
+
+    site_id: str
+    portal_name: str
+    portal_url_scheme: str
+    portal_url_host_and_query: str
+    ownership_query: tuple[str, str]
+    pre_auth_host: str
+    auth_timeout_minutes: int
+    operator_name: str
+    operator_note: str
+    operator_marker: str
+    guest_ssid_id: str | None = None
+    guest_ssid_name: str | None = None
+    create_operator_if_missing: bool = True
+    new_operator_password: str | None = field(default=None, repr=False)
+    take_over_ssid_portal: bool = False
+    dry_run: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderControllerSetupStep:
+    """One line of the report: ``outcome`` is one of ``created``,
+    ``updated``, ``unchanged``, ``skipped`` or ``failed``. ``details`` holds
+    identifiers and counts, never a credential."""
+
+    step: str
+    outcome: str
+    message: str
+    provider_code: int | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderControllerSetupBlock:
+    """Why the run stopped before writing anything. ``kind`` is
+    ``guest_ssid_not_found``, ``guest_ssid_ambiguous`` or
+    ``ssid_portal_conflict``; ``service.py`` turns each into its own typed
+    error."""
+
+    kind: str
+    message: str
+    portal_id: str | None = None
+    portal_name: str | None = None
+    match_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderControllerSetupReport:
+    dry_run: bool
+    steps: tuple[ProviderControllerSetupStep, ...] = ()
+    guest_ssid_id: str | None = None
+    portal_id: str | None = None
+    #: True only when this run put ``new_operator_password`` on an operator
+    #: account on the controller -- the caller's cue to store it.
+    operator_credentials_set: bool = False
+    block: ProviderControllerSetupBlock | None = None
+
+
 @runtime_checkable
 class NetworkProvider(Protocol):
     """What a vendor implements to become a supported network integration.
@@ -396,5 +477,19 @@ class NetworkProvider(Protocol):
         anyway -- it is a real capability that a second vendor will
         support, and defining the seam now is what stops that vendor's
         arrival from requiring a change to ``service.py``.
+        """
+        ...
+
+    async def configure_controller(
+        self,
+        config: ProviderConnectionConfig,
+        request: ProviderControllerSetupRequest,
+    ) -> ProviderControllerSetupReport:
+        """Make the controller match ``request``: portal, walled-garden entry
+        and guest-authorization account. Idempotent, merge-only for shared
+        settings, and read-only when ``request.dry_run`` is set.
+
+        Raises a ``ProviderError`` only for failures before anything was
+        written; once writing starts, every failure is reported on its step.
         """
         ...

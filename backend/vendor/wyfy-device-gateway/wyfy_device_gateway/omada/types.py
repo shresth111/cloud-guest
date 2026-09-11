@@ -51,6 +51,28 @@ OPENAPI_ERROR_TOKEN_OTHER = (-44106, -44111)
 OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND = -7131
 OPENAPI_ERROR_OPERATION_UNSUPPORTED = -1600
 
+# --- Open API permission refusals -------------------------------------------
+# VERIFIED from a primary source: the "Open API Access Guide" that Omada
+# Software Controller 5.15.24.19 embeds in its own OpenAPI document
+# (``GET /v3/api-docs`` -> ``x-openapi.x-setting.homeCustomLocation``,
+# section 1.2 "General Error Code In Result"), read 2026-09-12:
+#
+#   -1005  "Operation forbidden"
+#   -1505  "The current user does not have permissions to access this site"
+#
+# In Client (client-credentials) mode "the rights are the same as the login
+# Application", so these are what an Open API app whose role or site
+# privileges do not cover a call gets back. Mapped to their own error rather
+# than the generic fallback, whose normalized code the backend files under
+# "could not reach the network controller" -- false about a controller that
+# answered, and it sends the operator to the network instead of to the app's
+# role.
+OPENAPI_ERROR_OPERATION_FORBIDDEN = -1005
+OPENAPI_ERROR_SITE_PERMISSION_DENIED = -1505
+PERMISSION_DENIED_ERROR_CODES: frozenset[int] = frozenset(
+    {OPENAPI_ERROR_OPERATION_FORBIDDEN, OPENAPI_ERROR_SITE_PERMISSION_DENIED}
+)
+
 # --- External-portal (legacy hotspot) error codes --------------------------
 # MEASURED against a live 6.3.0.100 cloud controller on 2026-09-11 by probing
 # `POST /{omadacId}/api/v2/hotspot/extPortal/auth` with a non-existent client

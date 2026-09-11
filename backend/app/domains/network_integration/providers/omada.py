@@ -138,6 +138,10 @@ from .base import (
     ProviderClient,
     ProviderConnectionConfig,
     ProviderControllerInfo,
+    ProviderControllerSetupBlock,
+    ProviderControllerSetupReport,
+    ProviderControllerSetupRequest,
+    ProviderControllerSetupStep,
     ProviderDevice,
     ProviderPortalContext,
     ProviderSite,
@@ -657,6 +661,71 @@ class OmadaProvider:
         """
         result = await self._call(config, "deauthorize_guest", site_id, client_mac)
         return bool(result)
+
+    async def configure_controller(
+        self,
+        config: ProviderConnectionConfig,
+        request: ProviderControllerSetupRequest,
+    ) -> ProviderControllerSetupReport:
+        """External portal, Pre-Authentication Access and hotspot operator,
+        through the gateway's ``configure_external_portal``.
+
+        A pure translation in both directions. Every decision -- which portal
+        is ours, what is drift, what a merge keeps -- is the gateway's, where
+        the Omada field names are allowed to be known; this method only maps
+        the seam's vocabulary onto the contract's and back.
+        """
+        from wyfy_device_gateway.controller_contract import (  # noqa: PLC0415
+            PortalSetupSpec,
+        )
+
+        spec = PortalSetupSpec(
+            site_id=request.site_id,
+            portal_name=request.portal_name,
+            portal_url_scheme=request.portal_url_scheme,
+            portal_url=request.portal_url_host_and_query,
+            ownership_query=request.ownership_query,
+            pre_auth_host=request.pre_auth_host,
+            auth_timeout_minutes=request.auth_timeout_minutes,
+            operator_name=request.operator_name,
+            operator_note=request.operator_note,
+            operator_marker=request.operator_marker,
+            guest_ssid_id=request.guest_ssid_id,
+            guest_ssid_name=request.guest_ssid_name,
+            create_operator_if_missing=request.create_operator_if_missing,
+            new_operator_password=request.new_operator_password,
+            take_over_ssid_portal=request.take_over_ssid_portal,
+            dry_run=request.dry_run,
+        )
+        report = await self._call(config, "configure_external_portal", spec)
+        block = getattr(report, "block", None)
+        return ProviderControllerSetupReport(
+            dry_run=bool(report.dry_run),
+            steps=tuple(
+                ProviderControllerSetupStep(
+                    step=str(step.step),
+                    outcome=str(getattr(step.outcome, "value", step.outcome)),
+                    message=str(step.message),
+                    provider_code=step.provider_code,
+                    details=dict(step.details or {}),
+                )
+                for step in report.steps
+            ),
+            guest_ssid_id=report.guest_ssid_id,
+            portal_id=report.portal_id,
+            operator_credentials_set=bool(report.operator_credentials_set),
+            block=(
+                None
+                if block is None
+                else ProviderControllerSetupBlock(
+                    kind=str(block.kind),
+                    message=str(block.message),
+                    portal_id=block.portal_id,
+                    portal_name=block.portal_name,
+                    match_count=block.match_count,
+                )
+            ),
+        )
 
     # -- mapping -----------------------------------------------------------
 

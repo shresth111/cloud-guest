@@ -578,6 +578,17 @@ class FakeProvider:
         self._maybe_raise("deauthorize_guest")
         return True
 
+    async def configure_controller(self, config, request):
+        # Part of the Protocol since automatic controller setup landed. Its
+        # behaviour is exercised end to end, through the real provider and
+        # a mocked controller, in test_network_integration_autoconfig.py.
+        self._maybe_raise("configure_controller")
+        from app.domains.network_integration.providers.base import (
+            ProviderControllerSetupReport,
+        )
+
+        return ProviderControllerSetupReport(dry_run=request.dry_run)
+
 
 @dataclass
 class FakeAuditWriter:
@@ -4249,6 +4260,11 @@ class TestProviderSeamIsolation:
             # and a port that were both already correct.
             "OMADA_TLS_UNTRUSTED",
             "OMADA_TLS_PIN_MISMATCH",
+            # Added with automatic controller setup: Omada's -1005/-1505, an
+            # Open API app whose role does not cover the call. It used to
+            # fall through to OMADA_CONNECTION_FAILED -- "could not reach"
+            # a controller that had just answered.
+            "OMADA_PERMISSION_DENIED",
         }
         assert set(PROVIDER_ERRORS_BY_CODE) == expected
         for code, error_class in PROVIDER_ERRORS_BY_CODE.items():
@@ -4312,9 +4328,10 @@ class TestEveryRouteRequiresPermission:
             r for r in integration_router.routes if "/platform/" in r.path
         ]
         # summary, list, get, events, enable, disable, test-connection,
-        # onboard. Asserted as a count rather than a set so that adding a
-        # ninth platform route without a GLOBAL scope fails here loudly.
-        assert len(platform_routes) == 8
+        # configure-controller, onboard. Asserted as a count rather than a
+        # set so that adding a tenth platform route without a GLOBAL scope
+        # fails here loudly.
+        assert len(platform_routes) == 9
         for route in platform_routes:
             scopes = []
             for dep in route.dependant.dependencies:

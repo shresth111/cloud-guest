@@ -31,6 +31,7 @@ go-live date.
 | `clientIp` is accepted on firmware v6.2.10+ | Sent whenever the controller supplies it; **not verified with a real client** | #206, #254 |
 | Ending one guest's access early | **Observed** on 5.15.24.19 only, against authorizations created by hand. **Not tried on 6.x.** Not tried with a site *name* in place of a site id | #214, `omada/deauth.py` |
 | Pinning a self-signed controller certificate | **Verified** on 5.15.24.19 | #212 |
+| **Configure controller automatically** (§12): portal, Pre-Authentication Access, operator account written over the Open API | **Not verified on hardware.** Every path and field comes from the OpenAPI document the 5.15.24.19 controller serves about itself, and the operations exist there; no write has been sent to a real controller yet | §12.7 |
 
 The first real venue is also the first end-to-end test. Plan to be on site or on a
 call with a phone on the guest WiFi (§8).
@@ -53,6 +54,9 @@ steps below work around them. Each should be fixed; until then, follow the worka
    *Hotspot operator* in the admin wizard and *Hotspot operator account* on the
    customer page). You lose the Access points and Connected clients screens; guest
    sign-in is what matters.
+   *Update:* the backend now stores an operator login next to an Open API app,
+   and automatic configuration (§12) creates that operator itself. Once §12 has
+   been verified on hardware, an Open API app plus §12 replaces this workaround.
 2. **An integration created from the customer page can never produce a portal link.**
    Guests need a fleet record ("router" row) for their session. Only the platform
    onboarding path creates one (`POST /network-integrations/platform/onboard`). The
@@ -405,3 +409,236 @@ API: `POST /api/v1/network-integrations/{integration_id}/clients/disconnect` wit
 * The failure record in §9 stores the guest's MAC, which is already stored elsewhere
   for the same attempt. There is no retention sweep on `network_integration_events`
   yet; that is an open decision.
+
+---
+
+## 12. Automatic configuration ("Configure controller automatically")
+
+**Status: built and unit-tested against mocked HTTP; not yet run against a real
+controller.** Follow §12.7 on our own EC2 controller before offering it to a
+venue, and keep §7 as the fallback until then.
+
+### 12.1 What it does
+
+One request replaces §7.1, §7.2 and the operator account from §3, through the
+controller's **Open API** (not the operator login):
+
+| Step (`step`) | What it makes true | Idempotent how |
+|---|---|---|
+| `portal` | An **External Portal Server** portal (host type URL, scheme `https`) whose URL is exactly the one on the integration card, bound to the integration's guest SSID. Named `Wyfy Guest - <venue> (<first 8 hex of the integration id>)`. | Created if absent, patched if it drifted (name, enabled, auth type, host type, scheme, URL, SSID binding), otherwise `unchanged`. HTTPS redirect, landing page and timeout are the venue's to tune and are not treated as drift. |
+| `pre_auth_access` | Pre-Authentication Access switched on with a URL entry for the portal host (`auth.wyfyguest.com`). | **Merge-only.** The controller's own settings are read and sent back with our entry appended; every existing entry is kept verbatim, nothing is ever removed. If it was switched off, the report says that switching it on also activates the entries already in the list. |
+| `hotspot_operator` | An operator account for guest authorization. | If the integration holds no operator login: creates `wyfy-<first 12 hex of the integration id>` with a random password (Python `secrets`), stores it encrypted with the other controller credentials, and proves it signs in. If one is stored: proves it signs in and **never changes it**. |
+| `ssid_takeover` | Only with `take_over_ssid_portal: true`: removes the guest SSID from a portal this integration did not create. | That portal is otherwise sent back exactly as the controller returned it. It is never deleted. |
+
+**How "our" portal is recognised.** By its exact name, *or* by its URL: host
+`auth.wyfyguest.com` and a `routerId=` query value equal to this integration's
+fleet device id. The name carries the integration's id prefix and the `routerId`
+is unique per integration, so two locations of one customer on one site can never
+claim each other's portal, and a portal a venue renamed is still recognised. No
+other portal is ever written, except in take-over as above.
+
+**Refusals (HTTP 409, nothing changed on the controller or in our database):**
+
+| `data.code` | Meaning |
+|---|---|
+| `NETWORK_INTEGRATION_AUTOCONFIG_PRECONDITIONS` | Something the run needs is missing. `data.missing` lists all of them: `integration_disabled`, `provider_unsupported`, `openapi_required`, `credentials_missing`, `location_not_mapped`, `site_not_selected`, `fleet_device_missing`, `guest_ssid_missing`. |
+| `NETWORK_INTEGRATION_PORTAL_CONFLICT` | The guest SSID is bound to a portal we did not create. `data.portal_name` / `data.portal_id` name it. Remove the SSID from it on the controller, or run again with `take_over_ssid_portal: true`. |
+| `NETWORK_INTEGRATION_CONTROLLER_SITE_SHARED` | Another customer account has an integration on the same controller and site. Neither may automate it; the other account is not named. |
+| `NETWORK_INTEGRATION_GUEST_SSID_IN_USE` | Another location in the same organization already uses this SSID on this site. Each location needs its own guest SSID. |
+| `NETWORK_INTEGRATION_GUEST_SSID_NOT_FOUND` / `..._AMBIGUOUS` | The stored SSID does not exist on the site, or its name matches SSIDs in two WLAN groups. |
+
+Controller failures before anything is written keep their usual codes
+(`OMADA_AUTH_FAILED`, `OMADA_TLS_*`, ...). New: `OMADA_PERMISSION_DENIED`, the
+controller's `-1005 Operation forbidden` / `-1505 no permissions to access this
+site` -- the Open API app's role does not cover the call (§12.2). Once writing
+has started, a failure is reported on its step instead (`outcome: "failed"`,
+`provider_code`), the other steps still run, and the response is 200 with
+`ok: false`. A lost connection marks the remaining steps `skipped`. Creates are
+never retried after a timeout, so re-run instead: it re-reads and converges.
+
+Every real run writes one `controller_configured` event (the step report, no
+secrets) and one audit entry. A dry run writes nothing at all.
+
+### 12.2 What the venue must provide
+
+1. **Controller 5.13 or newer** (Open API). 5.15 was checked, see §12.6.
+2. **An Open API app.** On the controller: **Settings -> Platform Integration ->
+   Open API -> Add New App**.
+   * **Mode: Client** (client credentials). Authorization-code mode is for apps
+     that log a person in; this platform never does.
+   * **Role: Administrator** -- or, least privilege, a custom role with
+     **Site Settings (network) = Modify** and **Hotspot = Modify**; everything
+     else may be Block/View. Site Settings covers the portal and access-control
+     settings; Hotspot covers operator accounts. *Inferred:* TP-Link documents the
+     role privileges (`privilege.network`, "Site network settings permission in
+     site view -> settings"; `privilege.hotspot`, "Hotspot permission") but not
+     which privilege each endpoint checks. A role that is too weak fails with
+     `OMADA_PERMISSION_DENIED`, which names this fix.
+   * **Site Privileges:** at least the venue's site.
+   * Copy the **Client ID**, **Client Secret** and the **Omada ID** shown with
+     the app. The controller's own guide notes that changing an app's role or
+     site privileges invalidates tokens already issued; nothing needs doing
+     about that, the next call gets a new one.
+3. Save them on the integration (`auth_mode: "openapi"`, `client_id`,
+   `client_secret`), pick the site and the guest SSID, map the venue. **No
+   operator account is needed** -- the run creates one. If the venue already has
+   one it wants used, save it too and the run will only prove it.
+
+### 12.3 What stays manual
+
+* **Reachability.** Guests' devices must reach the controller's portal port
+  (**8088**, or **8843** with HTTPS redirect on) -- §7.3; our servers must reach
+  its HTTPS management port (8043 software / 443 hardware, from the allowlist in
+  §3).
+* **Certificate trust** for a self-signed controller -- §5. Do it first; every
+  call in this run goes over that connection.
+* **The SSID itself** must exist and be broadcast by adopted access points. The
+  run binds a portal to an SSID; it does not create one.
+* **The real-phone test** -- §8. Nothing here replaces it.
+
+### 12.4 API
+
+Customer, organization scope (`X-Organization-Id`), permission
+`network_integrations.update`:
+
+```
+POST /api/v1/network-integrations/{integration_id}/configure-controller
+{"dry_run": true, "take_over_ssid_portal": false}
+```
+
+Platform staff, GLOBAL scope, same permission key:
+
+```
+POST /api/v1/network-integrations/platform/integrations/{integration_id}/configure-controller
+```
+
+`dry_run` is required (no default); unknown fields are rejected with 422. The
+customer route reads the integration with the caller's organization in the
+query, so another tenant's id is a 404. Everything written -- URL, site, SSID,
+operator name -- comes from the integration row, never from the request.
+
+Response `data`:
+
+```json
+{
+  "integration_id": "…",
+  "dry_run": false,
+  "ok": true,
+  "changed": true,
+  "steps": [
+    {"step": "portal", "outcome": "created", "message": "Created portal …",
+     "provider_code": null, "details": {"portal_name": "…", "ssid_id": "…", "portal_id": "…"}},
+    {"step": "pre_auth_access", "outcome": "created", "message": "Added a URL entry …",
+     "provider_code": null, "details": {"host": "auth.wyfyguest.com", "entries_preserved": 2, "was_enabled": true}},
+    {"step": "hotspot_operator", "outcome": "created", "message": "Created hotspot operator account 'wyfy-…' …",
+     "provider_code": null, "details": {"operator_name": "wyfy-…"}}
+  ],
+  "portal_id": "…",
+  "guest_ssid_id": "…",
+  "portal_url_scheme": "https",
+  "portal_url_host_and_query": "auth.wyfyguest.com/portal?organizationId=…&locationId=…&routerId=…&netProvider=omada",
+  "pre_auth_host": "auth.wyfyguest.com"
+}
+```
+
+`outcome` is one of `created`, `updated`, `unchanged`, `skipped`, `failed`; on a
+dry run it is what *would* happen and the messages start with "Would".
+
+### 12.5 Sources
+
+Every path and field is taken from TP-Link's OpenAPI 3.0.1 document in two
+copies: the cloud gateway's (<https://use1-omada-northbound.tplinkcloud.com/v3/api-docs>)
+and the one **our 5.15.24.19 controller serves about itself** at
+`GET https://<controller>:8043/v3/api-docs` (unauthenticated; Swagger UI at
+`/doc.html`). Operations: `getPortalList`, `getPortalDetail`, `addPortal`,
+`modifyPortal`, `getAccessControl`, `modifyAccessControl`,
+`getHotspotOperatorList`, `createHotspotOperator`, `modifyHotspotOperator`,
+plus the existing site and SSID reads. Implementation:
+`vendor/wyfy-device-gateway/wyfy_device_gateway/omada/portal_setup.py`.
+
+### 12.6 Does 5.15 have these operations? Yes -- checked on the controller itself
+
+Read on 2026-09-12 from our EC2 controller's own `GET /v3/api-docs` (5.15.24.19,
+1224 paths; TP-Link's public docs site only covers software controllers from
+6.2.0):
+
+* **Present, same request/response fields as the cloud spec:** every operation
+  in §12.5. The only differences are fields this run does not use (5.15 lacks
+  `socialLogin`/`google` on portals and `description` on access-control entries;
+  its `welcomeInformation` pattern is shorter).
+* **Absent on 5.15:** `POST .../hotspot/portal/candidates` (`getPortalCandidates`)
+  and `GET /openapi/v2/.../wireless-network/ssids`. So SSIDs are resolved through
+  the WLAN-group walk, which both versions serve. 5.15's WLAN and SSID rows carry
+  `wlanId`/`ssidId` and no `id`; the SSID reader already handles that.
+* **Also from that controller's embedded Open API guide:** the client-credentials
+  token call is documented there exactly as we send it, and the general error
+  codes `-1005` / `-1505` used for `OMADA_PERMISSION_DENIED`.
+
+Confidence: **high that the routes exist and take these shapes on 5.15.24.19**
+(the controller's own document, not an inference from another version);
+**none that the controller accepts every value** until §12.7 is done. Two
+specific unknowns: whether `modifyPortal` resets settings it is not sent
+(`portalCustomize`, `pageType`, `importedPortalPage` are not returned by the
+detail call, so take-over cannot echo them -- matters only when taking over a
+portal with a customised local page), and whether a Viewer-role operator could
+authorize guests (we create role 0, Administrator, the only role ever proven).
+
+### 12.7 Hardware verification recipe (our EC2 controller)
+
+Controller `https://13.126.39.79:8043`, 5.15.24.19, Omada ID
+`15ab5e4b7c2ca6cd134a3fded6e2ec59`, site `6aa3913c3ee1605f71ac35a1`, SSID
+`WyfyGuest`. Admin login and certificate pin are in
+`~/wyfy-omada/EC2-CONTROLLER.md`. Port 8043 is open only to the office IP and the
+prod app server; run the API calls from one of those.
+
+1. **Snapshot what is there now**, so it can be put back. In the controller UI:
+   Site -> Settings -> Authentication -> Portal (note the existing portal on
+   `WyfyGuest`, its URL and SSIDs), Access Control -> Pre-Authentication Access
+   (note every entry), Hotspot Manager -> Operators (note `wyfyportal`).
+2. **Create the app:** Settings -> Platform Integration -> Open API -> Add New
+   App, name `wyfy-autoconfig-test`, Mode **Client**, Role **Administrator**, Site
+   Privileges `wyfyguest`. Copy Client ID and Client Secret.
+3. **Prove the token** (read-only):
+
+   ```bash
+   curl -sk "https://13.126.39.79:8043/openapi/authorize/token?grant_type=client_credentials" \
+     -H 'content-type: application/json' \
+     -d '{"omadacId":"15ab5e4b7c2ca6cd134a3fded6e2ec59","client_id":"<ID>","client_secret":"<SECRET>"}'
+   TOKEN=AT-...   # result.accessToken
+   B=https://13.126.39.79:8043/openapi/v1/15ab5e4b7c2ca6cd134a3fded6e2ec59/sites/6aa3913c3ee1605f71ac35a1
+   curl -sk "$B/portals" -H "Authorization: AccessToken=$TOKEN"
+   curl -sk "$B/setting/access-control" -H "Authorization: AccessToken=$TOKEN"
+   curl -sk "$B/hotspot/operators?page=1&pageSize=100" -H "Authorization: AccessToken=$TOKEN"
+   ```
+
+   Save the three responses with the step 1 notes -- they are the first real
+   5.15 payloads for these calls; compare their fields with §12.5.
+4. **Point a test integration at it** (a test organization, never a live
+   venue's): `POST /api/v1/network-integrations/{id}/credentials` with
+   `{"auth_mode":"openapi","client_id":"<ID>","client_secret":"<SECRET>","tls_mode":"pinned","tls_pinned_sha256":"<pin>"}`,
+   then `PATCH` it with `external_site_id: "6aa3913c3ee1605f71ac35a1"`,
+   `guest_ssid_name: "WyfyGuest"` and a venue. Leave the operator out on purpose
+   so step 6 exercises account creation.
+5. **Dry run:** `POST .../configure-controller {"dry_run": true}`. Expect
+   `pre_auth_access` `unchanged` if the `auth.wyfyguest.com` entry added by hand
+   on 2026-09-11 is still there and switched on (step 1 tells you),
+   `hotspot_operator` `created`, and for the portal
+   either `portal` `updated` (if the manual portal's URL carries this
+   integration's `routerId`) or a 409 `NETWORK_INTEGRATION_PORTAL_CONFLICT`
+   naming the manual portal. **Confirm nothing changed in the UI.**
+6. **Real run:** `{"dry_run": false}`, adding `"take_over_ssid_portal": true` if
+   step 5 was a conflict. Check in the UI: the portal (External Portal Server,
+   Scheme `https`, URL = the card's URL, SSID `WyfyGuest`); Pre-Authentication
+   Access still holds every step-1 entry; operator `wyfy-…` exists under Hotspot
+   Manager; with take-over, the manual portal still exists with everything but
+   the SSID unchanged. Check the integration's Activity feed for one
+   `controller_configured` row.
+7. **Re-run:** `{"dry_run": false}` again. **Expect every step `unchanged`**, and
+   no new entries in the controller's audit log (Logs -> Audit Logs).
+8. **Real phone** through §8 -- this is what proves the auto-created operator can
+   authorize a guest.
+9. **Put it back** if needed: delete the created portal and `wyfy-…` operator in
+   the UI, restore the manual portal's SSID, delete the Open API app.
+
+Record what differed from this section in `~/wyfy-omada/HARDWARE-FINDINGS.md`,
+and flip the §1 row only after steps 6-8 pass.

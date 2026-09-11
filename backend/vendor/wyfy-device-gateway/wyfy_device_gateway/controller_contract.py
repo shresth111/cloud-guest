@@ -57,7 +57,7 @@ trusted anyway.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
@@ -344,6 +344,109 @@ class AuthorizationResult:
     provider_code: str | None = None
 
 
+class PortalSetupOutcome(StrEnum):
+    """What one step of :meth:`ControllerAdapter.configure_external_portal`
+    did -- or, on a dry run, would do.
+
+    ``SKIPPED`` means not attempted: an earlier step lost contact with the
+    controller, or the step has nothing to act on. It is never used for "we
+    looked and it was already right" -- that is ``UNCHANGED``.
+    """
+
+    CREATED = "created"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class PortalSetupSpec:
+    """The desired external-portal state for ONE integration on ONE site.
+
+    Every value is derived by the caller from its own records for that
+    integration -- never from a request body -- and this package treats
+    them as given. Nothing here names a tenant; the controller only ever
+    sees a portal name, a URL, an SSID and an operator account.
+
+    ``ownership_query`` is how a portal is recognised as *this caller's*
+    when its name has been edited: a ``(key, value)`` pair that must appear
+    in the query string of the portal's configured server URL. The caller
+    picks a pair that is unique to the integration (the backend uses the
+    fleet ``routerId`` it already stamps into the URL), so two integrations
+    sharing a site can never mistake each other's portal for their own.
+
+    ``new_operator_password`` is only set on a real (non-dry) run when the
+    integration holds no operator login and one must be created. It is
+    excluded from ``repr`` and never appears in a report.
+    """
+
+    site_id: str
+    portal_name: str
+    portal_url_scheme: str
+    portal_url: str
+    ownership_query: tuple[str, str]
+    pre_auth_host: str
+    auth_timeout_minutes: int
+    operator_name: str
+    operator_note: str
+    operator_marker: str
+    guest_ssid_id: str | None = None
+    guest_ssid_name: str | None = None
+    create_operator_if_missing: bool = True
+    new_operator_password: str | None = field(default=None, repr=False)
+    take_over_ssid_portal: bool = False
+    dry_run: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class PortalSetupStep:
+    """One line of the report. ``details`` holds identifiers and counts only
+    -- portal ids and names, entry counts -- never a credential."""
+
+    step: str
+    outcome: PortalSetupOutcome
+    message: str
+    provider_code: int | None = None
+    details: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class PortalSetupBlock:
+    """A reason the run refused before writing anything.
+
+    ``kind`` is one of ``"guest_ssid_not_found"``, ``"guest_ssid_ambiguous"``
+    or ``"ssid_portal_conflict"``. A block is returned rather than raised so
+    the caller gets the identifiers it needs to explain itself (which portal
+    holds the SSID) without parsing a message.
+    """
+
+    kind: str
+    message: str
+    portal_id: str | None = None
+    portal_name: str | None = None
+    match_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PortalSetupReport:
+    """Outcome of one ``configure_external_portal`` run.
+
+    ``operator_credentials_set`` is ``True`` only when this run actually put
+    ``spec.new_operator_password`` on an operator account on the controller
+    (created it, or reset this integration's own account). It is the
+    caller's signal to persist that password, and is ``False`` on every dry
+    run.
+    """
+
+    dry_run: bool
+    steps: tuple[PortalSetupStep, ...] = ()
+    guest_ssid_id: str | None = None
+    portal_id: str | None = None
+    operator_credentials_set: bool = False
+    block: PortalSetupBlock | None = None
+
+
 @runtime_checkable
 class ControllerAdapter(Protocol):
     """One adapter per controller vendor.
@@ -425,6 +528,16 @@ class ControllerAdapter(Protocol):
         """
         ...
 
+    async def configure_external_portal(
+        self, creds: ControllerCredentials, spec: PortalSetupSpec
+    ) -> PortalSetupReport:
+        """Bring one site's external-portal configuration to ``spec``.
+
+        Idempotent, merge-only for shared settings, and read-only when
+        ``spec.dry_run`` is set. See ``omada/portal_setup.py``.
+        """
+        ...
+
 
 __all__ = [
     "AuthorizationResult",
@@ -440,4 +553,9 @@ __all__ = [
     "ControllerTlsObservation",
     "ControllerVendor",
     "PortalAuthContext",
+    "PortalSetupBlock",
+    "PortalSetupOutcome",
+    "PortalSetupReport",
+    "PortalSetupSpec",
+    "PortalSetupStep",
 ]

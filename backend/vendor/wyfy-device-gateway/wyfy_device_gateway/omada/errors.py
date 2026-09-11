@@ -171,6 +171,26 @@ class OmadaUnsupportedApiError(OmadaError):
     )
 
 
+class OmadaPermissionDeniedError(OmadaError):
+    """The controller answered and said this credential may not do that.
+
+    Omada's ``-1005`` / ``-1505`` (see ``types.PERMISSION_DENIED_ERROR_CODES``).
+    For an Open API app in Client mode the fix is always the same place --
+    the app's role and site privileges -- so the message names it. Not an
+    auth failure: the credential is valid, and re-entering it changes
+    nothing.
+    """
+
+    code = "OMADA_PERMISSION_DENIED"
+    default_message = (
+        "The Omada controller refused this request: the Open API app is not "
+        "allowed to make it. On the controller, open Settings > Platform "
+        "Integration > Open API, edit the app, and give it a role with "
+        "Modify access to Site Settings and Hotspot, with this site in its "
+        "site privileges."
+    )
+
+
 class OmadaSessionExpiredError(OmadaError):
     """Internal-ish: the client catches this to trigger exactly one re-login.
 
@@ -200,6 +220,7 @@ ALL_ERRORS: tuple[type[OmadaError], ...] = (
     OmadaAuthorizationError,
     OmadaUnsupportedApiError,
     OmadaSessionExpiredError,
+    OmadaPermissionDeniedError,
 )
 
 
@@ -211,6 +232,7 @@ __all__ = [
     "OmadaConnectionError",
     "OmadaError",
     "OmadaInvalidControllerError",
+    "OmadaPermissionDeniedError",
     "OmadaRateLimitedError",
     "OmadaSessionExpiredError",
     "OmadaSiteNotFoundError",

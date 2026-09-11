@@ -99,6 +99,19 @@ class NetworkIntegrationRepositoryProtocol(Protocol):
         self, integration_id: uuid.UUID, *, include_deleted: bool = False
     ) -> NetworkIntegration | None: ...
 
+    async def get_integration_for_organization(
+        self, integration_id: uuid.UUID, *, organization_id: uuid.UUID
+    ) -> NetworkIntegration | None: ...
+
+    async def list_live_integrations_on_controller_site(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        external_site_id: str,
+        exclude_id: uuid.UUID,
+    ) -> list[NetworkIntegration]: ...
+
     async def update_integration(
         self, integration: NetworkIntegration, data: dict[str, object]
     ) -> NetworkIntegration: ...
@@ -213,6 +226,54 @@ class NetworkIntegrationRepository:
         return await self.integrations.get_by_id(
             integration_id, include_deleted=include_deleted
         )
+
+    async def get_integration_for_organization(
+        self, integration_id: uuid.UUID, *, organization_id: uuid.UUID
+    ) -> NetworkIntegration | None:
+        """One live row, read WITH its owner in the WHERE clause.
+
+        The organization is part of the query rather than compared after the
+        row is loaded, so a path id belonging to another tenant is simply
+        not found -- a 404 that says nothing about whether the id exists --
+        instead of a read followed by a 403. Used by the by-id routes that
+        write to a customer's controller.
+        """
+        statement = self._live().where(
+            NetworkIntegration.id == integration_id,
+            NetworkIntegration.organization_id == organization_id,
+        )
+        return (await self.session.execute(statement.limit(1))).scalars().first()
+
+    async def list_live_integrations_on_controller_site(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        external_site_id: str,
+        exclude_id: uuid.UUID,
+    ) -> list[NetworkIntegration]:
+        """Every other live integration pointed at the same controller site,
+        **in any organization**.
+
+        Deliberately unscoped, and only ever used as a collision check:
+        ``service.configure_controller`` asks "does anyone else manage this
+        site" before it writes shared site settings on a controller, and a
+        tenant filter would make that question unanswerable. Nothing from the
+        returned rows reaches a response -- the caller compares organization
+        ids and SSIDs and raises an error that names no other tenant.
+
+        ``base_url`` is stored normalized (``validators.validate_controller_url``)
+        so string equality is controller equality up to the ``controller_id``
+        comparison the caller makes; a cloud-managed controller shares its
+        base URL with every controller in the region.
+        """
+        statement = self._live().where(
+            NetworkIntegration.provider == provider,
+            NetworkIntegration.base_url == base_url,
+            NetworkIntegration.external_site_id == external_site_id,
+            NetworkIntegration.id != exclude_id,
+        )
+        return list((await self.session.execute(statement)).scalars().all())
 
     async def update_integration(
         self, integration: NetworkIntegration, data: dict[str, object]
