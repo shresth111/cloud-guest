@@ -3390,6 +3390,52 @@ class TestCertificateTrust:
         assert updated.tls_pinned_sha256 == _PIN
         assert updated.tls_trust_decided_at is not None
 
+    async def test_a_new_fingerprint_alone_re_pins_an_already_pinned_row(
+        self,
+    ) -> None:
+        """The instruction OMADA_TLS_PIN_MISMATCH gives is "review the new
+        fingerprint and pin it". If that PATCH silently no-ops because the
+        mode was not restated, the row keeps the old pin and every call keeps
+        failing -- with the platform telling the operator to do the thing
+        they just did."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(
+                organization_id=org,
+                tls_mode=ControllerTlsMode.PINNED.value,
+                tls_pinned_sha256="b" * 64,
+            )
+        )
+        service = _service(repo)
+        updated = await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"tls_pinned_sha256": _PIN},
+        )
+        assert updated.tls_mode == ControllerTlsMode.PINNED.value
+        assert updated.tls_pinned_sha256 == _PIN
+
+    async def test_a_fingerprint_alone_on_a_strict_row_is_still_refused(
+        self,
+    ) -> None:
+        """Re-pinning is not a way in. A strict row given only a fingerprint
+        stays strict and stores nothing -- accepting the pin while leaving
+        the mode alone would store a pin that is never consulted."""
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        service = _service(repo)
+        updated = await service.update_integration(
+            integration.id,
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+            fields={"tls_pinned_sha256": _PIN},
+        )
+        assert updated.tls_mode == ControllerTlsMode.STRICT.value
+        assert updated.tls_pinned_sha256 is None
+
     async def test_the_audit_entry_records_what_was_accepted_not_just_that_it_changed(
         self,
     ) -> None:

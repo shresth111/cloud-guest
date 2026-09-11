@@ -1227,20 +1227,33 @@ class NetworkIntegrationService:
                 updates[field_name] = fields[field_name]
                 changed.append(field_name)
 
-        if "tls_mode" in fields and fields["tls_mode"] is not None:
+        if ("tls_mode" in fields and fields["tls_mode"] is not None) or (
+            # A fingerprint on its own is a re-pin, and it has to work. It is
+            # the literal instruction OMADA_TLS_PIN_MISMATCH gives the
+            # operator -- "review the new fingerprint and pin it" -- after a
+            # venue replaces a certificate. Requiring them to restate the
+            # mode they are already in would make that a silent no-op, which
+            # is the worst possible outcome for this particular field: the
+            # row keeps the *old* pin and every call keeps failing.
+            fields.get("tls_pinned_sha256") is not None
+        ):
             # Mode and fingerprint are resolved together even when only one
             # of them was sent, because the pair has to be coherent: moving
             # to 'pinned' needs a fingerprint from *somewhere*, and moving
-            # away from it must clear the one already stored. Taking the
-            # stored fingerprint as the fallback is what lets an operator
-            # switch strict -> pinned -> strict -> pinned without
-            # re-confirming a certificate that never changed... which is
-            # precisely why it is NOT the fallback: `validate_tls_trust`
-            # clears the column on the way out of pinned, so coming back
-            # requires a fresh confirmation.
+            # away from it must clear the one already stored.
+            #
+            # The stored fingerprint is the fallback only for a request that
+            # did not send one. That is not a way to skip re-confirming a
+            # certificate on the way back into pinned mode -- leaving pinned
+            # clears the column, so there is nothing to fall back to.
+            requested_mode = fields.get("tls_mode")
             requested_pin = fields.get("tls_pinned_sha256")
             trust_mode, pinned = self._resolve_tls_trust(
-                str(fields["tls_mode"]),
+                (
+                    integration.tls_mode
+                    if requested_mode is None
+                    else str(requested_mode)
+                ),
                 (
                     integration.tls_pinned_sha256
                     if requested_pin is None
