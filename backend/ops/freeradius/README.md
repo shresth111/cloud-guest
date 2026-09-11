@@ -197,7 +197,8 @@ there, then removed:
   `radacct/.../detail-<date>` for replay.
 
 After applying to the live server, the same rig was re-synced from the live
-files and pointed at the **real** backend (`10.30.1.10:8000`). It sent
+files and pointed at the **real** backend (`10.30.1.10:8000` — an *Azure*
+address; see the warning below). It sent
 `{"status_type": "interim-update", ..., "bytes_uploaded_total": 12884901988,
 "bytes_downloaded_total": 4294967496, "disconnect_reason": ""}` and received the
 backend's genuine `401 {"success":false,"message":"RADIUS NAS authentication
@@ -216,6 +217,35 @@ file is ahead of git: the 2026-08-18 dynamic-xlat and Message-Authenticator
 fixes were applied on the box and never committed.
 `sites-default.snippets.conf` is a diff, not a drop-in.
 
+## ⚠️ `rest.conf`'s `connect_uri` is environment-specific — check it first (2026-09-11)
+
+Production moved from Azure to **AWS ap-south-1 on 2026-08-27**, and this
+repo's `rest.conf` went on naming an Azure VNet address (`10.30.1.10`) for two
+more weeks. Applying it as-is would have pointed `rlm_rest` at an unroutable
+host and failed **every** authorize and **every** accounting request
+fleet-wide — while `radiusd -XC` reported the configuration perfectly valid,
+because syntactically it is. Nothing detected this, because nothing compares
+this directory to the hub.
+
+It now reads `http://172.31.38.118:8000/api/v1` (`wyfy-app-server`,
+`i-0cf9b79511abe6000`, verified 2026-09-11). That is a *private IP on a
+specific instance* and will move if the instance is replaced.
+
+**Before applying anything in this directory to a hub**, copy the live tree
+off-box and run:
+
+```bash
+./verify_hub_config.py /path/to/copy/of/etc/freeradius/3.0 \
+    --expect-api-cidr 172.31.0.0/16
+```
+
+It is read-only — no sockets, no FreeRADIUS binary, no writes — and checks the
+nine invariants whose absence has previously caused an outage: enabled-vs-
+available drift for `sites-enabled/default` and `mods-enabled/rest`, per-NAS
+REST headers, `Message-Authenticator` on the reply, `accounting{}` calling
+`rest`, totals-not-deltas, `Acct-*-Gigawords` reassembly, catch-all client
+stanzas, and this `connect_uri`. It is **not** a substitute for `radiusd -XC`;
+it checks the things `-XC` is happy to accept.
 ## Checking what a `client{}` stanza actually resolves to (2026-09-11)
 
 `%{client:shortname}` and `%{client:backend_secret}` decide which venue a
