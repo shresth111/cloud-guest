@@ -50,8 +50,11 @@ from typing import Any
 from urllib.parse import parse_qs
 
 import pytest
+from cryptography.fernet import Fernet
 
+from app.core.config import INSECURE_LOCAL_DEV_FERNET_KEY, Settings
 from app.database.utils.pagination import PageParams, PaginationMeta
+from app.domains.network_integration import crypto as crypto_module
 from app.domains.network_integration.constants import (
     MAX_SESSION_DURATION_SECONDS,
     PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
@@ -79,6 +82,7 @@ from app.domains.network_integration.exceptions import (
     GuestSessionNotActiveError,
     NetworkIntegrationDeauthorizationUnsupportedError,
     NetworkIntegrationDisabledError,
+    NetworkIntegrationEncryptionKeyNotConfiguredError,
     NetworkIntegrationFleetDeviceUnavailableError,
     NetworkIntegrationInventoryRequiresOpenApiError,
     NetworkIntegrationNotFoundError,
@@ -720,6 +724,7 @@ def _service(
     fleet_provisioner: FakeFleetDeviceProvisioner | None = None,
     guest_terminator: FakeGuestSessionTerminator | None = None,
     caller_location_scope=None,
+    settings: Settings | None = None,
 ) -> NetworkIntegrationService:
     fake_provider = provider or FakeProvider()
     return NetworkIntegrationService(
@@ -736,6 +741,7 @@ def _service(
         # against validate_controller_url in TestSsrfRejection.
         url_resolver=_resolves_public,
         redis=None,
+        settings=settings,
         caller_location_scope=caller_location_scope,
     )
 
@@ -822,6 +828,143 @@ class TestCredentialEncryption:
         tampered = ciphertext[:-4] + "AAAA"
         with pytest.raises(NetworkIntegrationCredentialDecryptionError):
             decrypt_credentials(tampered)
+
+
+class TestPublicDefaultKeyRefusal:
+    """``network_integration_encryption_key`` defaults to a value in a public
+    repository. Outside local, nothing new may be encrypted under it, and
+    nothing already stored may stop working because of it."""
+
+    PROD = Settings(environment="production")
+
+    @staticmethod
+    def _prod_with_real_key() -> Settings:
+        return Settings(
+            environment="production",
+            network_integration_encryption_key=Fernet.generate_key().decode(),
+        )
+
+    def test_encrypt_refuses_the_public_key_in_production(self) -> None:
+        assert self.PROD.network_integration_encryption_key == (
+            INSECURE_LOCAL_DEV_FERNET_KEY
+        )
+        with pytest.raises(NetworkIntegrationEncryptionKeyNotConfiguredError) as exc:
+            encrypt_credentials({"client_secret": "shh"}, settings=self.PROD)
+        assert exc.value.status_code == 503
+        assert exc.value.data["code"] == ErrorCode.ENCRYPTION_KEY_NOT_CONFIGURED.value
+        assert "CLOUDGUEST_" not in exc.value.message
+
+    def test_encrypt_allows_the_public_key_locally(self) -> None:
+        local = Settings(environment="local")
+        ciphertext = encrypt_credentials({"client_secret": "b"}, settings=local)
+        assert decrypt_credentials(ciphertext, settings=local) == {"client_secret": "b"}
+
+    def test_encrypt_works_in_production_with_a_real_key(self) -> None:
+        settings = self._prod_with_real_key()
+        ciphertext = encrypt_credentials({"client_secret": "b"}, settings=settings)
+        assert decrypt_credentials(ciphertext, settings=settings) == {
+            "client_secret": "b"
+        }
+
+    def test_an_existing_row_under_the_public_key_still_decrypts_and_says_so(
+        self, monkeypatch, caplog
+    ) -> None:
+        """A venue already running on a row written under the public key
+        keeps working -- refusing the read would take its guest WiFi down
+        and un-leak nothing."""
+        ciphertext = encrypt_credentials(
+            {"client_secret": "b"}, settings=Settings(environment="local")
+        )
+        monkeypatch.setattr(crypto_module, "_warned_public_key_decrypt", False)
+        with caplog.at_level("CRITICAL", logger=crypto_module.__name__):
+            assert decrypt_credentials(ciphertext, settings=self.PROD) == {
+                "client_secret": "b"
+            }
+            decrypt_credentials(ciphertext, settings=self.PROD)
+        warnings = [
+            r
+            for r in caplog.records
+            if r.getMessage() == "network_integration_credentials_read_under_public_key"
+        ]
+        assert len(warnings) == 1, "once per process, not once per read"
+        assert warnings[0].env_var == "CLOUDGUEST_NETWORK_INTEGRATION_ENCRYPTION_KEY"
+
+    async def test_create_with_credentials_is_refused_and_stores_nothing(self) -> None:
+        repo = FakeRepository()
+        service = _service(repo, settings=self.PROD)
+        with pytest.raises(NetworkIntegrationEncryptionKeyNotConfiguredError):
+            await service.create_integration(
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=uuid.uuid4(),
+                provider="omada",
+                name="Lobby",
+                base_url=CONTROLLER_URL,
+                auth_mode="openapi",
+                external_site_id="site-1",
+                session_duration_seconds=3600,
+                sync_interval_seconds=300,
+                client_id="cid",
+                client_secret="secret",
+            )
+        assert repo.integrations == {}
+
+    async def test_create_without_credentials_still_works(self) -> None:
+        """No secret, nothing to protect: the connect wizard can still save
+        a draft row while the deployment is being fixed."""
+        repo = FakeRepository()
+        service = _service(repo, settings=self.PROD)
+        integration = await service.create_integration(
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=uuid.uuid4(),
+            provider="omada",
+            name="Lobby",
+            base_url=CONTROLLER_URL,
+            auth_mode="openapi",
+            session_duration_seconds=3600,
+            sync_interval_seconds=300,
+        )
+        assert integration.credentials_encrypted is None
+        assert integration.status == IntegrationStatus.UNCONFIGURED.value
+
+    async def test_onboarding_is_refused_before_the_fleet_row(self) -> None:
+        provisioner = FakeFleetDeviceProvisioner()
+        repo = FakeRepository()
+        service = _service(repo, fleet_provisioner=provisioner, settings=self.PROD)
+        with pytest.raises(NetworkIntegrationEncryptionKeyNotConfiguredError):
+            await service.create_integration_with_fleet_device(
+                actor_user_id=uuid.uuid4(),
+                organization_id=uuid.uuid4(),
+                location_id=uuid.uuid4(),
+                provider="omada",
+                name="Lobby controller",
+                base_url=CONTROLLER_URL,
+                auth_mode="openapi",
+                controller_model="Omada Software Controller",
+                external_site_id="site-1",
+                session_duration_seconds=3600,
+                sync_interval_seconds=300,
+                client_id="cid",
+                client_secret="secret",
+            )
+        assert provisioner.calls == []
+        assert repo.integrations == {}
+
+    async def test_rotate_is_refused_and_keeps_the_old_ciphertext(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        original = integration.credentials_encrypted
+        service = _service(repo, settings=self.PROD)
+        with pytest.raises(NetworkIntegrationEncryptionKeyNotConfiguredError):
+            await service.rotate_credentials(
+                integration.id,
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+                auth_mode=ControllerAuthMode.OPENAPI.value,
+                client_id="x",
+                client_secret="y",
+            )
+        assert integration.credentials_encrypted == original
 
 
 # ============================================================================

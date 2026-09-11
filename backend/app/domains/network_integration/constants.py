@@ -428,6 +428,10 @@ class ErrorCode(StrEnum):
     # supplied one that is not a SHA-256). A 400 from this platform, not a
     # 502 from the controller -- the controller was never contacted.
     TLS_PIN_REQUIRED = "NETWORK_INTEGRATION_TLS_PIN_REQUIRED"
+    # This deployment would encrypt controller credentials under the key
+    # committed to the public repository. A 503 from this platform: nothing
+    # the operator typed is wrong, and nothing was stored.
+    ENCRYPTION_KEY_NOT_CONFIGURED = "NETWORK_INTEGRATION_ENCRYPTION_KEY_NOT_CONFIGURED"
 
 
 # ============================================================================

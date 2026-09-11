@@ -4,6 +4,27 @@ from pathlib import Path
 from pydantic import Field, PostgresDsn, RedisDsn
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The default for every Fernet key below. It is base64 of the ASCII string
+# "insecure-local-dev-fernet-key32!", committed to a public repository, so it
+# is not a secret: anything encrypted under it outside a developer machine
+# is readable by anyone holding the ciphertext.
+INSECURE_LOCAL_DEV_FERNET_KEY = "aW5zZWN1cmUtbG9jYWwtZGV2LWZlcm5ldC1rZXkzMiE="
+
+# The only `environment` values in which the committed secret defaults are
+# expected. Everything else -- production sets "production" -- is treated as
+# a real deployment. An allowlist rather than a denylist, so a typo'd or new
+# environment name errs towards "real".
+LOCAL_ENVIRONMENTS = frozenset({"local", "test"})
+
+# Settings fields whose committed default is public. Compared against each
+# field's own declared default, so this list never has to repeat a value.
+PUBLIC_DEFAULT_SECRET_FIELDS = (
+    "jwt_secret_key",
+    "router_encryption_key",
+    "network_integration_encryption_key",
+    "mfa_encryption_key",
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -201,7 +222,7 @@ class Settings(BaseSettings):
     )
 
     router_encryption_key: str = Field(
-        default="aW5zZWN1cmUtbG9jYWwtZGV2LWZlcm5ldC1rZXkzMiE=",
+        default=INSECURE_LOCAL_DEV_FERNET_KEY,
         min_length=32,
         description=(
             "App-level symmetric key (Fernet, urlsafe-base64) used by "
@@ -1551,7 +1572,7 @@ class Settings(BaseSettings):
     # venue per controller, and env is not a multi-tenant store.
 
     network_integration_encryption_key: str = Field(
-        default="aW5zZWN1cmUtbG9jYWwtZGV2LWZlcm5ldC1rZXkzMiE=",
+        default=INSECURE_LOCAL_DEV_FERNET_KEY,
         min_length=32,
         description=(
             "App-level symmetric key (Fernet, urlsafe-base64) used by "
@@ -1682,7 +1703,7 @@ class Settings(BaseSettings):
     # ========================================================================
 
     mfa_encryption_key: str = Field(
-        default="aW5zZWN1cmUtbG9jYWwtZGV2LWZlcm5ldC1rZXkzMiE=",
+        default=INSECURE_LOCAL_DEV_FERNET_KEY,
         min_length=32,
         description=(
             "App-level symmetric key (Fernet, urlsafe-base64) used by "
@@ -1752,6 +1773,38 @@ class Settings(BaseSettings):
     @property
     def log_path(self) -> Path:
         return self.log_dir / self.log_file
+
+    @property
+    def is_local_environment(self) -> bool:
+        return self.environment.strip().lower() in LOCAL_ENVIRONMENTS
+
+    def secrets_at_public_default(self) -> list[str]:
+        """Env var names of every secret still at its committed default,
+        in a non-local environment. Empty on a developer machine.
+
+        Returns names only, never values, so a caller can log the result
+        as-is. Deliberately does not raise: the api container runs its
+        migrations and then boots through this class, so a refusal here
+        would crash-loop a deployment whose .env nobody has checked yet.
+        What to do about each key is the caller's decision.
+        """
+        if self.is_local_environment:
+            return []
+        fields = type(self).model_fields
+        return [
+            f"CLOUDGUEST_{name.upper()}"
+            for name in PUBLIC_DEFAULT_SECRET_FIELDS
+            if getattr(self, name) == fields[name].default
+        ]
+
+    def uses_public_network_integration_key(self) -> bool:
+        """True when controller credentials would be encrypted under the
+        public default key outside a developer machine."""
+        return (
+            not self.is_local_environment
+            and self.network_integration_encryption_key
+            == INSECURE_LOCAL_DEV_FERNET_KEY
+        )
 
 
 @lru_cache

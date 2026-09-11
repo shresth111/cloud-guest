@@ -50,15 +50,40 @@ operation, rather than four nullable encrypted columns three of which are
 always empty. ``encrypt_credentials``/``decrypt_credentials`` are the only
 two functions that know the encoding, so the column's contents are never
 constructed or parsed anywhere else.
+
+## Refusing the public default key
+
+``network_integration_encryption_key`` defaults to a value committed to a
+public repository. Outside a developer machine, ``encrypt_credentials``
+refuses to use it (``NetworkIntegrationEncryptionKeyNotConfiguredError``),
+so no new secret is ever written under a key everyone has.
+
+``decrypt_credentials`` does *not* refuse it, and that asymmetry is
+deliberate. A row that already exists was already written under the public
+key; refusing to read it un-leaks nothing, and it would take a live venue's
+guest WiFi down until somebody re-enters credentials -- which, until a real
+key is set, they could not do anyway. So a read works and logs CRITICAL,
+once per process. Setting a real key is what ends the exposure; after that,
+any such row fails to decrypt and surfaces as "re-enter credentials", which
+is the correct remedy for a secret that was never protected.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 
 from cryptography.fernet import Fernet, InvalidToken
 
 from app.core.config import Settings, get_settings
+
+from .exceptions import NetworkIntegrationEncryptionKeyNotConfiguredError
+
+logger = logging.getLogger(__name__)
+
+# One CRITICAL per process for reads under the public key, not one per
+# sync tick per integration -- the startup line already names the env var.
+_warned_public_key_decrypt = False
 
 __all__ = [
     "NetworkIntegrationCredentialDecryptionError",
@@ -101,9 +126,23 @@ def encrypt_credentials(
     ``client_secret`` key at all and an Open-API one contains no
     ``password``. That keeps ``has_credentials``-style reasoning honest:
     the presence of a key means a real value.
+
+    Raises ``NetworkIntegrationEncryptionKeyNotConfiguredError`` outside a
+    developer machine when the configured key is the public default --
+    before anything is encrypted, so every caller refuses before it writes.
     """
+    app_settings = settings or get_settings()
+    if app_settings.uses_public_network_integration_key():
+        logger.critical(
+            "network_integration_credentials_refused_public_key",
+            extra={
+                "env_var": "CLOUDGUEST_NETWORK_INTEGRATION_ENCRYPTION_KEY",
+                "environment": app_settings.environment,
+            },
+        )
+        raise NetworkIntegrationEncryptionKeyNotConfiguredError()
     payload = {k: v for k, v in credentials.items() if v}
-    token = _fernet(settings).encrypt(json.dumps(payload).encode("utf-8"))
+    token = _fernet(app_settings).encrypt(json.dumps(payload).encode("utf-8"))
     return token.decode("utf-8")
 
 
@@ -120,9 +159,26 @@ def decrypt_credentials(
     plaintext -- it is written to logs on a failure path, and a "helpful"
     excerpt of either would be the exact leak this module exists to
     prevent.
+
+    Works under the public default key too -- see the module docstring for
+    why reads are not refused -- but says so, once per process.
     """
+    global _warned_public_key_decrypt
+    app_settings = settings or get_settings()
+    if (
+        app_settings.uses_public_network_integration_key()
+        and not _warned_public_key_decrypt
+    ):
+        _warned_public_key_decrypt = True
+        logger.critical(
+            "network_integration_credentials_read_under_public_key",
+            extra={
+                "env_var": "CLOUDGUEST_NETWORK_INTEGRATION_ENCRYPTION_KEY",
+                "environment": app_settings.environment,
+            },
+        )
     try:
-        plaintext = _fernet(settings).decrypt(ciphertext.encode("utf-8"))
+        plaintext = _fernet(app_settings).decrypt(ciphertext.encode("utf-8"))
     except InvalidToken as exc:
         raise NetworkIntegrationCredentialDecryptionError(
             "Stored network integration credentials could not be decrypted -- "
