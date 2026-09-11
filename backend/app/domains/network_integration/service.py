@@ -158,6 +158,7 @@ from .providers.base import (
 )
 from .repository import NetworkIntegrationRepositoryProtocol
 from .validators import (
+    ValidatedControllerUrl,
     describe_mac_wire_format,
     describe_portal_readiness_gaps,
     describe_redirect_shape,
@@ -463,9 +464,11 @@ def build_portal_authorize_diagnostics(
     ## What is not in here
 
     No credential, cookie, token or controller response body -- none of those
-    is an input to any value above. No client IP: this platform's authorize
-    body has no ``clientIp`` field, so there is nothing to record, and this
-    function does not invent one. The redirect URL is reduced to its origin,
+    is an input to any value above. A client IP appears only inside
+    ``request.body``, and only when the controller's redirect carried one
+    (CR-004): it is then part of the exact body that was sent. This function
+    never adds one of its own -- in particular never the HTTP request's
+    source address. The redirect URL is reduced to its origin,
     path and query-parameter *names* (``validators.summarize_redirect_url``
     explains why the values are dropped).
 
@@ -545,6 +548,17 @@ def build_portal_authorize_diagnostics(
 # ============================================================================
 # Service
 # ============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedIntegrationWrite:
+    """What ``_prepare_integration_write`` resolved from a create's inputs."""
+
+    mode: ControllerAuthMode
+    trust_mode: ControllerTlsMode
+    pinned: str | None
+    validated: ValidatedControllerUrl
+    credentials_encrypted: str | None
 
 
 class NetworkIntegrationService:
@@ -1012,28 +1026,21 @@ class NetworkIntegrationService:
         succeeded.
         """
         organization_id = self._require_organization(requesting_organization_id)
-        if provider not in {kind.value for kind in NetworkProviderKind}:
-            raise UnsupportedNetworkProviderError(provider)
-
-        mode = ControllerAuthMode(auth_mode)
-        trust_mode, pinned = self._resolve_tls_trust(tls_mode, tls_pinned_sha256)
-        validated = await self._validate_url(base_url)
-
-        credentials_encrypted: str | None = None
-        if any((client_id, client_secret, username, password)):
-            try:
-                credentials = validate_auth_mode_credentials(
-                    auth_mode=mode,
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    username=username,
-                    password=password,
-                )
-            except ValueError as exc:
-                raise NetworkIntegrationUrlRejectedError(str(exc)) from exc
-            credentials_encrypted = encrypt_credentials(
-                credentials, settings=self.settings
-            )
+        prepared = await self._prepare_integration_write(
+            provider=provider,
+            base_url=base_url,
+            auth_mode=auth_mode,
+            tls_mode=tls_mode,
+            tls_pinned_sha256=tls_pinned_sha256,
+            client_id=client_id,
+            client_secret=client_secret,
+            username=username,
+            password=password,
+        )
+        mode = prepared.mode
+        trust_mode, pinned = prepared.trust_mode, prepared.pinned
+        validated = prepared.validated
+        credentials_encrypted = prepared.credentials_encrypted
 
         existing = await self.repository.find_live_integration(
             organization_id=organization_id,
@@ -1125,6 +1132,98 @@ class NetworkIntegrationService:
             },
         )
         return integration
+
+    async def _prepare_integration_write(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        auth_mode: str,
+        tls_mode: str | None,
+        tls_pinned_sha256: str | None,
+        client_id: str | None,
+        client_secret: str | None,
+        username: str | None,
+        password: str | None,
+    ) -> _PreparedIntegrationWrite:
+        """Every refusal a create can make from its own inputs, before any
+        row is read or written: unknown provider, certificate-trust pair,
+        SSRF validation and normalization of the URL, credentials that do
+        not match the auth mode, and the refusal to encrypt anything under
+        the public default key.
+
+        One place, used by ``create_integration`` and by
+        ``precheck_controller_onboarding``, so the dry run and the real
+        write cannot disagree about what is acceptable.
+        """
+        if provider not in {kind.value for kind in NetworkProviderKind}:
+            raise UnsupportedNetworkProviderError(provider)
+
+        mode = ControllerAuthMode(auth_mode)
+        trust_mode, pinned = self._resolve_tls_trust(tls_mode, tls_pinned_sha256)
+        validated = await self._validate_url(base_url)
+
+        credentials_encrypted: str | None = None
+        if any((client_id, client_secret, username, password)):
+            try:
+                credentials = validate_auth_mode_credentials(
+                    auth_mode=mode,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    username=username,
+                    password=password,
+                )
+            except ValueError as exc:
+                raise NetworkIntegrationUrlRejectedError(str(exc)) from exc
+            credentials_encrypted = encrypt_credentials(
+                credentials, settings=self.settings
+            )
+        return _PreparedIntegrationWrite(
+            mode=mode,
+            trust_mode=trust_mode,
+            pinned=pinned,
+            validated=validated,
+            credentials_encrypted=credentials_encrypted,
+        )
+
+    async def precheck_controller_onboarding(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        auth_mode: str,
+        tls_mode: str | None = None,
+        tls_pinned_sha256: str | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
+        """Raise whatever ``create_integration`` would raise about these
+        inputs, without writing anything or contacting the controller.
+
+        Called by Smart Location Provisioning before it creates the
+        organization, location and owner, so a request that would fail at
+        the controller step fails first -- before it spends a location code
+        and a NAS code, which come from counters a rollback does not give
+        back -- and by its read-only preview, so the review screen reports
+        the same refusal the real submit would.
+
+        Not a guarantee: the duplicate-controller check needs an
+        organization to look in, and a hostname can resolve differently a
+        moment later. The real write re-runs every check.
+        """
+        await self._prepare_integration_write(
+            provider=provider,
+            base_url=base_url,
+            auth_mode=auth_mode,
+            tls_mode=tls_mode,
+            tls_pinned_sha256=tls_pinned_sha256,
+            client_id=client_id,
+            client_secret=client_secret,
+            username=username,
+            password=password,
+        )
 
     async def create_integration_with_fleet_device(
         self,

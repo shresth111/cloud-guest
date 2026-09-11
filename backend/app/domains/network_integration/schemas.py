@@ -55,6 +55,7 @@ from .constants import (
 )
 
 __all__ = [
+    "ControllerOnboardFields",
     "MessageResponse",
     "NetworkIntegrationAuthorizationResponse",
     "NetworkIntegrationClientListResponse",
@@ -271,36 +272,22 @@ class NetworkIntegrationCreateRequest(_CredentialFields):
     )
 
 
-class PlatformOnboardRequest(_CredentialFields):
-    """Master-driven controller onboarding -- contract §11.6.
+class ControllerOnboardFields(_CredentialFields):
+    """Everything that describes one controller being onboarded, and nothing
+    about *where* it goes.
 
-    Its own request model rather than a flag on
-    ``NetworkIntegrationCreateRequest``, because three of its fields differ
-    in *requiredness* rather than in value, and a shared model would have to
-    make all three optional and then re-check them by hand:
+    Shared by the two paths that register a controller together with its
+    fleet device row: Master onboarding (``PlatformOnboardRequest``, which
+    adds the tenant and venue ids) and Smart Location Provisioning
+    (``app.domains.location.provisioning_schemas``, where the tenant and
+    venue do not exist yet and are created in the same request). One model,
+    so the two cannot drift apart on requiredness, bounds or descriptions --
+    the location domain imports this rather than restating it.
 
-    * ``organization_id`` is required here and absent there. A GLOBAL-scoped
-      platform operator has no organization of their own, so the tenant is
-      named in the body. It is re-verified downstream -- the router domain
-      resolves ``location_id`` *with* this organization and rejects a
-      location belonging to anyone else -- so a body that names a mismatched
-      pair gets a 404 rather than a cross-tenant row.
-    * ``location_id`` is required here and optional there. This path writes
-      a fleet device, and a device must be somewhere.
-    * ``controller_model`` is required here and does not exist there. It
-      lands in ``routers.model``, which is NOT NULL.
+    ``controller_model`` is required because it lands in ``routers.model``,
+    which is NOT NULL.
     """
 
-    organization_id: uuid.UUID = Field(
-        description="The tenant this controller belongs to."
-    )
-    location_id: uuid.UUID = Field(
-        description=(
-            "The WyfyGuest location this controller serves. Required on this "
-            "path -- unlike customer self-service -- because it is also the "
-            "location of the fleet device row this creates."
-        )
-    )
     provider: _Provider = "omada"
     name: str = Field(min_length=1, max_length=120)
     base_url: str = Field(min_length=1, max_length=512)
@@ -354,7 +341,7 @@ class PlatformOnboardRequest(_CredentialFields):
     )
 
     @model_validator(mode="after")
-    def _identity_fields_travel_together(self) -> PlatformOnboardRequest:
+    def _identity_fields_travel_together(self) -> ControllerOnboardFields:
         """Half a hardware identity is worse than none.
 
         A serial with no MAC would silently take the synthesized-MAC branch
@@ -368,6 +355,41 @@ class PlatformOnboardRequest(_CredentialFields):
                 "both omitted for a software controller"
             )
         return self
+
+
+class PlatformOnboardRequest(ControllerOnboardFields):
+    """Master-driven controller onboarding -- contract §11.6.
+
+    Its own request model rather than a flag on
+    ``NetworkIntegrationCreateRequest``, because three of its fields differ
+    in *requiredness* rather than in value, and a shared model would have to
+    make all three optional and then re-check them by hand:
+
+    * ``organization_id`` is required here and absent there. A GLOBAL-scoped
+      platform operator has no organization of their own, so the tenant is
+      named in the body. It is re-verified downstream -- the router domain
+      resolves ``location_id`` *with* this organization and rejects a
+      location belonging to anyone else -- so a body that names a mismatched
+      pair gets a 404 rather than a cross-tenant row.
+    * ``location_id`` is required here and optional there. This path writes
+      a fleet device, and a device must be somewhere.
+    * ``controller_model`` is required here and does not exist there. It
+      lands in ``routers.model``, which is NOT NULL.
+
+    The controller description itself lives on ``ControllerOnboardFields``,
+    shared with Smart Location Provisioning.
+    """
+
+    organization_id: uuid.UUID = Field(
+        description="The tenant this controller belongs to."
+    )
+    location_id: uuid.UUID = Field(
+        description=(
+            "The WyfyGuest location this controller serves. Required on this "
+            "path -- unlike customer self-service -- because it is also the "
+            "location of the fleet device row this creates."
+        )
+    )
 
 
 class PlatformOnboardResponse(BaseModel):

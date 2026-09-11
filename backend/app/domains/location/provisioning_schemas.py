@@ -17,15 +17,17 @@ password is returned here, and only here, exactly once.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 from app.domains.billing.constants import PlanFeatureKey
+from app.domains.network_integration.schemas import ControllerOnboardFields
 
 from .enums import PropertyType
 
 __all__ = [
+    "NetworkControllerInputSchema",
     "NewOrganizationInputSchema",
     "ProvisionLocationRequest",
     "ProvisionLocationResponse",
@@ -100,6 +102,27 @@ class RouterInputSchema(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
 
 
+class NetworkControllerInputSchema(ControllerOnboardFields):
+    """The venue's first device when it is a network controller (TP-Link
+    Omada) rather than a MikroTik router.
+
+    Exactly the controller description Master onboarding
+    (``POST /network-integrations/platform/onboard``) takes, minus the
+    tenant and venue ids -- those do not exist yet here; they are created
+    by this same request. Imported rather than restated so the two paths
+    cannot disagree about a field.
+
+    No serial or MAC is required: a software controller has neither, and a
+    locally-administered identity is generated for its fleet row (see
+    ``network_integration.validators.synthesize_fleet_identity``). A
+    hardware controller (OC200/OC300) may supply both from its label.
+    """
+
+
+#: Which kind of first device a provisioning request enrolled.
+DeviceKind = Literal["router", "network_controller"]
+
+
 class FeatureOverrideInputSchema(BaseModel):
     """One Super-Admin-selected divergence from the selected Plan's own
     stock ``PlanFeature`` defaults -- see
@@ -129,14 +152,32 @@ class ProvisionLocationRequest(BaseModel):
     )
     location: LocationInputSchema
     owner: OwnerInputSchema
-    router: RouterInputSchema
+    router: RouterInputSchema | None = Field(
+        default=None,
+        description=(
+            "The venue's first device when it is a MikroTik router. Mutually "
+            "exclusive with `network_controller`; exactly one is required."
+        ),
+    )
+    network_controller: NetworkControllerInputSchema | None = Field(
+        default=None,
+        description=(
+            "The venue's first device when it is a network controller "
+            "(TP-Link Omada) and there is no MikroTik. Registers the "
+            "controller integration and its fleet device row in the same "
+            "transaction as the rest of provisioning. Requires the "
+            "`network_integrations.create` permission in addition to "
+            "`locations.manage`. Mutually exclusive with `router`."
+        ),
+    )
     router_config_template_id: str | None = Field(
         default=None,
         description=(
             "Explicit config template to apply. When omitted, the most "
             "recently created active system template is used; if none "
             "exists, provisioning fails with a clear, documented error "
-            "rather than silently skipping this step."
+            "rather than silently skipping this step. MikroTik routers "
+            "only -- a RouterOS template cannot apply to a controller."
         ),
     )
     plan_id: str = Field(..., description="The base subscription Plan to apply.")
@@ -151,6 +192,26 @@ class ProvisionLocationRequest(BaseModel):
             raise ValueError(
                 "Exactly one of existing_organization_id or new_organization "
                 "must be provided"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_first_device(self) -> ProvisionLocationRequest:
+        """Every location is provisioned with exactly one first device: a
+        MikroTik router or a network controller, never both and never
+        neither. A guest session needs a fleet row at the venue
+        (``guest_sessions.router_id`` is NOT NULL), so "neither" would
+        provision a venue no guest could ever sign in at."""
+        has_router = self.router is not None
+        has_controller = self.network_controller is not None
+        if has_router == has_controller:
+            raise ValueError(
+                "Exactly one of router or network_controller must be provided"
+            )
+        if has_controller and self.router_config_template_id is not None:
+            raise ValueError(
+                "router_config_template_id applies only to a MikroTik router; "
+                "a network controller takes no RouterOS configuration template"
             )
         return self
 
@@ -199,9 +260,34 @@ class ProvisionLocationResponse(BaseModel):
     plan_id: str
     plan_name: str
     feature_summary: dict[str, Any] = Field(default_factory=dict)
-    router_id: str
+    device_kind: DeviceKind = Field(
+        default="router",
+        description="Which kind of first device this location was provisioned with.",
+    )
+    router_id: str = Field(
+        ...,
+        description=(
+            "The fleet device row -- the MikroTik router, or the row "
+            "representing the network controller."
+        ),
+    )
     router_name: str
-    tunnel_ip_address: str | None = None
+    network_integration_id: str | None = Field(
+        default=None,
+        description=(
+            "The controller integration created for a `network_controller` "
+            "first device; null for a MikroTik router. Its site and guest "
+            "network mapping is finished on the venue's Network "
+            "Integrations page."
+        ),
+    )
+    tunnel_ip_address: str | None = Field(
+        default=None,
+        description=(
+            "The router's WireGuard tunnel address. Always null for a network "
+            "controller, which runs no agent and gets no tunnel."
+        ),
+    )
     owner_user_id: str
     owner_name: str
     owner_username: str
@@ -238,8 +324,16 @@ class ProvisionLocationPreviewResponse(BaseModel):
     )
     site_id: str = Field(..., description="Previewed Location.location_code.")
     nas_id: str = Field(..., description="Previewed RADIUS NAS code.")
-    controller_id: str = Field(
-        ..., description="The router's own serial_number -- the 'Controller ID'."
+    device_kind: DeviceKind = "router"
+    controller_id: str | None = Field(
+        default=None,
+        description=(
+            "The router's own serial_number -- the 'Controller ID'. For a "
+            "network controller: its hardware serial when one was supplied, "
+            "otherwise null, because a software controller's identity is "
+            "generated from the integration id when it is provisioned and "
+            "does not exist yet."
+        ),
     )
     plan_id: str
     plan_name: str

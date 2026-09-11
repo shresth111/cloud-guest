@@ -694,8 +694,12 @@ PORTAL_AUTHORIZE_DIAGNOSTICS_KEY = "authorize_diagnostics"
 # `network_integration_authorizations.client_mac`, in the same organization's
 # scope, and `app.common.masking.mask_mac` is a documented no-op because
 # venues need the real address to identify a device for support. What changes
-# is only which table it is in. No client IP is recorded because none is sent:
-# the authorize body this platform builds has no `clientIp` field at all.
+# is only which table it is in. A client IP appears only when one was sent:
+# since CR-004 (#206) the authorize body carries `clientIp` whenever the
+# controller's own redirect supplied one, and the recorded `request.body` is
+# that exact body. It falls under the same failure-only rule as the MAC, and
+# it is the less personal of the two -- per HARDWARE-FINDINGS it is the
+# venue's NAT address, not the guest device's.
 PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS = False
 
 # How old a redirect's `t` has to be before the record calls it stale.

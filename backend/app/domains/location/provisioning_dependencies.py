@@ -43,6 +43,10 @@ from app.domains.billing.dependencies import get_plan_service, get_subscription_
 from app.domains.billing.service import PlanService, SubscriptionService
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
+from app.domains.network_integration.dependencies import (
+    get_network_integration_service,
+)
+from app.domains.network_integration.service import NetworkIntegrationService
 from app.domains.notification.dependencies import get_notification_service
 from app.domains.notification.service import NotificationService
 from app.domains.organization.dependencies import get_organization_service
@@ -81,6 +85,13 @@ def get_location_provisioning_service(
     subscription_service: SubscriptionService = Depends(get_subscription_service),
     captive_portal_service: CaptivePortalService = Depends(get_captive_portal_service),
     notification_service: NotificationService = Depends(get_notification_service),
+    # A network-controller first device is registered through the network
+    # integration domain's own Master onboarding method. Resolved from the
+    # same request-scoped get_db_session as everything above, so its two
+    # writes join this request's one transaction.
+    network_integration_service: NetworkIntegrationService = Depends(
+        get_network_integration_service
+    ),
     settings: Settings = Depends(get_settings),
 ) -> LocationProvisioningService:
     return LocationProvisioningService(
@@ -99,6 +110,7 @@ def get_location_provisioning_service(
         LoggingSmsProvider(),
         login_url_base=settings.frontend_base_url,
         notification_service=notification_service,
+        network_controller_service=network_integration_service,
     )
 
 
