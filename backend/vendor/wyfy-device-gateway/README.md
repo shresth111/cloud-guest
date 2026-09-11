@@ -2,19 +2,26 @@
 
 Vendor-agnostic network device gateway for Wyfy Guest (formerly branded "ZIP WiFi" / "CloudGuest").
 
+> **This directory is the canonical copy.** The standalone `shresth111/wyfy-device-gateway`
+> repository is archived (read-only) as of 2026-09-11. Every gateway change is made here, in
+> `cloud-guest`, and is gated by this repo's CI (`ruff --select F` over the package and this
+> package's own pytest run — see `.github/workflows/ci.yml`). Do not re-create a second copy to
+> sync by hand: two copies edited independently is exactly how the upstream repo ended up behind
+> this one in code and ahead of it in tests.
+
 ## What this is
 
 Wyfy Guest's main platform (`cloud-guest-repo`) speaks to MikroTik RouterOS devices through
 this package: **one** stable interface (`wyfy_device_gateway.contract.DeviceGatewayAdapter`) that
 the backend calls regardless of vendor, with one adapter implementation per vendor behind it.
 
-Read [`PRD.md`](./PRD.md) before touching any code.
+Read `PRD.md` (in the archived standalone repo — see *History* below) before touching any code.
 
 ## What this is not
 
 - Not a rewrite of RADIUS/hotspot auth (standard RADIUS — out of scope; PRD §2.3).
-- Not a running HTTP service in Phase 1 — a library `cloud-guest-repo` vendors into
-  `backend/vendor/wyfy-device-gateway/` (private repos; Docker build has no git credentials).
+- Not a running HTTP service — a library that lives at `backend/vendor/wyfy-device-gateway/`
+  in `cloud-guest` and is installed from there (the Docker build has no git credentials).
 - Not a secrets/encryption layer — `cloud-guest-repo` decrypts credentials per call (PRD §6).
 
 ## Status
@@ -25,8 +32,7 @@ vendor stubs are implemented with unit tests against a fake transport (no live d
 **Wave 1 read-only discovery — shipped in the vendored copy.** `read_only_reader.py`
 (`ReadOnlyDeviceReader`) is used by `POST /api/v1/routers/{id}/discover` in `cloud-guest-repo`.
 It is read-only **by construction** (no write methods, print-path allowlist, row sanitization before
-persistence). Source of truth today: `cloud-guest-repo/backend/vendor/wyfy-device-gateway/` —
-backport to this standalone repo is tracked separately.
+persistence).
 
 **Call-site migration (PRD §7) — in progress.** `router/device_adapters.py` (`list_available_device_interfaces`,
 `reboot_device`) delegates here. Other domains (`network_diagnostics`, `queue_management`, most of
@@ -42,14 +48,17 @@ live-venue adoption procedure.
 wyfy_device_gateway/
   __init__.py
   contract.py           # DeviceGatewayAdapter Protocol + shared dataclasses
+  controller_contract.py # controller-shaped contract (Omada) — separate from the router one
   mikrotik_adapter.py    # MikroTikAdapter — librouteros API + asyncssh provision path
-  read_only_reader.py    # ReadOnlyDeviceReader — discovery-only (vendored copy; backport pending here)
-  stub_adapters.py       # TP-Link Omada, Ruckus, UniFi, Aruba, Cisco Meraki stubs
-  registry.py            # get_adapter(vendor) / list_supported_vendors()
-  snmp_poller.py         # SNMP helpers (vendored copy only today)
+  omada/                 # OmadaControllerAdapter — TP-Link Omada controller integration
+  read_only_reader.py    # ReadOnlyDeviceReader — discovery-only
+  stub_adapters.py       # Router-shaped stubs: TP-Link, Ruckus, UniFi, Aruba, Cisco Meraki
+  registry.py            # get_adapter(vendor) / get_controller_adapter(vendor)
+  snmp_poller.py         # SNMP helpers
 tests/
-  fake_transport.py      # in vendored copy; fake/mocked transports in standalone tests/
-PRD.md
+  fake_transport.py        # read-only fake RouterOS transport (no mutating methods, on purpose)
+  fake_write_transport.py  # write-capable fake RouterOS transport
+  omada_support.py         # fake Omada controller responses
 README.md
 ```
 
@@ -57,7 +66,7 @@ README.md
 
 ```bash
 cd backend/vendor/wyfy-device-gateway
-../../.venv/bin/python -m pytest tests/ -q      # 196 passed
+../../.venv/bin/python -m pytest tests/ -q      # 662 passed
 ```
 
 This package has its own `[tool.pytest.ini_options]` with `pythonpath = ["."]`, which is what
@@ -70,8 +79,8 @@ ModuleNotFoundError: No module named 'tests.fake_write_transport'
 
 That is a wrong working directory, **not broken code** — and it does not look like one, which is
 why it is written down here. `backend/pyproject.toml` sets `testpaths = ["tests"]`, so the
-backend's own suite never collects this package at all; a change here that breaks these tests
-will pass a full `backend/` run untouched. Run both.
+backend's own suite never collects this package; CI runs it as a separate step from this
+directory. Run both locally.
 
 ## ReadOnlyDeviceReader (Wave 1 discovery)
 
@@ -94,16 +103,16 @@ Discovery service code in `cloud-guest-repo` is typed against this class so writ
 expressed at the call site. See `app/domains/provisioning_engine/planner/service.py` and
 `backend/docs/router_fleet/PROVISIONING_RUNBOOK.md`.
 
-## Relationship to cloud-guest-repo
+## History
 
-`cloud-guest-repo` vendors this directory and syncs README + code on gateway PRs. Migration is a
-series of small PRs that swap one legacy `librouteros` call site at a time without changing outward
-API behavior. This repo can be built and tested independently before any vendor bump lands in
-production.
+Until 2026-09-11 this package also lived in a standalone repository that `cloud-guest` vendored
+from. The two drifted: the vendored copy took every fix from cloud-guest #15 onward, while the
+standalone repo kept ten test files the vendored copy never had. Those tests were ported here and
+the standalone repo was archived. It is kept read-only rather than deleted, for its history and for
+`PRD.md`, which the section references in this README and in module docstrings point to.
 
 ## New here?
 
-1. `PRD.md` §2 — current-state audit
-2. `PRD.md` §4 — API contract
-3. `PRD.md` §7 — migration order
-4. `cloud-guest-repo/backend/docs/router_fleet/README.md` — operator-facing Wave 1 docs
+1. `PRD.md` in the archived `shresth111/wyfy-device-gateway` repo — §2 current-state audit,
+   §4 API contract, §7 migration order
+2. `backend/docs/router_fleet/README.md` — operator-facing Wave 1 docs
