@@ -103,6 +103,7 @@ from .schemas import (
     TestConnectionResponse,
 )
 from .service import NetworkIntegrationService
+from .validators import build_external_portal_url, portal_readiness_gaps
 
 router = APIRouter(prefix="/network-integrations", tags=["Network Integrations"])
 portal_router = APIRouter(
@@ -149,6 +150,12 @@ def _integration_response(
     the value itself in a response.
     """
     numbers = counts or {}
+    portal_url = build_external_portal_url(
+        organization_id=integration.organization_id,
+        location_id=integration.location_id,
+        router_id=integration.router_id,
+        provider=integration.provider,
+    )
     return NetworkIntegrationResponse(
         id=str(integration.id),
         organization_id=str(integration.organization_id),
@@ -183,6 +190,14 @@ def _integration_response(
         client_count=numbers.get("client_count", 0),
         active_authorization_count=numbers.get("active_authorization_count", 0),
         has_credentials=integration.credentials_encrypted is not None,
+        # Both computed on read, never stored. Every input is already a
+        # column on this row, so a persisted copy would be a second set of
+        # the same facts able to disagree with them the moment a mapping is
+        # edited -- the reasoning `validators.portal_readiness_gaps` already
+        # spells out for itself.
+        portal_url_scheme=portal_url.scheme if portal_url else None,
+        portal_url_host_and_query=portal_url.host_and_query if portal_url else None,
+        portal_readiness_gaps=[gap.value for gap in portal_readiness_gaps(integration)],
         created_at=integration.created_at,
         updated_at=integration.updated_at,
     )
