@@ -71,9 +71,34 @@ directly on the VM (not containerized, since they need `docker exec` into
   `is_deleted=false, status='active'` `radius_nas_clients` row (LEFT JOINed
   against `wireguard_peers` by `router_id`) and prints a `client { ... }`
   block per NAS, `nas_identifier` as `shortname`, `ipaddr` scoped to that
-  router's real WireGuard tunnel IP as a `/32` (falls back to `0.0.0.0/0`
-  only if the NAS has no tunnel peer row yet -- logged to stderr as a
-  fallback count).
+  router's real WireGuard tunnel IP as a `/32`.
+
+  **A NAS with no tunnel peer row gets no stanza at all** (2026-09-11). This
+  used to fall back to `ipaddr = 0.0.0.0/0`, which was not a widened stanza
+  but a *catch-all carrying that router's real `shortname` and
+  `backend_secret`*: FreeRADIUS matches clients by longest prefix, so it
+  answered every source address no other stanza claimed, and anything that
+  reached UDP 1812 and knew its `secret` authenticated to the platform API as
+  that venue. It bought nothing either -- RADIUS is reachable only from
+  `10.20.0.0/24` and the VPC, so a NAS with no tunnel address cannot send
+  FreeRADIUS a packet at all, and the stanza could only ever have matched
+  somebody else. Skipped rows are named on stderr and in the generated file.
+
+  Two emptiness cases matter, because `sync_radius_clients.sh` guards on
+  `[ ! -s "$TMP" ]` and `test -s` means *size > 0*:
+  - **every** row unrenderable → exits non-zero, so `set -e` aborts and the
+    last good `clients.wyfy.conf` is kept. (A comments-only file is not empty
+    and would otherwise have been copied over it.)
+  - **zero** active NAS rows → emits literally nothing, so the guard fires and
+    keeps the existing file. It used to emit a single newline, which is
+    non-empty, so the guard did not fire.
+- `audit_clients_conf.py` → read-only report on the stanzas already in a
+  `clients.conf`, which the generator does not own (those come from
+  `ops/hub-agents/radius_agent.py` and from hand edits). Classifies each
+  stanza as stock / active / orphan / catch-all against the live NAS list and
+  prints a removal plan. It never edits its input; `--emit-pruned` writes a
+  separate file for review. Run it against a *fresh copy* of the live file --
+  not the 2026-08-22 capture, which predates the current NAS.
 - `sync_radius_clients.sh` (installed at `/opt/wyfy/sync_radius_clients.sh`
   on the VM) → runs the above via `docker cp` + `docker exec`, diffs the
   result against the live `clients.wyfy.conf`, and only overwrites +

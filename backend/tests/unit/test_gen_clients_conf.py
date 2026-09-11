@@ -75,13 +75,35 @@ class TestGenClientsConfIpaddrScoping:
         assert 'shortname = "cg-5d3a509e"' in block
         assert f"client nas_{str(nas_id).replace('-', '_')} {{" in block
 
-    def test_client_with_no_tunnel_ip_falls_back_explicitly(
+    def test_client_with_no_tunnel_ip_renders_nothing_at_all(
         self, gen_clients_conf
     ) -> None:
-        block = gen_clients_conf.render_client_block(
-            uuid.uuid4(), "cg-no-peer-yet", "s3cr3t", None
+        """Changed 2026-09-11. This used to assert the opposite -- that a NAS
+        with no tunnel address got an explicit ``ipaddr = 0.0.0.0/0`` stanza,
+        documented as the safe, visible fallback.
+
+        It was neither. The stanza carried that router's real ``shortname``
+        and ``backend_secret``, and FreeRADIUS matches clients by longest
+        prefix, so it answered every source address no other stanza claimed.
+        Anything that reached UDP 1812 and knew its ``secret`` authenticated
+        to the platform API *as that venue*.
+
+        Nor did it buy anything: the hub security group admits 1812/1813 only
+        from ``10.20.0.0/24`` and the VPC, so a NAS with no ``wireguard_peers``
+        row has no address in that range and cannot send FreeRADIUS a packet
+        at all. The stanza could only ever have matched a different host."""
+        assert (
+            gen_clients_conf.render_client_block(
+                uuid.uuid4(), "cg-no-peer-yet", "s3cr3t", None
+            )
+            is None
         )
-        assert "ipaddr = 0.0.0.0/0" in block
+        assert (
+            gen_clients_conf.render_client_block(
+                uuid.uuid4(), "cg-no-peer-yet", "s3cr3t", ""
+            )
+            is None
+        )
 
     def test_two_active_nas_clients_never_collide_on_ipaddr(
         self, gen_clients_conf
