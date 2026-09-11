@@ -422,3 +422,142 @@ def test_hostname_connect_uri_is_skipped_not_failed(tmp_path):
 def test_cli_exit_status(broken_tree, fixed_tree, capsys):
     assert verify.main([str(broken_tree), "--expect-api-cidr", "172.31.0.0/16"]) == 1
     assert verify.main([str(fixed_tree), "--expect-api-cidr", "172.31.0.0/16"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# check 10 -- a generated clients file that nothing loads
+#
+# This is the one that was missed. The generator's own catch-all defect was
+# found, fixed and merged before anyone checked whether the generator is read
+# at all. On the hub it is not: `clients.wyfy.conf` does not exist, nothing
+# `$INCLUDE`s it, and `radiusd.conf` loads only `clients.conf` -- so every fix
+# to `gen_clients_conf.py`, including a security fix, was inert there.
+# ---------------------------------------------------------------------------
+
+RADIUSD_CONF = """\
+prefix = /usr
+$INCLUDE proxy.conf
+$INCLUDE clients.conf
+modules {
+	$INCLUDE mods-enabled/
+}
+$INCLUDE sites-enabled/
+"""
+
+GENERATED_STANZA = """\
+client nas_bfc7ed1c {
+	ipaddr = 10.20.0.19/32
+	secret = "s-bfc7ed1c"
+	backend_secret = "s-bfc7ed1c"
+	shortname = "cg-bfc7ed1c"
+}
+"""
+
+
+def _clients_tree(
+    tmp_path: Path,
+    *,
+    radiusd: str = RADIUSD_CONF,
+    clients: str = CLEAN_CLIENTS,
+    generated: str | None = None,
+    name: str = "clients-3.0",
+) -> Path:
+    root = _tree(
+        tmp_path,
+        site=FIXED_SITE,
+        rest=FIXED_REST,
+        clients=clients,
+        symlink_site=True,
+        name=name,
+    )
+    (root / "radiusd.conf").write_text(radiusd, encoding="utf-8")
+    if generated is not None:
+        (root / "clients.wyfy.conf").write_text(generated, encoding="utf-8")
+    return root
+
+
+def test_generated_file_present_and_included_passes(tmp_path):
+    root = _clients_tree(
+        tmp_path,
+        radiusd=RADIUSD_CONF + "$INCLUDE clients.wyfy.conf\n",
+        generated=GENERATED_STANZA,
+    )
+    finding = _by_name(verify.check_tree(root), "generated clients file")
+    assert finding.status == verify.PASS
+
+
+def test_generated_file_present_but_not_included_is_a_failure(tmp_path):
+    """The dangerous asymmetry, and the reason this check exists.
+
+    `sync_radius_clients.sh` writes the file, diffs it, reloads FreeRADIUS and
+    logs success — and the server reads none of it. Every NAS the file defines
+    is silently absent, which looks from the outside exactly like the router
+    being misconfigured."""
+    root = _clients_tree(tmp_path, generated=GENERATED_STANZA)
+    finding = _by_name(verify.check_tree(root), "generated clients file")
+    assert finding.status == verify.FAIL
+    assert "EXISTS but nothing $INCLUDEs it" in finding.detail
+
+
+def test_generated_file_included_but_missing_is_a_failure(tmp_path):
+    """FreeRADIUS refuses to start on a missing `$INCLUDE`, so this one is not
+    a silent failure — it is an outage waiting for the next restart, which may
+    be days after the change that caused it."""
+    root = _clients_tree(
+        tmp_path, radiusd=RADIUSD_CONF + "$INCLUDE clients.wyfy.conf\n"
+    )
+    finding = _by_name(verify.check_tree(root), "generated clients file")
+    assert finding.status == verify.FAIL
+    assert "MISSING" in finding.detail
+
+
+def test_neither_present_nor_included_is_reported_as_not_wired_up(tmp_path):
+    """The hub's actual state on 2026-08-22, and it is deliberately SKIP, not
+    FAIL: it is a coherent configuration — `radius_agent.py` writes
+    `clients.conf` directly and is then the only writer. What it is not is
+    obvious, so the check says it out loud instead of staying silent."""
+    root = _clients_tree(tmp_path)
+    finding = _by_name(verify.check_tree(root), "generated clients file")
+    assert finding.status == verify.SKIP
+    assert "not wired up" in finding.detail
+    assert "no effect here" in finding.detail
+
+
+def test_a_commented_out_include_does_not_count_as_wiring(tmp_path):
+    """How the wiring gets lost in the first place: someone comments the line
+    out to debug something and never restores it. A check that greps for the
+    filename anywhere in the file would call this wired."""
+    root = _clients_tree(
+        tmp_path,
+        radiusd=RADIUSD_CONF + "#$INCLUDE clients.wyfy.conf\n",
+        generated=GENERATED_STANZA,
+    )
+    finding = _by_name(verify.check_tree(root), "generated clients file")
+    assert finding.status == verify.FAIL
+
+
+def test_include_is_matched_by_basename_not_by_exact_path(tmp_path):
+    """`$INCLUDE` paths are relative to the config dir and are written several
+    ways in the wild (`clients.wyfy.conf`, `./clients.wyfy.conf`,
+    `${confdir}/clients.wyfy.conf`). Matching the literal string would report a
+    correctly-wired hub as broken, which is the fastest way to get a checker
+    ignored."""
+    root = _clients_tree(
+        tmp_path,
+        radiusd=RADIUSD_CONF + "$INCLUDE ${confdir}/clients.wyfy.conf\n",
+        generated=GENERATED_STANZA,
+    )
+    finding = _by_name(verify.check_tree(root), "generated clients file")
+    assert finding.status == verify.PASS
+
+
+def test_the_real_hub_capture_shape_is_reported_correctly(tmp_path):
+    """End to end on the shape actually captured from the hub: radiusd.conf
+    loads only clients.conf, clients.conf has no $INCLUDE, and
+    clients.wyfy.conf is absent."""
+    root = _clients_tree(tmp_path, clients=CATCH_ALL_CLIENTS)
+    findings = verify.check_tree(root, expect_api_cidr="172.31.0.0/16")
+    wiring = _by_name(findings, "generated clients file")
+    catch_all = _by_name(findings, "no catch-all client")
+    assert wiring.status == verify.SKIP
+    assert catch_all.status == verify.FAIL

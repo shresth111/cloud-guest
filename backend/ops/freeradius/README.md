@@ -246,6 +246,68 @@ REST headers, `Message-Authenticator` on the reply, `accounting{}` calling
 `rest`, totals-not-deltas, `Acct-*-Gigawords` reassembly, catch-all client
 stanzas, and this `connect_uri`. It is **not** a substitute for `radiusd -XC`;
 it checks the things `-XC` is happy to accept.
+## ⚠️ The generator is NOT wired up on the AWS hub (2026-09-11)
+
+Everything in the "Dynamic NAS clients" section above describes a pipeline
+that, on the current estate, **does not run and would not be read if it did.**
+Established read-only against the 2026-08-22 hub capture and the app server:
+
+```
+radiusd.conf:611:  $INCLUDE clients.conf     ← the only clients file loaded
+clients.conf:      no $INCLUDE lines at all
+ls /etc/freeradius/3.0 | grep wyfy   → nothing
+grep -rn "clients.wyfy" <tree>       → no reference anywhere
+```
+
+`clients.wyfy.conf` does not exist on the hub and is named nowhere in its
+config. So `gen_clients_conf.py`'s output is not loaded by FreeRADIUS.
+
+It is not being produced either. `sync_radius_clients.sh` needs **one host**
+that has both `docker ... deploy-api-1` *and* `/etc/freeradius` +
+`systemctl reload freeradius`. On AWS those live on different machines:
+
+| host | `deploy-api-1` | `/etc/freeradius` | `/opt/wyfy/*radius*` | sync timer |
+|---|---|---|---|---|
+| app server `172.31.38.118` | yes | **no** | **no** | **not installed** |
+| hub `172.31.40.230` | almost certainly not | yes | unknown (no shell) | unknown |
+
+The script was written when those were co-located. **It cannot work as written
+on a split topology**, and nothing reports that, because each half looks fine
+on its own.
+
+**What this means in practice:** `ops/hub-agents/radius_agent.py` (port 9092)
+is the *only* thing writing client stanzas on this hub — it edits
+`clients.conf` directly at provisioning time, which is why the live stanzas
+carry its `cg-cg-` label convention. **Changes to `gen_clients_conf.py` have
+no effect on the running estate.** A fix to it is worth having for the day the
+pipeline is connected, but do not merge one and believe a live problem is
+solved.
+
+`verify_hub_config.py`'s check 10 now reports this state explicitly rather
+than leaving it to be rediscovered:
+
+```
+[SKIP] generated clients file is wired up
+       clients.wyfy.conf is neither present nor $INCLUDEd, so
+       gen_clients_conf.py/sync_radius_clients.sh are not wired up on this
+       host ... it means changes to the generator have no effect here
+```
+
+**Before this pipeline is relied on, one of two decisions has to be made**, and
+this file should be updated to say which:
+
+1. **Connect it** — add `$INCLUDE clients.wyfy.conf` to the hub's
+   `clients.conf`, and give `sync_radius_clients.sh` a way to work across two
+   hosts (run the generator in the container on the app server, ship the
+   output to the hub through the agent rather than assuming a shared
+   filesystem). Then two writers touch client stanzas and the drift risk in
+   `wyfy_generator_vs_writer_drift` becomes live — the agent and the generator
+   must agree on ownership.
+2. **Retire it** — delete the generator, the sync script and both systemd
+   units, and let `radius_agent.py` be the single documented writer.
+
+Leaving it half-wired is the worst of the three, because it reads as working.
+
 ## Checking what a `client{}` stanza actually resolves to (2026-09-11)
 
 `%{client:shortname}` and `%{client:backend_secret}` decide which venue a

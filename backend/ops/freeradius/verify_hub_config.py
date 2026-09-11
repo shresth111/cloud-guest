@@ -335,7 +335,102 @@ def check_tree(root: Path, expect_api_cidr: str | None = None) -> list[Finding]:
             ),
         )
 
+    # 10 -- every clients file that exists is actually loaded, and every one
+    #       referenced actually exists.
+    findings.extend(_check_clients_files_are_loaded(root))
+
     return findings
+
+
+#  FreeRADIUS loads clients only from files it is told to load: `radiusd.conf`
+#  pulls in `clients.conf`, and anything else has to be reached by an explicit
+#  `$INCLUDE`. A generated file that nothing includes is not a smaller problem
+#  than a missing one -- it is invisible, because every tool that writes it
+#  reports success and the server never reads a byte of it.
+_INCLUDE_RE = re.compile(r"^[ \t]*\$INCLUDE[ \t]+(\S+)", re.MULTILINE)
+
+#  Written by `gen_clients_conf.py` via `sync_radius_clients.sh`. Named
+#  explicitly rather than globbed: the check has to be able to say "this file
+#  is missing AND unreferenced", which a glob over what happens to be on disk
+#  cannot express.
+_GENERATED_CLIENTS_FILE = "clients.wyfy.conf"
+
+
+def _included_files(root: Path) -> set[str]:
+    """Every path `$INCLUDE`d from radiusd.conf or clients.conf, by basename.
+
+    Only these two matter for client stanzas: `radiusd.conf` is the entry
+    point and `clients.conf` is the one clients file it loads unconditionally.
+    Commented-out includes do not count -- that is precisely how such a line
+    gets lost."""
+    included: set[str] = set()
+    for name in ("radiusd.conf", "clients.conf"):
+        text = _read(root / name)
+        if text is None:
+            continue
+        for match in _INCLUDE_RE.finditer(_strip_comments(text)):
+            included.add(Path(match.group(1)).name)
+    return included
+
+
+def _check_clients_files_are_loaded(root: Path) -> list[Finding]:
+    """Catch the two halves of a half-wired generator.
+
+    Found on 2026-09-11, after the generator's own catch-all defect had already
+    been fixed and merged: on the hub, `clients.wyfy.conf` did not exist, was
+    referenced nowhere in the tree, and `radiusd.conf` loaded only
+    `clients.conf`. So `gen_clients_conf.py` was neither running nor read --
+    and every fix to it, including a real security fix, was inert. Nothing
+    anywhere reported that, because each piece looked fine on its own."""
+    check = "generated clients file is wired up"
+    if _read(root / "radiusd.conf") is None:
+        return [Finding(check, SKIP, "radiusd.conf not found")]
+
+    included = _included_files(root)
+    exists = (root / _GENERATED_CLIENTS_FILE).exists()
+    referenced = _GENERATED_CLIENTS_FILE in included
+
+    if exists and referenced:
+        return [
+            Finding(
+                check,
+                PASS,
+                f"{_GENERATED_CLIENTS_FILE} exists and is $INCLUDEd",
+            )
+        ]
+    if exists and not referenced:
+        #  The dangerous asymmetry. The sync script writes the file, diffs it,
+        #  reloads FreeRADIUS and logs success -- and the server never reads it.
+        return [
+            Finding(
+                check,
+                FAIL,
+                f"{_GENERATED_CLIENTS_FILE} EXISTS but nothing $INCLUDEs it -- "
+                "sync_radius_clients.sh writes it and reloads FreeRADIUS, which "
+                "reads none of it. Every NAS it defines is silently absent",
+            )
+        ]
+    if referenced and not exists:
+        return [
+            Finding(
+                check,
+                FAIL,
+                f"{_GENERATED_CLIENTS_FILE} is $INCLUDEd but MISSING -- "
+                "FreeRADIUS refuses to start on a missing $INCLUDE, so this is "
+                "an outage waiting for the next restart",
+            )
+        ]
+    return [
+        Finding(
+            check,
+            SKIP,
+            f"{_GENERATED_CLIENTS_FILE} is neither present nor $INCLUDEd, so "
+            "gen_clients_conf.py/sync_radius_clients.sh are not wired up on "
+            "this host. That is coherent -- ops/hub-agents/radius_agent.py "
+            "writes clients.conf directly and is then the only writer -- but "
+            "it means changes to the generator have no effect here",
+        )
+    ]
 
 
 def render_text(findings: list[Finding]) -> str:
