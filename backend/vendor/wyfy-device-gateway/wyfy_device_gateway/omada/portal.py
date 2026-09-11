@@ -69,10 +69,15 @@ JSON fields in the bodies we have seen, but sending version-specific fields
 unconditionally to an older controller is an avoidable risk on the one call
 in this package that a paying guest's internet access depends on.
 
-## There is no deauthorization endpoint
+## Revoking one of these
 
-TP-Link publishes no way to revoke an external-portal authorization. See
-``adapter.deauthorize_guest``.
+TP-Link publishes no way to revoke an external-portal authorization, and
+that used to be the end of the sentence. It is not: the controller has a
+disconnect in the Hotspot Manager tree, reachable with the same operator
+session this module's call uses, and it is implemented in ``deauth.py``.
+Nothing about the authorize body changes because of it -- an authorization
+is still granted for ``time`` milliseconds and still lapses on its own --
+but the grant is no longer irrevocable. See ``adapter.deauthorize_guest``.
 """
 
 from __future__ import annotations

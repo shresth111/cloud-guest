@@ -63,6 +63,8 @@ __all__ = [
     "NetworkIntegrationCredentialRotateRequest",
     "NetworkIntegrationDeviceListResponse",
     "NetworkIntegrationDeviceResponse",
+    "NetworkIntegrationDisconnectGuestRequest",
+    "NetworkIntegrationDisconnectGuestResponse",
     "NetworkIntegrationEventListResponse",
     "NetworkIntegrationEventResponse",
     "NetworkIntegrationListResponse",
@@ -645,3 +647,48 @@ class PortalAuthorizeResponse(BaseModel):
     # own redirect in the first place. Treating it as a URL this backend
     # would follow is what would make it an SSRF vector; it is not one.
     redirect_url: str | None = None
+
+
+class NetworkIntegrationDisconnectGuestRequest(BaseModel):
+    """Ask the controller to end one guest's access now.
+
+    Only a MAC. The integration is the path parameter, the venue and the
+    organization come from the integration row, and the guest session --
+    if there is one -- is looked up from this platform's own
+    authorization record rather than accepted from the caller. A request
+    body that could name a session id would be a request body that could
+    name *someone else's* session id, and nothing here needs it.
+
+    ``client_mac`` is a plain ``str`` on the way in, per this module's
+    convention: it is an identifier being supplied, not an identifier
+    being disclosed, and it is normalized server-side (a caller may send
+    colon, hyphen or bare-hex form).
+    """
+
+    client_mac: str = Field(min_length=12, max_length=32)
+    # Free text, stored on the guest session and in the audit entry. Not
+    # shown to the guest -- see the blocklist-reason work for why guest
+    # visibility of a staff-written reason is its own decision.
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class NetworkIntegrationDisconnectGuestResponse(BaseModel):
+    """Three facts, not one, because they are three different facts.
+
+    ``disconnected`` is the only one that means the device stopped
+    forwarding traffic. ``had_active_authorization`` false alongside it is
+    normal: the guest's grant had already lapsed, and the end state the
+    caller asked for is the state that now holds. ``guest_session_ended``
+    false means the session was already over, not that anything failed.
+
+    A UI showing only "Disconnected" is correct; a UI explaining what
+    happened should read all three rather than inferring two from one.
+    """
+
+    disconnected: bool
+    provider: str
+    client_mac: MaskedMac
+    had_active_authorization: bool
+    deauthorized_at: datetime | None = None
+    guest_session_id: str | None = None
+    guest_session_ended: bool = False

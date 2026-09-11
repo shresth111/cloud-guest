@@ -1,4 +1,4 @@
-"""Guest authorization -- the EAP path, the gateway path, and deauthorization.
+"""Guest authorization -- the EAP path, the gateway path, and its undo.
 
 This is the one flow with primary TP-Link documentation behind it, and the
 one where a wrong field name means a paying guest has no internet. The wire
@@ -261,26 +261,45 @@ async def test_authorize_recovers_from_an_expired_operator_session():
 # --- deauthorization -------------------------------------------------------
 
 
-async def test_deauthorize_reports_unsupported_rather_than_guessing():
-    """TP-Link publishes no deauthorization endpoint. We say so with a
-    normalized, catchable code instead of repurposing the blocklist."""
-    controller = FakeOmadaController()
+async def test_an_operator_credential_can_undo_what_it_did():
+    """The symmetry, asserted where the authorization itself is asserted.
 
-    with pytest.raises(OmadaUnsupportedApiError) as excinfo:
-        await _adapter(controller).deauthorize_guest(
-            make_creds(ControllerAuthMode.LEGACY), "Default", "AA-BB-CC-DD-EE-FF"
+    These two tests used to say the opposite -- that deauthorization was
+    impossible in both modes, on CR-001's claim that TP-Link publishes no
+    endpoint for it. TP-Link publishes none; the controller has one, and
+    it rides this same operator session. The full behaviour lives in
+    ``test_omada_deauth.py``; what is pinned *here* is the property that
+    matters next to ``authorize_guest``: any credential that can put a
+    guest on the network can also take them off it.
+    """
+    controller = FakeOmadaController()
+    # No rows: "already not authorized" is the end state asked for, so this
+    # is a success, and it exercises the credential check rather than the
+    # table walk.
+    result = await _adapter(controller).deauthorize_guest(
+        make_creds(ControllerAuthMode.LEGACY), "Default", "AA-BB-CC-DD-EE-FF"
+    )
+
+    assert result is True
+
+
+async def test_open_api_credentials_alone_can_neither_authorize_nor_deauthorize():
+    """The one refusal left, and it refuses in both directions.
+
+    Asserted as a pair deliberately: a build where only one of these
+    refused would be a build that could strand a guest on a network it
+    could not remove them from.
+    """
+    controller = FakeOmadaController()
+    creds = make_creds(ControllerAuthMode.OPENAPI)
+
+    with pytest.raises(OmadaUnsupportedApiError):
+        await _adapter(controller).authorize_guest(
+            creds, EAP_CTX, duration_seconds=3600
         )
-
-    assert excinfo.value.code == "OMADA_API_UNSUPPORTED"
-    assert "expires" in str(excinfo.value).lower()
-    # Crucially: it never sent a write to the controller.
-    assert controller.requests == []
-
-
-async def test_deauthorize_is_unsupported_in_openapi_mode_too():
-    controller = FakeOmadaController()
     with pytest.raises(OmadaUnsupportedApiError):
         await _adapter(controller).deauthorize_guest(
-            make_creds(ControllerAuthMode.OPENAPI), "Default", "AA-BB-CC-DD-EE-FF"
+            creds, "Default", "AA-BB-CC-DD-EE-FF"
         )
+
     assert controller.requests == []

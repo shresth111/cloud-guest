@@ -57,6 +57,7 @@ from app.domains.network_integration.constants import (
     IntegrationEventStatus,
     IntegrationEventType,
     IntegrationStatus,
+    NetworkIntegrationAuditAction,
     NetworkProviderKind,
     SyncStatus,
 )
@@ -70,12 +71,16 @@ from app.domains.network_integration.exceptions import (
     CrossOrganizationNetworkIntegrationAccessError,
     GuestSessionNotActiveError,
     NetworkIntegrationDeauthorizationUnsupportedError,
+    NetworkIntegrationDisabledError,
     NetworkIntegrationFleetDeviceUnavailableError,
     NetworkIntegrationInventoryRequiresOpenApiError,
     NetworkIntegrationNotFoundError,
     NetworkIntegrationOrganizationRequiredError,
+    NetworkIntegrationSiteNotSelectedError,
     NetworkIntegrationUrlRejectedError,
     ProviderAuthFailedError,
+    ProviderConnectionFailedError,
+    ProviderError,
     ProviderSessionExpiredError,
     ProviderTimeoutError,
     ProviderUnsupportedApiError,
@@ -544,6 +549,29 @@ class FakeGuestSessionLookup:
 
 
 @dataclass
+class FakeGuestSessionTerminator:
+    """``GuestService.disconnect_session``, and nothing else.
+
+    Records the keyword arguments rather than a bare call count, because
+    the interesting assertions are *what* was passed: the actor (so the
+    guest domain audits it as admin-initiated) and the requesting
+    organization (so the guest domain applies its own tenant scoping
+    instead of trusting ours).
+    """
+
+    calls: list[dict] = field(default_factory=list)
+    #: Set to model a session that is already over -- the guest domain's
+    #: status graph has no same-status no-op, by design.
+    raises: Exception | None = None
+
+    async def disconnect_session(self, **fields: object) -> object:
+        self.calls.append(dict(fields))
+        if self.raises is not None:
+            raise self.raises
+        return object()
+
+
+@dataclass
 class FakeRouter:
     """The shape `RouterService.create_router` returns, and nothing more."""
 
@@ -623,6 +651,7 @@ def _service(
     audit: FakeAuditWriter | None = None,
     guest_lookup: FakeGuestSessionLookup | None = None,
     fleet_provisioner: FakeFleetDeviceProvisioner | None = None,
+    guest_terminator: FakeGuestSessionTerminator | None = None,
     caller_location_scope=None,
 ) -> NetworkIntegrationService:
     fake_provider = provider or FakeProvider()
@@ -630,6 +659,7 @@ def _service(
         repository or FakeRepository(),
         audit_writer=audit or FakeAuditWriter(),
         guest_session_lookup=guest_lookup,
+        guest_session_terminator=guest_terminator,
         fleet_device_provisioner=fleet_provisioner,
         provider_resolver=lambda _kind: fake_provider,
         # Without this every service-level test does a REAL DNS lookup of
@@ -2388,16 +2418,245 @@ class TestPortalAuthorize:
 
 
 # ============================================================================
-# CR-001: deauthorization is unsupported, honestly
+# CR-006: the per-guest disconnect, which CR-001 said was impossible
 # ============================================================================
 
 
-class TestDeauthorizationIsUnsupported:
-    """Contract change CR-001. Omada publishes no deauthorization endpoint.
+class TestDisconnectGuest:
+    """The staff action that ends one guest's access now.
 
-    The assertion is that this platform *says so* rather than reporting a
-    success it did not achieve -- the exact failure
-    ``app.domains.guest_access.device_adapters`` was written to fix.
+    CR-001 said this could not be built, because TP-Link publishes no
+    client-deauthorization endpoint. TP-Link publishes none; the
+    controller has one anyway. These tests pin what the action claims --
+    the whole risk here is claiming more than was achieved, which is the
+    failure ``app.domains.guest_access.device_adapters`` exists to record.
+    """
+
+    @staticmethod
+    async def _seeded(repo, integration, org, location, *, mac="AA:BB:CC:DD:EE:FF"):
+        session_id = uuid.uuid4()
+        await repo.create_authorization(
+            integration_id=integration.id,
+            organization_id=org,
+            location_id=location,
+            guest_session_id=session_id,
+            client_mac=mac,
+            status=AuthorizationStatus.AUTHORIZED.value,
+            authorized_at=_now(),
+        )
+        return session_id
+
+    async def test_it_ends_the_authorization_and_the_guest_session(self) -> None:
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        session_id = await self._seeded(repo, integration, org, location)
+        provider = FakeProvider()
+        terminator = FakeGuestSessionTerminator()
+        actor = uuid.uuid4()
+        service = _service(repo, provider=provider, guest_terminator=terminator)
+
+        outcome = await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=actor,
+            requesting_organization_id=org,
+            reason="abuse",
+        )
+
+        assert outcome.disconnected is True
+        assert outcome.had_active_authorization is True
+        assert outcome.guest_session_ended is True
+        assert "deauthorize_guest" in provider.calls
+        row = repo.authorizations[0]
+        assert row.status == AuthorizationStatus.DEAUTHORIZED.value
+        assert row.deauthorized_at is not None
+        assert terminator.calls[0]["session_id"] == session_id
+        # Passed through so the guest domain applies its own scoping rather
+        # than trusting this one's, and so it audits as admin-initiated.
+        assert terminator.calls[0]["requesting_organization_id"] == org
+        assert terminator.calls[0]["actor_user_id"] == actor
+
+    async def test_the_controller_is_asked_before_anything_is_written(self) -> None:
+        """A controller failure must leave no trace claiming otherwise.
+
+        The reverse order is the falsehood this domain keeps guarding
+        against: a row reading "ended" over a device still forwarding
+        traffic.
+        """
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        await self._seeded(repo, integration, org, location)
+        provider = FakeProvider(
+            raise_on={"deauthorize_guest": ProviderConnectionFailedError()}
+        )
+        terminator = FakeGuestSessionTerminator()
+        service = _service(repo, provider=provider, guest_terminator=terminator)
+
+        with pytest.raises(ProviderError):
+            await service.disconnect_guest(
+                integration.id,
+                client_mac="AA-BB-CC-DD-EE-FF",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+            )
+
+        assert repo.authorizations[0].status == AuthorizationStatus.AUTHORIZED.value
+        assert repo.authorizations[0].deauthorized_at is None
+        assert terminator.calls == []
+
+    async def test_a_guest_who_was_already_off_is_a_success_not_an_error(self) -> None:
+        """Idempotent by design: a second click, an expired grant and a
+        guest an operator already removed all mean the same end state."""
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        service = _service(repo, guest_terminator=FakeGuestSessionTerminator())
+
+        outcome = await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        assert outcome.disconnected is True
+        # ...and says plainly that this call is not what ended it.
+        assert outcome.had_active_authorization is False
+        assert outcome.guest_session_ended is False
+
+    async def test_an_already_ended_session_does_not_fail_the_disconnect(self) -> None:
+        """The controller half has already succeeded by then. Turning a
+        completed disconnect into a 4xx would just make the operator click
+        again."""
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        await self._seeded(repo, integration, org, location)
+        terminator = FakeGuestSessionTerminator(
+            raises=NetworkIntegrationDisabledError()
+        )
+        service = _service(repo, guest_terminator=terminator)
+
+        outcome = await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        assert outcome.disconnected is True
+        assert outcome.guest_session_ended is False
+        assert repo.authorizations[0].deauthorized_at is not None
+
+    async def test_it_is_tenant_scoped_server_side(self) -> None:
+        """Through ``_load_owned_integration`` like every other by-id
+        operation -- the caller's organization is never read from the body."""
+        owner, intruder = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=owner))
+        provider = FakeProvider()
+        service = _service(repo, provider=provider)
+
+        with pytest.raises(CrossOrganizationNetworkIntegrationAccessError):
+            await service.disconnect_guest(
+                integration.id,
+                client_mac="AA-BB-CC-DD-EE-FF",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=intruder,
+            )
+
+        assert provider.calls == []
+
+    async def test_an_unmapped_integration_refuses_before_calling_out(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(
+            _integration(organization_id=org, external_site_id=None)
+        )
+        provider = FakeProvider()
+        service = _service(repo, provider=provider)
+
+        with pytest.raises(NetworkIntegrationSiteNotSelectedError):
+            await service.disconnect_guest(
+                integration.id,
+                client_mac="AA-BB-CC-DD-EE-FF",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+            )
+        assert provider.calls == []
+
+    async def test_it_writes_an_audit_entry_of_its_own_action(self) -> None:
+        """Its own action, not the integration-level DISCONNECTED. An
+        auditor asking "who kicked this guest off" must not have to
+        disambiguate it from "who unplugged this controller"."""
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        await self._seeded(repo, integration, org, location)
+        audit = FakeAuditWriter()
+        service = _service(
+            repo, audit=audit, guest_terminator=FakeGuestSessionTerminator()
+        )
+
+        await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        actions = [e["action"] for e in audit.entries]
+        assert NetworkIntegrationAuditAction.GUEST_DISCONNECTED.value in actions
+        assert NetworkIntegrationAuditAction.DISCONNECTED.value not in actions
+
+    async def test_it_records_a_portal_deauthorize_event(self) -> None:
+        org, location = uuid.uuid4(), uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org, location_id=location))
+        await self._seeded(repo, integration, org, location)
+        service = _service(repo, guest_terminator=FakeGuestSessionTerminator())
+
+        await service.disconnect_guest(
+            integration.id,
+            client_mac="AA-BB-CC-DD-EE-FF",
+            actor_user_id=uuid.uuid4(),
+            requesting_organization_id=org,
+        )
+
+        events = [
+            e
+            for e in repo.events
+            if e.event_type == IntegrationEventType.PORTAL_DEAUTHORIZE.value
+        ]
+        assert len(events) == 1
+        assert events[0].status == IntegrationEventStatus.OK.value
+
+    async def test_a_malformed_mac_is_rejected_before_the_controller(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        provider = FakeProvider()
+        service = _service(repo, provider=provider)
+
+        with pytest.raises(NetworkIntegrationUrlRejectedError):
+            await service.disconnect_guest(
+                integration.id,
+                client_mac="not-a-mac",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+            )
+        assert provider.calls == []
+
+
+class TestDeauthorizationRefusalIsNarrowNow:
+    """What is left of CR-001, and it is one configuration.
+
+    ``OMADA_API_UNSUPPORTED`` no longer means "Omada cannot do this". It
+    means the integration stores no hotspot operator credentials, which is
+    the same gap that makes ``authorize_guest`` refuse -- so an
+    integration that cannot disconnect a guest never connected one.
     """
 
     async def test_it_surfaces_api_unsupported_rather_than_faking_success(
@@ -2422,12 +2681,37 @@ class TestDeauthorizationIsUnsupported:
         assert caught.value.code is ErrorCode.API_UNSUPPORTED
         assert caught.value.status_code == 501
 
-    async def test_the_message_does_not_claim_the_device_was_disconnected(
+    async def test_the_staff_route_surfaces_it_too(self) -> None:
+        org = uuid.uuid4()
+        repo = FakeRepository()
+        integration = repo.add(_integration(organization_id=org))
+        provider = FakeProvider(
+            raise_on={"deauthorize_guest": ProviderUnsupportedApiError()}
+        )
+        terminator = FakeGuestSessionTerminator()
+        service = _service(repo, provider=provider, guest_terminator=terminator)
+
+        with pytest.raises(NetworkIntegrationDeauthorizationUnsupportedError):
+            await service.disconnect_guest(
+                integration.id,
+                client_mac="AA-BB-CC-DD-EE-FF",
+                actor_user_id=uuid.uuid4(),
+                requesting_organization_id=org,
+            )
+        # And the guest session is NOT quietly ended instead, which would
+        # report diligence for an action that touched nothing.
+        assert terminator.calls == []
+
+    async def test_the_message_names_the_missing_credential_not_the_vendor(
         self,
     ) -> None:
+        """The old copy said Omada could not do this at all. It can; this
+        integration cannot ask it."""
         error = NetworkIntegrationDeauthorizationUnsupportedError()
-        assert "not disconnected" in error.message
-        assert "cannot be ended on demand" in error.message
+        assert "operator" in error.message.lower()
+        assert "nothing was changed on the network" in error.message.lower()
+        # ...and it must not resurrect the claim it replaced.
+        assert "cannot be ended on demand" not in error.message
 
     async def test_nothing_is_recorded_as_deauthorized(self) -> None:
         """Recording a deauthorization this platform did not achieve would
@@ -2462,13 +2746,15 @@ class TestDeauthorizationIsUnsupported:
         )
         assert repo.authorizations[0].deauthorized_at is None
 
-    def test_the_session_duration_ceiling_reflects_the_missing_revocation(
+    def test_the_session_duration_ceiling_is_unchanged_but_no_longer_load_bearing(
         self,
     ) -> None:
-        """With no deauthorization, the duration is the ONLY revocation
-        mechanism, so the ceiling is a security control. 24 hours is the
-        longest window in which "wait for it to expire" is a usable answer
-        to "this guest is abusing the WiFi"."""
+        """The ceiling was justified entirely on revocation being
+        impossible. It is not impossible, and the value has deliberately
+        not moved with the justification -- raising it is a product
+        decision. This test pins the value; ``constants.py`` carries the
+        corrected reasoning.
+        """
         assert MAX_SESSION_DURATION_SECONDS == 24 * 3600
 
 

@@ -356,41 +356,55 @@ class NetworkIntegrationInventoryRequiresOpenApiError(NetworkIntegrationError):
 
 
 class NetworkIntegrationDeauthorizationUnsupportedError(NetworkIntegrationError):
-    """Something asked this platform to revoke a guest's controller
-    authorization. Omada cannot.
+    """The provider declined to end one guest's authorization early.
 
-    Contract change CR-001. TP-Link publishes no client-deauthorization
-    endpoint in any generation of the Omada API. Open API's
-    ``clients/{mac}/block`` exists but was deliberately not repurposed: a
-    blocklist is materially more punitive and longer-lived than ending a
-    portal session, and it keys on a MAC that phones rotate per-SSID --
-    the same reasoning ``app.domains.guest_access.device_adapters``
-    records for rejecting ``/ip hotspot ip-binding type=blocked`` as a
-    stand-in for ending a session (its "mechanism 3").
+    ## What this used to mean, and no longer does
 
-    So a guest's *network* access ends when the authorization duration
-    expires, and by no other means. See
-    ``constants.MAX_SESSION_DURATION_SECONDS``, whose 24-hour ceiling
-    exists because of this and not for tidiness.
+    This used to be unconditional for Omada, on CR-001's claim that
+    TP-Link publishes no client-deauthorization endpoint in any generation
+    of the Omada API. TP-Link indeed publishes none -- and the controller
+    has one regardless, in the Hotspot Manager API tree, reachable with
+    the very operator session the portal authorization already opens. It
+    is implemented (``omada.deauth``) and observed working on real
+    hardware. A guest's network access therefore no longer ends only when
+    the authorization duration expires.
 
-    **Raising is the point.** The alternative -- returning success, or
-    terminating only this platform's own ``GuestSession`` row and
-    reporting "disconnected" -- is exactly the lie that domain was written
-    to fix: a row saying "ended" while the device is still forwarding
-    traffic. Ending the ``GuestSession`` remains correct and remains
-    required (without it the next re-authorization finds an ACTIVE session
-    and re-admits the guest); it simply must not be described as kicking
-    the client off the network, because it isn't.
+    ## What it means now
+
+    One thing: the integration has no credential that can open a hotspot
+    session -- Open API client credentials and nothing else. Those can
+    read the controller's inventory and cannot end an authorization.
+
+    The useful property of that being the *only* remaining case is that it
+    is self-limiting: the same missing credential also makes
+    ``authorize_guest`` refuse, so an integration that cannot disconnect a
+    guest was never able to connect one either. There is no configuration
+    in which this platform puts a guest on a network it cannot take them
+    off.
+
+    ## Why this raises instead of returning success
+
+    Unchanged, and still the point. The alternative -- reporting 200, or
+    ending only this platform's own ``GuestSession`` row and calling that
+    "disconnected" -- is the lie
+    ``app.domains.guest_access.device_adapters`` was written to fix: a row
+    reading "ended" while the device is still forwarding traffic. Ending
+    the ``GuestSession`` is a separate, real, and still-required act
+    (without it the next portal hit finds an ACTIVE session and re-admits
+    the guest), and it is available on its own route; it simply must not
+    be described as kicking the client off the network, because it isn't.
     """
 
     def __init__(self) -> None:
         super().__init__(
-            "This controller's API provides no way to revoke a guest "
-            "authorization once granted, so the guest's network access "
-            "cannot be ended on demand -- it ends when the authorization "
-            "expires. The guest session has been recorded as ended on this "
-            "platform, which prevents re-authorization, but the device is "
-            "not disconnected from the network.",
+            "This integration has no hotspot operator credentials, so a "
+            "guest's access cannot be ended on the controller -- Open API "
+            "credentials can read the controller but cannot end an "
+            "authorization. Nothing was changed on the network. Add an "
+            "operator account to this integration, or end the guest's "
+            "session on this platform instead, which prevents them "
+            "re-authorizing but does not disconnect the device they are "
+            "already using.",
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             code=ErrorCode.API_UNSUPPORTED,
         )
