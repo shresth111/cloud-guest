@@ -2,5 +2,8 @@
 pytest==8.3.4
 pytest-asyncio==0.25.0
 pytest-cov==6.0.0
+# Parallel test execution. The suite is ~5,130 in-memory-fake tests with no
+# shared database, and runs clean under `-n auto` -- measured, not assumed.
+pytest-xdist==3.6.1
 ruff==0.8.4
 

@@ -84,8 +84,24 @@ jobs:
           print("one head, as required")
           EOF
 
+      # `-n auto`, and no coverage. Both halves are measured, not guessed:
+      #
+      #   serial + coverage (what this was)   25:15   <- the 2026-09-10 deploy
+      #   -n auto + coverage                1:15:40   31% CPU
+      #   -n auto, no coverage                 4:20   370% CPU
+      #
+      # Coverage under xdist is not merely slower than parallel, it is three
+      # times slower than SERIAL -- the workers contend on coverage data
+      # collection and the run drops to ~31% CPU. And nothing consumes the
+      # number: there is no threshold, no upload, no artifact, only a line in
+      # a log nobody reads. It was pure cost on the path that blocks deploys.
+      #
+      # `--junitxml` stays: the ratchet below parses it.
+      #
+      # If coverage is wanted again it belongs in its own scheduled job, where
+      # taking an hour costs nobody a deploy.
       - name: Pytest
-        run: pytest --cov=app --cov-report=term-missing --junitxml=junit.xml
+        run: pytest -n auto --junitxml=junit.xml
 
       # The suite has always gone green on every PR, which is exactly why
       # nobody noticed a branch drop from 2,924 collected tests to 2,868 --
@@ -97,7 +113,13 @@ jobs:
       # target -- a floor that drifts down with the suite protects nothing.
       - name: Assert the suite did not shrink
         env:
-          MIN_TESTS: "2900"
+          # Raised from 2900 on 2026-09-11. The suite had grown to 5,130
+          # while this floor stayed where it was set, so it would have
+          # passed a branch that silently lost 2,200 tests -- precisely the
+          # green-but-smaller failure described above, with the guard in
+          # place and asleep. Kept just below the real count so a
+          # legitimate small removal does not fail the build.
+          MIN_TESTS: "5100"
         run: |
           total=$(python - <<'EOF'
           import xml.etree.ElementTree as ET
