@@ -458,6 +458,33 @@ class GuestSession(BaseModel):
     # value stand, exactly as it did before this platform sent one at all.
     idle_timeout_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     disconnect_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: Whether the RFC 5176 Disconnect-Request for this session was actually
+    #: acknowledged by the NAS -- i.e. whether the guest's device was really
+    #: cut off, as opposed to this platform merely recording that it was.
+    #:
+    #: Deliberately tri-state, and the NULL is the common case:
+    #:
+    #: * ``NULL``  -- no live disconnect was attempted. The session is still
+    #:   running, or it ended because the NAS told *us* it ended (an
+    #:   Accounting-Stop carrying ``Lost-Service``/``Session-Timeout``), which
+    #:   needs no packet from this side.
+    #: * ``True``  -- a Disconnect-ACK came back. The device is off.
+    #: * ``False`` -- a disconnect was attempted and did NOT land: no NAS
+    #:   registered, no address on record, a send error, a NAK, or (the case
+    #:   that motivated this column) no response at all.
+    #:
+    #: This exists because the status transition commits *before* the packet
+    #: is sent and ``issue_live_disconnect`` never raises -- a deliberate
+    #: design, so an unreachable NAS cannot stop an operator ending a session
+    #: in our own records. The cost of that design was that ``TERMINATED``
+    #: meant "we wrote TERMINATED", not "the guest was disconnected", and
+    #: nothing anywhere recorded the difference. Measured on production
+    #: 2026-09-11: the app server has no route to the tunnel range, so every
+    #: Disconnect-Request is dropped and every one of these would be
+    #: ``False``.
+    disconnect_enforced: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True, default=None
+    )
 
     __table_args__ = (
         Index("ix_guest_sessions_guest_id", "guest_id"),
