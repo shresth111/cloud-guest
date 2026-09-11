@@ -8,8 +8,9 @@ engineer answering "the WiFi didn't work". Not a developer document. The code an
 PR history are cited so every step can be checked, but you do not need to read them.
 
 **Status, stated plainly:** everything below comes from the merged code and the PRs
-that built it (cloud-guest #203 #204 #206 #209 #210 #211 #212 #214 #218 #221,
-cloudguest-foundation #251 #253 #254 #256 #257 #258 #259 #264). Several steps were
+that built it (cloud-guest #203 #204 #206 #209 #210 #211 #212 #214 #218 #221 #224
+#226, cloudguest-foundation #251 #253 #254 #256 #257 #258 #259 #264 #265, and the
+change that added a controller as a provisioning wizard's first device). Several steps were
 measured on real controllers. **No real guest device has yet been let onto the
 internet end to end through this integration.** Read §1 before promising a venue a
 go-live date.
@@ -37,61 +38,106 @@ call with a phone on the guest WiFi (§8).
 
 ---
 
-## 2. Known defects that change the procedure
+## 2. Known gaps that change the procedure
 
-These are not configuration mistakes. They are gaps in the product today, and the
-steps below work around them. Each should be fixed; until then, follow the workaround.
+The first version of this runbook listed six defects. Four are fixed; two remain.
 
-1. **"Open API" sign-in cannot let any guest online.** Guest authorization uses the
-   controller's hotspot operator login in *both* modes
-   (`omada/adapter.py`, `authorize_guest`), but the backend refuses to store an
-   operator name and password on an Open API integration
-   (`validators.validate_auth_mode_credentials`). An Open API integration therefore
-   answers every guest with `OMADA_API_UNSUPPORTED`. The dashboard nevertheless marks
-   Open API **Recommended** and says "guest sign-in is enforced".
-   **Workaround: always choose the hotspot operator account** (labelled
-   *Hotspot operator* in the admin wizard and *Hotspot operator account* on the
-   customer page). You lose the Access points and Connected clients screens; guest
-   sign-in is what matters.
-2. **An integration created from the customer page can never produce a portal link.**
-   Guests need a fleet record ("router" row) for their session. Only the platform
-   onboarding path creates one (`POST /network-integrations/platform/onboard`). The
-   customer page's **Add integration** leaves the `fleet_device_missing` gap, and the
-   page says "Guests cannot sign in at this venue yet".
-   **Workaround: onboard from the admin Routers page (§4)**, not from the customer page.
-3. **No dashboard form sets certificate trust or the Omada ID.** `tls_mode`,
-   `tls_pinned_sha256` and `controller_id` exist on the API only (#210, #212). A
-   self-hosted controller, which almost always has a self-signed certificate, and a
-   TP-Link cloud controller both need them.
-   **Workaround: platform staff set them through the API (§5).**
-4. **The activity tab does not show the failure record.** The diagnostics bundle
-   (§9) is stored on the event, but the dashboard's Activity table shows only the
-   code and message. **Workaround: read it through the API or the database (§9.1).**
-5. **The admin onboarding wizard sends you to a screen with no site picker.** Its
-   final step says "Go to Integrations", which opens the Network Integrations list in
-   the Master console. That list has no site or SSID fields.
-   **Workaround: finish the mapping on the venue's own Network Integrations page (§6).**
-6. The dashboard has no wording for `OMADA_TLS_UNTRUSTED` or `OMADA_TLS_PIN_MISMATCH`,
-   so it shows the backend's own sentence instead. That sentence is accurate; it just
-   points at a pinning control the dashboard does not have (see item 3).
+**Fixed -- no workaround needed any more:**
 
----
+* **An Open API integration could let nobody online.** Guest authorization uses the
+  controller's hotspot operator login in *both* modes, and the backend used to refuse
+  to store one on an Open API integration. It now stores the operator login alongside
+  the Open API app (cloud-guest #226), every Open API form asks for it
+  (cloudguest-foundation #265), and an Open API integration saved without one shows a
+  **Hotspot operator account** gap with an **Add operator account** button instead of
+  failing at the first guest.
+* **An integration created from the customer page never got a fleet record**, so it
+  sat on `fleet_device_missing` with no portal link. Mapping a venue now registers the
+  controller as that venue's device (#226). An integration created *before* that fix
+  shows a **Register controller** button once it has a venue; it is a one-click,
+  idempotent repair (`POST /api/v1/network-integrations/{id}/fleet-device`). Nothing
+  rewrites existing rows on its own -- a person presses the button.
+* **Certificate trust and the Omada ID had no form.** They now do: a **Certificate &
+  Omada ID** section in the connect wizard (it opens by itself when a test fails with a
+  certificate error, and offers the fingerprint the controller presented as **Use this
+  fingerprint**), a **Certificate & Omada ID** dialog on an existing integration, and
+  the same three fields in the admin onboarding form and the provisioning wizard (§4).
+* **No wording for the certificate errors.** `OMADA_TLS_UNTRUSTED` and
+  `OMADA_TLS_PIN_MISMATCH` now have operator-facing sentences (#265).
+
+**Still open:**
+
+1. **The Activity tab does not show the failure record.** The diagnostics bundle (§9)
+   is stored on the event, but the Activity table shows only the code and message.
+   **Workaround: read it through the API or the database (§9.2).**
+2. **The admin onboarding form's last step sends you to a screen with no site
+   picker.** Its "Go to Integrations" link opens the Master console's Network
+   Integrations list, which has no site or SSID fields.
+   **Workaround: finish the mapping on the venue's own Network Integrations page
+   (§6).**
 
 ## 3. Before you start
 
 | Requirement | Why |
 |---|---|
-| Controller firmware **5.0.15 or newer** | The oldest version the integration accepts (`MIN_SUPPORTED_VERSION` in `omada/adapter.py`). Open API features need 5.13, but see §2 item 1. |
+| Controller firmware **5.0.15 or newer** | The oldest version the integration accepts (`MIN_SUPPORTED_VERSION` in `omada/adapter.py`). The Open API app (device, client and site lists) needs 5.13 or newer; guest sign-in works on either mode as long as the operator account below is stored too. |
 | The controller is reachable **from the internet over HTTPS**, on port **443, 8043, 8088 or 8843** | Our servers make the calls, not the operator's browser. Other ports are refused (`DEFAULT_CONTROLLER_PORTS`). Addresses that resolve to private ranges are refused in every shared environment. Software controllers usually listen on 8043; hardware controllers (OC200/OC300) on 443. |
-| A **hotspot operator account** on the controller | This is the credential that authorizes guests. It is a separate account created in the controller's **Hotspot Manager**, not a controller admin login. TP-Link's doc 13080 says to use the operator's credentials "rather than the account and password for the controller account". |
+| A **hotspot operator account** on the controller, **whichever mode you choose** | This is the credential that authorizes guests -- in Open API mode too. It is a separate account created in the controller's **Hotspot Manager** (Operators), not a controller admin login. TP-Link's doc 13080 says to use the operator's credentials "rather than the account and password for the controller account". |
 | For a **self-hosted** controller: its certificate fingerprint (captured in §5) | Self-hosted controllers present a self-signed certificate (`CN=localhost`, issued by itself), which the default `strict` check refuses. |
 | For a **TP-Link cloud** controller: its **Omada ID** | One cloud address fronts every controller in a region, so the controller cannot be identified without it (#210). TP-Link shows it on the credentials screen and in the controller's web address. |
 | The venue already exists in Wyfy Guest | The controller is mapped to a venue (location). |
-| Platform staff access with the global `network_integrations.create` permission | Required by the onboarding endpoint. |
+| Platform staff access with the global `network_integrations.create` permission | Required by both onboarding paths in §4 -- the provisioning wizard asks for it on top of `locations.manage` when the first device is a controller. |
 
 ---
 
 ## 4. Onboard the controller (platform staff)
+
+There are three ways in. All three write the controller integration **and** the fleet
+record a guest session needs (`guest_sessions.router_id` is NOT NULL) together, and all
+three render the same controller form, validated by the same rules.
+
+| Situation | Use |
+|---|---|
+| A **new customer**, or a new location for an existing customer, whose venue has an Omada controller and **no MikroTik** | §4.1 -- the provisioning wizard |
+| The customer and venue **already exist** | §4.2 -- Routers → Add router |
+| The venue's own staff are connecting it themselves | The venue dashboard's **Network Integrations → Add integration**. Pick the venue in the wizard; mapping it registers the controller (§2). |
+
+**Never type an invented serial number or MAC** to get past a form that asks for one.
+The MAC is the join key for client lookups, MAC authorization and DHCP leases, and an
+invented one can collide with a real device. A software controller needs neither: leave
+both blank and a locally-administered identity is generated, which no manufacturer can
+burn into hardware and so cannot collide.
+
+### 4.1 New customer: the provisioning wizard
+
+Master console → **Customers** → **Add Customer** (or, for another location of an
+existing customer: select the customer → **New Location**).
+
+1. **Organization**, **Location** and **Owner**: as for any customer.
+2. **First device** → **Device type: TP-Link Omada controller**.
+   * **Controller name** and **Controller model**.
+   * **Serial number (hardware only)** and **MAC address (hardware only)**: from the
+     label of an OC200/OC300; leave **both** blank for a software controller. Enter
+     both or neither.
+   * **Controller address**, **Authentication**, the **Hotspot operator name** and
+     **password** (in both modes), and for Open API the **Client ID** and **Client
+     secret**.
+   * **Omada ID** for a TP-Link cloud controller; **Certificate check** → **Pinned
+     certificate** with its fingerprint for a self-hosted one (§5).
+3. **Plan**, **Features**, **Review** → **Provision location**.
+
+Everything is one transaction: if any part fails, nothing is saved -- no organization,
+no owner, no location, no controller. Mistakes the controller step can catch from the
+form alone (an address the security rules refuse, credentials that do not fit the
+mode, the platform's encryption key not being configured) are caught **before**
+anything is created. No RouterOS configuration template is applied and no WireGuard
+tunnel is allocated; a controller uses neither.
+
+The result screen says **One step left before guests can get online**: map the site and
+guest network (§6), then configure the controller (§7). The new owner can do §6 after
+signing in; platform staff reach the venue's page from **Customers → View dashboard**.
+
+### 4.2 Existing venue: Routers → Add router
 
 Admin dashboard → **Routers** → **Add router**.
 
@@ -99,29 +145,25 @@ Admin dashboard → **Routers** → **Add router**.
 2. **Controller** (identity & venue):
    * **Controller name**: anything recognisable, for example "Lobby Controller".
    * **Controller model**.
-   * **Serial number (hardware only)** and **MAC address (hardware only)**: for an
-     OC200/OC300, copy both from the label. For a software controller, leave **both**
-     blank and an identifier is generated. Enter both or neither.
+   * **Serial number (hardware only)** and **MAC address (hardware only)**: as in §4.1.
    * **Location**: the venue.
-3. **Connection** (address & credentials):
-   * **Controller address**: for example `https://controller.example.com:8043`. Scheme
-     and host only, no path.
-   * **Authentication**: choose **Hotspot operator** (see §2 item 1).
-   * **Operator name** / **Operator password**: the hotspot operator account.
+3. **Connection** (address & credentials): the same fields as §4.1 step 2.
 4. **Connect controller**.
 
 You should see "*name* is registered", along with "One step left before guests can
 get online." The integration now holds credentials but authorizes nobody until §6 is
-done.
+done. (Its "Go to Integrations" link is the dead end in §2, still open item 2.)
 
-If the controller is self-hosted or cloud-managed, do §5 **before** §6.
-
----
-
-## 5. Certificate trust and Omada ID (API only for now)
+## 5. Certificate trust and Omada ID
 
 Skip this section for a controller with a certificate from a public certificate
 authority that is reached directly.
+
+Every form that registers a controller now has these fields (§2): the provisioning
+wizard and Routers → Add router (**Omada ID** and **Certificate check**), the connect
+wizard's **Certificate & Omada ID** section, and the **Certificate & Omada ID** dialog
+on an existing integration, which has its own **Test connection** to capture the
+fingerprint. The API calls below remain for scripting and for support.
 
 ### 5.1 Choose a certificate mode
 
@@ -202,7 +244,9 @@ set it on 2026-09-11, `MAX_SESSION_DURATION_SECONDS`).
 
 Once §6 is done, the integration's detail card shows an **Omada portal configuration**
 panel. If it instead says "Guests cannot sign in at this venue yet", it names what is
-still missing: credentials, venue, site or fleet device (see §2 item 2).
+still missing: credentials, the operator account, venue, site or fleet device. A missing
+operator account has an **Add operator account** button and a missing fleet device a
+**Register controller** button (§2).
 
 Guests cannot sign in until **both** steps below are done.
 
@@ -353,7 +397,7 @@ Nothing in `precall` blocks a guest. These checks describe; they never refuse.
 | Code | Meaning | What to do |
 |---|---|---|
 | `OMADA_SITE_NOT_FOUND` (at authorize time) | The redirect's `site` did not match the stored site, so the controller was never called | Correct the site (§6) to the value on the redirect. |
-| `OMADA_API_UNSUPPORTED` | The integration has no hotspot operator credentials. That covers every Open API integration (§2 item 1). | Switch to a hotspot operator account. |
+| `OMADA_API_UNSUPPORTED` | The integration has no hotspot operator credentials -- for example an Open API integration saved before #226, or without the operator account. | **Add operator account** (or **Replace credentials**) and enter the hotspot operator login. |
 | `OMADA_AUTH_FAILED` | The controller rejected the stored operator login | **Replace credentials** on the integration. Check that the account is an operator, not an admin. |
 | `OMADA_CONNECTION_FAILED` / `OMADA_TIMEOUT` | We could not reach the controller | Power, address, port, and internet reachability. |
 | `OMADA_TLS_UNTRUSTED` / `OMADA_TLS_PIN_MISMATCH` | Certificate trust | §5. |
