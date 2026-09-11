@@ -94,9 +94,12 @@ from app.domains.rbac.location_scope import LocationScope, enforce_entity_locati
 
 from .constants import (
     AUDIT_ENTITY_TYPE,
+    PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
+    PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS,
     PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW,
     PORTAL_AUTHORIZE_RATE_LIMIT_KEY_TEMPLATE,
     PORTAL_AUTHORIZE_WINDOW_SECONDS,
+    PORTAL_REDIRECT_STALE_AFTER_SECONDS,
     REDACTED_CONTEXT_KEYS,
     REDACTION_PLACEHOLDER,
     SYNC_BACKOFF_CAP_MULTIPLIER,
@@ -149,9 +152,13 @@ from .providers.base import (
 )
 from .repository import NetworkIntegrationRepositoryProtocol
 from .validators import (
+    describe_mac_wire_format,
     describe_portal_readiness_gaps,
+    describe_redirect_shape,
     normalize_client_mac,
     portal_readiness_gaps,
+    portal_redirect_timestamp_age_seconds,
+    summarize_redirect_url,
     synthesize_fleet_identity,
     validate_auth_mode_credentials,
     validate_controller_url,
@@ -406,6 +413,126 @@ def redact_context(value: Any, *, _depth: int = 0) -> Any:
     if isinstance(value, list | tuple):
         return [redact_context(item, _depth=_depth + 1) for item in value]
     return value
+
+
+# ============================================================================
+# Portal authorization diagnostics
+# ============================================================================
+
+
+def build_portal_authorize_diagnostics(
+    *,
+    context: ProviderPortalContext,
+    normalized_client_mac: str,
+    integration: NetworkIntegration,
+    request_snapshot: dict[str, Any] | None = None,
+    provider_code: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Everything a support engineer needs to diff a failed authorization.
+
+    Two halves, deliberately kept apart in the output:
+
+    * ``request`` -- the exact body that went to the controller, field by
+      field, in the vendor's own spelling, produced by the same builder the
+      gateway uses to make the request (see
+      ``providers/omada.py::_authorize_snapshot``). ``None`` when the call
+      never got that far.
+    * ``redirect`` -- the parameters the controller put on the redirect that
+      sent the guest here in the first place.
+
+    Diffing those two is the entire feature. Today neither is recoverable
+    after the fact, so a venue reporting "the WiFi did not work at 19:40"
+    leaves nothing to look at but a timestamp and a code that means "no".
+
+    ``precall`` is the third part and the one that does not come from either
+    side: the checks this platform could have made from its own state before
+    calling. They exist because the controller's ``-41501`` is a catch-all
+    (see ``constants``'s own write-up) and every candidate cause that can be
+    decided here is one an engineer does not have to chase. They describe;
+    they never refuse -- see ``validators``'s note on why a guard built on
+    this would be a guess that costs real guests their internet.
+
+    ## What is not in here
+
+    No credential, cookie, token or controller response body -- none of those
+    is an input to any value above. No client IP: this platform's authorize
+    body has no ``clientIp`` field, so there is nothing to record, and this
+    function does not invent one. The redirect URL is reduced to its origin,
+    path and query-parameter *names* (``validators.summarize_redirect_url``
+    explains why the values are dropped).
+
+    The raw ``provider_code`` is passed through as an integer and is not
+    interpreted here. Which codes are specific and which are catch-alls is
+    vendor knowledge, and this module does not hold vendor knowledge -- the
+    gateway classifies, this records. Keeping the number is what preserves
+    the one discrimination the controller makes.
+    """
+    stored_site_id = integration.external_site_id or None
+    stored_site_name = integration.external_site_name or None
+    if stored_site_id is not None and context.site == stored_site_id:
+        site_matched_by = "id"
+    elif stored_site_name is not None and context.site == stored_site_name:
+        # The redirect named the site's *display name* and the check passed on
+        # that. Worth recording rather than flattening into "matched": the
+        # body then carries a name where the controller may want a key, which
+        # is one of the causes the catch-all covers.
+        site_matched_by = "name"
+    else:
+        site_matched_by = "none"
+
+    age_seconds = portal_redirect_timestamp_age_seconds(context.t, now=now)
+    wire_format = describe_mac_wire_format(context.client_mac)
+
+    return {
+        "request": {
+            # The vendor's spelling, on purpose. A "friendlier" rename here
+            # would mean an engineer comparing this against TP-Link's own
+            # documentation has to translate it back, which is the one job
+            # this record exists to remove.
+            "body": request_snapshot,
+            "fields": sorted(request_snapshot) if request_snapshot else [],
+        },
+        "redirect": {
+            "client_mac": context.client_mac,
+            "site": context.site,
+            "ap_mac": context.ap_mac,
+            "ssid_name": context.ssid_name,
+            "radio_id": context.radio_id,
+            "gateway_mac": context.gateway_mac,
+            "vid": context.vid,
+            "t": context.t,
+            "redirect_url": summarize_redirect_url(context.redirect_url),
+        },
+        "precall": {
+            "site_matched_by": site_matched_by,
+            "stored_site_id": stored_site_id,
+            "redirect_shape": describe_redirect_shape(
+                ap_mac=context.ap_mac,
+                ssid_name=context.ssid_name,
+                radio_id=context.radio_id,
+                gateway_mac=context.gateway_mac,
+                vid=context.vid,
+            ),
+            "client_mac_wire_format": wire_format,
+            "client_mac_normalized": normalized_client_mac,
+            # True means the controller was sent a different spelling from the
+            # one this platform stored and compares on. Harmless on every
+            # firmware anyone has tested, and exactly the kind of thing that
+            # stops being harmless without warning.
+            "client_mac_rewritten_for_wire": (
+                (context.client_mac or "").strip() != normalized_client_mac
+            ),
+            "t_age_seconds": age_seconds,
+            "t_stale": (
+                None
+                if age_seconds is None
+                else age_seconds > PORTAL_REDIRECT_STALE_AFTER_SECONDS
+            ),
+            "requested_duration_seconds": integration.session_duration_seconds,
+        },
+        "controller": {"provider_code": provider_code},
+    }
 
 
 # ============================================================================
@@ -2300,27 +2427,6 @@ class NetworkIntegrationService:
             )
         if not integration.external_site_id:
             raise NetworkIntegrationSiteNotSelectedError()
-        if site != integration.external_site_id and site != (
-            integration.external_site_name or ""
-        ):
-            # The controller that issued this redirect is not the one this
-            # integration is configured against. Recorded, then refused --
-            # authorizing against a site we were not configured for would
-            # be acting on an attacker's choice of target.
-            await self._record_event(
-                integration,
-                event_type=IntegrationEventType.PORTAL_AUTHORIZE,
-                status=IntegrationEventStatus.ERROR,
-                error_code=ErrorCode.SITE_NOT_FOUND.value,
-                message="Portal redirect named a site this integration is not "
-                "configured for",
-                context={"requested_site": site},
-            )
-            raise GuestSessionNotActiveError()
-
-        credentials = self._credentials_for(integration)
-        provider_impl = self._provider(integration.provider)
-        config = self._connection_config(integration, credentials)
         context = ProviderPortalContext(
             client_mac=client_mac,
             site=site,
@@ -2332,6 +2438,44 @@ class NetworkIntegrationService:
             t=t,
             redirect_url=redirect_url,
         )
+        if site != integration.external_site_id and site != (
+            integration.external_site_name or ""
+        ):
+            # The controller that issued this redirect is not the one this
+            # integration is configured against. Recorded, then refused --
+            # authorizing against a site we were not configured for would
+            # be acting on an attacker's choice of target.
+            #
+            # The full diagnostics go on this row too, even though no request
+            # was ever built. This is the one failure the controller would
+            # never have explained anyway -- it never saw the call -- and it
+            # is a leading candidate whenever a venue's guests stop working
+            # after somebody re-created a site on the controller. An operator
+            # looking at a failed join should find the same shape of record
+            # whichever side refused.
+            await self._record_event(
+                integration,
+                event_type=IntegrationEventType.PORTAL_AUTHORIZE,
+                status=IntegrationEventStatus.ERROR,
+                error_code=ErrorCode.SITE_NOT_FOUND.value,
+                message="Portal redirect named a site this integration is not "
+                "configured for",
+                context={
+                    "requested_site": site,
+                    PORTAL_AUTHORIZE_DIAGNOSTICS_KEY: (
+                        build_portal_authorize_diagnostics(
+                            context=context,
+                            normalized_client_mac=normalized_mac,
+                            integration=integration,
+                        )
+                    ),
+                },
+            )
+            raise GuestSessionNotActiveError()
+
+        credentials = self._credentials_for(integration)
+        provider_impl = self._provider(integration.provider)
+        config = self._connection_config(integration, credentials)
         try:
             result = await provider_impl.authorize_guest(
                 config,
@@ -2354,6 +2498,17 @@ class NetworkIntegrationService:
                 status=IntegrationEventStatus.ERROR,
                 error_code=error.code.value,
                 message=error.message,
+                context={
+                    PORTAL_AUTHORIZE_DIAGNOSTICS_KEY: (
+                        build_portal_authorize_diagnostics(
+                            context=context,
+                            normalized_client_mac=normalized_mac,
+                            integration=integration,
+                            request_snapshot=error.request_snapshot,
+                            provider_code=error.provider_code,
+                        )
+                    )
+                },
             )
             raise
 
@@ -2380,7 +2535,12 @@ class NetworkIntegrationService:
                 if result.authorized
                 else "Controller declined the authorization"
             ),
-            context={"ssid_name": ssid_name},
+            context=self._portal_authorize_event_context(
+                context=context,
+                normalized_client_mac=normalized_mac,
+                integration=integration,
+                result=result,
+            ),
         )
         return PortalAuthorizationOutcome(
             authorized=result.authorized,
@@ -2389,6 +2549,49 @@ class NetworkIntegrationService:
             # Echoed back from the request. This platform never fetches it.
             redirect_url=redirect_url,
         )
+
+    @staticmethod
+    def _portal_authorize_event_context(
+        *,
+        context: ProviderPortalContext,
+        normalized_client_mac: str,
+        integration: NetworkIntegration,
+        result: ProviderAuthorizationResult,
+    ) -> dict[str, Any]:
+        """The event context for a call the controller actually answered.
+
+        A declined authorization gets the full diagnostics; a successful one
+        gets what it always got and nothing more.
+
+        That asymmetry is the retention decision, not an oversight. The
+        bundle names a guest's device, and writing it on every success would
+        put one MAC per guest per join into
+        ``network_integration_events`` -- a table that holds no per-guest
+        identifier today and has no retention sweep -- in order to answer a
+        question nobody asks about a call that worked. Failures are the small
+        population anybody ever diffs, and confining the record to them
+        bounds the new data by the failure rate rather than by traffic. See
+        ``constants.PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS``, which is the
+        switch and is off.
+
+        ``result.authorized`` is False here only defensively: the provider
+        raises on every refusal the controller reports, so this branch is
+        reached by a gateway that returned a negative result instead of
+        raising. That is exactly the case where an engineer has least to go
+        on, which is why it is treated as a failure for recording purposes.
+        """
+        event_context: dict[str, Any] = {"ssid_name": context.ssid_name}
+        if result.authorized and not PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS:
+            return event_context
+        event_context[PORTAL_AUTHORIZE_DIAGNOSTICS_KEY] = (
+            build_portal_authorize_diagnostics(
+                context=context,
+                normalized_client_mac=normalized_client_mac,
+                integration=integration,
+                request_snapshot=result.request_snapshot,
+            )
+        )
+        return event_context
 
     async def disconnect_guest(
         self,

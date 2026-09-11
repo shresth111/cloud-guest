@@ -426,6 +426,40 @@ class ProviderError(NetworkIntegrationError):
     live in a module that imports a vendor SDK.
     """
 
+    #: The vendor's own raw error code for this failure, as an integer, or
+    #: ``None`` when the failure never reached the controller (a timeout, a
+    #: refused connection).
+    #:
+    #: A class attribute with an instance override rather than a constructor
+    #: argument, so that the ten subclasses below keep their one-argument
+    #: signatures and ``providers/omada.py`` stays the only module that knows
+    #: a vendor code exists. ``with_diagnostics`` is the setter.
+    #:
+    #: **Why an integer is safe to keep and a response body is not.** The
+    #: gateway's contract (§2) lets exactly one piece of the raw controller
+    #: response survive into an exception: this number. It cannot smuggle a
+    #: credential, and it is the only thing that distinguishes Omada's
+    #: ``-41500`` ("Invalid authentication type", a named field) from its
+    #: ``-41501`` ("Failed to authenticate", a catch-all covering a wrong MAC,
+    #: a stale timestamp, an unknown site, an AP that never saw the client and
+    #: a missing required field). ``ErrorCode`` cannot carry that distinction
+    #: -- both normalize to ``OMADA_AUTHORIZATION_FAILED`` -- so if this is
+    #: dropped at the seam, the one discrimination the controller offers is
+    #: gone for good.
+    provider_code: int | None = None
+
+    #: What we actually put on the wire, field by field, already free of
+    #: secrets. ``None`` for every call except a portal authorization, which
+    #: is the one place a support engineer needs to diff the request against
+    #: the redirect that produced it.
+    #:
+    #: Opaque to this module and to ``service.py``: the keys are the vendor's
+    #: spelling and only ``providers/omada.py`` puts them there. It is carried
+    #: on the exception rather than returned alongside it because the failing
+    #: call raises -- there is no return value to hang it on, and a support
+    #: engineer needs it precisely when the call failed.
+    request_snapshot: dict[str, object] | None = None
+
     def __init__(
         self,
         message: str,
@@ -434,6 +468,30 @@ class ProviderError(NetworkIntegrationError):
         status_code: int = status.HTTP_502_BAD_GATEWAY,
     ) -> None:
         super().__init__(message, status_code=status_code, code=code)
+
+    def with_diagnostics(
+        self,
+        *,
+        provider_code: int | None = None,
+        request_snapshot: dict[str, object] | None = None,
+    ) -> ProviderError:
+        """Attach vendor diagnostics to an already-constructed error.
+
+        Returns ``self`` so a raise site reads as one expression. Neither
+        value is ever put in ``data`` and neither reaches the API response:
+        they exist to be written to ``network_integration_events.context``,
+        which is a different audience (an operator diffing a failure) with a
+        different threat model (already org-scoped, already redacted on the
+        way in) from an unauthenticated caller receiving a 502.
+
+        Passing ``None`` leaves the existing value alone rather than clearing
+        it, so a partial attachment cannot erase a fuller one.
+        """
+        if provider_code is not None:
+            self.provider_code = provider_code
+        if request_snapshot is not None:
+            self.request_snapshot = request_snapshot
+        return self
 
 
 class ProviderAuthFailedError(ProviderError):

@@ -79,6 +79,7 @@ from .auth import (
 )
 from .errors import (
     OmadaAuthError,
+    OmadaAuthorizationError,
     OmadaConnectionError,
     OmadaInvalidControllerError,
     OmadaRateLimitedError,
@@ -550,6 +551,7 @@ class OmadaHttpClient:
         from .types import (
             OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND,
             OPENAPI_ERROR_OPERATION_UNSUPPORTED,
+            PORTAL_AUTHORIZATION_ERROR_CODES,
         )
 
         code = envelope.error_code
@@ -557,6 +559,21 @@ class OmadaHttpClient:
 
         if code in SESSION_EXPIRED_ERROR_CODES:
             return OmadaSessionExpiredError(provider_code=code)
+        if code in PORTAL_AUTHORIZATION_ERROR_CODES:
+            # The controller answered and refused. Without this branch both
+            # codes fell through to the generic ``OmadaError`` below, whose
+            # ``OMADA_ERROR`` is absent from the backend's code table and so
+            # became ``OMADA_CONNECTION_FAILED`` -- "could not reach the
+            # network controller" about a controller that had just replied.
+            # The raw integer still rides along in ``provider_code``, which is
+            # what keeps -41500 distinguishable from -41501.
+            return OmadaAuthorizationError(
+                f"{OmadaAuthorizationError.default_message} "
+                f"Controller said: {detail}"
+                if detail
+                else None,
+                provider_code=code,
+            )
         if code == OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND:
             return OmadaInvalidControllerError(
                 "The Omada controller does not recognise that controller ID. "

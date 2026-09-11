@@ -52,7 +52,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
     "NetworkProvider",
@@ -188,9 +188,23 @@ class ProviderPortalContext:
 
 @dataclass(frozen=True, slots=True)
 class ProviderAuthorizationResult:
+    """What the controller did with one authorization request.
+
+    ``request_snapshot`` is the exact body that went on the wire, field by
+    field, in the vendor's own spelling. It is on the *result* as well as on
+    ``exceptions.ProviderError`` because "the controller accepted a body we
+    did not intend to send" is a real outcome -- a successful authorization
+    against the wrong site still reads as success here -- and because a
+    caller that records it only on failure can never show an operator a
+    working request to compare a broken one against.
+
+    Opaque above this layer: ``service.py`` persists it without reading it.
+    """
+
     authorized: bool
     expires_at: datetime | None = None
     provider_code: str | None = None
+    request_snapshot: dict[str, Any] | None = None
 
 
 @runtime_checkable

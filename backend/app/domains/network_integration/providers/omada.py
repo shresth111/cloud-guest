@@ -248,15 +248,27 @@ def _translate(exc: Exception) -> ProviderError:
     """
     code = getattr(exc, "code", None)
     message = str(exc) or None
+    # The gateway's own raw vendor code, as an integer. Contract §2 makes this
+    # the single piece of the controller's response that is allowed to survive
+    # into an exception, precisely because an integer cannot smuggle a
+    # credential. Carried across the seam because the normalized ``ErrorCode``
+    # is deliberately coarser than the vendor's: Omada's -41500 and -41501 both
+    # normalize to OMADA_AUTHORIZATION_FAILED, and -41500 is the only fault the
+    # controller names. Dropping it here -- which is what happened until now --
+    # discards the one discrimination the controller makes.
+    raw = getattr(exc, "provider_code", None)
+    provider_code = raw if isinstance(raw, int) and not isinstance(raw, bool) else None
     if isinstance(code, str):
         error_class = PROVIDER_ERRORS_BY_CODE.get(code)
         if error_class is not None:
-            return error_class(message)
+            return error_class(message).with_diagnostics(provider_code=provider_code)
         logger.warning(
             "network_integration_unmapped_provider_error_code",
             extra={"provider_error_code": code},
         )
-    return ProviderConnectionFailedError(message)
+    return ProviderConnectionFailedError(message).with_diagnostics(
+        provider_code=provider_code
+    )
 
 
 def _is_gateway_error(exc: Exception) -> bool:
@@ -435,14 +447,23 @@ class OmadaProvider:
             t=context.t,
             redirect_url=context.redirect_url,
         )
-        result = await self._call(
-            config,
-            "authorize_guest",
+        snapshot = self._authorize_snapshot(
             gateway_context,
             duration_seconds=duration_seconds,
             down_kbps=down_kbps,
             up_kbps=up_kbps,
         )
+        try:
+            result = await self._call(
+                config,
+                "authorize_guest",
+                gateway_context,
+                duration_seconds=duration_seconds,
+                down_kbps=down_kbps,
+                up_kbps=up_kbps,
+            )
+        except ProviderError as error:
+            raise error.with_diagnostics(request_snapshot=snapshot) from None
         expires_at = getattr(result, "expires_at", None)
         if expires_at is None and getattr(result, "authorized", False):
             # INFERRED, unverified: whether the gateway populates
@@ -457,7 +478,74 @@ class OmadaProvider:
             authorized=bool(getattr(result, "authorized", False)),
             expires_at=expires_at,
             provider_code=getattr(result, "provider_code", None),
+            request_snapshot=snapshot,
         )
+
+    @staticmethod
+    def _authorize_snapshot(
+        gateway_context: Any,
+        *,
+        duration_seconds: int,
+        down_kbps: int | None,
+        up_kbps: int | None,
+    ) -> dict[str, Any] | None:
+        """The exact ``extPortal/auth`` body, for the diagnostics record.
+
+        ## Why this calls the gateway's own builder instead of describing it
+
+        ``build_authorize_body`` is the pure function the gateway itself calls
+        one layer down to produce the request it sends -- kept pure, by that
+        module's own docstring, exactly so the wire body can be obtained
+        without HTTP in the way. Calling it here means the snapshot is the
+        body, not a second transcription of it that drifts the first time
+        somebody adds a field. A hand-written ``{"clientMac": ...}`` dict in
+        this module would be a *claim* about what was sent, and a claim is
+        worth nothing to an engineer diffing a failure: the whole point is to
+        find the field we got wrong, which is the field a transcription would
+        also get wrong.
+
+        It is called before the request rather than captured from it because
+        the gateway owns the HTTP client and this module cannot see the
+        request object at all -- and because the failure mode worth
+        diagnosing is a *malformed body*, which is fully determined before a
+        socket is opened.
+
+        ## Why a failure here is swallowed
+
+        Returning ``None`` rather than raising. The builder rejects a
+        non-positive duration, and if it ever rejects anything else, this is a
+        diagnostics path: it must not be able to turn a guest's working
+        authorization into a failure. ``_call`` issues the same build one
+        layer down and will raise the real, translated error a moment later,
+        so nothing is hidden -- only reordered.
+
+        ## Secrets
+
+        None can appear. The body is built only from the redirect's own query
+        parameters plus the duration this platform chose; no credential, token
+        or cookie is an input to it. ``service.py`` still passes the whole
+        context through ``redact_context`` before it is persisted, because a
+        second control that costs nothing is worth having on the one column
+        the customer dashboard renders.
+        """
+        try:
+            from wyfy_device_gateway.omada.portal import (  # noqa: PLC0415
+                build_authorize_body,
+            )
+
+            body = build_authorize_body(
+                gateway_context,
+                duration_seconds=duration_seconds,
+                down_kbps=down_kbps,
+                up_kbps=up_kbps,
+            )
+        except Exception:  # noqa: BLE001 -- diagnostics must never fail a call
+            logger.warning(
+                "network_integration_authorize_snapshot_unavailable",
+                exc_info=True,
+            )
+            return None
+        return dict(body)
 
     async def deauthorize_guest(
         self, config: ProviderConnectionConfig, site_id: str, client_mac: str

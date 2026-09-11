@@ -78,6 +78,9 @@ __all__ = [
     "ROUTER_VENDOR_BY_PROVIDER",
     "PORTAL_AUTHORIZE_RATE_LIMIT_KEY_TEMPLATE",
     "PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW",
+    "PORTAL_AUTHORIZE_DIAGNOSTICS_KEY",
+    "PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS",
+    "PORTAL_REDIRECT_STALE_AFTER_SECONDS",
     "PORTAL_AUTHORIZE_WINDOW_SECONDS",
     "REDACTED_CONTEXT_KEYS",
     "REDACTION_PLACEHOLDER",
@@ -503,6 +506,78 @@ PORTAL_AUTHORIZE_RATE_LIMIT_KEY_TEMPLATE = (
 # pattern and still bounds replay.
 PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW = 10
 PORTAL_AUTHORIZE_WINDOW_SECONDS = 300
+
+
+# ============================================================================
+# Portal authorization diagnostics
+# ============================================================================
+#
+# ## The problem this exists for
+#
+# Probed against a live Omada 6.3.0.100 cloud controller on 2026-09-11, one
+# body field varied at a time:
+#
+#     authType omitted        -> -41500  "Invalid authentication type."
+#     clientIp omitted        -> -41501  "Failed to authenticate."
+#     clientMac omitted       -> -41501  "Failed to authenticate."
+#     apMac/ssidName/radioId  -> -41501  "Failed to authenticate."
+#     time omitted            -> -41501  "Failed to authenticate."
+#     clientMac malformed     -> -41501  "Failed to authenticate."
+#
+# The endpoint validates its parameters -- `authType` has a code of its own --
+# and then collapses every other fault into one opaque code, including a
+# missing `clientMac`, which is beyond argument required. So when a guest in a
+# real venue cannot get online, the controller hands this platform a single
+# code covering a wrong MAC, a stale timestamp, the wrong site, an AP that
+# never saw the client, a missing field, and a `clientIp` it disliked.
+#
+# **No operator-facing error can be more specific than that.** The mitigation
+# therefore cannot be a better message; it has to be a better *record*. What
+# is stored on a failure is the exact body that went on the wire, the redirect
+# parameters that produced it, the raw vendor code, and the handful of checks
+# this platform could have made from its own state before calling -- so a
+# support engineer can diff the two sides afterwards, without asking a guest
+# who has long since left the building to reproduce it.
+#
+# ## Why this is a key in the existing event context and not a new table
+#
+# `network_integration_events.context` is already a JSONB column, already
+# written through `redact_context` on the way in, already scoped per
+# organization, and already rendered by `GET /{id}/events`. A new log sink
+# would need a migration, a retention policy, an endpoint and a permission of
+# its own to reach parity with a column that has all four today. Nesting under
+# one key keeps the bundle identifiable in a query
+# (`context ? 'authorize_diagnostics'`) without colonising the top level of a
+# context other event types share.
+PORTAL_AUTHORIZE_DIAGNOSTICS_KEY = "authorize_diagnostics"
+
+# Written on failure only.
+#
+# This is the retention control, and it is deliberately the *only* one. The
+# bundle names a guest's device, so recording it for every successful
+# authorization would put a MAC per guest per join into a table that has never
+# held a per-guest identifier, forever, to answer a question nobody asks about
+# a call that worked. Failures are the small minority and the only population
+# anybody diffs. A successful authorization still records what it always did.
+#
+# The MAC itself is not a new disclosure: the identical address for the
+# identical attempt is already persisted unmasked and indefinitely in
+# `network_integration_authorizations.client_mac`, in the same organization's
+# scope, and `app.common.masking.mask_mac` is a documented no-op because
+# venues need the real address to identify a device for support. What changes
+# is only which table it is in. No client IP is recorded because none is sent:
+# the authorize body this platform builds has no `clientIp` field at all.
+PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS = False
+
+# How old a redirect's `t` has to be before the record calls it stale.
+#
+# Not a validation threshold -- nothing refuses a redirect for exceeding it,
+# and a request that does is still authorized. It exists so that a human
+# reading a failure is not left to eyeball an epoch. Fifteen minutes is longer
+# than any guest spends between the redirect landing and finishing sign-in,
+# and short enough that a page reopened from a browser's history -- one of the
+# few `-41501` causes that is decidable from our side -- is visibly flagged.
+PORTAL_REDIRECT_STALE_AFTER_SECONDS = 900
 
 
 # ============================================================================

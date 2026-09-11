@@ -138,6 +138,12 @@ class FakeOmadaController:
         self.expire_sessions = 0
         self.session_expiry_code = -44112
 
+        #: Non-zero to make ``extPortal/auth`` refuse with that errorCode.
+        #: The real controller answers -41500 for a bad ``authType`` and
+        #: -41501 for literally everything else it dislikes.
+        self.authorize_error_code = 0
+        self.authorize_error_msg: str | None = None
+
         self.fail_times = 0
         self.failure_status: int | None = 500
         self.failure_exc: Exception | None = None
@@ -269,6 +275,14 @@ class FakeOmadaController:
                 200,
                 json=envelope(
                     error_code=self.session_expiry_code, msg="Session timeout."
+                ),
+            )
+        if self.authorize_error_code:
+            return httpx.Response(
+                200,
+                json=envelope(
+                    error_code=self.authorize_error_code,
+                    msg=self.authorize_error_msg,
                 ),
             )
         return httpx.Response(200, json={"errorCode": 0})
