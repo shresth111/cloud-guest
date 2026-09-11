@@ -53,6 +53,7 @@ __all__ = [
     "NetworkIntegrationCredentialsRequiredError",
     "NetworkIntegrationDeauthorizationUnsupportedError",
     "NetworkIntegrationDisabledError",
+    "NetworkIntegrationEncryptionKeyNotConfiguredError",
     "NetworkIntegrationFleetDeviceUnavailableError",
     "NetworkIntegrationInventoryRequiresOpenApiError",
     "NetworkIntegrationError",
@@ -247,6 +248,31 @@ class NetworkIntegrationTlsPinRequiredError(NetworkIntegrationError):
             f"Certificate pinning rejected: {reason}",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             code=ErrorCode.TLS_PIN_REQUIRED,
+        )
+
+
+class NetworkIntegrationEncryptionKeyNotConfiguredError(NetworkIntegrationError):
+    """Refuses to store controller credentials under the public default key.
+
+    ``network_integration_encryption_key`` defaults to a value committed to
+    a public repository. Outside a developer machine, a ciphertext written
+    under it is plaintext to anyone who reads the column -- and these are
+    credentials to networks *customers* own. So a write is refused before
+    anything reaches the database, on every path that encrypts (create,
+    Master onboarding, rotate).
+
+    503, not 4xx: the request is fine and a retry will succeed the moment
+    the deployment sets a real key. The message does not name the env var;
+    that is in the CRITICAL log line, where the person who can fix it looks.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Controller credentials cannot be saved yet: credential encryption "
+            "is not configured on this server. Nothing was stored. Contact "
+            "the platform administrator.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code=ErrorCode.ENCRYPTION_KEY_NOT_CONFIGURED,
         )
 
 
