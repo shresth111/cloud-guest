@@ -44,6 +44,7 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -511,6 +512,19 @@ class FakeGuestSession:
     location_id: uuid.UUID
     status: str = "active"
     is_deleted: bool = False
+    # The device that authenticated. Defaulted to the MAC these tests
+    # authorize, so the existing cases keep asserting what they were written
+    # to assert -- and so the *mismatch* cases below have something to
+    # mismatch against. This field not existing on the fake is why the
+    # missing device binding went unnoticed: a session with no device
+    # modelled a guest who could authorize anything.
+    device_mac: str | None = "AA:BB:CC:DD:EE:FF"
+
+    @property
+    def device_id(self):  # noqa: ANN201
+        if not self.device_mac:
+            return None
+        return uuid.uuid5(uuid.NAMESPACE_OID, self.device_mac)
 
 
 @dataclass
@@ -519,6 +533,14 @@ class FakeGuestSessionLookup:
 
     async def get_session_by_id(self, session_id, *, include_deleted: bool = False):
         return self.sessions.get(session_id)
+
+    async def get_device_by_id(self, device_id):  # noqa: ANN001, ANN201
+        for session in self.sessions.values():
+            if session.device_id == device_id:
+                return SimpleNamespace(
+                    id=device_id, mac_address=session.device_mac
+                )
+        return None
 
 
 @dataclass
@@ -1650,6 +1672,147 @@ class TestSyntheticFleetIdentity:
         serial, mac = synthesize_fleet_identity(integration_id)
         assert integration_id.hex[:8] not in serial.replace("-", "").lower()
         assert integration_id.hex[:8] not in mac.replace(":", "").lower()
+
+
+class TestThePortalAuthorizeBindsTheDeviceToTheSession:
+    """The MAC being authorized must be the one that authenticated.
+
+    Every other check on this path -- ACTIVE session, matching organization,
+    matching location, integration resolved from the SESSION's venue -- is
+    satisfied by a guest who did everything honestly. None of them says
+    anything about *which device* is being let onto the network. Without the
+    binding, that guest completes OTP once and then puts a stranger's phone
+    on the venue's WiFi, and on a controller older than 5.13 there is no
+    deauthorization call to take it back off again.
+    """
+
+    @staticmethod
+    def _fixture(device_mac: str | None):
+        org, location = uuid.uuid4(), uuid.uuid4()
+        session_id = uuid.uuid4()
+        integration = _integration(
+            organization_id=org,
+            location_id=location,
+            status=IntegrationStatus.CONNECTED.value,
+            external_site_id="site-1",
+            credentials_encrypted=encrypt_credentials(
+                {"client_id": "cid", "client_secret": "sec"}
+            ),
+        )
+        repo = FakeRepository()
+        repo.add(integration)
+        lookup = FakeGuestSessionLookup(
+            {
+                session_id: FakeGuestSession(
+                    session_id, org, location, device_mac=device_mac
+                )
+            }
+        )
+        provider = FakeProvider()
+        service = _service(repo, provider=provider, guest_lookup=lookup)
+        return service, provider, session_id, org, location
+
+    async def test_a_stranger_s_device_is_refused(self) -> None:
+        """The whole point: an honest session, the right venue, someone
+        else's hardware."""
+        service, provider, session_id, org, location = self._fixture(
+            "AA:BB:CC:DD:EE:FF"
+        )
+        with pytest.raises(GuestSessionNotActiveError):
+            await service.authorize_portal_client(
+                session_id=session_id,
+                organization_id=org,
+                location_id=location,
+                client_mac="11:22:33:44:55:66",
+                site="site-1",
+                provider="omada",
+            )
+        assert "authorize_guest" not in provider.calls, (
+            "the controller was asked to authorize a device the session "
+            "never presented"
+        )
+
+    async def test_the_session_s_own_device_is_allowed(self) -> None:
+        service, provider, session_id, org, location = self._fixture(
+            "AA:BB:CC:DD:EE:FF"
+        )
+        result = await service.authorize_portal_client(
+            session_id=session_id,
+            organization_id=org,
+            location_id=location,
+            client_mac="AA:BB:CC:DD:EE:FF",
+            site="site-1",
+            provider="omada",
+        )
+        assert result.authorized is True
+
+    async def test_the_comparison_is_on_the_normalized_form(self) -> None:
+        """Omada's redirect uses dashes, its API replies sometimes use
+        colons. A binding that compared raw strings would refuse the
+        session's own device for a punctuation difference -- which would
+        read as "the portal is broken" rather than as a security control."""
+        service, _provider, session_id, org, location = self._fixture(
+            "AA:BB:CC:DD:EE:FF"
+        )
+        result = await service.authorize_portal_client(
+            session_id=session_id,
+            organization_id=org,
+            location_id=location,
+            client_mac="aa-bb-cc-dd-ee-ff",
+            site="site-1",
+            provider="omada",
+        )
+        assert result.authorized is True
+
+    async def test_a_session_with_no_device_is_refused(self) -> None:
+        """`GuestSession.device_id` is nullable, but on this path the MAC
+        always arrives on Omada's own redirect. No device means the binding
+        cannot be established, and an authorization that cannot be bound is
+        the one worth refusing."""
+        service, provider, session_id, org, location = self._fixture(None)
+        with pytest.raises(GuestSessionNotActiveError):
+            await service.authorize_portal_client(
+                session_id=session_id,
+                organization_id=org,
+                location_id=location,
+                client_mac="AA:BB:CC:DD:EE:FF",
+                site="site-1",
+                provider="omada",
+            )
+        assert "authorize_guest" not in provider.calls
+
+    async def test_the_refusal_is_indistinguishable_from_any_other(self) -> None:
+        """The caller holds no credentials. Telling a prober that the
+        session was fine and only the device was wrong hands them the half
+        to vary."""
+        service, _p, session_id, org, location = self._fixture("AA:BB:CC:DD:EE:FF")
+        wrong_device = None
+        try:
+            await service.authorize_portal_client(
+                session_id=session_id,
+                organization_id=org,
+                location_id=location,
+                client_mac="11:22:33:44:55:66",
+                site="site-1",
+                provider="omada",
+            )
+        except GuestSessionNotActiveError as exc:
+            wrong_device = str(exc)
+
+        no_session = None
+        try:
+            await service.authorize_portal_client(
+                session_id=uuid.uuid4(),
+                organization_id=org,
+                location_id=location,
+                client_mac="AA:BB:CC:DD:EE:FF",
+                site="site-1",
+                provider="omada",
+            )
+        except GuestSessionNotActiveError as exc:
+            no_session = str(exc)
+
+        assert wrong_device == no_session
 
 
 class TestCredentialsAreNeverReturned:
