@@ -75,6 +75,59 @@ class OmadaConnectionError(OmadaError):
     )
 
 
+class OmadaTlsTrustError(OmadaError):
+    """The handshake happened; we refused the certificate at the other end.
+
+    Kept apart from :class:`OmadaConnectionError` because the two send an
+    operator to opposite ends of the building. ``OMADA_CONNECTION_FAILED``
+    says "check the URL, the port, the firewall"; every one of those is
+    already correct here -- the address answered, on the right port, with a
+    working TLS stack. The only thing wrong is that nothing this platform
+    trusts vouches for the certificate, which is the *normal* state of a
+    self-hosted Omada controller and is fixed by pinning it, not by editing
+    the URL.
+
+    Reporting this as a connectivity failure is the defect this class was
+    added for: no operator was ever going to diagnose a self-signed
+    certificate from "check that the controller is reachable from the
+    server."
+    """
+
+    code = "OMADA_TLS_UNTRUSTED"
+    default_message = (
+        "The Omada controller answered, but its HTTPS certificate is not "
+        "trusted by this platform -- which is normal for a self-hosted "
+        "controller, because they ship a self-signed certificate. The URL "
+        "and port are fine. Run Test Connection to see the controller's "
+        "certificate fingerprint and pin it, or install a certificate from "
+        "a public certificate authority on the controller."
+    )
+
+
+class OmadaTlsPinMismatchError(OmadaError):
+    """The controller presented a certificate other than the pinned one.
+
+    A separate code from :class:`OmadaTlsTrustError` because it means
+    something different and rarer: this integration has already recorded
+    which certificate it expects, and the box in front of it is not
+    presenting that certificate. That is either a certificate the venue
+    legitimately reissued, or somebody is in the middle. The platform cannot
+    tell those apart, so it refuses and says both.
+
+    It deliberately does NOT fall back to connecting anyway. A pin that
+    yields under pressure is decoration.
+    """
+
+    code = "OMADA_TLS_PIN_MISMATCH"
+    default_message = (
+        "The Omada controller presented a different HTTPS certificate than "
+        "the one pinned to this integration. If the controller's certificate "
+        "was recently replaced, run Test Connection to review the new "
+        "fingerprint and pin it. If it was not, stop: something is "
+        "intercepting the connection to the controller."
+    )
+
+
 class OmadaTimeoutError(OmadaError):
     code = "OMADA_TIMEOUT"
     default_message = "The Omada controller did not respond in time."
@@ -137,6 +190,8 @@ class OmadaSessionExpiredError(OmadaError):
 ALL_ERRORS: tuple[type[OmadaError], ...] = (
     OmadaAuthError,
     OmadaConnectionError,
+    OmadaTlsTrustError,
+    OmadaTlsPinMismatchError,
     OmadaTimeoutError,
     OmadaRateLimitedError,
     OmadaInvalidControllerError,
@@ -160,5 +215,7 @@ __all__ = [
     "OmadaSessionExpiredError",
     "OmadaSiteNotFoundError",
     "OmadaTimeoutError",
+    "OmadaTlsPinMismatchError",
+    "OmadaTlsTrustError",
     "OmadaUnsupportedApiError",
 ]

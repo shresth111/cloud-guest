@@ -122,12 +122,14 @@ from typing import Any
 from ..constants import (
     ROUTER_VENDOR_BY_PROVIDER,
     ControllerAuthMode,
+    ControllerTlsMode,
     NetworkProviderKind,
 )
 from ..exceptions import (
     PROVIDER_ERRORS_BY_CODE,
     ProviderConnectionFailedError,
     ProviderError,
+    ProviderTlsPinMismatchError,
     ProviderUnsupportedApiError,
 )
 from ..validators import validate_controller_url
@@ -140,6 +142,7 @@ from .base import (
     ProviderPortalContext,
     ProviderSite,
     ProviderSsid,
+    ProviderTlsObservation,
 )
 
 logger = logging.getLogger(__name__)
@@ -205,6 +208,9 @@ def _gateway_credentials(config: ProviderConnectionConfig, base_url: str) -> Any
         ControllerCredentials,
         ControllerVendor,
     )
+    from wyfy_device_gateway.controller_contract import (  # noqa: PLC0415
+        ControllerTlsMode as GatewayTlsMode,
+    )
 
     credentials = config.credentials or {}
     mode = (
@@ -221,7 +227,8 @@ def _gateway_credentials(config: ProviderConnectionConfig, base_url: str) -> Any
         username=credentials.get("username"),
         password=credentials.get("password"),
         omadac_id=config.controller_id,
-        verify_tls=config.verify_tls,
+        tls_mode=GatewayTlsMode(config.tls_mode),
+        tls_pinned_sha256=config.tls_pinned_sha256,
         timeout_seconds=config.timeout_seconds,
     )
 
@@ -271,6 +278,33 @@ def _translate(exc: Exception) -> ProviderError:
     )
 
 
+def _describe_certificate(
+    certificate_der: bytes | None,
+) -> tuple[str | None, str | None, datetime | None]:
+    """``(subject, issuer, expiry)`` for display, or three ``None``s.
+
+    Best-effort on purpose. Everything this returns is decoration around the
+    fingerprint, which is the value the operator is actually confirming, so
+    an unparseable certificate must degrade rather than break the probe. The
+    import is local for the same reason the gateway import is: nothing in
+    this module should be able to stop the domain from importing.
+    """
+    if not certificate_der:
+        return None, None, None
+    try:
+        from cryptography import x509  # noqa: PLC0415
+
+        certificate = x509.load_der_x509_certificate(bytes(certificate_der))
+        return (
+            certificate.subject.rfc4514_string(),
+            certificate.issuer.rfc4514_string(),
+            certificate.not_valid_after_utc,
+        )
+    except Exception:  # noqa: BLE001 -- display-only, never fatal
+        logger.warning("network_integration_certificate_parse_failed")
+        return None, None, None
+
+
 def _is_gateway_error(exc: Exception) -> bool:
     """Whether ``exc`` came from the gateway's own error hierarchy.
 
@@ -303,6 +337,25 @@ class OmadaProvider:
 
     # -- internals ---------------------------------------------------------
 
+    @staticmethod
+    def _assert_trust_is_coherent(config: ProviderConnectionConfig) -> None:
+        """Refuse a config that says it pins and carries nothing to pin to.
+
+        The gateway refuses this too, and this is not a duplicate of that
+        check -- it is the one that runs before the URL is re-resolved and
+        before a socket is opened, so a misconfigured row costs nothing and
+        produces this domain's own 422 rather than a 502 describing a
+        controller that was never contacted.
+        """
+        if config.tls_mode != ControllerTlsMode.PINNED.value:
+            return
+        if not config.tls_pinned_sha256:
+            raise ProviderTlsPinMismatchError(
+                "This integration is set to pin the controller's HTTPS "
+                "certificate but has no fingerprint recorded. Run Test "
+                "Connection to capture and confirm the certificate."
+            )
+
     async def _creds(self, config: ProviderConnectionConfig) -> Any:
         """Re-validate the URL, then build gateway credentials.
 
@@ -315,6 +368,7 @@ class OmadaProvider:
         before every outbound call. See ``validators.py``'s "Validated
         twice, deliberately".
         """
+        self._assert_trust_is_coherent(config)
         validated = await validate_controller_url(config.base_url)
         return _gateway_credentials(config, validated.base_url)
 
@@ -362,6 +416,37 @@ class OmadaProvider:
     ) -> ProviderControllerInfo:
         info = await self._call(config, "get_controller_info")
         return self._controller_info(info)
+
+    async def inspect_tls(
+        self, config: ProviderConnectionConfig
+    ) -> ProviderTlsObservation:
+        """The certificate the controller is presenting, for the operator.
+
+        Goes through :meth:`_call` like everything else, so the URL is
+        re-validated against the SSRF rules immediately beforehand and the
+        gateway's errors are translated the same way. That matters more here
+        than elsewhere: this is the one call an operator makes at an address
+        this platform has never successfully talked to.
+
+        The certificate is parsed for a subject and an expiry *here* rather
+        than in the gateway, because the gateway's dependency list is
+        deliberately four packages long and does not include
+        ``cryptography``, while this application already depends on it. A
+        parse failure degrades to a bare fingerprint rather than failing the
+        observation -- the fingerprint is the part the operator confirms.
+        """
+        observation = await self._call(config, "inspect_tls")
+        subject, issuer, not_valid_after = _describe_certificate(
+            getattr(observation, "certificate_der", None)
+        )
+        return ProviderTlsObservation(
+            fingerprint_sha256=str(observation.fingerprint_sha256),
+            chain_trusted=bool(observation.chain_trusted),
+            matches_pin=getattr(observation, "matches_pin", None),
+            subject=subject,
+            issuer=issuer,
+            not_valid_after=not_valid_after,
+        )
 
     async def list_sites(
         self, config: ProviderConnectionConfig

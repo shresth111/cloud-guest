@@ -88,6 +88,28 @@ __all__ = [
 
 _AuthMode = Literal["openapi", "legacy"]
 _Provider = Literal["omada"]
+_TlsMode = Literal["strict", "pinned", "insecure"]
+
+#: Shared field definitions for the certificate-trust pair, so the create,
+#: onboard, update, rotate and probe bodies cannot describe them three
+#: different ways in the generated OpenAPI schema the frontend is built
+#: from.
+_TLS_MODE_DESCRIPTION = (
+    "How this platform verifies the controller's HTTPS certificate. "
+    "'strict' (default) is ordinary public-CA verification. 'pinned' "
+    "requires the certificate to match tls_pinned_sha256 -- this is the "
+    "right answer for a self-hosted controller, which ships a self-signed "
+    "certificate that 'strict' will always refuse. 'insecure' performs no "
+    "certificate check at all and is recorded as an explicit decision."
+)
+_TLS_PIN_DESCRIPTION = (
+    "SHA-256 fingerprint of the controller's certificate, as 64 hex "
+    "characters; colons and spaces are accepted and stripped. Required "
+    "when tls_mode is 'pinned' and cleared otherwise. Obtain it by running "
+    "Test Connection against the controller -- the response carries the "
+    "fingerprint the controller is actually presenting, which is the value "
+    "an operator confirms rather than one they have to go and find."
+)
 
 
 # ============================================================================
@@ -206,6 +228,10 @@ class NetworkIntegrationCreateRequest(_CredentialFields):
         ),
     )
     is_enabled: bool = True
+    tls_mode: _TlsMode = Field(default="strict", description=_TLS_MODE_DESCRIPTION)
+    tls_pinned_sha256: str | None = Field(
+        default=None, max_length=200, description=_TLS_PIN_DESCRIPTION
+    )
 
 
 class PlatformOnboardRequest(_CredentialFields):
@@ -284,6 +310,10 @@ class PlatformOnboardRequest(_CredentialFields):
         le=MAX_SYNC_INTERVAL_SECONDS,
     )
     is_enabled: bool = True
+    tls_mode: _TlsMode = Field(default="strict", description=_TLS_MODE_DESCRIPTION)
+    tls_pinned_sha256: str | None = Field(
+        default=None, max_length=200, description=_TLS_PIN_DESCRIPTION
+    )
 
     @model_validator(mode="after")
     def _identity_fields_travel_together(self) -> PlatformOnboardRequest:
@@ -349,6 +379,20 @@ class NetworkIntegrationUpdateRequest(BaseModel):
         le=MAX_SYNC_INTERVAL_SECONDS,
     )
     is_enabled: bool | None = None
+    tls_mode: _TlsMode | None = Field(
+        default=None, description=_TLS_MODE_DESCRIPTION
+    )
+    tls_pinned_sha256: str | None = Field(
+        default=None,
+        max_length=200,
+        description=(
+            _TLS_PIN_DESCRIPTION
+            + " On this partial-update body, omitting it while setting "
+            "tls_mode to 'pinned' reuses the fingerprint already on the "
+            "row; there is none to reuse unless the integration was "
+            "already pinned, because leaving 'pinned' clears it."
+        ),
+    )
 
 
 class NetworkIntegrationCredentialRotateRequest(_CredentialFields):
@@ -361,6 +405,15 @@ class NetworkIntegrationCredentialRotateRequest(_CredentialFields):
     """
 
     auth_mode: _AuthMode
+    # Optional, and unchanged when omitted. Re-entering a password is the
+    # moment an operator is most likely to be looking at a controller whose
+    # certificate was just replaced along with it.
+    tls_mode: _TlsMode | None = Field(
+        default=None, description=_TLS_MODE_DESCRIPTION
+    )
+    tls_pinned_sha256: str | None = Field(
+        default=None, max_length=200, description=_TLS_PIN_DESCRIPTION
+    )
 
 
 class NetworkIntegrationResponse(BaseModel):
@@ -377,6 +430,13 @@ class NetworkIntegrationResponse(BaseModel):
     is_enabled: bool
     base_url: str
     auth_mode: str
+    tls_mode: str
+    # Returned, unlike every credential on this row. A certificate
+    # fingerprint is a hash of something the controller hands to anyone who
+    # connects to it -- showing an operator what their integration is
+    # pinned to is the mechanism that makes the pin auditable.
+    tls_pinned_sha256: str | None = None
+    tls_trust_decided_at: datetime | None = None
     controller_id: str | None = None
     controller_version: str | None = None
     external_site_id: str | None = None
@@ -435,9 +495,23 @@ class TestConnectionRequest(_CredentialFields):
     provider: _Provider = "omada"
     base_url: str = Field(min_length=1, max_length=512)
     auth_mode: _AuthMode = "openapi"
+    tls_mode: _TlsMode = Field(default="strict", description=_TLS_MODE_DESCRIPTION)
+    tls_pinned_sha256: str | None = Field(
+        default=None, max_length=200, description=_TLS_PIN_DESCRIPTION
+    )
 
 
 class TestConnectionResponse(BaseModel):
+    """The probe's answer, plus what the controller's certificate is.
+
+    The TLS block is populated whether the probe succeeded or failed, which
+    is deliberate: the failing probe against a self-signed controller is
+    exactly when the operator needs the fingerprint, because that is the
+    decision the failure is asking them to make. A wizard that only showed
+    it on success would require them to switch verification off in order to
+    discover that they did not have to.
+    """
+
     ok: bool
     provider: str
     controller_id: str | None = None
@@ -448,6 +522,20 @@ class TestConnectionResponse(BaseModel):
     # maps; `message` is human-safe but the frontend owns the copy.
     error_code: str | None = None
     message: str | None = None
+    # The certificate the controller presented on this probe. `None`
+    # throughout when the observation could not be made at all -- which is
+    # a different thing from "the controller has no certificate" and is
+    # reported as absence rather than as a verdict.
+    tls_fingerprint_sha256: str | None = None
+    #: True when ordinary public-CA verification of this controller
+    #: succeeded, i.e. the operator does not need to pin anything.
+    tls_chain_trusted: bool | None = None
+    #: Whether the observed certificate matches the fingerprint the request
+    #: asked to pin. `None` when the request pinned nothing.
+    tls_matches_pin: bool | None = None
+    tls_certificate_subject: str | None = None
+    tls_certificate_issuer: str | None = None
+    tls_certificate_expires_at: datetime | None = None
 
 
 class NetworkIntegrationStatusResponse(BaseModel):

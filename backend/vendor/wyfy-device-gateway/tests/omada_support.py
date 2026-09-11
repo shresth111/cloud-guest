@@ -25,6 +25,7 @@ import httpx
 from wyfy_device_gateway.controller_contract import (
     ControllerAuthMode,
     ControllerCredentials,
+    ControllerTlsMode,
     ControllerVendor,
 )
 
@@ -68,6 +69,8 @@ def make_creds(
     client_id: Any = UNSET,
     client_secret: Any = UNSET,
     timeout_seconds: float = 15.0,
+    tls_mode: ControllerTlsMode = ControllerTlsMode.STRICT,
+    tls_pinned_sha256: str | None = None,
 ) -> ControllerCredentials:
     """Credentials with sensible per-mode defaults.
 
@@ -95,7 +98,8 @@ def make_creds(
         username=username,
         password=password,
         omadac_id=omadac_id,
-        verify_tls=True,
+        tls_mode=tls_mode,
+        tls_pinned_sha256=tls_pinned_sha256,
         timeout_seconds=timeout_seconds,
     )
 
