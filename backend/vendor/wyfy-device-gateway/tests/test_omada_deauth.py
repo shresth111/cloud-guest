@@ -24,15 +24,6 @@ from typing import Any
 
 import httpx
 import pytest
-
-from wyfy_device_gateway.controller_contract import ControllerAuthMode
-from wyfy_device_gateway.omada.adapter import OmadaControllerAdapter
-from wyfy_device_gateway.omada.deauth import (
-    PAGE_SIZE,
-    parse_authorized_client,
-)
-from wyfy_device_gateway.omada.errors import OmadaError, OmadaUnsupportedApiError
-
 from omada_support import (
     OMADAC_ID,
     FakeOmadaController,
@@ -40,6 +31,13 @@ from omada_support import (
     make_creds,
     no_sleep,
 )
+from wyfy_device_gateway.controller_contract import ControllerAuthMode
+from wyfy_device_gateway.omada.adapter import OmadaControllerAdapter
+from wyfy_device_gateway.omada.deauth import (
+    PAGE_SIZE,
+    parse_authorized_client,
+)
+from wyfy_device_gateway.omada.errors import OmadaError, OmadaUnsupportedApiError
 
 SITE_ID = "6aa3913c3ee1605f71ac35a1"
 LIST_PATH = f"/{OMADAC_ID}/api/v2/hotspot/sites/{SITE_ID}/clients"
@@ -283,7 +281,9 @@ async def test_it_pages_with_the_legacy_parameter_names():
 
 async def test_a_guest_past_the_first_page_is_still_found():
     controller = FakeOmadaController()
-    rows = [row(f"rec-other-{i}", mac=f"11-22-33-44-55-{i:02X}") for i in range(PAGE_SIZE)]
+    rows = [
+        row(f"rec-other-{i}", mac=f"11-22-33-44-55-{i:02X}") for i in range(PAGE_SIZE)
+    ]
     rows.append(row("rec-live"))
     table = HotspotClientsTable(rows).install(controller)
 

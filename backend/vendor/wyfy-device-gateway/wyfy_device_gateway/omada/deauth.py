@@ -113,7 +113,13 @@ from typing import Any
 
 from .client import OmadaHttpClient
 from .errors import OmadaError
-from .types import coerce_bool, coerce_str, extract_page, extract_total_rows, normalize_mac
+from .types import (
+    coerce_bool,
+    coerce_str,
+    extract_page,
+    extract_total_rows,
+    normalize_mac,
+)
 
 logger = logging.getLogger(__name__)
 
