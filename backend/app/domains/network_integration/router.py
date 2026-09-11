@@ -80,6 +80,8 @@ from .schemas import (
     NetworkIntegrationCredentialRotateRequest,
     NetworkIntegrationDeviceListResponse,
     NetworkIntegrationDeviceResponse,
+    NetworkIntegrationDisconnectGuestRequest,
+    NetworkIntegrationDisconnectGuestResponse,
     NetworkIntegrationEventListResponse,
     NetworkIntegrationEventResponse,
     NetworkIntegrationListResponse,
@@ -101,6 +103,7 @@ from .schemas import (
     TestConnectionResponse,
 )
 from .service import NetworkIntegrationService
+from .validators import build_external_portal_url, portal_readiness_gaps
 
 router = APIRouter(prefix="/network-integrations", tags=["Network Integrations"])
 portal_router = APIRouter(
@@ -147,6 +150,12 @@ def _integration_response(
     the value itself in a response.
     """
     numbers = counts or {}
+    portal_url = build_external_portal_url(
+        organization_id=integration.organization_id,
+        location_id=integration.location_id,
+        router_id=integration.router_id,
+        provider=integration.provider,
+    )
     return NetworkIntegrationResponse(
         id=str(integration.id),
         organization_id=str(integration.organization_id),
@@ -161,6 +170,9 @@ def _integration_response(
         is_enabled=integration.is_enabled,
         base_url=integration.base_url,
         auth_mode=integration.auth_mode,
+        tls_mode=integration.tls_mode,
+        tls_pinned_sha256=integration.tls_pinned_sha256,
+        tls_trust_decided_at=integration.tls_trust_decided_at,
         controller_id=integration.controller_id,
         controller_version=integration.controller_version,
         external_site_id=integration.external_site_id,
@@ -178,9 +190,38 @@ def _integration_response(
         client_count=numbers.get("client_count", 0),
         active_authorization_count=numbers.get("active_authorization_count", 0),
         has_credentials=integration.credentials_encrypted is not None,
+        # Both computed on read, never stored. Every input is already a
+        # column on this row, so a persisted copy would be a second set of
+        # the same facts able to disagree with them the moment a mapping is
+        # edited -- the reasoning `validators.portal_readiness_gaps` already
+        # spells out for itself.
+        portal_url_scheme=portal_url.scheme if portal_url else None,
+        portal_url_host_and_query=portal_url.host_and_query if portal_url else None,
+        portal_readiness_gaps=[gap.value for gap in portal_readiness_gaps(integration)],
         created_at=integration.created_at,
         updated_at=integration.updated_at,
     )
+
+
+def _tls_fields(observation) -> dict[str, object]:  # noqa: ANN001
+    """The certificate half of a ``TestConnectionResponse``.
+
+    One helper for all three probe routes so the platform probe and the two
+    customer probes cannot drift into reporting different subsets of the
+    same observation. ``None`` in means every field absent, which is how
+    "we could not look at the certificate" is expressed -- distinct from
+    any verdict about it.
+    """
+    if observation is None:
+        return {}
+    return {
+        "tls_fingerprint_sha256": observation.fingerprint_sha256,
+        "tls_chain_trusted": observation.chain_trusted,
+        "tls_matches_pin": observation.matches_pin,
+        "tls_certificate_subject": observation.subject,
+        "tls_certificate_issuer": observation.issuer,
+        "tls_certificate_expires_at": observation.not_valid_after,
+    }
 
 
 def _event_response(event) -> NetworkIntegrationEventResponse:  # noqa: ANN001
@@ -445,7 +486,7 @@ async def test_platform_integration_connection(
     actor: AuthUser = Depends(CurrentUser),
     service: NetworkIntegrationService = Depends(get_network_integration_service),
 ):
-    info, error = await service.test_platform_connection(
+    info, error, observation = await service.test_platform_connection(
         integration_id, actor_user_id=_actor_id(actor)
     )
     payload = TestConnectionResponse(
@@ -457,6 +498,7 @@ async def test_platform_integration_connection(
         supports_openapi=bool(info.supports_openapi) if info else False,
         error_code=error.code.value if error else None,
         message=error.message if error else None,
+        **_tls_fields(observation),
     )
     return build_response(
         success=error is None,
@@ -518,6 +560,8 @@ async def onboard_platform_integration(
         session_duration_seconds=payload.session_duration_seconds,
         sync_interval_seconds=payload.sync_interval_seconds,
         is_enabled=payload.is_enabled,
+        tls_mode=payload.tls_mode,
+        tls_pinned_sha256=payload.tls_pinned_sha256,
         client_id=payload.client_id,
         client_secret=payload.client_secret,
         username=payload.username,
@@ -572,13 +616,15 @@ async def test_connection(
     502, so the wizard can render the specific reason inline next to the
     form instead of the browser swallowing it.
     """
-    info, error = await service.test_connection_unsaved(
+    info, error, observation = await service.test_connection_unsaved(
         actor_user_id=_actor_id(actor),
         requesting_organization_id=requesting_organization_id,
         provider=payload.provider,
         base_url=payload.base_url,
         auth_mode=payload.auth_mode,
         controller_id=payload.controller_id,
+        tls_mode=payload.tls_mode,
+        tls_pinned_sha256=payload.tls_pinned_sha256,
         client_id=payload.client_id,
         client_secret=payload.client_secret,
         username=payload.username,
@@ -593,6 +639,7 @@ async def test_connection(
         supports_openapi=bool(info.supports_openapi) if info else False,
         error_code=error.code.value if error else None,
         message=error.message if error else None,
+        **_tls_fields(observation),
     )
     return build_response(
         success=error is None,
@@ -677,6 +724,8 @@ async def create_integration(
         session_duration_seconds=payload.session_duration_seconds,
         sync_interval_seconds=payload.sync_interval_seconds,
         is_enabled=payload.is_enabled,
+        tls_mode=payload.tls_mode,
+        tls_pinned_sha256=payload.tls_pinned_sha256,
         client_id=payload.client_id,
         client_secret=payload.client_secret,
         username=payload.username,
@@ -796,7 +845,7 @@ async def test_integration_connection(
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: NetworkIntegrationService = Depends(get_network_integration_service),
 ):
-    info, error = await service.test_integration_connection(
+    info, error, observation = await service.test_integration_connection(
         integration_id,
         actor_user_id=_actor_id(actor),
         requesting_organization_id=requesting_organization_id,
@@ -810,6 +859,7 @@ async def test_integration_connection(
         supports_openapi=bool(info.supports_openapi) if info else False,
         error_code=error.code.value if error else None,
         message=error.message if error else None,
+        **_tls_fields(observation),
     )
     return build_response(
         success=error is None,
@@ -845,6 +895,8 @@ async def rotate_credentials(
         actor_user_id=_actor_id(actor),
         requesting_organization_id=requesting_organization_id,
         auth_mode=payload.auth_mode,
+        tls_mode=payload.tls_mode,
+        tls_pinned_sha256=payload.tls_pinned_sha256,
         client_id=payload.client_id,
         client_secret=payload.client_secret,
         username=payload.username,
@@ -1080,6 +1132,65 @@ async def list_clients(
         success=True,
         message="Controller clients retrieved",
         data=payload.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/{integration_id}/clients/disconnect",
+    response_model=ApiResponse[NetworkIntegrationDisconnectGuestResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("network_integrations.update"))],
+)
+async def disconnect_guest(
+    request: Request,
+    integration_id: uuid.UUID,
+    payload: NetworkIntegrationDisconnectGuestRequest,
+    actor: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    service: NetworkIntegrationService = Depends(get_network_integration_service),
+):
+    """End one guest's network access now.
+
+    A sibling of ``GET /{integration_id}/clients`` and deliberately placed
+    under it: the integration id the caller already needs to *see* the
+    clients is the one that scopes the disconnect, so the control can live
+    on that table with nothing extra to fetch.
+
+    ``network_integrations.update`` rather than a new ``.execute``: the
+    module seeds create/read/update/delete/manage and nothing else, and
+    inventing an action here would leave every existing role without it
+    until the seed and its tests were changed too. ``update`` is the
+    right blast radius in the meantime -- a caller who can rewrite this
+    integration's credentials can certainly end one guest's session.
+
+    A 501 means the integration has no hotspot operator credentials, which
+    is the one configuration where the controller cannot be asked. It is
+    not the old "Omada cannot do this"; see
+    ``exceptions.NetworkIntegrationDeauthorizationUnsupportedError``.
+    """
+    outcome = await service.disconnect_guest(
+        integration_id,
+        client_mac=payload.client_mac,
+        reason=payload.reason,
+        actor_user_id=_actor_id(actor),
+        requesting_organization_id=requesting_organization_id,
+    )
+    body = NetworkIntegrationDisconnectGuestResponse(
+        disconnected=outcome.disconnected,
+        provider=outcome.provider,
+        client_mac=outcome.client_mac,
+        had_active_authorization=outcome.had_active_authorization,
+        deauthorized_at=outcome.deauthorized_at,
+        guest_session_id=(
+            str(outcome.guest_session_id) if outcome.guest_session_id else None
+        ),
+        guest_session_ended=outcome.guest_session_ended,
+    )
+    return build_response(
+        success=True,
+        message="Guest access ended",
+        data=body.model_dump(),
         request_id=_request_id(request),
     )
 

@@ -52,7 +52,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
+from app.domains.guest.dependencies import get_guest_service
 from app.domains.guest.repository import GuestRepository
+from app.domains.guest.service import GuestService
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.location_scope import (
     LocationScope,
@@ -69,12 +71,14 @@ from .repository import (
 from .service import (
     FleetDeviceProvisionerProtocol,
     GuestSessionLookupProtocol,
+    GuestSessionTerminatorProtocol,
     NetworkIntegrationService,
 )
 
 __all__ = [
     "get_fleet_device_provisioner",
     "get_guest_session_lookup",
+    "get_guest_session_terminator",
     "get_network_integration_repository",
     "get_network_integration_service",
 ]
@@ -99,6 +103,38 @@ def get_guest_session_lookup(
     dependencies into this one's.
     """
     return GuestRepository(db)
+
+
+def get_guest_session_terminator(
+    guest_service: GuestService = Depends(get_guest_service),
+) -> GuestSessionTerminatorProtocol:
+    """The real ``GuestService``, satisfying this domain's one-method
+    Protocol for the staff disconnect.
+
+    The *service*, not the repository -- the opposite choice from
+    ``get_guest_session_lookup`` above, and deliberately so. Reading a
+    session is a query; ending one is a state transition that must be
+    validated against the status graph, stamped, audited, and accompanied
+    by the live RFC 5176 disconnect the venue's other enforcement path
+    depends on. A repository write would do the first of those and skip
+    the rest.
+
+    It costs a service graph, which is exactly why it is a separate
+    dependency rather than being folded into the lookup: the anonymous
+    ``POST /portal/authorize`` resolves this service too, and there is no
+    reason for a guest joining the WiFi to construct ``GuestService``.
+    FastAPI resolves declared dependencies eagerly, so this one is
+    resolved on every route in the domain -- the cost is construction,
+    not I/O, and the alternative (resolving it inside the endpoint) would
+    put a second, parallel construction path in the codebase, which this
+    module's docstring exists to forbid.
+
+    Direction check: this domain reaches into ``app.domains.guest``;
+    nothing in ``app.domains.guest`` reaches back. Keep it that way, or
+    the portal authorize endpoint stops being able to fail independently
+    of guest login.
+    """
+    return guest_service
 
 
 def get_fleet_device_provisioner(
@@ -127,6 +163,9 @@ def get_network_integration_service(
     guest_session_lookup: GuestSessionLookupProtocol = Depends(
         get_guest_session_lookup
     ),
+    guest_session_terminator: GuestSessionTerminatorProtocol = Depends(
+        get_guest_session_terminator
+    ),
     # The same real app.database.redis.redis_client singleton every other
     # Redis-backed limiter in this codebase reuses (OtpRateLimiter,
     # VoucherRedemptionRateLimiter, RateLimitMiddleware) -- not a new
@@ -141,6 +180,7 @@ def get_network_integration_service(
         repository,
         audit_writer=audit_repository,
         guest_session_lookup=guest_session_lookup,
+        guest_session_terminator=guest_session_terminator,
         fleet_device_provisioner=fleet_device_provisioner,
         redis=redis,
         caller_location_scope=caller_location_scope,

@@ -91,6 +91,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.database.base import BaseModel
 
 from .constants import (
+    DEFAULT_CONTROLLER_TLS_MODE,
     DEFAULT_SESSION_DURATION_SECONDS,
     DEFAULT_SYNC_INTERVAL_SECONDS,
     AuthorizationStatus,
@@ -216,6 +217,38 @@ class NetworkIntegration(BaseModel):
     external_site_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     guest_ssid_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     guest_ssid_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # How much this platform trusts the certificate the controller
+    # presents: 'strict', 'pinned' or 'insecure'. See
+    # constants.ControllerTlsMode for why three values rather than the
+    # boolean this used to (not) be.
+    #
+    # server_default is the point of the column: every row that predates it
+    # gets 'strict', which is exactly what those rows did before it existed
+    # (the old verify_tls flag was unreachable and therefore permanently
+    # True). The migration changes no integration's behaviour.
+    tls_mode: Mapped[str] = mapped_column(
+        String(20),
+        default=DEFAULT_CONTROLLER_TLS_MODE.value,
+        server_default=DEFAULT_CONTROLLER_TLS_MODE.value,
+        nullable=False,
+    )
+    # Lowercase hex SHA-256 of the controller certificate's DER encoding,
+    # when tls_mode is 'pinned'. NULL otherwise, and cleared when the mode
+    # moves away from 'pinned' -- a pin that is stored but not consulted
+    # reads to the next person as a guarantee that is not being made.
+    #
+    # Not encrypted, and that is correct rather than an oversight: this is a
+    # hash of a certificate the controller hands to anyone who opens a
+    # socket to it. Encrypting public data would only make it harder to show
+    # the operator what they pinned.
+    tls_pinned_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # When somebody last made an explicit trust decision about this
+    # controller. NULL means "nobody has; this is the strict default".
+    # Who made it lives in the audit log, which is the thing designed to
+    # hold an actor and cannot be overwritten by the next decision.
+    tls_trust_decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Fernet ciphertext of a JSON credential set. See crypto.py. Never
     # returned by any endpoint; never logged.
     credentials_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)

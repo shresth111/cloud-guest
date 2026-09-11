@@ -71,9 +71,34 @@ directly on the VM (not containerized, since they need `docker exec` into
   `is_deleted=false, status='active'` `radius_nas_clients` row (LEFT JOINed
   against `wireguard_peers` by `router_id`) and prints a `client { ... }`
   block per NAS, `nas_identifier` as `shortname`, `ipaddr` scoped to that
-  router's real WireGuard tunnel IP as a `/32` (falls back to `0.0.0.0/0`
-  only if the NAS has no tunnel peer row yet -- logged to stderr as a
-  fallback count).
+  router's real WireGuard tunnel IP as a `/32`.
+
+  **A NAS with no tunnel peer row gets no stanza at all** (2026-09-11). This
+  used to fall back to `ipaddr = 0.0.0.0/0`, which was not a widened stanza
+  but a *catch-all carrying that router's real `shortname` and
+  `backend_secret`*: FreeRADIUS matches clients by longest prefix, so it
+  answered every source address no other stanza claimed, and anything that
+  reached UDP 1812 and knew its `secret` authenticated to the platform API as
+  that venue. It bought nothing either -- RADIUS is reachable only from
+  `10.20.0.0/24` and the VPC, so a NAS with no tunnel address cannot send
+  FreeRADIUS a packet at all, and the stanza could only ever have matched
+  somebody else. Skipped rows are named on stderr and in the generated file.
+
+  Two emptiness cases matter, because `sync_radius_clients.sh` guards on
+  `[ ! -s "$TMP" ]` and `test -s` means *size > 0*:
+  - **every** row unrenderable → exits non-zero, so `set -e` aborts and the
+    last good `clients.wyfy.conf` is kept. (A comments-only file is not empty
+    and would otherwise have been copied over it.)
+  - **zero** active NAS rows → emits literally nothing, so the guard fires and
+    keeps the existing file. It used to emit a single newline, which is
+    non-empty, so the guard did not fire.
+- `audit_clients_conf.py` → read-only report on the stanzas already in a
+  `clients.conf`, which the generator does not own (those come from
+  `ops/hub-agents/radius_agent.py` and from hand edits). Classifies each
+  stanza as stock / active / orphan / catch-all against the live NAS list and
+  prints a removal plan. It never edits its input; `--emit-pruned` writes a
+  separate file for review. Run it against a *fresh copy* of the live file --
+  not the 2026-08-22 capture, which predates the current NAS.
 - `sync_radius_clients.sh` (installed at `/opt/wyfy/sync_radius_clients.sh`
   on the VM) → runs the above via `docker cp` + `docker exec`, diffs the
   result against the live `clients.wyfy.conf`, and only overwrites +
@@ -172,7 +197,8 @@ there, then removed:
   `radacct/.../detail-<date>` for replay.
 
 After applying to the live server, the same rig was re-synced from the live
-files and pointed at the **real** backend (`10.30.1.10:8000`). It sent
+files and pointed at the **real** backend (`10.30.1.10:8000` — an *Azure*
+address; see the warning below). It sent
 `{"status_type": "interim-update", ..., "bytes_uploaded_total": 12884901988,
 "bytes_downloaded_total": 4294967496, "disconnect_reason": ""}` and received the
 backend's genuine `401 {"success":false,"message":"RADIUS NAS authentication
@@ -190,6 +216,146 @@ nothing.
 file is ahead of git: the 2026-08-18 dynamic-xlat and Message-Authenticator
 fixes were applied on the box and never committed.
 `sites-default.snippets.conf` is a diff, not a drop-in.
+
+## ⚠️ `rest.conf`'s `connect_uri` is environment-specific — check it first (2026-09-11)
+
+Production moved from Azure to **AWS ap-south-1 on 2026-08-27**, and this
+repo's `rest.conf` went on naming an Azure VNet address (`10.30.1.10`) for two
+more weeks. Applying it as-is would have pointed `rlm_rest` at an unroutable
+host and failed **every** authorize and **every** accounting request
+fleet-wide — while `radiusd -XC` reported the configuration perfectly valid,
+because syntactically it is. Nothing detected this, because nothing compares
+this directory to the hub.
+
+It now reads `http://172.31.38.118:8000/api/v1` (`wyfy-app-server`,
+`i-0cf9b79511abe6000`, verified 2026-09-11). That is a *private IP on a
+specific instance* and will move if the instance is replaced.
+
+**Before applying anything in this directory to a hub**, copy the live tree
+off-box and run:
+
+```bash
+./verify_hub_config.py /path/to/copy/of/etc/freeradius/3.0 \
+    --expect-api-cidr 172.31.0.0/16
+```
+
+It is read-only — no sockets, no FreeRADIUS binary, no writes — and checks the
+nine invariants whose absence has previously caused an outage: enabled-vs-
+available drift for `sites-enabled/default` and `mods-enabled/rest`, per-NAS
+REST headers, `Message-Authenticator` on the reply, `accounting{}` calling
+`rest`, totals-not-deltas, `Acct-*-Gigawords` reassembly, catch-all client
+stanzas, and this `connect_uri`. It is **not** a substitute for `radiusd -XC`;
+it checks the things `-XC` is happy to accept.
+## ⚠️ The generator is NOT wired up on the AWS hub (2026-09-11)
+
+Everything in the "Dynamic NAS clients" section above describes a pipeline
+that, on the current estate, **does not run and would not be read if it did.**
+Established read-only against the 2026-08-22 hub capture and the app server:
+
+```
+radiusd.conf:611:  $INCLUDE clients.conf     ← the only clients file loaded
+clients.conf:      no $INCLUDE lines at all
+ls /etc/freeradius/3.0 | grep wyfy   → nothing
+grep -rn "clients.wyfy" <tree>       → no reference anywhere
+```
+
+`clients.wyfy.conf` does not exist on the hub and is named nowhere in its
+config. So `gen_clients_conf.py`'s output is not loaded by FreeRADIUS.
+
+It is not being produced either. `sync_radius_clients.sh` needs **one host**
+that has both `docker ... deploy-api-1` *and* `/etc/freeradius` +
+`systemctl reload freeradius`. On AWS those live on different machines:
+
+| host | `deploy-api-1` | `/etc/freeradius` | `/opt/wyfy/*radius*` | sync timer |
+|---|---|---|---|---|
+| app server `172.31.38.118` | yes | **no** | **no** | **not installed** |
+| hub `172.31.40.230` | almost certainly not | yes | unknown (no shell) | unknown |
+
+The script was written when those were co-located. **It cannot work as written
+on a split topology**, and nothing reports that, because each half looks fine
+on its own.
+
+**What this means in practice:** `ops/hub-agents/radius_agent.py` (port 9092)
+is the *only* thing writing client stanzas on this hub — it edits
+`clients.conf` directly at provisioning time, which is why the live stanzas
+carry its `cg-cg-` label convention. **Changes to `gen_clients_conf.py` have
+no effect on the running estate.** A fix to it is worth having for the day the
+pipeline is connected, but do not merge one and believe a live problem is
+solved.
+
+`verify_hub_config.py`'s check 10 now reports this state explicitly rather
+than leaving it to be rediscovered:
+
+```
+[SKIP] generated clients file is wired up
+       clients.wyfy.conf is neither present nor $INCLUDEd, so
+       gen_clients_conf.py/sync_radius_clients.sh are not wired up on this
+       host ... it means changes to the generator have no effect here
+```
+
+**Before this pipeline is relied on, one of two decisions has to be made**, and
+this file should be updated to say which:
+
+1. **Connect it** — add `$INCLUDE clients.wyfy.conf` to the hub's
+   `clients.conf`, and give `sync_radius_clients.sh` a way to work across two
+   hosts (run the generator in the container on the app server, ship the
+   output to the hub through the agent rather than assuming a shared
+   filesystem). Then two writers touch client stanzas and the drift risk in
+   `wyfy_generator_vs_writer_drift` becomes live — the agent and the generator
+   must agree on ownership.
+2. **Retire it** — delete the generator, the sync script and both systemd
+   units, and let `radius_agent.py` be the single documented writer.
+
+Leaving it half-wired is the worst of the three, because it reads as working.
+
+## Checking what a `client{}` stanza actually resolves to (2026-09-11)
+
+`%{client:shortname}` and `%{client:backend_secret}` decide which venue a
+router authenticates to the platform API *as*, and a stanza missing one of
+those items fails **silently** — the router gets `Auth-Type: Reject` behind an
+HTTP 200, with nothing logged anywhere. `radiusd -XC` will not tell you; it
+validates the syntax and stops.
+
+This resolves them for real, off-box, in about a minute. It needs no hub
+access and touches nothing live:
+
+```bash
+cp -RL /etc/freeradius/3.0 /tmp/probe          # or a captured tree
+rm -f /tmp/probe/sites-enabled/* /tmp/probe/mods-enabled/eap
+cat > /tmp/probe/sites-enabled/probe <<'EOF'
+server default {
+	listen { type = auth
+		 ipaddr = 127.0.0.1
+		 port = 18812 }
+	authorize {
+		update reply {
+			Reply-Message := "SHORT=[%{client:shortname}] BSEC=[%{client:backend_secret}]"
+		}
+		update control { Auth-Type := Accept }
+	}
+	authenticate {}
+	post-auth {}
+}
+EOF
+# put ONLY the stanza under test in clients.conf, so 127.0.0.1 matches it
+radiusd -X -d /tmp/probe &
+echo "User-Name = probe@example.com, User-Password = x" \
+  | radclient -x 127.0.0.1:18812 auth <that stanza's secret>
+```
+
+Measured results for the two stanza shapes that matter:
+
+| stanza | `Reply-Message` |
+|---|---|
+| the hub's `cloudguest-dynamic-wan` (`0.0.0.0/0`, no `backend_secret`) | `SHORT=[cloudguest-dynamic-wan] BSEC=[]` |
+| a generated `0.0.0.0/0` fallback (with `shortname` + `backend_secret`) | `SHORT=[cg-bfc7ed1c] BSEC=[s-bfc7ed1c-REAL-SECRET]` |
+
+Two things worth knowing from that. `%{client:backend_secret}` on a stanza
+lacking the item expands to the **empty string** — not a literal, not an
+error — so such a stanza is a dead end at `CurrentNas`, which refuses an empty
+secret before any lookup. And `%{client:shortname}` falls back to the
+`client <label>`, which is *not* a registered `nas_identifier`, so the label
+being cosmetic stops being true the moment `shortname` is missing.
 
 ## Manual verification commands (matches what was actually run 2026-08-10)
 

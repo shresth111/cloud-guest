@@ -69,10 +69,15 @@ JSON fields in the bodies we have seen, but sending version-specific fields
 unconditionally to an older controller is an avoidable risk on the one call
 in this package that a paying guest's internet access depends on.
 
-## There is no deauthorization endpoint
+## Revoking one of these
 
-TP-Link publishes no way to revoke an external-portal authorization. See
-``adapter.deauthorize_guest``.
+TP-Link publishes no way to revoke an external-portal authorization, and
+that used to be the end of the sentence. It is not: the controller has a
+disconnect in the Hotspot Manager tree, reachable with the same operator
+session this module's call uses, and it is implemented in ``deauth.py``.
+Nothing about the authorize body changes because of it -- an authorization
+is still granted for ``time`` milliseconds and still lapses on its own --
+but the grant is no longer irrevocable. See ``adapter.deauthorize_guest``.
 """
 
 from __future__ import annotations
@@ -89,10 +94,18 @@ from .redaction import sanitize_detail
 #: VERIFIED (TP-Link docs 13080 / 132060): external portal / RADIUS-free auth.
 AUTH_TYPE_EXTERNAL_PORTAL = 4
 
-#: Sanity ceiling on a single authorization, 24 hours. A caller passing a
-#: nonsense duration (a timestamp mistaken for a duration, say) would
-#: otherwise ask the controller for a session lasting decades.
-MAX_DURATION_SECONDS = 24 * 60 * 60
+#: Sanity ceiling on a single authorization. A caller passing a nonsense
+#: duration (a timestamp mistaken for a duration, say) would otherwise ask
+#: the controller for a session lasting decades.
+#:
+#: This is deliberately **not** the platform's policy ceiling. That one is
+#: ``network_integration.constants.MAX_SESSION_DURATION_SECONDS`` and is much
+#: lower; it rejects rather than caps, so an operator is told the number they
+#: asked for is not allowed. Keeping this bound above it is what stops the two
+#: from disagreeing silently -- when they were both 24h, raising the policy
+#: ceiling alone would have had the platform promise a week and the controller
+#: quietly receive a day.
+MAX_DURATION_SECONDS = 30 * 24 * 60 * 60
 
 
 def build_authorize_body(

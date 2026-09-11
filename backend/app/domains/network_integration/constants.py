@@ -58,7 +58,9 @@ from enum import StrEnum
 __all__ = [
     "AuthorizationStatus",
     "ControllerAuthMode",
+    "ControllerTlsMode",
     "DEFAULT_CONTROLLER_PORTS",
+    "DEFAULT_CONTROLLER_TLS_MODE",
     "DEFAULT_SESSION_DURATION_SECONDS",
     "DEFAULT_SYNC_INTERVAL_SECONDS",
     "ErrorCode",
@@ -78,6 +80,9 @@ __all__ = [
     "ROUTER_VENDOR_BY_PROVIDER",
     "PORTAL_AUTHORIZE_RATE_LIMIT_KEY_TEMPLATE",
     "PORTAL_AUTHORIZE_MAX_ATTEMPTS_PER_WINDOW",
+    "PORTAL_AUTHORIZE_DIAGNOSTICS_KEY",
+    "PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS",
+    "PORTAL_REDIRECT_STALE_AFTER_SECONDS",
     "PORTAL_AUTHORIZE_WINDOW_SECONDS",
     "REDACTED_CONTEXT_KEYS",
     "REDACTION_PLACEHOLDER",
@@ -157,6 +162,58 @@ class ControllerAuthMode(StrEnum):
     LEGACY = "legacy"
 
 
+class ControllerTlsMode(StrEnum):
+    """How much this platform trusts the certificate a controller presents.
+
+    ## Why three modes and not a ``verify_tls`` boolean
+
+    There was a boolean. It lived on the provider config dataclass, defaulted
+    to ``True``, and **nothing in ``app/`` ever set it** -- no column, no
+    schema field, no service parameter -- so in practice it was the constant
+    ``True``. Which meant a self-hosted Omada controller could not be
+    integrated at all, because those ship a self-signed certificate: the one
+    this was first tested against answers with ``CN=localhost`` issued by
+    itself.
+
+    Making the boolean reachable would have fixed that by handing operators a
+    switch whose only two positions are "cannot connect" and "no certificate
+    check whatsoever". Everybody picks the second, once, on the day they are
+    trying to get a venue online, and nothing records what they accepted.
+
+    So the middle answer gets to exist:
+
+    * ``STRICT`` -- ordinary public-CA verification. The default, because a
+      default weaker than the rest of this platform's HTTPS posture is a
+      decision nobody consciously made.
+    * ``PINNED`` -- the controller's certificate must match the SHA-256
+      fingerprint recorded on the integration row. This is the right answer
+      for a self-signed controller and it is *stronger* than what a public CA
+      buys: an interceptor has to hold that exact certificate, not merely one
+      some CA will issue. The fingerprint is captured and shown to the
+      operator by Test Connection, so pinning is a thing they confirm rather
+      than a thing they have to go and find.
+    * ``INSECURE`` -- no check. Reachable on purpose, because a controller
+      behind something that reissues certificates constantly is a real
+      configuration and refusing to model it pushes people to worse places.
+      Never a default; the row records when it was chosen and the audit log
+      records who.
+
+    The mode is per-integration, not a platform setting, for the same reason
+    ``ControllerAuthMode`` is: one tenant's controller has a real certificate
+    and the next one's does not.
+    """
+
+    STRICT = "strict"
+    PINNED = "pinned"
+    INSECURE = "insecure"
+
+
+#: What an integration created without saying anything about TLS gets, and
+#: what every row that predates the column is backfilled to. Strict, so the
+#: migration changes no existing integration's behaviour.
+DEFAULT_CONTROLLER_TLS_MODE = ControllerTlsMode.STRICT
+
+
 class IntegrationStatus(StrEnum):
     """Current state of one integration row. See the module docstring for
     why the four unhappy states are kept apart."""
@@ -209,6 +266,22 @@ class PortalReadinessGap(StrEnum):
       ``location_id`` means this row is never selected for any venue.
     * ``SITE_NOT_SELECTED`` -- an explicit
       ``NetworkIntegrationSiteNotSelectedError``.
+    * ``FLEET_DEVICE_MISSING`` -- there is no ``router_id`` to put in the
+      venue's portal URL, and none to put in ``guest_sessions.router_id``
+      (NOT NULL) if a guest somehow reached a sign-in screen anyway.
+
+      This one is not a branch inside ``authorize_portal_client``; it is
+      *earlier* than the whole flow, and it is here because
+      ``network_integrations.router_id`` is nullable and must stay nullable
+      -- a customer self-service integration legitimately has no fleet row
+      (see that column's own docstring). So an integration can be
+      credentialled, mapped, site-selected and CONNECTED, and still be
+      unable to issue a single guest session, because there is no value to
+      put in that NOT NULL column and no router id to hand the portal.
+
+      Nothing consumed that fact until the Omada guest flow existed, which
+      is exactly why it was invisible; now it decides whether the dashboard
+      can give a venue a portal URL at all.
 
     ``guest_ssid_id`` is deliberately **not** here. The wizard asks for it
     and the list view shows it, but nothing on the authorize path reads it
@@ -225,6 +298,7 @@ class PortalReadinessGap(StrEnum):
     CREDENTIALS_MISSING = "credentials_missing"
     LOCATION_NOT_MAPPED = "location_not_mapped"
     SITE_NOT_SELECTED = "site_not_selected"
+    FLEET_DEVICE_MISSING = "fleet_device_missing"
 
 
 # One human sentence per gap, written for the operator who has to fix it
@@ -238,6 +312,9 @@ PORTAL_READINESS_GAP_LABELS: dict[PortalReadinessGap, str] = {
     ),
     PortalReadinessGap.SITE_NOT_SELECTED: (
         "no controller site has been selected"
+    ),
+    PortalReadinessGap.FLEET_DEVICE_MISSING: (
+        "it has no fleet device, so no guest session can be created for it"
     ),
 }
 
@@ -338,6 +415,19 @@ class ErrorCode(StrEnum):
     AUTHORIZATION_FAILED = "OMADA_AUTHORIZATION_FAILED"
     API_UNSUPPORTED = "OMADA_API_UNSUPPORTED"
     SESSION_EXPIRED = "OMADA_SESSION_EXPIRED"
+    # Two codes, not one, and neither is CONNECTION_FAILED. A rejected
+    # certificate and an unreachable address send an operator to opposite
+    # ends of the problem, and "the certificate changed" is a third thing
+    # again -- it is the only one of the three that might mean somebody is
+    # in the middle. Collapsing them is how the original defect happened:
+    # a self-signed controller reported as "check the URL and port" when
+    # the URL and the port were both correct.
+    TLS_UNTRUSTED = "OMADA_TLS_UNTRUSTED"
+    TLS_PIN_MISMATCH = "OMADA_TLS_PIN_MISMATCH"
+    # The request asked for pinning without supplying a fingerprint (or
+    # supplied one that is not a SHA-256). A 400 from this platform, not a
+    # 502 from the controller -- the controller was never contacted.
+    TLS_PIN_REQUIRED = "NETWORK_INTEGRATION_TLS_PIN_REQUIRED"
 
 
 # ============================================================================
@@ -350,30 +440,59 @@ class ErrorCode(StrEnum):
 # here.
 DEFAULT_SESSION_DURATION_SECONDS = 3600
 MIN_SESSION_DURATION_SECONDS = 60
-# 24 hours, and this ceiling is a security control rather than a sanity
-# bound.
+# 7 days. **The reason this number was originally chosen no longer holds.**
+# It used to be a safety backstop; it is now a policy choice. Read both
+# halves before touching it.
 #
-# CR-001 (see /Users/shresth/wyfy-omada/CHANGE-REQUESTS.md).
-# TP-Link publishes **no client-deauthorization endpoint** in any
-# generation of the Omada API, so this platform cannot revoke a portal
-# authorization it has already granted. The duration is therefore not a
-# convenience default -- it is the *only* mechanism by which a guest's
-# network access ever ends.
+# ## The old reason, which was false
 #
-# That inverts how the number should be chosen. A generous ceiling would
-# normally be harmless; here a 30-day authorization is 30 days during
-# which an abusive guest cannot be removed from the venue's network by
-# any action this platform can take. Ending the WyfyGuest ``GuestSession``
-# row still works and is still required, but it does not touch the
-# controller -- claiming otherwise is precisely the class of falsehood
-# ``app.domains.guest_access.device_adapters`` was written to fix (read
-# its "mechanism 4" note).
+# This ceiling used to be justified entirely on CR-001's claim that
+# TP-Link publishes no client-deauthorization endpoint, and therefore that
+# this platform could never revoke an authorization it had granted. On
+# that premise the duration was not a convenience default but the *only*
+# mechanism by which a guest's access ever ended, which inverted how the
+# number had to be chosen: a 30-day authorization would have been 30 days
+# during which an abusive guest could not be removed from the venue's
+# network by any action available to us.
 #
-# 24 hours is the longest window in which "wait for it to expire" is a
-# usable answer to "this guest is abusing the WiFi". Venues wanting
-# longer sessions should re-authorize on the next portal hit, which costs
-# the guest nothing and keeps the revocation window bounded.
-MAX_SESSION_DURATION_SECONDS = 24 * 3600
+# **That premise is false.** CR-001 was overturned (2026-09-10) and then
+# found to be narrower still than its overturn said. A per-guest
+# disconnect exists on the controller and is implemented:
+# ``service.disconnect_guest`` -> the provider seam ->
+# ``omada.deauth``, which lists the Hotspot Manager's Authorized Clients
+# table and ends every live authorization the MAC holds. It needs only the
+# hotspot-operator credentials the portal authorization itself already
+# uses -- observed working against a live controller (5.15.24.19), not
+# inferred. So revocation is available in exactly the configurations that
+# can grant an authorization in the first place: there is no state in
+# which this platform can let a guest on and then not remove them.
+#
+# ## Why the value is a week, and not longer
+#
+# The owner raised it from 24 hours to 7 days on 2026-09-11, once the
+# disconnect above was verified on hardware. A week is the usual ask for a
+# hotel stay, which is the case that drove it. What the ceiling still
+# protects is narrower and weaker than what it protected before, and those
+# reasons are why it is a week rather than a month:
+#
+#   * Revocation is *operator-initiated*. Nobody watches the dashboard at
+#     03:00, so a long authorization is still a long unattended grant --
+#     it is now recoverable rather than irrevocable, which is a different
+#     thing from harmless.
+#   * The controller, not this database, is the authority on whether a
+#     client is still authorized (see ``AuthorizationStatus``). A longer
+#     window is a longer period over which the two can drift with nobody
+#     reconciling them.
+#   * A shorter authorization means the guest re-hits the portal, which is
+#     the only moment the platform re-checks consent, quota and blocklist
+#     state. That check is worth keeping frequent on its own merits, and
+#     it costs the guest nothing.
+#
+# What the ceiling no longer protects against is "an abusive guest cannot
+# be removed". So this is now a *policy* number, chosen for the length of
+# a stay, and not a safety backstop. Moving it again is the same kind of
+# decision and needs the same kind of reason -- not a code review.
+MAX_SESSION_DURATION_SECONDS = 7 * 24 * 3600
 
 DEFAULT_SYNC_INTERVAL_SECONDS = 300
 # A floor, and a real one. Every sync tick is a live HTTP round trip to a
@@ -477,6 +596,78 @@ PORTAL_AUTHORIZE_WINDOW_SECONDS = 300
 
 
 # ============================================================================
+# Portal authorization diagnostics
+# ============================================================================
+#
+# ## The problem this exists for
+#
+# Probed against a live Omada 6.3.0.100 cloud controller on 2026-09-11, one
+# body field varied at a time:
+#
+#     authType omitted        -> -41500  "Invalid authentication type."
+#     clientIp omitted        -> -41501  "Failed to authenticate."
+#     clientMac omitted       -> -41501  "Failed to authenticate."
+#     apMac/ssidName/radioId  -> -41501  "Failed to authenticate."
+#     time omitted            -> -41501  "Failed to authenticate."
+#     clientMac malformed     -> -41501  "Failed to authenticate."
+#
+# The endpoint validates its parameters -- `authType` has a code of its own --
+# and then collapses every other fault into one opaque code, including a
+# missing `clientMac`, which is beyond argument required. So when a guest in a
+# real venue cannot get online, the controller hands this platform a single
+# code covering a wrong MAC, a stale timestamp, the wrong site, an AP that
+# never saw the client, a missing field, and a `clientIp` it disliked.
+#
+# **No operator-facing error can be more specific than that.** The mitigation
+# therefore cannot be a better message; it has to be a better *record*. What
+# is stored on a failure is the exact body that went on the wire, the redirect
+# parameters that produced it, the raw vendor code, and the handful of checks
+# this platform could have made from its own state before calling -- so a
+# support engineer can diff the two sides afterwards, without asking a guest
+# who has long since left the building to reproduce it.
+#
+# ## Why this is a key in the existing event context and not a new table
+#
+# `network_integration_events.context` is already a JSONB column, already
+# written through `redact_context` on the way in, already scoped per
+# organization, and already rendered by `GET /{id}/events`. A new log sink
+# would need a migration, a retention policy, an endpoint and a permission of
+# its own to reach parity with a column that has all four today. Nesting under
+# one key keeps the bundle identifiable in a query
+# (`context ? 'authorize_diagnostics'`) without colonising the top level of a
+# context other event types share.
+PORTAL_AUTHORIZE_DIAGNOSTICS_KEY = "authorize_diagnostics"
+
+# Written on failure only.
+#
+# This is the retention control, and it is deliberately the *only* one. The
+# bundle names a guest's device, so recording it for every successful
+# authorization would put a MAC per guest per join into a table that has never
+# held a per-guest identifier, forever, to answer a question nobody asks about
+# a call that worked. Failures are the small minority and the only population
+# anybody diffs. A successful authorization still records what it always did.
+#
+# The MAC itself is not a new disclosure: the identical address for the
+# identical attempt is already persisted unmasked and indefinitely in
+# `network_integration_authorizations.client_mac`, in the same organization's
+# scope, and `app.common.masking.mask_mac` is a documented no-op because
+# venues need the real address to identify a device for support. What changes
+# is only which table it is in. No client IP is recorded because none is sent:
+# the authorize body this platform builds has no `clientIp` field at all.
+PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS = False
+
+# How old a redirect's `t` has to be before the record calls it stale.
+#
+# Not a validation threshold -- nothing refuses a redirect for exceeding it,
+# and a request that does is still authorized. It exists so that a human
+# reading a failure is not left to eyeball an epoch. Fifteen minutes is longer
+# than any guest spends between the redirect landing and finishing sign-in,
+# and short enough that a page reopened from a browser's history -- one of the
+# few `-41501` causes that is decidable from our side -- is visibly flagged.
+PORTAL_REDIRECT_STALE_AFTER_SECONDS = 900
+
+
+# ============================================================================
 # Audit actions
 # ============================================================================
 
@@ -522,6 +713,13 @@ class NetworkIntegrationAuditAction(StrEnum):
     # auditor asking "where did this Router row come from" must be able to
     # find it by action alone. Contract §11.6.
     FLEET_DEVICE_ONBOARDED = "network_integration_fleet_device_onboarded"
+    # One guest's access ended early by a human. Its own action rather
+    # than reusing DISCONNECTED, which means "the *integration* was
+    # disconnected from the controller" -- an integration-scoped
+    # administrative act, not a guest-scoped one. An auditor answering
+    # "who kicked this guest off the WiFi" must not have to disambiguate
+    # the two by reading the description.
+    GUEST_DISCONNECTED = "network_integration_guest_disconnected"
 
 # Audit entity_type for every entry this domain writes -- one value, so an
 # auditor can retrieve the whole trail for one integration by
