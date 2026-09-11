@@ -464,9 +464,11 @@ def build_portal_authorize_diagnostics(
     ## What is not in here
 
     No credential, cookie, token or controller response body -- none of those
-    is an input to any value above. No client IP: this platform's authorize
-    body has no ``clientIp`` field, so there is nothing to record, and this
-    function does not invent one. The redirect URL is reduced to its origin,
+    is an input to any value above. A client IP appears only inside
+    ``request.body``, and only when the controller's redirect carried one
+    (CR-004): it is then part of the exact body that was sent. This function
+    never adds one of its own -- in particular never the HTTP request's
+    source address. The redirect URL is reduced to its origin,
     path and query-parameter *names* (``validators.summarize_redirect_url``
     explains why the values are dropped).
 
