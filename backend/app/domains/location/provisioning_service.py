@@ -213,6 +213,10 @@ from app.domains.billing.models import Plan, PlanFeature, Subscription
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.captive_portal.validators import default_splash_headline
 from app.domains.guest.nas_number_generator import preview_first_nas_code
+from app.domains.network_integration.constants import (
+    DEFAULT_SESSION_DURATION_SECONDS,
+    DEFAULT_SYNC_INTERVAL_SECONDS,
+)
 from app.domains.notification.constants import (
     NotificationChannelType,
     NotificationEventType,
@@ -325,6 +329,26 @@ class RouterTunnelProvisioningFailedError(CloudGuestError):
             "attempt have all been rolled back. Once the hub bridge is "
             "reachable again, submit the form again.",
             status_code=cause.status_code,
+        )
+
+
+class NetworkControllerProvisioningUnavailableError(CloudGuestError):
+    """A request asked for a network-controller first device, but this
+    ``LocationProvisioningService`` was constructed without the network
+    integration service that registers one.
+
+    Production wiring always supplies it (see
+    ``provisioning_dependencies.py``); only a service built by hand -- a
+    test, a script -- can reach this. Refusing is the honest answer:
+    silently falling back to "no first device" would provision a venue no
+    guest could ever sign in at."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This deployment cannot provision a location with a network "
+            "controller as its first device: the network integration service "
+            "is not wired into location provisioning.",
+            status_code=500,
         )
 
 
@@ -492,6 +516,69 @@ class WireGuardProvisioningProtocol(Protocol):
     ) -> HubTunnelAllocation: ...
 
 
+class NetworkControllerOnboardingProtocol(Protocol):
+    """The two things provisioning needs from
+    ``app.domains.network_integration`` -- satisfied as-is by
+    ``NetworkIntegrationService``.
+
+    ``create_integration_with_fleet_device`` is the Master onboarding path
+    (``POST /network-integrations/platform/onboard``) itself, reused rather
+    than restated: SSRF validation, credential validation and encryption
+    (including the refusal to encrypt under the public default key), the
+    duplicate-controller check, the locally-administered fleet identity for
+    a software controller, the status ladder, the domain event and both
+    audit entries all stay in that one method. It writes through the same
+    request-scoped session as every other step here, so a failure in it
+    rolls the whole customer back.
+
+    ``precheck_controller_onboarding`` runs the input-only half of those
+    checks without writing, so provisioning can refuse before it creates
+    anything -- see ``provision_location``."""
+
+    async def precheck_controller_onboarding(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        auth_mode: str,
+        tls_mode: str | None = None,
+        tls_pinned_sha256: str | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None: ...
+
+    async def create_integration_with_fleet_device(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        provider: str,
+        name: str,
+        base_url: str,
+        auth_mode: str,
+        controller_model: str,
+        session_duration_seconds: int,
+        sync_interval_seconds: int,
+        controller_id: str | None = None,
+        serial_number: str | None = None,
+        mac_address: str | None = None,
+        external_site_id: str | None = None,
+        external_site_name: str | None = None,
+        guest_ssid_id: str | None = None,
+        guest_ssid_name: str | None = None,
+        is_enabled: bool = True,
+        tls_mode: str | None = None,
+        tls_pinned_sha256: str | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> tuple[Any, Any]: ...
+
+
 class PlanProvisioningProtocol(Protocol):
     async def get_plan(
         self, plan_id: uuid.UUID, *, include_deleted: bool = False
@@ -656,6 +743,36 @@ class RouterInput:
 
 
 @dataclass(frozen=True, slots=True)
+class NetworkControllerInput:
+    """A network controller (TP-Link Omada) as the venue's first device --
+    the same fields Master onboarding takes, minus the tenant and venue,
+    which this flow creates. The two secrets are ``repr=False`` so a
+    logged or asserted-on input never prints them."""
+
+    name: str
+    base_url: str
+    controller_model: str
+    provider: str = "omada"
+    auth_mode: str = "openapi"
+    controller_id: str | None = None
+    serial_number: str | None = None
+    mac_address: str | None = None
+    external_site_id: str | None = None
+    external_site_name: str | None = None
+    guest_ssid_id: str | None = None
+    guest_ssid_name: str | None = None
+    session_duration_seconds: int = DEFAULT_SESSION_DURATION_SECONDS
+    sync_interval_seconds: int = DEFAULT_SYNC_INTERVAL_SECONDS
+    is_enabled: bool = True
+    tls_mode: str | None = None
+    tls_pinned_sha256: str | None = None
+    client_id: str | None = None
+    client_secret: str | None = field(default=None, repr=False)
+    username: str | None = None
+    password: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class FeatureOverride:
     feature_key: PlanFeatureKey
     limit_value: Decimal | None = None
@@ -665,10 +782,15 @@ class FeatureOverride:
 
 @dataclass(frozen=True, slots=True)
 class ProvisionLocationInput:
+    """Exactly one of ``router`` and ``network_controller`` is set -- the
+    request schema enforces it, and ``provision_location`` re-checks it
+    rather than trusting every caller to have gone through that schema."""
+
     location: LocationInput
     owner: OwnerInput
-    router: RouterInput
     plan_id: uuid.UUID
+    router: RouterInput | None = None
+    network_controller: NetworkControllerInput | None = None
     existing_organization_id: uuid.UUID | None = None
     new_organization: NewOrganizationInput | None = None
     feature_overrides: tuple[FeatureOverride, ...] = ()
@@ -697,6 +819,8 @@ class ProvisionLocationResult:
     owner_temporary_password: str
     login_url: str
     provisioned_at: datetime
+    device_kind: str = "router"
+    network_integration_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -740,7 +864,7 @@ class ProvisionLocationPreview:
     customer_id: str
     site_id: str
     nas_id: str
-    controller_id: str
+    controller_id: str | None
     plan_id: uuid.UUID
     plan_name: str
     feature_summary: dict[str, object]
@@ -748,12 +872,31 @@ class ProvisionLocationPreview:
     owner_email: str
     owner_username_preview: str
     router_name: str
+    device_kind: str = "router"
 
 
 # ============================================================================
 # Generation helpers -- see module docstring's "Username / temporary-
 # password generation" section.
 # ============================================================================
+
+
+_DEVICE_KIND_ROUTER = "router"
+_DEVICE_KIND_NETWORK_CONTROLLER = "network_controller"
+
+
+def _first_device(
+    data: ProvisionLocationInput,
+) -> tuple[RouterInput | None, NetworkControllerInput | None]:
+    """The request's one first device. The request schema already enforces
+    exactly one; this re-checks it so a caller that built the input by hand
+    cannot provision a venue with no device (no guest could ever sign in)
+    or with two (nobody asked for that)."""
+    if (data.router is None) == (data.network_controller is None):
+        raise ValueError(
+            "Exactly one of router or network_controller must be provided"
+        )
+    return data.router, data.network_controller
 
 
 def _generate_username(email: str) -> str:
@@ -897,6 +1040,7 @@ class LocationProvisioningService:
         *,
         login_url_base: str = _DEFAULT_LOGIN_URL_BASE,
         notification_service: NotificationSenderProtocol | None = None,
+        network_controller_service: NetworkControllerOnboardingProtocol | None = None,
     ) -> None:
         self.location_service = location_service
         self.organization_service = organization_service
@@ -915,6 +1059,11 @@ class LocationProvisioningService:
         self.notification_service: NotificationSenderProtocol = (
             notification_service or _NoopNotificationSender()
         )
+        # Optional so the many existing unit tests that build this service
+        # by hand keep constructing it unchanged. Its absence is an error,
+        # not a degradation: a network-controller request refuses with
+        # NetworkControllerProvisioningUnavailableError.
+        self.network_controller_service = network_controller_service
 
     # -- preview (read-only dry run) ----------------------------------------
 
@@ -953,7 +1102,13 @@ class LocationProvisioningService:
         if owner_role is None:
             raise OwnerRoleNotSeededError()
 
-        if data.router_config_template_id is None:
+        router_input, controller_input = _first_device(data)
+        if controller_input is not None:
+            # The same input-only refusals the real submit makes first, so
+            # the review screen shows them instead of a clean preview that
+            # then fails. No RouterOS template applies to a controller.
+            await self._precheck_network_controller(controller_input)
+        elif data.router_config_template_id is None:
             await self._resolve_default_template_id()
 
         base_plan = await self.plan_service.get_plan(data.plan_id)
@@ -972,14 +1127,31 @@ class LocationProvisioningService:
             customer_id=customer_id,
             site_id=site_id,
             nas_id=nas_id,
-            controller_id=data.router.serial_number,
+            # A software controller's fleet identity is derived from the
+            # integration id at provisioning time, so there is nothing to
+            # preview yet -- None, rather than a placeholder that reads like
+            # a real serial number.
+            controller_id=(
+                router_input.serial_number
+                if router_input is not None
+                else controller_input.serial_number  # type: ignore[union-attr]
+            ),
             plan_id=base_plan.id,
             plan_name=base_plan.name,
             feature_summary=feature_summary,
             owner_name=f"{data.owner.first_name} {data.owner.last_name}".strip(),
             owner_email=data.owner.email,
             owner_username_preview=owner_username_preview,
-            router_name=data.router.name,
+            router_name=(
+                router_input.name
+                if router_input is not None
+                else controller_input.name  # type: ignore[union-attr]
+            ),
+            device_kind=(
+                _DEVICE_KIND_ROUTER
+                if router_input is not None
+                else _DEVICE_KIND_NETWORK_CONTROLLER
+            ),
         )
 
     # -- main orchestration ------------------------------------------------
@@ -992,6 +1164,21 @@ class LocationProvisioningService:
         transactional-guarantee section for why that is exactly what makes
         the single-transaction rollback real."""
         now = datetime.now(UTC)
+        router_input, controller_input = _first_device(data)
+
+        # -- 0. Network controller: refuse on the inputs alone, first ---------
+        #
+        # Everything the controller step can refuse without a database row
+        # to look at -- an unacceptable URL, credentials that do not fit the
+        # auth mode, a certificate-trust pair that does not add up, the
+        # public-default encryption key -- is checked before step (a). The
+        # rollback would undo the rows either way; this is about the two
+        # counters step (b) draws a location code and a NAS code from,
+        # which a rollback does not give back, and about telling the
+        # operator what is wrong with the one field they got wrong rather
+        # than after an organization and an owner were built and discarded.
+        if controller_input is not None:
+            await self._precheck_network_controller(controller_input)
 
         # -- a. Create Organization (if new) / reuse existing ----------------
         organization = await self._resolve_organization(actor_user_id, data)
@@ -1051,21 +1238,37 @@ class LocationProvisioningService:
             owner, must_change_password=True
         )
 
-        # -- d. Register Router ------------------------------------------------
-        router = await self.router_service.create_router(
-            actor_user_id=actor_user_id,
-            location_id=location.id,
-            requesting_organization_id=None,
-            name=data.router.name,
-            serial_number=data.router.serial_number,
-            mac_address=data.router.mac_address,
-            model=data.router.model,
-            management_ip_address=data.router.management_ip_address,
-            public_ip_address=data.router.public_ip_address,
-            api_username=data.router.api_username,
-            api_secret=data.router.api_secret,
-            settings=dict(data.router.settings),
-        )
+        # -- d. Register the first device ------------------------------------
+        #
+        # A MikroTik router, or a network controller registered through the
+        # network integration domain's own Master onboarding method, which
+        # writes the integration and the fleet row that represents it (a
+        # guest session needs one: guest_sessions.router_id is NOT NULL).
+        integration_id: uuid.UUID | None = None
+        if controller_input is not None:
+            integration, router = await self._onboard_network_controller(
+                actor_user_id=actor_user_id,
+                organization_id=organization.id,
+                location_id=location.id,
+                controller=controller_input,
+            )
+            integration_id = integration.id
+        else:
+            assert router_input is not None  # noqa: S101 -- _first_device
+            router = await self.router_service.create_router(
+                actor_user_id=actor_user_id,
+                location_id=location.id,
+                requesting_organization_id=None,
+                name=router_input.name,
+                serial_number=router_input.serial_number,
+                mac_address=router_input.mac_address,
+                model=router_input.model,
+                management_ip_address=router_input.management_ip_address,
+                public_ip_address=router_input.public_ip_address,
+                api_username=router_input.api_username,
+                api_secret=router_input.api_secret,
+                settings=dict(router_input.settings),
+            )
 
         # -- e. Generate WireGuard Peer -- DEFERRED, see step (e') below --------
         #
@@ -1099,15 +1302,20 @@ class LocationProvisioningService:
         # in scope for a template today.
 
         # -- f. Apply default router configuration ------------------------------
-        template_id = data.router_config_template_id
-        if template_id is None:
-            template_id = await self._resolve_default_template_id()
-        await self.router_provisioning_service.assign_profile(
-            actor_user_id=actor_user_id,
-            router_id=router.id,
-            template_id=template_id,
-            requesting_organization_id=None,
-        )
+        #
+        # MikroTik only. A config template is RouterOS script, and a
+        # controller's fleet row speaks no RouterOS; assigning one would
+        # queue a push that could never be delivered.
+        if router_input is not None:
+            template_id = data.router_config_template_id
+            if template_id is None:
+                template_id = await self._resolve_default_template_id()
+            await self.router_provisioning_service.assign_profile(
+                actor_user_id=actor_user_id,
+                router_id=router.id,
+                template_id=template_id,
+                requesting_organization_id=None,
+            )
 
         # -- g. Apply Subscription Plan (License is created/activated by
         # SubscriptionService.create_subscription itself -- see module
@@ -1218,28 +1426,37 @@ class LocationProvisioningService:
         # `allocate_tunnel_via_hub`'s reuse and adopt branches cannot match
         # and this always reaches the bridge -- one `POST /wg/peer` per
         # successfully provisioned customer, which is the minimum possible.
-        try:
-            tunnel = await self.wireguard_service.allocate_tunnel_via_hub(
-                actor_user_id=actor_user_id,
-                router_id=router.id,
-                requesting_organization_id=None,
-            )
-        except (HubBridgeUnavailableError, WireGuardError) as exc:
-            # BOTH types are named on purpose. `HubBridgeUnavailableError`
-            # subclasses `CloudGuestError`, NOT `WireGuardError` -- it is
-            # also the most likely failure here (the hub is another machine
-            # on the far end of an HTTP call), so an `except WireGuardError`
-            # alone would miss exactly the case this handler exists for.
-            # See that class's own docstring, trap 1.
-            #
-            # Re-raised, never swallowed: the re-raise is what makes the
-            # rollback happen, and a half-provisioned customer reported as a
-            # success is strictly worse than a clean failure. All this adds
-            # is the fact the operator needs and none of the underlying
-            # errors carry -- that nothing was saved.
-            raise RouterTunnelProvisioningFailedError(
-                router_name=router.name, cause=exc
-            ) from exc
+        #
+        # Never for a network controller. Its fleet row runs no agent and
+        # has no WireGuard peer to configure, and a hub peer minted for it
+        # would be the one write here that nothing can undo -- #204 closed
+        # the same hole on the router domain's own tunnel endpoints.
+        tunnel_ip_address: str | None = None
+        if router_input is not None:
+            try:
+                tunnel = await self.wireguard_service.allocate_tunnel_via_hub(
+                    actor_user_id=actor_user_id,
+                    router_id=router.id,
+                    requesting_organization_id=None,
+                )
+            except (HubBridgeUnavailableError, WireGuardError) as exc:
+                # BOTH types are named on purpose. `HubBridgeUnavailableError`
+                # subclasses `CloudGuestError`, NOT `WireGuardError` -- it
+                # is also the most likely failure here (the hub is another
+                # machine on the far end of an HTTP call), so an
+                # `except WireGuardError` alone would miss exactly the case
+                # this handler exists for. See that class's own docstring,
+                # trap 1.
+                #
+                # Re-raised, never swallowed: the re-raise is what makes the
+                # rollback happen, and a half-provisioned customer reported
+                # as a success is strictly worse than a clean failure. All
+                # this adds is the fact the operator needs and none of the
+                # underlying errors carry -- that nothing was saved.
+                raise RouterTunnelProvisioningFailedError(
+                    router_name=router.name, cause=exc
+                ) from exc
+            tunnel_ip_address = tunnel.peer.tunnel_ip_address
 
         # -- k. Audit logging (one additional Location-domain entry for the
         # overall event -- every composed step above already wrote its own,
@@ -1255,6 +1472,14 @@ class LocationProvisioningService:
                 "router_id": str(router.id),
                 "plan_id": str(effective_plan_id),
                 "owner_user_id": str(owner.id),
+                "device_kind": (
+                    _DEVICE_KIND_ROUTER
+                    if router_input is not None
+                    else _DEVICE_KIND_NETWORK_CONTROLLER
+                ),
+                "network_integration_id": (
+                    str(integration_id) if integration_id is not None else None
+                ),
             },
             organization_id=organization.id,
             location_id=location.id,
@@ -1300,7 +1525,7 @@ class LocationProvisioningService:
             feature_summary=feature_summary,
             router_id=router.id,
             router_name=router.name,
-            tunnel_ip_address=tunnel.peer.tunnel_ip_address,
+            tunnel_ip_address=tunnel_ip_address,
             owner_user_id=owner.id,
             owner_name=f"{owner.first_name} {owner.last_name}".strip(),
             owner_username=owner.username,
@@ -1308,7 +1533,80 @@ class LocationProvisioningService:
             owner_temporary_password=temporary_password,
             login_url=login_url,
             provisioned_at=now,
+            device_kind=(
+                _DEVICE_KIND_ROUTER
+                if router_input is not None
+                else _DEVICE_KIND_NETWORK_CONTROLLER
+            ),
+            network_integration_id=integration_id,
         )
+
+    # -- network controller first device ------------------------------------
+
+    def _require_network_controller_service(
+        self,
+    ) -> NetworkControllerOnboardingProtocol:
+        if self.network_controller_service is None:
+            raise NetworkControllerProvisioningUnavailableError()
+        return self.network_controller_service
+
+    async def _precheck_network_controller(
+        self, controller: NetworkControllerInput
+    ) -> None:
+        await self._require_network_controller_service().precheck_controller_onboarding(
+            provider=controller.provider,
+            base_url=controller.base_url,
+            auth_mode=controller.auth_mode,
+            tls_mode=controller.tls_mode,
+            tls_pinned_sha256=controller.tls_pinned_sha256,
+            client_id=controller.client_id,
+            client_secret=controller.client_secret,
+            username=controller.username,
+            password=controller.password,
+        )
+
+    async def _onboard_network_controller(
+        self,
+        *,
+        actor_user_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        location_id: uuid.UUID,
+        controller: NetworkControllerInput,
+    ) -> tuple[Any, Router]:
+        """Master onboarding's own method, pointed at the organization and
+        location this request just created. Returns
+        ``(integration, fleet_device)``. Nothing is caught: a failure here
+        rolls the whole customer back like any other step."""
+        service = self._require_network_controller_service()
+        integration, fleet_device = (
+            await service.create_integration_with_fleet_device(
+                actor_user_id=actor_user_id,
+                organization_id=organization_id,
+                location_id=location_id,
+                provider=controller.provider,
+                name=controller.name,
+                base_url=controller.base_url,
+                auth_mode=controller.auth_mode,
+                controller_model=controller.controller_model,
+                session_duration_seconds=controller.session_duration_seconds,
+                sync_interval_seconds=controller.sync_interval_seconds,
+                controller_id=controller.controller_id,
+                serial_number=controller.serial_number,
+                mac_address=controller.mac_address,
+                external_site_id=controller.external_site_id,
+                external_site_name=controller.external_site_name,
+                guest_ssid_id=controller.guest_ssid_id,
+                guest_ssid_name=controller.guest_ssid_name,
+                is_enabled=controller.is_enabled,
+                tls_mode=controller.tls_mode,
+                tls_pinned_sha256=controller.tls_pinned_sha256,
+                client_id=controller.client_id,
+                client_secret=controller.client_secret,
+                username=controller.username,
+                password=controller.password,
+            )
+        )
+        return integration, fleet_device
 
     # -- resend welcome email ------------------------------------------------
 

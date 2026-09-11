@@ -37,10 +37,12 @@ from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.captive_portal.validators import default_splash_headline
 from app.domains.connected_devices.dependencies import get_connected_device_service
 from app.domains.connected_devices.service import ConnectedDeviceService
+from app.domains.rbac.authorization import AccessValidator
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
     RequirePermission,
+    get_access_validator,
 )
 from app.domains.rbac.enums import ScopeType
 from app.domains.router.dependencies import get_router_service
@@ -54,6 +56,7 @@ from .models import Location
 from .provisioning_dependencies import get_location_provisioning_service
 from .provisioning_schemas import (
     FeatureOverrideInputSchema,
+    NetworkControllerInputSchema,
     ProvisionLocationPreviewResponse,
     ProvisionLocationRequest,
     ProvisionLocationResponse,
@@ -63,6 +66,7 @@ from .provisioning_service import (
     FeatureOverride,
     LocationInput,
     LocationProvisioningService,
+    NetworkControllerInput,
     NewOrganizationInput,
     OwnerInput,
     ProvisionLocationInput,
@@ -526,6 +530,58 @@ def _feature_override(item: FeatureOverrideInputSchema) -> FeatureOverride:
     )
 
 
+def _network_controller_input(
+    controller: NetworkControllerInputSchema,
+) -> NetworkControllerInput:
+    return NetworkControllerInput(
+        provider=controller.provider,
+        name=controller.name,
+        base_url=controller.base_url,
+        auth_mode=controller.auth_mode,
+        controller_id=controller.controller_id,
+        controller_model=controller.controller_model,
+        serial_number=controller.serial_number,
+        mac_address=controller.mac_address,
+        external_site_id=controller.external_site_id,
+        external_site_name=controller.external_site_name,
+        guest_ssid_id=controller.guest_ssid_id,
+        guest_ssid_name=controller.guest_ssid_name,
+        session_duration_seconds=controller.session_duration_seconds,
+        sync_interval_seconds=controller.sync_interval_seconds,
+        is_enabled=controller.is_enabled,
+        tls_mode=controller.tls_mode,
+        tls_pinned_sha256=controller.tls_pinned_sha256,
+        client_id=controller.client_id,
+        client_secret=controller.client_secret,
+        username=controller.username,
+        password=controller.password,
+    )
+
+
+async def _require_controller_permission(
+    payload: ProvisionLocationRequest,
+    user: AuthUser,
+    access_validator: AccessValidator,
+) -> None:
+    """A network-controller first device is a network integration, so the
+    caller needs the permission that creates one -- the same
+    ``network_integrations.create`` at GLOBAL scope Master onboarding
+    (``POST /network-integrations/platform/onboard``) requires -- on top of
+    this route's own ``locations.manage``. Otherwise provisioning would be a
+    side door around that permission.
+
+    Checked in the handler rather than as a route dependency because it
+    depends on the body: a MikroTik request must keep needing only
+    ``locations.manage``, exactly as before."""
+    if payload.network_controller is None:
+        return
+    await access_validator.check(
+        uuid.UUID(user.id),
+        "network_integrations.create",
+        scope_type=ScopeType.GLOBAL,
+    )
+
+
 def _provision_input(payload: ProvisionLocationRequest) -> ProvisionLocationInput:
     new_organization = (
         NewOrganizationInput(
@@ -572,16 +628,25 @@ def _provision_input(payload: ProvisionLocationRequest) -> ProvisionLocationInpu
             language=payload.owner.language,
             send_welcome_sms=payload.owner.send_welcome_sms,
         ),
-        router=RouterInput(
-            name=payload.router.name,
-            serial_number=payload.router.serial_number,
-            mac_address=payload.router.mac_address,
-            model=payload.router.model,
-            management_ip_address=payload.router.management_ip_address,
-            public_ip_address=payload.router.public_ip_address,
-            api_username=payload.router.api_username,
-            api_secret=payload.router.api_secret,
-            settings=payload.router.settings,
+        router=(
+            RouterInput(
+                name=payload.router.name,
+                serial_number=payload.router.serial_number,
+                mac_address=payload.router.mac_address,
+                model=payload.router.model,
+                management_ip_address=payload.router.management_ip_address,
+                public_ip_address=payload.router.public_ip_address,
+                api_username=payload.router.api_username,
+                api_secret=payload.router.api_secret,
+                settings=payload.router.settings,
+            )
+            if payload.router is not None
+            else None
+        ),
+        network_controller=(
+            _network_controller_input(payload.network_controller)
+            if payload.network_controller is not None
+            else None
         ),
         plan_id=uuid.UUID(payload.plan_id),
         existing_organization_id=(
@@ -613,6 +678,8 @@ def _provision_input(payload: ProvisionLocationRequest) -> ProvisionLocationInpu
 async def preview_provision_location(
     request: Request,
     payload: ProvisionLocationRequest,
+    user: AuthUser = Depends(CurrentUser),
+    access_validator: AccessValidator = Depends(get_access_validator),
     provisioning_service: LocationProvisioningService = Depends(
         get_location_provisioning_service
     ),
@@ -621,6 +688,7 @@ async def preview_provision_location(
     provisioning" step -- read-only, never creates anything. Takes the
     exact same request body ``POST /locations/provision`` does (so a
     client can preview, then re-submit the identical payload to commit)."""
+    await _require_controller_permission(payload, user, access_validator)
     preview = await provisioning_service.preview_provision_location(
         data=_provision_input(payload)
     )
@@ -640,6 +708,7 @@ async def preview_provision_location(
         owner_email=preview.owner_email,
         owner_username_preview=preview.owner_username_preview,
         router_name=preview.router_name,
+        device_kind=preview.device_kind,
     )
     return build_response(
         success=True,
@@ -661,10 +730,12 @@ async def provision_location(
     request: Request,
     payload: ProvisionLocationRequest,
     user: AuthUser = Depends(CurrentUser),
+    access_validator: AccessValidator = Depends(get_access_validator),
     provisioning_service: LocationProvisioningService = Depends(
         get_location_provisioning_service
     ),
 ):
+    await _require_controller_permission(payload, user, access_validator)
     result = await provisioning_service.provision_location(
         actor_user_id=uuid.UUID(user.id),
         data=_provision_input(payload),
@@ -679,8 +750,14 @@ async def provision_location(
         plan_id=str(result.plan_id),
         plan_name=result.plan_name,
         feature_summary=result.feature_summary,
+        device_kind=result.device_kind,
         router_id=str(result.router_id),
         router_name=result.router_name,
+        network_integration_id=(
+            str(result.network_integration_id)
+            if result.network_integration_id is not None
+            else None
+        ),
         tunnel_ip_address=result.tunnel_ip_address,
         owner_user_id=str(result.owner_user_id),
         owner_name=result.owner_name,
