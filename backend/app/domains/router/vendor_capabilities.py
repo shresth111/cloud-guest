@@ -48,16 +48,20 @@ where that decision gets recorded.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, TypeVar
 
 __all__ = [
     "CONTROLLER_MANAGED_VENDORS",
     "NOT_APPLICABLE_REASON",
+    "agent_managed_rows",
     "is_agent_managed",
     "is_controller_managed",
     "supports_zero_touch_provisioning",
     "vendor_of",
 ]
+
+_Row = TypeVar("_Row")
 
 
 # Vendors whose devices this platform reaches only through the vendor's own
@@ -132,3 +136,24 @@ def supports_zero_touch_provisioning(value: Any) -> bool:
     silently inheriting the other's answer.
     """
     return is_agent_managed(value)
+
+
+def agent_managed_rows(rows: Iterable[_Row]) -> list[_Row]:
+    """The agent-managed subset of a batch of fleet rows.
+
+    For the callers that must read the whole roster for one purpose and
+    judge only part of it for another -- the alert evaluator being the
+    case that forced this: the same ``list_routers`` result resolves an
+    alert's router *name* (where a controller must appear, or the customer
+    reads a bare UUID) and feeds the rules that decide whether a device is
+    down (where it must not, because those rules read columns only an
+    agent ever writes).
+
+    A named function rather than a comprehension at each site so the
+    router-read coverage test has something to recognise, and so a reader
+    of the sweep sees the question being asked instead of a filter that
+    looks like a performance tweak. Prefer
+    ``fleet_scope.agent_managed_only`` when the rows have not been loaded
+    yet -- a row a sweep never loads is a row it cannot act on by mistake.
+    """
+    return [row for row in rows if is_agent_managed(row)]

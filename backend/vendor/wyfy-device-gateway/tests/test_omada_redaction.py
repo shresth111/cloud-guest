@@ -186,6 +186,8 @@ def test_every_error_class_exposes_its_contract_code():
     expected = {
         "OmadaAuthError": "OMADA_AUTH_FAILED",
         "OmadaConnectionError": "OMADA_CONNECTION_FAILED",
+        "OmadaTlsTrustError": "OMADA_TLS_UNTRUSTED",
+        "OmadaTlsPinMismatchError": "OMADA_TLS_PIN_MISMATCH",
         "OmadaTimeoutError": "OMADA_TIMEOUT",
         "OmadaRateLimitedError": "OMADA_RATE_LIMITED",
         "OmadaInvalidControllerError": "OMADA_INVALID_CONTROLLER",

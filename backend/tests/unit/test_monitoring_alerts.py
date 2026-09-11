@@ -149,6 +149,11 @@ class FakeRouter:
     name: str
     health_status: str | None
     reachability_state: str | None = None
+    # Contract 11.5. Defaulted to the column's own default so every
+    # pre-existing construction in this file means exactly what it always
+    # meant -- a MikroTik running this platform's agent -- and the vendor
+    # gate this field feeds is only visible to the tests that set it.
+    vendor: str = "mikrotik"
 
 
 @dataclass
@@ -754,6 +759,166 @@ async def test_health_status_rule_auto_resolves_on_recovery():
 # ============================================================================
 # Alert Engine: evaluation -- HEALTH_STATUS_CHANGE (per-router)
 # ============================================================================
+
+
+# ============================================================================
+# Contract 11.5: a controller-managed fleet row is never judged as a device
+# ============================================================================
+
+
+def _controller_row(org_id: uuid.UUID, **overrides) -> FakeRouter:
+    """A TP-Link Omada controller as `create_integration_with_fleet_device`
+    actually writes it: a real `Router` row (because
+    `guest_sessions.router_id` is NOT NULL and an Omada-only venue has no
+    MikroTik in the path at all) whose agent-written columns are NULL
+    forever, not temporarily."""
+    fields = dict(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name="Lobby Controller",
+        health_status=None,
+        reachability_state=None,
+        vendor="tplink_omada",
+    )
+    fields.update(overrides)
+    return FakeRouter(**fields)
+
+
+async def test_a_controller_is_not_alerted_on_by_a_router_health_rule():
+    """The rule reads `Router.health_status`, which only an agent health
+    snapshot ever writes. A rule written for the NULL-ish state -- and
+    `unknown` is a state an operator would plausibly want to watch -- would
+    otherwise fire on every Omada venue, forever, with no action anyone
+    could take: the device will never run an agent."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    repo.routers.append(_controller_row(org_id, health_status="unhealthy"))
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ROUTER,
+            condition_config={"expected_status": "unhealthy"},
+            organization_id=org_id,
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert result.triggered == []
+
+
+async def test_a_controller_is_not_alerted_on_by_a_reachability_rule():
+    """`reachability_state` is written solely by
+    `RouterService.sweep_router_reachability`, whose candidate query is
+    inner-joined to `router_agent_credentials`. A controller has none, so
+    the column is permanently NULL -- and a rule watching for a state the
+    sweep can never write is a rule that can never resolve either."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    repo.routers.append(_controller_row(org_id, reachability_state="unreachable"))
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ROUTER_REACHABILITY,
+            condition_config={"expected_status": "unreachable"},
+            organization_id=org_id,
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert result.triggered == []
+
+
+async def test_a_controller_is_not_alerted_on_by_a_threshold_rule():
+    """Threshold rules read `RouterHealthSnapshot` metrics, which the agent
+    poll writes. Today a controller simply has no snapshot, so the rule
+    falls through -- this pins the gate rather than the accident, because
+    a snapshot arriving from some other writer would otherwise start
+    paging on a device with no CPU of ours to measure."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    controller = _controller_row(org_id)
+    repo.routers.append(controller)
+    repo.snapshots[controller.id] = FakeSnapshot(cpu_usage_percent=99.0)
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.THRESHOLD,
+            target_component=None,
+            condition_config={
+                "metric": "cpu_usage_percent",
+                "operator": "gte",
+                "value": 75,
+            },
+            organization_id=org_id,
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert result.triggered == []
+
+
+async def test_a_mikrotik_beside_a_controller_is_still_alerted_on():
+    """The gate has to be narrow. An Omada controller at one venue must not
+    make the MikroTik at the next one invisible to the same rule."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    mikrotik = FakeRouter(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=uuid.uuid4(),
+        name="Router One",
+        health_status="unhealthy",
+    )
+    repo.routers.append(_controller_row(org_id, health_status="unhealthy"))
+    repo.routers.append(mikrotik)
+    await repo.create_alert_rule(
+        **_alert_rule_fields(
+            trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+            target_component=ALERT_TARGET_ROUTER,
+            condition_config={"expected_status": "unhealthy"},
+            organization_id=org_id,
+        )
+    )
+
+    result = await service.evaluate_alert_rules()
+
+    assert [a.router_id for a in result.triggered] == [mikrotik.id]
+
+
+async def test_a_controller_still_resolves_to_its_name_on_the_alerts_page():
+    """The other half, and the reason `MonitoringRepository.list_routers`
+    is deliberately NOT filtered in SQL. An alert can legitimately carry a
+    controller's `router_id` -- the network integration links one -- and a
+    name lookup that hid the row would put a bare UUID back on the
+    customer's Alerts page, the exact defect
+    `get_router_names_for_alerts` was written to fix."""
+    repo = FakeRepository()
+    service = AlertService(repo)
+    org_id = uuid.uuid4()
+    controller = _controller_row(org_id)
+    repo.routers.append(controller)
+    alert = await repo.create_alert(
+        rule_id=uuid.uuid4(),
+        organization_id=org_id,
+        location_id=controller.location_id,
+        router_id=controller.id,
+        message="something",
+        severity=AlertSeverity.CRITICAL.value,
+        status=AlertStatus.TRIGGERED.value,
+    )
+
+    names = await service.get_router_names_for_alerts(
+        [alert], organization_id=org_id
+    )
+
+    assert names == {controller.id: controller.name}
 
 
 async def test_router_health_status_rule_triggers_and_resolves():

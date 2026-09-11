@@ -122,12 +122,14 @@ from typing import Any
 from ..constants import (
     ROUTER_VENDOR_BY_PROVIDER,
     ControllerAuthMode,
+    ControllerTlsMode,
     NetworkProviderKind,
 )
 from ..exceptions import (
     PROVIDER_ERRORS_BY_CODE,
     ProviderConnectionFailedError,
     ProviderError,
+    ProviderTlsPinMismatchError,
     ProviderUnsupportedApiError,
 )
 from ..validators import validate_controller_url
@@ -140,6 +142,7 @@ from .base import (
     ProviderPortalContext,
     ProviderSite,
     ProviderSsid,
+    ProviderTlsObservation,
 )
 
 logger = logging.getLogger(__name__)
@@ -205,6 +208,9 @@ def _gateway_credentials(config: ProviderConnectionConfig, base_url: str) -> Any
         ControllerCredentials,
         ControllerVendor,
     )
+    from wyfy_device_gateway.controller_contract import (  # noqa: PLC0415
+        ControllerTlsMode as GatewayTlsMode,
+    )
 
     credentials = config.credentials or {}
     mode = (
@@ -221,7 +227,8 @@ def _gateway_credentials(config: ProviderConnectionConfig, base_url: str) -> Any
         username=credentials.get("username"),
         password=credentials.get("password"),
         omadac_id=config.controller_id,
-        verify_tls=config.verify_tls,
+        tls_mode=GatewayTlsMode(config.tls_mode),
+        tls_pinned_sha256=config.tls_pinned_sha256,
         timeout_seconds=config.timeout_seconds,
     )
 
@@ -248,15 +255,54 @@ def _translate(exc: Exception) -> ProviderError:
     """
     code = getattr(exc, "code", None)
     message = str(exc) or None
+    # The gateway's own raw vendor code, as an integer. Contract §2 makes this
+    # the single piece of the controller's response that is allowed to survive
+    # into an exception, precisely because an integer cannot smuggle a
+    # credential. Carried across the seam because the normalized ``ErrorCode``
+    # is deliberately coarser than the vendor's: Omada's -41500 and -41501 both
+    # normalize to OMADA_AUTHORIZATION_FAILED, and -41500 is the only fault the
+    # controller names. Dropping it here -- which is what happened until now --
+    # discards the one discrimination the controller makes.
+    raw = getattr(exc, "provider_code", None)
+    provider_code = raw if isinstance(raw, int) and not isinstance(raw, bool) else None
     if isinstance(code, str):
         error_class = PROVIDER_ERRORS_BY_CODE.get(code)
         if error_class is not None:
-            return error_class(message)
+            return error_class(message).with_diagnostics(provider_code=provider_code)
         logger.warning(
             "network_integration_unmapped_provider_error_code",
             extra={"provider_error_code": code},
         )
-    return ProviderConnectionFailedError(message)
+    return ProviderConnectionFailedError(message).with_diagnostics(
+        provider_code=provider_code
+    )
+
+
+def _describe_certificate(
+    certificate_der: bytes | None,
+) -> tuple[str | None, str | None, datetime | None]:
+    """``(subject, issuer, expiry)`` for display, or three ``None``s.
+
+    Best-effort on purpose. Everything this returns is decoration around the
+    fingerprint, which is the value the operator is actually confirming, so
+    an unparseable certificate must degrade rather than break the probe. The
+    import is local for the same reason the gateway import is: nothing in
+    this module should be able to stop the domain from importing.
+    """
+    if not certificate_der:
+        return None, None, None
+    try:
+        from cryptography import x509  # noqa: PLC0415
+
+        certificate = x509.load_der_x509_certificate(bytes(certificate_der))
+        return (
+            certificate.subject.rfc4514_string(),
+            certificate.issuer.rfc4514_string(),
+            certificate.not_valid_after_utc,
+        )
+    except Exception:  # noqa: BLE001 -- display-only, never fatal
+        logger.warning("network_integration_certificate_parse_failed")
+        return None, None, None
 
 
 def _is_gateway_error(exc: Exception) -> bool:
@@ -291,6 +337,25 @@ class OmadaProvider:
 
     # -- internals ---------------------------------------------------------
 
+    @staticmethod
+    def _assert_trust_is_coherent(config: ProviderConnectionConfig) -> None:
+        """Refuse a config that says it pins and carries nothing to pin to.
+
+        The gateway refuses this too, and this is not a duplicate of that
+        check -- it is the one that runs before the URL is re-resolved and
+        before a socket is opened, so a misconfigured row costs nothing and
+        produces this domain's own 422 rather than a 502 describing a
+        controller that was never contacted.
+        """
+        if config.tls_mode != ControllerTlsMode.PINNED.value:
+            return
+        if not config.tls_pinned_sha256:
+            raise ProviderTlsPinMismatchError(
+                "This integration is set to pin the controller's HTTPS "
+                "certificate but has no fingerprint recorded. Run Test "
+                "Connection to capture and confirm the certificate."
+            )
+
     async def _creds(self, config: ProviderConnectionConfig) -> Any:
         """Re-validate the URL, then build gateway credentials.
 
@@ -303,6 +368,7 @@ class OmadaProvider:
         before every outbound call. See ``validators.py``'s "Validated
         twice, deliberately".
         """
+        self._assert_trust_is_coherent(config)
         validated = await validate_controller_url(config.base_url)
         return _gateway_credentials(config, validated.base_url)
 
@@ -350,6 +416,37 @@ class OmadaProvider:
     ) -> ProviderControllerInfo:
         info = await self._call(config, "get_controller_info")
         return self._controller_info(info)
+
+    async def inspect_tls(
+        self, config: ProviderConnectionConfig
+    ) -> ProviderTlsObservation:
+        """The certificate the controller is presenting, for the operator.
+
+        Goes through :meth:`_call` like everything else, so the URL is
+        re-validated against the SSRF rules immediately beforehand and the
+        gateway's errors are translated the same way. That matters more here
+        than elsewhere: this is the one call an operator makes at an address
+        this platform has never successfully talked to.
+
+        The certificate is parsed for a subject and an expiry *here* rather
+        than in the gateway, because the gateway's dependency list is
+        deliberately four packages long and does not include
+        ``cryptography``, while this application already depends on it. A
+        parse failure degrades to a bare fingerprint rather than failing the
+        observation -- the fingerprint is the part the operator confirms.
+        """
+        observation = await self._call(config, "inspect_tls")
+        subject, issuer, not_valid_after = _describe_certificate(
+            getattr(observation, "certificate_der", None)
+        )
+        return ProviderTlsObservation(
+            fingerprint_sha256=str(observation.fingerprint_sha256),
+            chain_trusted=bool(observation.chain_trusted),
+            matches_pin=getattr(observation, "matches_pin", None),
+            subject=subject,
+            issuer=issuer,
+            not_valid_after=not_valid_after,
+        )
 
     async def list_sites(
         self, config: ProviderConnectionConfig
@@ -440,14 +537,23 @@ class OmadaProvider:
             # controller's request byte-identical to what it was.
             client_ip=context.client_ip,
         )
-        result = await self._call(
-            config,
-            "authorize_guest",
+        snapshot = self._authorize_snapshot(
             gateway_context,
             duration_seconds=duration_seconds,
             down_kbps=down_kbps,
             up_kbps=up_kbps,
         )
+        try:
+            result = await self._call(
+                config,
+                "authorize_guest",
+                gateway_context,
+                duration_seconds=duration_seconds,
+                down_kbps=down_kbps,
+                up_kbps=up_kbps,
+            )
+        except ProviderError as error:
+            raise error.with_diagnostics(request_snapshot=snapshot) from None
         expires_at = getattr(result, "expires_at", None)
         if expires_at is None and getattr(result, "authorized", False):
             # INFERRED, unverified: whether the gateway populates
@@ -462,7 +568,74 @@ class OmadaProvider:
             authorized=bool(getattr(result, "authorized", False)),
             expires_at=expires_at,
             provider_code=getattr(result, "provider_code", None),
+            request_snapshot=snapshot,
         )
+
+    @staticmethod
+    def _authorize_snapshot(
+        gateway_context: Any,
+        *,
+        duration_seconds: int,
+        down_kbps: int | None,
+        up_kbps: int | None,
+    ) -> dict[str, Any] | None:
+        """The exact ``extPortal/auth`` body, for the diagnostics record.
+
+        ## Why this calls the gateway's own builder instead of describing it
+
+        ``build_authorize_body`` is the pure function the gateway itself calls
+        one layer down to produce the request it sends -- kept pure, by that
+        module's own docstring, exactly so the wire body can be obtained
+        without HTTP in the way. Calling it here means the snapshot is the
+        body, not a second transcription of it that drifts the first time
+        somebody adds a field. A hand-written ``{"clientMac": ...}`` dict in
+        this module would be a *claim* about what was sent, and a claim is
+        worth nothing to an engineer diffing a failure: the whole point is to
+        find the field we got wrong, which is the field a transcription would
+        also get wrong.
+
+        It is called before the request rather than captured from it because
+        the gateway owns the HTTP client and this module cannot see the
+        request object at all -- and because the failure mode worth
+        diagnosing is a *malformed body*, which is fully determined before a
+        socket is opened.
+
+        ## Why a failure here is swallowed
+
+        Returning ``None`` rather than raising. The builder rejects a
+        non-positive duration, and if it ever rejects anything else, this is a
+        diagnostics path: it must not be able to turn a guest's working
+        authorization into a failure. ``_call`` issues the same build one
+        layer down and will raise the real, translated error a moment later,
+        so nothing is hidden -- only reordered.
+
+        ## Secrets
+
+        None can appear. The body is built only from the redirect's own query
+        parameters plus the duration this platform chose; no credential, token
+        or cookie is an input to it. ``service.py`` still passes the whole
+        context through ``redact_context`` before it is persisted, because a
+        second control that costs nothing is worth having on the one column
+        the customer dashboard renders.
+        """
+        try:
+            from wyfy_device_gateway.omada.portal import (  # noqa: PLC0415
+                build_authorize_body,
+            )
+
+            body = build_authorize_body(
+                gateway_context,
+                duration_seconds=duration_seconds,
+                down_kbps=down_kbps,
+                up_kbps=up_kbps,
+            )
+        except Exception:  # noqa: BLE001 -- diagnostics must never fail a call
+            logger.warning(
+                "network_integration_authorize_snapshot_unavailable",
+                exc_info=True,
+            )
+            return None
+        return dict(body)
 
     async def deauthorize_guest(
         self, config: ProviderConnectionConfig, site_id: str, client_mac: str

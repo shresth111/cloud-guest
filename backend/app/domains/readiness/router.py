@@ -14,7 +14,7 @@ from app.domains.rbac.dependencies import (
     RequirePermission,
 )
 
-from .constants import CHECKLIST_ITEMS_BY_KEY
+from .constants import DEFINITIONS_BY_KEY
 from .dependencies import get_readiness_service
 from .models import RouterChecklistItem
 from .schemas import (
@@ -32,7 +32,7 @@ def _request_id(request: Request) -> str:
 
 
 def _item_response(row: RouterChecklistItem) -> ChecklistItemResponse:
-    definition = CHECKLIST_ITEMS_BY_KEY[row.item_key]
+    definition = DEFINITIONS_BY_KEY[row.item_key]
     return ChecklistItemResponse(
         item_key=row.item_key,
         label=definition.label,

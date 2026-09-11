@@ -5639,6 +5639,26 @@ class TestRecordUsageFupTracking:
         assert updated.status == GuestSessionStatus.ACTIVE.value
 
 
+# A fixed clock for this class, and it has to be fixed.
+#
+# Every test below establishes a quota window at `now` and then runs the
+# accrual at `now + N minutes`. With `now` taken from the real clock that is
+# a time bomb: `run_fup_time_accrual` calls `get_or_reset_quota_usage`, which
+# RESETS the window when the advanced `now` has crossed into the next period.
+# So a DAILY test that jumps 61 minutes fails for the whole hour before
+# midnight UTC -- `minutes_used` goes back to zero and nothing expires.
+#
+# That is not hypothetical: it failed a production deploy at 23:20 UTC on
+# 2026-09-10, and CI reported `assert 0 == 1` on a change that had nothing to
+# do with quotas. Four other tests here advance 10-15 minutes and carry the
+# same bug with a narrower window.
+#
+# Midday, mid-month, mid-week: leaves room before the next daily, weekly and
+# monthly boundary alike. The accrual reads only the quota row and the `now`
+# it is handed -- never a session's own timestamps -- so pinning this does not
+# desynchronize it from the sessions the fixtures create at the real clock.
+_FUP_NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
 class TestRunFupTimeAccrual:
     async def test_the_sweep_resolves_with_the_guests_real_location(self) -> None:
         """The sweep used to resolve with a hardcoded ``location_id=None``,
@@ -5672,7 +5692,7 @@ class TestRunFupTimeAccrual:
             fup_rules={"daily_time_limit_minutes": 999_999}
         )
 
-        await run_fup_time_accrual(fx.repository, policy_lookup, now=datetime.now(UTC))
+        await run_fup_time_accrual(fx.repository, policy_lookup, now=_FUP_NOW)
 
         assert policy_lookup.location_ids_seen == [fx.location_id]
         assert None not in policy_lookup.location_ids_seen
@@ -5698,7 +5718,7 @@ class TestRunFupTimeAccrual:
         policy_lookup = FakeLocationScopedFupPolicyLookup(
             fup_rules={"daily_time_limit_minutes": 60}
         )
-        now = datetime.now(UTC)
+        now = _FUP_NOW
         usage = await get_or_reset_quota_usage(
             fx.repository,
             guest_id=result.guest.id,
@@ -5757,7 +5777,7 @@ class TestRunFupTimeAccrual:
         policy_lookup = FakeLocationScopedFupPolicyLookup(
             fup_rules={"daily_time_limit_minutes": 999_999}
         )
-        now = datetime.now(UTC)
+        now = _FUP_NOW
         usage = await get_or_reset_quota_usage(
             fx.repository,
             guest_id=result.guest.id,
@@ -5791,7 +5811,7 @@ class TestRunFupTimeAccrual:
         )
         policy_lookup = FakeFupPolicyLookup(fup_rules={})
         summary = await run_fup_time_accrual(
-            fx.repository, policy_lookup, now=datetime.now(UTC)
+            fx.repository, policy_lookup, now=_FUP_NOW
         )
         assert summary == {"accrued_rows": 0, "expired_sessions": 0}
         assert (
@@ -5814,7 +5834,7 @@ class TestRunFupTimeAccrual:
         policy_lookup = FakeFupPolicyLookup(
             fup_rules={"daily_time_limit_minutes": 999_999}
         )
-        now = datetime.now(UTC)
+        now = _FUP_NOW
         # Pre-seed the row with a known last_accrued_at baseline (rather
         # than letting the first sweep tick accrue from period_start,
         # which -- at whatever real wall-clock time this test happens to
@@ -5852,7 +5872,7 @@ class TestRunFupTimeAccrual:
             device_mac="AA:11:22:33:44:01",
         )
         policy_lookup = FakeFupPolicyLookup(fup_rules={"daily_time_limit_minutes": 5})
-        now = datetime.now(UTC)
+        now = _FUP_NOW
         summary = await run_fup_time_accrual(
             fx.repository, policy_lookup, now=now + timedelta(minutes=10)
         )
@@ -5890,7 +5910,7 @@ class TestRunFupTimeAccrual:
         policy_lookup = FakeFupPolicyLookup(
             fup_rules={"daily_time_limit_minutes": 999_999}
         )
-        now = datetime.now(UTC)
+        now = _FUP_NOW
         # Pre-seed a known last_accrued_at baseline -- see the identical
         # note in test_accrues_elapsed_minutes_since_last_accrual.
         usage = await get_or_reset_quota_usage(

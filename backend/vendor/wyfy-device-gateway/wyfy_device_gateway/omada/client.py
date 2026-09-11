@@ -68,7 +68,7 @@ from typing import Any
 
 import httpx
 
-from ..controller_contract import ControllerCredentials
+from ..controller_contract import ControllerCredentials, ControllerTlsMode
 from .auth import (
     EnvelopeSender,
     RawResult,
@@ -79,14 +79,23 @@ from .auth import (
 )
 from .errors import (
     OmadaAuthError,
+    OmadaAuthorizationError,
     OmadaConnectionError,
     OmadaInvalidControllerError,
     OmadaRateLimitedError,
     OmadaSessionExpiredError,
     OmadaTimeoutError,
+    OmadaTlsTrustError,
     OmadaUnsupportedApiError,
 )
 from .redaction import redact_mapping, sanitize_detail
+from .tls import (
+    PinVerifyingTransport,
+    assert_peer_certificate_matches,
+    is_certificate_verification_failure,
+    require_pin,
+    ssl_verify_argument,
+)
 from .types import (
     SESSION_EXPIRED_ERROR_CODES,
     OmadaEnvelope,
@@ -162,11 +171,23 @@ class OmadaHttpClient:
             write=self._creds.timeout_seconds,
             pool=self._creds.timeout_seconds,
         )
+        verify = ssl_verify_argument(self._creds)
+        transport = self._transport
+        if self._creds.tls_mode is ControllerTlsMode.PINNED:
+            pin = require_pin(self._creds)
+            if transport is None:
+                # The preflight is what keeps a credential off the wire when
+                # the certificate is wrong -- see ``tls.py``. It is skipped
+                # when a transport was injected because there is then no real
+                # socket to preflight; the injector owns the network.
+                await assert_peer_certificate_matches(self._creds, pin)
+                transport = httpx.AsyncHTTPTransport(verify=verify)
+            transport = PinVerifyingTransport(transport, pin)
         self._http = httpx.AsyncClient(
             base_url=self._creds.base_url.rstrip("/"),
             timeout=timeout,
-            verify=self._creds.verify_tls,
-            transport=self._transport,
+            verify=verify,
+            transport=transport,
             # Redirects are not followed. The caller SSRF-validated one
             # specific host (contract section 6); letting the controller
             # redirect us to a different one would route around that check
@@ -240,8 +261,20 @@ class OmadaHttpClient:
             raise OmadaTimeoutError() from exc
         except httpx.TransportError as exc:
             # Covers connect errors, DNS failures, TLS handshake failures and
-            # read errors. All are "we could not complete a conversation with
-            # the controller", which is one actionable thing to a user.
+            # read errors -- but NOT all of them equally. A rejected
+            # certificate is a different problem from an unreachable address
+            # and gets its own code: see ``OmadaTlsTrustError``. Everything
+            # else really is "we could not complete a conversation with the
+            # controller", which is one actionable thing to a user.
+            if is_certificate_verification_failure(exc):
+                self._log(
+                    logging.WARNING,
+                    "omada_request_tls_untrusted",
+                    path=path,
+                    method=method,
+                    error_type=type(exc).__name__,
+                )
+                raise OmadaTlsTrustError() from exc
             self._log(
                 logging.WARNING,
                 "omada_request_transport_error",
@@ -550,6 +583,7 @@ class OmadaHttpClient:
         from .types import (
             OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND,
             OPENAPI_ERROR_OPERATION_UNSUPPORTED,
+            PORTAL_AUTHORIZATION_ERROR_CODES,
         )
 
         code = envelope.error_code
@@ -557,6 +591,21 @@ class OmadaHttpClient:
 
         if code in SESSION_EXPIRED_ERROR_CODES:
             return OmadaSessionExpiredError(provider_code=code)
+        if code in PORTAL_AUTHORIZATION_ERROR_CODES:
+            # The controller answered and refused. Without this branch both
+            # codes fell through to the generic ``OmadaError`` below, whose
+            # ``OMADA_ERROR`` is absent from the backend's code table and so
+            # became ``OMADA_CONNECTION_FAILED`` -- "could not reach the
+            # network controller" about a controller that had just replied.
+            # The raw integer still rides along in ``provider_code``, which is
+            # what keeps -41500 distinguishable from -41501.
+            return OmadaAuthorizationError(
+                f"{OmadaAuthorizationError.default_message} "
+                f"Controller said: {detail}"
+                if detail
+                else None,
+                provider_code=code,
+            )
         if code == OPENAPI_ERROR_CONTROLLER_ID_NOT_FOUND:
             return OmadaInvalidControllerError(
                 "The Omada controller does not recognise that controller ID. "

@@ -63,6 +63,8 @@ __all__ = [
     "NetworkIntegrationCredentialRotateRequest",
     "NetworkIntegrationDeviceListResponse",
     "NetworkIntegrationDeviceResponse",
+    "NetworkIntegrationDisconnectGuestRequest",
+    "NetworkIntegrationDisconnectGuestResponse",
     "NetworkIntegrationEventListResponse",
     "NetworkIntegrationEventResponse",
     "NetworkIntegrationListResponse",
@@ -86,6 +88,28 @@ __all__ = [
 
 _AuthMode = Literal["openapi", "legacy"]
 _Provider = Literal["omada"]
+_TlsMode = Literal["strict", "pinned", "insecure"]
+
+#: Shared field definitions for the certificate-trust pair, so the create,
+#: onboard, update, rotate and probe bodies cannot describe them three
+#: different ways in the generated OpenAPI schema the frontend is built
+#: from.
+_TLS_MODE_DESCRIPTION = (
+    "How this platform verifies the controller's HTTPS certificate. "
+    "'strict' (default) is ordinary public-CA verification. 'pinned' "
+    "requires the certificate to match tls_pinned_sha256 -- this is the "
+    "right answer for a self-hosted controller, which ships a self-signed "
+    "certificate that 'strict' will always refuse. 'insecure' performs no "
+    "certificate check at all and is recorded as an explicit decision."
+)
+_TLS_PIN_DESCRIPTION = (
+    "SHA-256 fingerprint of the controller's certificate, as 64 hex "
+    "characters; colons and spaces are accepted and stripped. Required "
+    "when tls_mode is 'pinned' and cleared otherwise. Obtain it by running "
+    "Test Connection against the controller -- the response carries the "
+    "fingerprint the controller is actually presenting, which is the value "
+    "an operator confirms rather than one they have to go and find."
+)
 
 
 # ============================================================================
@@ -181,12 +205,14 @@ class NetworkIntegrationCreateRequest(_CredentialFields):
         ge=MIN_SESSION_DURATION_SECONDS,
         le=MAX_SESSION_DURATION_SECONDS,
         description=(
-            "How long a guest's authorization lasts on the controller. This "
-            "is not merely a default: Omada's API offers no way to revoke an "
-            "authorization once granted, so this duration is the ONLY "
-            "mechanism by which a guest's network access ever ends. Ending "
-            "the WyfyGuest guest session prevents re-authorization but does "
-            "not disconnect the device. Capped at 24 hours for that reason."
+            "How long a guest's authorization lasts on the controller. An "
+            "authorization can also be ended early: see the per-guest "
+            "disconnect, which needs the same hotspot-operator credentials "
+            "this integration already uses. Ending the WyfyGuest guest "
+            "session on its own prevents re-authorization but does not "
+            "disconnect the device. Capped at 7 days, which is a policy "
+            "bound on how long an unattended grant may run, not a technical "
+            "limit."
         ),
     )
     sync_interval_seconds: int = Field(
@@ -202,6 +228,10 @@ class NetworkIntegrationCreateRequest(_CredentialFields):
         ),
     )
     is_enabled: bool = True
+    tls_mode: _TlsMode = Field(default="strict", description=_TLS_MODE_DESCRIPTION)
+    tls_pinned_sha256: str | None = Field(
+        default=None, max_length=200, description=_TLS_PIN_DESCRIPTION
+    )
 
 
 class PlatformOnboardRequest(_CredentialFields):
@@ -280,6 +310,10 @@ class PlatformOnboardRequest(_CredentialFields):
         le=MAX_SYNC_INTERVAL_SECONDS,
     )
     is_enabled: bool = True
+    tls_mode: _TlsMode = Field(default="strict", description=_TLS_MODE_DESCRIPTION)
+    tls_pinned_sha256: str | None = Field(
+        default=None, max_length=200, description=_TLS_PIN_DESCRIPTION
+    )
 
     @model_validator(mode="after")
     def _identity_fields_travel_together(self) -> PlatformOnboardRequest:
@@ -345,6 +379,20 @@ class NetworkIntegrationUpdateRequest(BaseModel):
         le=MAX_SYNC_INTERVAL_SECONDS,
     )
     is_enabled: bool | None = None
+    tls_mode: _TlsMode | None = Field(
+        default=None, description=_TLS_MODE_DESCRIPTION
+    )
+    tls_pinned_sha256: str | None = Field(
+        default=None,
+        max_length=200,
+        description=(
+            _TLS_PIN_DESCRIPTION
+            + " On this partial-update body, omitting it while setting "
+            "tls_mode to 'pinned' reuses the fingerprint already on the "
+            "row; there is none to reuse unless the integration was "
+            "already pinned, because leaving 'pinned' clears it."
+        ),
+    )
 
 
 class NetworkIntegrationCredentialRotateRequest(_CredentialFields):
@@ -357,6 +405,15 @@ class NetworkIntegrationCredentialRotateRequest(_CredentialFields):
     """
 
     auth_mode: _AuthMode
+    # Optional, and unchanged when omitted. Re-entering a password is the
+    # moment an operator is most likely to be looking at a controller whose
+    # certificate was just replaced along with it.
+    tls_mode: _TlsMode | None = Field(
+        default=None, description=_TLS_MODE_DESCRIPTION
+    )
+    tls_pinned_sha256: str | None = Field(
+        default=None, max_length=200, description=_TLS_PIN_DESCRIPTION
+    )
 
 
 class NetworkIntegrationResponse(BaseModel):
@@ -373,6 +430,13 @@ class NetworkIntegrationResponse(BaseModel):
     is_enabled: bool
     base_url: str
     auth_mode: str
+    tls_mode: str
+    # Returned, unlike every credential on this row. A certificate
+    # fingerprint is a hash of something the controller hands to anyone who
+    # connects to it -- showing an operator what their integration is
+    # pinned to is the mechanism that makes the pin auditable.
+    tls_pinned_sha256: str | None = None
+    tls_trust_decided_at: datetime | None = None
     controller_id: str | None = None
     controller_version: str | None = None
     external_site_id: str | None = None
@@ -391,6 +455,42 @@ class NetworkIntegrationResponse(BaseModel):
     active_authorization_count: int = 0
     # NEVER the credentials themselves. See the module docstring.
     has_credentials: bool
+    # The External Portal Server URL for this venue, split the way TP-Link's
+    # own form splits it -- a `Scheme` field and a `URL` field. See
+    # `validators.build_external_portal_url`, which is the only place the
+    # shape is decided.
+    #
+    # Returned to the operator ON PURPOSE, and this is not the same category
+    # as `has_credentials: bool` two lines up. A credential is a secret this
+    # platform holds on a customer's behalf and may never render; this is a
+    # URL that will be in every one of that venue's guests' address bars
+    # within minutes of being pasted, and there is no other way for the
+    # operator to learn it. Nothing in it is a capability: the three ids are
+    # the same three a MikroTik venue's portal URL already carries in plain
+    # sight, and every one of them is re-proven against an ACTIVE
+    # `GuestSession` at `POST /portal/authorize` before any device reaches a
+    # controller.
+    #
+    # Both are NULL together, and only when the integration cannot serve a
+    # guest at all (no mapped location, or no fleet device). A partial URL
+    # would be something an operator pastes that turns every guest away;
+    # `portal_readiness_gaps` below names the reason instead.
+    portal_url_scheme: str | None = None
+    portal_url_host_and_query: str | None = None
+    # Everything standing between this integration and its first authorized
+    # guest, machine-readable, from `validators.portal_readiness_gaps`.
+    #
+    # On the row rather than only inside `last_error_message`'s sentence
+    # because the dashboard has to ACT on it: the portal-configuration block
+    # shows a copyable URL or names a blocker, and parsing that decision out
+    # of English prose is the coupling this domain's `ErrorCode` enum exists
+    # to avoid.
+    #
+    # An empty list means "nothing missing", which is a stronger and
+    # different statement from `status == CONNECTED` -- see
+    # `PortalReadinessGap` on the venue that showed a green badge and
+    # authorized nobody.
+    portal_readiness_gaps: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -431,9 +531,23 @@ class TestConnectionRequest(_CredentialFields):
     provider: _Provider = "omada"
     base_url: str = Field(min_length=1, max_length=512)
     auth_mode: _AuthMode = "openapi"
+    tls_mode: _TlsMode = Field(default="strict", description=_TLS_MODE_DESCRIPTION)
+    tls_pinned_sha256: str | None = Field(
+        default=None, max_length=200, description=_TLS_PIN_DESCRIPTION
+    )
 
 
 class TestConnectionResponse(BaseModel):
+    """The probe's answer, plus what the controller's certificate is.
+
+    The TLS block is populated whether the probe succeeded or failed, which
+    is deliberate: the failing probe against a self-signed controller is
+    exactly when the operator needs the fingerprint, because that is the
+    decision the failure is asking them to make. A wizard that only showed
+    it on success would require them to switch verification off in order to
+    discover that they did not have to.
+    """
+
     ok: bool
     provider: str
     controller_id: str | None = None
@@ -444,6 +558,20 @@ class TestConnectionResponse(BaseModel):
     # maps; `message` is human-safe but the frontend owns the copy.
     error_code: str | None = None
     message: str | None = None
+    # The certificate the controller presented on this probe. `None`
+    # throughout when the observation could not be made at all -- which is
+    # a different thing from "the controller has no certificate" and is
+    # reported as absence rather than as a verdict.
+    tls_fingerprint_sha256: str | None = None
+    #: True when ordinary public-CA verification of this controller
+    #: succeeded, i.e. the operator does not need to pin anything.
+    tls_chain_trusted: bool | None = None
+    #: Whether the observed certificate matches the fingerprint the request
+    #: asked to pin. `None` when the request pinned nothing.
+    tls_matches_pin: bool | None = None
+    tls_certificate_subject: str | None = None
+    tls_certificate_issuer: str | None = None
+    tls_certificate_expires_at: datetime | None = None
 
 
 class NetworkIntegrationStatusResponse(BaseModel):
@@ -676,3 +804,48 @@ class PortalAuthorizeResponse(BaseModel):
     # own redirect in the first place. Treating it as a URL this backend
     # would follow is what would make it an SSRF vector; it is not one.
     redirect_url: str | None = None
+
+
+class NetworkIntegrationDisconnectGuestRequest(BaseModel):
+    """Ask the controller to end one guest's access now.
+
+    Only a MAC. The integration is the path parameter, the venue and the
+    organization come from the integration row, and the guest session --
+    if there is one -- is looked up from this platform's own
+    authorization record rather than accepted from the caller. A request
+    body that could name a session id would be a request body that could
+    name *someone else's* session id, and nothing here needs it.
+
+    ``client_mac`` is a plain ``str`` on the way in, per this module's
+    convention: it is an identifier being supplied, not an identifier
+    being disclosed, and it is normalized server-side (a caller may send
+    colon, hyphen or bare-hex form).
+    """
+
+    client_mac: str = Field(min_length=12, max_length=32)
+    # Free text, stored on the guest session and in the audit entry. Not
+    # shown to the guest -- see the blocklist-reason work for why guest
+    # visibility of a staff-written reason is its own decision.
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class NetworkIntegrationDisconnectGuestResponse(BaseModel):
+    """Three facts, not one, because they are three different facts.
+
+    ``disconnected`` is the only one that means the device stopped
+    forwarding traffic. ``had_active_authorization`` false alongside it is
+    normal: the guest's grant had already lapsed, and the end state the
+    caller asked for is the state that now holds. ``guest_session_ended``
+    false means the session was already over, not that anything failed.
+
+    A UI showing only "Disconnected" is correct; a UI explaining what
+    happened should read all three rather than inferring two from one.
+    """
+
+    disconnected: bool
+    provider: str
+    client_mac: MaskedMac
+    had_active_authorization: bool
+    deauthorized_at: datetime | None = None
+    guest_session_id: str | None = None
+    guest_session_ended: bool = False

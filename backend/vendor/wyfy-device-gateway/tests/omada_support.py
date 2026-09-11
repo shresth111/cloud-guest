@@ -25,6 +25,7 @@ import httpx
 from wyfy_device_gateway.controller_contract import (
     ControllerAuthMode,
     ControllerCredentials,
+    ControllerTlsMode,
     ControllerVendor,
 )
 
@@ -68,6 +69,8 @@ def make_creds(
     client_id: Any = UNSET,
     client_secret: Any = UNSET,
     timeout_seconds: float = 15.0,
+    tls_mode: ControllerTlsMode = ControllerTlsMode.STRICT,
+    tls_pinned_sha256: str | None = None,
 ) -> ControllerCredentials:
     """Credentials with sensible per-mode defaults.
 
@@ -95,7 +98,8 @@ def make_creds(
         username=username,
         password=password,
         omadac_id=omadac_id,
-        verify_tls=True,
+        tls_mode=tls_mode,
+        tls_pinned_sha256=tls_pinned_sha256,
         timeout_seconds=timeout_seconds,
     )
 
@@ -137,6 +141,12 @@ class FakeOmadaController:
         self.token_error_code = 0
         self.expire_sessions = 0
         self.session_expiry_code = -44112
+
+        #: Non-zero to make ``extPortal/auth`` refuse with that errorCode.
+        #: The real controller answers -41500 for a bad ``authType`` and
+        #: -41501 for literally everything else it dislikes.
+        self.authorize_error_code = 0
+        self.authorize_error_msg: str | None = None
 
         self.fail_times = 0
         self.failure_status: int | None = 500
@@ -269,6 +279,14 @@ class FakeOmadaController:
                 200,
                 json=envelope(
                     error_code=self.session_expiry_code, msg="Session timeout."
+                ),
+            )
+        if self.authorize_error_code:
+            return httpx.Response(
+                200,
+                json=envelope(
+                    error_code=self.authorize_error_code,
+                    msg=self.authorize_error_msg,
                 ),
             )
         return httpx.Response(200, json={"errorCode": 0})

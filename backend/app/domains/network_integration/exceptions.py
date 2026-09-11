@@ -60,6 +60,7 @@ __all__ = [
     "NetworkIntegrationOrganizationRequiredError",
     "NetworkIntegrationRateLimitedError",
     "NetworkIntegrationSiteNotSelectedError",
+    "NetworkIntegrationTlsPinRequiredError",
     "NetworkIntegrationUrlRejectedError",
     "PROVIDER_ERRORS_BY_CODE",
     "ProviderAuthFailedError",
@@ -72,6 +73,8 @@ __all__ = [
     "ProviderSessionExpiredError",
     "ProviderSiteNotFoundError",
     "ProviderTimeoutError",
+    "ProviderTlsPinMismatchError",
+    "ProviderTlsUntrustedError",
     "ProviderUnsupportedApiError",
     "UnsupportedNetworkProviderError",
 ]
@@ -226,6 +229,27 @@ class NetworkIntegrationUrlRejectedError(NetworkIntegrationError):
         )
 
 
+class NetworkIntegrationTlsPinRequiredError(NetworkIntegrationError):
+    """``tls_mode='pinned'`` with no usable fingerprint on the request.
+
+    A 422 from this platform rather than a 502 from the controller, because
+    nothing was dialled: the request describes an integration that would
+    claim to pin a certificate and would not actually pin anything. Storing
+    it and discovering the problem on the first guest authorization is the
+    failure mode this refuses.
+
+    ``reason`` is safe to show: it is a statement about the shape of a value
+    the caller sent, and a certificate fingerprint is public.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"Certificate pinning rejected: {reason}",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code=ErrorCode.TLS_PIN_REQUIRED,
+        )
+
+
 class NetworkIntegrationFleetDeviceUnavailableError(NetworkIntegrationError):
     """Master onboarding was asked for, but this service has no way to
     write the fleet row that makes it meaningful.
@@ -356,41 +380,55 @@ class NetworkIntegrationInventoryRequiresOpenApiError(NetworkIntegrationError):
 
 
 class NetworkIntegrationDeauthorizationUnsupportedError(NetworkIntegrationError):
-    """Something asked this platform to revoke a guest's controller
-    authorization. Omada cannot.
+    """The provider declined to end one guest's authorization early.
 
-    Contract change CR-001. TP-Link publishes no client-deauthorization
-    endpoint in any generation of the Omada API. Open API's
-    ``clients/{mac}/block`` exists but was deliberately not repurposed: a
-    blocklist is materially more punitive and longer-lived than ending a
-    portal session, and it keys on a MAC that phones rotate per-SSID --
-    the same reasoning ``app.domains.guest_access.device_adapters``
-    records for rejecting ``/ip hotspot ip-binding type=blocked`` as a
-    stand-in for ending a session (its "mechanism 3").
+    ## What this used to mean, and no longer does
 
-    So a guest's *network* access ends when the authorization duration
-    expires, and by no other means. See
-    ``constants.MAX_SESSION_DURATION_SECONDS``, whose 24-hour ceiling
-    exists because of this and not for tidiness.
+    This used to be unconditional for Omada, on CR-001's claim that
+    TP-Link publishes no client-deauthorization endpoint in any generation
+    of the Omada API. TP-Link indeed publishes none -- and the controller
+    has one regardless, in the Hotspot Manager API tree, reachable with
+    the very operator session the portal authorization already opens. It
+    is implemented (``omada.deauth``) and observed working on real
+    hardware. A guest's network access therefore no longer ends only when
+    the authorization duration expires.
 
-    **Raising is the point.** The alternative -- returning success, or
-    terminating only this platform's own ``GuestSession`` row and
-    reporting "disconnected" -- is exactly the lie that domain was written
-    to fix: a row saying "ended" while the device is still forwarding
-    traffic. Ending the ``GuestSession`` remains correct and remains
-    required (without it the next re-authorization finds an ACTIVE session
-    and re-admits the guest); it simply must not be described as kicking
-    the client off the network, because it isn't.
+    ## What it means now
+
+    One thing: the integration has no credential that can open a hotspot
+    session -- Open API client credentials and nothing else. Those can
+    read the controller's inventory and cannot end an authorization.
+
+    The useful property of that being the *only* remaining case is that it
+    is self-limiting: the same missing credential also makes
+    ``authorize_guest`` refuse, so an integration that cannot disconnect a
+    guest was never able to connect one either. There is no configuration
+    in which this platform puts a guest on a network it cannot take them
+    off.
+
+    ## Why this raises instead of returning success
+
+    Unchanged, and still the point. The alternative -- reporting 200, or
+    ending only this platform's own ``GuestSession`` row and calling that
+    "disconnected" -- is the lie
+    ``app.domains.guest_access.device_adapters`` was written to fix: a row
+    reading "ended" while the device is still forwarding traffic. Ending
+    the ``GuestSession`` is a separate, real, and still-required act
+    (without it the next portal hit finds an ACTIVE session and re-admits
+    the guest), and it is available on its own route; it simply must not
+    be described as kicking the client off the network, because it isn't.
     """
 
     def __init__(self) -> None:
         super().__init__(
-            "This controller's API provides no way to revoke a guest "
-            "authorization once granted, so the guest's network access "
-            "cannot be ended on demand -- it ends when the authorization "
-            "expires. The guest session has been recorded as ended on this "
-            "platform, which prevents re-authorization, but the device is "
-            "not disconnected from the network.",
+            "This integration has no hotspot operator credentials, so a "
+            "guest's access cannot be ended on the controller -- Open API "
+            "credentials can read the controller but cannot end an "
+            "authorization. Nothing was changed on the network. Add an "
+            "operator account to this integration, or end the guest's "
+            "session on this platform instead, which prevents them "
+            "re-authorizing but does not disconnect the device they are "
+            "already using.",
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             code=ErrorCode.API_UNSUPPORTED,
         )
@@ -412,6 +450,40 @@ class ProviderError(NetworkIntegrationError):
     live in a module that imports a vendor SDK.
     """
 
+    #: The vendor's own raw error code for this failure, as an integer, or
+    #: ``None`` when the failure never reached the controller (a timeout, a
+    #: refused connection).
+    #:
+    #: A class attribute with an instance override rather than a constructor
+    #: argument, so that the ten subclasses below keep their one-argument
+    #: signatures and ``providers/omada.py`` stays the only module that knows
+    #: a vendor code exists. ``with_diagnostics`` is the setter.
+    #:
+    #: **Why an integer is safe to keep and a response body is not.** The
+    #: gateway's contract (§2) lets exactly one piece of the raw controller
+    #: response survive into an exception: this number. It cannot smuggle a
+    #: credential, and it is the only thing that distinguishes Omada's
+    #: ``-41500`` ("Invalid authentication type", a named field) from its
+    #: ``-41501`` ("Failed to authenticate", a catch-all covering a wrong MAC,
+    #: a stale timestamp, an unknown site, an AP that never saw the client and
+    #: a missing required field). ``ErrorCode`` cannot carry that distinction
+    #: -- both normalize to ``OMADA_AUTHORIZATION_FAILED`` -- so if this is
+    #: dropped at the seam, the one discrimination the controller offers is
+    #: gone for good.
+    provider_code: int | None = None
+
+    #: What we actually put on the wire, field by field, already free of
+    #: secrets. ``None`` for every call except a portal authorization, which
+    #: is the one place a support engineer needs to diff the request against
+    #: the redirect that produced it.
+    #:
+    #: Opaque to this module and to ``service.py``: the keys are the vendor's
+    #: spelling and only ``providers/omada.py`` puts them there. It is carried
+    #: on the exception rather than returned alongside it because the failing
+    #: call raises -- there is no return value to hang it on, and a support
+    #: engineer needs it precisely when the call failed.
+    request_snapshot: dict[str, object] | None = None
+
     def __init__(
         self,
         message: str,
@@ -420,6 +492,30 @@ class ProviderError(NetworkIntegrationError):
         status_code: int = status.HTTP_502_BAD_GATEWAY,
     ) -> None:
         super().__init__(message, status_code=status_code, code=code)
+
+    def with_diagnostics(
+        self,
+        *,
+        provider_code: int | None = None,
+        request_snapshot: dict[str, object] | None = None,
+    ) -> ProviderError:
+        """Attach vendor diagnostics to an already-constructed error.
+
+        Returns ``self`` so a raise site reads as one expression. Neither
+        value is ever put in ``data`` and neither reaches the API response:
+        they exist to be written to ``network_integration_events.context``,
+        which is a different audience (an operator diffing a failure) with a
+        different threat model (already org-scoped, already redacted on the
+        way in) from an unauthenticated caller receiving a 502.
+
+        Passing ``None`` leaves the existing value alone rather than clearing
+        it, so a partial attachment cannot erase a fuller one.
+        """
+        if provider_code is not None:
+            self.provider_code = provider_code
+        if request_snapshot is not None:
+            self.request_snapshot = request_snapshot
+        return self
 
 
 class ProviderAuthFailedError(ProviderError):
@@ -437,6 +533,50 @@ class ProviderConnectionFailedError(ProviderError):
         super().__init__(
             message or "Could not reach the network controller.",
             code=ErrorCode.CONNECTION_FAILED,
+        )
+
+
+class ProviderTlsUntrustedError(ProviderError):
+    """The controller answered; this platform would not trust its certificate.
+
+    Separate from :class:`ProviderConnectionFailedError` because the copy
+    that goes with a connection failure -- check the URL, check the port,
+    check the firewall -- is actively misleading here. All three are already
+    right. This is the defect that motivated the whole change: a self-signed
+    controller, which is what nearly every self-hosted Omada install is,
+    reported as unreachable.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message
+            or "The network controller answered, but this platform does not "
+            "trust its HTTPS certificate. Self-hosted controllers ship a "
+            "self-signed certificate, so this is expected -- run Test "
+            "Connection to review the controller's certificate fingerprint "
+            "and pin it to this integration.",
+            code=ErrorCode.TLS_UNTRUSTED,
+        )
+
+
+class ProviderTlsPinMismatchError(ProviderError):
+    """The certificate is not the one pinned to this integration.
+
+    Its own code rather than a flavour of :class:`ProviderTlsUntrustedError`
+    because it is the only one of the TLS failures that can mean an attack in
+    progress, and the operator instruction differs accordingly: do not
+    re-pin blindly.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message
+            or "The network controller presented a different HTTPS "
+            "certificate than the one pinned to this integration. If the "
+            "certificate was replaced on purpose, run Test Connection to "
+            "review and confirm the new fingerprint. If it was not, stop: "
+            "something is intercepting this connection.",
+            code=ErrorCode.TLS_PIN_MISMATCH,
         )
 
 
@@ -528,4 +668,6 @@ PROVIDER_ERRORS_BY_CODE: dict[str, type[ProviderError]] = {
     ErrorCode.AUTHORIZATION_FAILED.value: ProviderAuthorizationFailedError,
     ErrorCode.API_UNSUPPORTED.value: ProviderUnsupportedApiError,
     ErrorCode.SESSION_EXPIRED.value: ProviderSessionExpiredError,
+    ErrorCode.TLS_UNTRUSTED.value: ProviderTlsUntrustedError,
+    ErrorCode.TLS_PIN_MISMATCH.value: ProviderTlsPinMismatchError,
 }

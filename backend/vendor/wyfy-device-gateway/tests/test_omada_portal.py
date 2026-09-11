@@ -1,4 +1,4 @@
-"""Guest authorization -- the EAP path, the gateway path, and deauthorization.
+"""Guest authorization -- the EAP path, the gateway path, and its undo.
 
 This is the one flow with primary TP-Link documentation behind it, and the
 one where a wrong field name means a paying guest has no internet. The wire
@@ -264,127 +264,137 @@ async def test_authorize_recovers_from_an_expired_operator_session():
 # --- deauthorization -------------------------------------------------------
 
 
-async def test_deauthorize_calls_tp_links_documented_unauth_endpoint():
-    """CR-001 said no deauthorization endpoint exists anywhere. It does:
-    ``cancelAuthClient`` in TP-Link's own published OpenAPI specification."""
-    controller = FakeOmadaController()
+async def test_an_operator_credential_can_undo_what_it_did():
+    """The symmetry, asserted where the authorization itself is asserted.
 
+    These two tests used to say the opposite -- that deauthorization was
+    impossible in both modes, on CR-001's claim that TP-Link publishes no
+    endpoint for it. TP-Link publishes none; the controller has one, and
+    it rides this same operator session. The full behaviour lives in
+    ``test_omada_deauth.py``; what is pinned *here* is the property that
+    matters next to ``authorize_guest``: any credential that can put a
+    guest on the network can also take them off it.
+    """
+    controller = FakeOmadaController()
+    # No rows: "already not authorized" is the end state asked for, so this
+    # is a success, and it exercises the credential check rather than the
+    # table walk.
     result = await _adapter(controller).deauthorize_guest(
-        make_creds(ControllerAuthMode.OPENAPI), "SITE-1", "AA-BB-CC-DD-EE-FF"
+        make_creds(ControllerAuthMode.LEGACY), "Default", "AA-BB-CC-DD-EE-FF"
     )
 
     assert result is True
-    request = controller.requests[-1]
-    assert request.method == "POST"
-    assert request.url.path == (
-        f"/openapi/v1/{OMADAC_ID}/sites/SITE-1/hotspot/clients/"
-        "AA-BB-CC-DD-EE-FF/unauth"
-    )
-    # The spec documents no request body for this operation, and sending one
-    # we invented is exactly the failure mode CR-001 was trying to avoid.
-    assert not request.content
 
 
-async def test_deauthorize_normalizes_the_mac_to_omadas_documented_form():
-    """The spec spells the path parameter out as "format: AA-BB-CC-DD-EE-FF".
-    A caller holding colon-separated lower case must still address the same
-    client rather than silently revoking nobody."""
+async def test_open_api_credentials_alone_can_neither_authorize_nor_deauthorize():
+    """The one refusal left, and it refuses in both directions.
+
+    Asserted as a pair deliberately: a build where only one of these
+    refused would be a build that could strand a guest on a network it
+    could not remove them from.
+    """
     controller = FakeOmadaController()
+    creds = make_creds(ControllerAuthMode.OPENAPI)
 
-    await _adapter(controller).deauthorize_guest(
-        make_creds(ControllerAuthMode.OPENAPI), "SITE-1", "aa:bb:cc:dd:ee:ff"
-    )
-
-    assert controller.requests[-1].url.path.endswith(
-        "/clients/AA-BB-CC-DD-EE-FF/unauth"
-    )
-
-
-async def test_deauthorize_refuses_in_legacy_mode_without_sending_anything():
-    """``cancelAuthClient`` is an Open API operation. A hotspot operator
-    credential cannot make it, and pretending otherwise would report a
-    revocation that never happened."""
-    controller = FakeOmadaController()
-
-    with pytest.raises(OmadaUnsupportedApiError) as excinfo:
+    with pytest.raises(OmadaUnsupportedApiError):
+        await _adapter(controller).authorize_guest(
+            creds, EAP_CTX, duration_seconds=3600
+        )
+    with pytest.raises(OmadaUnsupportedApiError):
         await _adapter(controller).deauthorize_guest(
-            make_creds(ControllerAuthMode.LEGACY), "Default", "AA-BB-CC-DD-EE-FF"
+            creds, "Default", "AA-BB-CC-DD-EE-FF"
         )
 
-    assert excinfo.value.code == "OMADA_API_UNSUPPORTED"
-    assert "open api" in str(excinfo.value).lower()
     assert controller.requests == []
 
 
-async def test_deauthorize_propagates_a_controller_refusal():
-    """A non-zero errorCode must not come back as ``True``."""
-    controller = FakeOmadaController()
-    controller.routes["/unauth"] = lambda request: httpx.Response(
-        200, json=envelope(error_code=-1600, msg="Operation not supported.")
-    )
+# --- What the controller says when it refuses ------------------------------
+#
+# MEASURED against a live 6.3.0.100 cloud controller on 2026-09-11, varying
+# one body field at a time against a non-existent client MAC. `authType` is
+# the only fault the endpoint names; every other one -- a missing `clientMac`
+# included, which is beyond argument required -- comes back as a bare -41501.
 
-    with pytest.raises(OmadaError):
-        await _adapter(controller).deauthorize_guest(
-            make_creds(ControllerAuthMode.OPENAPI), "SITE-1", "AA-BB-CC-DD-EE-FF"
+
+@pytest.mark.parametrize(
+    ("error_code", "msg"),
+    [
+        (-41500, "Invalid authentication type."),
+        (-41501, "Failed to authenticate."),
+    ],
+)
+async def test_a_refused_authorization_is_an_authorization_error_not_a_network_one(
+    error_code: int, msg: str
+):
+    """Both codes used to fall through to the generic ``OmadaError``, whose
+    ``OMADA_ERROR`` the backend does not recognise and therefore files under
+    ``OMADA_CONNECTION_FAILED`` -- "could not reach the network controller",
+    said about a controller that had just answered. That sends whoever reads
+    it to look at the network instead of at the request.
+    """
+    controller = FakeOmadaController()
+    controller.authorize_error_code = error_code
+    controller.authorize_error_msg = msg
+    creds = make_creds(ControllerAuthMode.LEGACY)
+
+    with pytest.raises(OmadaAuthorizationError) as excinfo:
+        await _adapter(controller).authorize_guest(
+            creds, EAP_CTX, duration_seconds=3600
         )
 
-
-# --- clientIp: required on v6.2.10+, absent before it -----------------------
-# VERIFIED against TP-Link doc 132060 ("API and Code Samples for External
-# Portal Server (Omada Controller v6.2.10 or Above)"), which lists clientIp
-# among the parameters the body "must contain" for both the EAP and the
-# Gateway shape, and against doc 13080 (v5.0.15-v6.2.0), which does not
-# contain the string at all.
+    assert excinfo.value.code == "OMADA_AUTHORIZATION_FAILED"
+    # The raw integer is the only thing that survives the normalization, and
+    # it is the only thing that tells the two apart afterwards.
+    assert excinfo.value.provider_code == error_code
 
 
-def test_client_ip_is_sent_when_the_redirect_carried_it():
-    body = build_authorize_body(
-        PortalAuthContext(
-            client_mac="AA-BB-CC-DD-EE-FF",
-            site="Default",
-            ap_mac="11-22-33-44-55-66",
-            ssid_name="Wyfy Guest",
-            radio_id=1,
-            client_ip="10.0.0.99",
-        ),
-        duration_seconds=600,
-    )
-    assert body["clientIp"] == "10.0.0.99"
+async def test_the_two_refusal_codes_stay_distinguishable():
+    """-41500 names the field that is wrong. -41501 is a catch-all covering a
+    wrong MAC, a stale time, an unknown site, an AP that never saw the client
+    and a missing required field. Collapsing them would throw away the one
+    discrimination this endpoint offers."""
+    codes = []
+    for error_code in (-41500, -41501):
+        controller = FakeOmadaController()
+        controller.authorize_error_code = error_code
+        with pytest.raises(OmadaAuthorizationError) as excinfo:
+            await _adapter(controller).authorize_guest(
+                make_creds(ControllerAuthMode.LEGACY), EAP_CTX, duration_seconds=3600
+            )
+        codes.append(excinfo.value.provider_code)
+    assert codes == [-41500, -41501]
 
 
-def test_client_ip_is_omitted_entirely_on_an_older_controllers_redirect():
-    """A v5 controller never sends clientIp, so we must not invent one --
-    an empty string or a guessed peer address is a value the controller
-    would try to match against a real pending session and fail."""
-    body = build_authorize_body(
-        PortalAuthContext(
-            client_mac="AA-BB-CC-DD-EE-FF",
-            site="Default",
-            gateway_mac="11-22-33-44-55-66",
-            vid=30,
-        ),
-        duration_seconds=600,
-    )
-    assert "clientIp" not in body
-
-
-async def test_client_ip_reaches_the_controller_on_the_authorize_call():
+async def test_a_refusal_message_carries_no_response_body():
+    """``str(exc)`` is rendered into the customer dashboard. The controller's
+    own ``msg`` is allowed through ``sanitize_detail``; the body is not."""
     controller = FakeOmadaController()
-    ctx = PortalAuthContext(
-        client_mac="AA-BB-CC-DD-EE-FF",
-        site="Default",
-        ap_mac="11-22-33-44-55-66",
-        ssid_name="Wyfy Guest",
-        radio_id=1,
-        client_ip="10.0.0.99",
-    )
+    controller.authorize_error_code = -41501
+    controller.authorize_error_msg = "Failed to authenticate."
 
-    await _adapter(controller).authorize_guest(
-        make_creds(ControllerAuthMode.LEGACY), ctx, duration_seconds=600
-    )
+    with pytest.raises(OmadaAuthorizationError) as excinfo:
+        await _adapter(controller).authorize_guest(
+            make_creds(ControllerAuthMode.LEGACY), EAP_CTX, duration_seconds=3600
+        )
 
-    authorize_body = controller.bodies[-1]
-    assert authorize_body["clientIp"] == "10.0.0.99"
-    assert authorize_body["clientMac"] == "AA-BB-CC-DD-EE-FF"
-    assert authorize_body["authType"] == "4"
-    assert authorize_body["time"] == 600_000
+    rendered = str(excinfo.value)
+    assert "Failed to authenticate." in rendered
+    assert SESSION_COOKIE_VALUE not in rendered
+    assert CSRF_TOKEN not in rendered
+
+
+async def test_an_unrelated_error_code_is_still_generic():
+    """The new branch is scoped to the two portal codes. A code from some
+    other endpoint must not be relabelled an authorization refusal."""
+    from wyfy_device_gateway.omada.errors import OmadaError
+
+    controller = FakeOmadaController()
+    controller.authorize_error_code = -33333
+
+    with pytest.raises(OmadaError) as excinfo:
+        await _adapter(controller).authorize_guest(
+            make_creds(ControllerAuthMode.LEGACY), EAP_CTX, duration_seconds=3600
+        )
+
+    assert excinfo.value.code == "OMADA_ERROR"
+    assert excinfo.value.provider_code == -33333

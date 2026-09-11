@@ -88,64 +88,15 @@ JSON fields in the bodies we have seen, but sending version-specific fields
 unconditionally to an older controller is an avoidable risk on the one call
 in this package that a paying guest's internet access depends on.
 
-## Deauthorization DOES exist -- CR-001 was wrong (corrected 2026-09-10)
+## Revoking one of these
 
-The original CR-001 claimed "TP-Link publishes no client-deauthorization
-endpoint in any generation". That claim was based on the external-portal
-documents alone, and within that family it is true: docs 13023, 13080 and
-132060 document exactly two calls, login and authorize, and none of them
-mentions revoking anything.
-
-It is false for the product as a whole. TP-Link publishes a machine-readable
-OpenAPI 3.0.1 specification for the Omada Open API from its own cloud host,
-<https://use1-omada-northbound.tplinkcloud.com/v3/api-docs> (rendered at
-``/doc.html``, and mirrored as human docs at
-<https://omada-northbound-docs.tplinkcloud.com/>). That spec contains an
-entire ``Authorized Client`` tag, and in it:
-
-    POST /openapi/v1/{omadacId}/sites/{siteId}/hotspot/clients/{clientMac}/unauth
-    operationId: cancelAuthClient
-    summary:     "Cancel authentication the given client"
-    description: "Cancel the authentication of this client with the given
-                  omadacId, siteId, clientMac."
-    parameters:  omadacId, siteId, clientMac -- all path, all required
-    body:        none
-    response:    {"errorCode": int, "msg": str}
-
-This is the exact inverse of ``authClient``
-(``.../hotspot/clients/{clientMac}/auth``) and it covers external-portal
-sessions specifically: the same spec's ``AuthClientOpenApiVO.authType``
-enumerates "4: External Portal Server", which is precisely the ``authType``
-this module sends when it authorizes.
-
-**Availability.** TP-Link's docs site publishes the operation list per model
-and per firmware version. ``cancelAuthClient`` is present in every version it
-covers, from ``oc_series`` 5.13.0 (the first release with Open API at all)
-through 6.2.14, in ``software`` 6.2.0+, and in Omada Pro v1.3.0+. So it
-raises no firmware floor beyond the one Open API already imposes.
-
-**Why this endpoint and not one of the others.** The spec also offers
-``blockClient``/``unblockClient`` (5.13.0+), ``reconnectClient`` (5.13.0+),
-``disconnectClient`` (5.15.24+), ``disconnectHotspotAuthedClient`` and
-``deleteHotspotAuthedClient`` (both 5.15.20+, and both keyed on an
-authed-record id we would have to look up first), plus MAC filters and ACLs.
-``unauth`` is the only one that is semantically "end this portal session",
-takes only the MAC we already hold, needs no lookup and no body, and raises
-no version floor. ``block`` remains deliberately unused: it is a persistent
-controller-level denial that an operator must clear by hand, which is a
-materially different and more punitive action than ending a session.
-
-**The one thing this does NOT do:** it is an *Open API* call. A hotspot
-operator credential cannot make it. An integration configured for legacy
-mode only can still authorize guests and still cannot revoke them --
-``adapter.deauthorize_guest`` says exactly that.
-
-Note also ``extendHotspotAuthedClient``
-(``.../hotspot/authed-records/{id}/period``) will not serve as a "shorten to
-zero" trick: its ``period`` is documented as "within the range of 60000 to
-86400000000000", so 60 seconds is the floor. And ``time: 0`` on the
-external-portal authorize call is undocumented in every TP-Link revision --
-do not rely on it.
+TP-Link publishes no way to revoke an external-portal authorization, and
+that used to be the end of the sentence. It is not: the controller has a
+disconnect in the Hotspot Manager tree, reachable with the same operator
+session this module's call uses, and it is implemented in ``deauth.py``.
+Nothing about the authorize body changes because of it -- an authorization
+is still granted for ``time`` milliseconds and still lapses on its own --
+but the grant is no longer irrevocable. See ``adapter.deauthorize_guest``.
 """
 
 from __future__ import annotations
@@ -165,17 +116,22 @@ from .types import normalize_mac
 #: ``AuthClientOpenApiVO.authType`` enumerates "4: External Portal Server".
 AUTH_TYPE_EXTERNAL_PORTAL = 4
 
-#: VERIFIED (TP-Link's own OpenAPI 3.0.1 spec, ``operationId:
-#: cancelAuthClient``). See this module's docstring for the full quotation
-#: and the per-version availability.
-OPENAPI_UNAUTH_PATH = (
-    "/openapi/v1/{omadac_id}/sites/{site_id}/hotspot/clients/{client_mac}/unauth"
-)
-
 #: Sanity ceiling on a single authorization, 24 hours. A caller passing a
 #: nonsense duration (a timestamp mistaken for a duration, say) would
 #: otherwise ask the controller for a session lasting decades.
-MAX_DURATION_SECONDS = 24 * 60 * 60
+
+#: Sanity ceiling on a single authorization. A caller passing a nonsense
+#: duration (a timestamp mistaken for a duration, say) would otherwise ask
+#: the controller for a session lasting decades.
+#:
+#: This is deliberately **not** the platform's policy ceiling. That one is
+#: ``network_integration.constants.MAX_SESSION_DURATION_SECONDS`` and is much
+#: lower; it rejects rather than caps, so an operator is told the number they
+#: asked for is not allowed. Keeping this bound above it is what stops the two
+#: from disagreeing silently -- when they were both 24h, raising the policy
+#: ceiling alone would have had the platform promise a week and the controller
+#: quietly receive a day.
+MAX_DURATION_SECONDS = 30 * 24 * 60 * 60
 
 
 def build_authorize_body(
@@ -289,46 +245,18 @@ async def authorize_client(
         expires_at=started + timedelta(seconds=capped_seconds),
         provider_code=detail,
     )
-
-
-async def deauthorize_client(
-    client: OmadaHttpClient,
-    omadac_id: str,
-    site_id: str,
-    client_mac: str,
-) -> bool:
-    """End one client's portal authorization now, via the Open API.
-
-    Returns ``True`` on ``errorCode: 0``. Anything else has already been
-    turned into a normalized ``OmadaError`` by ``client.request``, so there
-    is no falsy-but-fine path here -- the ``bool`` return exists to satisfy
-    contract section 2's signature, and a caller that gets ``True`` can trust
-    the controller accepted the revocation.
-
-    The MAC is normalized to Omada's own documented ``AA-BB-CC-DD-EE-FF``
-    form (the spec spells the parameter out as "Client MAC, format:
-    AA-BB-CC-DD-EE-FF") so that a caller holding ``aa:bb:cc:dd:ee:ff`` --
-    which is what the portal redirect and our own database both tend to
-    carry -- does not silently address a different client, or none.
-
-    Note what this is not: it is not a block. The client can walk back to the
-    captive portal and authorize again, which is the correct behaviour for
-    "this session is over" and the reason ``blockClient`` is not used here.
-    """
-    normalized = normalize_mac(client_mac) or client_mac
-    await client.request(
-        "POST",
-        OPENAPI_UNAUTH_PATH.format(
-            omadac_id=omadac_id, site_id=site_id, client_mac=normalized
-        ),
-    )
-    return True
-
+# NOTE: the Open API revocation path (`POST .../hotspot/clients/{mac}/unauth`,
+# `operationId: cancelAuthClient`) is real and is sourced in CHANGE-REQUESTS.md
+# CR-001. It is deliberately NOT implemented here. `adapter.deauthorize_guest`
+# revokes through the legacy hotspot session instead -- the path that was
+# actually run against a controller -- and this module briefly carried a second
+# `deauthorize_client` of the same name that nothing called. Wiring the Open API
+# path is its own change, and it needs its own run against real hardware before
+# anything claims it works.
 
 __all__ = [
     "AUTH_TYPE_EXTERNAL_PORTAL",
     "MAX_DURATION_SECONDS",
-    "OPENAPI_UNAUTH_PATH",
     "authorize_client",
     "build_authorize_body",
     "deauthorize_client",

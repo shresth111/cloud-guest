@@ -18,6 +18,10 @@ from app.domains.dhcp.dependencies import get_dhcp_service
 from app.domains.dhcp.service import DhcpService
 from app.domains.isp.dependencies import get_isp_service
 from app.domains.isp.service import IspService
+from app.domains.network_integration.dependencies import (
+    get_network_integration_service,
+)
+from app.domains.network_integration.service import NetworkIntegrationService
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 from app.domains.router_agent.dependencies import get_router_agent_service
@@ -49,6 +53,9 @@ def get_readiness_service(
         get_router_provisioning_service
     ),
     dhcp_service: DhcpService = Depends(get_dhcp_service),
+    network_integration_service: NetworkIntegrationService = Depends(
+        get_network_integration_service
+    ),
 ) -> ReadinessService:
     return ReadinessService(
         repository,
@@ -69,6 +76,13 @@ def get_readiness_service(
         # timeout behind every checklist GET -- see that method's own
         # docstring and ``service.RogueDhcpStatusLookupProtocol``'s.
         dhcp_service,
+        # Supplies CONTROLLER_INTEGRATION's evidence -- the item that only
+        # exists for a controller-managed device, and the only thing on
+        # its checklist that can actually be wrong. Database-only, like
+        # ``dhcp_service`` above: `find_integration_for_router` reads one
+        # row and never talks to the controller, which matters because
+        # every AUTO item re-runs on every checklist GET.
+        network_integration_service,
     )
 
 

@@ -87,6 +87,67 @@ class ControllerAuthMode(StrEnum):
     LEGACY = "legacy"  # hotspot operator name + password, controller v5.0.15+
 
 
+class ControllerTlsMode(StrEnum):
+    """How much this platform trusts the certificate a controller presents.
+
+    A boolean ``verify_tls`` used to sit here, and it was the wrong shape for
+    the population it describes. Essentially every self-hosted Omada
+    controller ships a self-signed certificate -- the one this package was
+    first pointed at answers with ``CN=localhost``, issued by itself -- so
+    ``True`` refuses every real box and ``False`` accepts *any* box. A
+    boolean forces the operator to pick between "cannot integrate" and "no
+    certificate check at all", and the second one is what they will pick.
+
+    Three modes exist so the middle answer is available:
+
+    * ``STRICT`` -- ordinary public-CA verification. Correct for a controller
+      behind a real certificate, and the default, because a default that is
+      weaker than the platform's ordinary HTTPS posture is a decision nobody
+      made.
+    * ``PINNED`` -- verify the certificate the controller presents against a
+      SHA-256 fingerprint recorded on the integration. Strictly stronger than
+      turning verification off: an interceptor must hold *that* certificate,
+      not merely *a* certificate. This is the intended answer for a
+      self-signed controller.
+    * ``INSECURE`` -- no certificate check. Left reachable because a
+      controller behind a load balancer that re-issues certificates
+      frequently is a real configuration, and pretending otherwise pushes
+      people to disable TLS entirely. It is never a default and the caller is
+      expected to record who chose it.
+
+    ``PINNED`` requires ``ControllerCredentials.tls_pinned_sha256``; this
+    package raises rather than silently degrading to ``INSECURE`` if it is
+    missing, because a pin that quietly is not enforced is worse than no pin.
+    """
+
+    STRICT = "strict"
+    PINNED = "pinned"
+    INSECURE = "insecure"
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerTlsObservation:
+    """What the controller's TLS endpoint actually presented, right now.
+
+    Produced by ``ControllerAdapter.inspect_tls`` and used by the connect
+    wizard: it is how an operator is shown the fingerprint they are about to
+    trust, rather than being asked to paste one they have no way to obtain.
+
+    ``chain_trusted`` is the answer to "would ``STRICT`` have worked", asked
+    by attempting an ordinary verified handshake. It is a separate fact from
+    ``matches_pin`` and neither implies the other.
+
+    ``certificate_der`` is the raw certificate. It is public by definition --
+    the controller hands it to anyone who connects -- so it is safe to return
+    and safe to log, unlike everything else in this module's vicinity.
+    """
+
+    fingerprint_sha256: str
+    certificate_der: bytes
+    chain_trusted: bool
+    matches_pin: bool | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class ControllerCredentials:
     """Resolved, already-decrypted controller connection material.
@@ -97,11 +158,21 @@ class ControllerCredentials:
     dataclass in this package already has (PRD section 6).
 
     ``base_url`` is trusted as given: it is the caller's responsibility to
-    have SSRF-validated it (contract section 6). ``verify_tls`` defaults to
-    ``True`` and should stay there; Omada controllers ship a self-signed
-    certificate by default, so operators will be tempted to turn it off, and
-    the honest place to make that trade-off consciously is the integration
-    row, not a silent default in here.
+    have SSRF-validated it (contract section 6).
+
+    ``tls_mode`` defaults to :attr:`ControllerTlsMode.STRICT` and replaces the
+    ``verify_tls`` boolean this dataclass used to carry. See
+    :class:`ControllerTlsMode` for why a boolean was the wrong shape. The
+    honest place to make the trust trade-off is still the integration row --
+    that has not changed -- but the row now records *which* certificate was
+    accepted rather than only that checking was switched off.
+
+    ``verify_tls`` survives as a read-only property so that code which only
+    *reads* it keeps working. Code that *set* it gets a ``TypeError``, on
+    purpose: a caller passing ``verify_tls=False`` needs to say which of
+    ``PINNED`` and ``INSECURE`` it meant, and silently mapping it to the
+    weaker one would reintroduce exactly the default this change exists to
+    remove.
     """
 
     vendor: ControllerVendor
@@ -112,8 +183,24 @@ class ControllerCredentials:
     username: str | None = None
     password: str | None = None
     omadac_id: str | None = None  # None => discover via GET /api/info
-    verify_tls: bool = True
+    tls_mode: ControllerTlsMode = ControllerTlsMode.STRICT
+    #: Lowercase hex SHA-256 of the controller certificate's DER encoding.
+    #: Required when ``tls_mode`` is ``PINNED``, ignored otherwise.
+    tls_pinned_sha256: str | None = None
     timeout_seconds: float = 15.0
+
+    @property
+    def verify_tls(self) -> bool:
+        """Whether ordinary chain verification applies. Read-only.
+
+        ``PINNED`` answers ``False`` here because the chain is *not* what is
+        being verified -- the fingerprint is, by a separate mechanism in
+        ``omada/tls.py``. Anything treating this property as "the connection
+        is unchecked" would be wrong for ``PINNED``, which is why the
+        property is deliberately narrow and the modes are what callers
+        branch on.
+        """
+        return self.tls_mode is ControllerTlsMode.STRICT
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +411,20 @@ class ControllerAdapter(Protocol):
         self, creds: ControllerCredentials, site_id: str, client_mac: str
     ) -> bool: ...
 
+    async def inspect_tls(
+        self, creds: ControllerCredentials
+    ) -> ControllerTlsObservation:
+        """Observe the certificate without authenticating or trusting it.
+
+        Exists so the connect wizard can show an operator the fingerprint of
+        the controller in front of them and ask them to confirm it, instead
+        of asking them to produce one. It sends no credentials -- it does not
+        get as far as an HTTP request -- so it is safe to call against an
+        address whose certificate is not yet trusted, which is the entire
+        situation it is for.
+        """
+        ...
+
 
 __all__ = [
     "AuthorizationResult",
@@ -335,6 +436,8 @@ __all__ = [
     "ControllerInfo",
     "ControllerSite",
     "ControllerSsid",
+    "ControllerTlsMode",
+    "ControllerTlsObservation",
     "ControllerVendor",
     "PortalAuthContext",
 ]
